@@ -13,13 +13,13 @@ const stages = ['new-inquiry', 'contacted', 'booked', 'visited', 'follow-up', 'r
 type Stage = typeof stages[number];
 
 const stageConfig: Record<Stage, { label: string; color: string; bg: string }> = {
-  'new-inquiry': { label: 'New Inquiry', color: 'text-blue-700', bg: 'bg-blue-50 border-blue-200' },
-  'contacted': { label: 'Contacted', color: 'text-cyan-700', bg: 'bg-cyan-50 border-cyan-200' },
-  'booked': { label: 'Booked', color: 'text-violet-700', bg: 'bg-violet-50 border-violet-200' },
-  'visited': { label: 'Visited', color: 'text-emerald-700', bg: 'bg-emerald-50 border-emerald-200' },
-  'follow-up': { label: 'Follow-up', color: 'text-amber-700', bg: 'bg-amber-50 border-amber-200' },
-  'retained': { label: 'Retained', color: 'text-teal-700', bg: 'bg-teal-50 border-teal-200' },
-  'lost': { label: 'Lost', color: 'text-red-600', bg: 'bg-red-50 border-red-200' },
+  'new-inquiry': { label: 'New Inquiry', color: 'text-blue-v', bg: 'bg-[var(--blue-soft)] border-[var(--b1)]' },
+  'contacted': { label: 'Contacted', color: 'text-cyan-v', bg: 'bg-[var(--blue-soft)] border-[var(--b1)]' },
+  'booked': { label: 'Booked', color: 'text-violet-v', bg: 'bg-[var(--violet-soft)] border-[var(--b1)]' },
+  'visited': { label: 'Visited', color: 'text-emerald-v', bg: 'bg-[var(--emerald-soft)] border-[var(--b1)]' },
+  'follow-up': { label: 'Follow-up', color: 'text-amber-v', bg: 'bg-[var(--amber-soft)] border-[var(--b1)]' },
+  'retained': { label: 'Retained', color: 'text-emerald-v', bg: 'bg-[var(--emerald-soft)] border-[var(--b1)]' },
+  'lost': { label: 'Lost', color: 'text-red-v', bg: 'bg-[var(--red-soft)] border-[var(--b1)]' },
 };
 
 const channelIcon: Record<string, React.ReactNode> = {
@@ -32,13 +32,13 @@ const channelIcon: Record<string, React.ReactNode> = {
 
 const daysSince = (date: string) => Math.floor((new Date('2025-05-26').getTime() - new Date(date).getTime()) / 86400000);
 
-const lifecycleConfig: Record<string, { label: string; color: string; bg: string }> = {
-  active: { label: 'Active', color: 'text-emerald-700', bg: 'bg-emerald-50' },
-  retained: { label: 'Retained', color: 'text-teal-700', bg: 'bg-teal-50' },
-  'at-risk': { label: 'At Risk', color: 'text-amber-700', bg: 'bg-amber-50' },
-  inactive: { label: 'Inactive', color: 'text-red-600', bg: 'bg-red-50' },
-  new: { label: 'New', color: 'text-blue-700', bg: 'bg-blue-50' },
-  lost: { label: 'Lost', color: 'text-slate-600', bg: 'bg-slate-100' },
+const lifecycleConfig: Record<string, { label: string; badgeClass: string }> = {
+  active: { label: 'Active', badgeClass: 'badge badge-emerald' },
+  retained: { label: 'Retained', badgeClass: 'badge badge-emerald' },
+  'at-risk': { label: 'At Risk', badgeClass: 'badge badge-amber' },
+  inactive: { label: 'Inactive', badgeClass: 'badge badge-red' },
+  new: { label: 'New', badgeClass: 'badge badge-blue' },
+  lost: { label: 'Lost', badgeClass: 'badge badge-blue' },
 };
 
 export default function CRM() {
@@ -77,10 +77,10 @@ export default function CRM() {
         badgeColor="blue"
         actions={
           <div className="flex gap-2">
-            <button type="button" className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 transition shadow-sm">
+            <button type="button" className="inline-flex items-center gap-2 rounded-xl border border-[var(--b2)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
               <Mail className="w-4 h-4" /> Export Segment
             </button>
-            <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700 transition shadow-md shadow-blue-500/20">
+            <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
               <Sparkles className="w-4 h-4" /> Create Campaign
             </button>
           </div>
@@ -97,7 +97,7 @@ export default function CRM() {
 
       {/* Pipeline Board */}
       <BentoCard title="Lead Conversion Pipeline" subtitle="Lead-to-booking funnel" headerRight={
-        <button type="button" className="text-xs font-semibold text-blue-600 flex items-center gap-1 hover:text-blue-700">View leads <ArrowRight className="w-3 h-3" /></button>
+        <button type="button" className="text-xs font-semibold text-indigo flex items-center gap-1 hover:opacity-80">View leads <ArrowRight className="w-3 h-3" /></button>
       }>
         <div className="grid gap-2 grid-cols-7">
           {stages.map((stage) => {
@@ -107,7 +107,7 @@ export default function CRM() {
             return (
               <div key={stage} className={`rounded-xl border p-3 ${cfg.bg}`}>
                 <p className={`text-[10px] font-bold uppercase tracking-widest mb-2 ${cfg.color}`}>{cfg.label}</p>
-                <p className="text-2xl font-bold text-slate-900">{count}</p>
+                <p className="text-2xl font-bold text-t1">{count}</p>
                 <p className={`text-[11px] font-semibold mt-1 ${cfg.color}`}>£{val.toLocaleString()}</p>
                 <ProgressBar value={count} max={leads.length} color={stage === 'lost' ? 'red' : stage === 'retained' ? 'emerald' : 'blue'} className="mt-2" />
               </div>
@@ -126,7 +126,7 @@ export default function CRM() {
               value={searchQuery}
               onChange={e => setSearchQuery(e.target.value)}
               placeholder="Search customers..."
-              className="text-xs px-3 py-1.5 border border-slate-200 rounded-xl bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent w-44"
+              className="text-xs px-3 py-1.5 border border-[var(--b1)] rounded-xl bg-[var(--s3)] text-t1 placeholder:text-t3 focus:outline-none focus:ring-2 focus:ring-[var(--indigo)] focus:border-transparent w-44"
             />
           }>
             <div className="space-y-2">
@@ -134,31 +134,31 @@ export default function CRM() {
                 const lc = lifecycleConfig[p.lifecycleStage] || lifecycleConfig.active;
                 const lastSeen = daysSince(p.lastVisit);
                 return (
-                  <div key={p.id} className="flex items-center gap-3 p-3 rounded-xl border border-slate-100 hover:border-slate-200 hover:bg-slate-50/50 transition-all cursor-pointer group">
+                  <div key={p.id} className="flex items-center gap-3 p-3 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all cursor-pointer group">
                     <div className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-400 to-violet-500 flex items-center justify-center text-white text-[11px] font-bold shrink-0">
                       {p.name.split(' ').map(n => n[0]).join('').slice(0, 2)}
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
-                        <p className="text-sm font-semibold text-slate-900 group-hover:text-blue-700 transition-colors">{p.name}</p>
-                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${lc.bg} ${lc.color}`}>{lc.label}</span>
-                        {p.familyAccountId && <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-violet-50 text-violet-700">Family</span>}
+                        <p className="text-sm font-semibold text-t1 group-hover:text-indigo transition-colors">{p.name}</p>
+                        <span className={lc.badgeClass}>{lc.label}</span>
+                        {p.familyAccountId && <span className="badge badge-violet">Family</span>}
                       </div>
-                      <div className="flex items-center gap-2 mt-0.5 text-[11px] text-slate-400">
+                      <div className="flex items-center gap-2 mt-0.5 text-[11px] text-t3">
                         <span>Last seen {lastSeen}d ago</span>
                         <span>·</span>
                         <span>LTV £{p.lifetimeValue.toLocaleString()}</span>
                         <span>·</span>
                         <span>{p.visitCount} visits</span>
                         {p.tags.slice(0, 1).map(t => (
-                          <span key={t} className="px-1.5 py-0.5 bg-slate-100 rounded text-[10px] text-slate-500">{t}</span>
+                          <span key={t} className="px-1.5 py-0.5 bg-[var(--s3)] rounded text-[10px] text-t3">{t}</span>
                         ))}
                       </div>
                     </div>
                     <div className="text-right shrink-0">
                       <RiskBadge level={p.churnRisk >= 70 ? 'high' : p.churnRisk >= 40 ? 'medium' : 'low'} label={`${p.churnRisk}% risk`} size="sm" />
                       {p.outstandingBalance > 0 && (
-                        <p className="text-[10px] text-amber-600 font-semibold mt-1">£{p.outstandingBalance} outstanding</p>
+                        <p className="text-[10px] text-amber-v font-semibold mt-1">£{p.outstandingBalance} outstanding</p>
                       )}
                     </div>
                   </div>
@@ -169,24 +169,24 @@ export default function CRM() {
 
           {/* Latest leads */}
           <BentoCard title="Latest Inbound Leads" subtitle="Recent inquiries" headerRight={
-            <button type="button" className="text-xs font-semibold text-blue-600 hover:text-blue-700 flex items-center gap-1">All leads <ArrowRight className="w-3 h-3" /></button>
+            <button type="button" className="text-xs font-semibold text-indigo hover:opacity-80 flex items-center gap-1">All leads <ArrowRight className="w-3 h-3" /></button>
           }>
             <div className="space-y-2">
               {leads.slice(0, 6).map((lead) => {
                 const cfg = stageConfig[lead.stage];
                 return (
-                  <div key={lead.id} className="flex items-center gap-3 p-3 rounded-xl border border-slate-100 hover:border-slate-200 hover:bg-slate-50 transition-all">
-                    <div className="w-7 h-7 rounded-xl bg-slate-100 flex items-center justify-center text-slate-500 shrink-0">
+                  <div key={lead.id} className="flex items-center gap-3 p-3 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all">
+                    <div className="w-7 h-7 rounded-xl bg-[var(--s3)] flex items-center justify-center text-t2 shrink-0">
                       {channelIcon[lead.channel] || <Phone className="w-3 h-3" />}
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
-                        <p className="text-sm font-semibold text-slate-900">{lead.name}</p>
+                        <p className="text-sm font-semibold text-t1">{lead.name}</p>
                         <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${cfg.bg} ${cfg.color}`}>{cfg.label}</span>
                       </div>
-                      <p className="text-[11px] text-slate-400">{lead.service} · via {lead.source}</p>
+                      <p className="text-[11px] text-t3">{lead.service} · via {lead.source}</p>
                     </div>
-                    <span className="text-xs font-bold text-emerald-700 shrink-0">£{lead.estimatedValue.toLocaleString()}</span>
+                    <span className="text-xs font-bold text-emerald-v shrink-0">£{lead.estimatedValue.toLocaleString()}</span>
                   </div>
                 );
               })}
@@ -199,13 +199,13 @@ export default function CRM() {
 
           {/* Inactive segments */}
           <BentoCard title="Inactive Customer Segments" subtitle="Reactivation opportunities">
-            <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-xl mb-4">
+            <div className="flex items-center gap-1 bg-[var(--s3)] p-1 rounded-xl mb-4">
               {['30', '60', '90', '180'].map(d => (
                 <button
                   key={d}
                   type="button"
                   onClick={() => setInactiveSegment(d)}
-                  className={`flex-1 py-1.5 rounded-lg text-xs font-semibold transition-all ${inactiveSegment === d ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}
+                  className={`flex-1 py-1.5 rounded-lg text-xs font-semibold transition-all ${inactiveSegment === d ? 'bg-[var(--s2)] text-t1' : 'text-t3'}`}
                 >
                   {d}d+
                 </button>
@@ -215,16 +215,16 @@ export default function CRM() {
               {Object.entries(inactiveCounts).map(([range, count]) => {
                 const estValue = count * avgLTV * 0.18;
                 return (
-                  <div key={range} className={`rounded-xl border p-3.5 transition-all ${inactiveSegment === range ? 'border-blue-200 bg-blue-50' : 'border-slate-200'}`}>
+                  <div key={range} className={`rounded-xl border p-3.5 transition-all ${inactiveSegment === range ? 'border-[var(--b2)] bg-[var(--blue-soft)]' : 'border-[var(--b1)]'}`}>
                     <div className="flex items-center justify-between gap-2 mb-2">
-                      <p className="text-sm font-bold text-slate-900">{range}–{parseInt(range) === 180 ? '365' : parseInt(range) + 30}d inactive</p>
-                      <span className="text-xs font-bold text-blue-700 bg-blue-100 px-2 py-0.5 rounded-full">{count} customers</span>
+                      <p className="text-sm font-bold text-t1">{range}–{parseInt(range) === 180 ? '365' : parseInt(range) + 30}d inactive</p>
+                      <span className="badge badge-blue">{count} customers</span>
                     </div>
                     <div className="flex items-center justify-between gap-2 mb-2">
-                      <p className="text-xs text-slate-500">Est. recoverable revenue</p>
-                      <p className="text-xs font-bold text-emerald-700">£{Math.round(estValue).toLocaleString()}</p>
+                      <p className="text-xs text-t2">Est. recoverable revenue</p>
+                      <p className="text-xs font-bold text-emerald-v">£{Math.round(estValue).toLocaleString()}</p>
                     </div>
-                    <button type="button" className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg border border-dashed border-blue-300 text-xs font-semibold text-blue-600 hover:bg-blue-100 transition-colors">
+                    <button type="button" className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg border border-dashed border-[var(--b2)] text-xs font-semibold text-indigo hover:bg-[var(--s3)] transition-colors">
                       <Zap className="w-3 h-3" /> Launch Reactivation Campaign
                     </button>
                   </div>
@@ -235,7 +235,7 @@ export default function CRM() {
 
           {/* Next-best actions */}
           <BentoCard title="AI-Recommended Retention Plays" subtitle="Next best actions" headerRight={
-            <Sparkles className="w-4 h-4 text-violet-500" />
+            <Sparkles className="w-4 h-4 text-violet-v" />
           }>
             <div className="space-y-2.5">
               {[
@@ -243,13 +243,13 @@ export default function CRM() {
                 { title: 'Assign premium dermatology leads to coordinator', sub: 'Dr. Okafor and Dr. Nwosu for high LTV accounts', impact: '£4,800', urgency: 'medium' },
                 { title: 'Promote family wellness package to overdue accounts', sub: 'Family accounts deliver 2.4× higher retention', impact: '£3,100', urgency: 'low' },
               ].map((item) => (
-                <div key={item.title} className="p-3.5 rounded-xl border border-slate-200 hover:border-blue-200 hover:shadow-sm transition-all">
+                <div key={item.title} className="p-3.5 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all">
                   <div className="flex items-start justify-between gap-2 mb-1.5">
-                    <p className="text-xs font-bold text-slate-900 leading-tight">{item.title}</p>
-                    <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full shrink-0">{item.impact}</span>
+                    <p className="text-xs font-bold text-t1 leading-tight">{item.title}</p>
+                    <span className="badge badge-emerald shrink-0">{item.impact}</span>
                   </div>
-                  <p className="text-[11px] text-slate-400 mb-2">{item.sub}</p>
-                  <button type="button" className="inline-flex items-center gap-1 text-xs font-semibold text-blue-600 hover:text-blue-700">
+                  <p className="text-[11px] text-t3 mb-2">{item.sub}</p>
+                  <button type="button" className="inline-flex items-center gap-1 text-xs font-semibold text-indigo hover:opacity-80">
                     Take action <ArrowRight className="w-3 h-3" />
                   </button>
                 </div>
@@ -261,27 +261,27 @@ export default function CRM() {
           <BentoCard title="Recent Campaign ROI" subtitle="Campaign highlights">
             <div className="space-y-3">
               {campaigns.slice(0, 3).map((c) => (
-                <div key={c.id} className="p-3 rounded-xl border border-slate-100">
+                <div key={c.id} className="p-3 rounded-xl border border-[var(--b1)]">
                   <div className="flex items-center justify-between gap-2 mb-2">
-                    <p className="text-xs font-bold text-slate-900 truncate">{c.name}</p>
-                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                      c.status === 'active' ? 'bg-emerald-100 text-emerald-700' :
-                      c.status === 'completed' ? 'bg-slate-100 text-slate-600' :
-                      'bg-amber-100 text-amber-700'
+                    <p className="text-xs font-bold text-t1 truncate">{c.name}</p>
+                    <span className={`${
+                      c.status === 'active' ? 'badge badge-emerald' :
+                      c.status === 'completed' ? 'badge badge-blue' :
+                      'badge badge-amber'
                     }`}>{c.status}</span>
                   </div>
                   <div className="grid grid-cols-3 gap-2 text-center">
                     <div>
-                      <p className="text-sm font-bold text-slate-900">{c.audienceSize}</p>
-                      <p className="text-[10px] text-slate-400">Audience</p>
+                      <p className="text-sm font-bold text-t1">{c.audienceSize}</p>
+                      <p className="text-[10px] text-t3">Audience</p>
                     </div>
                     <div>
-                      <p className="text-sm font-bold text-emerald-700">{c.booked}</p>
-                      <p className="text-[10px] text-slate-400">Booked</p>
+                      <p className="text-sm font-bold text-emerald-v">{c.booked}</p>
+                      <p className="text-[10px] text-t3">Booked</p>
                     </div>
                     <div>
-                      <p className="text-sm font-bold text-slate-900">£{c.revenue.toLocaleString()}</p>
-                      <p className="text-[10px] text-slate-400">Revenue</p>
+                      <p className="text-sm font-bold text-t1">£{c.revenue.toLocaleString()}</p>
+                      <p className="text-[10px] text-t3">Revenue</p>
                     </div>
                   </div>
                 </div>

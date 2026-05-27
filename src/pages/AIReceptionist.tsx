@@ -32,25 +32,25 @@ const missedCallTimeline = [
 ];
 
 const channelIcon: Record<string, React.ReactNode> = {
-  whatsapp: <MessageSquare className="w-3.5 h-3.5 text-emerald-600" />,
-  phone: <Phone className="w-3.5 h-3.5 text-blue-600" />,
-  sms: <MessageSquare className="w-3.5 h-3.5 text-violet-600" />,
-  email: <Mail className="w-3.5 h-3.5 text-amber-600" />,
+  whatsapp: <MessageSquare className="w-3.5 h-3.5 text-emerald-v" />,
+  phone: <Phone className="w-3.5 h-3.5 text-indigo" />,
+  sms: <MessageSquare className="w-3.5 h-3.5 text-violet-v" />,
+  email: <Mail className="w-3.5 h-3.5 text-amber-v" />,
 };
 
 const channelBg: Record<string, string> = {
-  whatsapp: 'bg-emerald-50 border-emerald-200',
-  phone: 'bg-blue-50 border-blue-200',
-  sms: 'bg-violet-50 border-violet-200',
-  email: 'bg-amber-50 border-amber-200',
+  whatsapp: 'bg-[var(--emerald-soft)] border-[var(--b1)]',
+  phone: 'bg-[var(--blue-soft)] border-[var(--b1)]',
+  sms: 'bg-[var(--violet-soft)] border-[var(--b1)]',
+  email: 'bg-[var(--amber-soft)] border-[var(--b1)]',
 };
 
-const statusConfig: Record<string, { label: string; color: string; bg: string }> = {
-  unread: { label: 'Unread', color: 'text-blue-700', bg: 'bg-blue-100' },
-  'ai-recovered': { label: 'AI Recovered', color: 'text-emerald-700', bg: 'bg-emerald-100' },
-  replied: { label: 'Replied', color: 'text-slate-600', bg: 'bg-slate-100' },
-  pending: { label: 'Pending', color: 'text-amber-700', bg: 'bg-amber-100' },
-  escalated: { label: 'Escalate', color: 'text-red-700', bg: 'bg-red-100' },
+const statusConfig: Record<string, { label: string; badgeClass: string }> = {
+  unread: { label: 'Unread', badgeClass: 'badge badge-blue' },
+  'ai-recovered': { label: 'AI Recovered', badgeClass: 'badge badge-emerald' },
+  replied: { label: 'Replied', badgeClass: 'badge badge-blue' },
+  pending: { label: 'Pending', badgeClass: 'badge badge-amber' },
+  escalated: { label: 'Escalate', badgeClass: 'badge badge-red' },
 };
 
 const afterHoursData = [3, 2, 4, 1, 5, 2, 1];
@@ -71,7 +71,7 @@ export default function AIReceptionist() {
         badge="7 Unread"
         badgeColor="red"
         actions={
-          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-violet-600 px-4 py-2 text-sm font-semibold text-white shadow-md shadow-blue-500/20 hover:opacity-90 transition">
+          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-violet-600 px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
             <Bot className="w-4 h-4" /> CareDesk AI Settings
           </button>
         }
@@ -86,20 +86,20 @@ export default function AIReceptionist() {
 
       <div className="grid gap-4 xl:grid-cols-[1fr_380px]">
         <div className="space-y-4">
-          <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-            <div className="px-4 pt-4 pb-3 border-b border-slate-100">
+          <div className="bg-[var(--s2)] rounded-2xl border border-[var(--b1)] overflow-hidden">
+            <div className="px-4 pt-4 pb-3 border-b border-[var(--b1)]">
               <div className="flex items-center justify-between gap-3 mb-3">
                 <div>
-                  <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-0.5">Conversation Inbox</p>
-                  <h3 className="text-sm font-bold text-slate-900">All incoming enquiries</h3>
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-t3 mb-0.5">Conversation Inbox</p>
+                  <h3 className="text-sm font-bold text-t1">All incoming enquiries</h3>
                 </div>
-                <span className="flex items-center gap-1.5 text-xs font-semibold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-full border border-emerald-200">
+                <span className="flex items-center gap-1.5 text-xs font-semibold text-emerald-v bg-[var(--emerald-soft)] px-2.5 py-1 rounded-full border border-[var(--b1)]">
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" /> AI Active
                 </span>
               </div>
               <ModuleTabs tabs={channelTabs} activeTab={activeChannel} onChange={setActiveChannel} variant="pills" />
             </div>
-            <div className="divide-y divide-slate-50">
+            <div className="divide-y divide-[var(--b0)]">
               {filtered.map((conv) => {
                 const status = statusConfig[conv.status] ?? statusConfig['pending'];
                 const isSelected = selectedConv.id === conv.id;
@@ -108,21 +108,21 @@ export default function AIReceptionist() {
                     key={conv.id}
                     type="button"
                     onClick={() => setSelectedConv(conv)}
-                    className={`w-full flex items-start gap-3 px-4 py-3.5 text-left hover:bg-slate-50 transition-colors ${isSelected ? 'bg-blue-50/50 border-l-2 border-l-blue-500' : ''}`}
+                    className={`w-full flex items-start gap-3 px-4 py-3.5 text-left hover:bg-[var(--s3)] transition-colors ${isSelected ? 'bg-[var(--blue-soft)] border-l-2 border-l-indigo' : ''}`}
                   >
-                    <div className={`w-8 h-8 rounded-xl border flex items-center justify-center shrink-0 ${channelBg[conv.channel] ?? 'bg-slate-50 border-slate-200'}`}>
+                    <div className={`w-8 h-8 rounded-xl border flex items-center justify-center shrink-0 ${channelBg[conv.channel] ?? 'bg-[var(--s3)] border-[var(--b1)]'}`}>
                       {channelIcon[conv.channel]}
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center justify-between gap-2">
-                        <p className="text-sm font-semibold text-slate-900">{conv.name}</p>
-                        <span className="text-[10px] text-slate-400 shrink-0">{conv.time}</span>
+                        <p className="text-sm font-semibold text-t1">{conv.name}</p>
+                        <span className="text-[10px] text-t3 shrink-0">{conv.time}</span>
                       </div>
-                      <p className="text-xs text-slate-500 truncate mt-0.5">{conv.message}</p>
+                      <p className="text-xs text-t3 truncate mt-0.5">{conv.message}</p>
                       <div className="flex items-center gap-2 mt-1">
-                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${status.bg} ${status.color}`}>{status.label}</span>
-                        {conv.aiHandled && <span className="text-[10px] font-semibold text-violet-600 bg-violet-50 px-2 py-0.5 rounded-full">AI handled</span>}
-                        <span className="text-[10px] font-bold text-emerald-700 ml-auto">{conv.value}</span>
+                        <span className={status.badgeClass}>{status.label}</span>
+                        {conv.aiHandled && <span className="badge badge-violet">AI handled</span>}
+                        <span className="text-[10px] font-bold text-emerald-v ml-auto">{conv.value}</span>
                       </div>
                     </div>
                   </button>
@@ -133,45 +133,45 @@ export default function AIReceptionist() {
         </div>
 
         <div className="space-y-4">
-          <BentoCard title="AI Conversation Summary" subtitle="Smart context panel" headerRight={<Sparkles className="w-4 h-4 text-violet-500" />}>
+          <BentoCard title="AI Conversation Summary" subtitle="Smart context panel" headerRight={<Sparkles className="w-4 h-4 text-violet-v" />}>
             <div className="space-y-3">
-              <div className="flex items-center gap-3 p-3 rounded-xl bg-slate-50 border border-slate-100">
+              <div className="flex items-center gap-3 p-3 rounded-xl bg-[var(--s3)] border border-[var(--b1)]">
                 <div className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-400 to-violet-500 flex items-center justify-center text-white text-[11px] font-bold shrink-0">
                   {selectedConv.name.split(' ').map(n => n[0]).join('')}
                 </div>
                 <div>
-                  <p className="text-sm font-bold text-slate-900">{selectedConv.name}</p>
-                  <p className="text-xs text-slate-400 capitalize">{selectedConv.channel} · {selectedConv.time}</p>
+                  <p className="text-sm font-bold text-t1">{selectedConv.name}</p>
+                  <p className="text-xs text-t3 capitalize">{selectedConv.channel} · {selectedConv.time}</p>
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-2">
-                <div className="p-2.5 rounded-xl bg-blue-50 border border-blue-100">
-                  <p className="text-[10px] font-bold text-blue-500 uppercase tracking-wide mb-0.5">Intent</p>
-                  <p className="text-xs font-semibold text-blue-900">{selectedConv.intent}</p>
+                <div className="p-2.5 rounded-xl bg-[var(--blue-soft)] border border-[var(--b1)]">
+                  <p className="text-[10px] font-bold text-blue-v uppercase tracking-wide mb-0.5">Intent</p>
+                  <p className="text-xs font-semibold text-t1">{selectedConv.intent}</p>
                 </div>
-                <div className="p-2.5 rounded-xl bg-emerald-50 border border-emerald-100">
-                  <p className="text-[10px] font-bold text-emerald-500 uppercase tracking-wide mb-0.5">Est. Value</p>
-                  <p className="text-xs font-bold text-emerald-700">{selectedConv.value}</p>
+                <div className="p-2.5 rounded-xl bg-[var(--emerald-soft)] border border-[var(--b1)]">
+                  <p className="text-[10px] font-bold text-emerald-v uppercase tracking-wide mb-0.5">Est. Value</p>
+                  <p className="text-xs font-bold text-emerald-v">{selectedConv.value}</p>
                 </div>
               </div>
               {selectedConv.suggestedSlot && (
-                <div className="p-3 rounded-xl border border-violet-200 bg-violet-50">
+                <div className="p-3 rounded-xl border border-[var(--b2)] bg-[var(--violet-soft)]">
                   <div className="flex items-center gap-2 mb-1">
-                    <Calendar className="w-3.5 h-3.5 text-violet-600" />
-                    <p className="text-[10px] font-bold text-violet-500 uppercase tracking-wide">AI Suggested Slot</p>
+                    <Calendar className="w-3.5 h-3.5 text-violet-v" />
+                    <p className="text-[10px] font-bold text-violet-v uppercase tracking-wide">AI Suggested Slot</p>
                   </div>
-                  <p className="text-sm font-bold text-violet-900">{selectedConv.suggestedSlot}</p>
-                  <button type="button" className="mt-2 w-full py-1.5 rounded-lg bg-violet-600 text-white text-xs font-semibold hover:bg-violet-700 transition-colors">
+                  <p className="text-sm font-bold text-t1">{selectedConv.suggestedSlot}</p>
+                  <button type="button" className="mt-2 w-full py-1.5 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition-colors">
                     Confirm & Book
                   </button>
                 </div>
               )}
               <div className="space-y-1.5">
-                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Suggested Reply</p>
-                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-xs text-slate-600 leading-relaxed">
+                <p className="text-[10px] font-bold text-t3 uppercase tracking-widest">Suggested Reply</p>
+                <div className="p-3 rounded-xl bg-[var(--s3)] border border-[var(--b1)] text-xs text-t2 leading-relaxed">
                   "Hi {selectedConv.name.split(' ')[0]}, thanks for reaching out! We have availability {selectedConv.suggestedSlot ?? 'this week'}. Would that work? Reply YES to confirm."
                 </div>
-                <button type="button" className="w-full flex items-center justify-center gap-1.5 py-2 rounded-xl border border-dashed border-blue-300 text-xs font-semibold text-blue-600 hover:bg-blue-50 transition-colors">
+                <button type="button" className="w-full flex items-center justify-center gap-1.5 py-2 rounded-xl border border-dashed border-[var(--b2)] text-xs font-semibold text-indigo hover:bg-[var(--s3)] transition-colors">
                   <Zap className="w-3 h-3" /> Send AI Reply
                 </button>
               </div>
@@ -179,36 +179,36 @@ export default function AIReceptionist() {
           </BentoCard>
 
           <BentoCard title="Missed-Call Recovery" subtitle="Today's call log" headerRight={
-            <span className="text-xs font-bold text-emerald-700 bg-emerald-50 px-2 py-1 rounded-full border border-emerald-200">{recovered}/{missedCallTimeline.length} recovered</span>
+            <span className="text-xs font-bold text-emerald-v bg-[var(--emerald-soft)] px-2 py-1 rounded-full border border-[var(--b1)]">{recovered}/{missedCallTimeline.length} recovered</span>
           }>
             <div className="space-y-3">
               {missedCallTimeline.map((call, i) => (
                 <div key={i} className="flex items-start gap-3">
                   <div className="flex flex-col items-center gap-1">
-                    <div className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 ${call.recovered ? 'bg-emerald-100' : 'bg-red-100'}`}>
-                      {call.recovered ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" /> : <AlertCircle className="w-3.5 h-3.5 text-red-500" />}
+                    <div className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 ${call.recovered ? 'bg-[var(--emerald-soft)]' : 'bg-[var(--red-soft)]'}`}>
+                      {call.recovered ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-v" /> : <AlertCircle className="w-3.5 h-3.5 text-red-v" />}
                     </div>
-                    {i < missedCallTimeline.length - 1 && <div className="w-px h-4 bg-slate-200" />}
+                    {i < missedCallTimeline.length - 1 && <div className="w-px h-4 bg-[var(--b1)]" />}
                   </div>
                   <div className="flex-1 min-w-0 pb-1">
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex items-center gap-1.5">
-                        <span className="text-[10px] font-bold text-slate-400">{call.time}</span>
-                        <User className="w-3 h-3 text-slate-400" />
-                        <p className="text-xs font-semibold text-slate-900">{call.name}</p>
+                        <span className="text-[10px] font-bold text-t3">{call.time}</span>
+                        <User className="w-3 h-3 text-t3" />
+                        <p className="text-xs font-semibold text-t1">{call.name}</p>
                       </div>
-                      {call.value !== '—' && <span className="text-[10px] font-bold text-emerald-700">{call.value}</span>}
+                      {call.value !== '—' && <span className="text-[10px] font-bold text-emerald-v">{call.value}</span>}
                     </div>
                     <div className="flex items-center gap-1.5 mt-0.5">
-                      <span className={`text-[10px] font-semibold ${call.recovered ? 'text-emerald-600' : 'text-red-500'}`}>{call.method}</span>
-                      <span className="text-slate-300">·</span>
-                      <span className="text-[10px] text-slate-400">{call.outcome}</span>
+                      <span className={`text-[10px] font-semibold ${call.recovered ? 'text-emerald-v' : 'text-red-v'}`}>{call.method}</span>
+                      <span className="text-t3">·</span>
+                      <span className="text-[10px] text-t3">{call.outcome}</span>
                     </div>
                   </div>
                 </div>
               ))}
             </div>
-            <button type="button" className="mt-3 w-full flex items-center justify-center gap-1.5 py-2 rounded-xl border border-dashed border-slate-300 text-xs font-semibold text-slate-500 hover:bg-slate-50 transition-colors">
+            <button type="button" className="mt-3 w-full flex items-center justify-center gap-1.5 py-2 rounded-xl border border-dashed border-[var(--b2)] text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition-colors">
               <ArrowRight className="w-3 h-3" /> View full call log
             </button>
           </BentoCard>
@@ -217,15 +217,15 @@ export default function AIReceptionist() {
             <div className="grid grid-cols-7 gap-1 mb-2 items-end">
               {['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((d, i) => (
                 <div key={i} className="text-center">
-                  <p className="text-[9px] text-slate-400 mb-1">{d}</p>
-                  <div className="h-12 bg-slate-50 rounded-md overflow-hidden flex items-end">
-                    <div className={`w-full bg-blue-500 rounded-sm ${afterHoursHeights[i]}`} />
+                  <p className="text-[9px] text-t3 mb-1">{d}</p>
+                  <div className="h-12 bg-[var(--s3)] rounded-md overflow-hidden flex items-end">
+                    <div className={`w-full bg-indigo rounded-sm ${afterHoursHeights[i]}`} />
                   </div>
-                  <p className="text-[9px] text-slate-500 mt-1">{afterHoursData[i]}</p>
+                  <p className="text-[9px] text-t2 mt-1">{afterHoursData[i]}</p>
                 </div>
               ))}
             </div>
-            <p className="text-xs text-slate-500 text-center">18 bookings captured after-hours · £3,840 revenue</p>
+            <p className="text-xs text-t2 text-center">18 bookings captured after-hours · £3,840 revenue</p>
           </BentoCard>
         </div>
       </div>

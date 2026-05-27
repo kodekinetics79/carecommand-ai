@@ -23,12 +23,12 @@ import Settings from '../pages/Settings';
 export default function App() {
   return (
     <BrowserRouter>
-      <div className="flex min-h-screen bg-slate-50">
+      <div className="app-shell">
         <Sidebar />
-        <div className="flex-1 flex flex-col ml-[280px]">
+        <div className="app-main">
           <Topbar />
-          <main className="flex-1 pt-14">
-            <div className="p-6">
+          <div className="app-scroll">
+            <div className="app-inner">
               <Routes>
                 <Route path="/" element={<Dashboard />} />
                 <Route path="/clinic-radar" element={<ClinicRadar />} />
@@ -50,7 +50,7 @@ export default function App() {
                 <Route path="/settings" element={<Settings />} />
               </Routes>
             </div>
-          </main>
+          </div>
         </div>
       </div>
     </BrowserRouter>

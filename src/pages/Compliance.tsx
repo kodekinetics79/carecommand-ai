@@ -14,12 +14,12 @@ const auditLogs = [
 ];
 
 const logTypeConfig: Record<string, { color: string; bg: string }> = {
-  consent:  { color: 'text-emerald-700', bg: 'bg-emerald-100' },
-  access:   { color: 'text-blue-700',    bg: 'bg-blue-100' },
-  approval: { color: 'text-violet-700',  bg: 'bg-violet-100' },
-  change:   { color: 'text-amber-700',   bg: 'bg-amber-100' },
-  optout:   { color: 'text-red-700',     bg: 'bg-red-100' },
-  export:   { color: 'text-slate-700',   bg: 'bg-slate-100' },
+  consent:  { color: 'text-emerald-v', bg: 'badge badge-emerald' },
+  access:   { color: 'text-blue-v',    bg: 'badge badge-blue' },
+  approval: { color: 'text-violet-v',  bg: 'badge badge-violet' },
+  change:   { color: 'text-amber-v',   bg: 'badge badge-amber' },
+  optout:   { color: 'text-red-v',     bg: 'badge badge-red' },
+  export:   { color: 'text-t2',        bg: 'badge badge-blue' },
 };
 
 const consentChannels = [
@@ -47,7 +47,7 @@ export default function Compliance() {
         badge="All Systems Active"
         badgeColor="blue"
         actions={
-          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 transition shadow-sm">
+          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition shadow-sm">
             <FileText className="w-4 h-4" /> Download Audit Report
           </button>
         }
@@ -68,18 +68,18 @@ export default function Compliance() {
               {consentChannels.map((ch) => (
                 <div key={ch.channel}>
                   <div className="flex items-center justify-between gap-3 mb-1.5">
-                    <p className="text-xs font-semibold text-slate-800">{ch.channel}</p>
+                    <p className="text-xs font-semibold text-t1">{ch.channel}</p>
                     <div className="flex items-center gap-2">
-                      <span className="text-[11px] text-slate-400">{ch.opted} / {ch.total} customers</span>
-                      <span className={`text-xs font-bold ${ch.pct >= 80 ? 'text-emerald-700' : ch.pct >= 60 ? 'text-amber-600' : 'text-red-600'}`}>{ch.pct}%</span>
+                      <span className="text-[11px] text-t3">{ch.opted} / {ch.total} customers</span>
+                      <span className={`text-xs font-bold ${ch.pct >= 80 ? 'text-emerald-v' : ch.pct >= 60 ? 'text-amber-v' : 'text-red-v'}`}>{ch.pct}%</span>
                     </div>
                   </div>
                   <ProgressBar value={ch.pct} color={ch.pct >= 80 ? 'emerald' : ch.pct >= 60 ? 'amber' : 'red'} />
                 </div>
               ))}
             </div>
-            <div className="mt-4 p-3 rounded-xl bg-blue-50 border border-blue-100">
-              <p className="text-[11px] text-blue-700 font-semibold">AI will only send marketing messages to consented customers. Opt-outs are processed immediately and cannot be overridden.</p>
+            <div className="mt-4 p-3 rounded-xl bg-[var(--blue-soft)] border border-[var(--b1)]">
+              <p className="text-[11px] text-blue-v font-semibold">AI will only send marketing messages to consented customers. Opt-outs are processed immediately and cannot be overridden.</p>
             </div>
           </BentoCard>
 
@@ -89,17 +89,17 @@ export default function Compliance() {
               {auditLogs.map((log) => {
                 const lc = logTypeConfig[log.type];
                 return (
-                  <div key={log.id} className="flex items-start gap-3 p-3 rounded-xl border border-slate-100 hover:bg-slate-50 transition-colors">
+                  <div key={log.id} className="flex items-start gap-3 p-3 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors">
                     <div className={`w-2 h-2 rounded-full mt-1.5 shrink-0 ${
                       log.type === 'consent' ? 'bg-emerald-500' :
                       log.type === 'optout' ? 'bg-red-500' :
                       log.type === 'access' ? 'bg-blue-500' : 'bg-slate-400'
                     }`} />
                     <div className="flex-1 min-w-0">
-                      <p className="text-xs font-semibold text-slate-900">{log.event}</p>
-                      <p className="text-[10px] text-slate-400 mt-0.5">{log.date} · {log.user}</p>
+                      <p className="text-xs font-semibold text-t1">{log.event}</p>
+                      <p className="text-[10px] text-t3 mt-0.5">{log.date} · {log.user}</p>
                     </div>
-                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full shrink-0 ${lc.bg} ${lc.color}`}>{log.type}</span>
+                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full shrink-0 ${lc.bg}`}>{log.type}</span>
                   </div>
                 );
               })}
@@ -112,9 +112,9 @@ export default function Compliance() {
           <BentoCard title="AI Guardrails" subtitle="Active compliance policies" headerRight={<Sparkles className="w-4 h-4 text-violet-500" />}>
             <div className="space-y-2.5">
               {guardrails.map((g) => (
-                <div key={g.rule} className="flex items-start gap-2.5 p-3 rounded-xl border border-emerald-100 bg-emerald-50/40">
-                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0 mt-0.5" />
-                  <p className="text-[11px] text-slate-700 font-medium leading-snug">{g.rule}</p>
+                <div key={g.rule} className="flex items-start gap-2.5 p-3 rounded-xl border border-[var(--b1)] bg-[var(--emerald-soft)]">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-v shrink-0 mt-0.5" />
+                  <p className="text-[11px] text-t2 font-medium leading-snug">{g.rule}</p>
                 </div>
               ))}
             </div>
@@ -129,38 +129,38 @@ export default function Compliance() {
                 { label: 'Post-visit review requests', desc: '24h after appointment', enabled: true },
                 { label: 'Winback & reactivation', desc: 'Marketing consent required', enabled: true },
               ].map((item) => (
-                <div key={item.label} className="flex items-start justify-between gap-3 p-3 rounded-xl border border-slate-100 hover:bg-slate-50 transition-colors">
+                <div key={item.label} className="flex items-start justify-between gap-3 p-3 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors">
                   <div>
-                    <p className="text-xs font-semibold text-slate-900">{item.label}</p>
-                    <p className="text-[10px] text-slate-400 mt-0.5">{item.desc}</p>
+                    <p className="text-xs font-semibold text-t1">{item.label}</p>
+                    <p className="text-[10px] text-t3 mt-0.5">{item.desc}</p>
                   </div>
-                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 shrink-0">On</span>
+                  <span className="badge badge-emerald shrink-0">On</span>
                 </div>
               ))}
             </div>
           </BentoCard>
 
           {/* GDPR compliance */}
-          <div className="rounded-2xl border border-slate-200 bg-gradient-to-br from-slate-900 to-slate-800 p-4 text-white">
+          <div className="rounded-2xl border border-[var(--b2)] bg-[var(--s2)] p-4">
             <div className="flex items-center gap-2 mb-2">
-              <Lock className="w-4 h-4 text-slate-400" />
-              <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Data Governance</p>
+              <Lock className="w-4 h-4 text-t3" />
+              <p className="text-[10px] font-bold uppercase tracking-widest text-t3">Data Governance</p>
             </div>
-            <p className="text-sm font-bold text-white mb-1">GDPR Compliant</p>
-            <p className="text-[11px] text-slate-400 mb-3">6-year retention policy · Right to erasure enforced · Data export available on request.</p>
-            <button type="button" className="inline-flex items-center gap-1.5 text-xs font-semibold text-blue-400 hover:text-blue-300 transition-colors">
+            <p className="text-sm font-bold text-t1 mb-1">GDPR Compliant</p>
+            <p className="text-[11px] text-t3 mb-3">6-year retention policy · Right to erasure enforced · Data export available on request.</p>
+            <button type="button" className="inline-flex items-center gap-1.5 text-xs font-semibold text-blue-v hover:text-cyan-v transition-colors">
               View data policy <ArrowRight className="w-3.5 h-3.5" />
             </button>
           </div>
 
           {/* Response SLA */}
-          <div className="rounded-2xl border border-amber-200/60 bg-amber-50 p-4">
+          <div className="rounded-2xl border border-[var(--b1)] bg-[var(--amber-soft)] p-4">
             <div className="flex items-start gap-3">
-              <Clock className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
+              <Clock className="w-4 h-4 text-amber-v shrink-0 mt-0.5" />
               <div>
-                <p className="text-xs font-bold text-amber-700">Data Request SLA</p>
-                <p className="text-[11px] text-amber-600 mt-0.5">1 pending GDPR data export request (Grace Adeyemi). Must be fulfilled within 30 days. 22 days remaining.</p>
-                <button type="button" className="mt-2 inline-flex items-center gap-1 text-xs font-semibold text-amber-700 bg-amber-100 px-3 py-1.5 rounded-lg hover:bg-amber-200 transition-colors">
+                <p className="text-xs font-bold text-amber-v">Data Request SLA</p>
+                <p className="text-[11px] text-amber-v mt-0.5">1 pending GDPR data export request (Grace Adeyemi). Must be fulfilled within 30 days. 22 days remaining.</p>
+                <button type="button" className="mt-2 inline-flex items-center gap-1 text-xs font-semibold text-amber-v bg-[var(--amber-soft)] px-3 py-1.5 rounded-lg hover:bg-[var(--s3)] transition-colors">
                   <ArrowRight className="w-3 h-3" /> Process request
                 </button>
               </div>

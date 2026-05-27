@@ -6,11 +6,11 @@ import { labOrders } from '../data/mockLabs';
 import { branches } from '../data/mockClinics';
 
 const statusConfig: Record<string, { label: string; color: string; bg: string; icon: React.ReactNode }> = {
-  'ordered':         { label: 'Ordered',       color: 'text-blue-700',    bg: 'bg-blue-100',    icon: <Clock className="w-3 h-3" /> },
-  'sample-collected':{ label: 'Collected',      color: 'text-violet-700',  bg: 'bg-violet-100',  icon: <FileText className="w-3 h-3" /> },
-  'pending-result':  { label: 'Pending',        color: 'text-amber-700',   bg: 'bg-amber-100',   icon: <Clock className="w-3 h-3" /> },
-  'result-received': { label: 'Received',       color: 'text-emerald-700', bg: 'bg-emerald-100', icon: <CheckCircle2 className="w-3 h-3" /> },
-  'doctor-reviewed': { label: 'Reviewed',       color: 'text-slate-700',   bg: 'bg-slate-100',   icon: <Archive className="w-3 h-3" /> },
+  'ordered':         { label: 'Ordered',       color: 'text-blue-v',    bg: 'badge badge-blue',    icon: <Clock className="w-3 h-3" /> },
+  'sample-collected':{ label: 'Collected',      color: 'text-violet-v',  bg: 'badge badge-violet',  icon: <FileText className="w-3 h-3" /> },
+  'pending-result':  { label: 'Pending',        color: 'text-amber-v',   bg: 'badge badge-amber',   icon: <Clock className="w-3 h-3" /> },
+  'result-received': { label: 'Received',       color: 'text-emerald-v', bg: 'badge badge-emerald', icon: <CheckCircle2 className="w-3 h-3" /> },
+  'doctor-reviewed': { label: 'Reviewed',       color: 'text-t2',        bg: 'badge badge-blue',    icon: <Archive className="w-3 h-3" /> },
 };
 
 const openCount = labOrders.filter(o => o.status !== 'doctor-reviewed').length;
@@ -33,7 +33,7 @@ export default function Labs() {
         badge={`${urgentCount} Urgent`}
         badgeColor="red"
         actions={
-          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700 transition shadow-md shadow-blue-500/20">
+          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition">
             <Upload className="w-4 h-4" /> Upload Document
           </button>
         }
@@ -55,40 +55,40 @@ export default function Labs() {
               const branch = branches.find(b => b.id === order.branchId);
               const isUrgent = order.urgency === 'urgent';
               return (
-                <div key={order.id} className={`p-4 rounded-2xl border transition-all hover:shadow-sm ${
-                  isUrgent ? 'border-red-200 bg-red-50/40' :
-                  order.status === 'result-received' ? 'border-emerald-200 bg-emerald-50/20' :
-                  'border-slate-200'
+                <div key={order.id} className={`p-4 rounded-2xl border transition-all hover:bg-[var(--s3)] ${
+                  isUrgent ? 'border-[var(--b2)] bg-[var(--red-soft)]' :
+                  order.status === 'result-received' ? 'border-[var(--b1)] bg-[var(--emerald-soft)]' :
+                  'border-[var(--b1)]'
                 }`}>
                   <div className="flex items-start justify-between gap-3 mb-1.5">
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
-                        <p className="text-sm font-bold text-slate-900">{order.testName}</p>
-                        {isUrgent && <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-red-100 text-red-700">Urgent</span>}
+                        <p className="text-sm font-bold text-t1">{order.testName}</p>
+                        {isUrgent && <span className="badge badge-red">Urgent</span>}
                       </div>
-                      <p className="text-[11px] text-slate-500 mt-0.5">{order.patientName} · {branch?.name.split(' ')[0]} · {order.lab}</p>
+                      <p className="text-[11px] text-t3 mt-0.5">{order.patientName} · {branch?.name.split(' ')[0]} · {order.lab}</p>
                     </div>
-                    <span className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full shrink-0 ${sc.bg} ${sc.color}`}>
+                    <span className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full shrink-0 ${sc.bg}`}>
                       {sc.icon}{sc.label}
                     </span>
                   </div>
 
                   {order.resultSummary && (
-                    <div className="mt-2 p-2.5 rounded-xl bg-slate-50 border border-slate-100">
-                      <p className="text-[10px] font-bold text-slate-400 mb-0.5">Internal note</p>
-                      <p className="text-[11px] text-slate-600">{order.resultSummary}</p>
+                    <div className="mt-2 p-2.5 rounded-xl bg-[var(--s3)] border border-[var(--b1)]">
+                      <p className="text-[10px] font-bold text-t3 mb-0.5">Internal note</p>
+                      <p className="text-[11px] text-t2">{order.resultSummary}</p>
                     </div>
                   )}
 
                   <div className="flex items-center justify-between gap-3 mt-2">
-                    <p className="text-[10px] text-slate-400">Provider: {order.doctorName}</p>
+                    <p className="text-[10px] text-t3">Provider: {order.doctorName}</p>
                     <div className="flex items-center gap-2">
                       {order.status === 'result-received' && (
-                        <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-blue-600 bg-blue-50 px-2.5 py-1 rounded-lg hover:bg-blue-100 transition-colors">
+                        <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors">
                           <CheckCircle2 className="w-3 h-3" /> Mark reviewed
                         </button>
                       )}
-                      <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-slate-500 hover:text-slate-700 transition-colors">
+                      <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-t2 hover:text-t1 transition-colors">
                         <ArrowRight className="w-3 h-3" /> View
                       </button>
                     </div>
@@ -105,10 +105,10 @@ export default function Labs() {
           <BentoCard title="AI Action Notes" subtitle="Automated workflow intelligence" headerRight={<Sparkles className="w-4 h-4 text-violet-500" />}>
             <div className="space-y-3">
               {aiNotes.map((note) => (
-                <div key={note.title} className={`p-3.5 rounded-xl border transition-all ${note.urgency === 'high' ? 'border-red-200 bg-red-50/40' : 'border-amber-100 bg-amber-50/30'}`}>
-                  <p className="text-xs font-bold text-slate-900 mb-1 leading-tight">{note.title}</p>
-                  <p className="text-[11px] text-slate-500 mb-2">{note.desc}</p>
-                  <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-blue-600 hover:text-blue-700">
+                <div key={note.title} className={`p-3.5 rounded-xl border transition-all ${note.urgency === 'high' ? 'border-[var(--b2)] bg-[var(--red-soft)]' : 'border-[var(--b1)] bg-[var(--amber-soft)]'}`}>
+                  <p className="text-xs font-bold text-t1 mb-1 leading-tight">{note.title}</p>
+                  <p className="text-[11px] text-t3 mb-2">{note.desc}</p>
+                  <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo hover:text-blue-v">
                     <ArrowRight className="w-3 h-3" /> Take action
                   </button>
                 </div>
@@ -123,11 +123,11 @@ export default function Labs() {
                 const count = labOrders.filter(o => o.status === status).length;
                 const sc = statusConfig[status];
                 return (
-                  <div key={status} className="flex items-center justify-between gap-3 p-2.5 rounded-xl border border-slate-100 hover:bg-slate-50 transition-colors">
+                  <div key={status} className="flex items-center justify-between gap-3 p-2.5 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors">
                     <span className={`inline-flex items-center gap-1.5 text-xs font-semibold ${sc.color}`}>
                       {sc.icon}{sc.label}
                     </span>
-                    <span className="text-sm font-bold text-slate-800">{count}</span>
+                    <span className="text-sm font-bold text-t1">{count}</span>
                   </div>
                 );
               })}
@@ -135,10 +135,10 @@ export default function Labs() {
           </BentoCard>
 
           {/* Upload zone */}
-          <div className="rounded-2xl border-2 border-dashed border-slate-200 p-5 text-center hover:border-blue-300 transition-colors cursor-pointer">
-            <Upload className="w-6 h-6 text-slate-400 mx-auto mb-2" />
-            <p className="text-xs font-semibold text-slate-700 mb-1">Upload partner report</p>
-            <p className="text-[11px] text-slate-400">PDF, DOCX, or image · Max 20MB</p>
+          <div className="rounded-2xl border-2 border-dashed border-[var(--b2)] p-5 text-center hover:border-[var(--b3)] transition-colors cursor-pointer">
+            <Upload className="w-6 h-6 text-t3 mx-auto mb-2" />
+            <p className="text-xs font-semibold text-t2 mb-1">Upload partner report</p>
+            <p className="text-[11px] text-t3">PDF, DOCX, or image · Max 20MB</p>
           </div>
         </div>
       </div>

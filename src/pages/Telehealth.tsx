@@ -17,8 +17,8 @@ const conversionOpportunities = [
 ];
 
 const statusColors: Record<string, { dot: string; text: string; bg: string }> = {
-  Confirmed: { dot: 'bg-emerald-500', text: 'text-emerald-700', bg: 'bg-emerald-100' },
-  Pending:   { dot: 'bg-amber-400',   text: 'text-amber-700',   bg: 'bg-amber-100' },
+  Confirmed: { dot: 'bg-emerald-500', text: 'text-emerald-v', bg: 'badge badge-emerald' },
+  Pending:   { dot: 'bg-amber-400',   text: 'text-amber-v',   bg: 'badge badge-amber' },
 };
 
 export default function Telehealth() {
@@ -34,7 +34,7 @@ export default function Telehealth() {
         badge={`${sessions.length} Today`}
         badgeColor="blue"
         actions={
-          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700 transition shadow-md shadow-blue-500/20">
+          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition">
             <Video className="w-4 h-4" /> Launch Video Room
           </button>
         }
@@ -54,8 +54,8 @@ export default function Telehealth() {
             {sessions.map((session) => {
               const sc = statusColors[session.status];
               return (
-                <div key={session.id} className={`p-4 rounded-2xl border transition-all hover:shadow-sm ${
-                  session.status === 'Confirmed' ? 'border-emerald-200 bg-emerald-50/20' : 'border-amber-200 bg-amber-50/20'
+                <div key={session.id} className={`p-4 rounded-2xl border transition-all hover:bg-[var(--s3)] ${
+                  session.status === 'Confirmed' ? 'border-[var(--b1)] bg-[var(--emerald-soft)]' : 'border-[var(--b1)] bg-[var(--amber-soft)]'
                 }`}>
                   <div className="flex items-start justify-between gap-3">
                     <div className="flex items-center gap-3">
@@ -63,37 +63,37 @@ export default function Telehealth() {
                         {session.initials}
                       </div>
                       <div>
-                        <p className="text-sm font-bold text-slate-900">{session.patient}</p>
-                        <p className="text-[11px] text-slate-500">{session.service}</p>
+                        <p className="text-sm font-bold text-t1">{session.patient}</p>
+                        <p className="text-[11px] text-t3">{session.service}</p>
                         <div className="flex items-center gap-2 mt-1">
-                          <Clock className="w-3 h-3 text-slate-400" />
-                          <span className="text-[11px] text-slate-500">{session.time} · {session.provider}</span>
+                          <Clock className="w-3 h-3 text-t3" />
+                          <span className="text-[11px] text-t3">{session.time} · {session.provider}</span>
                         </div>
                       </div>
                     </div>
                     <div className="flex flex-col items-end gap-2 shrink-0">
-                      <span className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full ${sc.bg} ${sc.text}`}>
+                      <span className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full ${sc.bg}`}>
                         <span className={`w-1.5 h-1.5 rounded-full ${sc.dot}`} />
                         {session.status}
                       </span>
-                      <span className="text-xs font-bold text-slate-700">£{session.value}</span>
+                      <span className="text-xs font-bold text-t2">£{session.value}</span>
                     </div>
                   </div>
 
                   <div className="mt-3 flex items-center justify-between">
                     <div className="flex items-center gap-2">
                       {session.intakeComplete
-                        ? <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-700"><CheckCircle2 className="w-3 h-3" /> Intake complete</span>
-                        : <span className="flex items-center gap-1 text-[10px] font-semibold text-amber-600"><Clock className="w-3 h-3" /> Intake pending</span>
+                        ? <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-v"><CheckCircle2 className="w-3 h-3" /> Intake complete</span>
+                        : <span className="flex items-center gap-1 text-[10px] font-semibold text-amber-v"><Clock className="w-3 h-3" /> Intake pending</span>
                       }
                     </div>
                     <div className="flex items-center gap-2">
                       {!session.intakeComplete && (
-                        <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-amber-700 bg-amber-50 px-2 py-1 rounded-lg hover:bg-amber-100 transition-colors">
+                        <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-amber-v bg-[var(--amber-soft)] px-2 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors">
                           <Zap className="w-3 h-3" /> Send intake
                         </button>
                       )}
-                      <button type="button" className="inline-flex items-center gap-1.5 text-[10px] font-semibold text-white bg-blue-600 px-2.5 py-1 rounded-lg hover:bg-blue-700 transition-colors">
+                      <button type="button" className="inline-flex items-center gap-1.5 text-[10px] font-semibold text-white bg-[var(--indigo)] px-2.5 py-1 rounded-lg hover:bg-[var(--indigo-mid)] transition-colors">
                         <Video className="w-3 h-3" /> Start
                       </button>
                     </div>
@@ -109,13 +109,13 @@ export default function Telehealth() {
           <BentoCard title="Convert to In-Person" subtitle="Upsell & booking opportunities" headerRight={<Sparkles className="w-4 h-4 text-violet-500" />}>
             <div className="space-y-3">
               {conversionOpportunities.map((opp) => (
-                <div key={opp.patient} className="p-3.5 rounded-xl border border-violet-100 bg-violet-50/40 hover:border-violet-200 transition-all">
+                <div key={opp.patient} className="p-3.5 rounded-xl border border-[var(--b1)] bg-[var(--violet-soft)] hover:border-[var(--b2)] transition-all">
                   <div className="flex items-start justify-between gap-2 mb-1.5">
-                    <p className="text-xs font-bold text-slate-900">{opp.patient}</p>
-                    <span className="text-xs font-bold text-violet-700 shrink-0">+£{opp.value}</span>
+                    <p className="text-xs font-bold text-t1">{opp.patient}</p>
+                    <span className="text-xs font-bold text-violet-v shrink-0">+£{opp.value}</span>
                   </div>
-                  <p className="text-[11px] text-slate-500 mb-2">{opp.suggestion}</p>
-                  <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-blue-600 hover:text-blue-700">
+                  <p className="text-[11px] text-t3 mb-2">{opp.suggestion}</p>
+                  <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo hover:text-blue-v">
                     <CalendarDays className="w-3 h-3" /> Book in-person slot
                   </button>
                 </div>
@@ -131,11 +131,11 @@ export default function Telehealth() {
                 { step: 2, title: 'Video waiting room', desc: 'Manage queue, start on time, and take session notes.', color: 'bg-violet-500' },
                 { step: 3, title: 'Post-visit follow-up', desc: 'Trigger reminders, in-person bookings and review requests.', color: 'bg-emerald-500' },
               ].map((item) => (
-                <div key={item.step} className="flex items-start gap-3 p-3 rounded-xl border border-slate-100 hover:bg-slate-50 transition-colors">
+                <div key={item.step} className="flex items-start gap-3 p-3 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors">
                   <div className={`w-6 h-6 rounded-full ${item.color} flex items-center justify-center text-white text-[10px] font-bold shrink-0`}>{item.step}</div>
                   <div>
-                    <p className="text-xs font-bold text-slate-900">{item.title}</p>
-                    <p className="text-[11px] text-slate-500 mt-0.5">{item.desc}</p>
+                    <p className="text-xs font-bold text-t1">{item.title}</p>
+                    <p className="text-[11px] text-t3 mt-0.5">{item.desc}</p>
                   </div>
                 </div>
               ))}
@@ -143,14 +143,14 @@ export default function Telehealth() {
           </BentoCard>
 
           {/* Post-visit follow-ups */}
-          <div className="rounded-2xl bg-gradient-to-br from-blue-600 to-violet-600 p-4 text-white shadow-lg shadow-blue-500/20">
+          <div className="rounded-2xl bg-[var(--s2)] border border-[var(--b1)] p-4">
             <div className="flex items-center gap-2 mb-2">
-              <Phone className="w-4 h-4 text-blue-200" />
-              <p className="text-[10px] font-bold uppercase tracking-widest text-blue-200">Post-Visit Automation</p>
+              <Phone className="w-4 h-4 text-t3" />
+              <p className="text-[10px] font-bold uppercase tracking-widest text-t3">Post-Visit Automation</p>
             </div>
-            <p className="text-2xl font-bold mb-1">6 follow-ups</p>
-            <p className="text-xs text-blue-200 mb-3">Triggered automatically after virtual sessions this month.</p>
-            <button type="button" className="w-full py-2 rounded-xl bg-white/20 hover:bg-white/30 text-white text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
+            <p className="text-2xl font-bold text-t1 mb-1">6 follow-ups</p>
+            <p className="text-xs text-t3 mb-3">Triggered automatically after virtual sessions this month.</p>
+            <button type="button" className="w-full py-2 rounded-xl bg-[var(--s3)] hover:bg-[var(--indigo-soft)] text-t2 hover:text-indigo text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
               <ArrowRight className="w-3.5 h-3.5" /> View follow-up queue
             </button>
           </div>

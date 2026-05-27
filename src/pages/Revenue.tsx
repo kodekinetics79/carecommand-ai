@@ -38,10 +38,10 @@ export default function Revenue() {
         subtitle="CFO-level revenue intelligence — recovery, attribution, branch comparison, and lost opportunity tracking."
         actions={
           <div className="flex gap-2">
-            <button type="button" className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 transition shadow-sm">
+            <button type="button" className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
               <BarChart3 className="w-4 h-4" /> Export Report
             </button>
-            <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700 transition shadow-md shadow-blue-500/20">
+            <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
               <Zap className="w-4 h-4" /> Recover Lost Revenue
             </button>
           </div>
@@ -61,7 +61,7 @@ export default function Revenue() {
       {/* Charts row */}
       <div className="grid gap-4 lg:grid-cols-[1.4fr_0.6fr]">
         <BentoCard title="Revenue Performance" subtitle="6-month recovery & growth trend" headerRight={
-          <span className="text-xs font-semibold text-violet-700 bg-violet-50 border border-violet-200 px-2.5 py-1 rounded-full">+18% campaign revenue</span>
+          <span className="badge badge-violet">+18% campaign revenue</span>
         }>
           <RevenueChart />
         </BentoCard>
@@ -74,8 +74,8 @@ export default function Revenue() {
               return (
                 <div key={w.label}>
                   <div className="flex items-center justify-between gap-2 mb-1">
-                    <p className="text-xs font-medium text-slate-600">{w.label}</p>
-                    <p className={`text-xs font-bold ${w.positive ? 'text-slate-900' : 'text-red-600'}`}>
+                    <p className="text-xs font-medium text-t2">{w.label}</p>
+                    <p className={`text-xs font-bold ${w.positive ? 'text-t1' : 'text-red-v'}`}>
                       {w.positive ? '' : '−'}{formatCurrency(Math.abs(w.value))}
                     </p>
                   </div>
@@ -90,7 +90,7 @@ export default function Revenue() {
       {/* Branch comparison + Service breakdown */}
       <div className="grid gap-4 lg:grid-cols-[1.2fr_0.8fr]">
         <BentoCard title="Branch Revenue Comparison" subtitle="vs target this month" headerRight={
-          <span className="text-xs font-semibold text-slate-500">{formatCurrency(branchRevenue.reduce((s, b) => s + b.revenue, 0))} total</span>
+          <span className="text-xs font-semibold text-t3">{formatCurrency(branchRevenue.reduce((s, b) => s + b.revenue, 0))} total</span>
         }>
           <BranchComparisonChart />
           <div className="mt-4 space-y-3">
@@ -101,14 +101,14 @@ export default function Revenue() {
                 <div key={b.name}>
                   <div className="flex items-center justify-between gap-2 mb-1">
                     <div className="flex items-center gap-2">
-                      <p className="text-xs font-semibold text-slate-800">{b.name}</p>
-                      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${growth >= 0 ? 'text-emerald-700 bg-emerald-50' : 'text-red-600 bg-red-50'}`}>
+                      <p className="text-xs font-semibold text-t1">{b.name}</p>
+                      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${growth >= 0 ? 'text-emerald-v bg-[var(--emerald-soft)]' : 'text-red-v bg-[var(--red-soft)]'}`}>
                         {growth >= 0 ? '+' : ''}{growth}%
                       </span>
                     </div>
                     <div className="text-right">
-                      <span className="text-xs font-bold text-slate-900">{formatCurrency(b.revenue)}</span>
-                      <span className="text-[10px] text-slate-400 ml-1">/ {formatCurrency(b.target)} target</span>
+                      <span className="text-xs font-bold text-t1">{formatCurrency(b.revenue)}</span>
+                      <span className="text-[10px] text-t3 ml-1">/ {formatCurrency(b.target)} target</span>
                     </div>
                   </div>
                   <ProgressBar value={b.revenue} max={b.target} color={pct >= 90 ? 'emerald' : pct >= 70 ? 'amber' : 'red'} />
@@ -125,10 +125,10 @@ export default function Revenue() {
               {serviceRevenue.map((s) => (
                 <div key={s.service}>
                   <div className="flex items-center justify-between gap-2 mb-1">
-                    <p className="text-xs font-semibold text-slate-700 truncate">{s.service}</p>
+                    <p className="text-xs font-semibold text-t1 truncate">{s.service}</p>
                     <div className="flex items-center gap-2 shrink-0">
-                      <span className="text-[10px] text-slate-400">{s.percent}%</span>
-                      <span className="text-xs font-bold text-slate-900">{formatCurrency(s.revenue)}</span>
+                      <span className="text-[10px] text-t3">{s.percent}%</span>
+                      <span className="text-xs font-bold text-t1">{formatCurrency(s.revenue)}</span>
                     </div>
                   </div>
                   <ProgressBar value={s.percent} />
@@ -139,18 +139,18 @@ export default function Revenue() {
 
           {/* Lost opportunity tracker */}
           <BentoCard title="Lost Opportunity Tracker" subtitle="Recoverable revenue" headerRight={
-            <span className="text-xs font-bold text-red-600 bg-red-50 px-2 py-1 rounded-full border border-red-200">
+            <span className="badge badge-red">
               {formatCurrency(lostOpportunities.reduce((s, o) => s + o.value, 0))} at risk
             </span>
           }>
             <div className="space-y-2.5">
               {lostOpportunities.map((opp) => (
-                <div key={opp.label} className="flex items-center justify-between gap-3 p-3 rounded-xl border border-slate-200 hover:border-red-200 hover:bg-red-50/30 transition-all">
+                <div key={opp.label} className="flex items-center justify-between gap-3 p-3 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all">
                   <div className="flex-1 min-w-0">
-                    <p className="text-xs font-semibold text-slate-800">{opp.label}</p>
-                    <p className="text-xs font-bold text-red-600">{formatCurrency(opp.value)}</p>
+                    <p className="text-xs font-semibold text-t1">{opp.label}</p>
+                    <p className="text-xs font-bold text-red-v">{formatCurrency(opp.value)}</p>
                   </div>
-                  <button type="button" className="shrink-0 inline-flex items-center gap-1 text-[10px] font-semibold text-blue-600 bg-blue-50 px-2.5 py-1.5 rounded-lg hover:bg-blue-100 transition-colors">
+                  <button type="button" className="shrink-0 inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1.5 rounded-lg hover:opacity-80 transition-colors">
                     <Zap className="w-3 h-3" />
                     {opp.action}
                   </button>
@@ -166,21 +166,21 @@ export default function Revenue() {
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
-              <tr className="border-b border-slate-100">
+              <tr className="border-b border-[var(--b1)]">
                 {['Month', 'Revenue', 'Recovered', 'Campaign', 'Lost', 'Net'].map(h => (
-                  <th key={h} className="text-left py-2 px-3 text-[10px] font-bold uppercase tracking-widest text-slate-400">{h}</th>
+                  <th key={h} className="text-left py-2 px-3 text-[10px] font-bold uppercase tracking-widest text-t3">{h}</th>
                 ))}
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-50">
+            <tbody className="divide-y divide-[var(--b0)]">
               {revenueData.map((row) => (
-                <tr key={row.month} className="hover:bg-slate-50 transition-colors">
-                  <td className="py-2.5 px-3 text-xs font-semibold text-slate-700">{row.month}</td>
-                  <td className="py-2.5 px-3 text-xs font-bold text-slate-900">{formatCurrency(row.revenue)}</td>
-                  <td className="py-2.5 px-3 text-xs font-semibold text-emerald-700">+{formatCurrency(row.recovered)}</td>
-                  <td className="py-2.5 px-3 text-xs font-semibold text-violet-700">+{formatCurrency(row.campaigns)}</td>
-                  <td className="py-2.5 px-3 text-xs font-semibold text-red-600">−{formatCurrency(row.lost)}</td>
-                  <td className="py-2.5 px-3 text-xs font-bold text-slate-900">{formatCurrency(row.revenue + row.campaigns + row.recovered - row.lost)}</td>
+                <tr key={row.month} className="hover:bg-[var(--s3)] transition-colors">
+                  <td className="py-2.5 px-3 text-xs font-semibold text-t2">{row.month}</td>
+                  <td className="py-2.5 px-3 text-xs font-bold text-t1">{formatCurrency(row.revenue)}</td>
+                  <td className="py-2.5 px-3 text-xs font-semibold text-emerald-v">+{formatCurrency(row.recovered)}</td>
+                  <td className="py-2.5 px-3 text-xs font-semibold text-violet-v">+{formatCurrency(row.campaigns)}</td>
+                  <td className="py-2.5 px-3 text-xs font-semibold text-red-v">−{formatCurrency(row.lost)}</td>
+                  <td className="py-2.5 px-3 text-xs font-bold text-t1">{formatCurrency(row.revenue + row.campaigns + row.recovered - row.lost)}</td>
                 </tr>
               ))}
             </tbody>
@@ -189,19 +189,19 @@ export default function Revenue() {
       </BentoCard>
 
       {/* AI Revenue Summary */}
-      <div className="rounded-2xl border border-blue-200/40 bg-gradient-to-r from-slate-900 to-blue-950 p-5">
+      <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-5">
         <div className="flex items-start gap-4">
-          <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500 to-violet-600 flex items-center justify-center shrink-0">
-            <TrendingUp className="w-5 h-5 text-white" />
+          <div className="w-9 h-9 rounded-xl bg-[var(--indigo-soft)] flex items-center justify-center shrink-0">
+            <TrendingUp className="w-5 h-5 text-indigo" />
           </div>
           <div className="flex-1">
-            <p className="text-xs font-bold uppercase tracking-widest text-blue-400 mb-1">AI Revenue Insight</p>
-            <p className="text-white font-semibold leading-relaxed mb-3">
+            <p className="text-xs font-bold uppercase tracking-widest text-blue-v mb-1">AI Revenue Insight</p>
+            <p className="text-t1 font-semibold leading-relaxed mb-3">
               Your network recovered £27,200 through automation this month — up 12% vs last month.
               The biggest untapped opportunity is £18,700 from inactive customers who haven't been contacted.
               Running a winback campaign today could convert 34 bookings within 14 days.
             </p>
-            <button type="button" className="inline-flex items-center gap-1.5 text-sm font-semibold text-blue-400 hover:text-blue-300 transition-colors">
+            <button type="button" className="inline-flex items-center gap-1.5 text-sm font-semibold text-indigo hover:opacity-80 transition-colors">
               Launch winback campaign <ArrowRight className="w-4 h-4" />
             </button>
           </div>

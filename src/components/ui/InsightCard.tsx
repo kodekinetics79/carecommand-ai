@@ -14,10 +14,10 @@ interface InsightCardProps {
 }
 
 const variants = {
-  default: { border: 'border-slate-200', bg: 'bg-white', accent: 'bg-blue-600', badge: 'bg-slate-100 text-slate-600' },
-  opportunity: { border: 'border-emerald-200/60', bg: 'bg-gradient-to-br from-emerald-50/80 to-white', accent: 'bg-emerald-600', badge: 'bg-emerald-100 text-emerald-700' },
-  risk: { border: 'border-red-200/60', bg: 'bg-gradient-to-br from-red-50/60 to-white', accent: 'bg-red-500', badge: 'bg-red-100 text-red-700' },
-  info: { border: 'border-blue-200/60', bg: 'bg-gradient-to-br from-blue-50/60 to-white', accent: 'bg-blue-600', badge: 'bg-blue-100 text-blue-700' },
+  default:     { border: 'border-[var(--b1)]',                     bg: 'bg-[var(--s2)]',                         accent: 'bg-[var(--indigo)]',   badge: 'badge badge-blue' },
+  opportunity: { border: 'border-[rgba(52,211,153,0.2)]',           bg: 'bg-[rgba(52,211,153,0.04)]',             accent: 'bg-[var(--emerald)]',  badge: 'badge badge-emerald' },
+  risk:        { border: 'border-[rgba(248,113,113,0.2)]',          bg: 'bg-[rgba(248,113,113,0.04)]',            accent: 'bg-[var(--red)]',      badge: 'badge badge-red' },
+  info:        { border: 'border-[rgba(96,165,250,0.2)]',           bg: 'bg-[rgba(96,165,250,0.04)]',             accent: 'bg-[var(--indigo)]',   badge: 'badge badge-blue' },
 };
 
 export default function InsightCard({
@@ -34,28 +34,28 @@ export default function InsightCard({
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-start justify-between gap-2 mb-1">
-            <p className="text-sm font-semibold text-slate-900 leading-tight">{title}</p>
+            <p className="text-sm font-semibold text-t1 leading-tight">{title}</p>
             {impact && (
               <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full shrink-0 ${v.badge}`}>{impact}</span>
             )}
           </div>
-          <p className="text-xs text-slate-500 leading-relaxed mb-3">{description}</p>
+          <p className="text-xs text-t3 leading-relaxed mb-3">{description}</p>
           <div className="flex items-center justify-between gap-3">
             {confidence !== undefined && (
               <div className="flex items-center gap-2">
-                <span className="text-[10px] font-medium text-slate-400 uppercase tracking-wide">AI confidence</span>
+                <span className="text-[10px] font-medium text-t3 uppercase tracking-wide">AI confidence</span>
                 <div className="flex gap-0.5">
                   {[...Array(5)].map((_, i) => (
-                    <div key={i} className={`w-5 h-1.5 rounded-full ${i < Math.round(confidence / 20) ? 'bg-blue-500' : 'bg-slate-200'}`} />
+                    <div key={i} className={`w-5 h-1.5 rounded-full ${i < Math.round(confidence / 20) ? 'bg-[var(--indigo)]' : 'bg-[var(--b1)]'}`} />
                   ))}
                 </div>
-                <span className="text-[10px] font-semibold text-slate-500">{confidence}%</span>
+                <span className="text-[10px] font-semibold text-t3">{confidence}%</span>
               </div>
             )}
             {action && (
               <button
                 onClick={onAction}
-                className="ml-auto inline-flex items-center gap-1.5 text-xs font-semibold text-blue-600 hover:text-blue-700 transition-colors"
+                className="ml-auto inline-flex items-center gap-1.5 text-xs font-semibold text-indigo hover:opacity-75 transition-opacity"
               >
                 {action}
                 <ArrowRight className="w-3 h-3" />

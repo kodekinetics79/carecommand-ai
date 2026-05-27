@@ -6,11 +6,11 @@ import ProgressBar from '../components/ui/ProgressBar';
 import { inventoryItems } from '../data/mockInventory';
 import { branches } from '../data/mockClinics';
 
-const statusConfig: Record<string, { label: string; color: string; bg: string; border: string }> = {
-  ok:       { label: 'In Stock',  color: 'text-emerald-700', bg: 'bg-emerald-100', border: 'border-emerald-200' },
-  low:      { label: 'Low Stock', color: 'text-amber-700',   bg: 'bg-amber-100',   border: 'border-amber-200' },
-  critical: { label: 'Critical',  color: 'text-red-700',     bg: 'bg-red-100',     border: 'border-red-200' },
-  expiring: { label: 'Expiring',  color: 'text-orange-700',  bg: 'bg-orange-100',  border: 'border-orange-200' },
+const statusConfig: Record<string, { label: string; badge: string; border: string; bg: string }> = {
+  ok:       { label: 'In Stock',  badge: 'badge badge-emerald', border: 'border-[var(--b1)]',        bg: 'bg-[var(--s2)]' },
+  low:      { label: 'Low Stock', badge: 'badge badge-amber',   border: 'border-[var(--b1)]',        bg: 'bg-[var(--amber-soft)]' },
+  critical: { label: 'Critical',  badge: 'badge badge-red',     border: 'border-[var(--b1)]',        bg: 'bg-[var(--red-soft)]' },
+  expiring: { label: 'Expiring',  badge: 'badge badge-amber',   border: 'border-[var(--b1)]',        bg: 'bg-[var(--amber-soft)]' },
 };
 
 const criticalCount = inventoryItems.filter(i => i.status === 'critical' || i.status === 'low').length;
@@ -32,7 +32,7 @@ export default function Inventory() {
         badge={`${criticalCount + expiringCount} Alerts`}
         badgeColor="red"
         actions={
-          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700 transition shadow-md shadow-blue-500/20">
+          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
             <Zap className="w-4 h-4" /> Place All Reorders
           </button>
         }
@@ -55,23 +55,18 @@ export default function Inventory() {
               const stockPct = Math.min(100, Math.round((item.currentStock / (item.reorderLevel * 2)) * 100));
               const weeksLeft = Math.round(item.currentStock / Math.max(item.usagePerWeek, 0.1));
               return (
-                <div key={item.id} className={`p-4 rounded-2xl border transition-all hover:shadow-sm ${
-                  item.status === 'critical' ? 'border-red-200 bg-red-50/40' :
-                  item.status === 'expiring' ? 'border-orange-200 bg-orange-50/30' :
-                  item.status === 'low' ? 'border-amber-200 bg-amber-50/20' :
-                  'border-slate-200'
-                }`}>
+                <div key={item.id} className={`p-4 rounded-2xl border transition-all ${sc.border} ${sc.bg}`}>
                   <div className="flex items-start justify-between gap-3 mb-2">
                     <div>
                       <div className="flex items-center gap-2">
-                        <p className="text-sm font-bold text-slate-900">{item.name}</p>
-                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${sc.bg} ${sc.color}`}>{sc.label}</span>
+                        <p className="text-sm font-bold text-t1">{item.name}</p>
+                        <span className={sc.badge}>{sc.label}</span>
                       </div>
-                      <p className="text-[11px] text-slate-500 mt-0.5">{item.category} · {branch?.name.split(' ')[0]} · Supplier: {item.supplier}</p>
+                      <p className="text-[11px] text-t3 mt-0.5">{item.category} · {branch?.name.split(' ')[0]} · Supplier: {item.supplier}</p>
                     </div>
                     <div className="text-right shrink-0">
-                      <p className="text-sm font-bold text-slate-900">{item.currentStock} {item.unit}</p>
-                      <p className="text-[10px] text-slate-400">Reorder at {item.reorderLevel}</p>
+                      <p className="text-sm font-bold text-t1">{item.currentStock} {item.unit}</p>
+                      <p className="text-[10px] text-t3">Reorder at {item.reorderLevel}</p>
                     </div>
                   </div>
 
@@ -80,13 +75,13 @@ export default function Inventory() {
                   </div>
 
                   <div className="flex items-center justify-between gap-3">
-                    <div className="flex items-center gap-3 text-[11px] text-slate-400">
+                    <div className="flex items-center gap-3 text-[11px] text-t3">
                       <span>~{weeksLeft}w left</span>
-                      {item.expiryDate && <span className={`font-semibold ${new Date(item.expiryDate) < new Date('2025-07-01') ? 'text-orange-600' : 'text-slate-400'}`}>Exp: {item.expiryDate}</span>}
+                      {item.expiryDate && <span className={`font-semibold ${new Date(item.expiryDate) < new Date('2025-07-01') ? 'text-amber-v' : 'text-t3'}`}>Exp: {item.expiryDate}</span>}
                       <span>£{item.unitCost}/unit</span>
                     </div>
                     {(item.status === 'critical' || item.status === 'low') && (
-                      <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-blue-600 bg-blue-50 px-2.5 py-1 rounded-lg hover:bg-blue-100 transition-colors">
+                      <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors">
                         <Zap className="w-3 h-3" /> Reorder now
                       </button>
                     )}
@@ -102,13 +97,13 @@ export default function Inventory() {
           <BentoCard title="AI Supply Recommendations" subtitle="Automated intelligence" headerRight={<Sparkles className="w-4 h-4 text-violet-500" />}>
             <div className="space-y-3">
               {aiRecommendations.map((rec) => (
-                <div key={rec.title} className="p-3.5 rounded-xl border border-slate-200 hover:border-blue-200 hover:shadow-sm transition-all">
+                <div key={rec.title} className="p-3.5 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all">
                   <div className="flex items-start justify-between gap-2 mb-1.5">
-                    <p className="text-xs font-bold text-slate-900 leading-tight">{rec.title}</p>
-                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full shrink-0 ${rec.urgency === 'Critical' ? 'bg-red-100 text-red-700' : 'bg-orange-100 text-orange-700'}`}>{rec.urgency}</span>
+                    <p className="text-xs font-bold text-t1 leading-tight">{rec.title}</p>
+                    <span className={`badge shrink-0 ${rec.urgency === 'Critical' ? 'badge-red' : 'badge-amber'}`}>{rec.urgency}</span>
                   </div>
-                  <p className="text-[11px] text-slate-500 mb-2">{rec.desc}</p>
-                  <button type="button" className="inline-flex items-center gap-1 text-xs font-semibold text-blue-600 hover:text-blue-700">
+                  <p className="text-[11px] text-t3 mb-2">{rec.desc}</p>
+                  <button type="button" className="inline-flex items-center gap-1 text-xs font-semibold text-indigo hover:opacity-80">
                     <ArrowRight className="w-3 h-3" /> {rec.action}
                   </button>
                 </div>
@@ -123,14 +118,14 @@ export default function Inventory() {
                 const catValue = catItems.reduce((s, i) => s + i.currentStock * i.unitCost, 0);
                 const hasIssue = catItems.some(i => i.status !== 'ok');
                 return (
-                  <div key={cat} className="flex items-center justify-between gap-3 p-2.5 rounded-xl border border-slate-100 hover:bg-slate-50 transition-colors">
+                  <div key={cat} className="flex items-center justify-between gap-3 p-2.5 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors">
                     <div className="flex items-center gap-2">
-                      {hasIssue && <AlertCircle className="w-3 h-3 text-amber-500 shrink-0" />}
-                      <p className="text-xs font-semibold text-slate-800">{cat}</p>
+                      {hasIssue && <AlertCircle className="w-3 h-3 text-amber-v shrink-0" />}
+                      <p className="text-xs font-semibold text-t1">{cat}</p>
                     </div>
                     <div className="flex items-center gap-2">
-                      <span className="text-[10px] text-slate-400">{catItems.length} items</span>
-                      <span className="text-xs font-bold text-slate-700">£{catValue.toLocaleString()}</span>
+                      <span className="text-[10px] text-t3">{catItems.length} items</span>
+                      <span className="text-xs font-bold text-t2">£{catValue.toLocaleString()}</span>
                     </div>
                   </div>
                 );
