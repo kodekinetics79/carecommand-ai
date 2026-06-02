@@ -2,9 +2,11 @@ import { Cloud, CreditCard, Globe2, Mail, MessageCircle, MessagesSquare, Monitor
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
+import { useState } from 'react';
 import { integrations } from '../data/mockIntegrations';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapIntegration, type ApiIntegration } from '../lib/apiAdapters';
+import { apiRequest } from '../lib/api';
 
 const iconMap: Record<string, React.ElementType> = {
   MessagesSquare,
@@ -41,7 +43,19 @@ const suggestedIntegrations = [
 ];
 
 export default function Integrations() {
-  const { data: integrationRecords, source } = useApiResource<ApiIntegration, typeof integrations[number]>('/v1/integrations', integrations, mapIntegration);
+  const { data: integrationRecords, source, reload } = useApiResource<ApiIntegration, typeof integrations[number]>('/v1/integrations', integrations, mapIntegration);
+  const [pendingId, setPendingId] = useState<string | null>(null);
+
+  async function setStatus(id: string, status: 'CONNECTED' | 'DISCONNECTED') {
+    setPendingId(id);
+    try {
+      await apiRequest(`/v1/integrations/${id}`, { method: 'PATCH', body: JSON.stringify({ status }) });
+      reload();
+    } finally {
+      setPendingId(null);
+    }
+  }
+
   const connectedCount = integrationRecords.filter(integration => integration.status === 'connected').length;
   const disconnectedCount = integrationRecords.filter(integration => integration.status === 'disconnected').length;
 
@@ -104,9 +118,14 @@ export default function Integrations() {
                       ? <span className="text-[10px] text-t3">Last sync: {integration.lastSync}</span>
                       : <span className="text-[10px] text-t3">Not synced</span>
                     }
-                    {integration.status === 'disconnected'
-                      ? <button type="button" className="text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors">Connect</button>
-                      : <button type="button" className="text-[10px] font-semibold text-t2 hover:text-t1 transition-colors flex items-center gap-0.5"><RefreshCw className="w-3 h-3" /> Sync</button>
+                    {integration.status === 'disconnected' || integration.status === 'error'
+                      ? <button type="button" disabled={pendingId === integration.id} onClick={() => setStatus(integration.id, 'CONNECTED')} className="text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors disabled:opacity-40">{pendingId === integration.id ? 'Connecting…' : 'Connect'}</button>
+                      : integration.status === 'connected'
+                      ? <div className="flex items-center gap-2">
+                          <button type="button" disabled={pendingId === integration.id} onClick={() => setStatus(integration.id, 'CONNECTED')} className="text-[10px] font-semibold text-t2 hover:text-t1 transition-colors flex items-center gap-0.5 disabled:opacity-40"><RefreshCw className="w-3 h-3" /> {pendingId === integration.id ? 'Syncing…' : 'Sync'}</button>
+                          <button type="button" disabled={pendingId === integration.id} onClick={() => setStatus(integration.id, 'DISCONNECTED')} className="text-[10px] font-semibold text-t3 hover:text-red-v transition-colors disabled:opacity-40">Disconnect</button>
+                        </div>
+                      : null
                     }
                   </div>
                 </div>

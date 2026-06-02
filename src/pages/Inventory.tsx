@@ -5,8 +5,10 @@ import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
 import { inventoryItems } from '../data/mockInventory';
 import { branches } from '../data/mockClinics';
+import { useState } from 'react';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapInventoryItem, type ApiInventoryItem } from '../lib/apiAdapters';
+import { apiRequest } from '../lib/api';
 
 const statusConfig: Record<string, { label: string; badge: string; border: string; bg: string }> = {
   ok:       { label: 'In Stock',  badge: 'badge badge-emerald', border: 'border-[var(--b1)]',        bg: 'bg-[var(--s2)]' },
@@ -22,7 +24,20 @@ const aiRecommendations = [
 ];
 
 export default function Inventory() {
-  const { data: stockItems, source } = useApiResource<ApiInventoryItem, typeof inventoryItems[number]>('/v1/inventory?limit=100', inventoryItems, mapInventoryItem);
+  const { data: stockItems, source, reload } = useApiResource<ApiInventoryItem, typeof inventoryItems[number]>('/v1/inventory?limit=100', inventoryItems, mapInventoryItem);
+  const [reorderingId, setReorderingId] = useState<string | null>(null);
+
+  async function reorder(id: string, reorderLevel: number) {
+    setReorderingId(id);
+    try {
+      // Restock to roughly two reorder cycles' worth of stock.
+      await apiRequest(`/v1/inventory/${id}`, { method: 'PATCH', body: JSON.stringify({ currentStock: Math.max(reorderLevel * 2, reorderLevel + 10) }) });
+      reload();
+    } finally {
+      setReorderingId(null);
+    }
+  }
+
   const criticalCount = stockItems.filter(i => i.status === 'critical' || i.status === 'low').length;
   const expiringCount = stockItems.filter(i => i.status === 'expiring').length;
   const totalValue = stockItems.reduce((sum, item) => sum + item.currentStock * item.unitCost, 0);
@@ -84,8 +99,8 @@ export default function Inventory() {
                       <span>£{item.unitCost}/unit</span>
                     </div>
                     {(item.status === 'critical' || item.status === 'low') && (
-                      <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors">
-                        <Zap className="w-3 h-3" /> Reorder now
+                      <button type="button" disabled={reorderingId === item.id} onClick={() => reorder(item.id, item.reorderLevel)} className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors disabled:opacity-40">
+                        <Zap className="w-3 h-3" /> {reorderingId === item.id ? 'Ordering…' : 'Reorder now'}
                       </button>
                     )}
                   </div>

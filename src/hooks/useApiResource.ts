@@ -6,7 +6,9 @@ export function useApiResource<TApi, TView extends { id: string }>(
   fallback: TView[],
   mapRow: (row: TApi) => TView,
 ) {
-  const demoFallbackEnabled = import.meta.env.DEV || import.meta.env.VITE_DEMO_FALLBACK === 'true';
+  // Live-only by default. Demo data is opt-in (VITE_DEMO_FALLBACK=true) and is
+  // only used as a placeholder until live data arrives / if the API is offline.
+  const demoFallbackEnabled = import.meta.env.VITE_DEMO_FALLBACK === 'true';
   const demoRows = useMemo(() => demoFallbackEnabled ? fallback : [], [demoFallbackEnabled, fallback]);
   const [data, setData] = useState(demoRows);
   const [source, setSource] = useState<'live' | 'demo'>('demo');
@@ -17,9 +19,9 @@ export function useApiResource<TApi, TView extends { id: string }>(
     apiRequest<TApi[] | { data: TApi[] }>(path)
       .then(response => {
         const rows = Array.isArray(response) ? response : response.data;
-        if (!active || rows.length === 0) return;
-        const liveRows = rows.map(mapRow);
-        setData(demoFallbackEnabled ? [...liveRows, ...demoRows.filter(row => !liveRows.some(liveRow => liveRow.id === row.id))] : liveRows);
+        if (!active) return;
+        // Always show live data once it loads, even when empty — never merge mock in.
+        setData(rows.map(mapRow));
         setSource('live');
       })
       .catch(() => {
@@ -28,7 +30,7 @@ export function useApiResource<TApi, TView extends { id: string }>(
         setSource('demo');
     });
     return () => { active = false; };
-  }, [demoFallbackEnabled, demoRows, mapRow, path, reloadIndex]);
+  }, [demoRows, mapRow, path, reloadIndex]);
 
   return { data, source, reload: () => setReloadIndex(current => current + 1) };
 }

@@ -95,6 +95,18 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     await audit(request, { action: 'lead.created', resource: 'lead', resourceId: row.id });
     return reply.code(201).send(row);
   });
+  app.patch('/leads/:id', { preHandler: writeRoles }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const input = z.object({
+      stage: z.string().min(2).max(40).optional(),
+      estimatedValue: z.coerce.number().min(0).optional(),
+    }).parse(request.body);
+    const existing = await db.lead.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    if (!existing) throw app.httpErrors.notFound('Lead not found');
+    const row = await db.lead.update({ where: { id }, data: input });
+    await audit(request, { action: 'lead.updated', resource: 'lead', resourceId: id, metadata: input });
+    return row;
+  });
 
   app.get('/campaigns', async request => {
     const { limit } = listLimit.parse(request.query);
@@ -111,6 +123,19 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     await audit(request, { action: 'campaign.created', resource: 'campaign', resourceId: row.id });
     return reply.code(201).send(row);
   });
+  app.patch('/campaigns/:id', { preHandler: adminRoles }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const input = z.object({
+      status: z.enum(['DRAFT', 'ACTIVE', 'PAUSED', 'COMPLETED', 'SCHEDULED']).optional(),
+      name: z.string().min(2).max(160).optional(),
+      goal: z.string().min(2).max(300).optional(),
+    }).parse(request.body);
+    const existing = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    if (!existing) throw app.httpErrors.notFound('Campaign not found');
+    const row = await db.campaign.update({ where: { id }, data: input });
+    await audit(request, { action: 'campaign.updated', resource: 'campaign', resourceId: id, metadata: input });
+    return row;
+  });
 
   app.get('/reviews', async request => {
     const query = listLimit.extend({ branchId: uuid.optional() }).parse(request.query);
@@ -125,6 +150,19 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     const row = await db.review.create({ data: { tenantId: request.auth.tenantId, ...input } });
     await audit(request, { action: 'review.created', resource: 'review', resourceId: row.id });
     return reply.code(201).send(row);
+  });
+  app.patch('/reviews/:id/respond', { preHandler: writeRoles }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const input = z.object({ response: z.string().min(1).max(4000) }).parse(request.body);
+    const existing = await db.review.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    if (!existing) throw app.httpErrors.notFound('Review not found');
+    if (existing.branchId) assertBranchAccess(request, existing.branchId);
+    const row = await db.review.update({
+      where: { id },
+      data: { responded: true, aiDraftResponse: input.response },
+    });
+    await audit(request, { action: 'review.responded', resource: 'review', resourceId: id });
+    return row;
   });
 
   app.get('/inventory', async request => {
@@ -141,6 +179,25 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     const row = await db.inventoryItem.create({ data: { tenantId: request.auth.tenantId, ...input } });
     await audit(request, { action: 'inventory.created', resource: 'inventoryItem', resourceId: row.id });
     return reply.code(201).send(row);
+  });
+  app.patch('/inventory/:id', { preHandler: writeRoles }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    // Either set an absolute stock level or add a restock amount.
+    const input = z.object({
+      currentStock: z.coerce.number().int().min(0).optional(),
+      restockBy: z.coerce.number().int().min(1).optional(),
+      reorderLevel: z.coerce.number().int().min(0).optional(),
+    }).parse(request.body);
+    const existing = await db.inventoryItem.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    if (!existing) throw app.httpErrors.notFound('Inventory item not found');
+    assertBranchAccess(request, existing.branchId);
+    const nextStock = input.currentStock ?? (input.restockBy ? existing.currentStock + input.restockBy : existing.currentStock);
+    const row = await db.inventoryItem.update({
+      where: { id },
+      data: { currentStock: nextStock, reorderLevel: input.reorderLevel ?? existing.reorderLevel },
+    });
+    await audit(request, { action: 'inventory.restocked', resource: 'inventoryItem', resourceId: id, metadata: { from: existing.currentStock, to: nextStock } });
+    return row;
   });
 
   app.get('/partner-reports', async request => {
@@ -197,6 +254,20 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
 
   app.get('/integrations', async request => {
     return db.integration.findMany({ where: { tenantId: request.auth.tenantId }, orderBy: { name: 'asc' } });
+  });
+  app.patch('/integrations/:id', { preHandler: adminRoles }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const input = z.object({
+      status: z.enum(['CONNECTED', 'DISCONNECTED', 'ERROR', 'COMING_SOON']),
+    }).parse(request.body);
+    const existing = await db.integration.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    if (!existing) throw app.httpErrors.notFound('Integration not found');
+    const row = await db.integration.update({
+      where: { id },
+      data: { status: input.status, lastSyncAt: input.status === 'CONNECTED' ? new Date() : existing.lastSyncAt },
+    });
+    await audit(request, { action: 'integration.statusChanged', resource: 'integration', resourceId: id, metadata: { status: input.status } });
+    return row;
   });
 
   app.get('/tasks', async request => {

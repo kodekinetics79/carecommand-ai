@@ -8,6 +8,7 @@ import ProgressBar from '../components/ui/ProgressBar';
 import { campaigns } from '../data/mockCampaigns';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapCampaign, type ApiCampaign } from '../lib/apiAdapters';
+import { apiRequest } from '../lib/api';
 
 const statusConfig: Record<string, { label: string; color: string; bg: string }> = {
   active:    { label: 'Active',     color: 'text-emerald-700', bg: 'bg-emerald-100' },
@@ -42,7 +43,18 @@ export default function Campaigner() {
   const [selectedGoal, setSelectedGoal] = useState<string | null>(null);
   const [previewChannel, setPreviewChannel] = useState('whatsapp');
   const [campaignFilter, setCampaignFilter] = useState('all');
-  const { data: campaignRecords, source } = useApiResource<ApiCampaign, typeof campaigns[number]>('/v1/campaigns?limit=100', campaigns, mapCampaign);
+  const { data: campaignRecords, source, reload } = useApiResource<ApiCampaign, typeof campaigns[number]>('/v1/campaigns?limit=100', campaigns, mapCampaign);
+  const [pendingId, setPendingId] = useState<string | null>(null);
+
+  async function setCampaignStatus(id: string, status: 'ACTIVE' | 'PAUSED') {
+    setPendingId(id);
+    try {
+      await apiRequest(`/v1/campaigns/${id}`, { method: 'PATCH', body: JSON.stringify({ status }) });
+      reload();
+    } finally {
+      setPendingId(null);
+    }
+  }
   const campaignFilterTabs = [
     { id: 'all', label: 'All', count: campaignRecords.length },
     { id: 'active', label: 'Active', count: campaignRecords.filter(c => c.status === 'active').length },
@@ -185,13 +197,13 @@ export default function Campaigner() {
 
                     <div className="flex items-center gap-2 mt-3">
                       {c.status === 'active' && (
-                        <button type="button" className="inline-flex items-center gap-1 text-xs font-semibold text-amber-v hover:text-amber-v/80">
-                          <PauseCircle className="w-3.5 h-3.5" /> Pause
+                        <button type="button" disabled={pendingId === c.id} onClick={() => setCampaignStatus(c.id, 'PAUSED')} className="inline-flex items-center gap-1 text-xs font-semibold text-amber-v hover:text-amber-v/80 disabled:opacity-40">
+                          <PauseCircle className="w-3.5 h-3.5" /> {pendingId === c.id ? 'Pausing…' : 'Pause'}
                         </button>
                       )}
-                      {(c.status === 'draft' || c.status === 'scheduled') && (
-                        <button type="button" className="inline-flex items-center gap-1 text-xs font-semibold text-indigo hover:text-indigo/80">
-                          <Play className="w-3.5 h-3.5" /> Launch
+                      {(c.status === 'draft' || c.status === 'scheduled' || c.status === 'paused') && (
+                        <button type="button" disabled={pendingId === c.id} onClick={() => setCampaignStatus(c.id, 'ACTIVE')} className="inline-flex items-center gap-1 text-xs font-semibold text-indigo hover:text-indigo/80 disabled:opacity-40">
+                          <Play className="w-3.5 h-3.5" /> {pendingId === c.id ? 'Launching…' : c.status === 'paused' ? 'Resume' : 'Launch'}
                         </button>
                       )}
                       <button type="button" className="ml-auto inline-flex items-center gap-1 text-xs font-semibold text-t3 hover:text-t2">

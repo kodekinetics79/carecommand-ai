@@ -53,7 +53,21 @@ interface ReputationResponse {
 }
 
 export default function Reviews() {
-  const { data: reviewRecords, source } = useApiResource<ApiReview, typeof reviews[number]>('/v1/reviews?limit=100', reviews, mapReview);
+  const { data: reviewRecords, source, reload } = useApiResource<ApiReview, typeof reviews[number]>('/v1/reviews?limit=100', reviews, mapReview);
+  const [respondingId, setRespondingId] = useState<string | null>(null);
+
+  async function respondToReview(id: string, draft?: string) {
+    setRespondingId(id);
+    try {
+      await apiRequest(`/v1/reviews/${id}/respond`, {
+        method: 'PATCH',
+        body: JSON.stringify({ response: draft?.trim() || 'Thank you so much for taking the time to share your feedback — we truly appreciate it.' }),
+      });
+      reload();
+    } finally {
+      setRespondingId(null);
+    }
+  }
   const [reputation, setReputation] = useState<ReputationResponse>({
     summary: { unresolvedCases: 0, avgBadReviewRisk: 0, avgNpsScore: 0, pendingReviewRequests: 0 },
     cases: [],
@@ -140,10 +154,10 @@ export default function Reviews() {
                   <div className="flex items-center gap-2">
                     {r.responded
                       ? <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-v"><CheckCircle2 className="w-3 h-3" /> Responded</span>
-                      : <button type="button" className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo bg-[var(--indigo-soft)] px-3 py-1.5 rounded-lg hover:opacity-80 transition-colors"><Sparkles className="w-3 h-3" /> Draft AI Response</button>
+                      : <button type="button" disabled={respondingId === r.id} onClick={() => respondToReview(r.id, r.aiDraftResponse)} className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo bg-[var(--indigo-soft)] px-3 py-1.5 rounded-lg hover:opacity-80 transition-colors disabled:opacity-40"><Sparkles className="w-3 h-3" /> {respondingId === r.id ? 'Sending…' : r.aiDraftResponse ? 'Send AI Response' : 'Draft AI Response'}</button>
                     }
                     {r.sentiment === 'negative' && !r.responded && (
-                      <button type="button" className="inline-flex items-center gap-1 text-xs font-semibold text-red-v hover:opacity-80"><AlertCircle className="w-3 h-3" /> Flag for manager</button>
+                      <button type="button" disabled={respondingId === r.id} onClick={() => respondToReview(r.id, r.aiDraftResponse)} className="inline-flex items-center gap-1 text-xs font-semibold text-red-v hover:opacity-80 disabled:opacity-40"><AlertCircle className="w-3 h-3" /> Resolve & respond</button>
                     )}
                   </div>
                 </div>
