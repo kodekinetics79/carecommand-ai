@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   ArrowRight, CalendarDays, DollarSign, Phone, Sparkles, TrendingUp,
   Users, Zap, AlertCircle, CheckCircle2, BarChart3, Star, Clock
@@ -63,6 +64,14 @@ const priorityActions = [
   { id: 'p5', title: '14 follow-up opportunities not yet rebooked', description: "Post-service customers who haven't scheduled their next visit. Est. value: £4,800.", impact: '£4,800', urgency: 'low' as const, action: 'Assign Follow-Up Tasks', icon: <CheckCircle2 className="w-3.5 h-3.5" /> },
 ];
 
+const actionRoute: Record<string, string> = {
+  p1: '/campaigner',
+  p2: '/scheduling',
+  p3: '/ai-receptionist',
+  p4: '/reviews',
+  p5: '/staff',
+};
+
 const urgencyClass: Record<'high' | 'medium' | 'low', string> = {
   high: 'urgency-high',
   medium: 'urgency-medium',
@@ -86,6 +95,7 @@ function branchScoreColor(score: number) {
 }
 
 export default function Dashboard() {
+  const navigate = useNavigate();
   const [summary, setSummary] = useState(fallbackSummary);
   const [summarySource, setSummarySource] = useState<'live' | 'demo'>('demo');
   const { data: campaignRecords } = useApiResource<ApiCampaign, typeof campaigns[number]>('/v1/campaigns?limit=3', campaigns, mapCampaign);
@@ -113,7 +123,7 @@ export default function Dashboard() {
         badge={summarySource === 'live' ? 'Live DB' : 'Demo'}
         badgeColor={summarySource === 'live' ? 'emerald' : 'blue'}
         actions={
-          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-[rgba(99,102,241,0.25)] hover:opacity-90 transition-opacity">
+          <button type="button" onClick={() => navigate('/clinic-radar')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-[rgba(99,102,241,0.25)] hover:opacity-90 transition-opacity">
             <Sparkles className="w-4 h-4" /> AI Briefing
           </button>
         }
@@ -139,7 +149,7 @@ export default function Dashboard() {
               <p className="text-2xl font-bold text-white tabular-nums">{formatCurrency(summary.networkRevenue)}</p>
               <p className="text-xs text-white/65">Network revenue this month</p>
             </div>
-            <button type="button" className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-200 hover:text-white transition-colors">
+            <button type="button" onClick={() => navigate('/revenue')} className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-200 hover:text-white transition-colors">
               View full report <ArrowRight className="w-3.5 h-3.5" />
             </button>
           </div>
@@ -214,7 +224,7 @@ export default function Dashboard() {
 
           {/* Campaign ROI */}
           <BentoCard title="Active Campaign ROI" subtitle="Campaign performance" headerRight={
-            <button type="button" className="text-xs font-semibold text-indigo hover:opacity-75 flex items-center gap-1 transition-opacity">
+            <button type="button" onClick={() => navigate('/campaigner')} className="text-xs font-semibold text-indigo hover:opacity-75 flex items-center gap-1 transition-opacity">
               View all <ArrowRight className="w-3 h-3" />
             </button>
           }>
@@ -271,7 +281,7 @@ export default function Dashboard() {
                       <span className="badge badge-emerald shrink-0">{item.impact}</span>
                     )}
                   </div>
-                  <button type="button" className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[var(--indigo)] text-white text-[11px] font-semibold hover:opacity-90 transition-opacity">
+                  <button type="button" onClick={() => navigate(actionRoute[item.id] ?? '/autopilot')} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[var(--indigo)] text-white text-[11px] font-semibold hover:opacity-90 transition-opacity">
                     <Zap className="w-3 h-3" />
                     {item.action}
                   </button>
@@ -298,7 +308,7 @@ export default function Dashboard() {
                   confidence={alert.severity === 'high' ? 88 : alert.severity === 'medium' ? 72 : 61}
                 />
               ))}
-              <button type="button" className="w-full text-center text-xs font-semibold text-indigo py-2 border border-dashed border-[var(--indigo-mid)] rounded-xl hover:bg-[var(--indigo-soft)] transition-colors flex items-center justify-center gap-1.5">
+              <button type="button" onClick={() => navigate('/clinic-radar')} className="w-full text-center text-xs font-semibold text-indigo py-2 border border-dashed border-[var(--indigo-mid)] rounded-xl hover:bg-[var(--indigo-soft)] transition-colors flex items-center justify-center gap-1.5">
                 <BarChart3 className="w-3.5 h-3.5" />
                 View all 15 signals in ClinicRadar AI
               </button>

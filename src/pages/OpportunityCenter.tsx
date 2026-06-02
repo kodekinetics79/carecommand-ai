@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { ArrowRight, AlertTriangle, BarChart3, Bolt, CheckCircle2, CircleDollarSign, ListTodo, Sparkles, Target, TrendingUp } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
@@ -6,6 +7,7 @@ import ProgressBar from '../components/ui/ProgressBar';
 import { formatCurrency } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapOpportunity, mapRevenueLeak, type ApiOpportunity, type ApiRevenueLeak } from '../lib/apiAdapters';
+import { apiRequest } from '../lib/api';
 import type { Opportunity, RevenueLeak } from '../types';
 
 const leakPreview: RevenueLeak[] = [
@@ -93,16 +95,37 @@ function scoreClass(confidence: number) {
 }
 
 export default function OpportunityCenter() {
-  const { data: revenueLeaks, source: leakSource } = useApiResource<ApiRevenueLeak, RevenueLeak>(
+  const { data: revenueLeaks, source: leakSource, reload: reloadLeaks } = useApiResource<ApiRevenueLeak, RevenueLeak>(
     '/v1/revenue-leaks?limit=20',
     leakPreview,
     mapRevenueLeak,
   );
-  const { data: opportunities, source: opportunitySource } = useApiResource<ApiOpportunity, Opportunity>(
+  const { data: opportunities, source: opportunitySource, reload: reloadOpportunities } = useApiResource<ApiOpportunity, Opportunity>(
     '/v1/opportunities?limit=20',
     opportunityPreview,
     mapOpportunity,
   );
+  const [pendingId, setPendingId] = useState<string | null>(null);
+
+  async function executeLeak(id: string) {
+    setPendingId(id);
+    try {
+      await apiRequest(`/v1/revenue-leaks/${id}`, { method: 'PATCH', body: JSON.stringify({ status: 'recovering', workflowStatus: 'in-progress' }) });
+      reloadLeaks();
+    } finally {
+      setPendingId(null);
+    }
+  }
+
+  async function approveOpportunity(id: string) {
+    setPendingId(id);
+    try {
+      await apiRequest(`/v1/opportunities/${id}`, { method: 'PATCH', body: JSON.stringify({ status: 'running', ownerApprovalRequired: false }) });
+      reloadOpportunities();
+    } finally {
+      setPendingId(null);
+    }
+  }
 
   const recoverableValue = revenueLeaks.reduce((sum, leak) => sum + leak.estimatedValue, 0);
   const expectedRevenue = opportunities.reduce((sum, opportunity) => sum + opportunity.expectedRevenue, 0);
@@ -160,8 +183,8 @@ export default function OpportunityCenter() {
                 </div>
                 <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
                   <p className="text-xs text-t2"><span className="font-semibold text-t1">Suggested action:</span> {leak.suggestedAction}</p>
-                  <button type="button" className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 transition">
-                    <Bolt className="w-3.5 h-3.5" /> Execute workflow
+                  <button type="button" disabled={pendingId === leak.id} onClick={() => executeLeak(leak.id)} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 transition disabled:opacity-40">
+                    <Bolt className="w-3.5 h-3.5" /> {pendingId === leak.id ? 'Executing…' : 'Execute workflow'}
                   </button>
                 </div>
               </div>
@@ -211,8 +234,8 @@ export default function OpportunityCenter() {
                   </div>
                   <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
                     <p className="text-xs text-t2"><span className="font-semibold text-t1">Recommended action:</span> {opportunity.recommendedAction}</p>
-                    <button type="button" className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo-soft)] px-3 py-1.5 text-[11px] font-semibold text-indigo hover:opacity-90 transition">
-                      <ListTodo className="w-3.5 h-3.5" /> Approve action
+                    <button type="button" disabled={pendingId === opportunity.id || opportunity.status === 'running'} onClick={() => approveOpportunity(opportunity.id)} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo-soft)] px-3 py-1.5 text-[11px] font-semibold text-indigo hover:opacity-90 transition disabled:opacity-40">
+                      <ListTodo className="w-3.5 h-3.5" /> {opportunity.status === 'running' ? 'Launched' : pendingId === opportunity.id ? 'Approving…' : 'Approve action'}
                     </button>
                   </div>
                 </div>

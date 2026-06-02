@@ -1,3 +1,4 @@
+import { useNavigate } from 'react-router-dom';
 import { TrendingUp, DollarSign, Phone, Megaphone, AlertCircle, ArrowRight, Zap, BarChart3 } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
@@ -21,7 +22,20 @@ type BarColor = 'blue' | 'violet' | 'emerald' | 'red' | 'teal';
 const revenueFallback = revenueData.map((row, index) => ({ ...row, id: `demo-revenue-${index}` })).reverse();
 
 export default function Revenue() {
+  const navigate = useNavigate();
   const { data: revenueRecords, source } = useApiResource<ApiRevenueSnapshot, typeof revenueFallback[number]>('/v1/revenue-snapshots?limit=100', revenueFallback, mapRevenueSnapshot);
+
+  function exportReport() {
+    const header = ['Month', 'Revenue', 'Campaigns', 'Recovered', 'Lost'];
+    const lines = revenueRecords.map(r => [r.month, r.revenue, r.campaigns, r.recovered, r.lost].join(','));
+    const csv = [header.join(','), ...lines].join('\n');
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `revenue-report-${new Date().toISOString().slice(0, 10)}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
   const latest = revenueRecords[0] ?? revenueRecords[revenueRecords.length - 1] ?? revenueFallback.at(-1)!;
   const prev = revenueRecords[1] ?? revenueRecords[revenueRecords.length - 2] ?? latest;
   const revGrowth = prev.revenue > 0 ? Math.round(((latest.revenue - prev.revenue) / prev.revenue) * 100) : 0;
@@ -44,10 +58,10 @@ export default function Revenue() {
         badgeColor={source === 'live' ? 'emerald' : 'blue'}
         actions={
           <div className="flex gap-2">
-            <button type="button" className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
+            <button type="button" onClick={exportReport} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
               <BarChart3 className="w-4 h-4" /> Export Report
             </button>
-            <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
+            <button type="button" onClick={() => navigate('/opportunities')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
               <Zap className="w-4 h-4" /> Recover Lost Revenue
             </button>
           </div>
@@ -156,7 +170,7 @@ export default function Revenue() {
                     <p className="text-xs font-semibold text-t1">{opp.label}</p>
                     <p className="text-xs font-bold text-red-v">{formatCurrency(opp.value)}</p>
                   </div>
-                  <button type="button" className="shrink-0 inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1.5 rounded-lg hover:opacity-80 transition-colors">
+                  <button type="button" onClick={() => navigate('/opportunities')} className="shrink-0 inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1.5 rounded-lg hover:opacity-80 transition-colors">
                     <Zap className="w-3 h-3" />
                     {opp.action}
                   </button>

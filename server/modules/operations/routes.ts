@@ -71,6 +71,20 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     });
   });
 
+  app.patch('/revenue-leaks/:id', { preHandler: writeRoles }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const input = z.object({
+      status: z.string().min(2).max(40).optional(),
+      workflowStatus: z.string().min(2).max(40).optional(),
+    }).parse(request.body);
+    const existing = await db.revenueLeak.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    if (!existing) throw app.httpErrors.notFound('Revenue leak not found');
+    if (existing.branchId) assertBranchAccess(request, existing.branchId);
+    const row = await db.revenueLeak.update({ where: { id }, data: input });
+    await audit(request, { action: 'revenueLeak.workflowUpdated', resource: 'revenueLeak', resourceId: id, metadata: input });
+    return row;
+  });
+
   app.get('/opportunities', async request => {
     const query = listLimit.extend({ branchId: uuid.optional() }).parse(request.query);
     return db.opportunity.findMany({
@@ -79,6 +93,20 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
       orderBy: { createdAt: 'desc' },
       include: { branch: { select: { name: true } }, ownerUser: { select: { displayName: true } }, patient: { select: { firstName: true, lastName: true } } },
     });
+  });
+  app.patch('/opportunities/:id', { preHandler: writeRoles }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const input = z.object({
+      status: z.string().min(2).max(40).optional(),
+      ownerApprovalRequired: z.boolean().optional(),
+      actualRevenue: z.coerce.number().min(0).optional(),
+    }).parse(request.body);
+    const existing = await db.opportunity.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    if (!existing) throw app.httpErrors.notFound('Opportunity not found');
+    if (existing.branchId) assertBranchAccess(request, existing.branchId);
+    const row = await db.opportunity.update({ where: { id }, data: input });
+    await audit(request, { action: 'opportunity.updated', resource: 'opportunity', resourceId: id, metadata: input });
+    return row;
   });
 
   app.get('/leads', async request => {
