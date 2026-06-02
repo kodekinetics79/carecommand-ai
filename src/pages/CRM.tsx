@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { ArrowRight, Mail, Sparkles, Users2, TrendingDown, Phone, MessageSquare, Globe, Zap } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
@@ -10,6 +11,7 @@ import { campaigns } from '../data/mockCampaigns';
 import { formatNumber } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapLead, mapPatient, type ApiLead, type ApiPatient } from '../lib/apiAdapters';
+import { apiRequest } from '../lib/api';
 
 const stages = ['new-inquiry', 'contacted', 'booked', 'visited', 'follow-up', 'retained', 'lost'] as const;
 type Stage = typeof stages[number];
@@ -44,8 +46,23 @@ const lifecycleConfig: Record<string, { label: string; badgeClass: string }> = {
 };
 
 export default function CRM() {
+  const navigate = useNavigate();
   const [inactiveSegment, setInactiveSegment] = useState('60');
   const [searchQuery, setSearchQuery] = useState('');
+  const [creatingCampaign, setCreatingCampaign] = useState(false);
+
+  async function createCampaign(name: string, goal: string, channels: string[] = ['WHATSAPP', 'EMAIL']) {
+    setCreatingCampaign(true);
+    try {
+      await apiRequest('/v1/campaigns', {
+        method: 'POST',
+        body: JSON.stringify({ name, goal, status: 'DRAFT', channels, aiGenerated: true }),
+      });
+      navigate('/campaigner');
+    } catch {
+      setCreatingCampaign(false);
+    }
+  }
   const { data: leadRecords, source: leadSource } = useApiResource<ApiLead, typeof leads[number]>('/v1/leads?limit=100', leads, mapLead);
   const { data: customerRecords } = useApiResource<ApiPatient, typeof patients[number]>('/v1/patients?limit=100', patients, mapPatient);
 
@@ -84,8 +101,8 @@ export default function CRM() {
             <button type="button" className="inline-flex items-center gap-2 rounded-xl border border-[var(--b2)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
               <Mail className="w-4 h-4" /> Export Segment
             </button>
-            <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
-              <Sparkles className="w-4 h-4" /> Create Campaign
+            <button type="button" disabled={creatingCampaign} onClick={() => createCampaign('New CRM Campaign', 'Custom campaign created from CRM')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition disabled:opacity-40">
+              <Sparkles className="w-4 h-4" /> {creatingCampaign ? 'Creating…' : 'Create Campaign'}
             </button>
           </div>
         }
@@ -228,7 +245,7 @@ export default function CRM() {
                       <p className="text-xs text-t2">Est. recoverable revenue</p>
                       <p className="text-xs font-bold text-emerald-v">£{Math.round(estValue).toLocaleString()}</p>
                     </div>
-                    <button type="button" className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg border border-dashed border-[var(--b2)] text-xs font-semibold text-indigo hover:bg-[var(--s3)] transition-colors">
+                    <button type="button" disabled={creatingCampaign} onClick={() => createCampaign(`Reactivation – ${range}d inactive`, `Win back ${count} customers inactive for ${range}+ days`, ['WHATSAPP', 'SMS', 'EMAIL'])} className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg border border-dashed border-[var(--b2)] text-xs font-semibold text-indigo hover:bg-[var(--s3)] transition-colors disabled:opacity-40">
                       <Zap className="w-3 h-3" /> Launch Reactivation Campaign
                     </button>
                   </div>
@@ -253,7 +270,7 @@ export default function CRM() {
                     <span className="badge badge-emerald shrink-0">{item.impact}</span>
                   </div>
                   <p className="text-[11px] text-t3 mb-2">{item.sub}</p>
-                  <button type="button" className="inline-flex items-center gap-1 text-xs font-semibold text-indigo hover:opacity-80">
+                  <button type="button" disabled={creatingCampaign} onClick={() => createCampaign(item.title, item.sub)} className="inline-flex items-center gap-1 text-xs font-semibold text-indigo hover:opacity-80 disabled:opacity-40">
                     Take action <ArrowRight className="w-3 h-3" />
                   </button>
                 </div>

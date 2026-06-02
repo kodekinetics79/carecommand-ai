@@ -6,12 +6,24 @@ import BentoCard from '../components/ui/BentoCard';
 import RiskBadge from '../components/ui/RiskBadge';
 import ProgressBar from '../components/ui/ProgressBar';
 import { appointments } from '../data/mockAppointments';
+import { patients } from '../data/mockPatients';
 import { branches } from '../data/mockClinics';
 import { doctors } from '../data/mockClinics';
 import { useApiResource } from '../hooks/useApiResource';
-import { mapAppointment, mapProviderProfile, type ApiAppointment, type ApiProviderProfile } from '../lib/apiAdapters';
+import { mapAppointment, mapProviderProfile, mapPatient, type ApiAppointment, type ApiProviderProfile, type ApiPatient } from '../lib/apiAdapters';
+import { apiRequest } from '../lib/api';
 
-const todayDate = '2025-05-26';
+const isoDate = (offsetDays: number) => {
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  return d.toISOString().slice(0, 10);
+};
+const dateOptions = [0, 1, 2].map(offset => ({
+  value: isoDate(offset),
+  label: offset === 0 ? 'Today' : offset === 1 ? 'Tomorrow' : new Date(isoDate(offset)).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric' }),
+}));
+const todayDate = dateOptions[0].value;
+const emptyBooking = { patientId: '', service: '', date: todayDate, time: '10:00', channel: 'WHATSAPP', value: '150' };
 
 const statusConfig: Record<string, { label: string; dot: string; bg: string; text: string }> = {
   confirmed:  { label: 'Confirmed',  dot: 'bg-emerald-500', bg: 'bg-[var(--emerald-soft)]',  text: 'text-emerald-v' },
@@ -38,8 +50,48 @@ const aiRecommendations = [
 export default function Scheduling() {
   const [selectedBranch, setSelectedBranch] = useState('all');
   const [selectedDate, setSelectedDate] = useState(todayDate);
-  const { data: appointmentRecords, source } = useApiResource<ApiAppointment, typeof appointments[number]>('/v1/appointments?limit=100', appointments, mapAppointment);
+  const { data: appointmentRecords, source, reload } = useApiResource<ApiAppointment, typeof appointments[number]>('/v1/appointments?limit=100', appointments, mapAppointment);
   const { data: providerRecords } = useApiResource<ApiProviderProfile, typeof doctors[number]>('/v1/providers/overview?limit=100', doctors, mapProviderProfile);
+  const { data: patientRecords } = useApiResource<ApiPatient, typeof patients[number]>('/v1/patients?limit=100', patients, mapPatient);
+
+  const [showBooking, setShowBooking] = useState(false);
+  const [booking, setBooking] = useState(emptyBooking);
+  const [saving, setSaving] = useState(false);
+  const [bookingError, setBookingError] = useState<string | null>(null);
+
+  async function bookAppointment() {
+    const patient = patientRecords.find(p => p.id === booking.patientId);
+    if (!patient || !patient.branchId || !booking.service.trim()) {
+      setBookingError('Pick a customer and enter a service.');
+      return;
+    }
+    setSaving(true);
+    setBookingError(null);
+    try {
+      const startsAt = new Date(`${booking.date}T${booking.time}:00`);
+      await apiRequest('/v1/appointments', {
+        method: 'POST',
+        body: JSON.stringify({
+          branchId: patient.branchId,
+          patientId: patient.id,
+          service: booking.service.trim(),
+          startsAt: startsAt.toISOString(),
+          endsAt: new Date(startsAt.getTime() + 30 * 60000).toISOString(),
+          channel: booking.channel,
+          value: Number(booking.value) || 0,
+          status: 'CONFIRMED',
+        }),
+      });
+      setBooking(emptyBooking);
+      setShowBooking(false);
+      setSelectedDate(booking.date);
+      reload();
+    } catch (err) {
+      setBookingError(err instanceof Error ? err.message : 'Failed to book appointment');
+    } finally {
+      setSaving(false);
+    }
+  }
 
   const todayAppts = useMemo(() =>
     appointmentRecords.filter(a => a.date === selectedDate && (selectedBranch === 'all' || a.branchId === selectedBranch))
@@ -60,15 +112,40 @@ export default function Scheduling() {
         badgeColor={source === 'live' ? 'emerald' : 'blue'}
         actions={
           <div className="flex gap-2">
-            <button type="button" className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
-              <CalendarDays className="w-4 h-4" /> Export Schedule
-            </button>
-            <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
-              <Zap className="w-4 h-4" /> Fill Empty Slots
+            <button type="button" onClick={() => setShowBooking(true)} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
+              <CalendarDays className="w-4 h-4" /> Book Appointment
             </button>
           </div>
         }
       />
+
+      {showBooking && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setShowBooking(false)}>
+          <div className="w-full max-w-md rounded-2xl bg-[var(--s1)] border border-[var(--b2)] p-5 shadow-xl" onClick={e => e.stopPropagation()}>
+            <p className="text-sm font-bold text-t1 mb-3">Book Appointment</p>
+            {bookingError && <p className="text-[11px] text-red-v mb-2">{bookingError}</p>}
+            <div className="space-y-2.5">
+              <select aria-label="Customer" title="Customer" value={booking.patientId} onChange={e => setBooking(b => ({ ...b, patientId: e.target.value }))} className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
+                <option value="">Select customer…</option>
+                {patientRecords.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+              <input value={booking.service} onChange={e => setBooking(b => ({ ...b, service: e.target.value }))} placeholder="Service (e.g. Dermatology Review)" className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+              <div className="grid grid-cols-2 gap-2.5">
+                <input type="date" aria-label="Date" value={booking.date} onChange={e => setBooking(b => ({ ...b, date: e.target.value }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+                <input type="time" aria-label="Time" value={booking.time} onChange={e => setBooking(b => ({ ...b, time: e.target.value }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+                <select aria-label="Channel" title="Channel" value={booking.channel} onChange={e => setBooking(b => ({ ...b, channel: e.target.value }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
+                  {['WHATSAPP', 'SMS', 'EMAIL', 'CALL', 'VIDEO'].map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+                <input type="number" aria-label="Value" value={booking.value} onChange={e => setBooking(b => ({ ...b, value: e.target.value }))} placeholder="Value (£)" className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+              </div>
+            </div>
+            <div className="flex gap-2 mt-4">
+              <button type="button" disabled={saving} onClick={bookAppointment} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition disabled:opacity-40">{saving ? 'Booking…' : 'Book Appointment'}</button>
+              <button type="button" onClick={() => setShowBooking(false)} className="px-4 py-2 rounded-lg border border-[var(--b1)] text-t2 text-xs font-semibold hover:bg-[var(--s3)] transition">Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
         <StatCard title="Today's Appointments" value={todayAppts.length} subtitle="All branches" icon={<CalendarDays className="w-4 h-4" />} accent="blue" />
@@ -80,9 +157,9 @@ export default function Scheduling() {
       {/* Filters */}
       <div className="flex items-center gap-3 flex-wrap">
         <div className="flex items-center gap-1 bg-[var(--s2)] border border-[var(--b1)] p-1 rounded-xl">
-          <button type="button" onClick={() => setSelectedDate('2025-05-26')} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedDate === '2025-05-26' ? 'bg-[var(--indigo)] text-white' : 'text-t3 hover:text-t1'}`}>Today</button>
-          <button type="button" onClick={() => setSelectedDate('2025-05-27')} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedDate === '2025-05-27' ? 'bg-[var(--indigo)] text-white' : 'text-t3 hover:text-t1'}`}>Tomorrow</button>
-          <button type="button" onClick={() => setSelectedDate('2025-05-28')} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedDate === '2025-05-28' ? 'bg-[var(--indigo)] text-white' : 'text-t3 hover:text-t1'}`}>Wed 28</button>
+          {dateOptions.map(opt => (
+            <button key={opt.value} type="button" onClick={() => setSelectedDate(opt.value)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedDate === opt.value ? 'bg-[var(--indigo)] text-white' : 'text-t3 hover:text-t1'}`}>{opt.label}</button>
+          ))}
         </div>
         <div className="flex items-center gap-1 bg-[var(--s2)] border border-[var(--b1)] p-1 rounded-xl">
           <button type="button" onClick={() => setSelectedBranch('all')} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedBranch === 'all' ? 'bg-[var(--s3)] text-t1' : 'text-t3 hover:text-t1'}`}>All Branches</button>
