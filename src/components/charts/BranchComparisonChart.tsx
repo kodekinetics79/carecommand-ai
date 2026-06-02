@@ -12,7 +12,7 @@ export default function BranchComparisonChart() {
         <YAxis tick={{ fontSize: 11, fill: '#9CA3AF' }} axisLine={false} tickLine={false} tickFormatter={v => `£${(v/1000).toFixed(0)}k`} />
         <Tooltip
           contentStyle={{ background: '#FFFFFF', border: '1px solid #E5EAF0', borderRadius: '12px', fontSize: 12, color: '#111827', boxShadow: '0 8px 24px rgba(15,23,42,0.1)' }}
-          formatter={(v: any) => [`£${(v/1000).toFixed(1)}k`, 'Revenue']}
+          formatter={(value) => [`£${(Number(value) / 1000).toFixed(1)}k`, 'Revenue']}
         />
         <Bar dataKey="revenue" radius={[6, 6, 0, 0]}>
           {branchRevenue.map((_, i) => <Cell key={i} fill={colors[i]} />)}

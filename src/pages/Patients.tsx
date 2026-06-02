@@ -8,6 +8,8 @@ import ProgressBar from '../components/ui/ProgressBar';
 import { patients } from '../data/mockPatients';
 import { branches } from '../data/mockClinics';
 import { formatCurrency } from '../utils/formatters';
+import { useApiResource } from '../hooks/useApiResource';
+import { mapPatient, type ApiPatient } from '../lib/apiAdapters';
 
 const lifecycleConfig: Record<string, { label: string; color: string; bg: string }> = {
   new:      { label: 'New',      color: 'text-indigo',    bg: 'badge badge-blue' },
@@ -17,26 +19,25 @@ const lifecycleConfig: Record<string, { label: string; color: string; bg: string
   inactive: { label: 'Inactive', color: 'text-red-v',     bg: 'badge badge-red' },
 };
 
-const familyCount = patients.filter(p => p.familyAccountId).length;
-const highRisk = patients.filter(p => p.churnRisk >= 60).length;
-const activeCount = patients.filter(p => p.lifecycleStage === 'active' || p.lifecycleStage === 'retained').length;
-const avgLTV = Math.round(patients.reduce((s, p) => s + p.lifetimeValue, 0) / patients.length);
-
-const segments = [
-  { label: 'High LTV (>£4,000)', count: patients.filter(p => p.lifetimeValue > 4000).length, color: 'emerald' as const },
-  { label: 'At-risk churn', count: patients.filter(p => p.churnRisk >= 60).length, color: 'red' as const },
-  { label: 'Inactive (90d+)', count: patients.filter(p => p.lifecycleStage === 'inactive').length, color: 'amber' as const },
-  { label: 'Marketing consented', count: patients.filter(p => p.consentStatus.marketing).length, color: 'blue' as const },
-  { label: 'Family accounts', count: familyCount, color: 'violet' as const },
-];
-
 export default function Patients() {
   const navigate = useNavigate();
   const [query, setQuery] = useState('');
   const [activeLifecycle, setActiveLifecycle] = useState<string>('all');
+  const { data: customerRecords, source } = useApiResource<ApiPatient, typeof patients[number]>('/v1/patients?limit=100', patients, mapPatient);
+  const familyCount = customerRecords.filter(p => p.familyAccountId).length;
+  const highRisk = customerRecords.filter(p => p.churnRisk >= 60).length;
+  const activeCount = customerRecords.filter(p => p.lifecycleStage === 'active' || p.lifecycleStage === 'retained').length;
+  const avgLTV = customerRecords.length > 0 ? Math.round(customerRecords.reduce((sum, patient) => sum + patient.lifetimeValue, 0) / customerRecords.length) : 0;
+  const segments = [
+    { label: 'High LTV (>£4,000)', count: customerRecords.filter(p => p.lifetimeValue > 4000).length, color: 'emerald' as const },
+    { label: 'At-risk churn', count: customerRecords.filter(p => p.churnRisk >= 60).length, color: 'red' as const },
+    { label: 'Inactive (90d+)', count: customerRecords.filter(p => p.lifecycleStage === 'inactive').length, color: 'amber' as const },
+    { label: 'Marketing consented', count: customerRecords.filter(p => p.consentStatus.marketing).length, color: 'blue' as const },
+    { label: 'Family accounts', count: familyCount, color: 'violet' as const },
+  ];
 
   const filtered = useMemo(() => {
-    let list = patients;
+    let list = customerRecords;
     if (activeLifecycle !== 'all') list = list.filter(p => p.lifecycleStage === activeLifecycle);
     if (query) list = list.filter(p =>
       p.name.toLowerCase().includes(query.toLowerCase()) ||
@@ -44,14 +45,14 @@ export default function Patients() {
       p.email.toLowerCase().includes(query.toLowerCase())
     );
     return list;
-  }, [query, activeLifecycle]);
+  }, [query, activeLifecycle, customerRecords]);
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Customer360"
         subtitle="Customer intelligence, lifecycle insights, consent-aware outreach, and LTV management."
-        badge={`${highRisk} At Risk`}
+        badge={`${highRisk} At Risk · ${source === 'live' ? 'Live DB' : 'Demo'}`}
         badgeColor="red"
         actions={
           <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
@@ -61,7 +62,7 @@ export default function Patients() {
       />
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Total Customers" value={patients.length} subtitle="All branches" icon={<Users className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Total Customers" value={customerRecords.length} subtitle="All branches" icon={<Users className="w-4 h-4" />} accent="blue" />
         <StatCard title="Active & Retained" value={activeCount} subtitle="Engaged lifecycle" trend={4} icon={<Heart className="w-4 h-4" />} accent="emerald" />
         <StatCard title="At-Risk Churn" value={highRisk} subtitle="Score ≥60%" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
         <StatCard title="Avg Lifetime Value" value={formatCurrency(avgLTV)} subtitle="Per customer" trend={6} icon={<TrendingUp className="w-4 h-4" />} accent="violet" />
@@ -86,7 +87,7 @@ export default function Patients() {
                   }`}
                 >
                   {lc === 'all' ? 'All' : lifecycleConfig[lc]?.label ?? lc}
-                  {lc !== 'all' && <span className="ml-1 opacity-70">({patients.filter(p => p.lifecycleStage === lc).length})</span>}
+                  {lc !== 'all' && <span className="ml-1 opacity-70">({customerRecords.filter(p => p.lifecycleStage === lc).length})</span>}
                 </button>
               ))}
             </div>
@@ -158,7 +159,7 @@ export default function Patients() {
                 { label: 'Preferred channel', value: 'WhatsApp', icon: <ShieldCheck className="w-3.5 h-3.5 text-emerald-v" /> },
                 { label: 'Marketing consent rate', value: '87%', icon: <ShieldCheck className="w-3.5 h-3.5 text-emerald-v" /> },
                 { label: 'Follow-up opportunities', value: '18 customers', icon: <Sparkles className="w-3.5 h-3.5 text-violet-v" /> },
-                { label: 'Outstanding balances', value: formatCurrency(patients.reduce((s, p) => s + p.outstandingBalance, 0)), icon: <AlertCircle className="w-3.5 h-3.5 text-amber-v" /> },
+                { label: 'Outstanding balances', value: formatCurrency(customerRecords.reduce((s, p) => s + p.outstandingBalance, 0)), icon: <AlertCircle className="w-3.5 h-3.5 text-amber-v" /> },
               ].map((item) => (
                 <div key={item.label} className="flex items-center justify-between gap-3 p-2.5 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors">
                   <div className="flex items-center gap-2">
@@ -178,7 +179,7 @@ export default function Patients() {
                 <div key={seg.label} className="flex items-center justify-between gap-3 p-3 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-all">
                   <div className="flex-1">
                     <p className="text-xs font-semibold text-t1 mb-1">{seg.label}</p>
-                    <ProgressBar value={seg.count} max={patients.length} color={seg.color} size="xs" />
+                    <ProgressBar value={seg.count} max={customerRecords.length} color={seg.color} size="xs" />
                   </div>
                   <span className="text-xs font-bold text-t2 shrink-0">{seg.count}</span>
                 </div>

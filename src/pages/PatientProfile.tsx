@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, Star, ShieldCheck, MessageSquare, CalendarDays, TrendingUp, AlertCircle, Sparkles, Zap, CheckCircle2, Mail, Phone, Clock } from 'lucide-react';
 import BentoCard from '../components/ui/BentoCard';
@@ -7,6 +7,8 @@ import { patients } from '../data/mockPatients';
 import { appointments } from '../data/mockAppointments';
 import { doctors, branches } from '../data/mockClinics';
 import { formatCurrency, formatDate } from '../utils/formatters';
+import { apiRequest } from '../lib/api';
+import { mapAppointment, mapPatient, type ApiPatient } from '../lib/apiAdapters';
 
 const lifecycleConfig: Record<string, { label: string; color: string; bg: string }> = {
   new:      { label: 'New',      color: 'text-indigo',    bg: 'badge badge-blue' },
@@ -32,24 +34,44 @@ const commsTimeline = [
 export default function PatientProfile() {
   const { id } = useParams();
   const navigate = useNavigate();
-  const patient = patients.find(p => p.id === id);
+  const fallbackPatient = patients.find(p => p.id === id);
+  const [patient, setPatient] = useState(fallbackPatient);
+  const [loading, setLoading] = useState(!fallbackPatient);
+  const [liveVisitHistory, setLiveVisitHistory] = useState<typeof appointments>([]);
   const visitHistory = useMemo(() => appointments.filter(a => a.patientId === id), [id]);
   const assignedDoctor = doctors.find(d => d.id === patient?.assignedDoctorId);
   const branch = branches.find(b => b.id === patient?.branchId);
+
+  useEffect(() => {
+    if (!id) return;
+    let active = true;
+    apiRequest<ApiPatient>(`/v1/patients/${id}`)
+      .then(row => {
+        if (!active) return;
+        setPatient(mapPatient(row));
+        setLiveVisitHistory(row.appointments?.map(mapAppointment) ?? []);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => { active = false; };
+  }, [id]);
 
   if (!patient) {
     return (
       <div className="flex items-center justify-center h-64">
         <div className="text-center">
-          <AlertCircle className="w-8 h-8 text-t3 mx-auto mb-2" />
-          <p className="text-sm text-t3">Customer not found.</p>
+          {loading ? <Clock className="w-8 h-8 text-t3 mx-auto mb-2 animate-pulse" /> : <AlertCircle className="w-8 h-8 text-t3 mx-auto mb-2" />}
+          <p className="text-sm text-t3">{loading ? 'Loading customer profile…' : 'Customer not found.'}</p>
         </div>
       </div>
     );
   }
 
   const lc = lifecycleConfig[patient.lifecycleStage];
-  const totalSpend = visitHistory.reduce((s, v) => s + v.value, 0);
+  const visibleVisitHistory = liveVisitHistory.length > 0 ? liveVisitHistory : visitHistory;
+  const totalSpend = visibleVisitHistory.reduce((s, v) => s + v.value, 0);
 
   return (
     <div className="space-y-6 pb-8">
@@ -119,10 +141,10 @@ export default function PatientProfile() {
         {/* Main content */}
         <div className="space-y-4">
           {/* Visit history */}
-          <BentoCard title="Service History" subtitle={`${visitHistory.length} visits · ${formatCurrency(totalSpend)} total`} headerRight={<TrendingUp className="w-4 h-4 text-t3" />}>
-            {visitHistory.length > 0 ? (
+          <BentoCard title="Service History" subtitle={`${visibleVisitHistory.length} visits · ${formatCurrency(totalSpend)} total`} headerRight={<TrendingUp className="w-4 h-4 text-t3" />}>
+            {visibleVisitHistory.length > 0 ? (
               <div className="space-y-2.5">
-                {visitHistory.map((visit) => (
+                {visibleVisitHistory.map((visit) => (
                   <div key={visit.id} className="flex items-start justify-between gap-3 p-3.5 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors">
                     <div className="flex items-center gap-3">
                       <div className="w-2 h-2 rounded-full bg-[var(--indigo)] shrink-0 mt-1" />

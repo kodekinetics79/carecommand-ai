@@ -1,24 +1,28 @@
+import { lazy, Suspense } from 'react';
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import Sidebar from '../components/layout/Sidebar';
 import Topbar from '../components/layout/Topbar';
-import Dashboard from '../pages/Dashboard';
-import ClinicRadar from '../pages/ClinicRadar';
-import CRM from '../pages/CRM';
-import AIReceptionist from '../pages/AIReceptionist';
-import Scheduling from '../pages/Scheduling';
-import Patients from '../pages/Patients';
-import PatientProfile from '../pages/PatientProfile';
-import Campaigner from '../pages/Campaigner';
-import Revenue from '../pages/Revenue';
-import DoctorWorkspace from '../pages/DoctorWorkspace';
-import StaffWorkflow from '../pages/StaffWorkflow';
-import Reviews from '../pages/Reviews';
-import Inventory from '../pages/Inventory';
-import Labs from '../pages/Labs';
-import Telehealth from '../pages/Telehealth';
-import Compliance from '../pages/Compliance';
-import Integrations from '../pages/Integrations';
-import Settings from '../pages/Settings';
+
+const Dashboard = lazy(() => import('../pages/Dashboard'));
+const ClinicRadar = lazy(() => import('../pages/ClinicRadar'));
+const Autopilot = lazy(() => import('../pages/Autopilot'));
+const CRM = lazy(() => import('../pages/CRM'));
+const AIReceptionist = lazy(() => import('../pages/AIReceptionist'));
+const Scheduling = lazy(() => import('../pages/Scheduling'));
+const Patients = lazy(() => import('../pages/Patients'));
+const PatientProfile = lazy(() => import('../pages/PatientProfile'));
+const Campaigner = lazy(() => import('../pages/Campaigner'));
+const Revenue = lazy(() => import('../pages/Revenue'));
+const OpportunityCenter = lazy(() => import('../pages/OpportunityCenter'));
+const DoctorWorkspace = lazy(() => import('../pages/DoctorWorkspace'));
+const StaffWorkflow = lazy(() => import('../pages/StaffWorkflow'));
+const Reviews = lazy(() => import('../pages/Reviews'));
+const Inventory = lazy(() => import('../pages/Inventory'));
+const Labs = lazy(() => import('../pages/Labs'));
+const Telehealth = lazy(() => import('../pages/Telehealth'));
+const Compliance = lazy(() => import('../pages/Compliance'));
+const Integrations = lazy(() => import('../pages/Integrations'));
+const Settings = lazy(() => import('../pages/Settings'));
 
 export default function App() {
   return (
@@ -29,26 +33,30 @@ export default function App() {
           <Topbar />
           <div className="app-scroll">
             <div className="app-inner">
-              <Routes>
-                <Route path="/" element={<Dashboard />} />
-                <Route path="/clinic-radar" element={<ClinicRadar />} />
-                <Route path="/crm" element={<CRM />} />
-                <Route path="/ai-receptionist" element={<AIReceptionist />} />
-                <Route path="/scheduling" element={<Scheduling />} />
-                <Route path="/patients" element={<Patients />} />
-                <Route path="/patients/:id" element={<PatientProfile />} />
-                <Route path="/campaigner" element={<Campaigner />} />
-                <Route path="/revenue" element={<Revenue />} />
-                <Route path="/doctor-workspace" element={<DoctorWorkspace />} />
-                <Route path="/staff" element={<StaffWorkflow />} />
-                <Route path="/reviews" element={<Reviews />} />
-                <Route path="/inventory" element={<Inventory />} />
-                <Route path="/labs" element={<Labs />} />
-                <Route path="/telehealth" element={<Telehealth />} />
-                <Route path="/compliance" element={<Compliance />} />
-                <Route path="/integrations" element={<Integrations />} />
-                <Route path="/settings" element={<Settings />} />
-              </Routes>
+              <Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}>
+                <Routes>
+                  <Route path="/" element={<Dashboard />} />
+                  <Route path="/clinic-radar" element={<ClinicRadar />} />
+                  <Route path="/autopilot" element={<Autopilot />} />
+                  <Route path="/crm" element={<CRM />} />
+                  <Route path="/ai-receptionist" element={<AIReceptionist />} />
+                  <Route path="/scheduling" element={<Scheduling />} />
+                  <Route path="/patients" element={<Patients />} />
+                  <Route path="/patients/:id" element={<PatientProfile />} />
+                  <Route path="/campaigner" element={<Campaigner />} />
+                  <Route path="/revenue" element={<Revenue />} />
+                  <Route path="/opportunities" element={<OpportunityCenter />} />
+                  <Route path="/doctor-workspace" element={<DoctorWorkspace />} />
+                  <Route path="/staff" element={<StaffWorkflow />} />
+                  <Route path="/reviews" element={<Reviews />} />
+                  <Route path="/inventory" element={<Inventory />} />
+                  <Route path="/labs" element={<Labs />} />
+                  <Route path="/telehealth" element={<Telehealth />} />
+                  <Route path="/compliance" element={<Compliance />} />
+                  <Route path="/integrations" element={<Integrations />} />
+                  <Route path="/settings" element={<Settings />} />
+                </Routes>
+              </Suspense>
             </div>
           </div>
         </div>

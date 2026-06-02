@@ -1,8 +1,11 @@
 import { RadarChart, PolarGrid, PolarAngleAxis, Radar, ResponsiveContainer } from 'recharts';
 import { doctors } from '../../data/mockClinics';
+import { useApiResource } from '../../hooks/useApiResource';
+import { mapProviderProfile, type ApiProviderProfile } from '../../lib/apiAdapters';
 
 export default function UtilizationChart() {
-  const data = doctors.slice(0, 8).map(d => ({
+  const { data: providerRecords } = useApiResource<ApiProviderProfile, typeof doctors[number]>('/v1/providers/overview?limit=8', doctors, mapProviderProfile);
+  const data = providerRecords.slice(0, 8).map(d => ({
     name: d.name.replace('Dr. ', '').split(' ')[0],
     utilization: d.utilization,
   }));

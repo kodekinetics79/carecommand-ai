@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { AlertCircle, BarChart3, Radar, ShieldCheck, Sparkles, TrendingUp, Zap, ArrowRight, Eye } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import RiskBadge from '../components/ui/RiskBadge';
@@ -8,6 +8,80 @@ import { radarAlerts } from '../data/mockRadar';
 import { branches } from '../data/mockClinics';
 import { formatCurrency } from '../utils/formatters';
 import type { AlertCategory, AlertSeverity } from '../types';
+import { apiRequest } from '../lib/api';
+
+interface ApiCompetitorRadar {
+  id: string;
+  name: string;
+  distanceKm: string;
+  googleRating: string;
+  reviewVolume: number;
+  complaintThemes: string[];
+  activeOffers: string[];
+  localRankTrend: string;
+  weaknessSummary: string;
+  opportunityAlert: string;
+  marketOpeningRecommendation: string;
+  branch: { name: string };
+  insights: Array<{ theme: string; complaintCount: number; summary: string }>;
+}
+
+const competitorPreview: ApiCompetitorRadar[] = [
+  {
+    id: 'demo-comp-1',
+    name: 'Apex MediSuite Dental',
+    distanceKm: '1.4',
+    googleRating: '4.6',
+    reviewVolume: 286,
+    complaintThemes: ['long waits', 'hard upsell'],
+    activeOffers: ['Free consultation', '0% finance'],
+    localRankTrend: 'down',
+    weaknessSummary: 'Lower review velocity and inconsistent follow-up.',
+    opportunityAlert: 'Rating gap opened up after recent complaint spikes.',
+    marketOpeningRecommendation: 'Run a fast-response reputation and reactivation campaign.',
+    branch: { name: 'Downtown' },
+    insights: [
+      { theme: 'waiting time', complaintCount: 14, summary: 'Patients mention slow handoff from reception to consult.' },
+      { theme: 'price transparency', complaintCount: 9, summary: 'Prospects compare pricing before booking.' },
+    ],
+  },
+  {
+    id: 'demo-comp-2',
+    name: 'Northgate Wellness Studio',
+    distanceKm: '2.8',
+    googleRating: '4.2',
+    reviewVolume: 92,
+    complaintThemes: ['pricing', 'availability'],
+    activeOffers: ['Weekend bundle'],
+    localRankTrend: 'flat',
+    weaknessSummary: 'Weak visibility and limited review momentum.',
+    opportunityAlert: 'Their bundled offer is attracting price-sensitive leads.',
+    marketOpeningRecommendation: 'Target value-led campaigns with clear booking urgency.',
+    branch: { name: 'Northgate' },
+    insights: [
+      { theme: 'pricing', complaintCount: 8, summary: 'Visitors see the offer as less transparent.' },
+      { theme: 'availability', complaintCount: 6, summary: 'Weekend capacity is driving missed bookings.' },
+    ],
+  },
+  {
+    id: 'demo-comp-3',
+    name: 'PrimeCare Clinic Group',
+    distanceKm: '3.1',
+    googleRating: '4.8',
+    reviewVolume: 514,
+    complaintThemes: ['wait times', 'phone delays'],
+    activeOffers: ['Same-day booking'],
+    localRankTrend: 'up',
+    weaknessSummary: 'Strong reputation but slow call handling creates openings.',
+    opportunityAlert: 'Phone delays are the most exploitable gap in the market.',
+    marketOpeningRecommendation: 'Compete on response speed and missed-call recovery.',
+    branch: { name: 'Southbank' },
+    insights: [
+      { theme: 'phone queue', complaintCount: 18, summary: 'Call response times are inconsistent during peak hours.' },
+      { theme: 'waiting time', complaintCount: 11, summary: 'In-clinic wait times remain the top complaint theme.' },
+    ],
+  },
+];
 
 const categories: { id: AlertCategory | 'all'; label: string }[] = [
   { id: 'all', label: 'All Signals' },
@@ -43,6 +117,20 @@ const medCount = radarAlerts.filter(a => a.severity === 'medium').length;
 export default function ClinicRadar() {
   const [activeCategory, setActiveCategory] = useState<AlertCategory | 'all'>('all');
   const [activeTab, setActiveTab] = useState<'opportunity' | 'risk'>('opportunity');
+  const [competitors, setCompetitors] = useState<ApiCompetitorRadar[]>(competitorPreview);
+  const [competitorSource, setCompetitorSource] = useState<'live' | 'demo'>('demo');
+
+  useEffect(() => {
+    let active = true;
+    apiRequest<ApiCompetitorRadar[]>('/v1/competitors/radar?limit=10')
+      .then(rows => {
+        if (!active || rows.length === 0) return;
+        setCompetitors(rows);
+        setCompetitorSource('live');
+      })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, []);
 
   const filtered = useMemo(() => {
     let list = activeCategory === 'all' ? radarAlerts : radarAlerts.filter(a => a.category === activeCategory);
@@ -202,6 +290,36 @@ export default function ClinicRadar() {
         {/* Right sidebar */}
         <div className="space-y-4">
           {/* Branch heatmap */}
+          <BentoCard title="Nearby Competitors" subtitle="Local openings, ratings, and complaint themes" headerRight={
+            <span className={`badge ${competitorSource === 'live' ? 'badge-emerald' : 'badge-blue'}`}>{competitorSource === 'live' ? 'Live DB' : 'Demo'}</span>
+          }>
+            <div className="space-y-3">
+              {competitors.map((competitor) => (
+                <div key={competitor.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-sm font-bold text-t1">{competitor.name}</p>
+                      <p className="text-[10px] text-t3 mt-0.5">{competitor.branch.name} · {competitor.distanceKm} km away</p>
+                    </div>
+                    <div className="text-right shrink-0">
+                      <p className="text-sm font-bold text-t1">{Number(competitor.googleRating).toFixed(1)}</p>
+                      <p className="text-[10px] text-t3">{competitor.reviewVolume} reviews</p>
+                    </div>
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {competitor.activeOffers.slice(0, 2).map(offer => (
+                      <span key={offer} className="badge badge-blue">{offer}</span>
+                    ))}
+                  </div>
+                  <p className="text-xs text-t2 mt-2">{competitor.weaknessSummary}</p>
+                  <p className="text-[11px] text-amber-v mt-2">{competitor.opportunityAlert}</p>
+                  <p className="text-[11px] text-t3 mt-1">Weak themes: {competitor.complaintThemes.join(' · ')}</p>
+                  <p className="text-[11px] text-indigo mt-2 font-semibold">{competitor.marketOpeningRecommendation}</p>
+                </div>
+              ))}
+            </div>
+          </BentoCard>
+
           <BentoCard title="Branch Health Heatmap" subtitle="Comparative performance" headerRight={<BarChart3 className="w-4 h-4 text-t3" />}>
             <div className="space-y-3">
               {branches.map((branch) => (

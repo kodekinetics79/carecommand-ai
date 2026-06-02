@@ -8,6 +8,8 @@ import ProgressBar from '../components/ui/ProgressBar';
 import { appointments } from '../data/mockAppointments';
 import { branches } from '../data/mockClinics';
 import { doctors } from '../data/mockClinics';
+import { useApiResource } from '../hooks/useApiResource';
+import { mapAppointment, mapProviderProfile, type ApiAppointment, type ApiProviderProfile } from '../lib/apiAdapters';
 
 const todayDate = '2025-05-26';
 
@@ -36,11 +38,13 @@ const aiRecommendations = [
 export default function Scheduling() {
   const [selectedBranch, setSelectedBranch] = useState('all');
   const [selectedDate, setSelectedDate] = useState(todayDate);
+  const { data: appointmentRecords, source } = useApiResource<ApiAppointment, typeof appointments[number]>('/v1/appointments?limit=100', appointments, mapAppointment);
+  const { data: providerRecords } = useApiResource<ApiProviderProfile, typeof doctors[number]>('/v1/providers/overview?limit=100', doctors, mapProviderProfile);
 
   const todayAppts = useMemo(() =>
-    appointments.filter(a => a.date === selectedDate && (selectedBranch === 'all' || a.branchId === selectedBranch))
+    appointmentRecords.filter(a => a.date === selectedDate && (selectedBranch === 'all' || a.branchId === selectedBranch))
       .sort((a, b) => a.time.localeCompare(b.time)),
-    [selectedBranch, selectedDate]
+    [appointmentRecords, selectedBranch, selectedDate]
   );
 
   const totalValue = todayAppts.reduce((s, a) => s + a.value, 0);
@@ -52,6 +56,8 @@ export default function Scheduling() {
       <PageHeader
         title="Smart Scheduling"
         subtitle="AI-optimised appointment calendar with no-show prediction and slot-filling intelligence."
+        badge={source === 'live' ? 'Live DB' : 'Demo'}
+        badgeColor={source === 'live' ? 'emerald' : 'blue'}
         actions={
           <div className="flex gap-2">
             <button type="button" className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
@@ -176,7 +182,7 @@ export default function Scheduling() {
           {/* Provider utilisation */}
           <BentoCard title="Provider Utilisation" subtitle="Today's capacity">
             <div className="space-y-3">
-              {doctors.slice(0, 5).map((doc) => (
+              {providerRecords.slice(0, 5).map((doc) => (
                 <div key={doc.id}>
                   <div className="flex items-center justify-between gap-2 mb-1">
                     <div className="flex items-center gap-2">

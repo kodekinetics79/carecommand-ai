@@ -5,6 +5,8 @@ import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
 import { inventoryItems } from '../data/mockInventory';
 import { branches } from '../data/mockClinics';
+import { useApiResource } from '../hooks/useApiResource';
+import { mapInventoryItem, type ApiInventoryItem } from '../lib/apiAdapters';
 
 const statusConfig: Record<string, { label: string; badge: string; border: string; bg: string }> = {
   ok:       { label: 'In Stock',  badge: 'badge badge-emerald', border: 'border-[var(--b1)]',        bg: 'bg-[var(--s2)]' },
@@ -13,10 +15,6 @@ const statusConfig: Record<string, { label: string; badge: string; border: strin
   expiring: { label: 'Expiring',  badge: 'badge badge-amber',   border: 'border-[var(--b1)]',        bg: 'bg-[var(--amber-soft)]' },
 };
 
-const criticalCount = inventoryItems.filter(i => i.status === 'critical' || i.status === 'low').length;
-const expiringCount = inventoryItems.filter(i => i.status === 'expiring').length;
-const totalValue = inventoryItems.reduce((s, i) => s + i.currentStock * i.unitCost, 0);
-
 const aiRecommendations = [
   { title: 'Reorder Botox immediately', desc: 'Downtown: 3 vials left, 8 appointments next week. 2-day lead time.', urgency: 'Critical', action: 'Place reorder with Allergan UK' },
   { title: 'Use expiring composite resin first', desc: 'Northgate: expires 15 Jun. Prioritise dental fillings to avoid waste.', urgency: 'Expiring', action: 'Schedule usage priority' },
@@ -24,12 +22,17 @@ const aiRecommendations = [
 ];
 
 export default function Inventory() {
+  const { data: stockItems, source } = useApiResource<ApiInventoryItem, typeof inventoryItems[number]>('/v1/inventory?limit=100', inventoryItems, mapInventoryItem);
+  const criticalCount = stockItems.filter(i => i.status === 'critical' || i.status === 'low').length;
+  const expiringCount = stockItems.filter(i => i.status === 'expiring').length;
+  const totalValue = stockItems.reduce((sum, item) => sum + item.currentStock * item.unitCost, 0);
+
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Inventory Intelligence"
         subtitle="Stock levels, expiry risk, reorder alerts, and AI supply recommendations across all branches."
-        badge={`${criticalCount + expiringCount} Alerts`}
+        badge={`${criticalCount + expiringCount} Alerts · ${source === 'live' ? 'Live DB' : 'Demo'}`}
         badgeColor="red"
         actions={
           <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
@@ -39,7 +42,7 @@ export default function Inventory() {
       />
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Total Items Tracked" value={inventoryItems.length} subtitle="Across all branches" icon={<Package className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Total Items Tracked" value={stockItems.length} subtitle="Across all branches" icon={<Package className="w-4 h-4" />} accent="blue" />
         <StatCard title="Critical / Low Stock" value={criticalCount} subtitle="Needs reorder now" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
         <StatCard title="Expiring Soon" value={expiringCount} subtitle="Within 30 days" icon={<Clock className="w-4 h-4" />} accent="amber" />
         <StatCard title="Inventory Value" value={`£${totalValue.toLocaleString()}`} subtitle="Current stock value" icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
@@ -49,7 +52,7 @@ export default function Inventory() {
         {/* Inventory table */}
         <BentoCard title="Stock Level Dashboard" subtitle="All items across branches">
           <div className="space-y-2.5">
-            {inventoryItems.map((item) => {
+            {stockItems.map((item) => {
               const sc = statusConfig[item.status];
               const branch = branches.find(b => b.id === item.branchId);
               const stockPct = Math.min(100, Math.round((item.currentStock / (item.reorderLevel * 2)) * 100));
@@ -114,7 +117,7 @@ export default function Inventory() {
           <BentoCard title="Category Breakdown" subtitle="Stock by category">
             <div className="space-y-2.5">
               {['Aesthetics', 'Dental', 'Diagnostics', 'Dermatology', 'Physiotherapy', 'General'].map(cat => {
-                const catItems = inventoryItems.filter(i => i.category === cat);
+                const catItems = stockItems.filter(i => i.category === cat);
                 const catValue = catItems.reduce((s, i) => s + i.currentStock * i.unitCost, 0);
                 const hasIssue = catItems.some(i => i.status !== 'ok');
                 return (

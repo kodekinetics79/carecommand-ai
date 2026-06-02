@@ -6,6 +6,8 @@ import BentoCard from '../components/ui/BentoCard';
 import ModuleTabs from '../components/ui/ModuleTabs';
 import ProgressBar from '../components/ui/ProgressBar';
 import { campaigns } from '../data/mockCampaigns';
+import { useApiResource } from '../hooks/useApiResource';
+import { mapCampaign, type ApiCampaign } from '../lib/apiAdapters';
 
 const statusConfig: Record<string, { label: string; color: string; bg: string }> = {
   active:    { label: 'Active',     color: 'text-emerald-700', bg: 'bg-emerald-100' },
@@ -36,30 +38,29 @@ const channelTabs = [
   { id: 'push', label: 'Push' },
 ];
 
-const campaignFilterTabs = [
-  { id: 'all', label: 'All', count: campaigns.length },
-  { id: 'active', label: 'Active', count: campaigns.filter(c => c.status === 'active').length },
-  { id: 'draft', label: 'Draft', count: campaigns.filter(c => c.status === 'draft').length },
-  { id: 'completed', label: 'Completed', count: campaigns.filter(c => c.status === 'completed').length },
-];
-
-const totalRevenue = campaigns.reduce((s, c) => s + c.revenue, 0);
-const totalBooked = campaigns.reduce((s, c) => s + c.booked, 0);
-const activeCount = campaigns.filter(c => c.status === 'active').length;
-
 export default function Campaigner() {
   const [selectedGoal, setSelectedGoal] = useState<string | null>(null);
   const [previewChannel, setPreviewChannel] = useState('whatsapp');
   const [campaignFilter, setCampaignFilter] = useState('all');
+  const { data: campaignRecords, source } = useApiResource<ApiCampaign, typeof campaigns[number]>('/v1/campaigns?limit=100', campaigns, mapCampaign);
+  const campaignFilterTabs = [
+    { id: 'all', label: 'All', count: campaignRecords.length },
+    { id: 'active', label: 'Active', count: campaignRecords.filter(c => c.status === 'active').length },
+    { id: 'draft', label: 'Draft', count: campaignRecords.filter(c => c.status === 'draft').length },
+    { id: 'completed', label: 'Completed', count: campaignRecords.filter(c => c.status === 'completed').length },
+  ];
+  const totalRevenue = campaignRecords.reduce((sum, campaign) => sum + campaign.revenue, 0);
+  const totalBooked = campaignRecords.reduce((sum, campaign) => sum + campaign.booked, 0);
+  const activeCount = campaignRecords.filter(campaign => campaign.status === 'active').length;
 
-  const filteredCampaigns = campaignFilter === 'all' ? campaigns : campaigns.filter(c => c.status === campaignFilter);
+  const filteredCampaigns = campaignFilter === 'all' ? campaignRecords : campaignRecords.filter(c => c.status === campaignFilter);
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Campaigner"
         subtitle="AI-powered campaign studio — build, launch, and measure multi-channel growth campaigns."
-        badge={`${activeCount} Active`}
+        badge={`${activeCount} Active · ${source === 'live' ? 'Live DB' : 'Demo'}`}
         badgeColor="emerald"
         actions={
           <div className="flex gap-2">

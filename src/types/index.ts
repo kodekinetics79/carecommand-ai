@@ -167,6 +167,8 @@ export interface LabOrder {
   lab: string;
   urgency: 'routine' | 'urgent' | 'stat';
   resultSummary?: string;
+  reviewedAt?: string;
+  reviewedBy?: string;
 }
 
 export interface Review {
@@ -199,4 +201,44 @@ export interface RevenueData {
   recovered: number;
   lost: number;
   campaigns: number;
+}
+
+export interface RevenueLeak {
+  id: string;
+  branchId: string;
+  branchName: string;
+  category: string;
+  source: string;
+  evidence: string;
+  estimatedValue: number;
+  confidence: number;
+  status: string;
+  workflowStatus: string;
+  suggestedAction: string;
+  ownerName?: string;
+  patientName?: string;
+  createdAt: string;
+}
+
+export interface Opportunity {
+  id: string;
+  branchId: string;
+  branchName: string;
+  title: string;
+  source: string;
+  category: string;
+  trigger: string;
+  automationSteps: string[];
+  expectedRevenue: number;
+  actualRevenue: number;
+  roi: number;
+  confidence: number;
+  effortLevel: string;
+  urgency: string;
+  status: string;
+  ownerApprovalRequired: boolean;
+  recommendedAction: string;
+  ownerName?: string;
+  patientName?: string;
+  createdAt: string;
 }

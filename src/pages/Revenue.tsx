@@ -7,11 +7,8 @@ import RevenueChart from '../components/charts/RevenueChart';
 import BranchComparisonChart from '../components/charts/BranchComparisonChart';
 import { revenueData, branchRevenue, serviceRevenue } from '../data/mockRevenue';
 import { formatCurrency } from '../utils/formatters';
-
-const latest = revenueData[revenueData.length - 1];
-const prev = revenueData[revenueData.length - 2];
-const revGrowth = Math.round(((latest.revenue - prev.revenue) / prev.revenue) * 100);
-const recoveredGrowth = Math.round(((latest.recovered - prev.recovered) / prev.recovered) * 100);
+import { useApiResource } from '../hooks/useApiResource';
+import { mapRevenueSnapshot, type ApiRevenueSnapshot } from '../lib/apiAdapters';
 
 const lostOpportunities = [
   { label: 'Missed calls — unrecovered', value: 3450, action: 'Launch AI follow-up' },
@@ -21,21 +18,30 @@ const lostOpportunities = [
 ];
 
 type BarColor = 'blue' | 'violet' | 'emerald' | 'red' | 'teal';
-const waterfall: { label: string; value: number; color: BarColor; positive: boolean }[] = [
-  { label: 'Gross Revenue',        value: latest.revenue,                                                     color: 'blue',    positive: true },
-  { label: '+ Campaign Revenue',   value: latest.campaigns,                                                   color: 'violet',  positive: true },
-  { label: '+ Automation Recovery',value: latest.recovered,                                                   color: 'emerald', positive: true },
-  { label: '− Lost Opportunities', value: latest.lost,                                                        color: 'red',     positive: false },
-  { label: 'Net Revenue',          value: latest.revenue + latest.campaigns + latest.recovered - latest.lost, color: 'teal',    positive: true },
-];
-const maxWaterfall = Math.max(...waterfall.map(w => Math.abs(w.value)));
+const revenueFallback = revenueData.map((row, index) => ({ ...row, id: `demo-revenue-${index}` })).reverse();
 
 export default function Revenue() {
+  const { data: revenueRecords, source } = useApiResource<ApiRevenueSnapshot, typeof revenueFallback[number]>('/v1/revenue-snapshots?limit=100', revenueFallback, mapRevenueSnapshot);
+  const latest = revenueRecords[0] ?? revenueRecords[revenueRecords.length - 1] ?? revenueFallback.at(-1)!;
+  const prev = revenueRecords[1] ?? revenueRecords[revenueRecords.length - 2] ?? latest;
+  const revGrowth = prev.revenue > 0 ? Math.round(((latest.revenue - prev.revenue) / prev.revenue) * 100) : 0;
+  const recoveredGrowth = prev.recovered > 0 ? Math.round(((latest.recovered - prev.recovered) / prev.recovered) * 100) : 0;
+  const waterfall: { label: string; value: number; color: BarColor; positive: boolean }[] = [
+    { label: 'Gross Revenue', value: latest.revenue, color: 'blue', positive: true },
+    { label: '+ Campaign Revenue', value: latest.campaigns, color: 'violet', positive: true },
+    { label: '+ Automation Recovery', value: latest.recovered, color: 'emerald', positive: true },
+    { label: '− Lost Opportunities', value: latest.lost, color: 'red', positive: false },
+    { label: 'Net Revenue', value: latest.revenue + latest.campaigns + latest.recovered - latest.lost, color: 'teal', positive: true },
+  ];
+  const maxWaterfall = Math.max(...waterfall.map(item => Math.abs(item.value)));
+
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="RevenuePulse"
         subtitle="CFO-level revenue intelligence — recovery, attribution, branch comparison, and lost opportunity tracking."
+        badge={source === 'live' ? 'Live DB' : 'Demo'}
+        badgeColor={source === 'live' ? 'emerald' : 'blue'}
         actions={
           <div className="flex gap-2">
             <button type="button" className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
@@ -173,7 +179,7 @@ export default function Revenue() {
               </tr>
             </thead>
             <tbody className="divide-y divide-[var(--b0)]">
-              {revenueData.map((row) => (
+              {revenueRecords.map((row) => (
                 <tr key={row.month} className="hover:bg-[var(--s3)] transition-colors">
                   <td className="py-2.5 px-3 text-xs font-semibold text-t2">{row.month}</td>
                   <td className="py-2.5 px-3 text-xs font-bold text-t1">{formatCurrency(row.revenue)}</td>

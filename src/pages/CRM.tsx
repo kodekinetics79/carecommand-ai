@@ -8,6 +8,8 @@ import RiskBadge from '../components/ui/RiskBadge';
 import { leads, patients } from '../data/mockPatients';
 import { campaigns } from '../data/mockCampaigns';
 import { formatNumber } from '../utils/formatters';
+import { useApiResource } from '../hooks/useApiResource';
+import { mapLead, mapPatient, type ApiLead, type ApiPatient } from '../lib/apiAdapters';
 
 const stages = ['new-inquiry', 'contacted', 'booked', 'visited', 'follow-up', 'retained', 'lost'] as const;
 type Stage = typeof stages[number];
@@ -44,36 +46,38 @@ const lifecycleConfig: Record<string, { label: string; badgeClass: string }> = {
 export default function CRM() {
   const [inactiveSegment, setInactiveSegment] = useState('60');
   const [searchQuery, setSearchQuery] = useState('');
+  const { data: leadRecords, source: leadSource } = useApiResource<ApiLead, typeof leads[number]>('/v1/leads?limit=100', leads, mapLead);
+  const { data: customerRecords } = useApiResource<ApiPatient, typeof patients[number]>('/v1/patients?limit=100', patients, mapPatient);
 
-  const churnRisk = useMemo(() => Math.round(patients.reduce((s, p) => s + p.churnRisk, 0) / patients.length), []);
-  const avgLTV = useMemo(() => Math.round(patients.reduce((s, p) => s + p.lifetimeValue, 0) / patients.length), []);
-  const atRiskCount = useMemo(() => patients.filter(p => p.lifecycleStage === 'at-risk' || p.lifecycleStage === 'inactive').length, []);
-  const totalPipelineValue = useMemo(() => leads.reduce((s, l) => s + l.estimatedValue, 0), []);
+  const churnRisk = useMemo(() => customerRecords.length > 0 ? Math.round(customerRecords.reduce((s, p) => s + p.churnRisk, 0) / customerRecords.length) : 0, [customerRecords]);
+  const avgLTV = useMemo(() => customerRecords.length > 0 ? Math.round(customerRecords.reduce((s, p) => s + p.lifetimeValue, 0) / customerRecords.length) : 0, [customerRecords]);
+  const atRiskCount = useMemo(() => customerRecords.filter(p => p.lifecycleStage === 'at-risk' || p.lifecycleStage === 'inactive').length, [customerRecords]);
+  const totalPipelineValue = useMemo(() => leadRecords.reduce((s, l) => s + l.estimatedValue, 0), [leadRecords]);
 
   const stageLeads = useMemo(() => {
     const map: Record<string, typeof leads> = {};
-    stages.forEach(s => { map[s] = leads.filter(l => l.stage === s); });
+    stages.forEach(s => { map[s] = leadRecords.filter(l => l.stage === s); });
     return map;
-  }, []);
+  }, [leadRecords]);
 
   const inactiveCounts = useMemo(() => ({
-    '30': patients.filter(p => { const d = daysSince(p.lastVisit); return d > 30 && d <= 60; }).length,
-    '60': patients.filter(p => { const d = daysSince(p.lastVisit); return d > 60 && d <= 90; }).length,
-    '90': patients.filter(p => { const d = daysSince(p.lastVisit); return d > 90 && d <= 180; }).length,
-    '180': patients.filter(p => daysSince(p.lastVisit) > 180).length,
-  }), []);
+    '30': customerRecords.filter(p => { const d = daysSince(p.lastVisit); return d > 30 && d <= 60; }).length,
+    '60': customerRecords.filter(p => { const d = daysSince(p.lastVisit); return d > 60 && d <= 90; }).length,
+    '90': customerRecords.filter(p => { const d = daysSince(p.lastVisit); return d > 90 && d <= 180; }).length,
+    '180': customerRecords.filter(p => daysSince(p.lastVisit) > 180).length,
+  }), [customerRecords]);
 
   const filteredPatients = useMemo(() => {
     const q = searchQuery.toLowerCase();
-    return patients.filter(p => !q || p.name.toLowerCase().includes(q) || p.tags.some(t => t.includes(q)));
-  }, [searchQuery]);
+    return customerRecords.filter(p => !q || p.name.toLowerCase().includes(q) || p.tags.some(t => t.includes(q)));
+  }, [customerRecords, searchQuery]);
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="GrowthPulse CRM"
         subtitle="Lead pipeline, customer lifecycle, and revenue retention intelligence."
-        badge={`${leads.length} Open Leads`}
+        badge={`${leadRecords.length} Open Leads · ${leadSource === 'live' ? 'Live DB' : 'Demo'}`}
         badgeColor="blue"
         actions={
           <div className="flex gap-2">
@@ -109,7 +113,7 @@ export default function CRM() {
                 <p className={`text-[10px] font-bold uppercase tracking-widest mb-2 ${cfg.color}`}>{cfg.label}</p>
                 <p className="text-2xl font-bold text-t1">{count}</p>
                 <p className={`text-[11px] font-semibold mt-1 ${cfg.color}`}>£{val.toLocaleString()}</p>
-                <ProgressBar value={count} max={leads.length} color={stage === 'lost' ? 'red' : stage === 'retained' ? 'emerald' : 'blue'} className="mt-2" />
+                <ProgressBar value={count} max={leadRecords.length} color={stage === 'lost' ? 'red' : stage === 'retained' ? 'emerald' : 'blue'} className="mt-2" />
               </div>
             );
           })}
@@ -172,7 +176,7 @@ export default function CRM() {
             <button type="button" className="text-xs font-semibold text-indigo hover:opacity-80 flex items-center gap-1">All leads <ArrowRight className="w-3 h-3" /></button>
           }>
             <div className="space-y-2">
-              {leads.slice(0, 6).map((lead) => {
+              {leadRecords.slice(0, 6).map((lead) => {
                 const cfg = stageConfig[lead.stage];
                 return (
                   <div key={lead.id} className="flex items-center gap-3 p-3 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all">

@@ -20,7 +20,7 @@ export default function RevenueChart() {
         <YAxis tick={{ fontSize: 11, fill: '#9CA3AF' }} axisLine={false} tickLine={false} tickFormatter={v => `£${(v/1000).toFixed(0)}k`} />
         <Tooltip
           contentStyle={{ background: '#FFFFFF', border: '1px solid #E5EAF0', borderRadius: '12px', fontSize: 12, color: '#111827', boxShadow: '0 8px 24px rgba(15,23,42,0.1)' }}
-          formatter={(v: any, name: any) => [`£${(v/1000).toFixed(1)}k`, name === 'revenue' ? 'Revenue' : name === 'recovered' ? 'Recovered' : 'Campaign']}
+          formatter={(value, name) => [`£${(Number(value) / 1000).toFixed(1)}k`, name === 'revenue' ? 'Revenue' : name === 'recovered' ? 'Recovered' : 'Campaign']}
         />
         <Area type="monotone" dataKey="revenue" stroke="#4F46E5" strokeWidth={2} fill="url(#revGrad)" name="revenue" />
         <Area type="monotone" dataKey="recovered" stroke="#059669" strokeWidth={2} fill="url(#recGrad)" name="recovered" />

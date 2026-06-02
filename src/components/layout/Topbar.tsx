@@ -2,10 +2,12 @@ import { useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import { Search, Bell, Command, Zap } from 'lucide-react';
 import CommandPalette from '../ui/CommandPalette';
+import { useBackendHealth } from '../../hooks/useBackendHealth';
 
 const routeLabels: Record<string, string> = {
   '/':                'Dashboard',
   '/clinic-radar':    'Clinic Radar',
+  '/autopilot':       'CareFlow Autopilot',
   '/crm':             'CRM Pipeline',
   '/campaigner':      'Campaigner',
   '/reviews':         'Reviews & Referrals',
@@ -34,6 +36,7 @@ export default function Topbar() {
   const { pathname } = useLocation();
   const [cmdOpen,   setCmdOpen]   = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
+  const backendReady = useBackendHealth();
 
   const pageLabel = pathname === '/'
     ? 'Dashboard'
@@ -49,7 +52,7 @@ export default function Topbar() {
           <span className="text-sm font-semibold text-t1 truncate">{pageLabel}</span>
           <div className="flex items-center gap-1.5 ml-2 px-2 py-0.5 rounded-full topbar-live">
             <span className="w-1.5 h-1.5 rounded-full live-dot pf-emerald" />
-            <span className="text-[10px] font-semibold topbar-live-text">Live</span>
+            <span className="text-[10px] font-semibold topbar-live-text">{backendReady ? 'API Live' : 'Demo Mode'}</span>
           </div>
         </div>
 

@@ -3,6 +3,8 @@ import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import { integrations } from '../data/mockIntegrations';
+import { useApiResource } from '../hooks/useApiResource';
+import { mapIntegration, type ApiIntegration } from '../lib/apiAdapters';
 
 const iconMap: Record<string, React.ElementType> = {
   MessagesSquare,
@@ -32,9 +34,6 @@ const categoryColors: Record<string, string> = {
   Booking:     'badge badge-indigo',
 };
 
-const connectedCount = integrations.filter(i => i.status === 'connected').length;
-const disconnectedCount = integrations.filter(i => i.status === 'disconnected').length;
-
 const suggestedIntegrations = [
   { name: 'Calendly', category: 'Booking', desc: 'Self-booking for consultations and virtual visits.' },
   { name: 'Xero', category: 'Accounting', desc: 'Financial sync for UK clinics — alternative to QuickBooks.' },
@@ -42,12 +41,16 @@ const suggestedIntegrations = [
 ];
 
 export default function Integrations() {
+  const { data: integrationRecords, source } = useApiResource<ApiIntegration, typeof integrations[number]>('/v1/integrations', integrations, mapIntegration);
+  const connectedCount = integrationRecords.filter(integration => integration.status === 'connected').length;
+  const disconnectedCount = integrationRecords.filter(integration => integration.status === 'disconnected').length;
+
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Integrations Hub"
         subtitle="Connect messaging, payment, analytics, and practice infrastructure to automate your entire operation."
-        badge={`${connectedCount} Connected`}
+        badge={`${connectedCount} Connected · ${source === 'live' ? 'Live DB' : 'Demo'}`}
         badgeColor="blue"
         actions={
           <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition">
@@ -67,7 +70,7 @@ export default function Integrations() {
         {/* Integration cards */}
         <BentoCard title="Connected Services" subtitle="All integrations · Live status">
           <div className="grid gap-3 sm:grid-cols-2">
-            {integrations.map((integration) => {
+            {integrationRecords.map((integration) => {
               const Icon = iconMap[integration.icon as string] || Cloud;
               const sc = statusConfig[integration.status as keyof typeof statusConfig];
               const catColor = categoryColors[integration.category] || 'badge badge-blue';

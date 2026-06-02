@@ -2,8 +2,10 @@ import { Video, CheckCircle2, Clock, ArrowRight, Sparkles, Phone, CalendarDays, 
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
+import { useApiResource } from '../hooks/useApiResource';
+import { mapTelehealthSession, type ApiTelehealthSession, type TelehealthSession } from '../lib/apiAdapters';
 
-const sessions = [
+const fallbackSessions: TelehealthSession[] = [
   { id: 't1', patient: 'Rowan Brooks', initials: 'RB', service: 'Virtual Dermatology Review', date: '2026-05-26', time: '10:00', status: 'Confirmed', provider: 'Dr. Priya Sharma', value: 220, intakeComplete: true },
   { id: 't2', patient: 'Nora Steele', initials: 'NS', service: 'Telehealth Nutrition Follow-up', date: '2026-05-26', time: '14:00', status: 'Pending', provider: 'Dr. Lisa Wong', value: 180, intakeComplete: false },
   { id: 't3', patient: 'Oliver Chen', initials: 'OC', service: 'Virtual GP Consultation', date: '2026-05-27', time: '09:30', status: 'Confirmed', provider: 'Dr. James Okafor', value: 150, intakeComplete: true },
@@ -22,6 +24,12 @@ const statusColors: Record<string, { dot: string; text: string; bg: string }> = 
 };
 
 export default function Telehealth() {
+  const { data: sessions } = useApiResource<ApiTelehealthSession, TelehealthSession>(
+    '/v1/telehealth/sessions?limit=100',
+    fallbackSessions,
+    mapTelehealthSession,
+  );
+
   const intakeComplete = sessions.filter(s => s.intakeComplete).length;
   const confirmedCount = sessions.filter(s => s.status === 'Confirmed').length;
   const totalValue = sessions.reduce((s, sess) => s + sess.value, 0);

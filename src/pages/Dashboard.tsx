@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import {
   ArrowRight, CalendarDays, DollarSign, Phone, Sparkles, TrendingUp,
   Users, Zap, AlertCircle, CheckCircle2, BarChart3, Star, Clock
@@ -15,6 +16,9 @@ import { patients } from '../data/mockPatients';
 import { radarAlerts } from '../data/mockRadar';
 import { campaigns } from '../data/mockCampaigns';
 import { formatCurrency } from '../utils/formatters';
+import { apiRequest } from '../lib/api';
+import { useApiResource } from '../hooks/useApiResource';
+import { mapCampaign, type ApiCampaign } from '../lib/apiAdapters';
 
 const todayDate = '2025-05-26';
 const todayAppts = appointments.filter(a => a.date === todayDate).length;
@@ -24,6 +28,32 @@ const missedCallRecovery = 19;
 const noShowRisk = appointments.filter(a => a.status === 'risky' || a.status === 'no-show').length;
 const totalRevenue = branches.reduce((s, b) => s + b.revenue, 0);
 const avgHealthScore = Math.round(branches.reduce((s, b) => s + b.healthScore, 0) / branches.length);
+
+interface DashboardSummary {
+  generatedAt: string;
+  networkRevenue: number;
+  revenueRecovered: number;
+  activeCustomers: number;
+  todaysAppointments: number;
+  noShowRisk: number;
+  callsRecovered: number;
+  missedCalls: number;
+  activeOpportunities: number;
+  pendingApprovals: number;
+}
+
+const fallbackSummary: DashboardSummary = {
+  generatedAt: new Date().toISOString(),
+  networkRevenue: totalRevenue,
+  revenueRecovered,
+  activeCustomers,
+  todaysAppointments: todayAppts,
+  noShowRisk,
+  callsRecovered: missedCallRecovery,
+  missedCalls: 23,
+  activeOpportunities: 28350,
+  pendingApprovals: 1,
+};
 
 const priorityActions = [
   { id: 'p1', title: 'Run 90-day inactive customer campaign', description: '187 customers eligible. Historical conversion: 18%. Est. £18,700 in recoverable revenue.', impact: '£18,700', urgency: 'high' as const, action: 'Activate Winback Campaign', icon: <Users className="w-3.5 h-3.5" /> },
@@ -56,11 +86,32 @@ function branchScoreColor(score: number) {
 }
 
 export default function Dashboard() {
+  const [summary, setSummary] = useState(fallbackSummary);
+  const [summarySource, setSummarySource] = useState<'live' | 'demo'>('demo');
+  const { data: campaignRecords } = useApiResource<ApiCampaign, typeof campaigns[number]>('/v1/campaigns?limit=3', campaigns, mapCampaign);
+
+  useEffect(() => {
+    let active = true;
+    apiRequest<DashboardSummary>('/v1/dashboard/summary')
+      .then(row => {
+        if (!active) return;
+        setSummary(row);
+        setSummarySource('live');
+      })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, []);
+
+  const reportDate = new Date(summary.generatedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+  const totalCalls = summary.callsRecovered + summary.missedCalls;
+
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Command Center"
-        subtitle="Growth cockpit for your multi-location clinic network · 26 May 2026"
+        subtitle={`Growth cockpit for your multi-location clinic network · ${reportDate}`}
+        badge={summarySource === 'live' ? 'Live DB' : 'Demo'}
+        badgeColor={summarySource === 'live' ? 'emerald' : 'blue'}
         actions={
           <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-[rgba(99,102,241,0.25)] hover:opacity-90 transition-opacity">
             <Sparkles className="w-4 h-4" /> AI Briefing
@@ -77,15 +128,15 @@ export default function Dashboard() {
               <p className="text-xs font-bold uppercase tracking-widest text-indigo-200">Today's Growth Briefing</p>
             </div>
             <h2 className="text-xl font-bold text-white mb-1 leading-snug">
-              £{(revenueRecovered / 1000).toFixed(0)}K recovered this month · £28,350 in active opportunities
+              £{(summary.revenueRecovered / 1000).toFixed(0)}K recovered this month · {formatCurrency(summary.activeOpportunities)} in active opportunities
             </h2>
             <p className="text-sm text-white/70 leading-relaxed max-w-2xl">
-              AI detected <span className="text-white font-medium">5 revenue signals</span> today. Westside has 31 empty slots at risk, 23 missed calls need follow-up, and your 90-day winback campaign can generate £18,700 this week.
+              Your live operating data shows <span className="text-white font-medium">{summary.pendingApprovals} governed AI action{summary.pendingApprovals === 1 ? '' : 's'}</span> awaiting review and {summary.missedCalls} missed calls needing follow-up. Preview intelligence below shows the richer network model as more records arrive.
             </p>
           </div>
           <div className="shrink-0 flex flex-col items-end gap-2">
             <div className="text-right">
-              <p className="text-2xl font-bold text-white tabular-nums">{formatCurrency(totalRevenue)}</p>
+              <p className="text-2xl font-bold text-white tabular-nums">{formatCurrency(summary.networkRevenue)}</p>
               <p className="text-xs text-white/65">Network revenue this month</p>
             </div>
             <button type="button" className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-200 hover:text-white transition-colors">
@@ -97,12 +148,12 @@ export default function Dashboard() {
 
       {/* KPI Strip — 6 stats */}
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-3 xl:grid-cols-6">
-        <StatCard title="Network Revenue" value={formatCurrency(totalRevenue)} subtitle="This month" trend={12} icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Revenue Recovered" value={formatCurrency(revenueRecovered)} subtitle="By automation" trend={23} icon={<DollarSign className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Today's Appointments" value={todayAppts} subtitle="Across all branches" icon={<CalendarDays className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Active Customers" value={activeCustomers} subtitle="Engaged base" trend={4} icon={<Users className="w-4 h-4" />} accent="violet" />
-        <StatCard title="No-Show Risk" value={noShowRisk} subtitle="Flagged today" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
-        <StatCard title="Calls Recovered" value={`${missedCallRecovery}/42`} subtitle="AI follow-up rate" trend={48} icon={<Phone className="w-4 h-4" />} accent="cyan" />
+        <StatCard title="Network Revenue" value={formatCurrency(summary.networkRevenue)} subtitle="Latest snapshot" icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Revenue Recovered" value={formatCurrency(summary.revenueRecovered)} subtitle="By automation" icon={<DollarSign className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Today's Appointments" value={summary.todaysAppointments} subtitle="Across your scope" icon={<CalendarDays className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Active Customers" value={summary.activeCustomers} subtitle="Engaged base" icon={<Users className="w-4 h-4" />} accent="violet" />
+        <StatCard title="No-Show Risk" value={summary.noShowRisk} subtitle="Flagged today" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
+        <StatCard title="Calls Recovered" value={`${summary.callsRecovered}/${totalCalls}`} subtitle="AI follow-up queue" icon={<Phone className="w-4 h-4" />} accent="cyan" />
       </div>
 
       {/* Main Bento Grid */}
@@ -112,7 +163,7 @@ export default function Dashboard() {
         <div className="space-y-4">
 
           {/* Branch Health Grid */}
-          <BentoCard title="Branch Health Scores" subtitle="Live branch intelligence" headerRight={
+          <BentoCard title="Branch Health Scores" subtitle="Network intelligence preview" headerRight={
             <span className="text-xs font-semibold text-t3 bg-[var(--s3)] px-2.5 py-1 rounded-full">Avg {avgHealthScore}/100</span>
           }>
             <div className="grid gap-3 sm:grid-cols-2">
@@ -168,7 +219,7 @@ export default function Dashboard() {
             </button>
           }>
             <div className="space-y-3">
-              {campaigns.slice(0, 3).map((c) => {
+              {campaignRecords.slice(0, 3).map((c) => {
                 const convRate = c.audienceSize > 0 ? Math.round((c.booked / c.audienceSize) * 100) : 0;
                 return (
                   <div key={c.id} className="flex items-center gap-4 p-3 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] transition-colors">
@@ -202,7 +253,7 @@ export default function Dashboard() {
         <div className="space-y-4">
 
           {/* Owner's Priority List */}
-          <BentoCard title="Owner's Priority List" subtitle="AI-recommended actions" headerRight={
+          <BentoCard title="Owner's Priority List" subtitle="AI recommendation preview" headerRight={
             <span className="flex items-center gap-1 text-[10px] font-bold text-violet-v bg-[var(--violet-soft)] px-2 py-1 rounded-full">
               <Sparkles className="w-3 h-3" /> AI
             </span>
@@ -230,7 +281,7 @@ export default function Dashboard() {
           </BentoCard>
 
           {/* AI Growth Signals */}
-          <BentoCard title="Key Growth Signals" subtitle="ClinicRadar AI · Live" headerRight={
+          <BentoCard title="Key Growth Signals" subtitle="ClinicRadar AI · Preview" headerRight={
             <span className="flex items-center gap-1 text-[10px] font-bold text-emerald-v bg-[var(--emerald-soft)] px-2 py-1 rounded-full">
               <span className="w-1.5 h-1.5 rounded-full bg-[var(--emerald)]" /> Live
             </span>

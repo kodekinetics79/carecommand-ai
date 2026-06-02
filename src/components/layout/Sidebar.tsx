@@ -3,7 +3,7 @@ import {
   LayoutDashboard, Radar, Users2, Megaphone, TrendingUp,
   Bot, CalendarDays, UserCircle2, Stethoscope, ClipboardList,
   Package, FileText, Video, ShieldCheck, Puzzle, Settings,
-  Star, ChevronDown, Hexagon,
+  Star, ChevronDown, Hexagon, Orbit, Target,
 } from 'lucide-react';
 
 interface NavItem {
@@ -26,6 +26,7 @@ const nav: NavSection[] = [
     items: [
       { label: 'Dashboard',    path: '/',             icon: LayoutDashboard },
       { label: 'Clinic Radar', path: '/clinic-radar', icon: Radar, badge: 3, badgeColor: 'red' },
+      { label: 'CareFlow Autopilot', path: '/autopilot', icon: Orbit, live: true },
     ],
   },
   {
@@ -35,6 +36,7 @@ const nav: NavSection[] = [
       { label: 'Campaigner',   path: '/campaigner',  icon: Megaphone },
       { label: 'Reviews',      path: '/reviews',     icon: Star },
       { label: 'RevenuePulse', path: '/revenue',     icon: TrendingUp },
+      { label: 'Opportunity Center', path: '/opportunities', icon: Target, badge: 'New', badgeColor: 'indigo' },
     ],
   },
   {
