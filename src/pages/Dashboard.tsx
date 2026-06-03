@@ -11,11 +11,7 @@ import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
 import RevenueChart from '../components/charts/RevenueChart';
 import UtilizationChart from '../components/charts/UtilizationChart';
-import { branches } from '../data/mockClinics';
-import { appointments } from '../data/mockAppointments';
-import { patients } from '../data/mockPatients';
-import { radarAlerts } from '../data/mockRadar';
-import { campaigns } from '../data/mockCampaigns';
+import { branches, appointments, patients, radarAlerts, campaigns } from '../data/seedData';
 import { formatCurrency } from '../utils/formatters';
 import { apiRequest } from '../lib/api';
 import { useApiResource } from '../hooks/useApiResource';
@@ -57,11 +53,11 @@ const fallbackSummary: DashboardSummary = {
 };
 
 const priorityActions = [
-  { id: 'p1', title: 'Run 90-day inactive customer campaign', description: '187 customers eligible. Historical conversion: 18%. Est. £18,700 in recoverable revenue.', impact: '£18,700', urgency: 'high' as const, action: 'Activate Winback Campaign', icon: <Users className="w-3.5 h-3.5" /> },
-  { id: 'p2', title: 'Westside has 31 empty slots this week', description: 'At £200/slot, £6,200 is at risk. Recommend limited weekday offer for skin services.', impact: '£6,200', urgency: 'high' as const, action: 'Create Slot-Fill Campaign', icon: <CalendarDays className="w-3.5 h-3.5" /> },
-  { id: 'p3', title: '23 missed calls still uncontacted', description: '42 calls this month. AI recovered 19. 23 remain — est. £3,450 in lost opportunity.', impact: '£3,450', urgency: 'medium' as const, action: 'Review Missed-Call Queue', icon: <Phone className="w-3.5 h-3.5" /> },
+  { id: 'p1', title: 'Run 90-day inactive customer campaign', description: `187 customers eligible. Historical conversion: 18%. Est. ${formatCurrency(18700)} in recoverable revenue.`, impact: formatCurrency(18700), urgency: 'high' as const, action: 'Activate Winback Campaign', icon: <Users className="w-3.5 h-3.5" /> },
+  { id: 'p2', title: 'Westside has 31 empty slots this week', description: `At ${formatCurrency(200)}/slot, ${formatCurrency(6200)} is at risk. Recommend limited weekday offer for skin services.`, impact: formatCurrency(6200), urgency: 'high' as const, action: 'Create Slot-Fill Campaign', icon: <CalendarDays className="w-3.5 h-3.5" /> },
+  { id: 'p3', title: '23 missed calls still uncontacted', description: `42 calls this month. 19 recovered. 23 remain — est. ${formatCurrency(3450)} in lost opportunity.`, impact: formatCurrency(3450), urgency: 'medium' as const, action: 'Review Missed-Call Queue', icon: <Phone className="w-3.5 h-3.5" /> },
   { id: 'p4', title: 'Dr. Mitchell: high repeat rate, low reviews', description: '78% repeat-visit rate. Only 12 review requests sent vs 89 consultations. Est. 28 new reviews.', impact: 'Reputation', urgency: 'medium' as const, action: 'Launch Review Campaign', icon: <Star className="w-3.5 h-3.5" /> },
-  { id: 'p5', title: '14 follow-up opportunities not yet rebooked', description: "Post-service customers who haven't scheduled their next visit. Est. value: £4,800.", impact: '£4,800', urgency: 'low' as const, action: 'Assign Follow-Up Tasks', icon: <CheckCircle2 className="w-3.5 h-3.5" /> },
+  { id: 'p5', title: '14 follow-up opportunities not yet rebooked', description: "Post-service customers who haven't scheduled their next visit. Est. value: $4,800.", impact: formatCurrency(4800), urgency: 'low' as const, action: 'Assign Follow-Up Tasks', icon: <CheckCircle2 className="w-3.5 h-3.5" /> },
 ];
 
 const actionRoute: Record<string, string> = {
@@ -123,9 +119,17 @@ export default function Dashboard() {
         badge={summarySource === 'live' ? 'Live DB' : 'Demo'}
         badgeColor={summarySource === 'live' ? 'emerald' : 'blue'}
         actions={
-          <button type="button" onClick={() => navigate('/clinic-radar')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-[rgba(99,102,241,0.25)] hover:opacity-90 transition-opacity">
-            <Sparkles className="w-4 h-4" /> AI Briefing
-          </button>
+          <div className="flex flex-wrap gap-2">
+            <button type="button" onClick={() => navigate('/opportunities')} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
+              <AlertCircle className="w-4 h-4" /> View Leaks
+            </button>
+            <button type="button" onClick={() => navigate('/crm')} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
+              <Users className="w-4 h-4" /> Open CRM
+            </button>
+            <button type="button" onClick={() => navigate('/campaigner')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-[rgba(99,102,241,0.25)] hover:opacity-90 transition-opacity">
+              <Sparkles className="w-4 h-4" /> Launch Campaign
+            </button>
+          </div>
         }
       />
 
@@ -138,10 +142,10 @@ export default function Dashboard() {
               <p className="text-xs font-bold uppercase tracking-widest text-indigo-200">Today's Growth Briefing</p>
             </div>
             <h2 className="text-xl font-bold text-white mb-1 leading-snug">
-              £{(summary.revenueRecovered / 1000).toFixed(0)}K recovered this month · {formatCurrency(summary.activeOpportunities)} in active opportunities
+              {formatCurrency(summary.revenueRecovered)} recovered this month · {formatCurrency(summary.activeOpportunities)} in active opportunities
             </h2>
             <p className="text-sm text-white/70 leading-relaxed max-w-2xl">
-              Your live operating data shows <span className="text-white font-medium">{summary.pendingApprovals} governed AI action{summary.pendingApprovals === 1 ? '' : 's'}</span> awaiting review and {summary.missedCalls} missed calls needing follow-up. Preview intelligence below shows the richer network model as more records arrive.
+              Your live operating data shows <span className="text-white font-medium">{summary.pendingApprovals} governed action{summary.pendingApprovals === 1 ? '' : 's'}</span> awaiting review and {summary.missedCalls} missed calls needing follow-up. Open the advisory team when you want a revenue, growth, front desk, or operations readout.
             </p>
           </div>
           <div className="shrink-0 flex flex-col items-end gap-2">
@@ -149,9 +153,14 @@ export default function Dashboard() {
               <p className="text-2xl font-bold text-white tabular-nums">{formatCurrency(summary.networkRevenue)}</p>
               <p className="text-xs text-white/65">Network revenue this month</p>
             </div>
-            <button type="button" onClick={() => navigate('/revenue')} className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-200 hover:text-white transition-colors">
-              View full report <ArrowRight className="w-3.5 h-3.5" />
-            </button>
+            <div className="flex flex-wrap items-center justify-end gap-3">
+              <button type="button" onClick={() => navigate('/advisory')} className="inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-white/10 px-3 py-1.5 text-xs font-semibold text-white hover:bg-white/15 transition-colors">
+                <Sparkles className="w-3.5 h-3.5" /> Ask Advisors
+              </button>
+              <button type="button" onClick={() => navigate('/revenue')} className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-200 hover:text-white transition-colors">
+                View full report <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -163,7 +172,7 @@ export default function Dashboard() {
         <StatCard title="Today's Appointments" value={summary.todaysAppointments} subtitle="Across your scope" icon={<CalendarDays className="w-4 h-4" />} accent="blue" />
         <StatCard title="Active Customers" value={summary.activeCustomers} subtitle="Engaged base" icon={<Users className="w-4 h-4" />} accent="violet" />
         <StatCard title="No-Show Risk" value={summary.noShowRisk} subtitle="Flagged today" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
-        <StatCard title="Calls Recovered" value={`${summary.callsRecovered}/${totalCalls}`} subtitle="AI follow-up queue" icon={<Phone className="w-4 h-4" />} accent="cyan" />
+        <StatCard title="Calls Recovered" value={`${summary.callsRecovered}/${totalCalls}`} subtitle="Follow-up queue" icon={<Phone className="w-4 h-4" />} accent="cyan" />
       </div>
 
       {/* Main Bento Grid */}
@@ -173,7 +182,7 @@ export default function Dashboard() {
         <div className="space-y-4">
 
           {/* Branch Health Grid */}
-          <BentoCard title="Branch Health Scores" subtitle="Network intelligence preview" headerRight={
+          <BentoCard title="Branch Health Scores" subtitle="Network-wide operating health" headerRight={
             <span className="text-xs font-semibold text-t3 bg-[var(--s3)] px-2.5 py-1 rounded-full">Avg {avgHealthScore}/100</span>
           }>
             <div className="grid gap-3 sm:grid-cols-2">
@@ -249,7 +258,7 @@ export default function Dashboard() {
                       </div>
                     </div>
                     <div className="text-right shrink-0">
-                      <p className="text-sm font-bold text-t1">£{c.revenue.toLocaleString()}</p>
+                      <p className="text-sm font-bold text-t1">{formatCurrency(c.revenue)}</p>
                       <p className="text-[10px] text-t3">Revenue</p>
                     </div>
                   </div>
@@ -263,11 +272,7 @@ export default function Dashboard() {
         <div className="space-y-4">
 
           {/* Owner's Priority List */}
-          <BentoCard title="Owner's Priority List" subtitle="AI recommendation preview" headerRight={
-            <span className="flex items-center gap-1 text-[10px] font-bold text-violet-v bg-[var(--violet-soft)] px-2 py-1 rounded-full">
-              <Sparkles className="w-3 h-3" /> AI
-            </span>
-          }>
+          <BentoCard title="Owner's Priority List" subtitle="Top actions to recover revenue" headerRight={<span className="badge badge-violet">Live priorities</span>}>
             <div className="space-y-2.5">
               {priorityActions.map((item) => (
                 <div key={item.id} className={`rounded-xl p-3.5 cursor-pointer hover:opacity-90 transition-opacity ${urgencyClass[item.urgency]}`}>
@@ -291,7 +296,7 @@ export default function Dashboard() {
           </BentoCard>
 
           {/* AI Growth Signals */}
-          <BentoCard title="Key Growth Signals" subtitle="ClinicRadar AI · Preview" headerRight={
+          <BentoCard title="Key Growth Signals" subtitle="ClinicRadar signals from live data" headerRight={
             <span className="flex items-center gap-1 text-[10px] font-bold text-emerald-v bg-[var(--emerald-soft)] px-2 py-1 rounded-full">
               <span className="w-1.5 h-1.5 rounded-full bg-[var(--emerald)]" /> Live
             </span>
@@ -302,7 +307,7 @@ export default function Dashboard() {
                   key={alert.id}
                   title={alert.title}
                   description={alert.description}
-                  impact={alert.estimatedValue ? `£${alert.estimatedValue.toLocaleString()}` : undefined}
+                  impact={alert.estimatedValue ? formatCurrency(alert.estimatedValue) : undefined}
                   variant={alert.severity === 'high' ? 'risk' : alert.category === 'revenue' ? 'opportunity' : 'info'}
                   action="Take action"
                   confidence={alert.severity === 'high' ? 88 : alert.severity === 'medium' ? 72 : 61}
@@ -310,7 +315,7 @@ export default function Dashboard() {
               ))}
               <button type="button" onClick={() => navigate('/clinic-radar')} className="w-full text-center text-xs font-semibold text-indigo py-2 border border-dashed border-[var(--indigo-mid)] rounded-xl hover:bg-[var(--indigo-soft)] transition-colors flex items-center justify-center gap-1.5">
                 <BarChart3 className="w-3.5 h-3.5" />
-                View all 15 signals in ClinicRadar AI
+                View all signals in ClinicRadar
               </button>
             </div>
           </BentoCard>

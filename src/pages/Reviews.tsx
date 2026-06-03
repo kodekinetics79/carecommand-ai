@@ -1,14 +1,15 @@
 import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Star, CheckCircle2, AlertCircle, Sparkles, ArrowRight, TrendingUp, MessageSquare, ShieldCheck, BellRing } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
-import { reviews } from '../data/mockReviews';
-import { branches, doctors } from '../data/mockClinics';
+import { reviews, branches, doctors } from '../data/seedData';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapReview, type ApiReview } from '../lib/apiAdapters';
 import { apiRequest } from '../lib/api';
+import { formatCurrency } from '../utils/formatters';
 
 interface ApiReputationCase {
   id: string;
@@ -53,6 +54,7 @@ interface ReputationResponse {
 }
 
 export default function Reviews() {
+  const navigate = useNavigate();
   const { data: reviewRecords, source, reload } = useApiResource<ApiReview, typeof reviews[number]>('/v1/reviews?limit=100', reviews, mapReview);
   const [respondingId, setRespondingId] = useState<string | null>(null);
 
@@ -101,7 +103,7 @@ export default function Reviews() {
         badge={`${reputation.summary.unresolvedCases || unrespondedNegative.length} Needs Response · ${source === 'live' || reputationSource === 'live' ? 'Live DB' : 'Demo'}`}
         badgeColor="red"
         actions={
-          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
+          <button type="button" onClick={() => navigate('/campaigner')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
             <Sparkles className="w-4 h-4" /> Launch Review Campaign
           </button>
         }
@@ -270,8 +272,8 @@ export default function Reviews() {
           <div className="rounded-2xl bg-[var(--s2)] border border-[var(--b1)] p-4">
             <p className="text-[10px] font-bold uppercase tracking-widest text-violet-v mb-2">Referral Programme</p>
             <p className="text-2xl font-bold text-t1 mb-1">18 referrals</p>
-            <p className="text-xs text-t2 mb-3">Generated this month · £6,400 attributed revenue</p>
-            <button type="button" className="w-full py-2 rounded-xl bg-[var(--s3)] hover:bg-[var(--b1)] text-t1 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
+            <p className="text-xs text-t2 mb-3">Generated this month · {formatCurrency(6400)} attributed revenue</p>
+            <button type="button" onClick={() => navigate('/campaigner')} className="w-full py-2 rounded-xl bg-[var(--s3)] hover:bg-[var(--b1)] text-t1 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
               <ArrowRight className="w-3.5 h-3.5" /> Launch referral campaign
             </button>
           </div>

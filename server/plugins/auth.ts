@@ -5,6 +5,8 @@ import type { UserRole } from '../generated/prisma/enums';
 import { env } from '../config/env';
 import { db } from '../lib/db';
 
+const authErrorMessage = 'Session expired. Please sign in again.';
+
 declare module 'fastify' {
   interface FastifyRequest {
     auth: {
@@ -22,11 +24,14 @@ export const authPlugin = fp(async app => {
   app.decorateRequest('auth');
 
   app.decorate('authenticate', async (request: FastifyRequest) => {
-    const payload = await request.jwtVerify<FastifyRequest['auth']>();
+    const payload = await request.jwtVerify<FastifyRequest['auth'] & { type?: 'access' }>();
+    if (payload.type && payload.type !== 'access') {
+      throw app.httpErrors.unauthorized(authErrorMessage);
+    }
     const user = await db.user.findFirst({
       where: { id: payload.userId, tenantId: payload.tenantId, active: true },
     });
-    if (!user) throw app.httpErrors.unauthorized('User is inactive or no longer belongs to this tenant');
+    if (!user) throw app.httpErrors.unauthorized(authErrorMessage);
     request.auth = {
       userId: user.id,
       tenantId: user.tenantId,

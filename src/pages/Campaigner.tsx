@@ -1,11 +1,13 @@
 import { useState } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { Sparkles, Zap, ArrowRight, Target, Users, TrendingUp, CheckCircle2, Play, PauseCircle } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ModuleTabs from '../components/ui/ModuleTabs';
 import ProgressBar from '../components/ui/ProgressBar';
-import { campaigns } from '../data/mockCampaigns';
+import { campaigns } from '../data/seedData';
+import { formatCurrency } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapCampaign, type ApiCampaign } from '../lib/apiAdapters';
 import { apiRequest } from '../lib/api';
@@ -19,16 +21,16 @@ const statusConfig: Record<string, { label: string; color: string; bg: string }>
 };
 
 const goalCards = [
-  { id: 'winback', icon: <Users className="w-5 h-5" />, title: 'Reactivate Inactive Customers', desc: 'Target 30–180 day inactive segment', est: '£18,700', color: 'border-[var(--b2)] bg-[var(--blue-soft)]', iconBg: 'bg-[var(--blue-soft)] text-blue-v' },
-  { id: 'slots', icon: <Target className="w-5 h-5" />, title: 'Fill Empty Appointment Slots', desc: 'Boost branch utilisation with targeted offers', est: '£6,200', color: 'border-[var(--b2)] bg-[var(--violet-soft)]', iconBg: 'bg-[var(--violet-soft)] text-violet-v' },
+  { id: 'winback', icon: <Users className="w-5 h-5" />, title: 'Reactivate Inactive Customers', desc: 'Target 30–180 day inactive segment', est: formatCurrency(18700), color: 'border-[var(--b2)] bg-[var(--blue-soft)]', iconBg: 'bg-[var(--blue-soft)] text-blue-v' },
+  { id: 'slots', icon: <Target className="w-5 h-5" />, title: 'Fill Empty Appointment Slots', desc: 'Boost branch utilisation with targeted offers', est: formatCurrency(6200), color: 'border-[var(--b2)] bg-[var(--violet-soft)]', iconBg: 'bg-[var(--violet-soft)] text-violet-v' },
   { id: 'reviews', icon: <CheckCircle2 className="w-5 h-5" />, title: 'Grow Reputation & Reviews', desc: 'Post-visit review request automation', est: '28 reviews', color: 'border-[var(--b2)] bg-[var(--amber-soft)]', iconBg: 'bg-[var(--amber-soft)] text-amber-v' },
-  { id: 'referrals', icon: <TrendingUp className="w-5 h-5" />, title: 'Drive Referral Revenue', desc: 'Loyalty and referral reward program', est: '£4,500', color: 'border-[var(--b2)] bg-[var(--emerald-soft)]', iconBg: 'bg-[var(--emerald-soft)] text-emerald-v' },
+  { id: 'referrals', icon: <TrendingUp className="w-5 h-5" />, title: 'Drive Referral Revenue', desc: 'Loyalty and referral reward program', est: formatCurrency(4500), color: 'border-[var(--b2)] bg-[var(--emerald-soft)]', iconBg: 'bg-[var(--emerald-soft)] text-emerald-v' },
 ];
 
 const messagePreviews: Record<string, string> = {
   whatsapp: "👋 Hi {Name}, it's been a while! We miss you at CareCommand Clinics.\n\nWe've saved a slot just for you this week: *Wednesday 28 May at 10:30am*.\n\nReply YES to confirm or tap to rebook: 🔗 [Book Now]\n\n_Reply STOP to opt out._",
   sms: "Hi {Name}, you have a special slot waiting at CareCommand Clinics. Book your appointment: bit.ly/carecommand-book. Reply STOP to opt out.",
-  email: "Subject: We've saved a slot for you, {Name}!\n\nHi {Name},\n\nIt's been a while since your last visit, and we'd love to welcome you back.\n\nOur team at [Branch Name] has availability this week, and we've put together a special offer just for returning customers.\n\n[Book Your Appointment →]\n\nWarm regards,\nThe CareCommand AI Team",
+  email: "Subject: We've saved a slot for you, {Name}!\n\nHi {Name},\n\nIt's been a while since your last visit, and we'd love to welcome you back.\n\nOur team at [Branch Name] has availability this week, and we've put together a special offer just for returning customers.\n\n[Book Your Appointment →]\n\nWarm regards,\nThe CareCommand Team",
   push: "📅 Your slot is waiting! Tap to book your appointment this week at CareCommand Clinics.",
 };
 
@@ -39,12 +41,23 @@ const channelTabs = [
   { id: 'push', label: 'Push' },
 ];
 
+const launchPlans: Record<string, { name: string; goal: string; channels: string[] }> = {
+  winback: { name: 'Winback Campaign', goal: 'Reactivation for inactive customers', channels: ['WHATSAPP', 'EMAIL', 'SMS'] },
+  slots: { name: 'Slot Fill Campaign', goal: 'Boost branch utilisation with targeted offers', channels: ['WHATSAPP', 'SMS'] },
+  reviews: { name: 'Review Growth Campaign', goal: 'Post-visit review request automation', channels: ['WHATSAPP', 'SMS', 'EMAIL'] },
+  referrals: { name: 'Referral Growth Campaign', goal: 'Loyalty and referral reward program', channels: ['EMAIL', 'WHATSAPP'] },
+};
+
 export default function Campaigner() {
-  const [selectedGoal, setSelectedGoal] = useState<string | null>(null);
+  const navigate = useNavigate();
+  const location = useLocation();
+  const campaignContext = (location.state as { title?: string; branchName?: string; recommendedAction?: string } | null) ?? null;
+  const [selectedGoal, setSelectedGoal] = useState<string | null>(campaignContext ? 'winback' : null);
   const [previewChannel, setPreviewChannel] = useState('whatsapp');
   const [campaignFilter, setCampaignFilter] = useState('all');
   const { data: campaignRecords, source, reload } = useApiResource<ApiCampaign, typeof campaigns[number]>('/v1/campaigns?limit=100', campaigns, mapCampaign);
   const [pendingId, setPendingId] = useState<string | null>(null);
+  const [creatingCampaign, setCreatingCampaign] = useState(false);
 
   async function setCampaignStatus(id: string, status: 'ACTIVE' | 'PAUSED') {
     setPendingId(id);
@@ -54,6 +67,25 @@ export default function Campaigner() {
     } finally {
       setPendingId(null);
     }
+  }
+
+  async function createCampaign(name: string, goal: string, channels: string[] = ['WHATSAPP', 'EMAIL']) {
+    setCreatingCampaign(true);
+    try {
+      await apiRequest('/v1/campaigns', {
+        method: 'POST',
+        body: JSON.stringify({ name, goal, status: 'DRAFT', channels, aiGenerated: true }),
+      });
+      reload();
+    } finally {
+      setCreatingCampaign(false);
+    }
+  }
+
+  async function launchSelectedGoal() {
+    const goalId = selectedGoal && launchPlans[selectedGoal] ? selectedGoal : 'winback';
+    const plan = launchPlans[goalId];
+    await createCampaign(plan.name, plan.goal, plan.channels);
   }
   const campaignFilterTabs = [
     { id: 'all', label: 'All', count: campaignRecords.length },
@@ -71,13 +103,13 @@ export default function Campaigner() {
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Campaigner"
-        subtitle="AI-powered campaign studio — build, launch, and measure multi-channel growth campaigns."
+        subtitle="Campaign studio — build, launch, and measure multi-channel growth campaigns."
         badge={`${activeCount} Active · ${source === 'live' ? 'Live DB' : 'Demo'}`}
         badgeColor="emerald"
         actions={
           <div className="flex gap-2">
-            <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
-              <Sparkles className="w-4 h-4" /> Launch AI Campaign Wizard
+            <button type="button" onClick={() => { setSelectedGoal('winback'); window.scrollTo({ top: 320, behavior: 'smooth' }); }} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
+              <Sparkles className="w-4 h-4" /> Open Campaign Wizard
             </button>
           </div>
         }
@@ -85,14 +117,20 @@ export default function Campaigner() {
 
       {/* KPIs */}
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Total Campaign Revenue" value={`£${totalRevenue.toLocaleString()}`} subtitle="All campaigns" trend={18} icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Total Campaign Revenue" value={formatCurrency(totalRevenue)} subtitle="All campaigns" trend={18} icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
         <StatCard title="Total Bookings" value={totalBooked} subtitle="From campaigns" trend={12} icon={<CheckCircle2 className="w-4 h-4" />} accent="blue" />
         <StatCard title="Active Campaigns" value={activeCount} subtitle="Currently running" icon={<Play className="w-4 h-4" />} accent="violet" />
         <StatCard title="Avg Conversion Rate" value="19.4%" subtitle="Across all campaigns" trend={3} icon={<Target className="w-4 h-4" />} accent="cyan" />
       </div>
 
       {/* Goal Selector */}
-      <BentoCard title="AI Campaign Goal Selector" subtitle="Choose a campaign objective" headerRight={<Sparkles className="w-4 h-4 text-violet-v" />}>
+      <BentoCard title="Campaign Goal Selector" subtitle="Choose a campaign objective" headerRight={<Sparkles className="w-4 h-4 text-violet-v" />}>
+        {campaignContext && (
+          <div className="mb-3 rounded-xl border border-[var(--b2)] bg-[var(--indigo-soft)] px-3 py-2 text-xs text-t1">
+            <span className="font-semibold text-indigo">Context from ClinicRadar:</span>{' '}
+            {campaignContext.title}{campaignContext.branchName ? ` · ${campaignContext.branchName}` : ''}{campaignContext.recommendedAction ? ` · ${campaignContext.recommendedAction}` : ''}
+          </div>
+        )}
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           {goalCards.map((goal) => (
             <button
@@ -119,10 +157,10 @@ export default function Campaigner() {
           <div className="mt-4 p-4 rounded-2xl bg-[var(--indigo-soft)] border border-[var(--b2)]">
             <div className="flex items-center justify-between gap-3">
               <div>
-                <p className="text-sm font-bold text-t1">AI has built your campaign segments</p>
-                <p className="text-xs text-t3 mt-0.5">Audience identified · Message optimised · Best send time set</p>
+                <p className="text-sm font-bold text-t1">Campaign segments are ready</p>
+                <p className="text-xs text-t3 mt-0.5">Audience identified · Message prepared · Best send time set</p>
               </div>
-              <button type="button" className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition-colors shrink-0">
+              <button type="button" disabled={!selectedGoal || creatingCampaign} onClick={() => void launchSelectedGoal()} className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition-colors shrink-0 disabled:opacity-40">
                 <Zap className="w-3.5 h-3.5" /> Continue to Launch
               </button>
             </div>
@@ -164,7 +202,7 @@ export default function Campaigner() {
                           c.status === 'completed' ? 'badge-cyan' :
                           'badge-blue'
                         }`}>{sc.label}</span>
-                        {c.revenue > 0 && <span className="text-xs font-bold text-emerald-v">£{c.revenue.toLocaleString()}</span>}
+                        {c.revenue > 0 && <span className="text-xs font-bold text-emerald-v">{formatCurrency(c.revenue)}</span>}
                       </div>
                     </div>
 
@@ -206,7 +244,7 @@ export default function Campaigner() {
                           <Play className="w-3.5 h-3.5" /> {pendingId === c.id ? 'Launching…' : c.status === 'paused' ? 'Resume' : 'Launch'}
                         </button>
                       )}
-                      <button type="button" className="ml-auto inline-flex items-center gap-1 text-xs font-semibold text-t3 hover:text-t2">
+                      <button type="button" onClick={() => navigate('/revenue')} className="ml-auto inline-flex items-center gap-1 text-xs font-semibold text-t3 hover:text-t2">
                         View report <ArrowRight className="w-3 h-3" />
                       </button>
                     </div>
@@ -238,7 +276,7 @@ export default function Campaigner() {
           </BentoCard>
 
           {/* Audience preview */}
-          <BentoCard title="Audience Builder" subtitle="AI-segmented audience">
+          <BentoCard title="Audience Builder" subtitle="Segmented audience">
             <div className="space-y-2.5">
               {[
                 { label: 'Inactive 60–90 days', count: 87, pct: 47, color: 'bg-blue-500' },
@@ -267,7 +305,7 @@ export default function Campaigner() {
           {/* ROI estimate */}
           <div className="rounded-2xl bg-[var(--emerald-soft)] border border-[var(--b2)] p-4">
             <p className="text-[10px] font-bold uppercase tracking-widest text-emerald-v mb-2">Estimated Campaign ROI</p>
-            <p className="text-3xl font-bold text-t1 mb-0.5">£18,700</p>
+            <p className="text-3xl font-bold text-t1 mb-0.5">{formatCurrency(18700)}</p>
             <p className="text-xs text-t3 mb-3">Based on 18% historical conversion · 187 audience</p>
             <div className="grid grid-cols-3 gap-2 text-center">
               <div className="bg-[var(--s2)] border border-[var(--b1)] rounded-xl p-2">
@@ -275,7 +313,7 @@ export default function Campaigner() {
                 <p className="text-[10px] text-t3">Est. bookings</p>
               </div>
               <div className="bg-[var(--s2)] border border-[var(--b1)] rounded-xl p-2">
-                <p className="text-sm font-bold text-t1">£550</p>
+                <p className="text-sm font-bold text-t1">{formatCurrency(550)}</p>
                 <p className="text-[10px] text-t3">Avg value</p>
               </div>
               <div className="bg-[var(--s2)] border border-[var(--b1)] rounded-xl p-2">
@@ -283,7 +321,7 @@ export default function Campaigner() {
                 <p className="text-[10px] text-t3">Est. ROI</p>
               </div>
             </div>
-            <button type="button" className="mt-3 w-full py-2 rounded-xl bg-[var(--s2)] border border-[var(--b1)] hover:bg-[var(--s3)] text-t1 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
+            <button type="button" onClick={() => void launchSelectedGoal()} className="mt-3 w-full py-2 rounded-xl bg-[var(--s2)] border border-[var(--b1)] hover:bg-[var(--s3)] text-t1 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
               <Zap className="w-3.5 h-3.5" /> Launch Campaign Now
             </button>
           </div>

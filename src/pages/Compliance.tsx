@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { ShieldCheck, AlertCircle, FileText, CheckCircle2, Clock, Sparkles, ArrowRight, Lock, Eye, Trash2, Plus, Circle } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
@@ -8,18 +9,12 @@ import { useApiResource } from '../hooks/useApiResource';
 import { useCrudResource } from '../hooks/useCrudResource';
 import { apiRequest } from '../lib/api';
 import { mapAuditEvent, type ApiAuditEvent, type AuditLogEntry, type ApiConsentSummary } from '../lib/apiAdapters';
+import { auditLogs as seedAuditLogs } from '../data/seedData';
 
 interface ApiGuardrail { id: string; rule: string; active: boolean; sortOrder: number }
 interface ApiPreference { id: string; label: string; description: string; enabled: boolean; sortOrder: number }
 
-const fallbackAuditLogs: AuditLogEntry[] = [
-  { id: 'log1', event: 'Marketing consent granted', user: 'System (WhatsApp opt-in)', date: '26 May 2026, 09:12', type: 'consent' },
-  { id: 'log2', event: 'Customer record accessed', user: 'Dr. Sarah Mitchell', date: '26 May 2026, 10:00', type: 'access' },
-  { id: 'log3', event: 'Data sharing request approved', user: 'Compliance Team', date: '25 May 2026, 16:30', type: 'approval' },
-  { id: 'log4', event: 'Review campaign template updated', user: 'Marketing Admin', date: '24 May 2026, 14:20', type: 'change' },
-  { id: 'log5', event: 'Opt-out processed for Tom Nakamura', user: 'System (SMS reply)', date: '23 May 2026, 11:05', type: 'optout' },
-  { id: 'log6', event: 'GDPR data export requested', user: 'Grace Adeyemi (customer)', date: '22 May 2026, 09:40', type: 'export' },
-];
+const fallbackAuditLogs: AuditLogEntry[] = [...seedAuditLogs];
 
 const logTypeConfig: Record<string, { color: string; bg: string }> = {
   consent:  { color: 'text-emerald-v', bg: 'badge badge-emerald' },
@@ -56,6 +51,7 @@ const fallbackPreferences: ApiPreference[] = [
 ];
 
 export default function Compliance() {
+  const navigate = useNavigate();
   const { data: auditLogs } = useApiResource<ApiAuditEvent, AuditLogEntry>(
     '/v1/compliance/audit-log?limit=20',
     fallbackAuditLogs,
@@ -102,7 +98,7 @@ export default function Compliance() {
         badge="All Systems Active"
         badgeColor="blue"
         actions={
-          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition shadow-sm">
+          <button type="button" onClick={() => navigate('/settings')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition shadow-sm">
             <FileText className="w-4 h-4" /> Download Audit Report
           </button>
         }
@@ -225,7 +221,7 @@ export default function Compliance() {
             </div>
             <p className="text-sm font-bold text-t1 mb-1">GDPR Compliant</p>
             <p className="text-[11px] text-t3 mb-3">6-year retention policy · Right to erasure enforced · Data export available on request.</p>
-            <button type="button" className="inline-flex items-center gap-1.5 text-xs font-semibold text-blue-v hover:text-cyan-v transition-colors">
+            <button type="button" onClick={() => navigate('/settings')} className="inline-flex items-center gap-1.5 text-xs font-semibold text-blue-v hover:text-cyan-v transition-colors">
               View data policy <ArrowRight className="w-3.5 h-3.5" />
             </button>
           </div>
@@ -237,7 +233,7 @@ export default function Compliance() {
               <div>
                 <p className="text-xs font-bold text-amber-v">Data Request SLA</p>
                 <p className="text-[11px] text-amber-v mt-0.5">1 pending GDPR data export request (Grace Adeyemi). Must be fulfilled within 30 days. 22 days remaining.</p>
-                <button type="button" className="mt-2 inline-flex items-center gap-1 text-xs font-semibold text-amber-v bg-[var(--amber-soft)] px-3 py-1.5 rounded-lg hover:bg-[var(--s3)] transition-colors">
+                <button type="button" onClick={() => navigate('/settings')} className="mt-2 inline-flex items-center gap-1 text-xs font-semibold text-amber-v bg-[var(--amber-soft)] px-3 py-1.5 rounded-lg hover:bg-[var(--s3)] transition-colors">
                   <ArrowRight className="w-3 h-3" /> Process request
                 </button>
               </div>

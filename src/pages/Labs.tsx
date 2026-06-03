@@ -1,10 +1,9 @@
 import { useState } from 'react';
-import { FileText, Clock, CheckCircle2, Archive, AlertCircle, Sparkles, ArrowRight, Upload } from 'lucide-react';
+import { FileText, Clock, CheckCircle2, Archive, AlertCircle, Sparkles, Upload } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
-import { labOrders } from '../data/mockLabs';
-import { branches } from '../data/mockClinics';
+import { labOrders, branches } from '../data/seedData';
 import { useApiResource } from '../hooks/useApiResource';
 import { apiRequest } from '../lib/api';
 import { mapPartnerReport, type ApiPartnerReport } from '../lib/apiAdapters';
@@ -52,7 +51,7 @@ export default function Labs() {
         badge={`${urgentCount} Urgent · ${source === 'live' ? 'Live DB' : 'Demo'}`}
         badgeColor="red"
         actions={
-          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition">
+          <button type="button" onClick={() => document.getElementById('upload-zone')?.scrollIntoView({ behavior: 'smooth', block: 'start' })} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition">
             <Upload className="w-4 h-4" /> Upload Document
           </button>
         }
@@ -115,9 +114,6 @@ export default function Labs() {
                           <CheckCircle2 className="w-3 h-3" /> Mark reviewed
                         </button>
                       )}
-                      <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-t2 hover:text-t1 transition-colors">
-                        <ArrowRight className="w-3 h-3" /> View
-                      </button>
                     </div>
                   </div>
                 </div>
@@ -135,9 +131,6 @@ export default function Labs() {
                 <div key={note.title} className={`p-3.5 rounded-xl border transition-all ${note.urgency === 'high' ? 'border-[var(--b2)] bg-[var(--red-soft)]' : 'border-[var(--b1)] bg-[var(--amber-soft)]'}`}>
                   <p className="text-xs font-bold text-t1 mb-1 leading-tight">{note.title}</p>
                   <p className="text-[11px] text-t3 mb-2">{note.desc}</p>
-                  <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo hover:text-blue-v">
-                    <ArrowRight className="w-3 h-3" /> Take action
-                  </button>
                 </div>
               ))}
             </div>
@@ -162,7 +155,7 @@ export default function Labs() {
           </BentoCard>
 
           {/* Upload zone */}
-          <div className="rounded-2xl border-2 border-dashed border-[var(--b2)] p-5 text-center hover:border-[var(--b3)] transition-colors cursor-pointer">
+          <div id="upload-zone" className="rounded-2xl border-2 border-dashed border-[var(--b2)] p-5 text-center hover:border-[var(--b3)] transition-colors cursor-pointer">
             <Upload className="w-6 h-6 text-t3 mx-auto mb-2" />
             <p className="text-xs font-semibold text-t2 mb-1">Upload partner report</p>
             <p className="text-[11px] text-t3">PDF, DOCX, or image · Max 20MB</p>

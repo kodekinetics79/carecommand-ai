@@ -1,34 +1,35 @@
 import { useState } from 'react';
 import { useLocation } from 'react-router-dom';
-import { Search, Bell, Command, Zap } from 'lucide-react';
+import { Search, Bell, Command, Zap, LogOut, UserCircle2 } from 'lucide-react';
 import CommandPalette from '../ui/CommandPalette';
 import { useBackendHealth } from '../../hooks/useBackendHealth';
+import { formatCurrency } from '../../utils/formatters';
+import { useSession } from '../../hooks/useSession';
 
 const routeLabels: Record<string, string> = {
-  '/':                'Dashboard',
-  '/clinic-radar':    'Clinic Radar',
-  '/autopilot':       'CareFlow Autopilot',
-  '/crm':             'CRM Pipeline',
-  '/campaigner':      'Campaigner',
-  '/reviews':         'Reviews & Referrals',
-  '/revenue':         'RevenuePulse',
-  '/ai-receptionist': 'AI Receptionist',
-  '/scheduling':      'Scheduling',
-  '/doctor-workspace':'Provider Productivity',
-  '/staff':           'Staff Workflow',
-  '/inventory':       'Inventory',
-  '/labs':            'Documents',
-  '/telehealth':      'Virtual Visits',
-  '/patients':        'Customer360',
-  '/compliance':      'Privacy & Compliance',
-  '/integrations':    'Integrations',
-  '/settings':        'Settings',
+  '/':                 'Dashboard',
+  '/opportunities':    'Opportunity Center',
+  '/clinic-radar':     'Clinic Radar',
+  '/benchmarking':     'Multi-Clinic Benchmarking',
+  '/autopilot':        'Autopilot',
+  '/crm':              'CRM',
+  '/campaigner':       'Campaigner',
+  '/reviews':          'Reviews',
+  '/revenue':          'Revenue Leaks',
+  '/doctor-workspace': 'Provider Performance',
+  '/patients':         'Patients',
+  '/scheduling':       'Scheduling',
+  '/staff':            'Staff',
+  '/control-plane':    'Control Plane',
+  '/admin':            'Control Plane',
+  '/integrations':     'Integrations',
+  '/settings':         'Settings',
 };
 
 const notifs = [
   { title: '3 critical stock alerts',    desc: 'Botox critically low at Downtown',          time: '2m', dotCls: 'pf-red' },
   { title: 'SLA breach — Jake Williams', desc: 'Response time exceeds 6-min threshold',     time: '8m', dotCls: 'pf-amber' },
-  { title: 'AI recovered £840 today',    desc: '6 missed-call bookings converted',          time: '1h', dotCls: 'pf-emerald' },
+  { title: `AI recovered ${formatCurrency(840)} today`, desc: '6 missed-call bookings converted', time: '1h', dotCls: 'pf-emerald' },
   { title: 'New 1-star review',          desc: 'Unresponded negative review — Southbank',   time: '2h', dotCls: 'pf-red' },
 ];
 
@@ -37,6 +38,7 @@ export default function Topbar() {
   const [cmdOpen,   setCmdOpen]   = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
   const backendReady = useBackendHealth();
+  const { user, signOut } = useSession();
 
   const pageLabel = pathname === '/'
     ? 'Dashboard'
@@ -64,8 +66,24 @@ export default function Topbar() {
         </button>
 
         {/* Actions */}
-        <div className="flex items-center gap-1.5">
-          <button type="button" className="topbar-ai-btn">
+          <div className="flex items-center gap-1.5">
+          {user && (
+            <div className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-full border border-[var(--b1)] bg-[var(--s2)]">
+              <UserCircle2 className="w-4 h-4 text-t3" />
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold leading-none text-t1 truncate">{user.displayName}</p>
+                <p className="text-[10px] leading-none mt-0.5 text-t3">{user.role}</p>
+              </div>
+            </div>
+          )}
+
+          {user && (
+            <button type="button" onClick={() => void signOut()} className="topbar-ai-btn">
+              <LogOut className="w-3.5 h-3.5" /> Logout
+            </button>
+          )}
+
+          <button type="button" onClick={() => setCmdOpen(true)} className="topbar-ai-btn">
             <Zap className="w-3.5 h-3.5" /> AI Actions
           </button>
 

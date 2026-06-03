@@ -1,17 +1,17 @@
-import { useMemo, useState } from 'react';
-import { CalendarDays, Sparkles, Zap, AlertCircle, CheckCircle2, Clock, Users, DollarSign, ArrowRight } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { CalendarDays, Sparkles, Zap, AlertCircle, CheckCircle2, Clock, Users, DollarSign, ArrowRight, RefreshCw } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import RiskBadge from '../components/ui/RiskBadge';
 import ProgressBar from '../components/ui/ProgressBar';
-import { appointments } from '../data/mockAppointments';
-import { patients } from '../data/mockPatients';
-import { branches } from '../data/mockClinics';
-import { doctors } from '../data/mockClinics';
+import { appointments, patients, branches, doctors } from '../data/seedData';
+import { formatCurrency } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapAppointment, mapProviderProfile, mapPatient, type ApiAppointment, type ApiProviderProfile, type ApiPatient } from '../lib/apiAdapters';
 import { apiRequest } from '../lib/api';
+import { checkEligibility, fetchAppointmentVerificationQueue, type AppointmentVerificationQueueRow } from '../lib/revenueProtection';
 
 const isoDate = (offsetDays: number) => {
   const d = new Date();
@@ -36,20 +36,25 @@ const statusConfig: Record<string, { label: string; dot: string; bg: string; tex
 };
 
 const waitlistSlots = [
-  { name: 'Isabelle Dubois', service: 'Nutrition Consultation', preferred: 'Mon–Wed afternoon', value: '£180' },
-  { name: 'Jack Harrison', service: 'Annual Wellness Review', preferred: 'Any weekday AM', value: '£200' },
-  { name: 'Sara Montero', service: 'Skin Consultation', preferred: 'Thu or Fri', value: '£320' },
+  { name: 'Isabelle Dubois', service: 'Nutrition Consultation', preferred: 'Mon–Wed afternoon', value: formatCurrency(180) },
+  { name: 'Jack Harrison', service: 'Annual Wellness Review', preferred: 'Any weekday AM', value: formatCurrency(200) },
+  { name: 'Sara Montero', service: 'Skin Consultation', preferred: 'Thu or Fri', value: formatCurrency(320) },
 ];
 
 const aiRecommendations = [
-  { title: 'Fill 6 empty Downtown slots', desc: 'Target 90-day inactive dermatology customers. Est. £1,680.', impact: '£1,680', action: 'Create offer campaign' },
-  { title: 'Westside: 31 slots at risk this week', desc: 'Utilisation at 61%. Activate a slot-filling offer immediately.', impact: '£6,200', action: 'Launch fill campaign' },
-  { title: '3 high no-show risk appointments today', desc: 'Marcus Thompson (74%), Mohammed Al-Farsi (61%), Yuki Tanaka (78%). AI reminders sent.', impact: '£660', action: 'Review risk queue' },
+  { title: 'Fill 6 empty Downtown slots', desc: 'Target 90-day inactive dermatology customers. Est. ' + formatCurrency(1680) + '.', impact: formatCurrency(1680), action: 'Create offer campaign' },
+  { title: 'Westside: 31 slots at risk this week', desc: 'Utilisation at 61%. Activate a slot-filling offer immediately.', impact: formatCurrency(6200), action: 'Launch fill campaign' },
+  { title: '3 high no-show risk appointments today', desc: 'Marcus Thompson (74%), Mohammed Al-Farsi (61%), Yuki Tanaka (78%). AI reminders sent.', impact: formatCurrency(660), action: 'Review risk queue' },
 ];
 
 export default function Scheduling() {
+  const navigate = useNavigate();
   const [selectedBranch, setSelectedBranch] = useState('all');
   const [selectedDate, setSelectedDate] = useState(todayDate);
+  const [insuranceQueue, setInsuranceQueue] = useState<AppointmentVerificationQueueRow[]>([]);
+  const [queueLoading, setQueueLoading] = useState(true);
+  const [queueError, setQueueError] = useState<string | null>(null);
+  const [queueBusy, setQueueBusy] = useState<string | null>(null);
   const { data: appointmentRecords, source, reload } = useApiResource<ApiAppointment, typeof appointments[number]>('/v1/appointments?limit=100', appointments, mapAppointment);
   const { data: providerRecords } = useApiResource<ApiProviderProfile, typeof doctors[number]>('/v1/providers/overview?limit=100', doctors, mapProviderProfile);
   const { data: patientRecords } = useApiResource<ApiPatient, typeof patients[number]>('/v1/patients?limit=100', patients, mapPatient);
@@ -58,6 +63,27 @@ export default function Scheduling() {
   const [booking, setBooking] = useState(emptyBooking);
   const [saving, setSaving] = useState(false);
   const [bookingError, setBookingError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      setQueueLoading(true);
+      setQueueError(null);
+      try {
+        const response = await fetchAppointmentVerificationQueue(selectedBranch === 'all' ? undefined : selectedBranch);
+        if (!active) return;
+        setInsuranceQueue(response.appointments);
+      } catch (err) {
+        if (!active) return;
+        setQueueError(err instanceof Error ? err.message : 'Unable to load insurance verification queue');
+      } finally {
+        if (active) setQueueLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [selectedBranch]);
 
   async function bookAppointment() {
     const patient = patientRecords.find(p => p.id === booking.patientId);
@@ -102,6 +128,26 @@ export default function Scheduling() {
   const totalValue = todayAppts.reduce((s, a) => s + a.value, 0);
   const riskyCount = todayAppts.filter(a => a.status === 'risky').length;
   const confirmedCount = todayAppts.filter(a => a.status === 'confirmed' || a.status === 'arrived').length;
+  const queueMode = insuranceQueue.some(row => row.providerMode !== 'mock') ? 'Sandbox Active' : 'Mock Mode';
+
+  async function verifyInsurance(row: AppointmentVerificationQueueRow) {
+    setQueueBusy(row.id);
+    setQueueError(null);
+    try {
+      await checkEligibility({
+        patientId: row.patientId,
+        appointmentId: row.id,
+        branchId: row.branchId,
+        serviceType: row.serviceType,
+      });
+      const refreshed = await fetchAppointmentVerificationQueue(selectedBranch === 'all' ? undefined : selectedBranch);
+      setInsuranceQueue(refreshed.appointments);
+    } catch (err) {
+      setQueueError(err instanceof Error ? err.message : 'Unable to verify insurance');
+    } finally {
+      setQueueBusy(null);
+    }
+  }
 
   return (
     <div className="space-y-6 pb-8">
@@ -136,7 +182,7 @@ export default function Scheduling() {
                 <select aria-label="Channel" title="Channel" value={booking.channel} onChange={e => setBooking(b => ({ ...b, channel: e.target.value }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
                   {['WHATSAPP', 'SMS', 'EMAIL', 'CALL', 'VIDEO'].map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
-                <input type="number" aria-label="Value" value={booking.value} onChange={e => setBooking(b => ({ ...b, value: e.target.value }))} placeholder="Value (£)" className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+                <input type="number" aria-label="Value" value={booking.value} onChange={e => setBooking(b => ({ ...b, value: e.target.value }))} placeholder="Value ($)" className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
               </div>
             </div>
             <div className="flex gap-2 mt-4">
@@ -151,7 +197,7 @@ export default function Scheduling() {
         <StatCard title="Today's Appointments" value={todayAppts.length} subtitle="All branches" icon={<CalendarDays className="w-4 h-4" />} accent="blue" />
         <StatCard title="Confirmed / Arrived" value={confirmedCount} subtitle="On track" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
         <StatCard title="No-Show Risk" value={riskyCount} subtitle="AI flagged today" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
-        <StatCard title="Today's Value" value={`£${totalValue.toLocaleString()}`} subtitle="Appointment revenue" icon={<DollarSign className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Today's Value" value={formatCurrency(totalValue)} subtitle="Appointment revenue" icon={<DollarSign className="w-4 h-4" />} accent="violet" />
       </div>
 
       {/* Filters */}
@@ -174,8 +220,78 @@ export default function Scheduling() {
       <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
         {/* Appointment timeline */}
         <div className="space-y-4">
+          <BentoCard
+            title="Insurance Verification Queue"
+            subtitle="Patient appointments that need a real eligibility check"
+            headerRight={<span className="text-xs font-semibold text-t3">{queueMode}</span>}
+          >
+            {queueError && <p className="mb-3 text-xs text-red-v">{queueError}</p>}
+            {queueLoading ? (
+              <div className="py-8 text-center text-sm text-t3">Loading verification queue…</div>
+            ) : insuranceQueue.length === 0 ? (
+              <div className="py-8 text-center text-sm text-t3">No appointments found for this clinic scope.</div>
+            ) : (
+              <div className="overflow-hidden rounded-2xl border border-[var(--b1)]">
+                <table className="min-w-full text-sm">
+                  <thead className="bg-[var(--s2)] text-left text-xs text-t3">
+                    <tr>
+                      <th className="px-4 py-3">Patient</th>
+                      <th className="px-4 py-3">Appointment</th>
+                      <th className="px-4 py-3">Payer</th>
+                      <th className="px-4 py-3">Member ID</th>
+                      <th className="px-4 py-3">Eligibility</th>
+                      <th className="px-4 py-3">Copay</th>
+                      <th className="px-4 py-3">Deductible</th>
+                      <th className="px-4 py-3">Prior Auth</th>
+                      <th className="px-4 py-3">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {insuranceQueue.map(row => {
+                      const active = row.eligibilityStatus === 'Active';
+                      return (
+                        <tr key={row.id} className="border-t border-[var(--b1)]">
+                          <td className="px-4 py-3">
+                            <p className="font-semibold text-t1">{row.patientName}</p>
+                            <p className="text-[11px] text-t3">{row.branchName}</p>
+                          </td>
+                          <td className="px-4 py-3">
+                            <p className="font-semibold text-t1">{new Date(row.appointmentTime).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}</p>
+                            <p className="text-[11px] text-t3">{row.serviceType}</p>
+                          </td>
+                          <td className="px-4 py-3 text-t2">{row.payerName}</td>
+                          <td className="px-4 py-3 text-t2">{row.memberId}</td>
+                          <td className="px-4 py-3">
+                            <span className={`badge ${active ? 'badge-emerald' : 'badge-amber'}`}>{row.eligibilityStatus}</span>
+                            <p className="mt-1 text-[11px] text-t3">{row.coverageStatus}</p>
+                          </td>
+                          <td className="px-4 py-3 text-t2">{active ? formatCurrency(row.copay) : '—'}</td>
+                          <td className="px-4 py-3 text-t2">{active ? formatCurrency(row.deductibleRemaining) : '—'}</td>
+                          <td className="px-4 py-3">
+                            <span className={`badge ${row.priorAuthStatus === 'Not Required' ? 'badge-emerald' : row.priorAuthStatus.toLowerCase().includes('pending') ? 'badge-amber' : 'badge-blue'}`}>{row.priorAuthStatus}</span>
+                          </td>
+                          <td className="px-4 py-3">
+                            <button
+                              type="button"
+                              disabled={queueBusy === row.id}
+                              onClick={() => void verifyInsurance(row)}
+                              className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-50"
+                            >
+                              <RefreshCw className="w-3.5 h-3.5" />
+                              {queueBusy === row.id ? 'Verifying…' : row.eligibilityStatus === 'Active' ? 'Re-verify' : 'Verify Insurance'}
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </BentoCard>
+
           <BentoCard title="Appointment Timeline" subtitle={`${selectedDate === todayDate ? "Today's" : ""} schedule`} headerRight={
-            <span className="text-xs font-semibold text-t3">{todayAppts.length} appointments · £{totalValue.toLocaleString()}</span>
+            <span className="text-xs font-semibold text-t3">{todayAppts.length} appointments · {formatCurrency(totalValue)}</span>
           }>
             <div className="space-y-2">
               {todayAppts.length === 0 ? (
@@ -187,7 +303,7 @@ export default function Scheduling() {
                   <div key={appt.id} className={`flex items-start gap-3 p-3.5 rounded-xl border transition-all hover:bg-[var(--s3)] ${isRisky ? 'border-[var(--b2)] bg-[var(--red-soft)]' : 'border-[var(--b1)]'}`}>
                     <div className="text-center shrink-0 w-14">
                       <p className="text-sm font-bold text-t1">{appt.time}</p>
-                      <p className="text-[10px] text-t3">{appt.value ? `£${appt.value}` : ''}</p>
+                      <p className="text-[10px] text-t3">{appt.value ? formatCurrency(Number(appt.value)) : ''}</p>
                     </div>
                     <div className="w-px self-stretch bg-[var(--b1)] shrink-0" />
                     <div className="flex-1 min-w-0">
@@ -202,7 +318,7 @@ export default function Scheduling() {
                       <div className="flex items-center gap-2 mt-1.5">
                         <span className="text-[10px] text-t3 capitalize">{appt.channel}</span>
                         {isRisky && (
-                          <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2 py-0.5 rounded-full hover:opacity-80 transition-colors">
+                          <button type="button" onClick={() => navigate('/ai-receptionist')} className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2 py-0.5 rounded-full hover:opacity-80 transition-colors">
                             <Zap className="w-2.5 h-2.5" /> Send reminder
                           </button>
                         )}
@@ -227,7 +343,7 @@ export default function Scheduling() {
                     <span className="badge badge-emerald shrink-0">{rec.impact}</span>
                   </div>
                   <p className="text-[11px] text-t3 mb-2 leading-relaxed">{rec.desc}</p>
-                  <button type="button" className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo hover:opacity-80">
+                  <button type="button" onClick={() => navigate('/campaigner')} className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo hover:opacity-80">
                     <Zap className="w-3 h-3" /> {rec.action} <ArrowRight className="w-3 h-3" />
                   </button>
                 </div>
@@ -248,7 +364,7 @@ export default function Scheduling() {
                   </div>
                   <p className="text-[11px] text-t3">{w.service}</p>
                   <p className="text-[10px] text-t3 mt-0.5">Pref: {w.preferred}</p>
-                  <button type="button" className="mt-2 inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2 py-1 rounded-lg hover:opacity-80 transition-colors">
+                  <button type="button" onClick={() => setShowBooking(true)} className="mt-2 inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2 py-1 rounded-lg hover:opacity-80 transition-colors">
                     <CalendarDays className="w-3 h-3" /> Match & Book
                   </button>
                 </div>
@@ -280,7 +396,7 @@ export default function Scheduling() {
                   </div>
                 </div>
               ))}
-              <button type="button" className="w-full text-xs font-semibold text-indigo flex items-center justify-center gap-1 py-2 border border-dashed border-[var(--b2)] rounded-xl hover:bg-[var(--s3)] transition-colors">
+              <button type="button" onClick={() => navigate('/doctor-workspace')} className="w-full text-xs font-semibold text-indigo flex items-center justify-center gap-1 py-2 border border-dashed border-[var(--b2)] rounded-xl hover:bg-[var(--s3)] transition-colors">
                 <Users className="w-3.5 h-3.5" /> View all providers
               </button>
             </div>
@@ -289,9 +405,9 @@ export default function Scheduling() {
           {/* Empty slot value */}
           <div className="rounded-2xl bg-[var(--s2)] border border-[var(--b1)] p-4">
             <p className="text-[10px] font-bold uppercase tracking-widest text-blue-v mb-1">Empty Slot Value</p>
-            <p className="text-2xl font-bold text-t1 mb-0.5">£6,200</p>
+            <p className="text-2xl font-bold text-t1 mb-0.5">{formatCurrency(6200)}</p>
             <p className="text-xs text-t2 mb-3">31 unfilled slots this week across Westside</p>
-            <button type="button" className="w-full py-2 rounded-xl bg-[var(--s3)] hover:bg-[var(--b1)] text-t1 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
+            <button type="button" onClick={() => navigate('/campaigner')} className="w-full py-2 rounded-xl bg-[var(--s3)] hover:bg-[var(--b1)] text-t1 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
               <Zap className="w-3.5 h-3.5" /> Activate slot-fill campaign
             </button>
           </div>

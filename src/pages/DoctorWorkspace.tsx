@@ -1,14 +1,16 @@
+import { useNavigate } from 'react-router-dom';
 import { Star, TrendingUp, Users, CalendarDays, ArrowRight, Sparkles, Award, Clock } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
-import { doctors, branches } from '../data/mockClinics';
+import { doctors, branches } from '../data/seedData';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapProviderProfile, type ApiProviderProfile } from '../lib/apiAdapters';
 import { formatCurrency } from '../utils/formatters';
 
 export default function DoctorWorkspace() {
+  const navigate = useNavigate();
   const { data: providerRecords, source } = useApiResource<ApiProviderProfile, typeof doctors[number]>('/v1/providers/overview?limit=100', doctors, mapProviderProfile);
   const totalRevenue = providerRecords.reduce((s, d) => s + d.revenueThisMonth, 0);
   const avgUtilization = providerRecords.length > 0 ? Math.round(providerRecords.reduce((s, d) => s + d.utilization, 0) / providerRecords.length) : 0;
@@ -22,7 +24,7 @@ export default function DoctorWorkspace() {
         badge={`${source === 'live' ? 'Live DB' : 'Demo'} · ${providerRecords.length} providers`}
         badgeColor={source === 'live' ? 'emerald' : 'blue'}
         actions={
-          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
+          <button type="button" onClick={() => window.print()} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
             <Sparkles className="w-4 h-4" /> Generate Productivity Report
           </button>
         }
@@ -135,7 +137,7 @@ export default function DoctorWorkspace() {
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-bold text-amber-v">{doc.followUpRate}%</span>
-                  <button type="button" className="text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors flex items-center gap-1">
+                  <button type="button" onClick={() => navigate('/reviews')} className="text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors flex items-center gap-1">
                     <Clock className="w-3 h-3" /> Request reviews
                   </button>
                 </div>
@@ -145,7 +147,7 @@ export default function DoctorWorkspace() {
               <p className="text-sm text-t3 text-center py-4">All providers meeting follow-up targets.</p>
             )}
           </div>
-          <button type="button" className="mt-3 w-full flex items-center justify-center gap-1 text-xs font-semibold text-indigo py-2 border border-dashed border-[var(--b2)] rounded-xl hover:bg-[var(--s3)] transition-colors">
+          <button type="button" onClick={() => navigate('/campaigner')} className="mt-3 w-full flex items-center justify-center gap-1 text-xs font-semibold text-indigo py-2 border border-dashed border-[var(--b2)] rounded-xl hover:bg-[var(--s3)] transition-colors">
             Launch review campaign for all providers <ArrowRight className="w-3.5 h-3.5" />
           </button>
         </BentoCard>

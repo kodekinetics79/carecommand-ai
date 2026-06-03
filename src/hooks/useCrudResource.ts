@@ -24,7 +24,24 @@ export function useCrudResource<T extends { id: string }>(path: string, fallback
     }
   }, [path]);
 
-  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      try {
+        const rows = await apiRequest<T[]>(path);
+        if (!active) return;
+        setData(rows);
+        setSource('live');
+        setError(null);
+      } catch (err) {
+        if (!active) return;
+        setError(err instanceof Error ? err.message : 'Failed to load');
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [path]);
 
   async function mutate(run: () => Promise<unknown>) {
     setBusy(true);

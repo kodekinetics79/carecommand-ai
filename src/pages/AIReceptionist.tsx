@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Phone, MessageSquare, Mail, Sparkles, Clock, CheckCircle2, AlertCircle, ArrowRight, Bot, Zap, User, Calendar } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
@@ -26,13 +27,13 @@ interface ConversationCard {
 }
 
 const fallbackConversations: ConversationCard[] = [
-  { id: 'c1', name: 'Rebecca Walsh', channel: 'whatsapp', message: "Hi, I'd like to book a skin consultation this week", time: '2 min ago', createdAt: '2026-06-02T09:00:00.000Z', updatedAt: '2026-06-02T09:02:00.000Z', status: 'unread', aiHandled: true, intent: 'Booking inquiry', suggestedSlot: 'Wed 28 May, 10:30am', value: '£320', lastAgentMessage: 'We have a couple of openings later this week.', lastAgentMessageAt: '2026-06-02T09:01:00.000Z' },
-  { id: 'c2', name: 'Kevin Addo', channel: 'call', message: 'Missed call — AI follow-up sent via SMS', time: '14 min ago', createdAt: '2026-06-02T08:35:00.000Z', updatedAt: '2026-06-02T08:49:00.000Z', status: 'ai-recovered', aiHandled: true, intent: 'Missed call recovery', suggestedSlot: 'Thu 29 May, 2:00pm', value: '£180', lastAgentMessage: 'Sorry we missed you — reply with a good time and we will call you back.', lastAgentMessageAt: '2026-06-02T08:48:00.000Z' },
-  { id: 'c3', name: 'Lara Petrov', channel: 'email', message: 'Can I reschedule my Botox appointment?', time: '28 min ago', createdAt: '2026-06-02T08:00:00.000Z', updatedAt: '2026-06-02T08:28:00.000Z', status: 'replied', aiHandled: false, intent: 'Reschedule', suggestedSlot: 'Fri 30 May, 11:00am', value: '£480', lastAgentMessage: 'Yes — Friday at 11:00 is available if you want to move it.', lastAgentMessageAt: '2026-06-02T08:26:00.000Z' },
-  { id: 'c4', name: 'Michael Owusu', channel: 'whatsapp', message: 'What are your weekend availability hours?', time: '45 min ago', createdAt: '2026-06-02T07:45:00.000Z', updatedAt: '2026-06-02T08:30:00.000Z', status: 'pending', aiHandled: true, intent: 'Availability enquiry', suggestedSlot: 'Sat 31 May, 9:00am', value: '£150', lastAgentMessage: 'Weekend slots are open Saturday morning and early afternoon.', lastAgentMessageAt: '2026-06-02T08:29:00.000Z' },
-  { id: 'c5', name: 'Chloe Bennett', channel: 'sms', message: 'Missed call — 3rd attempt. Escalate to manager.', time: '1 hr ago', createdAt: '2026-06-02T07:00:00.000Z', updatedAt: '2026-06-02T08:00:00.000Z', status: 'escalated', aiHandled: false, intent: 'Escalation needed', suggestedSlot: null, value: '£240', lastAgentMessage: 'Escalated to the manager for a callback today.', lastAgentMessageAt: '2026-06-02T08:00:00.000Z' },
-  { id: 'c6', name: 'Paul Nguyen', channel: 'email', message: 'Do you offer a family discount on wellness packages?', time: '2 hr ago', createdAt: '2026-06-02T06:00:00.000Z', updatedAt: '2026-06-02T08:00:00.000Z', status: 'replied', aiHandled: true, intent: 'Pricing inquiry', suggestedSlot: 'Mon 2 Jun, 9:30am', value: '£580', lastAgentMessage: 'I can share the current package options and family pricing.', lastAgentMessageAt: '2026-06-02T06:08:00.000Z' },
-  { id: 'c7', name: 'Harriet Cole', channel: 'whatsapp', message: 'I saw your offer on Instagram. Are there slots this week?', time: '2 hr ago', createdAt: '2026-06-02T06:15:00.000Z', updatedAt: '2026-06-02T08:10:00.000Z', status: 'unread', aiHandled: true, intent: 'Booking inquiry', suggestedSlot: 'Wed 28 May, 3:00pm', value: '£290', lastAgentMessage: 'We have a few slots left this week — want me to hold one?', lastAgentMessageAt: '2026-06-02T06:18:00.000Z' },
+  { id: 'c1', name: 'Rebecca Walsh', channel: 'whatsapp', message: "Hi, I'd like to book a skin consultation this week", time: '2 min ago', createdAt: '2026-06-02T09:00:00.000Z', updatedAt: '2026-06-02T09:02:00.000Z', status: 'unread', aiHandled: true, intent: 'Booking inquiry', suggestedSlot: 'Wed 28 May, 10:30am', value: '$320', lastAgentMessage: 'We have a couple of openings later this week.', lastAgentMessageAt: '2026-06-02T09:01:00.000Z' },
+  { id: 'c2', name: 'Kevin Addo', channel: 'call', message: 'Missed call — AI follow-up sent via SMS', time: '14 min ago', createdAt: '2026-06-02T08:35:00.000Z', updatedAt: '2026-06-02T08:49:00.000Z', status: 'ai-recovered', aiHandled: true, intent: 'Missed call recovery', suggestedSlot: 'Thu 29 May, 2:00pm', value: '$180', lastAgentMessage: 'Sorry we missed you — reply with a good time and we will call you back.', lastAgentMessageAt: '2026-06-02T08:48:00.000Z' },
+  { id: 'c3', name: 'Lara Petrov', channel: 'email', message: 'Can I reschedule my Botox appointment?', time: '28 min ago', createdAt: '2026-06-02T08:00:00.000Z', updatedAt: '2026-06-02T08:28:00.000Z', status: 'replied', aiHandled: false, intent: 'Reschedule', suggestedSlot: 'Fri 30 May, 11:00am', value: '$480', lastAgentMessage: 'Yes — Friday at 11:00 is available if you want to move it.', lastAgentMessageAt: '2026-06-02T08:26:00.000Z' },
+  { id: 'c4', name: 'Michael Owusu', channel: 'whatsapp', message: 'What are your weekend availability hours?', time: '45 min ago', createdAt: '2026-06-02T07:45:00.000Z', updatedAt: '2026-06-02T08:30:00.000Z', status: 'pending', aiHandled: true, intent: 'Availability enquiry', suggestedSlot: 'Sat 31 May, 9:00am', value: '$150', lastAgentMessage: 'Weekend slots are open Saturday morning and early afternoon.', lastAgentMessageAt: '2026-06-02T08:29:00.000Z' },
+  { id: 'c5', name: 'Chloe Bennett', channel: 'sms', message: 'Missed call — 3rd attempt. Escalate to manager.', time: '1 hr ago', createdAt: '2026-06-02T07:00:00.000Z', updatedAt: '2026-06-02T08:00:00.000Z', status: 'escalated', aiHandled: false, intent: 'Escalation needed', suggestedSlot: null, value: '$240', lastAgentMessage: 'Escalated to the manager for a callback today.', lastAgentMessageAt: '2026-06-02T08:00:00.000Z' },
+  { id: 'c6', name: 'Paul Nguyen', channel: 'email', message: 'Do you offer a family discount on wellness packages?', time: '2 hr ago', createdAt: '2026-06-02T06:00:00.000Z', updatedAt: '2026-06-02T08:00:00.000Z', status: 'replied', aiHandled: true, intent: 'Pricing inquiry', suggestedSlot: 'Mon 2 Jun, 9:30am', value: '$580', lastAgentMessage: 'I can share the current package options and family pricing.', lastAgentMessageAt: '2026-06-02T06:08:00.000Z' },
+  { id: 'c7', name: 'Harriet Cole', channel: 'whatsapp', message: 'I saw your offer on Instagram. Are there slots this week?', time: '2 hr ago', createdAt: '2026-06-02T06:15:00.000Z', updatedAt: '2026-06-02T08:10:00.000Z', status: 'unread', aiHandled: true, intent: 'Booking inquiry', suggestedSlot: 'Wed 28 May, 3:00pm', value: '$290', lastAgentMessage: 'We have a few slots left this week — want me to hold one?', lastAgentMessageAt: '2026-06-02T06:18:00.000Z' },
 ];
 
 const channelIcon: Record<string, React.ReactNode> = {
@@ -72,6 +73,7 @@ function buildReplyDraft(conversation?: ConversationCard) {
 }
 
 export default function AIReceptionist() {
+  const navigate = useNavigate();
   const [activeChannel, setActiveChannel] = useState('all');
   const [selectedId, setSelectedId] = useState<string>('');
   const [replyText, setReplyText] = useState('');
@@ -142,7 +144,7 @@ export default function AIReceptionist() {
         badge={`Unread: ${unresolved} · ${source === 'live' ? 'Live DB' : 'Demo'}`}
         badgeColor="red"
         actions={
-          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-violet-600 px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
+          <button type="button" onClick={() => navigate('/settings')} className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-violet-600 px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
             <Bot className="w-4 h-4" /> CareDesk AI Settings
           </button>
         }
@@ -246,7 +248,7 @@ export default function AIReceptionist() {
                       <p className="text-[10px] font-bold text-violet-v uppercase tracking-wide">AI Suggested Slot</p>
                     </div>
                     <p className="text-sm font-bold text-t1">{selectedConv.suggestedSlot}</p>
-                    <button type="button" className="mt-2 w-full py-1.5 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition-colors">
+                    <button type="button" onClick={() => navigate('/scheduling')} className="mt-2 w-full py-1.5 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition-colors">
                       Confirm & Book
                     </button>
                   </div>
@@ -320,7 +322,7 @@ export default function AIReceptionist() {
                 );
               })}
             </div>
-            <button type="button" className="mt-3 w-full flex items-center justify-center gap-1.5 py-2 rounded-xl border border-dashed border-[var(--b2)] text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition-colors">
+            <button type="button" onClick={() => navigate('/control-plane')} className="mt-3 w-full flex items-center justify-center gap-1.5 py-2 rounded-xl border border-dashed border-[var(--b2)] text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition-colors">
               <ArrowRight className="w-3 h-3" /> View full call log
             </button>
           </BentoCard>

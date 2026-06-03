@@ -16,6 +16,38 @@ export interface ApiPatient {
   nextVisitAt?: string | null;
   appointments?: ApiAppointment[];
   consentEvents?: Array<{ purpose: 'SMS' | 'WHATSAPP' | 'EMAIL' | 'MARKETING'; granted: boolean }>;
+  patientInsurancePolicies?: Array<{
+    id: string;
+    payerId?: string | null;
+    memberId: string;
+    groupNumber?: string | null;
+    payer?: { name: string } | null;
+    verificationStatus: string;
+    verifiedAt?: string | null;
+    active: boolean;
+  }>;
+  eligibilityVerifications?: Array<{
+    id: string;
+    appointmentId?: string | null;
+    payerId?: string | null;
+    payer?: { name: string } | null;
+    policy?: { memberId: string; groupNumber?: string | null } | null;
+    coverageStatus: string;
+    coverageActive: boolean;
+    planName: string;
+    copay: string;
+    deductibleRemaining: string;
+    coinsurance: string;
+    eligibilityMessage: string;
+    payerReference?: string | null;
+    checkedAt: string;
+    providerMode: string;
+    priorAuthRequired?: boolean;
+    recommendedAction?: string;
+    riskLevel?: 'LOW' | 'MEDIUM' | 'HIGH';
+    revenueAtRisk?: number;
+  }>;
+  priorAuthorizations?: Array<{ id: string; status: string; serviceName: string; notes?: string | null; dueAt?: string | null; payer?: { name: string } | null }>;
 }
 
 export interface ApiInventoryItem {
@@ -576,6 +608,6 @@ export function mapConversation(row: ApiConversation) {
     lastAgentMessage: row.lastAgentMessage ?? undefined,
     lastAgentMessageAt: row.lastAgentMessageAt ?? undefined,
     suggestedSlot: null,
-    value: `£${Number(row.estimatedValue).toLocaleString()}`,
+    value: `$${Number(row.estimatedValue).toLocaleString()}`,
   };
 }

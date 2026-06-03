@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   Activity, AlertTriangle, ArrowRight, Bot, CheckCircle2, Clock3,
   DollarSign, FileCheck2, Pause, Play, ShieldCheck, Sparkles, Users,
@@ -9,6 +10,7 @@ import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
 import { apiRequest } from '../lib/api';
+import { formatCurrency } from '../utils/formatters';
 
 type ApprovalStatus = 'pending' | 'approved' | 'dismissed';
 type ApiApprovalStatus = 'PENDING' | 'APPROVED' | 'DISMISSED' | 'EXECUTED' | 'FAILED';
@@ -23,24 +25,24 @@ interface ApiApproval {
 }
 
 const playbooks = [
-  { id: 'slot-fill', name: 'Empty Slot Rescue', trigger: 'Cancellation or under-utilised diary', action: 'Match waitlist, score fit, send consent-safe offer', recovered: '£8,420', runs: 34, success: 76, status: 'live', icon: CalendarIcon },
-  { id: 'missed-call', name: 'Missed Call Recovery', trigger: 'Call unanswered for 90 seconds', action: 'Identify intent, send WhatsApp/SMS, offer booking', recovered: '£5,880', runs: 51, success: 63, status: 'live', icon: PhoneIcon },
-  { id: 'winback', name: 'Customer Winback', trigger: 'High-value customer inactive for 90 days', action: 'Build personal outreach journey with branch offer', recovered: '£12,900', runs: 187, success: 18, status: 'live', icon: Users },
+  { id: 'slot-fill', name: 'Empty Slot Rescue', trigger: 'Cancellation or under-utilised diary', action: 'Match waitlist, score fit, send consent-safe offer', recovered: formatCurrency(8420), runs: 34, success: 76, status: 'live', icon: CalendarIcon },
+  { id: 'missed-call', name: 'Missed Call Recovery', trigger: 'Call unanswered for 90 seconds', action: 'Identify intent, send WhatsApp/SMS, offer booking', recovered: formatCurrency(5880), runs: 51, success: 63, status: 'live', icon: PhoneIcon },
+  { id: 'winback', name: 'Customer Winback', trigger: 'High-value customer inactive for 90 days', action: 'Build personal outreach journey with branch offer', recovered: formatCurrency(12900), runs: 187, success: 18, status: 'live', icon: Users },
   { id: 'review', name: 'Reputation Flywheel', trigger: 'Positive post-visit signal detected', action: 'Request review, route detractors to private recovery', recovered: '42 reviews', runs: 96, success: 44, status: 'draft', icon: WandSparkles },
 ];
 
 const initialApprovals = [
-  { id: 'a1', title: 'Activate Westside weekday slot-fill offer', reason: '31 empty slots detected · estimated £6,200 at risk', scope: 'Send to 84 matched customers', value: '£6,200', confidence: 91, risk: 'Low risk', status: 'pending' as ApprovalStatus },
-  { id: 'a2', title: 'Escalate 14 customers for personal follow-up', reason: 'High LTV customers need a human touch after two automated attempts', scope: 'Create tasks for branch coordinators', value: '£4,800', confidence: 86, risk: 'Human review', status: 'pending' as ApprovalStatus },
+  { id: 'a1', title: 'Activate Westside weekday slot-fill offer', reason: `31 empty slots detected · estimated ${formatCurrency(6200)} at risk`, scope: 'Send to 84 matched customers', value: formatCurrency(6200), confidence: 91, risk: 'Low risk', status: 'pending' as ApprovalStatus },
+  { id: 'a2', title: 'Escalate 14 customers for personal follow-up', reason: 'High LTV customers need a human touch after two automated attempts', scope: 'Create tasks for branch coordinators', value: formatCurrency(4800), confidence: 86, risk: 'Human review', status: 'pending' as ApprovalStatus },
   { id: 'a3', title: 'Pause Northgate reminder experiment', reason: 'Opt-out rate increased 1.8% after the second reminder variant', scope: 'Stop variant B and preserve the control', value: 'Protect trust', confidence: 94, risk: 'Recommended', status: 'pending' as ApprovalStatus },
 ];
 
 const auditTrail = [
-  { time: '10:42', event: 'Booked Charlotte Davies into released Downtown slot', actor: 'Empty Slot Rescue', result: '+£320', type: 'success' },
+  { time: '10:42', event: 'Booked Charlotte Davies into released Downtown slot', actor: 'Empty Slot Rescue', result: `+${formatCurrency(320)}`, type: 'success' },
   { time: '10:36', event: 'Suppressed outreach: marketing consent not present', actor: 'Consent Guardrail', result: 'Blocked', type: 'guardrail' },
-  { time: '10:18', event: 'Recovered missed call with WhatsApp booking link', actor: 'Missed Call Recovery', result: '+£180', type: 'success' },
+  { time: '10:18', event: 'Recovered missed call with WhatsApp booking link', actor: 'Missed Call Recovery', result: `+${formatCurrency(180)}`, type: 'success' },
   { time: '09:54', event: 'Created personal follow-up task for branch coordinator', actor: 'Customer Winback', result: 'Human step', type: 'human' },
-  { time: '09:31', event: 'Filled cancellation from priority waitlist match', actor: 'Empty Slot Rescue', result: '+£480', type: 'success' },
+  { time: '09:31', event: 'Filled cancellation from priority waitlist match', actor: 'Empty Slot Rescue', result: `+${formatCurrency(480)}`, type: 'success' },
 ];
 
 function CalendarIcon({ className }: { className?: string }) {
@@ -52,6 +54,7 @@ function PhoneIcon({ className }: { className?: string }) {
 }
 
 export default function Autopilot() {
+  const navigate = useNavigate();
   const [isPaused, setIsPaused] = useState(false);
   const [approvals, setApprovals] = useState(initialApprovals);
   const [selectedPlaybook, setSelectedPlaybook] = useState(playbooks[0].id);
@@ -116,7 +119,7 @@ export default function Autopilot() {
               <p className="text-xs font-bold uppercase tracking-widest text-indigo-200">Closed-loop growth engine</p>
             </div>
             <h2 className="max-w-3xl text-xl font-bold leading-snug text-white">
-              CareFlow found £11,000 in recoverable value and safely actioned 68% without adding front-desk work.
+              CareFlow found {formatCurrency(11000)} in recoverable value and safely actioned 68% without adding front-desk work.
             </h2>
             <p className="mt-2 max-w-3xl text-sm leading-relaxed text-white/70">
               Unlike a passive dashboard, Autopilot connects revenue signals, consent rules, scheduling inventory, customer context, and staff escalation into one governed action layer.
@@ -131,7 +134,7 @@ export default function Autopilot() {
       </div>
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Value Recovered" value="£27,200" subtitle="Autopilot this month" trend={23} icon={<DollarSign className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Value Recovered" value={formatCurrency(27200)} subtitle="Autopilot this month" trend={23} icon={<DollarSign className="w-4 h-4" />} accent="emerald" />
         <StatCard title="Agent Actions" value="368" subtitle="Across 4 playbooks" trend={18} icon={<Bot className="w-4 h-4" />} accent="violet" />
         <StatCard title="Human Time Saved" value="42.5h" subtitle="Estimated monthly" trend={31} icon={<Clock3 className="w-4 h-4" />} accent="blue" />
         <StatCard title="Guardrail Blocks" value="17" subtitle="Unsafe actions prevented" icon={<ShieldCheck className="w-4 h-4" />} accent="amber" />
@@ -262,7 +265,7 @@ export default function Autopilot() {
                 </div>
               ))}
             </div>
-            <button type="button" className="mt-4 flex w-full items-center justify-center gap-1 rounded-xl border border-dashed border-[var(--b2)] py-2 text-xs font-semibold text-indigo hover:bg-[var(--s3)]">
+            <button type="button" onClick={() => navigate('/control-plane')} className="mt-4 flex w-full items-center justify-center gap-1 rounded-xl border border-dashed border-[var(--b2)] py-2 text-xs font-semibold text-indigo hover:bg-[var(--s3)]">
               View full audit log <ArrowRight className="w-3 h-3" />
             </button>
           </BentoCard>

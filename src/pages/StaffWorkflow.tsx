@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Clock, Phone, TrendingUp, AlertCircle, Sparkles, Zap, ArrowRight } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
-import { branches } from '../data/mockClinics';
-import { staffMembers as staffFallback } from '../data/mockStaff';
+import { branches, staffMembers as staffFallback } from '../data/seedData';
 import { apiRequest } from '../lib/api';
 import { mapStaffProfile, mapStaffTask, type ApiStaffProfile, type ApiStaffTask } from '../lib/apiAdapters';
 import type { StaffMember } from '../types';
@@ -47,6 +47,7 @@ function extractRows<T>(payload: T[] | { data: T[] }) {
 }
 
 export default function StaffWorkflow() {
+  const navigate = useNavigate();
   const [staffRecords, setStaffRecords] = useState<StaffView[]>(mapFallbackStaff());
   const [taskRecords, setTaskRecords] = useState<TaskView[]>(taskFallback.map(mapStaffTask));
   const [source, setSource] = useState<'live' | 'demo'>('demo');
@@ -89,18 +90,30 @@ export default function StaffWorkflow() {
     }
   }
 
+  async function markTaskInProgress(taskId: string) {
+    setTaskRecords(current => current.map(task => task.id === taskId ? { ...task, status: 'in-progress' } : task));
+    try {
+      await apiRequest(`/v1/staff/tasks/${taskId}/status`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status: 'IN_PROGRESS' }),
+      });
+    } catch {
+      setTaskRecords(current => current.map(task => task.id === taskId ? { ...task, status: 'open' } : task));
+    }
+  }
+
   const underperformers = staffRecords.filter(member => member.bookingConversionRate < 55 || member.responseTime > 6);
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Staff Workflow"
-        subtitle="Task board, response SLA tracking, booking conversion, and AI coaching recommendations."
+        subtitle="Task board, response SLA tracking, booking conversion, and coaching recommendations."
         badge={`${totals.overdueCount} Overdue · ${source === 'live' ? 'Live DB' : 'Demo'}`}
         badgeColor="red"
         actions={
-          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
-            <Zap className="w-4 h-4" /> Assign AI Tasks
+          <button type="button" onClick={() => navigate('/autopilot')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
+            <Zap className="w-4 h-4" /> Assign tasks
           </button>
         }
       />
@@ -138,7 +151,7 @@ export default function StaffWorkflow() {
                         <span className="text-[10px] text-t3">· {task.branch} · {task.assignee}</span>
                       </div>
                     </div>
-                    <button type="button" className="text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors shrink-0">
+                    <button type="button" onClick={() => void markTaskInProgress(task.id)} className="text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors shrink-0">
                       Act
                     </button>
                   </div>
@@ -192,7 +205,7 @@ export default function StaffWorkflow() {
         </div>
 
         <div className="space-y-4">
-          <BentoCard title="AI Coaching Recommendations" subtitle="For underperforming staff" headerRight={<Sparkles className="w-4 h-4 text-violet-500" />}>
+          <BentoCard title="Coaching Recommendations" subtitle="For underperforming staff" headerRight={<Sparkles className="w-4 h-4 text-violet-500" />}>
             <div className="space-y-3">
               {underperformers.map(member => (
                 <div key={member.id} className="p-3.5 rounded-xl border border-[var(--b1)] bg-[var(--amber-soft)]">
@@ -211,10 +224,10 @@ export default function StaffWorkflow() {
                     <ProgressBar value={Math.max(0, 100 - (member.responseTime * 10))} size="xs" />
                   </div>
                   <p className="text-[11px] text-t2 mb-2">
-                    AI script: use customer name, reference their last service, and offer a specific time slot.
+                    Script: use customer name, reference their last service, and offer a specific time slot.
                   </p>
-                  <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo hover:opacity-80">
-                    <Sparkles className="w-3 h-3" /> View AI coaching script <ArrowRight className="w-3 h-3" />
+                  <button type="button" onClick={() => navigate('/autopilot')} className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo hover:opacity-80">
+                    <Sparkles className="w-3 h-3" /> View coaching script <ArrowRight className="w-3 h-3" />
                   </button>
                 </div>
               ))}
@@ -244,10 +257,10 @@ export default function StaffWorkflow() {
               <div>
                 <p className="text-sm font-bold text-red-v">SLA Breach Alert</p>
                 <p className="text-xs text-t2 mt-0.5 leading-relaxed">
-                  {underperformers.slice(0, 2).map(member => member.name).join(' and ')} are exceeding the 6-minute response-time SLA. Escalate to the branch manager or reassign incoming calls to AI.
+                  {underperformers.slice(0, 2).map(member => member.name).join(' and ')} are exceeding the 6-minute response-time SLA. Escalate to the branch manager or reassign incoming calls to overflow routing.
                 </p>
-                <button type="button" className="mt-2 inline-flex items-center gap-1 text-xs font-semibold badge badge-red px-3 py-1.5 rounded-lg hover:opacity-80 transition-colors">
-                  <Zap className="w-3 h-3" /> Enable AI overflow routing
+                <button type="button" onClick={() => navigate('/ai-receptionist')} className="mt-2 inline-flex items-center gap-1 text-xs font-semibold badge badge-red px-3 py-1.5 rounded-lg hover:opacity-80 transition-colors">
+                  <Zap className="w-3 h-3" /> Enable overflow routing
                 </button>
               </div>
             </div>

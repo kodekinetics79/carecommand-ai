@@ -54,6 +54,24 @@ export const patientRoutes: FastifyPluginAsync = async app => {
       include: {
         appointments: { where: { deletedAt: null }, orderBy: { startsAt: 'desc' }, take: 20 },
         consentEvents: { orderBy: { occurredAt: 'desc' } },
+        patientInsurancePolicies: {
+          where: { tenantId: request.auth.tenantId, active: true },
+          orderBy: { updatedAt: 'desc' },
+          take: 1,
+          include: { payer: { select: { name: true } } },
+        },
+        eligibilityVerifications: {
+          where: { tenantId: request.auth.tenantId },
+          orderBy: { checkedAt: 'desc' },
+          take: 20,
+          include: { payer: { select: { name: true } }, policy: { select: { memberId: true, groupNumber: true } }, appointment: { select: { service: true, startsAt: true } } },
+        },
+        priorAuthorizations: {
+          where: { tenantId: request.auth.tenantId },
+          orderBy: [{ dueAt: 'asc' }, { updatedAt: 'desc' }],
+          take: 10,
+          include: { payer: { select: { name: true } } },
+        },
       },
     });
     if (!patient) throw app.httpErrors.notFound('Patient not found');
@@ -91,5 +109,30 @@ export const patientRoutes: FastifyPluginAsync = async app => {
     });
     await audit(request, { action: 'patient.consent.recorded', resource: 'patient', resourceId: patient.id, metadata: { purpose: input.purpose, granted: input.granted } });
     return reply.code(201).send(consent);
+  });
+
+  app.post('/:id/follow-up-task', { preHandler: requireRoles('OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK') }, async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const input = z.object({
+      title: z.string().trim().min(2).max(240).optional(),
+      priority: z.string().trim().min(2).max(40).default('high'),
+      dueAt: z.coerce.date().optional(),
+    }).parse(request.body ?? {});
+    const patient = await db.patient.findFirst({
+      where: { id, tenantId: request.auth.tenantId, deletedAt: null, ...branchScope(request) },
+    });
+    if (!patient) throw app.httpErrors.notFound('Patient not found');
+
+    const task = await db.staffTask.create({
+      data: {
+        tenantId: request.auth.tenantId,
+        branchId: patient.branchId,
+        title: input.title ?? `Follow up with ${patient.firstName} ${patient.lastName}`,
+        priority: input.priority,
+        dueAt: input.dueAt ?? new Date(Date.now() + 1000 * 60 * 60 * 24),
+      },
+    });
+    await audit(request, { action: 'patient.followup.task_created', resource: 'patient', resourceId: patient.id, metadata: { taskId: task.id } });
+    return reply.code(201).send(task);
   });
 };

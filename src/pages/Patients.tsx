@@ -5,8 +5,7 @@ import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
-import { patients } from '../data/mockPatients';
-import { branches } from '../data/mockClinics';
+import { patients, branches } from '../data/seedData';
 import { formatCurrency } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapPatient, type ApiPatient } from '../lib/apiAdapters';
@@ -69,7 +68,7 @@ export default function Patients() {
   const activeCount = customerRecords.filter(p => p.lifecycleStage === 'active' || p.lifecycleStage === 'retained').length;
   const avgLTV = customerRecords.length > 0 ? Math.round(customerRecords.reduce((sum, patient) => sum + patient.lifetimeValue, 0) / customerRecords.length) : 0;
   const segments = [
-    { label: 'High LTV (>£4,000)', count: customerRecords.filter(p => p.lifetimeValue > 4000).length, color: 'emerald' as const },
+    { label: 'High LTV (>$4,000)', count: customerRecords.filter(p => p.lifetimeValue > 4000).length, color: 'emerald' as const },
     { label: 'At-risk churn', count: customerRecords.filter(p => p.churnRisk >= 60).length, color: 'red' as const },
     { label: 'Inactive (90d+)', count: customerRecords.filter(p => p.lifecycleStage === 'inactive').length, color: 'amber' as const },
     { label: 'Marketing consented', count: customerRecords.filter(p => p.consentStatus.marketing).length, color: 'blue' as const },
@@ -239,7 +238,7 @@ export default function Patients() {
           </BentoCard>
 
           {/* Segments */}
-          <BentoCard title="Customer Segments" subtitle="AI-driven groups">
+          <BentoCard title="Customer Segments" subtitle="Live segmentation">
             <div className="space-y-2.5">
               {segments.map((seg) => (
                 <div key={seg.label} className="flex items-center justify-between gap-3 p-3 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-all">
@@ -268,15 +267,15 @@ export default function Patients() {
             </div>
           </BentoCard>
 
-          {/* AI outreach */}
+          {/* Outreach recommendation */}
           <div className="rounded-2xl bg-[var(--s2)] border border-[var(--b2)] p-4">
             <div className="flex items-center gap-2 mb-2">
               <Sparkles className="w-4 h-4 text-violet-v" />
-              <p className="text-[10px] font-bold uppercase tracking-widest text-violet-v">AI Recommendation</p>
+              <p className="text-[10px] font-bold uppercase tracking-widest text-violet-v">Outreach Recommendation</p>
             </div>
             <p className="text-sm font-bold text-t1 mb-1">18 customers ready for outreach</p>
             <p className="text-xs text-t2 mb-3">High-LTV customers with marketing consent who haven't been contacted in 60+ days.</p>
-            <button type="button" className="w-full py-2 rounded-xl bg-[var(--violet-soft)] hover:bg-[var(--s3)] text-violet-v text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
+            <button type="button" onClick={() => navigate('/campaigner')} className="w-full py-2 rounded-xl bg-[var(--violet-soft)] hover:bg-[var(--s3)] text-violet-v text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
               <ArrowRight className="w-3.5 h-3.5" /> Launch outreach campaign
             </button>
           </div>

@@ -1,5 +1,5 @@
 import { RadarChart, PolarGrid, PolarAngleAxis, Radar, ResponsiveContainer } from 'recharts';
-import { doctors } from '../../data/mockClinics';
+import { doctors } from '../../data/seedData';
 import { useApiResource } from '../../hooks/useApiResource';
 import { mapProviderProfile, type ApiProviderProfile } from '../../lib/apiAdapters';
 

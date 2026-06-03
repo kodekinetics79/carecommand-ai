@@ -12,6 +12,8 @@ export function useApiResource<TApi, TView extends { id: string }>(
   const demoRows = useMemo(() => demoFallbackEnabled ? fallback : [], [demoFallbackEnabled, fallback]);
   const [data, setData] = useState(demoRows);
   const [source, setSource] = useState<'live' | 'demo'>('demo');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [reloadIndex, setReloadIndex] = useState(0);
 
   useEffect(() => {
@@ -28,9 +30,24 @@ export function useApiResource<TApi, TView extends { id: string }>(
         if (!active) return;
         setData(demoRows);
         setSource('demo');
-    });
+        setError('Using demo fallback data');
+      })
+      .finally(() => {
+        if (!active) return;
+        setLoading(false);
+      });
     return () => { active = false; };
   }, [demoRows, mapRow, path, reloadIndex]);
 
-  return { data, source, reload: () => setReloadIndex(current => current + 1) };
+  return {
+    data,
+    source,
+    loading,
+    error,
+    reload: () => {
+      setLoading(true);
+      setError(null);
+      setReloadIndex(current => current + 1);
+    },
+  };
 }
