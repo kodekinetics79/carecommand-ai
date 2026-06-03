@@ -3,12 +3,11 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, Star, ShieldCheck, MessageSquare, CalendarDays, TrendingUp, AlertCircle, Sparkles, Zap, CheckCircle2, Mail, Phone, Clock } from 'lucide-react';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
-import { patients } from '../data/mockPatients';
-import { appointments } from '../data/mockAppointments';
-import { doctors, branches } from '../data/mockClinics';
+import { patients, appointments, doctors, branches } from '../data/seedData';
 import { formatCurrency, formatDate } from '../utils/formatters';
 import { apiRequest } from '../lib/api';
 import { mapAppointment, mapPatient, type ApiPatient } from '../lib/apiAdapters';
+import { checkEligibility, type EligibilityVerification } from '../lib/revenueProtection';
 
 const lifecycleConfig: Record<string, { label: string; color: string; bg: string }> = {
   new:      { label: 'New',      color: 'text-indigo',    bg: 'badge badge-blue' },
@@ -38,6 +37,21 @@ export default function PatientProfile() {
   const [patient, setPatient] = useState(fallbackPatient);
   const [loading, setLoading] = useState(!fallbackPatient);
   const [liveVisitHistory, setLiveVisitHistory] = useState<typeof appointments>([]);
+  const [eligibilityHistory, setEligibilityHistory] = useState<EligibilityVerification[]>([]);
+  const [policyRow, setPolicyRow] = useState<{
+    payerName: string;
+    memberId: string;
+    groupNumber?: string | null;
+    verifiedAt?: string | null;
+    verificationStatus: string;
+  } | null>(null);
+  const [taskState, setTaskState] = useState<'idle' | 'saving' | 'saved'>('idle');
+  const [insuranceAction, setInsuranceAction] = useState<'idle' | 'saving' | 'saved'>('idle');
+  const [insuranceError, setInsuranceError] = useState<string | null>(null);
+  const [acceptedPayers, setAcceptedPayers] = useState<{ id: string; name: string }[]>([]);
+  const [showPolicyForm, setShowPolicyForm] = useState(false);
+  const [policySaving, setPolicySaving] = useState(false);
+  const [policyForm, setPolicyForm] = useState({ payerId: '', planName: '', memberId: '', groupNumber: '' });
   const visitHistory = useMemo(() => appointments.filter(a => a.patientId === id), [id]);
   const assignedDoctor = doctors.find(d => d.id === patient?.assignedDoctorId);
   const branch = branches.find(b => b.id === patient?.branchId);
@@ -50,13 +64,162 @@ export default function PatientProfile() {
         if (!active) return;
         setPatient(mapPatient(row));
         setLiveVisitHistory(row.appointments?.map(mapAppointment) ?? []);
+        setEligibilityHistory(row.eligibilityVerifications?.map(item => ({
+          id: item.id,
+          branchId: row.branchId,
+          branchName: branch?.name ?? '—',
+          patientId: id,
+          patientName: `${row.firstName} ${row.lastName}`,
+          appointmentId: item.appointmentId ?? null,
+          payerId: item.payerId ?? null,
+          payerName: item.payer?.name ?? '—',
+          policyId: null,
+          memberId: item.policy?.memberId ?? null,
+          providerMode: item.providerMode === 'mock' ? 'mock' : 'sandbox',
+          coverageStatus: item.coverageStatus,
+          planName: item.planName,
+          copay: Number(item.copay),
+          deductibleRemaining: Number(item.deductibleRemaining),
+          coinsurance: Number(item.coinsurance),
+          coverageActive: item.coverageActive,
+          eligibilityMessage: item.eligibilityMessage,
+          payerReference: item.payerReference ?? null,
+          checkedAt: item.checkedAt,
+          priorAuthRequired: item.priorAuthRequired,
+          recommendedAction: item.recommendedAction,
+          riskLevel: item.riskLevel,
+          revenueAtRisk: item.revenueAtRisk,
+        })) ?? []);
+        setPolicyRow(row.patientInsurancePolicies?.[0] ? {
+          payerName: row.patientInsurancePolicies[0].payer?.name ?? '—',
+          memberId: row.patientInsurancePolicies[0].memberId,
+          groupNumber: row.patientInsurancePolicies[0].groupNumber ?? null,
+          verifiedAt: row.patientInsurancePolicies[0].verifiedAt ?? null,
+          verificationStatus: row.patientInsurancePolicies[0].verificationStatus,
+        } : null);
       })
       .catch(() => undefined)
       .finally(() => {
         if (active) setLoading(false);
       });
     return () => { active = false; };
-  }, [id]);
+  }, [id, branch?.name]);
+
+  useEffect(() => {
+    let active = true;
+    apiRequest<{ id: string; name: string }[]>('/v1/insurance/accepted')
+      .then(rows => { if (active) setAcceptedPayers(rows); })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, []);
+
+  async function savePolicy() {
+    if (!patient) return;
+    const payer = acceptedPayers.find(p => p.id === policyForm.payerId);
+    if (!payer || !policyForm.memberId.trim()) {
+      setInsuranceError('Select an insurer and enter a member ID.');
+      return;
+    }
+    setPolicySaving(true);
+    setInsuranceError(null);
+    try {
+      await apiRequest('/v1/insurance/policies', {
+        method: 'POST',
+        body: JSON.stringify({
+          patientId: patient.id,
+          payerId: payer.id,
+          planName: policyForm.planName.trim() || `${payer.name} Plan`,
+          memberId: policyForm.memberId.trim(),
+          groupNumber: policyForm.groupNumber.trim() || undefined,
+        }),
+      });
+      setPolicyForm({ payerId: '', planName: '', memberId: '', groupNumber: '' });
+      setShowPolicyForm(false);
+      await refreshPatient();
+    } catch (err) {
+      setInsuranceError(err instanceof Error ? err.message : 'Failed to save insurance');
+    } finally {
+      setPolicySaving(false);
+    }
+  }
+
+  async function refreshPatient() {
+    if (!id) return;
+    const row = await apiRequest<ApiPatient>(`/v1/patients/${id}`);
+    setPatient(mapPatient(row));
+    setLiveVisitHistory(row.appointments?.map(mapAppointment) ?? []);
+    setEligibilityHistory(row.eligibilityVerifications?.map(item => ({
+      id: item.id,
+      branchId: row.branchId,
+      branchName: branch?.name ?? '—',
+      patientId: id,
+      patientName: `${row.firstName} ${row.lastName}`,
+      appointmentId: item.appointmentId ?? null,
+      payerId: item.payerId ?? null,
+      payerName: item.payer?.name ?? '—',
+      policyId: null,
+      memberId: item.policy?.memberId ?? null,
+      providerMode: item.providerMode === 'mock' ? 'mock' : 'sandbox',
+      coverageStatus: item.coverageStatus,
+      planName: item.planName,
+      copay: Number(item.copay),
+      deductibleRemaining: Number(item.deductibleRemaining),
+      coinsurance: Number(item.coinsurance),
+      coverageActive: item.coverageActive,
+      eligibilityMessage: item.eligibilityMessage,
+      payerReference: item.payerReference ?? null,
+      checkedAt: item.checkedAt,
+      priorAuthRequired: item.priorAuthRequired,
+      recommendedAction: item.recommendedAction,
+      riskLevel: item.riskLevel,
+      revenueAtRisk: item.revenueAtRisk,
+    })) ?? []);
+    setPolicyRow(row.patientInsurancePolicies?.[0] ? {
+      payerName: row.patientInsurancePolicies[0].payer?.name ?? '—',
+      memberId: row.patientInsurancePolicies[0].memberId,
+      groupNumber: row.patientInsurancePolicies[0].groupNumber ?? null,
+      verifiedAt: row.patientInsurancePolicies[0].verifiedAt ?? null,
+      verificationStatus: row.patientInsurancePolicies[0].verificationStatus,
+    } : null);
+  }
+
+  async function createFollowUpTask() {
+    if (!patient) return;
+    setTaskState('saving');
+    try {
+      await apiRequest(`/v1/patients/${patient.id}/follow-up-task`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+      setTaskState('saved');
+    } catch {
+      setTaskState('idle');
+    }
+  }
+
+  async function verifyNow() {
+    if (!patient) return;
+    const latestAppointment = visibleVisitHistory.find(visit => visit.status !== 'completed' && visit.status !== 'canceled') ?? visibleVisitHistory[0];
+    if (!latestAppointment) {
+      setInsuranceError('No appointment available to verify.');
+      return;
+    }
+    setInsuranceAction('saving');
+    setInsuranceError(null);
+    try {
+      await checkEligibility({
+        patientId: patient.id,
+        appointmentId: latestAppointment.id,
+        branchId: patient.branchId,
+        serviceType: latestAppointment.service,
+      });
+      await refreshPatient();
+      setInsuranceAction('saved');
+    } catch (err) {
+      setInsuranceError(err instanceof Error ? err.message : 'Unable to verify insurance');
+      setInsuranceAction('idle');
+    }
+  }
 
   if (!patient) {
     return (
@@ -72,6 +235,16 @@ export default function PatientProfile() {
   const lc = lifecycleConfig[patient.lifecycleStage];
   const visibleVisitHistory = liveVisitHistory.length > 0 ? liveVisitHistory : visitHistory;
   const totalSpend = visibleVisitHistory.reduce((s, v) => s + v.value, 0);
+  const latestEligibility = eligibilityHistory[0] ?? null;
+  const coverageActive = latestEligibility?.coverageActive ?? policyRow?.verificationStatus === 'verified';
+  const normalizedCoverage = (latestEligibility?.coverageStatus ?? policyRow?.verificationStatus ?? 'Not Verified').toUpperCase();
+  const coverageLabel = normalizedCoverage === 'ACTIVE'
+    ? 'Active'
+    : normalizedCoverage === 'INACTIVE'
+      ? 'Inactive'
+      : normalizedCoverage === 'VERIFIED'
+        ? 'Active'
+        : normalizedCoverage;
 
   return (
     <div className="space-y-6 pb-8">
@@ -102,10 +275,10 @@ export default function PatientProfile() {
           </div>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          <button type="button" className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--indigo-soft)] border border-[var(--b2)] px-3 py-2 text-xs font-semibold text-indigo hover:bg-[var(--s3)] transition">
-            <Zap className="w-3.5 h-3.5" /> Quick outreach
+          <button type="button" onClick={() => void createFollowUpTask()} className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--indigo-soft)] border border-[var(--b2)] px-3 py-2 text-xs font-semibold text-indigo hover:bg-[var(--s3)] transition">
+            <Zap className="w-3.5 h-3.5" /> {taskState === 'saving' ? 'Creating task…' : taskState === 'saved' ? 'Task created' : 'Create follow-up task'}
           </button>
-          <button type="button" className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition">
+          <button type="button" onClick={() => navigate('/scheduling')} className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition">
             <CalendarDays className="w-3.5 h-3.5" /> Book appointment
           </button>
         </div>
@@ -200,6 +373,92 @@ export default function PatientProfile() {
             </div>
           </BentoCard>
 
+          <BentoCard title="Patient Insurance" subtitle="Verify coverage, payer, and member details" headerRight={<ShieldCheck className="w-4 h-4 text-emerald-v" />}>
+            <div className="space-y-2.5">
+              <div className="flex items-center justify-between gap-3 py-2 border-b border-[var(--b1)]">
+                <p className="text-xs text-t3">Payer</p>
+                <p className="text-xs font-bold text-t1">{policyRow?.payerName ?? latestEligibility?.payerName ?? '—'}</p>
+              </div>
+              <div className="flex items-center justify-between gap-3 py-2 border-b border-[var(--b1)]">
+                <p className="text-xs text-t3">Member ID</p>
+                <p className="text-xs font-bold text-t1">{policyRow?.memberId ?? latestEligibility?.memberId ?? '—'}</p>
+              </div>
+              <div className="flex items-center justify-between gap-3 py-2 border-b border-[var(--b1)]">
+                <p className="text-xs text-t3">Group Number</p>
+                <p className="text-xs font-bold text-t1">{policyRow?.groupNumber ?? '—'}</p>
+              </div>
+              <div className="flex items-center justify-between gap-3 py-2 border-b border-[var(--b1)]">
+                <p className="text-xs text-t3">Coverage Status</p>
+                <span className={`badge ${coverageActive ? 'badge-emerald' : 'badge-amber'}`}>{coverageLabel}</span>
+              </div>
+              <div className="flex items-center justify-between gap-3 py-2 border-b border-[var(--b1)]">
+                <p className="text-xs text-t3">Last Verified</p>
+                <p className="text-xs font-bold text-t1">{formatDate(policyRow?.verifiedAt ?? latestEligibility?.checkedAt ?? undefined)}</p>
+              </div>
+              {latestEligibility && (
+                <>
+                  <div className="flex items-center justify-between gap-3 py-2 border-b border-[var(--b1)]">
+                    <p className="text-xs text-t3">Copay</p>
+                    <p className="text-xs font-bold text-t1">{formatCurrency(latestEligibility.copay)}</p>
+                  </div>
+                  <div className="flex items-center justify-between gap-3 py-2 border-b border-[var(--b1)]">
+                    <p className="text-xs text-t3">Deductible</p>
+                    <p className="text-xs font-bold text-t1">{formatCurrency(latestEligibility.deductibleRemaining)}</p>
+                  </div>
+                  <div className="flex items-center justify-between gap-3 py-2 border-b border-[var(--b1)]">
+                    <p className="text-xs text-t3">Auth</p>
+                    <p className="text-xs font-bold text-t1">{latestEligibility.priorAuthRequired ? 'Required' : 'Not Required'}</p>
+                  </div>
+                </>
+              )}
+              {insuranceError && <p className="text-[11px] text-red-v">{insuranceError}</p>}
+
+              {showPolicyForm ? (
+                <div className="p-3 rounded-xl border border-[var(--b2)] bg-[var(--s2)] space-y-2">
+                  <select aria-label="Insurer" value={policyForm.payerId} onChange={e => setPolicyForm(f => ({ ...f, payerId: e.target.value }))} className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s1)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
+                    <option value="">Select insurer…</option>
+                    {acceptedPayers.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                  </select>
+                  <input value={policyForm.memberId} onChange={e => setPolicyForm(f => ({ ...f, memberId: e.target.value }))} placeholder="Member ID" className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s1)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+                  <div className="grid grid-cols-2 gap-2">
+                    <input value={policyForm.groupNumber} onChange={e => setPolicyForm(f => ({ ...f, groupNumber: e.target.value }))} placeholder="Group (optional)" className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s1)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+                    <input value={policyForm.planName} onChange={e => setPolicyForm(f => ({ ...f, planName: e.target.value }))} placeholder="Plan (optional)" className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s1)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+                  </div>
+                  <div className="flex gap-2">
+                    <button type="button" disabled={policySaving} onClick={() => void savePolicy()} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 disabled:opacity-40">{policySaving ? 'Saving…' : 'Save insurance'}</button>
+                    <button type="button" onClick={() => setShowPolicyForm(false)} className="px-3 py-2 rounded-lg border border-[var(--b1)] text-t2 text-xs font-semibold hover:bg-[var(--s3)]">Cancel</button>
+                  </div>
+                </div>
+              ) : (
+                <button type="button" onClick={() => setShowPolicyForm(true)} className="w-full inline-flex items-center justify-center gap-2 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition">
+                  <ShieldCheck className="w-3.5 h-3.5" /> {policyRow ? 'Update insurance' : 'Add insurance'}
+                </button>
+              )}
+
+              <button type="button" onClick={() => void verifyNow()} className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition">
+                <ShieldCheck className="w-3.5 h-3.5" />
+                {insuranceAction === 'saving' ? 'Verifying…' : insuranceAction === 'saved' ? 'Verified' : 'Verify Now'}
+              </button>
+              <div className="space-y-2 pt-2">
+                <p className="text-[10px] font-bold uppercase tracking-widest text-t3">Eligibility History</p>
+                {eligibilityHistory.length === 0 ? (
+                  <p className="text-xs text-t3">No eligibility history yet.</p>
+                ) : (
+                  eligibilityHistory.map(item => (
+                    <div key={item.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-xs font-semibold text-t1">{item.coverageStatus}</p>
+                        <span className={`badge ${item.coverageActive ? 'badge-emerald' : 'badge-amber'}`}>{item.riskLevel ?? 'LOW'}</span>
+                      </div>
+                      <p className="mt-1 text-[11px] text-t3">{formatDate(item.checkedAt)}</p>
+                      <p className="mt-1 text-[11px] text-t3">{item.recommendedAction ?? item.eligibilityMessage}</p>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </BentoCard>
+
           {/* Consent status */}
           <BentoCard title="Consent & Channels" subtitle="Communication permissions" headerRight={<ShieldCheck className="w-4 h-4 text-emerald-v" />}>
             <div className="space-y-2">
@@ -232,7 +491,7 @@ export default function PatientProfile() {
           )}
 
           {/* AI snapshot */}
-          <BentoCard title="AI Engagement Snapshot" subtitle="Automated insight" headerRight={<Sparkles className="w-4 h-4 text-violet-v" />}>
+          <BentoCard title="Engagement Snapshot" subtitle="Automated insight" headerRight={<Sparkles className="w-4 h-4 text-violet-v" />}>
             <p className="text-xs text-t2 leading-relaxed mb-3">
               {patient.name} is a <strong className="text-t1">{patient.lifecycleStage.replace('-', ' ')}</strong> customer with strong lifetime value. Recent service history suggests an ideal opportunity for a follow-up campaign and review request.
             </p>
@@ -246,7 +505,7 @@ export default function PatientProfile() {
                 <div className="flex items-center gap-2 text-[11px] text-amber-v"><AlertCircle className="w-3.5 h-3.5 shrink-0" /> No marketing consent — limit to transactional messages</div>
               )}
             </div>
-            <button type="button" className="mt-3 w-full flex items-center justify-center gap-1.5 py-2 rounded-xl bg-[var(--violet-soft)] border border-[var(--b2)] text-xs font-semibold text-violet-v hover:bg-[var(--s3)] transition-colors">
+            <button type="button" onClick={() => navigate('/reviews')} className="mt-3 w-full flex items-center justify-center gap-1.5 py-2 rounded-xl bg-[var(--violet-soft)] border border-[var(--b2)] text-xs font-semibold text-violet-v hover:bg-[var(--s3)] transition-colors">
               <Star className="w-3.5 h-3.5" /> Request review from this customer
             </button>
           </BentoCard>

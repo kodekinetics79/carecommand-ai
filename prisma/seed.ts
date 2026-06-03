@@ -1,15 +1,39 @@
 import 'dotenv/config';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '../server/generated/prisma/client';
+import { generatePasswordHash } from '../server/lib/security';
 
 const tenantId = process.env.DEV_TENANT_ID ?? '11111111-1111-4111-8111-111111111111';
 const userId = process.env.DEV_USER_ID ?? '22222222-2222-4222-8222-222222222222';
 const branchId = '33333333-3333-4333-8333-333333333333';
 const patientId = '44444444-4444-4444-8444-444444444444';
+const providerLoginEmail = 'sarah.mitchell@carecommand.local';
+const providerLoginPassword = 'Provider123!';
 
 const db = new PrismaClient({
   adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }),
 });
+
+async function ensureClinicAccess(userId: string, branchId: string, isPrimary = false) {
+  const existing = await db.userClinicAccess.findFirst({
+    where: { tenantId, userId, branchId },
+  });
+  if (!existing) {
+    await db.userClinicAccess.create({
+      data: {
+        tenantId,
+        userId,
+        branchId,
+        isPrimary,
+      },
+    });
+  } else if (isPrimary && !existing.isPrimary) {
+    await db.userClinicAccess.update({
+      where: { id: existing.id },
+      data: { isPrimary: true },
+    });
+  }
+}
 
 await db.tenant.upsert({
   where: { id: tenantId },
@@ -25,8 +49,22 @@ await db.branch.upsert({
 
 await db.user.upsert({
   where: { id: userId },
-  update: {},
-  create: { id: userId, tenantId, email: 'owner@carecommand.local', displayName: 'Demo Owner', role: 'OWNER' },
+  update: {
+    tenantId,
+    email: 'admin@carecommand.ai',
+    displayName: 'Demo Admin',
+    role: 'OWNER',
+    passwordHash: await generatePasswordHash('ChangeMe123!'),
+    active: true,
+  },
+  create: {
+    id: userId,
+    tenantId,
+    email: 'admin@carecommand.ai',
+    displayName: 'Demo Admin',
+    role: 'OWNER',
+    passwordHash: await generatePasswordHash('ChangeMe123!'),
+  },
 });
 
 for (const branch of [
@@ -40,6 +78,10 @@ for (const branch of [
     update: {},
     create: { id: branch.id, tenantId, name: branch.name, location: branch.location },
   });
+}
+
+for (const branchAccessId of [branchId, '66666666-6666-4666-8666-666666666666', '77777777-7777-4777-8777-777777777777', '88888888-8888-4888-8888-888888888888']) {
+  await ensureClinicAccess(userId, branchAccessId, branchAccessId === branchId);
 }
 
 const providerSeeds = [
@@ -73,6 +115,18 @@ for (const provider of providerSeeds) {
       role: 'PROVIDER',
     },
   });
+
+  if (provider.email === providerLoginEmail) {
+    await db.user.update({
+      where: { id: providerUser.id },
+      data: {
+        passwordHash: await generatePasswordHash(providerLoginPassword),
+        active: true,
+      },
+    });
+  }
+
+  await ensureClinicAccess(providerUser.id, provider.branchId, true);
 
   const existingProfile = await db.providerProfile.findFirst({
     where: {
@@ -127,6 +181,8 @@ for (const staff of staffSeeds) {
     },
   });
   staffUsers[staff.email] = user.id;
+
+  await ensureClinicAccess(user.id, staff.branchId, true);
 
   const existingProfile = await db.staffProfile.findFirst({ where: { tenantId, userId: user.id } });
   if (!existingProfile) {
@@ -797,6 +853,283 @@ for (const snap of revenueHistory) {
   }
 }
 
+// ---- Revenue protection command center --------------------------------------
+const payerSeeds = [
+  { name: 'Stedi Test Payer', tradingPartnerServiceId: 'STEDI-TEST', sourceProvider: 'stedi', sortOrder: 0 },
+  { name: 'Cigna', tradingPartnerServiceId: 'CIGNA', sourceProvider: 'stedi', sortOrder: 1 },
+  { name: 'Aetna', tradingPartnerServiceId: 'AETNA', sourceProvider: 'stedi', sortOrder: 2 },
+  { name: 'UnitedHealthcare', tradingPartnerServiceId: 'UHC', sourceProvider: 'stedi', sortOrder: 3 },
+  { name: 'Blue Cross Blue Shield', tradingPartnerServiceId: 'BCBS', sourceProvider: 'stedi', sortOrder: 4 },
+  { name: 'Humana', tradingPartnerServiceId: 'HUMANA', sourceProvider: 'stedi', sortOrder: 5 },
+  { name: 'Kaiser Permanente', tradingPartnerServiceId: 'KAISER', sourceProvider: 'stedi', sortOrder: 6 },
+];
+for (const payer of payerSeeds) {
+  const existing = await db.insurancePayer.findFirst({ where: { tenantId, name: payer.name } });
+  if (!existing) {
+    await db.insurancePayer.create({ data: { tenantId, ...payer, active: true } });
+  }
+}
+
+const payerMap = new Map((await db.insurancePayer.findMany({ where: { tenantId, active: true } })).map(row => [row.name, row]));
+
+const policySeeds = [
+  { patientId: patientPool[0].id, branchId: patientPool[0].branchId, payerName: 'Cigna', planName: 'Cigna Choice Gold', memberId: 'CIG-428194', groupNumber: 'GRP-9012', subscriberName: 'Charlotte Live' },
+  { patientId: patientPool[1].id, branchId: patientPool[1].branchId, payerName: 'Aetna', planName: 'Aetna Core Plus', memberId: 'AET-110293', groupNumber: 'GRP-2411', subscriberName: 'Amelia Hughes' },
+  { patientId: patientPool[2].id, branchId: patientPool[2].branchId, payerName: 'UnitedHealthcare', planName: 'UHC Balance Plan', memberId: 'UHC-551028', groupNumber: 'GRP-7740', subscriberName: 'Daniel Okoro' },
+];
+for (const policy of policySeeds) {
+  const existing = await db.patientInsurancePolicy.findFirst({ where: { tenantId, patientId: policy.patientId, active: true } });
+  if (!existing) {
+    await db.patientInsurancePolicy.create({
+      data: {
+        tenantId,
+        branchId: policy.branchId,
+        patientId: policy.patientId,
+        payerId: payerMap.get(policy.payerName)?.id,
+        planName: policy.planName,
+        memberId: policy.memberId,
+        groupNumber: policy.groupNumber,
+        relationship: 'self',
+        subscriberName: policy.subscriberName,
+        payerReference: policy.memberId,
+        verificationStatus: 'pending',
+        active: true,
+      },
+    });
+  }
+}
+
+for (const rule of [
+  { branchId: null, name: 'New patient deposit', ruleType: 'new-patient', description: 'Collect a deposit for new patients before arrival.', amountType: 'fixed', amountValue: 50, refundable: false, cancellationWindowHours: 24, appliesToNewPatients: true, appliesToHighNoShowRisk: false, appliesToPremiumServices: false, appliesToSameDayAppointments: false, appliesToExemptPatients: false, sortOrder: 0 },
+  { branchId: null, name: 'High no-show hold', ruleType: 'risk-based', description: 'Apply a higher deposit for patients with elevated no-show risk.', amountType: 'percentage', amountValue: 25, refundable: true, cancellationWindowHours: 12, appliesToNewPatients: false, appliesToHighNoShowRisk: true, appliesToPremiumServices: false, appliesToSameDayAppointments: true, appliesToExemptPatients: false, sortOrder: 1 },
+  { branchId: BR.westside, name: 'Premium service deposit', ruleType: 'premium-service', description: 'Collect an upfront deposit for higher value premium services.', amountType: 'fixed', amountValue: 120, refundable: false, cancellationWindowHours: 48, appliesToNewPatients: false, appliesToHighNoShowRisk: false, appliesToPremiumServices: true, appliesToSameDayAppointments: false, appliesToExemptPatients: false, sortOrder: 2 },
+]) {
+  const existing = await db.depositRule.findFirst({ where: { tenantId, name: rule.name } });
+  if (!existing) {
+    await db.depositRule.create({
+      data: {
+        tenantId,
+        active: true,
+        depositRequired: true,
+        ...rule,
+        branchId: rule.branchId ?? undefined,
+      },
+    });
+  }
+}
+
+const [cignaPayer, aetnaPayer, uhcPayer] = ['Cigna', 'Aetna', 'UnitedHealthcare'].map(name => payerMap.get(name));
+const policyRows = await db.patientInsurancePolicy.findMany({ where: { tenantId, active: true }, orderBy: { createdAt: 'asc' } });
+const cignaPolicy = policyRows[0];
+const aetnaPolicy = policyRows[1];
+const uhcPolicy = policyRows[2];
+const seededAppointments = await db.appointment.findMany({ where: { tenantId }, orderBy: { startsAt: 'asc' }, take: 8 });
+
+const eligibilitySeeds = [
+  {
+    patientId: cignaPolicy.patientId,
+    appointmentId: seededAppointments[0]?.id ?? null,
+    payerId: cignaPayer?.id ?? null,
+    policyId: cignaPolicy.id,
+    providerMode: 'sandbox',
+    coverageStatus: 'active',
+    planName: cignaPolicy.planName,
+    payerName: 'Cigna',
+    copay: 35,
+    deductibleRemaining: 1350,
+    coinsurance: 0.2,
+    coverageActive: true,
+    eligibilityMessage: 'Coverage active with a deductible balance. Collect a deposit before arrival.',
+    payerReference: cignaPolicy.memberId,
+  },
+  {
+    patientId: aetnaPolicy.patientId,
+    appointmentId: seededAppointments[1]?.id ?? null,
+    payerId: aetnaPayer?.id ?? null,
+    policyId: aetnaPolicy.id,
+    providerMode: 'sandbox',
+    coverageStatus: 'uncertain',
+    planName: aetnaPolicy.planName,
+    payerName: 'Aetna',
+    copay: 40,
+    deductibleRemaining: 1850,
+    coinsurance: 0.25,
+    coverageActive: true,
+    eligibilityMessage: 'Benefits are active but the payer response is uncertain. Review before treatment.',
+    payerReference: aetnaPolicy.memberId,
+  },
+  {
+    patientId: uhcPolicy.patientId,
+    appointmentId: seededAppointments[2]?.id ?? null,
+    payerId: uhcPayer?.id ?? null,
+    policyId: uhcPolicy.id,
+    providerMode: 'mock',
+    coverageStatus: 'inactive',
+    planName: uhcPolicy.planName,
+    payerName: 'UnitedHealthcare',
+    copay: 0,
+    deductibleRemaining: 0,
+    coinsurance: 0,
+    coverageActive: false,
+    eligibilityMessage: 'Coverage inactive; front desk should verify and route to follow-up.',
+    payerReference: uhcPolicy.memberId,
+  },
+];
+for (const seed of eligibilitySeeds) {
+  const existing = await db.eligibilityVerification.findFirst({ where: { tenantId, patientId: seed.patientId, payerReference: seed.payerReference } });
+  if (!existing) {
+    const row = await db.eligibilityVerification.create({
+      data: {
+        tenantId,
+        branchId: (await db.patient.findUnique({ where: { id: seed.patientId }, select: { branchId: true } }))?.branchId ?? branchId,
+        patientId: seed.patientId,
+        appointmentId: seed.appointmentId ?? undefined,
+        payerId: seed.payerId ?? undefined,
+        policyId: seed.policyId,
+        providerMode: seed.providerMode,
+        coverageStatus: seed.coverageStatus,
+        planName: seed.planName,
+        payerName: seed.payerName,
+        copay: seed.copay,
+        deductibleRemaining: seed.deductibleRemaining,
+        coinsurance: seed.coinsurance,
+        coverageActive: seed.coverageActive,
+        eligibilityMessage: seed.eligibilityMessage,
+        payerReference: seed.payerReference,
+        normalizedResponse: {
+          coverageStatus: seed.coverageStatus,
+          planName: seed.planName,
+          payerName: seed.payerName,
+          copay: seed.copay,
+          deductibleRemaining: seed.deductibleRemaining,
+          coinsurance: seed.coinsurance,
+          coverageActive: seed.coverageActive,
+          eligibilityMessage: seed.eligibilityMessage,
+          providerMode: seed.providerMode,
+          providerName: seed.providerMode === 'sandbox' ? 'Stedi Eligibility' : 'Mock Eligibility',
+        },
+      },
+    });
+    await db.benefitSnapshot.create({
+      data: {
+        tenantId,
+        branchId: (await db.patient.findUnique({ where: { id: seed.patientId }, select: { branchId: true } }))?.branchId ?? branchId,
+        verificationId: row.id,
+        summary: seed.eligibilityMessage,
+        details: { seeded: true, payerName: seed.payerName, planName: seed.planName },
+      },
+    });
+    await db.patientResponsibilityEstimate.create({
+      data: {
+        tenantId,
+        branchId: (await db.patient.findUnique({ where: { id: seed.patientId }, select: { branchId: true } }))?.branchId ?? branchId,
+        patientId: seed.patientId,
+        appointmentId: seed.appointmentId ?? undefined,
+        eligibilityVerificationId: row.id,
+        estimatedInsurancePortion: 90,
+        estimatedPatientResponsibility: 180,
+        recommendedCollectAmount: 90,
+        reason: seed.coverageActive ? 'Seeded estimate based on active coverage.' : 'Seeded estimate based on inactive coverage.',
+      },
+    });
+  }
+}
+
+for (const auth of [
+  { branchId: BR.downtown, patientId: cignaPolicy.patientId, payerId: cignaPayer?.id ?? null, serviceName: 'Botox consultation', authNumber: 'AUTH-34091', status: 'pending', dueAt: new Date(NOW + 5 * DAY), notes: 'High-value aesthetic service requires prior authorisation.', lastUpdatedAt: new Date(NOW - DAY) },
+  { branchId: BR.northgate, patientId: aetnaPolicy.patientId, payerId: aetnaPayer?.id ?? null, serviceName: 'Dermatology procedure', authNumber: 'AUTH-88011', status: 'submitted', dueAt: new Date(NOW + 2 * DAY), notes: 'Submitted to payer; awaiting determination.', lastUpdatedAt: new Date(NOW - DAY) },
+  { branchId: BR.southbank, patientId: uhcPolicy.patientId, payerId: uhcPayer?.id ?? null, serviceName: 'Dental implant review', authNumber: 'AUTH-55120', status: 'needs_action', dueAt: new Date(NOW + 1 * DAY), notes: 'Need chart note before approval can proceed.', lastUpdatedAt: new Date(NOW - DAY) },
+]) {
+  const existing = await db.priorAuthorization.findFirst({ where: { tenantId, authNumber: auth.authNumber } });
+  if (!existing) {
+    await db.priorAuthorization.create({ data: { tenantId, ...auth } });
+  }
+}
+
+for (const request of [
+  { branchId: BR.downtown, patientId: cignaPolicy.patientId, appointmentId: seededAppointments[0]?.id ?? null, amount: 90, status: 'link_sent', reason: 'Copay and deposit request', mode: 'sandbox', paymentUrl: 'https://example.com/pay/cigna', providerReference: 'plink_seed_1', dueAt: new Date(NOW + DAY), collectedAmount: 0, collected: false },
+  { branchId: BR.northgate, patientId: aetnaPolicy.patientId, appointmentId: seededAppointments[1]?.id ?? null, amount: 130, status: 'pending', reason: 'High deductible deposit', mode: 'mock', paymentUrl: 'http://localhost:12000/revenue-protection?payment=seed_2', providerReference: 'mock_seed_2', dueAt: new Date(NOW + DAY), collectedAmount: 0, collected: false },
+  { branchId: BR.southbank, patientId: uhcPolicy.patientId, appointmentId: seededAppointments[2]?.id ?? null, amount: 75, status: 'collected', reason: 'Follow-up payment', mode: 'sandbox', paymentUrl: 'https://example.com/pay/uhc', providerReference: 'cs_seed_3', dueAt: new Date(NOW - DAY), collectedAmount: 75, collected: true },
+]) {
+  const existing = await db.paymentRequest.findFirst({ where: { tenantId, providerReference: request.providerReference } });
+  if (!existing) {
+    const row = await db.paymentRequest.create({
+      data: {
+        tenantId,
+        branchId: request.branchId,
+        patientId: request.patientId,
+        appointmentId: request.appointmentId ?? undefined,
+        amount: request.amount,
+        currency: 'USD',
+        status: request.status,
+        reason: request.reason,
+        mode: request.mode,
+        paymentUrl: request.paymentUrl,
+        providerReference: request.providerReference,
+        dueAt: request.dueAt,
+      },
+    });
+    if (request.collected) {
+      await db.paymentTransaction.create({
+        data: {
+          tenantId,
+          branchId: request.branchId,
+          patientId: request.patientId,
+          appointmentId: request.appointmentId ?? undefined,
+          paymentRequestId: row.id,
+          amount: request.collectedAmount,
+          currency: 'USD',
+          status: 'succeeded',
+          mode: request.mode,
+          providerReference: request.providerReference,
+          receivedAt: new Date(NOW - 4 * DAY),
+          rawResponse: { source: 'seed', status: 'succeeded' },
+        },
+      });
+    }
+  }
+}
+
+for (const requirement of [
+  { branchId: BR.downtown, patientId: cignaPolicy.patientId, appointmentId: seededAppointments[0]?.id ?? null, depositRuleId: null, status: 'requested', requiredAmount: 90, collectedAmount: 0, waiverReason: null, reason: 'New patient deposit', mode: 'sandbox', dueAt: new Date(NOW + DAY), collectedAt: null },
+  { branchId: BR.northgate, patientId: aetnaPolicy.patientId, appointmentId: seededAppointments[1]?.id ?? null, depositRuleId: null, status: 'waived', requiredAmount: 130, collectedAmount: 0, waiverReason: 'Clinical manager approved a same-day waiver', reason: 'High no-show hold', mode: 'mock', dueAt: new Date(NOW + DAY), collectedAt: null },
+  { branchId: BR.southbank, patientId: uhcPolicy.patientId, appointmentId: seededAppointments[2]?.id ?? null, depositRuleId: null, status: 'collected', requiredAmount: 75, collectedAmount: 75, waiverReason: null, reason: 'Premium service deposit', mode: 'sandbox', dueAt: new Date(NOW - DAY), collectedAt: new Date(NOW - DAY / 2) },
+]) {
+  const existing = await db.depositRequirement.findFirst({ where: { tenantId, branchId: requirement.branchId, reason: requirement.reason, patientId: requirement.patientId } });
+  if (!existing) {
+    await db.depositRequirement.create({ data: { tenantId, ...requirement } });
+  }
+}
+
+for (const alert of [
+  { branchId: BR.downtown, patientId: cignaPolicy.patientId, appointmentId: seededAppointments[0]?.id ?? null, sourceType: 'eligibility', severity: 'high', title: 'Coverage inactive risk', description: 'Coverage is active but a large deductible still needs collection.', evidence: { type: 'eligibility', gap: 1350 }, estimatedValue: 420, status: 'open', recommendedAction: 'Collect a deposit and keep the front desk in the loop.', actionLink: '/revenue-protection' },
+  { branchId: BR.northgate, patientId: aetnaPolicy.patientId, appointmentId: seededAppointments[1]?.id ?? null, sourceType: 'payment', severity: 'medium', title: 'Payment link pending', description: 'A payment request is pending follow-up.', evidence: { type: 'payment', pending: true }, estimatedValue: 180, status: 'follow_up_required', recommendedAction: 'Send the payment link again and assign a callback task.', actionLink: '/revenue-protection' },
+  { branchId: BR.westside, patientId: patientId, appointmentId: seededAppointments[3]?.id ?? null, sourceType: 'deposit', severity: 'medium', title: 'Deposit not collected', description: 'A high-value booking remains without a deposit.', evidence: { type: 'deposit', amount: 120 }, estimatedValue: 260, status: 'task_created', recommendedAction: 'Create a recovery task for the front desk.', actionLink: '/staff' },
+]) {
+  const existing = await db.revenueProtectionAlert.findFirst({ where: { tenantId, title: alert.title } });
+  if (!existing) {
+    await db.revenueProtectionAlert.create({ data: { tenantId, ...alert } });
+  }
+}
+
+if (await db.paymentProviderConnection.count({ where: { tenantId } }) === 0) {
+  await db.paymentProviderConnection.createMany({
+    data: [
+      { tenantId, providerKey: 'mock', displayName: 'Mock Payments', mode: 'mock', status: 'connected', baseUrl: null, connectedAt: new Date(NOW - DAY), lastSyncAt: new Date(NOW - DAY / 2), configuration: { description: 'Safe fallback for local demo runs.' } },
+      { tenantId, providerKey: 'stripe', displayName: 'Stripe Test Mode', mode: 'sandbox', status: 'connected', baseUrl: 'https://api.stripe.com', connectedAt: new Date(NOW - 5 * DAY), lastSyncAt: new Date(NOW - DAY), configuration: { description: 'Sandbox-ready payment link and checkout session mode.' } },
+    ],
+  });
+}
+
+if (await db.integrationRunLog.count({ where: { tenantId } }) === 0) {
+  await db.integrationRunLog.createMany({
+    data: [
+      { tenantId, branchId: BR.downtown, provider: 'stedi', providerMode: 'sandbox', operation: 'eligibility.check', status: 'success', requestSummary: { patientId: cignaPolicy.patientId }, responseSummary: { coverageStatus: 'active' }, createdAt: new Date(NOW - 3 * DAY) },
+      { tenantId, branchId: BR.northgate, provider: 'stripe', providerMode: 'sandbox', operation: 'payment.link', status: 'success', requestSummary: { amount: 130 }, responseSummary: { status: 'pending' }, createdAt: new Date(NOW - 2 * DAY) },
+    ],
+  });
+}
+
 // ---- Configuration management defaults --------------------------------------
 if (await db.notificationTemplate.count({ where: { tenantId } }) === 0) {
   await db.notificationTemplate.createMany({
@@ -837,8 +1170,10 @@ if (await db.customerPreference.count({ where: { tenantId } }) === 0) {
 for (const role of [
   { name: 'Owner', description: 'Full access to all modules, billing, and settings.', accent: 'violet', sortOrder: 0 },
   { name: 'Branch Manager', description: 'Access to branch-level data, staff, and inventory.', accent: 'blue', sortOrder: 1 },
-  { name: 'Provider', description: 'Own schedule, patient notes, and follow-up tools.', accent: 'emerald', sortOrder: 2 },
-  { name: 'Front Desk', description: 'Scheduling, CRM, and inbound communication.', accent: 'amber', sortOrder: 3 },
+  { name: 'Billing', description: 'Finance, payment, and reimbursement workflows.', accent: 'amber', sortOrder: 2 },
+  { name: 'Provider', description: 'Own schedule, patient notes, and follow-up tools.', accent: 'emerald', sortOrder: 3 },
+  { name: 'Front Desk', description: 'Scheduling, CRM, and inbound communication.', accent: 'blue', sortOrder: 4 },
+  { name: 'Analyst', description: 'Read-only operational and financial reporting.', accent: 'violet', sortOrder: 5 },
 ]) {
   await db.roleDefinition.upsert({
     where: { tenantId_name: { tenantId, name: role.name } },

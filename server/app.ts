@@ -20,7 +20,11 @@ import { operationsRoutes } from './modules/operations/routes';
 import { dashboardRoutes } from './modules/dashboard/routes';
 import { telehealthRoutes } from './modules/telehealth/routes';
 import { complianceRoutes } from './modules/compliance/routes';
-import { settingsRoutes } from './modules/settings/routes';
+import { settingsRoutes, adminRoutes, securityRoutes } from './modules/settings/routes';
+import { advisoryRoutes } from './modules/advisory/routes';
+import { revenueProtectionRoutes } from './modules/revenue-protection';
+import { controlPlaneRoutes } from './modules/control-plane/routes';
+import { insuranceRoutes } from './modules/insurance/routes';
 
 export async function buildApp() {
   const app = Fastify({
@@ -46,6 +50,11 @@ export async function buildApp() {
         { name: 'providers', description: 'Provider productivity and utilization' },
         { name: 'staff', description: 'Staff workflow and SLA management' },
         { name: 'autopilot', description: 'Governed AI workflow actions' },
+        { name: 'advisory', description: 'Premium AI advisory room' },
+        { name: 'revenue-protection', description: 'Revenue protection command center' },
+        { name: 'control-plane', description: 'Enterprise control plane' },
+        { name: 'admin', description: 'Enterprise admin and tenant controls' },
+        { name: 'security', description: 'Security posture and session controls' },
       ],
     },
   });
@@ -67,6 +76,12 @@ export async function buildApp() {
     await protectedApi.register(telehealthRoutes, { prefix: '/telehealth' });
     await protectedApi.register(complianceRoutes, { prefix: '/compliance' });
     await protectedApi.register(settingsRoutes, { prefix: '/settings' });
+    await protectedApi.register(adminRoutes, { prefix: '/admin' });
+    await protectedApi.register(securityRoutes, { prefix: '/security' });
+    await protectedApi.register(controlPlaneRoutes, { prefix: '/control-plane' });
+    await protectedApi.register(advisoryRoutes, { prefix: '/advisory' });
+    await protectedApi.register(revenueProtectionRoutes, { prefix: '/revenue-protection' });
+    await protectedApi.register(insuranceRoutes, { prefix: '/insurance' });
     await protectedApi.register(operationsRoutes);
     await protectedApi.register(dashboardRoutes);
   }, { prefix: '/v1' });
