@@ -500,6 +500,24 @@ button, a, [role="button"] {
   pointer-events: none;
 }
 
+.autopilot-hero {
+  position: relative;
+  overflow: hidden;
+  border-radius: 16px;
+  padding: 28px;
+  background: linear-gradient(135deg, #172554 0%, #312E81 48%, #581C87 100%);
+  box-shadow: 0 8px 28px rgba(49,46,129,0.22), 0 1px 6px rgba(49,46,129,0.14);
+}
+.autopilot-hero::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 82% 22%, rgba(167,139,250,0.28), transparent 26%),
+    radial-gradient(circle at 14% 92%, rgba(59,130,246,0.18), transparent 30%);
+}
+
 /* ═══════════════════════════════════════════════════════
    PROGRESS FILL COLORS
    ═══════════════════════════════════════════════════════ */

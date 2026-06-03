@@ -1,111 +1,243 @@
-import { Cloud, CreditCard, Globe2, Mail, MessageCircle, MessagesSquare, Monitor, Phone, CheckCircle2, AlertCircle, Plus, Zap, ArrowRight, RefreshCw } from 'lucide-react';
+import { useEffect, useMemo, useState, type ElementType } from 'react';
+import {
+  AlertCircle,
+  CheckCircle2,
+  Cloud,
+  CreditCard,
+  Globe2,
+  MessagesSquare,
+  RefreshCw,
+  Search,
+  ShieldCheck,
+  Sparkles,
+} from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
-import { integrations } from '../data/mockIntegrations';
+import { apiRequest } from '../lib/api';
+import { useSession } from '../hooks/useSession';
+import type { IntegrationStatus } from '../types';
 
-const iconMap: Record<string, React.ElementType> = {
-  MessagesSquare,
-  MessageCircle,
-  Mail,
-  Globe2,
-  CreditCard,
-  Phone,
-  Monitor,
-  BookOpen: Cloud,
+const iconMap: Record<string, ElementType> = {
+  Communication: MessagesSquare,
+  Insurance: ShieldCheck,
+  Payments: CreditCard,
+  'Reputation / Marketing': Globe2,
+  'AI Providers': Sparkles,
+  default: Cloud,
 };
-
-const statusConfig = {
-  connected:     { label: 'Connected',    color: 'text-emerald-v', bg: 'badge badge-emerald', dot: 'bg-emerald-500' },
-  disconnected:  { label: 'Disconnected', color: 'text-t2',        bg: 'badge badge-blue',    dot: 'bg-slate-400' },
-  error:         { label: 'Error',        color: 'text-red-v',     bg: 'badge badge-red',     dot: 'bg-red-500' },
-  'coming-soon': { label: 'Coming Soon',  color: 'text-amber-v',   bg: 'badge badge-amber',   dot: 'bg-amber-400' },
-};
-
-const categoryColors: Record<string, string> = {
-  Messaging:   'badge badge-blue',
-  Marketing:   'badge badge-violet',
-  Reputation:  'badge badge-amber',
-  Payments:    'badge badge-emerald',
-  Accounting:  'badge badge-blue',
-  Telephony:   'badge badge-cyan',
-  Booking:     'badge badge-indigo',
-};
-
-const connectedCount = integrations.filter(i => i.status === 'connected').length;
-const disconnectedCount = integrations.filter(i => i.status === 'disconnected').length;
-
-const suggestedIntegrations = [
-  { name: 'Calendly', category: 'Booking', desc: 'Self-booking for consultations and virtual visits.' },
-  { name: 'Xero', category: 'Accounting', desc: 'Financial sync for UK clinics — alternative to QuickBooks.' },
-  { name: 'Trustpilot', category: 'Reputation', desc: 'Review collection and brand reputation management.' },
-];
 
 export default function Integrations() {
+  const navigate = useNavigate();
+  const { user } = useSession();
+  const canTest = !!user && ['OWNER', 'ADMIN', 'MANAGER'].includes(user.role);
+  const [statusRows, setStatusRows] = useState<IntegrationStatus[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [search, setSearch] = useState('');
+  const [category, setCategory] = useState('All');
+  const [testingKey, setTestingKey] = useState<string | null>(null);
+  const [testResults, setTestResults] = useState<Record<string, string>>({});
+
+  async function loadStatuses() {
+    setLoading(true);
+    setError(null);
+    try {
+      const rows = await apiRequest<IntegrationStatus[]>('/v1/integrations/status');
+      setStatusRows(rows);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to load integrations');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadStatuses();
+  }, []);
+
+  const categories = useMemo(() => ['All', ...new Set(statusRows.map(row => row.category))], [statusRows]);
+  const filteredRows = useMemo(() => {
+    const term = search.trim().toLowerCase();
+    return statusRows.filter(row => {
+      const matchesCategory = category === 'All' || row.category === category;
+      const matchesSearch = !term
+        || row.name.toLowerCase().includes(term)
+        || row.description.toLowerCase().includes(term)
+        || row.category.toLowerCase().includes(term);
+      return matchesCategory && matchesSearch;
+    });
+  }, [category, search, statusRows]);
+
+  const configuredCount = statusRows.filter(row => row.configured).length;
+  const healthyCount = statusRows.filter(row => row.health === 'healthy').length;
+  const mockCount = statusRows.filter(row => row.mode === 'mock').length;
+  const sandboxCount = statusRows.filter(row => row.mode === 'sandbox').length;
+
+  async function testConnection(providerKey: string) {
+    if (!canTest) return;
+    setTestingKey(providerKey);
+    try {
+      const result = await apiRequest<{
+        providerKey: string;
+        providerName: string;
+        modeLabel: string;
+        health: string;
+        configured: boolean;
+        message: string;
+        supportedWorkflows: string[];
+        missingEnvVars: string[];
+        riskLevel: string;
+      }>(`/v1/integrations/${providerKey}/test`, { method: 'POST' });
+      setTestResults(current => ({
+        ...current,
+        [providerKey]: `${result.modeLabel} · ${result.message}`,
+      }));
+      await loadStatuses();
+    } catch (err) {
+      setTestResults(current => ({
+        ...current,
+        [providerKey]: err instanceof Error ? err.message : 'Test failed',
+      }));
+    } finally {
+      setTestingKey(null);
+    }
+  }
+
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Integrations Hub"
-        subtitle="Connect messaging, payment, analytics, and practice infrastructure to automate your entire operation."
-        badge={`${connectedCount} Connected`}
+        subtitle="Operational status for insurance, payments, communication, reputation, and AI providers."
+        badge={`${configuredCount} configured · ${loading ? 'Loading…' : 'Live status'}`}
         badgeColor="blue"
         actions={
-          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition">
-            <Plus className="w-4 h-4" /> Add Integration
+          <button
+            type="button"
+            onClick={() => navigate('/settings')}
+            className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition"
+          >
+            <Sparkles className="w-4 h-4" /> Open Settings
           </button>
         }
       />
 
+      {error && (
+        <div className="rounded-2xl border border-[var(--red-soft)] bg-[var(--red-soft)] p-4 text-sm text-red-v">
+          {error}
+        </div>
+      )}
+
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Connected" value={connectedCount} subtitle="Live integrations" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Disconnected" value={disconnectedCount} subtitle="Needs attention" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
-        <StatCard title="Data Syncs" value="1,240" subtitle="Last 24 hours" icon={<RefreshCw className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Automation Events" value="347" subtitle="Triggered this week" icon={<Zap className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Configured" value={configuredCount} subtitle="Providers ready" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Healthy" value={healthyCount} subtitle="Healthy connections" icon={<ShieldCheck className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Sandbox" value={sandboxCount} subtitle="Sandbox-ready or active" icon={<RefreshCw className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Mock" value={mockCount} subtitle="Fallback / not configured" icon={<AlertCircle className="w-4 h-4" />} accent="amber" />
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-[1fr_340px]">
-        {/* Integration cards */}
-        <BentoCard title="Connected Services" subtitle="All integrations · Live status">
-          <div className="grid gap-3 sm:grid-cols-2">
-            {integrations.map((integration) => {
-              const Icon = iconMap[integration.icon as string] || Cloud;
-              const sc = statusConfig[integration.status as keyof typeof statusConfig];
-              const catColor = categoryColors[integration.category] || 'badge badge-blue';
+      <div className="grid gap-4 xl:grid-cols-[1fr_320px]">
+        <BentoCard title="Integration Status" subtitle="Honest provider readiness and health" headerRight={<Cloud className="w-4 h-4 text-t3" />}>
+          <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+            <div className="relative flex-1">
+              <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-t3" />
+              <input
+                value={search}
+                onChange={event => setSearch(event.target.value)}
+                placeholder="Search integrations"
+                className="w-full rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-10 py-2 text-sm text-t1 outline-none focus:border-[var(--b3)]"
+              />
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {categories.map(item => (
+                <button
+                  key={item}
+                  type="button"
+                  onClick={() => setCategory(item)}
+                  className={`rounded-full px-3 py-1.5 text-xs font-semibold transition ${
+                    category === item ? 'bg-[var(--indigo)] text-white' : 'border border-[var(--b1)] text-t2 hover:bg-[var(--s3)]'
+                  }`}
+                >
+                  {item}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            {filteredRows.map(row => {
+              const Icon = iconMap[row.category] || iconMap.default;
+              const result = testResults[row.key];
               return (
-                <div key={integration.id} className={`p-4 rounded-2xl border transition-all hover:bg-[var(--s3)] ${
-                  integration.status === 'disconnected' ? 'border-[var(--b1)] bg-[var(--s2)]' :
-                  integration.status === 'error' ? 'border-[var(--b2)] bg-[var(--red-soft)]' :
-                  integration.status === 'coming-soon' ? 'border-[var(--b2)] bg-[var(--amber-soft)]' :
-                  'border-[var(--b1)] hover:border-[var(--b2)]'
-                }`}>
-                  <div className="flex items-start justify-between gap-3 mb-3">
-                    <div className="flex items-center gap-3">
-                      <div className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${
-                        integration.status === 'connected' ? 'bg-[var(--blue-soft)] text-blue-v' : 'bg-[var(--s3)] text-t3'
-                      }`}>
-                        <Icon className="w-4 h-4" />
+                <div key={row.key} className="rounded-2xl border border-[var(--b1)] p-4 hover:bg-[var(--s3)] transition-colors">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-start gap-3">
+                      <div className="w-10 h-10 rounded-2xl bg-[var(--s2)] flex items-center justify-center shrink-0">
+                        <Icon className="w-4 h-4 text-t3" />
                       </div>
-                      <div>
-                        <p className="text-xs font-bold text-t1">{integration.name}</p>
-                        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${catColor}`}>{integration.category}</span>
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold text-t1">{row.name}</p>
+                        <p className="text-[11px] text-t3">{row.category}</p>
                       </div>
                     </div>
-                    <span className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full shrink-0 ${sc.bg}`}>
-                      <span className={`w-1.5 h-1.5 rounded-full ${sc.dot}`} />
-                      {sc.label}
+                    <span className={`badge ${
+                      row.health === 'healthy' ? 'badge-emerald' :
+                      row.health === 'degraded' ? 'badge-amber' :
+                      row.health === 'not_configured' ? 'badge-blue' : 'badge-red'
+                    }`}>
+                      {row.modeLabel}
                     </span>
                   </div>
-                  <p className="text-[11px] text-t3 mb-2.5 leading-relaxed">{integration.description}</p>
-                  <div className="flex items-center justify-between gap-2">
-                    {integration.lastSync
-                      ? <span className="text-[10px] text-t3">Last sync: {integration.lastSync}</span>
-                      : <span className="text-[10px] text-t3">Not synced</span>
-                    }
-                    {integration.status === 'disconnected'
-                      ? <button type="button" className="text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors">Connect</button>
-                      : <button type="button" className="text-[10px] font-semibold text-t2 hover:text-t1 transition-colors flex items-center gap-0.5"><RefreshCw className="w-3 h-3" /> Sync</button>
-                    }
+
+                  <p className="mt-2 text-[11px] text-t3 leading-relaxed">{row.description}</p>
+
+                  <div className="mt-3 flex flex-wrap gap-1.5">
+                    {row.supportedWorkflows.map(workflow => (
+                      <span key={workflow} className="badge badge-indigo">{workflow}</span>
+                    ))}
                   </div>
+
+                  <div className="mt-3 grid gap-2 text-[11px] text-t2">
+                    <div className="flex items-center justify-between gap-3">
+                      <span>Health</span>
+                      <span className={`font-semibold ${row.health === 'healthy' ? 'text-emerald-v' : row.health === 'degraded' ? 'text-amber-v' : 'text-t3'}`}>{row.health}</span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span>Configured</span>
+                      <span className="font-semibold text-t1">{row.configured ? 'Yes' : 'No'}</span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span>Last check</span>
+                      <span className="font-semibold text-t1">{row.lastSyncAt ? new Date(row.lastSyncAt).toLocaleString('en-US') : '—'}</span>
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span>Risk</span>
+                      <span className={`badge ${row.riskLevel === 'high' ? 'badge-red' : row.riskLevel === 'medium' ? 'badge-amber' : 'badge-emerald'}`}>{row.riskLevel}</span>
+                    </div>
+                  </div>
+
+                  {row.missingEnvVars.length > 0 && (
+                    <p className="mt-3 text-[11px] text-t3">
+                      Missing env: {row.missingEnvVars.join(', ')}
+                    </p>
+                  )}
+
+                  {result && (
+                    <div className="mt-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3 text-[11px] text-t2">
+                      {result}
+                    </div>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => void testConnection(row.key)}
+                    disabled={!canTest || testingKey === row.key}
+                    title={!canTest ? 'Backend action not implemented yet for this role' : ''}
+                    className="mt-3 inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition disabled:opacity-40"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    {testingKey === row.key ? 'Testing…' : 'Test connection'}
+                  </button>
                 </div>
               );
             })}
@@ -113,57 +245,38 @@ export default function Integrations() {
         </BentoCard>
 
         <div className="space-y-4">
-          {/* Disconnected alert */}
-          {disconnectedCount > 0 && (
-            <div className="rounded-2xl border border-[var(--b1)] bg-[var(--amber-soft)] p-4">
-              <div className="flex items-start gap-3">
-                <AlertCircle className="w-4 h-4 text-amber-v shrink-0 mt-0.5" />
-                <div>
-                  <p className="text-xs font-bold text-amber-v">Integration Attention Needed</p>
-                  <p className="text-[11px] text-amber-v mt-0.5">QuickBooks is disconnected. Financial data is not syncing. Reconnect to restore accounting reconciliation.</p>
-                  <button type="button" className="mt-2 inline-flex items-center gap-1 text-xs font-semibold text-amber-v bg-[var(--s3)] px-3 py-1.5 rounded-lg hover:bg-[var(--s2)] transition-colors">
-                    <Zap className="w-3 h-3" /> Reconnect now
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Suggested integrations */}
-          <BentoCard title="Suggested Integrations" subtitle="Expand your automation stack">
-            <div className="space-y-2.5">
-              {suggestedIntegrations.map((s) => (
-                <div key={s.name} className="p-3.5 rounded-xl border border-dashed border-[var(--b2)] hover:border-[var(--b3)] hover:bg-[var(--s3)] transition-all">
-                  <div className="flex items-start justify-between gap-2 mb-1">
-                    <p className="text-xs font-bold text-t1">{s.name}</p>
-                    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${categoryColors[s.category] || 'badge badge-blue'}`}>{s.category}</span>
-                  </div>
-                  <p className="text-[11px] text-t3 mb-2">{s.desc}</p>
-                  <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo hover:text-blue-v">
-                    <Plus className="w-3 h-3" /> Add integration
-                  </button>
+          <BentoCard title="Integration Notes" subtitle="What the owner should know">
+            <div className="space-y-2">
+              {[
+                { title: 'Mock Mode', text: 'Safe fallback when a provider is not configured.' },
+                { title: 'Sandbox Ready', text: 'Credentials are present but not actively connected.' },
+                { title: 'Sandbox Active', text: 'Configured and ready for test transactions or sandbox calls.' },
+                { title: 'Live Not Configured', text: 'Production provider not wired yet.' },
+                { title: 'Live Active', text: 'Provider is live and health checks are passing.' },
+              ].map(item => (
+                <div key={item.title} className="rounded-xl border border-[var(--b1)] p-3">
+                  <p className="text-sm font-semibold text-t1">{item.title}</p>
+                  <p className="mt-1 text-[11px] text-t3 leading-relaxed">{item.text}</p>
                 </div>
               ))}
             </div>
           </BentoCard>
 
-          {/* Automation stats */}
-          <BentoCard title="Automation Performance" subtitle="This month">
-            <div className="space-y-2.5">
-              {[
-                { label: 'WhatsApp messages sent', value: '4,820', color: 'text-blue-v' },
-                { label: 'Appointment reminders triggered', value: '1,204', color: 'text-emerald-v' },
-                { label: 'Missed-call recoveries', value: '89', color: 'text-violet-v' },
-                { label: 'Payments processed', value: '£48,200', color: 'text-amber-v' },
-              ].map((stat) => (
-                <div key={stat.label} className="flex items-center justify-between gap-3 p-2.5 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors">
-                  <p className="text-[11px] font-medium text-t2">{stat.label}</p>
-                  <p className={`text-xs font-bold ${stat.color}`}>{stat.value}</p>
+          <BentoCard title="Provider Categories" subtitle="Coverage across the platform">
+            <div className="space-y-2">
+              {categories.filter(item => item !== 'All').map(item => (
+                <div key={item} className="flex items-center justify-between gap-3 rounded-xl border border-[var(--b1)] p-3">
+                  <span className="text-sm font-semibold text-t1">{item}</span>
+                  <span className="badge badge-blue">{statusRows.filter(row => row.category === item).length}</span>
                 </div>
               ))}
             </div>
-            <button type="button" className="mt-3 w-full flex items-center justify-center gap-1 text-xs font-semibold text-indigo py-2 border border-dashed border-[var(--b2)] rounded-xl hover:bg-[var(--s3)] transition-colors">
-              View full automation log <ArrowRight className="w-3.5 h-3.5" />
+            <button
+              type="button"
+              onClick={() => navigate('/control-plane')}
+              className="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-xl border border-dashed border-[var(--b2)] px-4 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition"
+            >
+              <ShieldCheck className="w-3.5 h-3.5" /> Open Control Plane
             </button>
           </BentoCard>
         </div>

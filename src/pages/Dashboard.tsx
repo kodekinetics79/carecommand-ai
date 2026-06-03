@@ -1,3 +1,5 @@
+import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   ArrowRight, CalendarDays, DollarSign, Phone, Sparkles, TrendingUp,
   Users, Zap, AlertCircle, CheckCircle2, BarChart3, Star, Clock
@@ -9,12 +11,11 @@ import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
 import RevenueChart from '../components/charts/RevenueChart';
 import UtilizationChart from '../components/charts/UtilizationChart';
-import { branches } from '../data/mockClinics';
-import { appointments } from '../data/mockAppointments';
-import { patients } from '../data/mockPatients';
-import { radarAlerts } from '../data/mockRadar';
-import { campaigns } from '../data/mockCampaigns';
+import { branches, appointments, patients, radarAlerts, campaigns } from '../data/seedData';
 import { formatCurrency } from '../utils/formatters';
+import { apiRequest } from '../lib/api';
+import { useApiResource } from '../hooks/useApiResource';
+import { mapCampaign, type ApiCampaign } from '../lib/apiAdapters';
 
 const todayDate = '2025-05-26';
 const todayAppts = appointments.filter(a => a.date === todayDate).length;
@@ -25,13 +26,47 @@ const noShowRisk = appointments.filter(a => a.status === 'risky' || a.status ===
 const totalRevenue = branches.reduce((s, b) => s + b.revenue, 0);
 const avgHealthScore = Math.round(branches.reduce((s, b) => s + b.healthScore, 0) / branches.length);
 
+interface DashboardSummary {
+  generatedAt: string;
+  networkRevenue: number;
+  revenueRecovered: number;
+  activeCustomers: number;
+  todaysAppointments: number;
+  noShowRisk: number;
+  callsRecovered: number;
+  missedCalls: number;
+  activeOpportunities: number;
+  pendingApprovals: number;
+}
+
+const fallbackSummary: DashboardSummary = {
+  generatedAt: new Date().toISOString(),
+  networkRevenue: totalRevenue,
+  revenueRecovered,
+  activeCustomers,
+  todaysAppointments: todayAppts,
+  noShowRisk,
+  callsRecovered: missedCallRecovery,
+  missedCalls: 23,
+  activeOpportunities: 28350,
+  pendingApprovals: 1,
+};
+
 const priorityActions = [
-  { id: 'p1', title: 'Run 90-day inactive customer campaign', description: '187 customers eligible. Historical conversion: 18%. Est. £18,700 in recoverable revenue.', impact: '£18,700', urgency: 'high' as const, action: 'Activate Winback Campaign', icon: <Users className="w-3.5 h-3.5" /> },
-  { id: 'p2', title: 'Westside has 31 empty slots this week', description: 'At £200/slot, £6,200 is at risk. Recommend limited weekday offer for skin services.', impact: '£6,200', urgency: 'high' as const, action: 'Create Slot-Fill Campaign', icon: <CalendarDays className="w-3.5 h-3.5" /> },
-  { id: 'p3', title: '23 missed calls still uncontacted', description: '42 calls this month. AI recovered 19. 23 remain — est. £3,450 in lost opportunity.', impact: '£3,450', urgency: 'medium' as const, action: 'Review Missed-Call Queue', icon: <Phone className="w-3.5 h-3.5" /> },
+  { id: 'p1', title: 'Run 90-day inactive customer campaign', description: `187 customers eligible. Historical conversion: 18%. Est. ${formatCurrency(18700)} in recoverable revenue.`, impact: formatCurrency(18700), urgency: 'high' as const, action: 'Activate Winback Campaign', icon: <Users className="w-3.5 h-3.5" /> },
+  { id: 'p2', title: 'Westside has 31 empty slots this week', description: `At ${formatCurrency(200)}/slot, ${formatCurrency(6200)} is at risk. Recommend limited weekday offer for skin services.`, impact: formatCurrency(6200), urgency: 'high' as const, action: 'Create Slot-Fill Campaign', icon: <CalendarDays className="w-3.5 h-3.5" /> },
+  { id: 'p3', title: '23 missed calls still uncontacted', description: `42 calls this month. 19 recovered. 23 remain — est. ${formatCurrency(3450)} in lost opportunity.`, impact: formatCurrency(3450), urgency: 'medium' as const, action: 'Review Missed-Call Queue', icon: <Phone className="w-3.5 h-3.5" /> },
   { id: 'p4', title: 'Dr. Mitchell: high repeat rate, low reviews', description: '78% repeat-visit rate. Only 12 review requests sent vs 89 consultations. Est. 28 new reviews.', impact: 'Reputation', urgency: 'medium' as const, action: 'Launch Review Campaign', icon: <Star className="w-3.5 h-3.5" /> },
-  { id: 'p5', title: '14 follow-up opportunities not yet rebooked', description: "Post-service customers who haven't scheduled their next visit. Est. value: £4,800.", impact: '£4,800', urgency: 'low' as const, action: 'Assign Follow-Up Tasks', icon: <CheckCircle2 className="w-3.5 h-3.5" /> },
+  { id: 'p5', title: '14 follow-up opportunities not yet rebooked', description: "Post-service customers who haven't scheduled their next visit. Est. value: $4,800.", impact: formatCurrency(4800), urgency: 'low' as const, action: 'Assign Follow-Up Tasks', icon: <CheckCircle2 className="w-3.5 h-3.5" /> },
 ];
+
+const actionRoute: Record<string, string> = {
+  p1: '/campaigner',
+  p2: '/scheduling',
+  p3: '/ai-receptionist',
+  p4: '/reviews',
+  p5: '/staff',
+};
 
 const urgencyClass: Record<'high' | 'medium' | 'low', string> = {
   high: 'urgency-high',
@@ -56,15 +91,45 @@ function branchScoreColor(score: number) {
 }
 
 export default function Dashboard() {
+  const navigate = useNavigate();
+  const [summary, setSummary] = useState(fallbackSummary);
+  const [summarySource, setSummarySource] = useState<'live' | 'demo'>('demo');
+  const { data: campaignRecords } = useApiResource<ApiCampaign, typeof campaigns[number]>('/v1/campaigns?limit=3', campaigns, mapCampaign);
+
+  useEffect(() => {
+    let active = true;
+    apiRequest<DashboardSummary>('/v1/dashboard/summary')
+      .then(row => {
+        if (!active) return;
+        setSummary(row);
+        setSummarySource('live');
+      })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, []);
+
+  const reportDate = new Date(summary.generatedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+  const totalCalls = summary.callsRecovered + summary.missedCalls;
+
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Command Center"
-        subtitle="Growth cockpit for your multi-location clinic network · 26 May 2026"
+        subtitle={`Growth cockpit for your multi-location clinic network · ${reportDate}`}
+        badge={summarySource === 'live' ? 'Live DB' : 'Demo'}
+        badgeColor={summarySource === 'live' ? 'emerald' : 'blue'}
         actions={
-          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-[rgba(99,102,241,0.25)] hover:opacity-90 transition-opacity">
-            <Sparkles className="w-4 h-4" /> AI Briefing
-          </button>
+          <div className="flex flex-wrap gap-2">
+            <button type="button" onClick={() => navigate('/opportunities')} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
+              <AlertCircle className="w-4 h-4" /> View Leaks
+            </button>
+            <button type="button" onClick={() => navigate('/crm')} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
+              <Users className="w-4 h-4" /> Open CRM
+            </button>
+            <button type="button" onClick={() => navigate('/campaigner')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-[rgba(99,102,241,0.25)] hover:opacity-90 transition-opacity">
+              <Sparkles className="w-4 h-4" /> Launch Campaign
+            </button>
+          </div>
         }
       />
 
@@ -77,32 +142,37 @@ export default function Dashboard() {
               <p className="text-xs font-bold uppercase tracking-widest text-indigo-200">Today's Growth Briefing</p>
             </div>
             <h2 className="text-xl font-bold text-white mb-1 leading-snug">
-              £{(revenueRecovered / 1000).toFixed(0)}K recovered this month · £28,350 in active opportunities
+              {formatCurrency(summary.revenueRecovered)} recovered this month · {formatCurrency(summary.activeOpportunities)} in active opportunities
             </h2>
             <p className="text-sm text-white/70 leading-relaxed max-w-2xl">
-              AI detected <span className="text-white font-medium">5 revenue signals</span> today. Westside has 31 empty slots at risk, 23 missed calls need follow-up, and your 90-day winback campaign can generate £18,700 this week.
+              Your live operating data shows <span className="text-white font-medium">{summary.pendingApprovals} governed action{summary.pendingApprovals === 1 ? '' : 's'}</span> awaiting review and {summary.missedCalls} missed calls needing follow-up. Open the advisory team when you want a revenue, growth, front desk, or operations readout.
             </p>
           </div>
           <div className="shrink-0 flex flex-col items-end gap-2">
             <div className="text-right">
-              <p className="text-2xl font-bold text-white tabular-nums">{formatCurrency(totalRevenue)}</p>
+              <p className="text-2xl font-bold text-white tabular-nums">{formatCurrency(summary.networkRevenue)}</p>
               <p className="text-xs text-white/65">Network revenue this month</p>
             </div>
-            <button type="button" className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-200 hover:text-white transition-colors">
-              View full report <ArrowRight className="w-3.5 h-3.5" />
-            </button>
+            <div className="flex flex-wrap items-center justify-end gap-3">
+              <button type="button" onClick={() => navigate('/advisory')} className="inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-white/10 px-3 py-1.5 text-xs font-semibold text-white hover:bg-white/15 transition-colors">
+                <Sparkles className="w-3.5 h-3.5" /> Ask Advisors
+              </button>
+              <button type="button" onClick={() => navigate('/revenue')} className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-200 hover:text-white transition-colors">
+                View full report <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
         </div>
       </div>
 
       {/* KPI Strip — 6 stats */}
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-3 xl:grid-cols-6">
-        <StatCard title="Network Revenue" value={formatCurrency(totalRevenue)} subtitle="This month" trend={12} icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Revenue Recovered" value={formatCurrency(revenueRecovered)} subtitle="By automation" trend={23} icon={<DollarSign className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Today's Appointments" value={todayAppts} subtitle="Across all branches" icon={<CalendarDays className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Active Customers" value={activeCustomers} subtitle="Engaged base" trend={4} icon={<Users className="w-4 h-4" />} accent="violet" />
-        <StatCard title="No-Show Risk" value={noShowRisk} subtitle="Flagged today" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
-        <StatCard title="Calls Recovered" value={`${missedCallRecovery}/42`} subtitle="AI follow-up rate" trend={48} icon={<Phone className="w-4 h-4" />} accent="cyan" />
+        <StatCard title="Network Revenue" value={formatCurrency(summary.networkRevenue)} subtitle="Latest snapshot" icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Revenue Recovered" value={formatCurrency(summary.revenueRecovered)} subtitle="By automation" icon={<DollarSign className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Today's Appointments" value={summary.todaysAppointments} subtitle="Across your scope" icon={<CalendarDays className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Active Customers" value={summary.activeCustomers} subtitle="Engaged base" icon={<Users className="w-4 h-4" />} accent="violet" />
+        <StatCard title="No-Show Risk" value={summary.noShowRisk} subtitle="Flagged today" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
+        <StatCard title="Calls Recovered" value={`${summary.callsRecovered}/${totalCalls}`} subtitle="Follow-up queue" icon={<Phone className="w-4 h-4" />} accent="cyan" />
       </div>
 
       {/* Main Bento Grid */}
@@ -112,7 +182,7 @@ export default function Dashboard() {
         <div className="space-y-4">
 
           {/* Branch Health Grid */}
-          <BentoCard title="Branch Health Scores" subtitle="Live branch intelligence" headerRight={
+          <BentoCard title="Branch Health Scores" subtitle="Network-wide operating health" headerRight={
             <span className="text-xs font-semibold text-t3 bg-[var(--s3)] px-2.5 py-1 rounded-full">Avg {avgHealthScore}/100</span>
           }>
             <div className="grid gap-3 sm:grid-cols-2">
@@ -163,12 +233,12 @@ export default function Dashboard() {
 
           {/* Campaign ROI */}
           <BentoCard title="Active Campaign ROI" subtitle="Campaign performance" headerRight={
-            <button type="button" className="text-xs font-semibold text-indigo hover:opacity-75 flex items-center gap-1 transition-opacity">
+            <button type="button" onClick={() => navigate('/campaigner')} className="text-xs font-semibold text-indigo hover:opacity-75 flex items-center gap-1 transition-opacity">
               View all <ArrowRight className="w-3 h-3" />
             </button>
           }>
             <div className="space-y-3">
-              {campaigns.slice(0, 3).map((c) => {
+              {campaignRecords.slice(0, 3).map((c) => {
                 const convRate = c.audienceSize > 0 ? Math.round((c.booked / c.audienceSize) * 100) : 0;
                 return (
                   <div key={c.id} className="flex items-center gap-4 p-3 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] transition-colors">
@@ -188,7 +258,7 @@ export default function Dashboard() {
                       </div>
                     </div>
                     <div className="text-right shrink-0">
-                      <p className="text-sm font-bold text-t1">£{c.revenue.toLocaleString()}</p>
+                      <p className="text-sm font-bold text-t1">{formatCurrency(c.revenue)}</p>
                       <p className="text-[10px] text-t3">Revenue</p>
                     </div>
                   </div>
@@ -202,11 +272,7 @@ export default function Dashboard() {
         <div className="space-y-4">
 
           {/* Owner's Priority List */}
-          <BentoCard title="Owner's Priority List" subtitle="AI-recommended actions" headerRight={
-            <span className="flex items-center gap-1 text-[10px] font-bold text-violet-v bg-[var(--violet-soft)] px-2 py-1 rounded-full">
-              <Sparkles className="w-3 h-3" /> AI
-            </span>
-          }>
+          <BentoCard title="Owner's Priority List" subtitle="Top actions to recover revenue" headerRight={<span className="badge badge-violet">Live priorities</span>}>
             <div className="space-y-2.5">
               {priorityActions.map((item) => (
                 <div key={item.id} className={`rounded-xl p-3.5 cursor-pointer hover:opacity-90 transition-opacity ${urgencyClass[item.urgency]}`}>
@@ -220,7 +286,7 @@ export default function Dashboard() {
                       <span className="badge badge-emerald shrink-0">{item.impact}</span>
                     )}
                   </div>
-                  <button type="button" className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[var(--indigo)] text-white text-[11px] font-semibold hover:opacity-90 transition-opacity">
+                  <button type="button" onClick={() => navigate(actionRoute[item.id] ?? '/autopilot')} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[var(--indigo)] text-white text-[11px] font-semibold hover:opacity-90 transition-opacity">
                     <Zap className="w-3 h-3" />
                     {item.action}
                   </button>
@@ -230,7 +296,7 @@ export default function Dashboard() {
           </BentoCard>
 
           {/* AI Growth Signals */}
-          <BentoCard title="Key Growth Signals" subtitle="ClinicRadar AI · Live" headerRight={
+          <BentoCard title="Key Growth Signals" subtitle="ClinicRadar signals from live data" headerRight={
             <span className="flex items-center gap-1 text-[10px] font-bold text-emerald-v bg-[var(--emerald-soft)] px-2 py-1 rounded-full">
               <span className="w-1.5 h-1.5 rounded-full bg-[var(--emerald)]" /> Live
             </span>
@@ -241,15 +307,15 @@ export default function Dashboard() {
                   key={alert.id}
                   title={alert.title}
                   description={alert.description}
-                  impact={alert.estimatedValue ? `£${alert.estimatedValue.toLocaleString()}` : undefined}
+                  impact={alert.estimatedValue ? formatCurrency(alert.estimatedValue) : undefined}
                   variant={alert.severity === 'high' ? 'risk' : alert.category === 'revenue' ? 'opportunity' : 'info'}
                   action="Take action"
                   confidence={alert.severity === 'high' ? 88 : alert.severity === 'medium' ? 72 : 61}
                 />
               ))}
-              <button type="button" className="w-full text-center text-xs font-semibold text-indigo py-2 border border-dashed border-[var(--indigo-mid)] rounded-xl hover:bg-[var(--indigo-soft)] transition-colors flex items-center justify-center gap-1.5">
+              <button type="button" onClick={() => navigate('/clinic-radar')} className="w-full text-center text-xs font-semibold text-indigo py-2 border border-dashed border-[var(--indigo-mid)] rounded-xl hover:bg-[var(--indigo-soft)] transition-colors flex items-center justify-center gap-1.5">
                 <BarChart3 className="w-3.5 h-3.5" />
-                View all 15 signals in ClinicRadar AI
+                View all signals in ClinicRadar
               </button>
             </div>
           </BentoCard>

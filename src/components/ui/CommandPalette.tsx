@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Search, Megaphone, Users, Phone, TrendingUp, Star, BarChart2, UserPlus, Zap, X, ArrowRight } from 'lucide-react';
+import { Search, Megaphone, Users, Phone, TrendingUp, Star, BarChart2, UserPlus, Zap, X, ArrowRight, Orbit } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 
 interface Command {
@@ -23,6 +23,7 @@ const commands: Command[] = [
   { id: 'c8', label: 'View Branch Performance', description: 'Compare all clinic locations', icon: <BarChart2 className="w-4 h-4" />, path: '/clinic-radar', action: 'navigate', category: 'Reports' },
   { id: 'c9', label: 'ClinicRadar AI Insights', description: "See today's detected revenue signals", icon: <Zap className="w-4 h-4" />, path: '/clinic-radar', action: 'navigate', category: 'AI' },
   { id: 'c10', label: 'Smart Scheduling', description: 'View and fill empty appointment slots', icon: <Zap className="w-4 h-4" />, path: '/scheduling', action: 'navigate', category: 'AI' },
+  { id: 'c11', label: 'Open CareFlow Autopilot', description: 'Review agent playbooks, approvals, and audit trail', icon: <Orbit className="w-4 h-4" />, path: '/autopilot', action: 'navigate', category: 'AI' },
 ];
 
 interface CommandPaletteProps {
@@ -37,8 +38,10 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
 
   useEffect(() => {
     if (isOpen) {
-      setQuery('');
-      setTimeout(() => inputRef.current?.focus(), 50);
+      setTimeout(() => {
+        setQuery('');
+        inputRef.current?.focus();
+      }, 50);
     }
   }, [isOpen]);
 

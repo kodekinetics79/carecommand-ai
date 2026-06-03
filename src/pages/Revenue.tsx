@@ -1,3 +1,4 @@
+import { useNavigate } from 'react-router-dom';
 import { TrendingUp, DollarSign, Phone, Megaphone, AlertCircle, ArrowRight, Zap, BarChart3 } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
@@ -5,43 +6,62 @@ import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
 import RevenueChart from '../components/charts/RevenueChart';
 import BranchComparisonChart from '../components/charts/BranchComparisonChart';
-import { revenueData, branchRevenue, serviceRevenue } from '../data/mockRevenue';
+import { revenueData, branchRevenue, serviceRevenue } from '../data/seedData';
 import { formatCurrency } from '../utils/formatters';
-
-const latest = revenueData[revenueData.length - 1];
-const prev = revenueData[revenueData.length - 2];
-const revGrowth = Math.round(((latest.revenue - prev.revenue) / prev.revenue) * 100);
-const recoveredGrowth = Math.round(((latest.recovered - prev.recovered) / prev.recovered) * 100);
+import { useApiResource } from '../hooks/useApiResource';
+import { mapRevenueSnapshot, type ApiRevenueSnapshot } from '../lib/apiAdapters';
 
 const lostOpportunities = [
-  { label: 'Missed calls — unrecovered', value: 3450, action: 'Launch AI follow-up' },
+  { label: 'Missed calls — unrecovered', value: 3450, action: 'Launch follow-up' },
   { label: 'Empty slots — unfilled this week', value: 6200, action: 'Fill with slot campaign' },
   { label: 'Inactive customers — no outreach', value: 18700, action: 'Run winback campaign' },
   { label: 'Unpaid invoices >30 days', value: 1150, action: 'Send payment reminder' },
 ];
 
 type BarColor = 'blue' | 'violet' | 'emerald' | 'red' | 'teal';
-const waterfall: { label: string; value: number; color: BarColor; positive: boolean }[] = [
-  { label: 'Gross Revenue',        value: latest.revenue,                                                     color: 'blue',    positive: true },
-  { label: '+ Campaign Revenue',   value: latest.campaigns,                                                   color: 'violet',  positive: true },
-  { label: '+ Automation Recovery',value: latest.recovered,                                                   color: 'emerald', positive: true },
-  { label: '− Lost Opportunities', value: latest.lost,                                                        color: 'red',     positive: false },
-  { label: 'Net Revenue',          value: latest.revenue + latest.campaigns + latest.recovered - latest.lost, color: 'teal',    positive: true },
-];
-const maxWaterfall = Math.max(...waterfall.map(w => Math.abs(w.value)));
+const revenueFallback = revenueData.map((row, index) => ({ ...row, id: `demo-revenue-${index}` })).reverse();
 
 export default function Revenue() {
+  const navigate = useNavigate();
+  const { data: revenueRecords, source } = useApiResource<ApiRevenueSnapshot, typeof revenueFallback[number]>('/v1/revenue-snapshots?limit=100', revenueFallback, mapRevenueSnapshot);
+
+  function exportReport() {
+    const header = ['Month', 'Revenue', 'Campaigns', 'Recovered', 'Lost'];
+    const lines = revenueRecords.map(r => [r.month, r.revenue, r.campaigns, r.recovered, r.lost].join(','));
+    const csv = [header.join(','), ...lines].join('\n');
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `revenue-report-${new Date().toISOString().slice(0, 10)}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+  const latest = revenueRecords[0] ?? revenueRecords[revenueRecords.length - 1] ?? revenueFallback.at(-1)!;
+  const prev = revenueRecords[1] ?? revenueRecords[revenueRecords.length - 2] ?? latest;
+  const revGrowth = prev.revenue > 0 ? Math.round(((latest.revenue - prev.revenue) / prev.revenue) * 100) : 0;
+  const recoveredGrowth = prev.recovered > 0 ? Math.round(((latest.recovered - prev.recovered) / prev.recovered) * 100) : 0;
+  const waterfall: { label: string; value: number; color: BarColor; positive: boolean }[] = [
+    { label: 'Gross Revenue', value: latest.revenue, color: 'blue', positive: true },
+    { label: '+ Campaign Revenue', value: latest.campaigns, color: 'violet', positive: true },
+    { label: '+ Automation Recovery', value: latest.recovered, color: 'emerald', positive: true },
+    { label: '− Lost Opportunities', value: latest.lost, color: 'red', positive: false },
+    { label: 'Net Revenue', value: latest.revenue + latest.campaigns + latest.recovered - latest.lost, color: 'teal', positive: true },
+  ];
+  const maxWaterfall = Math.max(...waterfall.map(item => Math.abs(item.value)));
+
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="RevenuePulse"
         subtitle="CFO-level revenue intelligence — recovery, attribution, branch comparison, and lost opportunity tracking."
+        badge={source === 'live' ? 'Live DB' : 'Demo'}
+        badgeColor={source === 'live' ? 'emerald' : 'blue'}
         actions={
           <div className="flex gap-2">
-            <button type="button" className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
+            <button type="button" onClick={exportReport} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
               <BarChart3 className="w-4 h-4" /> Export Report
             </button>
-            <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
+            <button type="button" onClick={() => navigate('/opportunities')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
               <Zap className="w-4 h-4" /> Recover Lost Revenue
             </button>
           </div>
@@ -53,7 +73,7 @@ export default function Revenue() {
         <StatCard title="Monthly Revenue" value={formatCurrency(latest.revenue)} subtitle="This month" trend={revGrowth} icon={<TrendingUp className="w-4 h-4" />} accent="blue" />
         <StatCard title="Revenue Recovered" value={formatCurrency(latest.recovered)} subtitle="By automation" trend={recoveredGrowth} icon={<DollarSign className="w-4 h-4" />} accent="emerald" />
         <StatCard title="Campaign Attribution" value={formatCurrency(latest.campaigns)} subtitle="This month" trend={18} icon={<Megaphone className="w-4 h-4" />} accent="violet" />
-        <StatCard title="Missed-Call Recovery" value="£3,840" subtitle="AI follow-up this month" trend={48} icon={<Phone className="w-4 h-4" />} accent="cyan" />
+        <StatCard title="Missed-Call Recovery" value={formatCurrency(3840)} subtitle="Follow-up this month" trend={48} icon={<Phone className="w-4 h-4" />} accent="cyan" />
         <StatCard title="Lost Opportunities" value={formatCurrency(latest.lost)} subtitle="This month" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
         <StatCard title="Recovery Rate" value="72%" subtitle="Of identified opportunities" trend={5} icon={<TrendingUp className="w-4 h-4" />} accent="amber" />
       </div>
@@ -150,7 +170,7 @@ export default function Revenue() {
                     <p className="text-xs font-semibold text-t1">{opp.label}</p>
                     <p className="text-xs font-bold text-red-v">{formatCurrency(opp.value)}</p>
                   </div>
-                  <button type="button" className="shrink-0 inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1.5 rounded-lg hover:opacity-80 transition-colors">
+                  <button type="button" onClick={() => navigate('/opportunities')} className="shrink-0 inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1.5 rounded-lg hover:opacity-80 transition-colors">
                     <Zap className="w-3 h-3" />
                     {opp.action}
                   </button>
@@ -173,7 +193,7 @@ export default function Revenue() {
               </tr>
             </thead>
             <tbody className="divide-y divide-[var(--b0)]">
-              {revenueData.map((row) => (
+              {revenueRecords.map((row) => (
                 <tr key={row.month} className="hover:bg-[var(--s3)] transition-colors">
                   <td className="py-2.5 px-3 text-xs font-semibold text-t2">{row.month}</td>
                   <td className="py-2.5 px-3 text-xs font-bold text-t1">{formatCurrency(row.revenue)}</td>
@@ -188,20 +208,20 @@ export default function Revenue() {
         </div>
       </BentoCard>
 
-      {/* AI Revenue Summary */}
+      {/* Revenue Action Plan */}
       <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-5">
         <div className="flex items-start gap-4">
           <div className="w-9 h-9 rounded-xl bg-[var(--indigo-soft)] flex items-center justify-center shrink-0">
             <TrendingUp className="w-5 h-5 text-indigo" />
           </div>
           <div className="flex-1">
-            <p className="text-xs font-bold uppercase tracking-widest text-blue-v mb-1">AI Revenue Insight</p>
+            <p className="text-xs font-bold uppercase tracking-widest text-blue-v mb-1">Revenue Action Plan</p>
             <p className="text-t1 font-semibold leading-relaxed mb-3">
-              Your network recovered £27,200 through automation this month — up 12% vs last month.
-              The biggest untapped opportunity is £18,700 from inactive customers who haven't been contacted.
+              Your network recovered {formatCurrency(27200)} through automation this month — up 12% vs last month.
+              The biggest untapped opportunity is {formatCurrency(18700)} from inactive customers who haven't been contacted.
               Running a winback campaign today could convert 34 bookings within 14 days.
             </p>
-            <button type="button" className="inline-flex items-center gap-1.5 text-sm font-semibold text-indigo hover:opacity-80 transition-colors">
+            <button type="button" onClick={() => navigate('/campaigner')} className="inline-flex items-center gap-1.5 text-sm font-semibold text-indigo hover:opacity-80 transition-colors">
               Launch winback campaign <ArrowRight className="w-4 h-4" />
             </button>
           </div>

@@ -167,6 +167,8 @@ export interface LabOrder {
   lab: string;
   urgency: 'routine' | 'urgent' | 'stat';
   resultSummary?: string;
+  reviewedAt?: string;
+  reviewedBy?: string;
 }
 
 export interface Review {
@@ -199,4 +201,235 @@ export interface RevenueData {
   recovered: number;
   lost: number;
   campaigns: number;
+}
+
+export interface RevenueLeak {
+  id: string;
+  branchId: string;
+  branchName: string;
+  category: string;
+  source: string;
+  evidence: string;
+  estimatedValue: number;
+  confidence: number;
+  status: string;
+  workflowStatus: string;
+  suggestedAction: string;
+  ownerName?: string;
+  patientName?: string;
+  createdAt: string;
+}
+
+export interface Opportunity {
+  id: string;
+  branchId: string;
+  branchName: string;
+  title: string;
+  source: string;
+  category: string;
+  trigger: string;
+  automationSteps: string[];
+  expectedRevenue: number;
+  actualRevenue: number;
+  roi: number;
+  confidence: number;
+  effortLevel: string;
+  urgency: string;
+  status: string;
+  ownerApprovalRequired: boolean;
+  recommendedAction: string;
+  ownerName?: string;
+  patientName?: string;
+  createdAt: string;
+}
+
+export type AdvisorType = 'revenue' | 'growth' | 'front-desk' | 'competitor' | 'operations';
+
+export interface AdvisoryAction {
+  label: string;
+  path: string;
+  description: string;
+  primary?: boolean;
+  context?: Record<string, unknown>;
+}
+
+export interface AdvisorResponse {
+  advisorType: AdvisorType;
+  answer: string;
+  summary: string;
+  diagnosis: string;
+  recommendedAction: string;
+  expectedImpact: number;
+  confidence: number;
+  evidence: string[];
+  recommendations: string[];
+  actions: AdvisoryAction[];
+  question?: string;
+  clinicId?: string | null;
+  generatedAt: string;
+}
+
+export interface AdvisoryBriefResponse {
+  generatedAt: string;
+  clinicId?: string | null;
+  clinicName?: string | null;
+  advisors: AdvisorResponse[];
+}
+
+export interface AdminBranchAccess {
+  id: string;
+  name: string;
+  location: string;
+  isPrimary: boolean;
+}
+
+export interface AdminUser {
+  id: string;
+  displayName: string;
+  email: string;
+  role: string;
+  active: boolean;
+  branchId?: string | null;
+  branch?: { id: string; name: string; location: string } | null;
+  accessBranches: AdminBranchAccess[];
+  lastLoginAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  sessionActive: boolean;
+}
+
+export interface AdminRole {
+  id: string;
+  name: string;
+  enumValue: string;
+  description: string;
+  accent: string;
+  userCount: number;
+  moduleAccess: string[];
+  clinicScope: string;
+}
+
+export interface AdminAuditEvent {
+  id: string;
+  action: string;
+  resource: string;
+  resourceId?: string | null;
+  actor: string;
+  role?: string | null;
+  ipAddress?: string | null;
+  userAgent?: string | null;
+  occurredAt: string;
+  metadata: unknown;
+}
+
+export interface SecurityPosture {
+  authMode: string;
+  passwordLoginEnabled?: boolean;
+  devTokenEnabled?: boolean;
+  refreshCookieHttpOnly?: boolean;
+  csrfEnabled?: boolean;
+  refreshRotationEnabled?: boolean;
+  adminRouteProtected?: boolean;
+  tenantIsolationEnabled?: boolean;
+  clinicScopingEnabled?: boolean;
+  refreshCookie: {
+    httpOnly: boolean;
+    secure: boolean;
+    sameSite: string;
+    path: string;
+  };
+  csrf?: {
+    enabled: boolean;
+    strategy: string;
+  };
+  rbacEnabled: boolean;
+  auditLoggingEnabled: boolean;
+  rateLimitingEnabled: boolean;
+  devTokenDisabledInProduction: boolean;
+  httpsRequired: boolean;
+  secrets: {
+    jwtSecretConfigured: boolean;
+    jwtRefreshSecretConfigured: boolean;
+  };
+  accessTokenTtlMinutes: number;
+  jwtSecretsConfigured?: boolean;
+  refreshSecretConfigured?: boolean;
+  corsMode?: string;
+  environmentMode?: string;
+  riskLabel?: string;
+  readinessScore?: number;
+  paymentRailsStatus?: string;
+  insuranceRailsStatus?: string;
+  auditEventCount: number;
+  loginEventCount: number;
+  integrations: Array<{
+    key: string;
+    name: string;
+    status: string;
+    lastSyncAt: string | null;
+  }>;
+  paymentProviders: Array<{
+    key: string;
+    displayName: string;
+    mode: string;
+    status: string;
+  }>;
+  alerts: Array<{
+    severity: string;
+    title: string;
+    message: string;
+  }>;
+}
+
+export interface SecuritySession {
+  id: string;
+  user: {
+    id: string;
+    displayName: string;
+    email: string;
+    role: string;
+    branch: { id: string; name: string; location: string } | null;
+  };
+  issuedAt: string | null;
+  expiresAt: string | null;
+  revoked: boolean;
+  lastActivityAt: string | null;
+  lastLoginAudit: {
+    occurredAt: string;
+    ipAddress?: string | null;
+    userAgent?: string | null;
+  } | null;
+  accessBranches: AdminBranchAccess[];
+}
+
+export interface SecurityLoginHistory {
+  id: string;
+  status: 'success' | 'failed';
+  action: string;
+  user: string;
+  email: string | null;
+  role: string | null;
+  ipAddress?: string | null;
+  userAgent?: string | null;
+  occurredAt: string;
+  metadata: unknown;
+}
+
+export interface IntegrationStatus {
+  key: string;
+  name: string;
+  category: string;
+  description: string;
+  supportedWorkflows: string[];
+  mode: 'mock' | 'sandbox' | 'live';
+  modeLabel: string;
+  configured: boolean;
+  health: 'healthy' | 'degraded' | 'disconnected' | 'not_configured';
+  lastSyncAt: string | null;
+  missingEnvVars: string[];
+  riskLevel: 'low' | 'medium' | 'high' | string;
+  action: string;
+  integrationId: string | null;
+  providerConnectionId: string | null;
+  databaseStatus: string | null;
 }

@@ -2,8 +2,13 @@ import { Video, CheckCircle2, Clock, ArrowRight, Sparkles, Phone, CalendarDays, 
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
+import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useApiResource } from '../hooks/useApiResource';
+import { mapTelehealthSession, type ApiTelehealthSession, type TelehealthSession } from '../lib/apiAdapters';
+import { formatCurrency } from '../utils/formatters';
 
-const sessions = [
+const fallbackSessions: TelehealthSession[] = [
   { id: 't1', patient: 'Rowan Brooks', initials: 'RB', service: 'Virtual Dermatology Review', date: '2026-05-26', time: '10:00', status: 'Confirmed', provider: 'Dr. Priya Sharma', value: 220, intakeComplete: true },
   { id: 't2', patient: 'Nora Steele', initials: 'NS', service: 'Telehealth Nutrition Follow-up', date: '2026-05-26', time: '14:00', status: 'Pending', provider: 'Dr. Lisa Wong', value: 180, intakeComplete: false },
   { id: 't3', patient: 'Oliver Chen', initials: 'OC', service: 'Virtual GP Consultation', date: '2026-05-27', time: '09:30', status: 'Confirmed', provider: 'Dr. James Okafor', value: 150, intakeComplete: true },
@@ -22,6 +27,15 @@ const statusColors: Record<string, { dot: string; text: string; bg: string }> = 
 };
 
 export default function Telehealth() {
+  const navigate = useNavigate();
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [sentIntakeIds, setSentIntakeIds] = useState<string[]>([]);
+  const { data: sessions } = useApiResource<ApiTelehealthSession, TelehealthSession>(
+    '/v1/telehealth/sessions?limit=100',
+    fallbackSessions,
+    mapTelehealthSession,
+  );
+
   const intakeComplete = sessions.filter(s => s.intakeComplete).length;
   const confirmedCount = sessions.filter(s => s.status === 'Confirmed').length;
   const totalValue = sessions.reduce((s, sess) => s + sess.value, 0);
@@ -34,7 +48,7 @@ export default function Telehealth() {
         badge={`${sessions.length} Today`}
         badgeColor="blue"
         actions={
-          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition">
+          <button type="button" onClick={() => navigate('/scheduling')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition">
             <Video className="w-4 h-4" /> Launch Video Room
           </button>
         }
@@ -44,7 +58,7 @@ export default function Telehealth() {
         <StatCard title="Virtual Sessions" value={sessions.length} subtitle="Booked today" icon={<Video className="w-4 h-4" />} accent="blue" />
         <StatCard title="Confirmed" value={confirmedCount} subtitle="Ready to start" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
         <StatCard title="Intake Complete" value={`${Math.round((intakeComplete / sessions.length) * 100)}%`} subtitle="Pre-visit forms" icon={<Users className="w-4 h-4" />} accent="violet" />
-        <StatCard title="Session Revenue" value={`£${totalValue}`} subtitle="Today's virtual visits" icon={<CalendarDays className="w-4 h-4" />} accent="amber" />
+        <StatCard title="Session Revenue" value={formatCurrency(totalValue)} subtitle="Today's virtual visits" icon={<CalendarDays className="w-4 h-4" />} accent="amber" />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
@@ -76,7 +90,7 @@ export default function Telehealth() {
                         <span className={`w-1.5 h-1.5 rounded-full ${sc.dot}`} />
                         {session.status}
                       </span>
-                      <span className="text-xs font-bold text-t2">£{session.value}</span>
+                      <span className="text-xs font-bold text-t2">{formatCurrency(session.value)}</span>
                     </div>
                   </div>
 
@@ -89,12 +103,12 @@ export default function Telehealth() {
                     </div>
                     <div className="flex items-center gap-2">
                       {!session.intakeComplete && (
-                        <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-amber-v bg-[var(--amber-soft)] px-2 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors">
-                          <Zap className="w-3 h-3" /> Send intake
+                        <button type="button" disabled={sentIntakeIds.includes(session.id)} onClick={() => setSentIntakeIds(current => current.includes(session.id) ? current : [...current, session.id])} className="inline-flex items-center gap-1 text-[10px] font-semibold text-amber-v bg-[var(--amber-soft)] px-2 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors disabled:opacity-40">
+                          <Zap className="w-3 h-3" /> {sentIntakeIds.includes(session.id) ? 'Sent' : 'Send intake'}
                         </button>
                       )}
-                      <button type="button" className="inline-flex items-center gap-1.5 text-[10px] font-semibold text-white bg-[var(--indigo)] px-2.5 py-1 rounded-lg hover:bg-[var(--indigo-mid)] transition-colors">
-                        <Video className="w-3 h-3" /> Start
+                      <button type="button" onClick={() => setActiveSessionId(session.id)} className="inline-flex items-center gap-1.5 text-[10px] font-semibold text-white bg-[var(--indigo)] px-2.5 py-1 rounded-lg hover:bg-[var(--indigo-mid)] transition-colors">
+                        <Video className="w-3 h-3" /> {activeSessionId === session.id ? 'Starting…' : 'Start'}
                       </button>
                     </div>
                   </div>
@@ -112,10 +126,10 @@ export default function Telehealth() {
                 <div key={opp.patient} className="p-3.5 rounded-xl border border-[var(--b1)] bg-[var(--violet-soft)] hover:border-[var(--b2)] transition-all">
                   <div className="flex items-start justify-between gap-2 mb-1.5">
                     <p className="text-xs font-bold text-t1">{opp.patient}</p>
-                    <span className="text-xs font-bold text-violet-v shrink-0">+£{opp.value}</span>
+                    <span className="text-xs font-bold text-violet-v shrink-0">+{formatCurrency(opp.value)}</span>
                   </div>
                   <p className="text-[11px] text-t3 mb-2">{opp.suggestion}</p>
-                  <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo hover:text-blue-v">
+                  <button type="button" onClick={() => navigate('/scheduling')} className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo hover:text-blue-v">
                     <CalendarDays className="w-3 h-3" /> Book in-person slot
                   </button>
                 </div>
@@ -150,7 +164,7 @@ export default function Telehealth() {
             </div>
             <p className="text-2xl font-bold text-t1 mb-1">6 follow-ups</p>
             <p className="text-xs text-t3 mb-3">Triggered automatically after virtual sessions this month.</p>
-            <button type="button" className="w-full py-2 rounded-xl bg-[var(--s3)] hover:bg-[var(--indigo-soft)] text-t2 hover:text-indigo text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
+            <button type="button" onClick={() => navigate('/crm')} className="w-full py-2 rounded-xl bg-[var(--s3)] hover:bg-[var(--indigo-soft)] text-t2 hover:text-indigo text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
               <ArrowRight className="w-3.5 h-3.5" /> View follow-up queue
             </button>
           </div>

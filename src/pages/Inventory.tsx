@@ -3,8 +3,12 @@ import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
-import { inventoryItems } from '../data/mockInventory';
-import { branches } from '../data/mockClinics';
+import { inventoryItems, branches } from '../data/seedData';
+import { useState } from 'react';
+import { useApiResource } from '../hooks/useApiResource';
+import { mapInventoryItem, type ApiInventoryItem } from '../lib/apiAdapters';
+import { apiRequest } from '../lib/api';
+import { formatCurrency } from '../utils/formatters';
 
 const statusConfig: Record<string, { label: string; badge: string; border: string; bg: string }> = {
   ok:       { label: 'In Stock',  badge: 'badge badge-emerald', border: 'border-[var(--b1)]',        bg: 'bg-[var(--s2)]' },
@@ -13,10 +17,6 @@ const statusConfig: Record<string, { label: string; badge: string; border: strin
   expiring: { label: 'Expiring',  badge: 'badge badge-amber',   border: 'border-[var(--b1)]',        bg: 'bg-[var(--amber-soft)]' },
 };
 
-const criticalCount = inventoryItems.filter(i => i.status === 'critical' || i.status === 'low').length;
-const expiringCount = inventoryItems.filter(i => i.status === 'expiring').length;
-const totalValue = inventoryItems.reduce((s, i) => s + i.currentStock * i.unitCost, 0);
-
 const aiRecommendations = [
   { title: 'Reorder Botox immediately', desc: 'Downtown: 3 vials left, 8 appointments next week. 2-day lead time.', urgency: 'Critical', action: 'Place reorder with Allergan UK' },
   { title: 'Use expiring composite resin first', desc: 'Northgate: expires 15 Jun. Prioritise dental fillings to avoid waste.', urgency: 'Expiring', action: 'Schedule usage priority' },
@@ -24,32 +24,65 @@ const aiRecommendations = [
 ];
 
 export default function Inventory() {
+  const { data: stockItems, source, reload } = useApiResource<ApiInventoryItem, typeof inventoryItems[number]>('/v1/inventory?limit=100', inventoryItems, mapInventoryItem);
+  const [reorderingId, setReorderingId] = useState<string | null>(null);
+
+  async function reorder(id: string, reorderLevel: number) {
+    setReorderingId(id);
+    try {
+      // Restock to roughly two reorder cycles' worth of stock.
+      await apiRequest(`/v1/inventory/${id}`, { method: 'PATCH', body: JSON.stringify({ currentStock: Math.max(reorderLevel * 2, reorderLevel + 10) }) });
+      reload();
+    } finally {
+      setReorderingId(null);
+    }
+  }
+
+  async function reorderAll() {
+    const targets = stockItems.filter(item => item.status === 'critical' || item.status === 'low' || item.status === 'expiring');
+    if (targets.length === 0) return;
+    setReorderingId('bulk');
+    try {
+      await Promise.all(targets.map(item => apiRequest(`/v1/inventory/${item.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ currentStock: Math.max(item.reorderLevel * 2, item.reorderLevel + 10) }),
+      })));
+      reload();
+    } finally {
+      setReorderingId(null);
+    }
+  }
+
+  const criticalCount = stockItems.filter(i => i.status === 'critical' || i.status === 'low').length;
+  const expiringCount = stockItems.filter(i => i.status === 'expiring').length;
+  const totalValue = stockItems.reduce((sum, item) => sum + item.currentStock * item.unitCost, 0);
+
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Inventory Intelligence"
         subtitle="Stock levels, expiry risk, reorder alerts, and AI supply recommendations across all branches."
-        badge={`${criticalCount + expiringCount} Alerts`}
+        badge={`${criticalCount + expiringCount} Alerts · ${source === 'live' ? 'Live DB' : 'Demo'}`}
         badgeColor="red"
         actions={
-          <button type="button" className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
+          <button type="button" disabled={reorderingId === 'bulk'} onClick={() => void reorderAll()} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition disabled:opacity-40">
             <Zap className="w-4 h-4" /> Place All Reorders
           </button>
         }
       />
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Total Items Tracked" value={inventoryItems.length} subtitle="Across all branches" icon={<Package className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Total Items Tracked" value={stockItems.length} subtitle="Across all branches" icon={<Package className="w-4 h-4" />} accent="blue" />
         <StatCard title="Critical / Low Stock" value={criticalCount} subtitle="Needs reorder now" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
         <StatCard title="Expiring Soon" value={expiringCount} subtitle="Within 30 days" icon={<Clock className="w-4 h-4" />} accent="amber" />
-        <StatCard title="Inventory Value" value={`£${totalValue.toLocaleString()}`} subtitle="Current stock value" icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Inventory Value" value={formatCurrency(totalValue)} subtitle="Current stock value" icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_340px]">
         {/* Inventory table */}
         <BentoCard title="Stock Level Dashboard" subtitle="All items across branches">
           <div className="space-y-2.5">
-            {inventoryItems.map((item) => {
+            {stockItems.map((item) => {
               const sc = statusConfig[item.status];
               const branch = branches.find(b => b.id === item.branchId);
               const stockPct = Math.min(100, Math.round((item.currentStock / (item.reorderLevel * 2)) * 100));
@@ -78,11 +111,11 @@ export default function Inventory() {
                     <div className="flex items-center gap-3 text-[11px] text-t3">
                       <span>~{weeksLeft}w left</span>
                       {item.expiryDate && <span className={`font-semibold ${new Date(item.expiryDate) < new Date('2025-07-01') ? 'text-amber-v' : 'text-t3'}`}>Exp: {item.expiryDate}</span>}
-                      <span>£{item.unitCost}/unit</span>
+                      <span>{formatCurrency(item.unitCost)}/unit</span>
                     </div>
                     {(item.status === 'critical' || item.status === 'low') && (
-                      <button type="button" className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors">
-                        <Zap className="w-3 h-3" /> Reorder now
+                      <button type="button" disabled={reorderingId === item.id} onClick={() => reorder(item.id, item.reorderLevel)} className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors disabled:opacity-40">
+                        <Zap className="w-3 h-3" /> {reorderingId === item.id ? 'Ordering…' : 'Reorder now'}
                       </button>
                     )}
                   </div>
@@ -103,7 +136,7 @@ export default function Inventory() {
                     <span className={`badge shrink-0 ${rec.urgency === 'Critical' ? 'badge-red' : 'badge-amber'}`}>{rec.urgency}</span>
                   </div>
                   <p className="text-[11px] text-t3 mb-2">{rec.desc}</p>
-                  <button type="button" className="inline-flex items-center gap-1 text-xs font-semibold text-indigo hover:opacity-80">
+                  <button type="button" onClick={() => void reorderAll()} className="inline-flex items-center gap-1 text-xs font-semibold text-indigo hover:opacity-80">
                     <ArrowRight className="w-3 h-3" /> {rec.action}
                   </button>
                 </div>
@@ -114,7 +147,7 @@ export default function Inventory() {
           <BentoCard title="Category Breakdown" subtitle="Stock by category">
             <div className="space-y-2.5">
               {['Aesthetics', 'Dental', 'Diagnostics', 'Dermatology', 'Physiotherapy', 'General'].map(cat => {
-                const catItems = inventoryItems.filter(i => i.category === cat);
+                const catItems = stockItems.filter(i => i.category === cat);
                 const catValue = catItems.reduce((s, i) => s + i.currentStock * i.unitCost, 0);
                 const hasIssue = catItems.some(i => i.status !== 'ok');
                 return (
@@ -125,7 +158,7 @@ export default function Inventory() {
                     </div>
                     <div className="flex items-center gap-2">
                       <span className="text-[10px] text-t3">{catItems.length} items</span>
-                      <span className="text-xs font-bold text-t2">£{catValue.toLocaleString()}</span>
+                      <span className="text-xs font-bold text-t2">{formatCurrency(catValue)}</span>
                     </div>
                   </div>
                 );
