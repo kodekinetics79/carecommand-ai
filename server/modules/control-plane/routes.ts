@@ -518,7 +518,7 @@ function buildSecurityPosture(_tenantId: string, integrationRows: Array<{ health
 
 export const controlPlaneRoutes: FastifyPluginAsync = async app => {
   const userStatusBody = z.object({ active: z.boolean() });
-  const userRoleBody = z.object({ role: z.enum(['OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'PROVIDER', 'FRONT_DESK', 'ANALYST']) });
+  const userRoleBody = z.object({ role: z.enum(['OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'PROVIDER', 'FRONT_DESK', 'ANALYST', 'COMPLIANCE_OFFICER', 'AUDITOR']) });
   const clinicAccessBody = z.object({
     branchIds: z.array(uuid).default([]),
     primaryBranchId: uuid.optional(),
@@ -632,7 +632,7 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     const existing = await db.user.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!existing) throw app.httpErrors.notFound('User not found');
     await db.user.update({ where: { id }, data: { role } });
-    await audit(request, { action: 'controlPlane.user.roleChanged', resource: 'user', resourceId: id, metadata: { role } });
+    await audit(request, { action: 'controlPlane.user.roleChanged', resource: 'user', resourceId: id, metadata: { fromRole: existing.role, toRole: role } });
     return { id, role };
   });
 

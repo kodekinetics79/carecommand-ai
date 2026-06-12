@@ -42,6 +42,11 @@ interface SessionRow {
 }
 
 const ROLE_OPTIONS = ['OWNER', 'ADMIN', 'MANAGER', 'PROVIDER', 'FRONT_DESK', 'ANALYST'];
+// Compliance roles are enforced by the Compliance module and assignable here
+// (the backend role-change API accepts them). Assignment itself remains gated
+// to OWNER/ADMIN by the backend.
+const COMPLIANCE_ROLE_OPTIONS = ['COMPLIANCE_OFFICER', 'AUDITOR'];
+const COMPLIANCE_ROLE_LABEL: Record<string, string> = { COMPLIANCE_OFFICER: 'Compliance Officer', AUDITOR: 'Auditor' };
 const accentBadge: Record<string, string> = {
   violet: 'badge badge-violet', blue: 'badge badge-blue', emerald: 'badge badge-emerald',
   amber: 'badge badge-amber', red: 'badge badge-red',
@@ -251,6 +256,7 @@ function TeamSection() {
               className="px-2.5 py-1.5 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-[11px] font-semibold text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-40"
             >
               {ROLE_OPTIONS.map(r => <option key={r} value={r}>{r.replace('_', ' ')}</option>)}
+              {COMPLIANCE_ROLE_OPTIONS.map(r => <option key={r} value={r}>{COMPLIANCE_ROLE_LABEL[r]}</option>)}
             </select>
             <button
               type="button"

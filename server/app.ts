@@ -20,6 +20,7 @@ import { operationsRoutes } from './modules/operations/routes';
 import { dashboardRoutes } from './modules/dashboard/routes';
 import { telehealthRoutes } from './modules/telehealth/routes';
 import { complianceRoutes } from './modules/compliance/routes';
+import { complianceCenterRoutes } from './modules/compliance/center';
 import { settingsRoutes, adminRoutes, securityRoutes } from './modules/settings/routes';
 import { advisoryRoutes } from './modules/advisory/routes';
 import { revenueProtectionRoutes, revenueProtectionWebhookRoutes } from './modules/revenue-protection';
@@ -133,6 +134,7 @@ export async function buildApp() {
     await protectedApi.register(autopilotRoutes, { prefix: '/autopilot' });
     await protectedApi.register(telehealthRoutes, { prefix: '/telehealth' });
     await protectedApi.register(complianceRoutes, { prefix: '/compliance' });
+    await protectedApi.register(complianceCenterRoutes, { prefix: '/compliance' });
     await protectedApi.register(settingsRoutes, { prefix: '/settings' });
     await protectedApi.register(adminRoutes, { prefix: '/admin' });
     await protectedApi.register(securityRoutes, { prefix: '/security' });

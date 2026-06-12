@@ -2,7 +2,7 @@ import { useLocation, Link, useNavigate } from 'react-router-dom';
 import {
   LayoutDashboard, Radar, Users2, Megaphone, TrendingUp,
   CalendarDays, ClipboardList, Puzzle, Settings,
-  Star, ChevronDown, Hexagon, Orbit, Target, UserCircle2, ShieldCheck, Sparkles, BadgeCheck, Bot,
+  Star, ChevronDown, Hexagon, Orbit, Target, UserCircle2, ShieldCheck, Sparkles, BadgeCheck, Bot, FileText,
 } from 'lucide-react';
 import { useSession } from '../../hooks/useSession';
 
@@ -62,6 +62,7 @@ const nav: NavSection[] = [
     label: 'Platform',
     items: [
       { label: 'Control Plane', path: '/control-plane', icon: ShieldCheck },
+      { label: 'Compliance Readiness', path: '/compliance', icon: FileText, badge: 'New', badgeColor: 'indigo' },
       { label: 'Integrations',  path: '/integrations', icon: Puzzle },
       { label: 'Settings',      path: '/settings',     icon: Settings },
     ],
@@ -79,11 +80,16 @@ export default function Sidebar() {
   const navigate = useNavigate();
   const { user } = useSession();
   const isAdmin = user ? ['OWNER', 'ADMIN'].includes(user.role) : false;
+  // Compliance Readiness Center is visible only to compliance roles; normal
+  // users (manager/provider/front-desk/billing/analyst) never see it.
+  const canCompliance = user ? ['OWNER', 'ADMIN', 'COMPLIANCE_OFFICER', 'AUDITOR'].includes(user.role) : false;
 
   const visibleNav = nav
     .map(section => ({
       ...section,
-      items: section.items.filter(item => item.path !== '/control-plane' || isAdmin),
+      items: section.items.filter(item =>
+        (item.path !== '/control-plane' || isAdmin) &&
+        (item.path !== '/compliance' || canCompliance)),
     }))
     .filter(section => section.items.length > 0);
 

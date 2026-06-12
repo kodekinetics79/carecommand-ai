@@ -585,7 +585,7 @@ export const adminRoutes: FastifyPluginAsync = async app => {
   const adminUserQuery = z.object({
     limit: z.coerce.number().int().min(1).max(100).default(50),
     search: z.string().trim().optional(),
-    role: z.enum(['OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'PROVIDER', 'FRONT_DESK', 'ANALYST']).optional(),
+    role: z.enum(['OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'PROVIDER', 'FRONT_DESK', 'ANALYST', 'COMPLIANCE_OFFICER', 'AUDITOR']).optional(),
     active: z.enum(['active', 'inactive', 'all']).default('all'),
     branchId: uuid.optional(),
   });
@@ -605,7 +605,7 @@ export const adminRoutes: FastifyPluginAsync = async app => {
   });
 
   const roleBody = z.object({
-    role: z.enum(['OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'PROVIDER', 'FRONT_DESK', 'ANALYST']),
+    role: z.enum(['OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'PROVIDER', 'FRONT_DESK', 'ANALYST', 'COMPLIANCE_OFFICER', 'AUDITOR']),
   });
 
   const statusBody = z.object({
@@ -692,7 +692,7 @@ export const adminRoutes: FastifyPluginAsync = async app => {
       action: 'admin.user.roleChanged',
       resource: 'user',
       resourceId: id,
-      metadata: { role: input.role },
+      metadata: { fromRole: existing.role, toRole: input.role },
     });
     return { id: updated.id, role: updated.role };
   });

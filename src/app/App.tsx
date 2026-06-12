@@ -26,7 +26,7 @@ const Reviews = lazy(() => import('../pages/Reviews'));
 const Inventory = lazy(() => import('../pages/Inventory'));
 const Labs = lazy(() => import('../pages/Labs'));
 const Telehealth = lazy(() => import('../pages/Telehealth'));
-const Compliance = lazy(() => import('../pages/Compliance'));
+const ComplianceCenter = lazy(() => import('../pages/ComplianceCenter'));
 const Integrations = lazy(() => import('../pages/Integrations'));
 const Settings = lazy(() => import('../pages/Settings'));
 const ControlPlane = lazy(() => import('../pages/ControlPlane'));
@@ -98,6 +98,26 @@ function AdminRoute() {
   );
 }
 
+function ComplianceRoute() {
+  const { loading, isAuthenticated, user } = useSession();
+
+  if (loading) {
+    return <div className="min-h-screen flex items-center justify-center text-sm text-t3">Loading session…</div>;
+  }
+  if (!isAuthenticated) {
+    return <Navigate to="/login" replace />;
+  }
+  if (!user || !['OWNER', 'ADMIN', 'COMPLIANCE_OFFICER', 'AUDITOR'].includes(user.role)) {
+    return <Navigate to="/" replace />;
+  }
+
+  return (
+    <Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}>
+      <ComplianceCenter />
+    </Suspense>
+  );
+}
+
 export default function App() {
   return (
     <BrowserRouter>
@@ -135,7 +155,8 @@ export default function App() {
           <Route path="/inventory" element={<Inventory />} />
           <Route path="/labs" element={<Labs />} />
           <Route path="/telehealth" element={<Telehealth />} />
-          <Route path="/compliance" element={<Compliance />} />
+          <Route path="/compliance" element={<ComplianceRoute />} />
+          <Route path="/compliance/:section" element={<ComplianceRoute />} />
           <Route path="/integrations" element={<Integrations />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/control-plane" element={<AdminRoute />} />
