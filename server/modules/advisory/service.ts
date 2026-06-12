@@ -1,6 +1,7 @@
 import type { FastifyRequest } from 'fastify';
 import { db } from '../../lib/db';
 import { branchScope, assertBranchAccess } from '../../lib/scope';
+import { runWithTenantContext } from '../../lib/tenantContext';
 import { createAIProvider } from './providers';
 import type {
   AdvisorAnalysis,
@@ -69,7 +70,9 @@ async function loadContext(request: FastifyRequest, clinicId?: string, range?: A
       take: 20,
       select: { id: true, name: true, status: true, audienceSize: true, sent: true, opened: true, booked: true, revenue: true, aiGenerated: true },
     }),
-    db.revenueLeak.findMany({
+    // RLS (B-3): RevenueLeak is tenant-isolated — wrap only this read in tenant
+    // context; the other advisory reads (non-RLS tables) are left untouched.
+    runWithTenantContext(request.auth.tenantId, tx => tx.revenueLeak.findMany({
       where: { tenantId: request.auth.tenantId, ...branchWhere, ...(dateWhere ? { createdAt: dateWhere } : {}) },
       orderBy: [{ confidence: 'desc' }, { estimatedValue: 'desc' }],
       take: 20,
@@ -78,7 +81,7 @@ async function loadContext(request: FastifyRequest, clinicId?: string, range?: A
         patient: { select: { firstName: true, lastName: true } },
         ownerUser: { select: { displayName: true } },
       },
-    }),
+    })),
     db.opportunity.findMany({
       where: { tenantId: request.auth.tenantId, ...branchWhere, ...(dateWhere ? { createdAt: dateWhere } : {}) },
       orderBy: [{ confidence: 'desc' }, { expectedRevenue: 'desc' }],

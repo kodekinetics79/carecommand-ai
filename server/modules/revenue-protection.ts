@@ -6,6 +6,7 @@ import { db } from '../lib/db';
 import { audit } from '../lib/audit';
 import { assertBranchAccess } from '../lib/scope';
 import { requireRoles } from '../plugins/roles';
+import { runWithTenantContext } from '../lib/tenantContext';
 import type { Prisma } from '../generated/prisma/client';
 
 // --- Idempotency -----------------------------------------------------------
@@ -898,7 +899,8 @@ async function createEligibilityAlert(context: RevenueContext, branchId: string,
   const riskThemes = deriveEligibilityRisk(outcome);
   if (!riskThemes.length) return null;
   const [primaryTheme, ...rest] = riskThemes;
-  return db.revenueProtectionAlert.create({
+  // RLS (B-3): RevenueProtectionAlert is tenant-isolated; create under context.
+  return runWithTenantContext(context.tenantId, tx => tx.revenueProtectionAlert.create({
     data: {
       tenantId: context.tenantId,
       branchId,
@@ -925,7 +927,7 @@ async function createEligibilityAlert(context: RevenueContext, branchId: string,
         : 'Collect deposit or route to front desk follow-up.',
       actionLink: '/revenue-protection',
     },
-  });
+  }));
 }
 
 async function buildResponsibilityEstimate(context: RevenueContext, branchId: string, patientId: string, appointmentId: string | null, verificationId: string, outcome: EligibilityOutcome) {
@@ -1370,13 +1372,15 @@ async function loadOverview(context: RevenueContext, branchId?: string) {
       take: 50,
       include: { branch: { select: { name: true } }, patient: { select: { firstName: true, lastName: true } } },
     }),
-    db.depositRule.findMany({
+    // RLS (B-3): DepositRule is tenant-isolated — read under tenant context.
+    runWithTenantContext(context.tenantId, tx => tx.depositRule.findMany({
       where: { tenantId: context.tenantId, ...filter },
       orderBy: [{ sortOrder: 'asc' }, { createdAt: 'desc' }],
       take: 50,
       include: { branch: { select: { name: true } } },
-    }),
-    db.depositRequirement.findMany({
+    })),
+    // The depositRule include below also reads the RLS table, so wrap this read.
+    runWithTenantContext(context.tenantId, tx => tx.depositRequirement.findMany({
       where: { tenantId: context.tenantId, ...filter },
       orderBy: { createdAt: 'desc' },
       take: 50,
@@ -1386,8 +1390,9 @@ async function loadOverview(context: RevenueContext, branchId?: string) {
         appointment: { select: { service: true } },
         depositRule: { select: { name: true } },
       },
-    }),
-    db.revenueProtectionAlert.findMany({
+    })),
+    // RLS (B-3): RevenueProtectionAlert is tenant-isolated — read under context.
+    runWithTenantContext(context.tenantId, tx => tx.revenueProtectionAlert.findMany({
       where: { tenantId: context.tenantId, ...filter },
       orderBy: [{ severity: 'desc' }, { createdAt: 'desc' }],
       take: 50,
@@ -1396,7 +1401,7 @@ async function loadOverview(context: RevenueContext, branchId?: string) {
         patient: { select: { firstName: true, lastName: true } },
         appointment: { select: { service: true } },
       },
-    }),
+    })),
     db.integrationRunLog.findMany({
       where: { tenantId: context.tenantId, ...filter },
       orderBy: { createdAt: 'desc' },
@@ -1930,12 +1935,14 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
         take: query.limit,
         include: { branch: { select: { name: true } }, patient: { select: { firstName: true, lastName: true } } },
       }),
-      db.depositRequirement.findMany({
+      // RLS (B-3): the depositRule include reads a tenant-isolated table, so
+      // this read runs under tenant context (payment reads above are untouched).
+      runWithTenantContext(request.auth.tenantId, tx => tx.depositRequirement.findMany({
         where: { tenantId: request.auth.tenantId, ...filter },
         orderBy: { createdAt: 'desc' },
         take: query.limit,
         include: { branch: { select: { name: true } }, patient: { select: { firstName: true, lastName: true } }, appointment: { select: { service: true } }, depositRule: { select: { name: true } } },
-      }),
+      })),
     ]);
     return {
       paymentRequests: paymentRequests.map(mapPaymentRequest),
@@ -2284,12 +2291,12 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
   app.get('/deposit-rules', async request => {
     const query = listLimit.parse(request.query);
     const filter = branchFilter(request, query.branchId);
-    const rows = await db.depositRule.findMany({
+    const rows = await runWithTenantContext(request.auth.tenantId, tx => tx.depositRule.findMany({
       where: { tenantId: request.auth.tenantId, ...filter },
       orderBy: [{ sortOrder: 'asc' }, { createdAt: 'desc' }],
       take: query.limit,
       include: { branch: { select: { name: true } } },
-    });
+    }));
     return { depositRules: rows.map(mapDepositRule) };
   });
 
@@ -2314,7 +2321,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     }).parse(request.body);
     const branchId = branchIdForWrite(request, body.branchId);
     if (branchId) assertBranchAccess(request, branchId);
-    const row = await db.depositRule.create({
+    const row = await runWithTenantContext(request.auth.tenantId, tx => tx.depositRule.create({
       data: {
         tenantId: request.auth.tenantId,
         branchId: branchId ?? undefined,
@@ -2335,7 +2342,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
         sortOrder: body.sortOrder,
       },
       include: { branch: { select: { name: true } } },
-    });
+    }));
     await audit(request, { action: 'depositRule.created', resource: 'depositRule', resourceId: row.id });
     return reply.code(201).send(mapDepositRule(row));
   });
@@ -2360,16 +2367,18 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
       appliesToExemptPatients: z.boolean().optional(),
       sortOrder: z.coerce.number().int().min(0).optional(),
     }).parse(request.body);
-    const existing = await db.depositRule.findFirst({ where: { id: params.id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Deposit rule not found');
-    assertBranchAccess(request, existing.branchId ?? request.auth.branchId ?? existing.branchId ?? '');
-    const row = await db.depositRule.update({
-      where: { id: params.id },
-      data: {
-        ...body,
-        branchId: body.branchId ?? existing.branchId ?? undefined,
-      },
-      include: { branch: { select: { name: true } } },
+    const row = await runWithTenantContext(request.auth.tenantId, async tx => {
+      const existing = await tx.depositRule.findFirst({ where: { id: params.id, tenantId: request.auth.tenantId } });
+      if (!existing) throw app.httpErrors.notFound('Deposit rule not found');
+      assertBranchAccess(request, existing.branchId ?? request.auth.branchId ?? existing.branchId ?? '');
+      return tx.depositRule.update({
+        where: { id: params.id },
+        data: {
+          ...body,
+          branchId: body.branchId ?? existing.branchId ?? undefined,
+        },
+        include: { branch: { select: { name: true } } },
+      });
     });
     await audit(request, { action: 'depositRule.updated', resource: 'depositRule', resourceId: row.id, metadata: body });
     return reply.send(mapDepositRule(row));
@@ -2420,7 +2429,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
   app.get('/leaks', async request => {
     const query = listLimit.parse(request.query);
     const filter = branchFilter(request, query.branchId);
-    const rows = await db.revenueProtectionAlert.findMany({
+    const rows = await runWithTenantContext(request.auth.tenantId, tx => tx.revenueProtectionAlert.findMany({
       where: { tenantId: request.auth.tenantId, ...filter },
       orderBy: [{ severity: 'desc' }, { createdAt: 'desc' }],
       take: query.limit,
@@ -2429,7 +2438,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
         patient: { select: { firstName: true, lastName: true } },
         appointment: { select: { service: true } },
       },
-    });
+    }));
     return { revenueProtectionAlerts: rows.map(mapAlert) };
   });
 
@@ -2441,20 +2450,22 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
       taskTitle: z.string().max(240).optional(),
       taskPriority: z.string().max(40).optional(),
     }).parse(request.body);
-    const existing = await db.revenueProtectionAlert.findFirst({
-      where: { id: params.id, tenantId: request.auth.tenantId },
-      include: {
-        patient: { select: { firstName: true, lastName: true } },
-        appointment: { select: { service: true } },
-        branch: { select: { name: true } },
-      },
-    });
-    if (!existing) throw app.httpErrors.notFound('Revenue protection alert not found');
-    assertBranchAccess(request, existing.branchId);
-
-    const row = await db.revenueProtectionAlert.update({
-      where: { id: params.id },
-      data: { status: body.status },
+    const { existing, row } = await runWithTenantContext(request.auth.tenantId, async tx => {
+      const existing = await tx.revenueProtectionAlert.findFirst({
+        where: { id: params.id, tenantId: request.auth.tenantId },
+        include: {
+          patient: { select: { firstName: true, lastName: true } },
+          appointment: { select: { service: true } },
+          branch: { select: { name: true } },
+        },
+      });
+      if (!existing) throw app.httpErrors.notFound('Revenue protection alert not found');
+      assertBranchAccess(request, existing.branchId);
+      const row = await tx.revenueProtectionAlert.update({
+        where: { id: params.id },
+        data: { status: body.status },
+      });
+      return { existing, row };
     });
 
     let task = null;

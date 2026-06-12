@@ -5,6 +5,7 @@ import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { assertBranchAccess, branchScope } from '../../lib/scope';
 import { requireRoles } from '../../plugins/roles';
+import { runWithTenantContext } from '../../lib/tenantContext';
 
 const channel = z.enum(['WHATSAPP', 'SMS', 'EMAIL', 'PUSH', 'CALL', 'VIDEO']);
 const uuid = z.string().uuid();
@@ -350,14 +351,15 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     };
   });
 
+  // RLS (B-3): RevenueLeak is tenant-isolated — reads/writes run under context.
   app.get('/revenue-leaks', async request => {
     const query = listLimit.extend({ branchId: uuid.optional() }).parse(request.query);
-    return db.revenueLeak.findMany({
+    return runWithTenantContext(request.auth.tenantId, tx => tx.revenueLeak.findMany({
       where: { tenantId: request.auth.tenantId, branchId: scopedBranch(request, query.branchId) },
       take: query.limit,
       orderBy: { createdAt: 'desc' },
       include: { branch: { select: { name: true } }, ownerUser: { select: { displayName: true } }, patient: { select: { firstName: true, lastName: true } } },
-    });
+    }));
   });
 
   app.patch('/revenue-leaks/:id', { preHandler: writeRoles }, async request => {
@@ -366,10 +368,12 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
       status: z.string().min(2).max(40).optional(),
       workflowStatus: z.string().min(2).max(40).optional(),
     }).parse(request.body);
-    const existing = await db.revenueLeak.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Revenue leak not found');
-    if (existing.branchId) assertBranchAccess(request, existing.branchId);
-    const row = await db.revenueLeak.update({ where: { id }, data: input });
+    const row = await runWithTenantContext(request.auth.tenantId, async tx => {
+      const existing = await tx.revenueLeak.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+      if (!existing) throw app.httpErrors.notFound('Revenue leak not found');
+      if (existing.branchId) assertBranchAccess(request, existing.branchId);
+      return tx.revenueLeak.update({ where: { id }, data: input });
+    });
     await audit(request, { action: 'revenueLeak.workflowUpdated', resource: 'revenueLeak', resourceId: id, metadata: input });
     return row;
   });
