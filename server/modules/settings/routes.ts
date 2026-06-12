@@ -4,6 +4,7 @@ import { env } from '../../config/env';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { requireRoles } from '../../plugins/roles';
+import { runWithTenantContext } from '../../lib/tenantContext';
 
 const uuid = z.string().uuid();
 const writeRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
@@ -359,16 +360,21 @@ export const settingsRoutes: FastifyPluginAsync = async app => {
   });
   const templateUpdate = templateCreate.partial();
 
+  // RLS pilot: NotificationTemplate is tenant-isolated at the DB. All reads/
+  // writes run inside runWithTenantContext so app.current_tenant_id is set on
+  // the same connection (tx) the query uses.
   app.get('/notification-templates', async request => {
-    return db.notificationTemplate.findMany({
-      where: { tenantId: request.auth.tenantId },
-      orderBy: { createdAt: 'asc' },
-    });
+    return runWithTenantContext(request.auth.tenantId, tx =>
+      tx.notificationTemplate.findMany({
+        where: { tenantId: request.auth.tenantId },
+        orderBy: { createdAt: 'asc' },
+      }));
   });
 
   app.post('/notification-templates', { preHandler: writeRoles }, async (request, reply) => {
     const input = templateCreate.parse(request.body);
-    const row = await db.notificationTemplate.create({ data: { tenantId: request.auth.tenantId, ...input } });
+    const row = await runWithTenantContext(request.auth.tenantId, tx =>
+      tx.notificationTemplate.create({ data: { tenantId: request.auth.tenantId, ...input } }));
     await audit(request, { action: 'notificationTemplate.created', resource: 'notificationTemplate', resourceId: row.id });
     return reply.code(201).send(row);
   });
@@ -376,18 +382,22 @@ export const settingsRoutes: FastifyPluginAsync = async app => {
   app.patch('/notification-templates/:id', { preHandler: writeRoles }, async request => {
     const { id } = idParam.parse(request.params);
     const input = templateUpdate.parse(request.body);
-    const existing = await db.notificationTemplate.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Template not found');
-    const row = await db.notificationTemplate.update({ where: { id }, data: input });
+    const row = await runWithTenantContext(request.auth.tenantId, async tx => {
+      const existing = await tx.notificationTemplate.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+      if (!existing) throw app.httpErrors.notFound('Template not found');
+      return tx.notificationTemplate.update({ where: { id }, data: input });
+    });
     await audit(request, { action: 'notificationTemplate.updated', resource: 'notificationTemplate', resourceId: id });
     return row;
   });
 
   app.delete('/notification-templates/:id', { preHandler: writeRoles }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
-    const existing = await db.notificationTemplate.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Template not found');
-    await db.notificationTemplate.delete({ where: { id } });
+    await runWithTenantContext(request.auth.tenantId, async tx => {
+      const existing = await tx.notificationTemplate.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+      if (!existing) throw app.httpErrors.notFound('Template not found');
+      await tx.notificationTemplate.delete({ where: { id } });
+    });
     await audit(request, { action: 'notificationTemplate.deleted', resource: 'notificationTemplate', resourceId: id });
     return reply.code(204).send();
   });
@@ -400,16 +410,19 @@ export const settingsRoutes: FastifyPluginAsync = async app => {
   });
   const guardrailUpdate = guardrailCreate.partial();
 
+  // RLS pilot: AiGuardrail is tenant-isolated at the DB.
   app.get('/guardrails', async request => {
-    return db.aiGuardrail.findMany({
-      where: { tenantId: request.auth.tenantId },
-      orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
-    });
+    return runWithTenantContext(request.auth.tenantId, tx =>
+      tx.aiGuardrail.findMany({
+        where: { tenantId: request.auth.tenantId },
+        orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+      }));
   });
 
   app.post('/guardrails', { preHandler: writeRoles }, async (request, reply) => {
     const input = guardrailCreate.parse(request.body);
-    const row = await db.aiGuardrail.create({ data: { tenantId: request.auth.tenantId, ...input } });
+    const row = await runWithTenantContext(request.auth.tenantId, tx =>
+      tx.aiGuardrail.create({ data: { tenantId: request.auth.tenantId, ...input } }));
     await audit(request, { action: 'guardrail.created', resource: 'aiGuardrail', resourceId: row.id });
     return reply.code(201).send(row);
   });
@@ -417,18 +430,22 @@ export const settingsRoutes: FastifyPluginAsync = async app => {
   app.patch('/guardrails/:id', { preHandler: writeRoles }, async request => {
     const { id } = idParam.parse(request.params);
     const input = guardrailUpdate.parse(request.body);
-    const existing = await db.aiGuardrail.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Guardrail not found');
-    const row = await db.aiGuardrail.update({ where: { id }, data: input });
+    const row = await runWithTenantContext(request.auth.tenantId, async tx => {
+      const existing = await tx.aiGuardrail.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+      if (!existing) throw app.httpErrors.notFound('Guardrail not found');
+      return tx.aiGuardrail.update({ where: { id }, data: input });
+    });
     await audit(request, { action: 'guardrail.updated', resource: 'aiGuardrail', resourceId: id });
     return row;
   });
 
   app.delete('/guardrails/:id', { preHandler: writeRoles }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
-    const existing = await db.aiGuardrail.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Guardrail not found');
-    await db.aiGuardrail.delete({ where: { id } });
+    await runWithTenantContext(request.auth.tenantId, async tx => {
+      const existing = await tx.aiGuardrail.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+      if (!existing) throw app.httpErrors.notFound('Guardrail not found');
+      await tx.aiGuardrail.delete({ where: { id } });
+    });
     await audit(request, { action: 'guardrail.deleted', resource: 'aiGuardrail', resourceId: id });
     return reply.code(204).send();
   });
@@ -442,16 +459,19 @@ export const settingsRoutes: FastifyPluginAsync = async app => {
   });
   const preferenceUpdate = preferenceCreate.partial();
 
+  // RLS pilot: CustomerPreference is tenant-isolated at the DB.
   app.get('/preferences', async request => {
-    return db.customerPreference.findMany({
-      where: { tenantId: request.auth.tenantId },
-      orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
-    });
+    return runWithTenantContext(request.auth.tenantId, tx =>
+      tx.customerPreference.findMany({
+        where: { tenantId: request.auth.tenantId },
+        orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+      }));
   });
 
   app.post('/preferences', { preHandler: writeRoles }, async (request, reply) => {
     const input = preferenceCreate.parse(request.body);
-    const row = await db.customerPreference.create({ data: { tenantId: request.auth.tenantId, ...input } });
+    const row = await runWithTenantContext(request.auth.tenantId, tx =>
+      tx.customerPreference.create({ data: { tenantId: request.auth.tenantId, ...input } }));
     await audit(request, { action: 'preference.created', resource: 'customerPreference', resourceId: row.id });
     return reply.code(201).send(row);
   });
@@ -459,18 +479,22 @@ export const settingsRoutes: FastifyPluginAsync = async app => {
   app.patch('/preferences/:id', { preHandler: writeRoles }, async request => {
     const { id } = idParam.parse(request.params);
     const input = preferenceUpdate.parse(request.body);
-    const existing = await db.customerPreference.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Preference not found');
-    const row = await db.customerPreference.update({ where: { id }, data: input });
+    const row = await runWithTenantContext(request.auth.tenantId, async tx => {
+      const existing = await tx.customerPreference.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+      if (!existing) throw app.httpErrors.notFound('Preference not found');
+      return tx.customerPreference.update({ where: { id }, data: input });
+    });
     await audit(request, { action: 'preference.updated', resource: 'customerPreference', resourceId: id });
     return row;
   });
 
   app.delete('/preferences/:id', { preHandler: writeRoles }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
-    const existing = await db.customerPreference.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Preference not found');
-    await db.customerPreference.delete({ where: { id } });
+    await runWithTenantContext(request.auth.tenantId, async tx => {
+      const existing = await tx.customerPreference.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+      if (!existing) throw app.httpErrors.notFound('Preference not found');
+      await tx.customerPreference.delete({ where: { id } });
+    });
     await audit(request, { action: 'preference.deleted', resource: 'customerPreference', resourceId: id });
     return reply.code(204).send();
   });

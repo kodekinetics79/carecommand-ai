@@ -73,9 +73,11 @@ export default function Settings() {
       <PageHeader
         title="Settings"
         subtitle="Practice configuration, team access, automation, integrations, and security — all live."
-        badge="Admin"
+        badge="Control Panel"
         badgeColor="violet"
       />
+
+      <SettingsSummary />
 
       <div className="grid gap-4 lg:grid-cols-[220px_1fr] items-start">
         {/* Section nav */}
@@ -110,6 +112,57 @@ export default function Settings() {
         </div>
       </div>
     </div>
+  );
+}
+
+function SettingsSummary() {
+  const { data: overview } = useApiData<AdminOverview | null>('/v1/admin/overview', null);
+  const { data: integrations } = useApiData<IntegrationStatus[]>('/v1/integrations/status', []);
+  const { data: posture } = useApiData<SecurityPosture | null>('/v1/security/posture', null);
+
+  const connected = integrations.filter(item => item.configured).length;
+  const risky = integrations.filter(item => item.health !== 'healthy').length;
+  const activeBranches = overview?.summary.activeBranches ?? 0;
+  const securityChecks = posture
+    ? [posture.rbacEnabled, posture.auditLoggingEnabled, posture.rateLimitingEnabled, posture.csrf.enabled, posture.secrets.jwtSecretConfigured, posture.secrets.jwtRefreshSecretConfigured]
+    : [];
+  const passingSecurityChecks = securityChecks.filter(Boolean).length;
+
+  return (
+    <BentoCard title="Workspace Control Summary" subtitle="Live configuration, integration health, and security posture">
+      <div className="grid gap-3 xl:grid-cols-[1.3fr_0.9fr]">
+        <div className="grid gap-3 grid-cols-2 xl:grid-cols-4">
+          <StatCard title="Team Members" value={overview?.summary.totalUsers ?? '—'} subtitle={`${overview?.summary.activeUsers ?? 0} active`} icon={<Users className="w-4 h-4" />} accent="blue" />
+          <StatCard title="Connected" value={connected} subtitle={`${integrations.length} integrations`} icon={<Cable className="w-4 h-4" />} accent="emerald" />
+          <StatCard title="Security Checks" value={posture ? `${passingSecurityChecks}/${securityChecks.length}` : '—'} subtitle="Passing controls" icon={<ShieldCheck className="w-4 h-4" />} accent="violet" />
+          <StatCard title="Active Branches" value={activeBranches} subtitle={`${risky} integrations need attention`} icon={<Building2 className="w-4 h-4" />} accent="amber" />
+        </div>
+
+        <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
+          <div className="flex items-center justify-between gap-2 mb-3">
+            <div>
+              <p className="text-xs font-bold uppercase tracking-widest text-t3">Operational status</p>
+              <p className="text-sm font-semibold text-t1 mt-1">{overview?.tenant.name ?? 'Workspace'} · {overview?.tenant.slug ?? '—'}</p>
+            </div>
+            <span className="badge badge-emerald">{connected}/{integrations.length} live</span>
+          </div>
+          <div className="space-y-2.5">
+            <div className="flex items-center justify-between gap-3 text-xs">
+              <span className="text-t3">Integration health</span>
+              <span className="font-semibold text-t1">{risky === 0 ? 'All healthy' : `${risky} need attention`}</span>
+            </div>
+            <div className="flex items-center justify-between gap-3 text-xs">
+              <span className="text-t3">Security posture</span>
+              <span className="font-semibold text-t1">{posture?.authMode ?? 'Loading…'}</span>
+            </div>
+            <div className="flex items-center justify-between gap-3 text-xs">
+              <span className="text-t3">Tenant created</span>
+              <span className="font-semibold text-t1">{overview?.tenant.createdAt ? new Date(overview.tenant.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '—'}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </BentoCard>
   );
 }
 

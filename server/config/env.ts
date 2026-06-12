@@ -6,6 +6,10 @@ const envSchema = z.object({
   API_HOST: z.string().default('0.0.0.0'),
   API_PORT: z.coerce.number().int().positive().default(3001),
   DATABASE_URL: z.string().min(1),
+  // Optional owner/superuser connection for migrations + seed. When set, the
+  // runtime DATABASE_URL can be the restricted `app_rls` role while schema
+  // changes and seeding keep running as the owner. Falls back to DATABASE_URL.
+  DATABASE_MIGRATION_URL: z.string().optional(),
   REDIS_URL: z.string().url().default('redis://localhost:6379'),
   JWT_SECRET: z.string().min(32),
   JWT_REFRESH_SECRET: z.string().min(32),
@@ -45,6 +49,8 @@ const envSchema = z.object({
   META_APP_SECRET: z.string().optional(),
   DEV_TENANT_ID: z.string().uuid().default('11111111-1111-4111-8111-111111111111'),
   DEV_USER_ID: z.string().uuid().default('22222222-2222-4222-8222-222222222222'),
+  PUBLIC_API_URL: z.string().url().default('http://localhost:3001'),
+  RETELL_API_KEY: z.string().optional(),
 });
 
 export const env = envSchema.parse(process.env);

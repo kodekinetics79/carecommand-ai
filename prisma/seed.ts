@@ -10,8 +10,10 @@ const patientId = '44444444-4444-4444-8444-444444444444';
 const providerLoginEmail = 'sarah.mitchell@carecommand.local';
 const providerLoginPassword = 'Provider123!';
 
+// Seed runs as the owner/superuser (it must bypass RLS to write across tenants
+// and into RLS-enabled pilot tables). Prefer DATABASE_MIGRATION_URL when set.
 const db = new PrismaClient({
-  adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }),
+  adapter: new PrismaPg({ connectionString: process.env.DATABASE_MIGRATION_URL ?? process.env.DATABASE_URL }),
 });
 
 async function ensureClinicAccess(userId: string, branchId: string, isPrimary = false) {
@@ -1179,6 +1181,133 @@ for (const role of [
     where: { tenantId_name: { tenantId, name: role.name } },
     update: { description: role.description, accent: role.accent, sortOrder: role.sortOrder },
     create: { tenantId, ...role },
+  });
+}
+
+// ---- AI Receptionist Studio ------------------------------------------------
+const receptionistClinicId = '55555555-5555-4555-8555-555555555555';
+const receptionistLocationDowntownId = '55555555-5555-4555-8555-555555550001';
+const receptionistLocationUptownId = '55555555-5555-4555-8555-555555550002';
+const receptionistAgentId = '55555555-5555-4555-8555-555555550010';
+const receptionistCampaignId = '55555555-5555-4555-8555-555555550020';
+
+if (await db.receptionistClinic.count({ where: { id: receptionistClinicId } }) === 0) {
+  await db.receptionistClinic.create({
+    data: {
+      id: receptionistClinicId,
+      tenantId,
+      name: 'Brightsmile Dental Group',
+      phone: '+1 (415) 555-0142',
+      website: 'https://brightsmile.example.com',
+      addressLine: '500 Market Street, San Francisco, CA',
+      timezone: 'America/Los_Angeles',
+      defaultLanguage: 'en-US',
+      complianceDisclosure: 'Hi, this is Riley, the AI assistant calling on behalf of Brightsmile Dental Group.',
+      humanFallbackNumber: '+1 (415) 555-0100',
+      doNotContactPolicy: 'If the caller asks not to be contacted again, confirm warmly, apologize for the interruption, and mark them do-not-contact across all channels.',
+      workingHours: {
+        monday: '08:00-17:00', tuesday: '08:00-17:00', wednesday: '08:00-17:00',
+        thursday: '08:00-17:00', friday: '08:00-15:00', saturday: 'closed', sunday: 'closed',
+      },
+      active: true,
+    },
+  });
+
+  await db.receptionistLocation.createMany({
+    data: [
+      { id: receptionistLocationDowntownId, tenantId, clinicId: receptionistClinicId, name: 'Downtown Office', address: '500 Market Street, San Francisco, CA', phone: '+1 (415) 555-0142', timezone: 'America/Los_Angeles' },
+      { id: receptionistLocationUptownId, tenantId, clinicId: receptionistClinicId, name: 'Uptown Office', address: '2200 Fillmore Street, San Francisco, CA', phone: '+1 (415) 555-0188', timezone: 'America/Los_Angeles' },
+    ],
+  });
+
+  await db.receptionistAgent.create({
+    data: {
+      id: receptionistAgentId,
+      tenantId,
+      clinicId: receptionistClinicId,
+      name: 'Riley',
+      voice: '11labs-Adrian',
+      tone: 'Warm, upbeat, and concise',
+      language: 'en-US',
+      persona: 'You are friendly and efficient, you smile through the phone, and you never sound robotic or pushy.',
+      greetingOverride: 'Hi, this is Riley, the AI assistant calling on behalf of Brightsmile Dental Group.',
+      active: true,
+    },
+  });
+
+  await db.receptionistCampaign.create({
+    data: {
+      id: receptionistCampaignId,
+      tenantId,
+      clinicId: receptionistClinicId,
+      agentId: receptionistAgentId,
+      name: 'Spring Cleaning Reactivation',
+      campaignType: 'Reactivation',
+      status: 'ACTIVE',
+      offerTitle: 'Complimentary New-Patient Cleaning & Exam',
+      offerDescription: 'A no-cost cleaning, exam, and digital X-rays for patients who have not visited in over 12 months.',
+      offerScript: "We're reaching out because it's been a little while since your last visit, and we'd love to welcome you back with a complimentary cleaning, exam, and digital X-rays. It usually takes about 45 minutes. Would you like me to find a time that works for you?",
+      appointmentType: 'New-patient cleaning & exam',
+      bookingRules: {
+        leadTimeHours: 24,
+        slotDurationMinutes: 45,
+        maxPerDay: 6,
+        availableDays: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'],
+        hoursStart: '08:00',
+        hoursEnd: '16:30',
+        notes: 'Saturdays are reserved for emergencies only.',
+      },
+      eligibleLocationIds: [receptionistLocationDowntownId, receptionistLocationUptownId],
+      smsConfirmation: true,
+      emailConfirmation: true,
+    },
+  });
+
+  await db.receptionistIntakeField.createMany({
+    data: [
+      { tenantId, campaignId: receptionistCampaignId, fieldType: 'FIRST_NAME', label: 'First name', aiQuestion: 'Can I start with your first name?', required: true, confirmationRequired: false, sortOrder: 0, options: [] },
+      { tenantId, campaignId: receptionistCampaignId, fieldType: 'LAST_NAME', label: 'Last name', aiQuestion: 'And your last name?', required: true, confirmationRequired: false, sortOrder: 1, options: [] },
+      { tenantId, campaignId: receptionistCampaignId, fieldType: 'PHONE', label: 'Phone number', aiQuestion: 'What is the best phone number to reach you on?', validationRule: 'US phone number — read back to confirm', required: true, confirmationRequired: true, sortOrder: 2, options: [] },
+      { tenantId, campaignId: receptionistCampaignId, fieldType: 'EMAIL', label: 'Email', aiQuestion: 'What email should we send the confirmation to?', validationRule: 'email — read back to confirm', required: false, confirmationRequired: true, sortOrder: 3, options: [] },
+      { tenantId, campaignId: receptionistCampaignId, fieldType: 'PREFERRED_LOCATION', label: 'Preferred location', aiQuestion: 'Which office is more convenient — Downtown or Uptown?', required: true, confirmationRequired: false, sortOrder: 4, options: ['Downtown Office', 'Uptown Office'] },
+      { tenantId, campaignId: receptionistCampaignId, fieldType: 'PREFERRED_DATE', label: 'Preferred date', aiQuestion: 'What day works best for you this week or next?', required: true, confirmationRequired: false, sortOrder: 5, options: [] },
+      { tenantId, campaignId: receptionistCampaignId, fieldType: 'PREFERRED_TIME', label: 'Preferred time', aiQuestion: 'Do you prefer a morning or afternoon appointment?', required: true, confirmationRequired: false, sortOrder: 6, options: [] },
+      { tenantId, campaignId: receptionistCampaignId, fieldType: 'INSURANCE_PROVIDER', label: 'Insurance provider', aiQuestion: 'Do you have dental insurance, and if so, who is your provider?', validationRule: 'carrier name only — never policy numbers', required: false, confirmationRequired: false, sortOrder: 7, options: [] },
+      { tenantId, campaignId: receptionistCampaignId, fieldType: 'CONSENT', label: 'SMS/email consent', aiQuestion: 'Is it okay if we send you a reminder by text and email?', required: true, confirmationRequired: false, sortOrder: 8, options: [] },
+    ],
+  });
+
+  await db.receptionistCallLog.createMany({
+    data: [
+      { tenantId, clinicId: receptionistClinicId, campaignId: receptionistCampaignId, retellCallId: 'call_demo_001', callerName: 'Maria Gonzalez', callerPhone: '+14155550199', direction: 'outbound', outcome: 'BOOKED', durationSeconds: 184, sentiment: 'Positive', transcriptSummary: 'Patient was happy to return, booked a Tuesday morning cleaning at the Downtown office, consented to SMS reminders.', startedAt: new Date('2026-06-05T16:10:00Z'), endedAt: new Date('2026-06-05T16:13:04Z') },
+      { tenantId, clinicId: receptionistClinicId, campaignId: receptionistCampaignId, retellCallId: 'call_demo_002', callerName: 'Daniel Cho', callerPhone: '+14155550177', direction: 'outbound', outcome: 'NOT_INTERESTED', durationSeconds: 52, sentiment: 'Neutral', transcriptSummary: 'Patient recently moved away and declined politely. No follow-up requested.', startedAt: new Date('2026-06-05T16:20:00Z'), endedAt: new Date('2026-06-05T16:20:52Z') },
+      { tenantId, clinicId: receptionistClinicId, campaignId: receptionistCampaignId, retellCallId: 'call_demo_003', callerName: 'Priya Nair', callerPhone: '+14155550133', direction: 'outbound', outcome: 'ESCALATED', durationSeconds: 97, sentiment: 'Negative', transcriptSummary: 'Patient had a billing question beyond the offer; escalated to a human at the fallback number.', startedAt: new Date('2026-06-05T16:31:00Z'), endedAt: new Date('2026-06-05T16:32:37Z') },
+      { tenantId, clinicId: receptionistClinicId, campaignId: receptionistCampaignId, retellCallId: 'call_demo_004', callerName: 'James Becker', callerPhone: '+14155550144', direction: 'outbound', outcome: 'OPTED_OUT', durationSeconds: 28, sentiment: 'Neutral', transcriptSummary: 'Patient asked not to be contacted again; marked do-not-contact.', startedAt: new Date('2026-06-05T16:40:00Z'), endedAt: new Date('2026-06-05T16:40:28Z') },
+      { tenantId, clinicId: receptionistClinicId, campaignId: receptionistCampaignId, retellCallId: 'call_demo_005', callerName: 'Unknown', callerPhone: '+14155550155', direction: 'outbound', outcome: 'VOICEMAIL', durationSeconds: 19, sentiment: 'Neutral', transcriptSummary: 'Reached voicemail; left a short callback message.', startedAt: new Date('2026-06-05T16:48:00Z'), endedAt: new Date('2026-06-05T16:48:19Z') },
+    ],
+  });
+
+  await db.receptionistAppointmentRequest.create({
+    data: {
+      tenantId,
+      clinicId: receptionistClinicId,
+      campaignId: receptionistCampaignId,
+      locationId: receptionistLocationDowntownId,
+      contactName: 'Maria Gonzalez',
+      contactPhone: '+14155550199',
+      contactEmail: 'maria.g@example.com',
+      appointmentType: 'New-patient cleaning & exam',
+      requestedDate: '2026-06-09',
+      requestedTime: '09:30',
+      bookedSlot: 'Tue Jun 9, 9:30 AM — Downtown Office',
+      status: 'CONFIRMED',
+      collectedData: { first_name: 'Maria', last_name: 'Gonzalez', phone: '+14155550199', email: 'maria.g@example.com', preferred_location: 'Downtown Office', insurance_provider: 'Delta Dental', consent: true },
+      source: 'retell',
+    },
+  });
+
+  await db.receptionistOptOut.create({
+    data: { tenantId, clinicId: receptionistClinicId, contactPhone: '+14155550144', channel: 'ALL', reason: 'Requested during AI call' },
   });
 }
 

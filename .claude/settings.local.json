@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(lsof -ti:12000)"
+      "Bash(lsof -ti:12000)",
+      "Bash(npx prisma *)",
+      "Bash(npx tsx *)",
+      "Bash(npx eslint *)"
     ]
   }
 }

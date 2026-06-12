@@ -1,8 +1,8 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   ArrowRight, Mail, Sparkles, Users2, TrendingDown, Phone, MessageSquare, Globe, Zap,
-  Flame, ChevronRight, X, Trophy, GaugeCircle, Target, Layers,
+  Flame, ChevronRight, X, Trophy, GaugeCircle, Target, Layers, Clock,
 } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
@@ -10,12 +10,58 @@ import ProgressBar from '../components/ui/ProgressBar';
 import BentoCard from '../components/ui/BentoCard';
 import RiskBadge from '../components/ui/RiskBadge';
 import { leads, patients, campaigns } from '../data/seedData';
-import { formatCurrency } from '../utils/formatters';
+import { formatCurrency, formatDate, formatRelativeDate } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
-import { mapLead, mapPatient, type ApiLead, type ApiPatient } from '../lib/apiAdapters';
+import { mapLead, mapPatient, type ApiAppointment, type ApiLead, type ApiPatient } from '../lib/apiAdapters';
 import { apiRequest } from '../lib/api';
 
 type Lead = typeof leads[number];
+type ApiPatientDetail = Omit<ApiPatient, 'appointments' | 'consentEvents' | 'patientInsurancePolicies' | 'eligibilityVerifications' | 'priorAuthorizations'> & {
+  consentEvents?: Array<{ purpose: 'SMS' | 'WHATSAPP' | 'EMAIL' | 'MARKETING'; granted: boolean; occurredAt?: string | null }>;
+  appointments?: ApiAppointment[];
+  patientInsurancePolicies?: Array<{
+    id: string;
+    payerId?: string | null;
+    memberId: string;
+    groupNumber?: string | null;
+    payer?: { name: string } | null;
+    verificationStatus: string;
+    verifiedAt?: string | null;
+    active: boolean;
+  }>;
+  eligibilityVerifications?: Array<{
+    id: string;
+    appointmentId?: string | null;
+    payerId?: string | null;
+    payer?: { name: string } | null;
+    policy?: { memberId: string; groupNumber?: string | null } | null;
+    coverageStatus: string;
+    coverageActive: boolean;
+    planName: string;
+    copay: string;
+    deductibleRemaining: string;
+    coinsurance: string;
+    eligibilityMessage: string;
+    payerReference?: string | null;
+    checkedAt: string;
+    providerMode: string;
+    priorAuthRequired?: boolean;
+    recommendedAction?: string;
+    riskLevel?: 'LOW' | 'MEDIUM' | 'HIGH';
+    revenueAtRisk?: number;
+  }>;
+  priorAuthorizations?: Array<{ id: string; status: string; serviceName: string; notes?: string | null; dueAt?: string | null; payer?: { name: string } | null }>;
+  firstName: string;
+  lastName: string;
+};
+
+type CustomerTimelineItem = {
+  id: string;
+  date: string;
+  title: string;
+  detail: string;
+  kind: 'visit' | 'consent' | 'insurance' | 'authorization';
+};
 const stageOrder = ['new-inquiry', 'contacted', 'booked', 'visited', 'follow-up', 'retained'] as const;
 const stages = [...stageOrder, 'lost'] as const;
 type Stage = typeof stages[number];
@@ -65,12 +111,83 @@ function scoreLead(lead: Lead, maxValue: number): number {
 const tempOf = (score: number) => (score >= 70 ? 'hot' : score >= 45 ? 'warm' : 'cold');
 const tempBadge: Record<string, string> = { hot: 'badge badge-red', warm: 'badge badge-amber', cold: 'badge badge-blue' };
 
+function buildCustomerTimeline(row: ApiPatientDetail): CustomerTimelineItem[] {
+  const items: CustomerTimelineItem[] = [];
+
+  row.appointments?.forEach((appointment, index) => {
+    items.push({
+      id: `appt-${appointment.id}-${index}`,
+      date: appointment.startsAt,
+      title: appointment.service,
+      detail: `${appointment.status.replace('_', ' ').toLowerCase()} · ${appointment.channel.toLowerCase()} · ${formatCurrency(Number(appointment.value))}`,
+      kind: 'visit',
+    });
+  });
+
+  row.consentEvents?.forEach((event, index) => {
+    if (!event.occurredAt) return;
+    items.push({
+      id: `consent-${event.purpose}-${index}`,
+      date: event.occurredAt,
+      title: `${event.purpose} consent ${event.granted ? 'granted' : 'revoked'}`,
+      detail: event.granted ? 'Ready for outreach and campaign automation.' : 'Restricted from campaign outreach for this channel.',
+      kind: 'consent',
+    });
+  });
+
+  row.eligibilityVerifications?.forEach((verification, index) => {
+    items.push({
+      id: `elig-${verification.id}-${index}`,
+      date: verification.checkedAt,
+      title: `Eligibility ${verification.coverageStatus.toLowerCase()}`,
+      detail: `${verification.payer?.name ?? 'Unknown payer'} · ${formatCurrency(Number(verification.copay))} copay · ${verification.recommendedAction ?? verification.eligibilityMessage}`,
+      kind: 'insurance',
+    });
+  });
+
+  row.priorAuthorizations?.forEach((auth, index) => {
+    if (!auth.dueAt) return;
+    items.push({
+      id: `auth-${auth.id}-${index}`,
+      date: auth.dueAt,
+      title: `Prior auth ${auth.status.toLowerCase()}`,
+      detail: `${auth.serviceName} · ${auth.payer?.name ?? 'Unknown payer'}${auth.notes ? ` · ${auth.notes}` : ''}`,
+      kind: 'authorization',
+    });
+  });
+
+  return items.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+}
+
+function campaignReadinessLabel(patient: ReturnType<typeof mapPatient>, detail: ApiPatientDetail | null) {
+  const tags = detail?.tags ?? patient.tags;
+  const consentReady = patient.consentStatus.marketing || patient.consentStatus.whatsapp || patient.consentStatus.sms;
+  const readiness: string[] = [];
+  if (patient.preferredChannel) readiness.push(`${patient.preferredChannel.toUpperCase()}-first`);
+  if (consentReady) readiness.push('Consent ready');
+  if (patient.outstandingBalance > 0) readiness.push(`Collect ${formatCurrency(patient.outstandingBalance)} first`);
+  if (tags.length > 0) readiness.push(tags.slice(0, 3).join(' · '));
+  return readiness;
+}
+
+function Field({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="p-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)]">
+      <p className="text-[10px] font-bold uppercase tracking-widest text-t3">{label}</p>
+      <p className="text-sm font-semibold text-t1 mt-1 truncate">{value}</p>
+    </div>
+  );
+}
+
 export default function CRM() {
   const navigate = useNavigate();
   const [inactiveSegment, setInactiveSegment] = useState('60');
   const [searchQuery, setSearchQuery] = useState('');
   const [creatingCampaign, setCreatingCampaign] = useState(false);
   const [movingId, setMovingId] = useState<string | null>(null);
+  const [selectedCustomerId, setSelectedCustomerId] = useState<string | null>(null);
+  const [selectedCustomerDetail, setSelectedCustomerDetail] = useState<ApiPatientDetail | null>(null);
+  const [detailError, setDetailError] = useState<string | null>(null);
 
   const { data: leadRecords, source: leadSource, reload: reloadLeads } = useApiResource<ApiLead, Lead>('/v1/leads?limit=100', leads, mapLead);
   const { data: customerRecords } = useApiResource<ApiPatient, typeof patients[number]>('/v1/patients?limit=100', patients, mapPatient);
@@ -140,6 +257,25 @@ export default function CRM() {
     const q = searchQuery.toLowerCase();
     return customerRecords.filter(p => !q || p.name.toLowerCase().includes(q) || p.tags.some(t => t.includes(q)));
   }, [customerRecords, searchQuery]);
+  const currentSelectedCustomerId = selectedCustomerId ?? filteredPatients[0]?.id ?? null;
+
+  useEffect(() => {
+    if (!currentSelectedCustomerId) {
+      return;
+    }
+    let active = true;
+    apiRequest<ApiPatientDetail>(`/v1/patients/${currentSelectedCustomerId}`)
+      .then(row => {
+        if (!active) return;
+        setSelectedCustomerDetail(row);
+      })
+      .catch(err => {
+        if (!active) return;
+        setSelectedCustomerDetail(null);
+        setDetailError(err instanceof Error ? err.message : 'Unable to load customer record');
+      });
+    return () => { active = false; };
+  }, [currentSelectedCustomerId]);
 
   function exportSegment() {
     const rows = filteredPatients.map(p => [p.name, p.lifecycleStage, p.churnRisk, p.lifetimeValue, p.lastVisit]);
@@ -158,6 +294,31 @@ export default function CRM() {
     if (p.churnRisk >= 50) return 'Schedule retention touch';
     return 'Invite to loyalty programme';
   }
+
+  const selectedCustomer = useMemo(() => {
+    if (selectedCustomerDetail?.id === currentSelectedCustomerId) return mapPatient(selectedCustomerDetail);
+    return customerRecords.find(p => p.id === currentSelectedCustomerId) ?? null;
+  }, [currentSelectedCustomerId, customerRecords, selectedCustomerDetail]);
+
+  const selectedCustomerHistory = useMemo(() => {
+    if (!selectedCustomerDetail || selectedCustomerDetail.id !== currentSelectedCustomerId) return [];
+    return buildCustomerTimeline(selectedCustomerDetail);
+  }, [currentSelectedCustomerId, selectedCustomerDetail]);
+
+  const selectedCustomerCampaignSignals = useMemo(() => {
+    if (!selectedCustomer) return [];
+    return campaignReadinessLabel(selectedCustomer, selectedCustomerDetail);
+  }, [selectedCustomer, selectedCustomerDetail]);
+
+  const selectedInsurance = selectedCustomerDetail?.patientInsurancePolicies?.[0] ?? null;
+  const selectedLatestEligibility = selectedCustomerDetail?.eligibilityVerifications?.[0] ?? null;
+  const selectedLatestAuth = selectedCustomerDetail?.priorAuthorizations?.[0] ?? null;
+  const detailLoading = Boolean(currentSelectedCustomerId && (!selectedCustomerDetail || selectedCustomerDetail.id !== currentSelectedCustomerId) && !detailError);
+  const selectedAgeOfRecord = selectedCustomerHistory.length > 0
+    ? formatRelativeDate(selectedCustomerHistory[0].date)
+    : selectedCustomerDetail
+      ? formatRelativeDate(selectedCustomerDetail.lastVisitAt ?? selectedCustomerDetail.appointments?.[0]?.startsAt ?? new Date().toISOString())
+      : '—';
 
   return (
     <div className="space-y-6 pb-8">
@@ -243,7 +404,7 @@ export default function CRM() {
         </div>
       </BentoCard>
 
-      <div className="grid gap-4 xl:grid-cols-[1fr_380px]">
+      <div className="grid gap-4 xl:grid-cols-[1fr_420px]">
         {/* Left column */}
         <div className="space-y-4">
           {/* Priority leads (scored) */}
@@ -282,13 +443,19 @@ export default function CRM() {
               {filteredPatients.slice(0, 8).map(p => {
                 const lc = lifecycleConfig[p.lifecycleStage] || lifecycleConfig.active;
                 return (
-                  <div key={p.id} className="flex items-center gap-3 p-3 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all group">
-                    <button type="button" onClick={() => navigate(`/patients/${p.id}`)} className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-400 to-violet-500 flex items-center justify-center text-white text-[11px] font-bold shrink-0">
+                  <div
+                    key={p.id}
+                    onClick={() => { setDetailError(null); setSelectedCustomerId(p.id); }}
+                    role="button"
+                    tabIndex={0}
+                    className={`w-full flex items-center gap-3 p-3 rounded-xl border transition-all group text-left cursor-pointer ${currentSelectedCustomerId === p.id ? 'border-[var(--b2)] bg-[var(--blue-soft)]' : 'border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)]'}`}
+                  >
+                    <button type="button" onClick={event => { event.stopPropagation(); navigate(`/patients/${p.id}`); }} className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-400 to-violet-500 flex items-center justify-center text-white text-[11px] font-bold shrink-0">
                       {p.name.split(' ').map(n => n[0]).join('').slice(0, 2)}
                     </button>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
-                        <button type="button" onClick={() => navigate(`/patients/${p.id}`)} className="text-sm font-semibold text-t1 group-hover:text-indigo transition-colors truncate">{p.name}</button>
+                        <button type="button" onClick={event => { event.stopPropagation(); navigate(`/patients/${p.id}`); }} className="text-sm font-semibold text-t1 group-hover:text-indigo transition-colors truncate">{p.name}</button>
                         <span className={lc.badgeClass}>{lc.label}</span>
                       </div>
                       <p className="text-[11px] text-indigo font-medium mt-0.5">→ {nextBestAction(p)}</p>
@@ -297,7 +464,7 @@ export default function CRM() {
                     <div className="text-right shrink-0">
                       <RiskBadge level={p.churnRisk >= 70 ? 'high' : p.churnRisk >= 40 ? 'medium' : 'low'} label={`${p.churnRisk}%`} size="sm" />
                     </div>
-                    <button type="button" onClick={() => void createFollowUpTask(p.id)} className="shrink-0 inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1.5 rounded-lg hover:opacity-80 transition-colors">
+                    <button type="button" onClick={event => { event.stopPropagation(); void createFollowUpTask(p.id); }} className="shrink-0 inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1.5 rounded-lg hover:opacity-80 transition-colors">
                       <Sparkles className="w-3 h-3" /> Task
                     </button>
                   </div>
@@ -305,10 +472,100 @@ export default function CRM() {
               })}
             </div>
           </BentoCard>
+
+          <BentoCard title="Customer Record" subtitle="Full history from day one · campaign-ready profile" headerRight={<Users2 className="w-4 h-4 text-t3" />}>
+            {!selectedCustomer ? (
+              <p className="text-xs text-t3 py-4 text-center">Select a customer to load their record.</p>
+            ) : detailLoading ? (
+              <p className="text-xs text-t3 py-4 text-center">Loading customer history…</p>
+            ) : detailError ? (
+              <div className="rounded-xl border border-[var(--b1)] bg-[var(--red-soft)] p-3 text-xs text-red-v">{detailError}</div>
+            ) : (
+              <div className="space-y-3">
+                <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <p className="text-lg font-bold text-t1">{selectedCustomer.name}</p>
+                        <span className={lifecycleConfig[selectedCustomer.lifecycleStage]?.badgeClass ?? lifecycleConfig.active.badgeClass}>{lifecycleConfig[selectedCustomer.lifecycleStage]?.label ?? 'Active'}</span>
+                      </div>
+                      <p className="text-[11px] text-t3 mt-1">Record age {selectedAgeOfRecord} · {selectedCustomer.visitCount} visits · last visit {selectedCustomer.lastVisit}</p>
+                    </div>
+                    <RiskBadge level={selectedCustomer.churnRisk >= 70 ? 'high' : selectedCustomer.churnRisk >= 40 ? 'medium' : 'low'} label={`${selectedCustomer.churnRisk}%`} size="sm" />
+                  </div>
+                <div className="grid grid-cols-2 gap-2 mt-3">
+                  <Field label="Preferred channel" value={selectedCustomer.preferredChannel.toUpperCase()} />
+                  <Field label="LTV" value={formatCurrency(selectedCustomer.lifetimeValue)} />
+                  <Field label="Outstanding" value={selectedCustomer.outstandingBalance > 0 ? formatCurrency(selectedCustomer.outstandingBalance) : 'Clear'} />
+                  <Field label="Marketing consent" value={selectedCustomer.consentStatus.marketing ? 'Ready' : 'Restricted'} />
+                </div>
+              </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <Field label="Primary tags" value={selectedCustomer.tags.length > 0 ? selectedCustomer.tags.slice(0, 4).map(tag => tag.replace('-', ' ')).join(' · ') : '—'} />
+                  <Field label="Campaign window" value={selectedCustomer.nextVisit ? `Next visit ${formatDate(selectedCustomer.nextVisit)}` : 'Open for outreach'} />
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <Field label="Payer" value={selectedInsurance?.payer?.name ?? selectedLatestEligibility?.payer?.name ?? '—'} />
+                  <Field label="Member ID" value={selectedInsurance?.memberId ?? selectedLatestEligibility?.policy?.memberId ?? '—'} />
+                  <Field label="Coverage" value={selectedLatestEligibility?.coverageStatus ?? selectedInsurance?.verificationStatus ?? 'Not verified'} />
+                  <Field label="Prior auth" value={selectedLatestAuth?.status ?? 'None'} />
+                </div>
+
+                <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-t3 mb-2">Campaign-ready signals</p>
+                  <div className="flex flex-wrap gap-2">
+                    {selectedCustomerCampaignSignals.map(signal => (
+                      <span key={signal} className="badge badge-blue">{signal}</span>
+                    ))}
+                    {selectedCustomerCampaignSignals.length === 0 && <span className="text-xs text-t3">No campaign signals yet.</span>}
+                  </div>
+                </div>
+
+                <div className="grid gap-2 sm:grid-cols-3">
+                  <button type="button" onClick={() => void createFollowUpTask(selectedCustomer.id)} className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-[var(--indigo-soft)] px-3 py-2 text-xs font-semibold text-indigo hover:bg-[var(--s3)] transition">
+                    <Sparkles className="w-3.5 h-3.5" /> Create task
+                  </button>
+                  <button type="button" onClick={() => navigate(`/patients/${selectedCustomer.id}`)} className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition">
+                    Open profile
+                  </button>
+                  <button type="button" disabled={creatingCampaign} onClick={() => void createCampaign(`${selectedCustomer.name} retention`, `Retain ${selectedCustomer.name} using ${selectedCustomer.preferredChannel} and ${selectedCustomer.tags.slice(0, 3).join(', ') || 'personalised outreach'}`, selectedCustomer.preferredChannel === 'whatsapp' ? ['WHATSAPP', 'EMAIL'] : ['EMAIL', 'SMS'])} className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-40">
+                    <Zap className="w-3.5 h-3.5" /> {creatingCampaign ? 'Creating…' : 'Launch campaign'}
+                  </button>
+                </div>
+              </div>
+            )}
+          </BentoCard>
         </div>
 
         {/* Right sidebar */}
         <div className="space-y-4">
+          <BentoCard title="Customer History" subtitle="Chronological activity from day one" headerRight={<Clock className="w-4 h-4 text-t3" />}>
+            {detailLoading ? (
+              <p className="text-xs text-t3 py-4 text-center">Loading history…</p>
+            ) : selectedCustomerHistory.length > 0 ? (
+              <div className="space-y-3">
+                {selectedCustomerHistory.map(item => (
+                  <div key={item.id} className="flex items-start gap-3 p-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)]">
+                    <div className={`w-7 h-7 rounded-full flex items-center justify-center shrink-0 ${item.kind === 'visit' ? 'bg-[var(--indigo-soft)]' : item.kind === 'insurance' ? 'bg-[var(--emerald-soft)]' : item.kind === 'authorization' ? 'bg-[var(--amber-soft)]' : 'bg-[var(--violet-soft)]'}`}>
+                      <Clock className="w-3.5 h-3.5 text-t2" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <p className="text-xs font-semibold text-t1">{item.title}</p>
+                        <span className="text-[10px] text-t3">{formatDate(item.date)}</span>
+                      </div>
+                      <p className="text-[11px] text-t3 mt-0.5">{item.detail}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-xs text-t3 py-4 text-center">No customer history yet.</p>
+            )}
+          </BentoCard>
+
           {/* Conversion funnel */}
           <BentoCard title="Conversion Funnel" subtitle="Where leads progress & drop off" headerRight={<GaugeCircle className="w-4 h-4 text-violet-v" />}>
             <div className="space-y-2.5">

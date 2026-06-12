@@ -142,6 +142,14 @@ model Tenant {
   customerPreferences CustomerPreference[]
   roleDefinitions RoleDefinition[]
   userClinicAccesses UserClinicAccess[]
+  receptionistClinics ReceptionistClinic[]
+  receptionistLocations ReceptionistLocation[]
+  receptionistAgents ReceptionistAgent[]
+  receptionistCampaigns ReceptionistCampaign[]
+  receptionistIntakeFields ReceptionistIntakeField[]
+  receptionistAppointmentRequests ReceptionistAppointmentRequest[]
+  receptionistCallLogs ReceptionistCallLog[]
+  receptionistOptOuts ReceptionistOptOut[]
 }
 
 model User {
@@ -1136,4 +1144,264 @@ model UserClinicAccess {
   @@unique([tenantId, userId, branchId])
   @@index([tenantId, userId, isPrimary])
   @@index([tenantId, branchId])
+}
+
+// ===========================================================================
+// AI Receptionist Studio
+// Configurable, multi-tenant voice-agent engine. Each clinic configures its
+// own profile, locations, agents, campaigns, and intake flow; the prompt
+// service composes a RetellAI-ready system prompt from these records.
+// ===========================================================================
+
+enum ReceptionistFieldType {
+  FIRST_NAME
+  LAST_NAME
+  PHONE
+  EMAIL
+  PREFERRED_DATE
+  PREFERRED_TIME
+  PREFERRED_LOCATION
+  PATIENT_STATUS
+  INSURANCE_PROVIDER
+  REASON_FOR_VISIT
+  PREFERRED_PROVIDER
+  LANGUAGE_PREFERENCE
+  CONSENT
+  CUSTOM_TEXT
+  CUSTOM_DROPDOWN
+  CUSTOM_YES_NO
+}
+
+enum ReceptionistCampaignStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  ARCHIVED
+}
+
+enum ReceptionistCallOutcome {
+  IN_PROGRESS
+  BOOKED
+  NOT_INTERESTED
+  NO_ANSWER
+  VOICEMAIL
+  ESCALATED
+  OPTED_OUT
+  FAILED
+}
+
+enum ReceptionistRequestStatus {
+  PENDING
+  CONFIRMED
+  CANCELED
+  COMPLETED
+  NO_SLOTS
+}
+
+enum ReceptionistOptOutChannel {
+  VOICE
+  SMS
+  EMAIL
+  ALL
+}
+
+model ReceptionistClinic {
+  id                   String   @id @default(uuid()) @db.Uuid
+  tenantId             String   @db.Uuid
+  name                 String
+  logoUrl              String?
+  phone                String
+  website              String?
+  addressLine          String?
+  timezone             String   @default("America/New_York")
+  defaultLanguage      String   @default("en-US")
+  complianceDisclosure String   @default("Hi, this is your AI assistant calling on behalf of the clinic.")
+  humanFallbackNumber  String?
+  doNotContactPolicy   String   @default("If the person asks not to be contacted again, confirm politely and mark them do-not-contact.")
+  workingHours         Json?
+  active               Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  tenant               Tenant                          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  locations            ReceptionistLocation[]
+  agents               ReceptionistAgent[]
+  campaigns            ReceptionistCampaign[]
+  appointmentRequests  ReceptionistAppointmentRequest[]
+  callLogs             ReceptionistCallLog[]
+  optOuts              ReceptionistOptOut[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId, active])
+}
+
+model ReceptionistLocation {
+  id           String   @id @default(uuid()) @db.Uuid
+  tenantId     String   @db.Uuid
+  clinicId     String   @db.Uuid
+  name         String
+  address      String
+  phone        String?
+  timezone     String?
+  workingHours Json?
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  tenant       Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clinic       ReceptionistClinic @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, clinicId, active])
+}
+
+model ReceptionistAgent {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  clinicId        String   @db.Uuid
+  name            String
+  voice           String   @default("11labs-Adrian")
+  tone            String   @default("Warm and professional")
+  language        String   @default("en-US")
+  persona         String?
+  greetingOverride String?
+  active          Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  tenant          Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clinic          ReceptionistClinic     @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  campaigns       ReceptionistCampaign[]
+
+  @@index([tenantId, clinicId, active])
+}
+
+model ReceptionistCampaign {
+  id                String                     @id @default(uuid()) @db.Uuid
+  tenantId          String                     @db.Uuid
+  clinicId          String                     @db.Uuid
+  agentId           String?                    @db.Uuid
+  name              String
+  campaignType      String                     @default("Reactivation")
+  status            ReceptionistCampaignStatus @default(DRAFT)
+  offerTitle        String
+  offerDescription  String
+  offerScript       String
+  appointmentType   String
+  bookingRules      Json?
+  eligibleLocationIds String[]                 @db.Uuid
+  smsConfirmation   Boolean                    @default(true)
+  emailConfirmation Boolean                    @default(false)
+  createdAt         DateTime                   @default(now())
+  updatedAt         DateTime                   @updatedAt
+  tenant            Tenant                          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clinic            ReceptionistClinic              @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  agent             ReceptionistAgent?              @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  intakeFields      ReceptionistIntakeField[]
+  appointmentRequests ReceptionistAppointmentRequest[]
+  callLogs          ReceptionistCallLog[]
+
+  @@index([tenantId, clinicId, status])
+}
+
+model ReceptionistIntakeField {
+  id                   String                @id @default(uuid()) @db.Uuid
+  tenantId             String                @db.Uuid
+  campaignId           String                @db.Uuid
+  fieldType            ReceptionistFieldType
+  label                String
+  aiQuestion           String
+  validationRule       String?
+  placeholder          String?
+  options              String[]
+  required             Boolean               @default(true)
+  confirmationRequired Boolean               @default(false)
+  sortOrder            Int                   @default(0)
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+  tenant               Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  campaign             ReceptionistCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@index([campaignId, sortOrder])
+}
+
+model ReceptionistAppointmentRequest {
+  id              String                    @id @default(uuid()) @db.Uuid
+  tenantId        String                    @db.Uuid
+  clinicId        String?                   @db.Uuid
+  campaignId      String?                   @db.Uuid
+  locationId      String?                   @db.Uuid
+  contactName     String?
+  contactPhone    String?
+  contactEmail    String?
+  appointmentType String?
+  requestedDate   String?
+  requestedTime   String?
+  bookedSlot      String?
+  status          ReceptionistRequestStatus @default(PENDING)
+  collectedData   Json?
+  notes           String?
+  source          String                    @default("retell")
+  createdAt       DateTime                  @default(now())
+  updatedAt       DateTime                  @updatedAt
+  tenant          Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clinic          ReceptionistClinic?   @relation(fields: [clinicId], references: [id], onDelete: SetNull)
+  campaign        ReceptionistCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, status, createdAt])
+}
+
+model ReceptionistCallLog {
+  id                String                  @id @default(uuid()) @db.Uuid
+  tenantId          String                  @db.Uuid
+  clinicId          String?                 @db.Uuid
+  campaignId        String?                 @db.Uuid
+  retellCallId      String?
+  callerName        String?
+  callerPhone       String?
+  direction         String                  @default("outbound")
+  outcome           ReceptionistCallOutcome @default(IN_PROGRESS)
+  durationSeconds   Int                     @default(0)
+  recordingUrl      String?
+  transcriptSummary String?
+  sentiment         String?
+  startedAt         DateTime?
+  endedAt           DateTime?
+  createdAt         DateTime                @default(now())
+  updatedAt         DateTime                @updatedAt
+  tenant            Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clinic            ReceptionistClinic?   @relation(fields: [clinicId], references: [id], onDelete: SetNull)
+  campaign          ReceptionistCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, outcome, createdAt])
+}
+
+model ReceptionistOptOut {
+  id           String                    @id @default(uuid()) @db.Uuid
+  tenantId     String                    @db.Uuid
+  clinicId     String?                   @db.Uuid
+  contactPhone String?
+  contactEmail String?
+  channel      ReceptionistOptOutChannel @default(ALL)
+  reason       String?
+  createdAt    DateTime                  @default(now())
+  tenant       Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clinic       ReceptionistClinic? @relation(fields: [clinicId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, createdAt])
+}
+
+// ===========================================================================
+// Idempotency
+// DB-backed idempotency guard for payment creation and inbound webhooks.
+// A successful claim inserts a unique (scope,key); redelivery hits the unique
+// constraint and is treated as already-processed. resultId lets callers return
+// the original result on replay.
+// ===========================================================================
+model IdempotencyKey {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String?  @db.Uuid
+  scope     String
+  key       String
+  resultId  String?
+  createdAt DateTime @default(now())
+
+  @@unique([scope, key])
+  @@index([tenantId, scope])
 }

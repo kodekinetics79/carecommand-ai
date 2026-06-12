@@ -2,7 +2,7 @@ import { useLocation, Link, useNavigate } from 'react-router-dom';
 import {
   LayoutDashboard, Radar, Users2, Megaphone, TrendingUp,
   CalendarDays, ClipboardList, Puzzle, Settings,
-  Star, ChevronDown, Hexagon, Orbit, Target, UserCircle2, ShieldCheck, Sparkles, BadgeCheck,
+  Star, ChevronDown, Hexagon, Orbit, Target, UserCircle2, ShieldCheck, Sparkles, BadgeCheck, Bot,
 } from 'lucide-react';
 import { useSession } from '../../hooks/useSession';
 
@@ -33,6 +33,7 @@ const nav: NavSection[] = [
     label: 'Growth',
     items: [
       { label: 'CRM',          path: '/crm',             icon: Users2 },
+      { label: 'Receptionist Studio', path: '/receptionist-studio', icon: Bot, badge: 'New', badgeColor: 'indigo' },
       { label: 'Campaigner',   path: '/campaigner',      icon: Megaphone },
       { label: 'Autopilot',    path: '/autopilot',       icon: Orbit, live: true },
       { label: 'Reviews',      path: '/reviews',         icon: Star },

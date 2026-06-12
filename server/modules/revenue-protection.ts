@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { env } from '../config/env';
 import { db } from '../lib/db';
@@ -7,6 +7,50 @@ import { audit } from '../lib/audit';
 import { assertBranchAccess } from '../lib/scope';
 import { requireRoles } from '../plugins/roles';
 import type { Prisma } from '../generated/prisma/client';
+
+// --- Idempotency -----------------------------------------------------------
+// Claims a unique (scope,key). Returns claimed=false on redelivery, exposing
+// the original resultId so callers can return the first result instead of
+// creating a duplicate record.
+async function claimIdempotency(scope: string, key: string, tenantId?: string): Promise<{ claimed: boolean; resultId: string | null }> {
+  try {
+    await db.idempotencyKey.create({ data: { scope, key, tenantId } });
+    return { claimed: true, resultId: null };
+  } catch (error) {
+    if ((error as { code?: string }).code === 'P2002') {
+      const existing = await db.idempotencyKey.findUnique({ where: { scope_key: { scope, key } } });
+      return { claimed: false, resultId: existing?.resultId ?? null };
+    }
+    throw error;
+  }
+}
+
+async function recordIdempotencyResult(scope: string, key: string, resultId: string) {
+  await db.idempotencyKey.updateMany({ where: { scope, key }, data: { resultId } });
+}
+
+// --- Stripe signature verification (no SDK; manual HMAC per Stripe spec) ----
+const STRIPE_SIGNATURE_TOLERANCE_SECONDS = 5 * 60;
+
+function verifyStripeSignature(rawBody: Buffer | undefined, signatureHeader: string | undefined, secret: string): boolean {
+  if (!rawBody || !signatureHeader) return false;
+  const parts = signatureHeader.split(',').reduce<Record<string, string>>((acc, part) => {
+    const [name, value] = part.split('=');
+    if (name && value) acc[name.trim()] = value.trim();
+    return acc;
+  }, {});
+  const timestamp = parts.t;
+  const signature = parts.v1;
+  if (!timestamp || !signature) return false;
+  // Reject replays outside the tolerance window.
+  const age = Math.abs(Date.now() / 1000 - Number(timestamp));
+  if (!Number.isFinite(age) || age > STRIPE_SIGNATURE_TOLERANCE_SECONDS) return false;
+  const expected = createHmac('sha256', secret).update(`${timestamp}.${rawBody.toString('utf8')}`).digest('hex');
+  const expectedBuffer = Buffer.from(expected);
+  const signatureBuffer = Buffer.from(signature);
+  if (expectedBuffer.length !== signatureBuffer.length) return false;
+  return timingSafeEqual(expectedBuffer, signatureBuffer);
+}
 
 type ProviderMode = 'mock' | 'sandbox' | 'live';
 type EligibilityPayload = {
@@ -1916,6 +1960,33 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
       throw app.httpErrors.badRequest('A patient or appointment context is required');
     }
 
+    // Optional client idempotency: replays with the same Idempotency-Key return
+    // the original payment request instead of creating a duplicate (and a
+    // duplicate provider charge).
+    const idempotencyHeader = typeof request.headers['idempotency-key'] === 'string' ? request.headers['idempotency-key'].trim() : '';
+    const idempotencyScope = 'payment.request';
+    const idempotencyKey = idempotencyHeader ? `${request.auth.tenantId}:${idempotencyHeader}` : '';
+    if (idempotencyKey) {
+      const claim = await claimIdempotency(idempotencyScope, idempotencyKey, request.auth.tenantId);
+      if (!claim.claimed) {
+        if (claim.resultId) {
+          const existing = await db.paymentRequest.findFirst({
+            where: { id: claim.resultId, tenantId: request.auth.tenantId },
+            include: {
+              branch: { select: { name: true } },
+              patient: { select: { firstName: true, lastName: true } },
+              appointment: { select: { service: true } },
+              depositRequirements: { select: { id: true }, take: 1 },
+            },
+          });
+          if (existing) {
+            return reply.code(200).send({ ...mapPaymentRequest(existing), depositRequirementId: existing.depositRequirements[0]?.id ?? null });
+          }
+        }
+        throw app.httpErrors.conflict('A payment request for this idempotency key is already being processed');
+      }
+    }
+
     const entities = await resolveBranchIdAndEntities(request, { tenantId: request.auth.tenantId, branchId: request.auth.branchId ?? undefined }, body);
     if (body.patientId && !entities.patient) throw app.httpErrors.notFound('Patient not found');
     if (body.appointmentId && !entities.appointment) throw app.httpErrors.notFound('Appointment not found');
@@ -2003,6 +2074,10 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
         },
       },
     });
+
+    if (idempotencyKey) {
+      await recordIdempotencyResult(idempotencyScope, idempotencyKey, requestRow.id);
+    }
 
     await audit(request, {
       action: 'payment.request.created',
@@ -2202,22 +2277,9 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     });
   });
 
-  app.post('/webhooks/stripe', { preHandler: adminRoles }, async request => {
-    await db.integrationRunLog.create({
-      data: {
-        tenantId: request.auth.tenantId,
-        branchId: request.auth.branchId ?? undefined,
-        provider: 'stripe',
-        providerMode: env.STRIPE_SECRET_KEY ? (env.STRIPE_SECRET_KEY.startsWith('sk_test_') ? 'sandbox' : 'live') : 'mock',
-        operation: 'webhook.placeholder',
-        status: 'received',
-        requestSummary: {
-          note: 'Stripe webhook placeholder endpoint; real signature verification can be added later.',
-        },
-      },
-    });
-    return { ok: true };
-  });
+  // Stripe webhook moved to the public, signature-verified plugin
+  // `revenueProtectionWebhookRoutes` (registered outside the authenticated
+  // scope, since Stripe cannot present a JWT).
 
   app.get('/deposit-rules', async request => {
     const query = listLimit.parse(request.query);
@@ -2419,5 +2481,92 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
       status: row.status,
       taskId: task?.id ?? null,
     });
+  });
+};
+
+// ===========================================================================
+// Public Stripe webhook (no JWT — Stripe cannot present one).
+// Verifies the Stripe signature over the raw body, is idempotent on the Stripe
+// event id, and never double-records a payment transaction on redelivery.
+// ===========================================================================
+export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
+  app.post('/webhooks/stripe', async (request, reply) => {
+    const secret = env.STRIPE_WEBHOOK_SECRET;
+    const signatureRaw = request.headers['stripe-signature'];
+    const signatureHeader = Array.isArray(signatureRaw) ? signatureRaw[0] : signatureRaw;
+
+    if (secret) {
+      if (!verifyStripeSignature(request.rawBody, signatureHeader, secret)) {
+        request.log.warn({ ip: request.ip }, 'Stripe webhook signature verification failed');
+        return reply.code(400).send({ error: 'INVALID_SIGNATURE' });
+      }
+    } else if (env.NODE_ENV === 'production') {
+      // Never accept unsigned payment webhooks in production.
+      request.log.error('Stripe webhook rejected: STRIPE_WEBHOOK_SECRET not configured in production');
+      return reply.code(503).send({ error: 'WEBHOOK_NOT_CONFIGURED' });
+    } else {
+      request.log.warn('Stripe webhook accepted WITHOUT verification (non-production; set STRIPE_WEBHOOK_SECRET to enforce)');
+    }
+
+    const event = z.object({
+      id: z.string(),
+      type: z.string(),
+      data: z.object({ object: z.record(z.string(), z.unknown()).optional() }).partial().optional(),
+    }).partial().parse(request.body ?? {});
+    if (!event.id || !event.type) return reply.code(400).send({ error: 'INVALID_EVENT' });
+
+    // Idempotent on the Stripe event id: redelivery is acknowledged, not reprocessed.
+    const claim = await claimIdempotency('stripe.webhook', event.id);
+    if (!claim.claimed) return reply.code(200).send({ received: true, duplicate: true });
+
+    const object = (event.data?.object ?? {}) as Record<string, unknown>;
+    const candidates = [object.id, object.payment_intent, object.client_reference_id].filter(
+      (value): value is string => typeof value === 'string',
+    );
+    if (candidates.length === 0) return reply.code(200).send({ received: true });
+
+    const paymentRequest = await db.paymentRequest.findFirst({ where: { providerReference: { in: candidates } } });
+    if (!paymentRequest) {
+      request.log.info({ eventId: event.id, type: event.type }, 'Stripe webhook: no matching payment request');
+      return reply.code(200).send({ received: true });
+    }
+
+    const succeeded = ['checkout.session.completed', 'payment_intent.succeeded', 'charge.succeeded'].includes(event.type)
+      || object.payment_status === 'paid';
+    if (succeeded) {
+      await db.$transaction([
+        db.paymentTransaction.create({
+          data: {
+            tenantId: paymentRequest.tenantId,
+            branchId: paymentRequest.branchId,
+            patientId: paymentRequest.patientId ?? undefined,
+            appointmentId: paymentRequest.appointmentId ?? undefined,
+            paymentRequestId: paymentRequest.id,
+            amount: paymentRequest.amount,
+            currency: paymentRequest.currency,
+            status: 'succeeded',
+            mode: paymentRequest.mode,
+            providerReference: typeof object.id === 'string' ? object.id : paymentRequest.providerReference ?? undefined,
+            receivedAt: new Date(),
+            rawResponse: { eventId: event.id, type: event.type, source: 'stripe-webhook' },
+          },
+        }),
+        db.paymentRequest.update({ where: { id: paymentRequest.id }, data: { status: 'collected' } }),
+        db.integrationRunLog.create({
+          data: {
+            tenantId: paymentRequest.tenantId,
+            branchId: paymentRequest.branchId,
+            provider: 'stripe',
+            providerMode: paymentRequest.mode,
+            operation: 'webhook.payment',
+            status: 'success',
+            requestSummary: { eventId: event.id, type: event.type },
+            responseSummary: { paymentRequestId: paymentRequest.id },
+          },
+        }),
+      ]);
+    }
+
+    return reply.code(200).send({ received: true });
   });
 };
