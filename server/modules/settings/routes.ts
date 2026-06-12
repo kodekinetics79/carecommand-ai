@@ -5,6 +5,7 @@ import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { requireRoles } from '../../plugins/roles';
 import { runWithTenantContext } from '../../lib/tenantContext';
+import { assertRoleChangeSafe, assertDeactivateSafe } from '../../lib/adminSafety';
 
 const uuid = z.string().uuid();
 const writeRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
@@ -40,6 +41,16 @@ const ROLE_ACCESS: Record<string, { scope: string; modules: string[] }> = {
   Analyst: {
     scope: 'Tenant-wide, read-only',
     modules: ['Dashboard', 'Advisory Room', 'Revenue', 'Patients', 'Scheduling', 'Staff', 'Settings'],
+  },
+  // Descriptive module guidance only (RoleDefinition is not the enforcement
+  // layer). Actual access is enforced by route role checks in the compliance module.
+  'Compliance Officer': {
+    scope: 'Compliance module',
+    modules: ['Compliance Readiness: manage', 'Evidence Vault: manage', 'Risks/Vendors/Incidents: manage', 'Reports/Audit Logs: view'],
+  },
+  Auditor: {
+    scope: 'Compliance module, read-only',
+    modules: ['Compliance Readiness: view', 'Evidence Vault: view', 'Reports/Audit Logs: view'],
   },
 };
 
@@ -510,6 +521,8 @@ export const settingsRoutes: FastifyPluginAsync = async app => {
     'Front Desk': 'FRONT_DESK',
     Admin: 'ADMIN',
     Analyst: 'ANALYST',
+    'Compliance Officer': 'COMPLIANCE_OFFICER',
+    Auditor: 'AUDITOR',
   };
   const roleCreate = z.object({
     name: z.string().trim().min(2).max(80),
@@ -663,6 +676,7 @@ export const adminRoutes: FastifyPluginAsync = async app => {
     const input = statusBody.parse(request.body);
     const existing = await db.user.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!existing) throw app.httpErrors.notFound('User not found');
+    if (!input.active) await assertDeactivateSafe(request, existing);
     const updated = await db.user.update({
       where: { id },
       data: {
@@ -687,6 +701,7 @@ export const adminRoutes: FastifyPluginAsync = async app => {
     const input = roleBody.parse(request.body);
     const existing = await db.user.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!existing) throw app.httpErrors.notFound('User not found');
+    await assertRoleChangeSafe(request, existing, input.role);
     const updated = await db.user.update({ where: { id }, data: { role: input.role } });
     await audit(request, {
       action: 'admin.user.roleChanged',

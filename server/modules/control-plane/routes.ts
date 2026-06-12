@@ -5,6 +5,7 @@ import { env } from '../../config/env';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { requireRoles } from '../../plugins/roles';
+import { assertRoleChangeSafe, assertDeactivateSafe } from '../../lib/adminSafety';
 
 const ownerAdminRoles = requireRoles('OWNER', 'ADMIN');
 const uuid = z.string().uuid();
@@ -50,6 +51,20 @@ const rolePermissionMatrix: Array<{ role: string; scope: string; modules: string
     role: 'ANALYST',
     scope: 'Tenant-wide, read-only',
     modules: ['Command Center', 'Revenue', 'Operations'],
+    risk: 'low',
+  },
+  // Descriptive module guidance only — enforcement lives in the compliance
+  // module's route role checks, not in this matrix.
+  {
+    role: 'COMPLIANCE_OFFICER',
+    scope: 'Compliance module',
+    modules: ['Compliance Readiness: manage', 'Evidence Vault: manage', 'Risks/Vendors/Incidents: manage', 'Reports/Audit Logs: view'],
+    risk: 'medium',
+  },
+  {
+    role: 'AUDITOR',
+    scope: 'Compliance module, read-only',
+    modules: ['Compliance Readiness: view', 'Evidence Vault: view', 'Reports/Audit Logs: view'],
     risk: 'low',
   },
 ];
@@ -615,6 +630,7 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     const { active } = userStatusBody.parse(request.body);
     const existing = await db.user.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!existing) throw app.httpErrors.notFound('User not found');
+    if (!active) await assertDeactivateSafe(request, existing);
     const updated = await db.user.update({
       where: { id },
       data: {
@@ -631,6 +647,7 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     const { role } = userRoleBody.parse(request.body);
     const existing = await db.user.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!existing) throw app.httpErrors.notFound('User not found');
+    await assertRoleChangeSafe(request, existing, role);
     await db.user.update({ where: { id }, data: { role } });
     await audit(request, { action: 'controlPlane.user.roleChanged', resource: 'user', resourceId: id, metadata: { fromRole: existing.role, toRole: role } });
     return { id, role };
