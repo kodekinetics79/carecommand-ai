@@ -152,6 +152,7 @@ model Tenant {
   receptionistAppointmentRequests ReceptionistAppointmentRequest[]
   receptionistCallLogs ReceptionistCallLog[]
   receptionistOptOuts ReceptionistOptOut[]
+  passwordResetTokens PasswordResetToken[]
   complianceFrameworks ComplianceFramework[]
   complianceControls ComplianceControl[]
   complianceEvidence ComplianceEvidence[]
@@ -182,6 +183,12 @@ model User {
   refreshTokenHash String?
   refreshTokenExpiresAt DateTime?
   lastLoginAt  DateTime?
+  failedLoginCount Int     @default(0)
+  lockedUntil  DateTime?
+  passwordChangedAt DateTime?
+  mfaSecretEnc String?
+  mfaEnabled   Boolean      @default(false)
+  mfaEnrolledAt DateTime?
   active       Boolean      @default(true)
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
@@ -196,6 +203,7 @@ model User {
   staffProfile StaffProfile?
   partnerReportsReviewed PartnerReport[] @relation("PartnerReportReviewer")
   clinicAccesses  UserClinicAccess[]
+  passwordResetTokens PasswordResetToken[]
 
   @@unique([tenantId, email])
   @@index([tenantId, role])
@@ -1741,4 +1749,19 @@ model TenantSecurityPolicy {
   createdAt               DateTime @default(now())
   updatedAt               DateTime @updatedAt
   tenant                  Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+}
+
+model PasswordResetToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @db.Uuid
+  userId    String   @db.Uuid
+  tokenHash String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, userId])
+  @@index([expiresAt])
 }

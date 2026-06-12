@@ -3,8 +3,13 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
+import { env } from '../../config/env';
 import { requireRoles } from '../../plugins/roles';
 import type { Prisma } from '../../generated/prisma/client';
+
+const PASSWORD_MIN_LENGTH = env.PASSWORD_MIN_LENGTH;
+const LOCKOUT_THRESHOLD = env.AUTH_LOCKOUT_THRESHOLD;
+const LOCKOUT_DURATION_MINUTES = env.AUTH_LOCKOUT_DURATION_MINUTES;
 
 // ===========================================================================
 // Compliance Readiness Center — backend APIs (Phase C-1B).
@@ -71,7 +76,7 @@ export const complianceCenterRoutes: FastifyPluginAsync = async app => {
     const horizon = new Date();
     horizon.setDate(horizon.getDate() + 30);
 
-    const [frameworks, controls, risks, incidents, latestBackup, recentAudit, controlEvidenceLinks, expiringEvidence] = await Promise.all([
+    const [frameworks, controls, risks, incidents, latestBackup, recentAudit, controlEvidenceLinks, expiringEvidence, activeUsers, mfaUsers, secPolicy] = await Promise.all([
       db.complianceFramework.findMany({ where: { tenantId } }),
       db.complianceControl.findMany({ where: { tenantId }, select: { id: true, frameworkId: true, status: true } }),
       db.complianceRisk.findMany({ where: { tenantId }, select: { status: true } }),
@@ -80,6 +85,9 @@ export const complianceCenterRoutes: FastifyPluginAsync = async app => {
       db.auditEvent.findMany({ where: { tenantId }, orderBy: { occurredAt: 'desc' }, take: 10, include: { actorUser: { select: { displayName: true } } } }),
       db.complianceControlEvidence.findMany({ where: { tenantId, evidence: { deletedAt: null } }, select: { controlId: true } }),
       db.complianceEvidence.count({ where: { tenantId, deletedAt: null, expiresAt: { not: null, gte: new Date(), lte: horizon } } }),
+      db.user.count({ where: { tenantId, active: true } }),
+      db.user.count({ where: { tenantId, active: true, mfaEnabled: true } }),
+      db.tenantSecurityPolicy.findUnique({ where: { tenantId } }),
     ]);
 
     const scoreFor = (frameworkId?: string) => {
@@ -123,7 +131,14 @@ export const complianceCenterRoutes: FastifyPluginAsync = async app => {
       backupStatus: latestBackup
         ? { integrated: latestBackup.status === 'verified', status: latestBackup.status, lastRunAt: latestBackup.runAt.toISOString() }
         : { integrated: false, status: 'unverified', lastRunAt: null },
-      mfaStatus: { integrated: false, enforced: false, adoptionPct: 0, note: 'MFA is not implemented in this build.' },
+      mfaStatus: {
+        integrated: true,
+        enforced: secPolicy?.requireMfa ?? false,
+        adoptionPct: activeUsers > 0 ? Math.round((mfaUsers / activeUsers) * 100) : 0,
+        enrolledUsers: mfaUsers,
+        totalUsers: activeUsers,
+        note: secPolicy?.requireMfa ? 'TOTP MFA is enforced by tenant policy.' : 'TOTP MFA is available but not enforced by policy.',
+      },
     };
   });
 
@@ -351,20 +366,41 @@ export const complianceCenterRoutes: FastifyPluginAsync = async app => {
 
   // ===== Reports (real data where available; truthful placeholders else) ===
   app.get('/reports/mfa', { preHandler: complianceRead }, async request => {
-    const totalUsers = await db.user.count({ where: { tenantId: tenant(request), active: true } });
-    return { integrated: false, status: 'not_integrated', enforced: false, totalUsers, mfaEnabledUsers: 0, adoptionPct: 0, note: 'MFA is not implemented in this build.' };
+    const tenantId = tenant(request);
+    const [totalUsers, mfaEnabledUsers, policy] = await Promise.all([
+      db.user.count({ where: { tenantId, active: true } }),
+      db.user.count({ where: { tenantId, active: true, mfaEnabled: true } }),
+      db.tenantSecurityPolicy.findUnique({ where: { tenantId } }),
+    ]);
+    return {
+      integrated: true,
+      status: 'integrated',
+      method: 'TOTP',
+      enforced: policy?.requireMfa ?? false,
+      totalUsers,
+      mfaEnabledUsers,
+      adoptionPct: totalUsers > 0 ? Math.round((mfaEnabledUsers / totalUsers) * 100) : 0,
+      note: policy?.requireMfa
+        ? 'TOTP MFA is enforced by tenant policy; users without verified MFA must enroll at login.'
+        : 'TOTP MFA is available; adoption reflects users with a verified authenticator.',
+    };
   });
 
   app.get('/reports/password-policy', { preHandler: complianceRead }, async request => {
     const policy = await db.tenantSecurityPolicy.findUnique({ where: { tenantId: tenant(request) } });
+    const lockoutEnabled = policy?.failedLoginLockout ?? false;
+    const expiryDays = policy?.passwordExpiryDays ?? null;
     return {
       integrated: true,
       hashing: 'scrypt',
-      minLength: 8,
-      expiryDays: policy?.passwordExpiryDays ?? null,
-      lockoutEnabled: policy?.failedLoginLockout ?? false,
+      minLength: PASSWORD_MIN_LENGTH,
+      expiryDays,
+      expiryEnforced: typeof expiryDays === 'number' && expiryDays > 0,
+      lockoutEnabled,
+      lockoutThreshold: lockoutEnabled ? LOCKOUT_THRESHOLD : null,
+      lockoutDurationMinutes: lockoutEnabled ? LOCKOUT_DURATION_MINUTES : null,
       historyEnforced: false,
-      note: 'Password expiry, lockout, and history are not enforced yet.',
+      note: 'Account lockout and password expiry are enforced when enabled in the tenant security policy. Password history is not enforced.',
     };
   });
 

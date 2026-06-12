@@ -13,6 +13,14 @@ const envSchema = z.object({
   REDIS_URL: z.string().url().default('redis://localhost:6379'),
   JWT_SECRET: z.string().min(32),
   JWT_REFRESH_SECRET: z.string().min(32),
+  // Auth hardening (Phase A). Optional dedicated key for encrypting MFA secrets
+  // at rest; if unset, a key is derived from JWT_SECRET.
+  AUTH_ENCRYPTION_KEY: z.string().optional(),
+  PASSWORD_MIN_LENGTH: z.coerce.number().int().min(8).max(128).default(8),
+  AUTH_LOCKOUT_THRESHOLD: z.coerce.number().int().min(1).max(50).default(5),
+  AUTH_LOCKOUT_DURATION_MINUTES: z.coerce.number().int().min(1).max(1440).default(15),
+  PASSWORD_RESET_TTL_MINUTES: z.coerce.number().int().min(5).max(1440).default(60),
+  MFA_ISSUER: z.string().default('CareCommand AI'),
   CORS_ORIGINS: z.string().default('http://localhost:12000'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
   AI_PROVIDER: z.enum(['mock', 'ollama', 'openai', 'claude']).default('mock'),

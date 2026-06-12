@@ -1,6 +1,8 @@
 import { Worker } from 'bullmq';
 import { db } from '../lib/db';
 import { redisConnection, type AutopilotExecutionJob } from './queues';
+// Run the compliance maintenance worker + schedules in the same worker process.
+import './compliance.worker';
 
 const worker = new Worker<AutopilotExecutionJob>(
   'autopilot-execution',

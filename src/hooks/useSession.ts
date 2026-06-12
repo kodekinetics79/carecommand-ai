@@ -36,10 +36,12 @@ export function useSession() {
   }, [hydrate]);
 
   const signIn = async (email: string, password: string) => {
-    const session = await login(email, password);
-    setUser(session.user);
-    setLoading(false);
-    return session;
+    const result = await login(email, password);
+    if (result.kind === 'session') {
+      setUser(result.user);
+      setLoading(false);
+    }
+    return result;
   };
 
   const signOut = async () => {
