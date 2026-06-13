@@ -26,6 +26,7 @@ import { advisoryRoutes } from './modules/advisory/routes';
 import { revenueProtectionRoutes, revenueProtectionWebhookRoutes } from './modules/revenue-protection';
 import { paymentsCheckoutRoutes, paymentsPublicRoutes } from './modules/payments/checkout';
 import { serviceCatalogRoutes } from './modules/services/routes';
+import { crmRoutes } from './modules/campaigns/routes';
 import { controlPlaneRoutes } from './modules/control-plane/routes';
 import { insuranceRoutes } from './modules/insurance/routes';
 import { receptionistRoutes, receptionistWebhookRoutes } from './modules/receptionist/routes';
@@ -143,6 +144,7 @@ export async function buildApp() {
     await protectedApi.register(patientRoutes, { prefix: '/patients' });
     await protectedApi.register(appointmentRoutes, { prefix: '/appointments' });
     await protectedApi.register(serviceCatalogRoutes, { prefix: '/services' });
+    await protectedApi.register(crmRoutes, { prefix: '/crm' });
     await protectedApi.register(autopilotRoutes, { prefix: '/autopilot' });
     await protectedApi.register(telehealthRoutes, { prefix: '/telehealth' });
     await protectedApi.register(complianceRoutes, { prefix: '/compliance' });

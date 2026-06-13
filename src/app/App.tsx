@@ -16,6 +16,7 @@ const Scheduling = lazy(() => import('../pages/Scheduling'));
 const Patients = lazy(() => import('../pages/Patients'));
 const PatientProfile = lazy(() => import('../pages/PatientProfile'));
 const Campaigner = lazy(() => import('../pages/Campaigner'));
+const CampaignEngine = lazy(() => import('../pages/CampaignEngine'));
 const Revenue = lazy(() => import('../pages/Revenue'));
 const RevenueProtection = lazy(() => import('../pages/RevenueProtection'));
 const Insurance = lazy(() => import('../pages/Insurance'));
@@ -147,6 +148,7 @@ export default function App() {
           <Route path="/patients" element={<Patients />} />
           <Route path="/patients/:id" element={<PatientProfile />} />
           <Route path="/campaigner" element={<Campaigner />} />
+          <Route path="/reactivation" element={<CampaignEngine />} />
           <Route path="/revenue" element={<Revenue />} />
           <Route path="/revenue-protection" element={<RevenueProtection />} />
           <Route path="/insurance" element={<Insurance />} />

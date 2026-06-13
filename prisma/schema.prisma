@@ -74,6 +74,9 @@ enum CampaignStatus {
   PAUSED
   COMPLETED
   SCHEDULED
+  CANCELLED
+  APPROVAL_REQUIRED
+  FAILED
 }
 
 enum IntegrationStatus {
@@ -180,6 +183,9 @@ model Tenant {
   businessEvents BusinessEvent[]
   operationalSignals OperationalSignal[]
   aiRecommendations AIRecommendation[]
+  communicationConsents CommunicationConsent[]
+  campaignSuppressions CampaignSuppression[]
+  campaignDeliveries CampaignDelivery[]
 }
 
 model User {
@@ -306,6 +312,9 @@ model Patient {
   revenueProtectionAlerts RevenueProtectionAlert[]
   reputationCases ReputationCase[]
   reviewRequests ReviewRequest[]
+
+  communicationConsents CommunicationConsent[]
+  campaignSuppressions CampaignSuppression[]
 
   @@unique([tenantId, externalRef])
   @@index([tenantId, branchId, deletedAt])
@@ -457,9 +466,24 @@ model Campaign {
   aiGenerated  Boolean        @default(false)
   startsAt     DateTime?
   endsAt       DateTime?
+  // CRM / reactivation engine (Phase A). Existing analytics fields above are
+  // reused; these add playbook/approval/delivery semantics.
+  campaignType     String?
+  audienceType     String?
+  campaignChannel  String?
+  messageSubject   String?
+  messageTemplate  String?
+  draftSource      String?    @default("rule_based")
+  requiresApproval Boolean    @default(true)
+  approvedByUserId String?    @db.Uuid
+  approvedAt       DateTime?
+  scheduledAt      DateTime?
+  quietHours       Json?
+  createdByUserId  String?    @db.Uuid
   createdAt    DateTime       @default(now())
   updatedAt    DateTime       @updatedAt
   tenant       Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  deliveries   CampaignDelivery[]
 
   @@index([tenantId, status, createdAt])
 }
@@ -2136,4 +2160,68 @@ model AIRecommendation {
   signal             OperationalSignal? @relation(fields: [signalId], references: [id], onDelete: SetNull)
 
   @@index([tenantId, status, recommendationType])
+}
+
+// ===========================================================================
+// CRM Campaign / Reactivation engine (Phase A). Tenant-scoped, RLS-ready (RLS
+// not enabled this phase). Consent + suppression gate every outreach; no PHI in
+// message logs (destinations are masked).
+// ===========================================================================
+model CommunicationConsent {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenantId   String   @db.Uuid
+  patientId  String?  @db.Uuid
+  leadId     String?  @db.Uuid
+  channel    String
+  status     String   @default("unknown")
+  source     String   @default("staff")
+  capturedAt DateTime @default(now())
+  revokedAt  DateTime?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  patient    Patient? @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, patientId, leadId, channel])
+  @@index([tenantId, channel, status])
+}
+
+model CampaignSuppression {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @db.Uuid
+  patientId String?  @db.Uuid
+  leadId    String?  @db.Uuid
+  channel   String
+  reason    String
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  patient   Patient? @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, channel, active])
+}
+
+model CampaignDelivery {
+  id                String   @id @default(uuid()) @db.Uuid
+  tenantId          String   @db.Uuid
+  campaignId        String   @db.Uuid
+  patientId         String?  @db.Uuid
+  leadId            String?  @db.Uuid
+  channel           String
+  destinationMasked String?
+  status            String   @default("pending")
+  provider          String?
+  providerMessageId String?
+  idempotencyKey    String?
+  failureReason     String?
+  sentAt            DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  tenant            Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  campaign          Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignId, patientId, leadId, channel])
+  @@index([tenantId, status, createdAt])
 }

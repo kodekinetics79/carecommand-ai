@@ -14,7 +14,17 @@ export type WorkflowEventType =
   | 'appointment_request.created' | 'receptionist.appointmentRequest.created'
   | 'deposit.required' | 'deposit.missing' | 'deposit.paid'
   | 'payment.request.created' | 'payment.link.created' | 'payment.succeeded' | 'payment.failed' | 'payment.expired'
-  | 'revenue.leakage_detected';
+  | 'revenue.leakage_detected'
+  // Insurance Command Center events (derivation handled in insuranceIntelligence).
+  | 'insurance.profile.created' | 'insurance.profile.updated'
+  | 'insurance.eligibility.requested' | 'insurance.eligibility.completed' | 'insurance.eligibility.failed' | 'insurance.eligibility.needs_review'
+  | 'insurance.prior_auth.required' | 'insurance.prior_auth.updated'
+  | 'insurance.intake.gap_detected' | 'insurance.patient_responsibility.estimated' | 'insurance.denialRisk.created'
+  // CRM campaign / reactivation events.
+  | 'campaign.created' | 'campaign.approved' | 'campaign.scheduled' | 'campaign.launched'
+  | 'campaign.delivery.sent' | 'campaign.delivery.failed' | 'campaign.delivery.suppressed' | 'campaign.completed'
+  | 'patient.reactivation.recommended' | 'no_show.recovery.recommended' | 'unpaid_deposit.followup.recommended'
+  | 'failed_payment.followup.recommended' | 'insurance_update.followup.recommended' | 'review_request.recommended' | 'empty_slot.fill.recommended';
 
 interface EventInput {
   eventType: WorkflowEventType;
@@ -30,14 +40,14 @@ export async function emitBusinessEvent(tenantId: string, input: EventInput) {
   });
 }
 
-interface SignalInput {
+export interface SignalInput {
   signalType: string; entityType: string; entityId: string; severity: 'low' | 'medium' | 'high';
   score: number; reason: string; sourceEventId?: string | null;
 }
 
 // Upsert by (tenantId, signalType, entityType, entityId); refreshes an open
 // signal but never reopens one a human acknowledged/resolved/dismissed.
-async function upsertSignal(tenantId: string, s: SignalInput) {
+export async function upsertSignal(tenantId: string, s: SignalInput) {
   const existing = await db.operationalSignal.findFirst({ where: { tenantId, signalType: s.signalType, entityType: s.entityType, entityId: s.entityId } });
   if (existing) {
     if (existing.status === 'open') {
@@ -50,13 +60,13 @@ async function upsertSignal(tenantId: string, s: SignalInput) {
   });
 }
 
-interface RecInput {
+export interface RecInput {
   signalId?: string | null; title: string; recommendationType: string; reason: string;
   expectedImpact?: string; confidence: number; allowedActionType: string; sourceData?: Prisma.InputJsonObject;
 }
 
 // Avoid duplicate pending recommendations of the same type for the same signal.
-async function createRecommendation(tenantId: string, r: RecInput) {
+export async function createRecommendation(tenantId: string, r: RecInput) {
   if (r.signalId) {
     const dup = await db.aIRecommendation.findFirst({ where: { tenantId, signalId: r.signalId, recommendationType: r.recommendationType, status: 'pending' } });
     if (dup) return dup;

@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { CalendarDays, Sparkles, Zap, AlertCircle, CheckCircle2, Clock, Users, DollarSign, ArrowRight, RefreshCw, CreditCard } from 'lucide-react';
 import AppointmentPaymentCard from '../components/payments/AppointmentPaymentCard';
 import PaymentRequestsPanel from '../components/payments/PaymentRequestsPanel';
+import InsuranceIntakeCard from '../components/insurance/InsuranceIntakeCard';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
@@ -330,7 +331,8 @@ export default function Scheduling() {
                         </button>
                       </div>
                       {paymentApptId === appt.id && (
-                        <div className="mt-2.5">
+                        <div className="mt-2.5 space-y-2.5">
+                          <InsuranceIntakeCard appointmentId={appt.id} />
                           <AppointmentPaymentCard appointmentId={appt.id} />
                         </div>
                       )}

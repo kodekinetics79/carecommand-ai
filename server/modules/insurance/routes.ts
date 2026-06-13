@@ -3,13 +3,45 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { requireRoles } from '../../plugins/roles';
+import { requireFeature } from '../../lib/entitlements';
 import { assertBranchAccess, branchScope } from '../../lib/scope';
+import { eligibilityProviderStatus, computeDenialRisk, runDenialPreventionForAppointment } from '../../lib/insuranceIntelligence';
+import { emitBusinessEvent } from '../../lib/intelligence';
 
 const uuid = z.string().uuid();
 const adminRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
-const deskRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK');
+const deskRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'FRONT_DESK');
 
 export const insuranceRoutes: FastifyPluginAsync = async app => {
+  // Entire insurance surface requires the insurance_eligibility entitlement.
+  app.addHook('preHandler', requireFeature('insurance_eligibility'));
+
+  // Eligibility provider configuration status (no secrets exposed).
+  app.get('/provider-status', async () => {
+    const s = eligibilityProviderStatus();
+    return { provider: s.provider, configured: s.configured, mock: s.mock, setupRequired: s.setupRequired, missing: s.missing };
+  });
+
+  // Appointment intake insurance summary + rule-based denial risk (view-only;
+  // PROVIDER may read). Mobile-ready fields.
+  app.get('/intake/:appointmentId', async request => {
+    const { appointmentId } = z.object({ appointmentId: uuid }).parse(request.params);
+    const appointment = await db.appointment.findFirst({ where: { id: appointmentId, tenantId: request.auth.tenantId, deletedAt: null }, select: { id: true, patientId: true, branchId: true } });
+    if (!appointment) throw app.httpErrors.notFound('Appointment not found');
+    const assessment = await computeDenialRisk({ tenantId: request.auth.tenantId, appointmentId });
+    return assessment;
+  });
+
+  // Run rule-based denial prevention for an appointment (creates signals/tasks/
+  // alerts/recommendations where warranted). Write roles only.
+  app.post('/denial-prevention/:appointmentId', { preHandler: deskRoles }, async (request, reply) => {
+    const { appointmentId } = z.object({ appointmentId: uuid }).parse(request.params);
+    const appointment = await db.appointment.findFirst({ where: { id: appointmentId, tenantId: request.auth.tenantId, deletedAt: null }, select: { id: true, branchId: true } });
+    if (!appointment) throw app.httpErrors.notFound('Appointment not found');
+    const assessment = await runDenialPreventionForAppointment(request.auth.tenantId, appointmentId, { actorUserId: request.auth.userId, branchId: appointment.branchId });
+    return reply.send({ ...assessment, requiresHumanReview: true });
+  });
+
   // Snapshot of accepted insurances + policy coverage for the practice.
   app.get('/overview', async request => {
     const tenantId = request.auth.tenantId;
@@ -148,7 +180,8 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
       },
       include: { payer: { select: { name: true } } },
     });
-    await audit(request, { action: 'insurance.policy.created', resource: 'patientInsurancePolicy', resourceId: row.id, metadata: { patientId: input.patientId } });
+    await audit(request, { action: 'insurance.profile.created', resource: 'patientInsurancePolicy', resourceId: row.id, metadata: { patientId: input.patientId } });
+    await emitBusinessEvent(request.auth.tenantId, { eventType: 'insurance.profile.created', entityType: 'patientInsurancePolicy', entityId: row.id, sourceModule: 'insurance', payload: { patientId: input.patientId } }).catch(() => {});
     return reply.code(201).send(row);
   });
 };

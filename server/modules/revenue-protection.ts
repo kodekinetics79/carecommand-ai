@@ -8,7 +8,8 @@ import { assertBranchAccess } from '../lib/scope';
 import { requireRoles } from '../plugins/roles';
 import { requireFeature } from '../lib/entitlements';
 import { runWithTenantContext } from '../lib/tenantContext';
-import { recordWorkflowEvent } from '../lib/intelligence';
+import { recordWorkflowEvent, emitBusinessEvent } from '../lib/intelligence';
+import { eligibilityProviderStatus, runDenialPreventionForAppointment } from '../lib/insuranceIntelligence';
 import type { Prisma } from '../generated/prisma/client';
 
 // --- Idempotency -----------------------------------------------------------
@@ -90,6 +91,9 @@ const editRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK');
 const adminRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
 // Payments & deposits routes additionally require the payments_deposits entitlement.
 const paymentsFeature = requireFeature('payments_deposits');
+// Insurance/eligibility routes require the insurance_eligibility entitlement.
+const insuranceFeature = requireFeature('insurance_eligibility');
+const insuranceWriteRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'FRONT_DESK');
 
 type RevenueContext = {
   tenantId: string;
@@ -376,6 +380,7 @@ async function resolveBranchIdAndEntities(request: FastifyRequest, context: Reve
       select: {
         id: true,
         branchId: true,
+        patientId: true,
         service: true,
         startsAt: true,
         value: true,
@@ -384,10 +389,21 @@ async function resolveBranchIdAndEntities(request: FastifyRequest, context: Reve
       },
     });
     if (row) {
+      const { patientId: rowPatientId, ...rest } = row;
       appointment = {
-        ...row,
+        ...rest,
         value: toNumber(row.value),
       };
+      // Safe derivation: when only an appointment is given, resolve its patient
+      // server-side (tenant-scoped — no IDOR) so eligibility/intake never needs
+      // the caller to pass a patientId redundantly.
+      if (!patient && rowPatientId) {
+        const p = await db.patient.findFirst({
+          where: { id: rowPatientId, tenantId: context.tenantId },
+          select: { id: true, firstName: true, lastName: true, branchId: true, lifecycleStage: true, churnRisk: true, outstandingBalance: true, lifetimeValue: true, email: true, phone: true },
+        });
+        if (p) patient = { ...p, outstandingBalance: toNumber(p.outstandingBalance), lifetimeValue: toNumber(p.lifetimeValue) };
+      }
     }
   }
 
@@ -1533,7 +1549,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     };
   });
 
-  app.get('/eligibility', async request => {
+  app.get('/eligibility', { preHandler: insuranceFeature }, async request => {
     const query = listLimit.parse(request.query);
     const filter = { ...branchFilter(request, query.branchId), ...(query.patientId ? { patientId: query.patientId } : {}), ...(query.appointmentId ? { appointmentId: query.appointmentId } : {}) };
     const [insurancePayers, patientInsurancePolicies, eligibilityVerifications, patientResponsibilityEstimates] = await Promise.all([
@@ -1596,7 +1612,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     };
   });
 
-  app.get('/appointment-queue', async request => {
+  app.get('/appointment-queue', { preHandler: insuranceFeature }, async request => {
     const query = listLimit.parse(request.query);
     const filter = branchFilter(request, query.branchId);
     const rows = await db.appointment.findMany({
@@ -1639,7 +1655,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     return { appointments: rows.map(mapAppointmentQueueRow) };
   });
 
-  app.post('/eligibility/check', { preHandler: editRoles }, async (request, reply) => {
+  app.post('/eligibility/check', { preHandler: [insuranceFeature, insuranceWriteRoles] }, async (request, reply) => {
     const body = z.object({
       branchId: uuid.optional(),
       patientId: uuid.optional(),
@@ -1651,6 +1667,14 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     if (!body.patientId && !body.appointmentId) {
       throw app.httpErrors.badRequest('A patient or appointment context is required');
     }
+
+    // Truthful provider gating: never fabricate an eligible result when the
+    // eligibility provider is unconfigured (and never run mock in production).
+    const providerStatus = eligibilityProviderStatus();
+    if (providerStatus.setupRequired) {
+      return reply.code(200).send({ status: 'setup_required', setupRequired: true, provider: providerStatus.provider, missing: providerStatus.missing, message: `Configure the ${providerStatus.provider} eligibility provider to run real checks.` });
+    }
+    await emitBusinessEvent(request.auth.tenantId, { eventType: 'insurance.eligibility.requested', entityType: 'appointment', entityId: body.appointmentId ?? body.patientId ?? null, sourceModule: 'insurance', payload: { provider: providerStatus.provider } }).catch(() => {});
 
     const entities = await resolveBranchIdAndEntities(request, { tenantId: request.auth.tenantId, branchId: request.auth.branchId ?? undefined }, body);
     if (body.patientId && !entities.patient) throw app.httpErrors.notFound('Patient not found');
@@ -1808,6 +1832,14 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
       },
     });
 
+    // Intelligence: completion/needs-review/failed event + rule-based denial
+    // prevention for the linked appointment (creates signals/tasks/alerts).
+    const eligEvent = !outcome.coverageActive ? 'insurance.eligibility.failed' : outcome.benefitUncertainty ? 'insurance.eligibility.needs_review' : 'insurance.eligibility.completed';
+    await emitBusinessEvent(request.auth.tenantId, { eventType: eligEvent as 'insurance.eligibility.completed', entityType: 'eligibilityVerification', entityId: verification.id, sourceModule: 'insurance', payload: { coverageStatus: outcome.coverageStatus, appointmentId: verification.appointmentId } }).catch(() => {});
+    if (verification.appointmentId) {
+      await runDenialPreventionForAppointment(request.auth.tenantId, verification.appointmentId, { actorUserId: request.auth.userId, branchId: entities.branchId }).catch(() => {});
+    }
+
     return reply.send({
       verificationId: verification.id,
       id: verification.id,
@@ -1839,7 +1871,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     });
   });
 
-  app.patch('/eligibility/:id/status', { preHandler: editRoles }, async (request, reply) => {
+  app.patch('/eligibility/:id/status', { preHandler: [insuranceFeature, insuranceWriteRoles] }, async (request, reply) => {
     const params = z.object({ id: uuid }).parse(request.params);
     const body = z.object({ coverageStatus: z.string().min(2).max(80) }).parse(request.body);
     const existing = await db.eligibilityVerification.findFirst({
@@ -1882,7 +1914,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     });
   });
 
-  app.get('/prior-auth', async request => {
+  app.get('/prior-auth', { preHandler: insuranceFeature }, async request => {
     const query = listLimit.parse(request.query);
     const filter = branchFilter(request, query.branchId);
     const rows = await db.priorAuthorization.findMany({
@@ -1894,7 +1926,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     return { priorAuthorizations: rows.map(mapPriorAuth) };
   });
 
-  app.patch('/prior-auth/:id/status', { preHandler: editRoles }, async (request, reply) => {
+  app.patch('/prior-auth/:id/status', { preHandler: [insuranceFeature, insuranceWriteRoles] }, async (request, reply) => {
     const params = z.object({ id: uuid }).parse(request.params);
     const body = z.object({
       status: z.string().min(2).max(80),
@@ -1915,6 +1947,10 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
       resourceId: row.id,
       metadata: { status: body.status },
     });
+    await emitBusinessEvent(request.auth.tenantId, { eventType: 'insurance.prior_auth.updated', entityType: 'priorAuthorization', entityId: row.id, sourceModule: 'insurance', payload: { status: row.status, appointmentId: row.appointmentId } }).catch(() => {});
+    if (row.appointmentId) {
+      await runDenialPreventionForAppointment(request.auth.tenantId, row.appointmentId, { actorUserId: request.auth.userId, branchId: row.branchId }).catch(() => {});
+    }
     return reply.send({
       id: row.id,
       status: row.status,
@@ -2595,33 +2631,43 @@ export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
       await recordWorkflowEvent(paymentRequest.tenantId, { eventType: 'payment.succeeded', entityType: 'paymentRequest', entityId: paymentRequest.id, sourceModule: 'payments', payload: { appointmentId: paymentRequest.appointmentId } });
     } else if (failed || expired) {
       const newStatus = failed ? 'failed' : 'expired';
-      await db.paymentRequest.update({ where: { id: paymentRequest.id }, data: { status: newStatus } });
-      // Surface to revenue protection: a follow-up task + an alert so unpaid /
-      // failed deposits become visible operational risk (no fake recovery value).
-      await db.staffTask.create({
-        data: {
-          tenantId: paymentRequest.tenantId, branchId: paymentRequest.branchId,
-          title: failed ? 'Review failed deposit payment' : 'Resend expired deposit link',
-          priority: failed ? 'high' : 'normal', status: 'OPEN',
-          metadata: { source: 'payment_webhook', paymentRequestId: paymentRequest.id, appointmentId: paymentRequest.appointmentId, event: event.type },
-        },
-      }).catch(() => {});
-      if (paymentRequest.appointmentId || paymentRequest.patientId) {
-        await runWithTenantContext(paymentRequest.tenantId, tx => tx.revenueProtectionAlert.create({
+      // Never regress an already-paid request from a late/out-of-order failure
+      // or expiry event — acknowledge and stop.
+      if (paymentRequest.status === 'collected') {
+        return reply.code(200).send({ received: true, ignored: 'already_paid' });
+      }
+      // Only move OUT of a non-terminal state; the guard prevents clobbering a
+      // collected request even under a race.
+      await db.paymentRequest.updateMany({ where: { id: paymentRequest.id, status: { not: 'collected' } }, data: { status: newStatus } });
+      // Dedupe the follow-up task/alert per (request,outcome) so distinct
+      // provider failure events don't spam revenue protection.
+      const failureClaim = await claimIdempotency('payment.failure', `${paymentRequest.tenantId}:${paymentRequest.id}:${newStatus}`, paymentRequest.tenantId);
+      if (failureClaim.claimed) {
+        await db.staffTask.create({
           data: {
             tenantId: paymentRequest.tenantId, branchId: paymentRequest.branchId,
-            patientId: paymentRequest.patientId ?? undefined, appointmentId: paymentRequest.appointmentId ?? undefined,
-            sourceType: 'deposit_payment', severity: failed ? 'high' : 'medium',
-            title: failed ? 'Deposit payment failed' : 'Deposit link expired unpaid',
-            description: failed ? 'A patient deposit payment failed and needs follow-up.' : 'A deposit payment link expired before payment.',
-            estimatedValue: paymentRequest.amount, status: 'open',
-            recommendedAction: failed ? 'Contact the patient and resend a payment link.' : 'Resend a fresh deposit payment link.',
-            actionLink: paymentRequest.appointmentId ? `appointment/${paymentRequest.appointmentId}` : null,
+            title: failed ? 'Review failed deposit payment' : 'Resend expired deposit link',
+            priority: failed ? 'high' : 'normal', status: 'OPEN',
+            metadata: { source: 'payment_webhook', paymentRequestId: paymentRequest.id, appointmentId: paymentRequest.appointmentId, event: event.type },
           },
-        })).catch(() => {});
+        }).catch(() => {});
+        if (paymentRequest.appointmentId || paymentRequest.patientId) {
+          await runWithTenantContext(paymentRequest.tenantId, tx => tx.revenueProtectionAlert.create({
+            data: {
+              tenantId: paymentRequest.tenantId, branchId: paymentRequest.branchId,
+              patientId: paymentRequest.patientId ?? undefined, appointmentId: paymentRequest.appointmentId ?? undefined,
+              sourceType: 'deposit_payment', severity: failed ? 'high' : 'medium',
+              title: failed ? 'Deposit payment failed' : 'Deposit link expired unpaid',
+              description: failed ? 'A patient deposit payment failed and needs follow-up.' : 'A deposit payment link expired before payment.',
+              estimatedValue: paymentRequest.amount, status: 'open',
+              recommendedAction: failed ? 'Contact the patient and resend a payment link.' : 'Resend a fresh deposit payment link.',
+              actionLink: paymentRequest.appointmentId ? `appointment/${paymentRequest.appointmentId}` : null,
+            },
+          })).catch(() => {});
+        }
+        await recordWorkflowEvent(paymentRequest.tenantId, { eventType: failed ? 'payment.failed' : 'payment.expired', entityType: 'paymentRequest', entityId: paymentRequest.id, sourceModule: 'payments', payload: { appointmentId: paymentRequest.appointmentId } });
       }
       await db.auditEvent.create({ data: { tenantId: paymentRequest.tenantId, action: failed ? 'payment.failed' : 'payment.expired', resource: 'paymentRequest', resourceId: paymentRequest.id, metadata: { eventId: event.id, type: event.type } } }).catch(() => {});
-      await recordWorkflowEvent(paymentRequest.tenantId, { eventType: failed ? 'payment.failed' : 'payment.expired', entityType: 'paymentRequest', entityId: paymentRequest.id, sourceModule: 'payments', payload: { appointmentId: paymentRequest.appointmentId } });
     }
 
     return reply.code(200).send({ received: true });

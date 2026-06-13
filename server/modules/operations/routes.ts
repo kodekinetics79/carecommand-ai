@@ -752,6 +752,8 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     const [
       appointmentRequestsPending, receptionistHandoffPending, unpaidDeposits,
       failedPayments, expiredPayments, revenueAlertsOpen, openTasks, recommendations, openSignals,
+      insuranceGaps, priorAuthAttention, highResponsibilityEstimates, ineligibleVerifications,
+      inactivePatients, noShowRecoveryCandidates, reviewRequestOpportunities, campaignDeliveryFailures, pendingCampaignApprovals,
     ] = await Promise.all([
       db.appointmentRequest.count({ where: { tenantId, status: 'PENDING_REVIEW' } }),
       db.appointmentRequest.count({ where: { tenantId, source: 'ai_receptionist', status: { in: ['PENDING_REVIEW', 'MISSING_INFO'] } } }),
@@ -762,6 +764,17 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
       db.staffTask.count({ where: { tenantId, status: 'OPEN' } }),
       db.aIRecommendation.findMany({ where: { tenantId, status: 'pending' }, orderBy: [{ confidence: 'desc' }, { createdAt: 'desc' }], take: 8 }),
       db.operationalSignal.count({ where: { tenantId, status: 'open' } }),
+      // Insurance gaps surfaced to the briefing — real data only.
+      db.operationalSignal.count({ where: { tenantId, status: 'open', signalType: 'denial_risk' } }),
+      db.priorAuthorization.count({ where: { tenantId, status: { in: ['required', 'pending', 'denied', 'expired'] } } }),
+      db.patientResponsibilityEstimate.count({ where: { tenantId, estimatedPatientResponsibility: { gte: 200 } } }),
+      db.eligibilityVerification.count({ where: { tenantId, coverageActive: false } }),
+      // CRM campaign opportunities — real data only.
+      db.patient.count({ where: { tenantId, deletedAt: null, lifecycleStage: { not: 'LOST' }, OR: [{ lastVisitAt: { lt: new Date(Date.now() - 180 * 86400000) } }, { lastVisitAt: null, createdAt: { lt: new Date(Date.now() - 180 * 86400000) } }] } }),
+      db.appointment.count({ where: { tenantId, status: 'NO_SHOW', deletedAt: null } }),
+      db.appointment.count({ where: { tenantId, status: 'COMPLETED', deletedAt: null } }),
+      db.campaignDelivery.count({ where: { tenantId, status: 'failed' } }),
+      db.campaign.count({ where: { tenantId, campaignType: { not: null }, requiresApproval: true, approvedByUserId: null, status: 'DRAFT' } }),
     ]);
     return {
       label: 'Rule-based morning briefing',
@@ -776,6 +789,17 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
         revenueAlertsOpen,
         openTasks,
         openSignals,
+        insuranceGaps,
+        priorAuthAttention,
+        highResponsibilityEstimates,
+        ineligibleVerifications,
+        inactivePatients,
+        noShowRecoveryCandidates,
+        reviewRequestOpportunities,
+        unpaidDepositFollowupCandidates: unpaidDeposits,
+        appointmentRequestFollowupCandidates: appointmentRequestsPending,
+        campaignDeliveryFailures,
+        pendingCampaignApprovals,
       },
       topRecommendations: recommendations.map(r => ({
         id: r.id, title: r.title, recommendationType: r.recommendationType, reason: r.reason,
