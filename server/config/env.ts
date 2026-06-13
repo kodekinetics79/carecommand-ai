@@ -59,6 +59,14 @@ const envSchema = z.object({
   DEV_USER_ID: z.string().uuid().default('22222222-2222-4222-8222-222222222222'),
   PUBLIC_API_URL: z.string().url().default('http://localhost:3001'),
   RETELL_API_KEY: z.string().optional(),
+  RETELL_AGENT_ID: z.string().optional(),
+  RETELL_FROM_NUMBER: z.string().optional(),
+  RETELL_BASE_URL: z.string().url().default('https://api.retellai.com'),
+  // Platform control plane (separate from tenant UserRole). Operators present
+  // this token on /v1/platform/* and /v1/onboarding/*. In non-production a dev
+  // default is allowed; production MUST set a strong token.
+  PLATFORM_API_TOKEN: z.string().optional(),
+  TRIAL_DAYS: z.coerce.number().int().min(1).max(365).default(14),
 });
 
 export const env = envSchema.parse(process.env);

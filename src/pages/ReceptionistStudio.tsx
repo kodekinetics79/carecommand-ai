@@ -3,6 +3,7 @@ import {
   Bot, Building2, Plus, Trash2, Save, Sparkles, Phone,
   GripVertical, ChevronUp, ChevronDown, Copy, Check, ShieldCheck, PhoneOff,
   Megaphone, ListChecks, Eye, Code2, Activity, MapPin, Loader2, AlertCircle,
+  PhoneCall, PhoneOutgoing, CalendarClock, CircleCheck, CircleAlert,
 } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
@@ -10,11 +11,14 @@ import { Field, TextInput, TextArea, Select, Toggle } from '../components/ui/Fie
 import {
   receptionistApi as api,
   FIELD_CATALOG, VOICE_OPTIONS, TONE_OPTIONS, LANGUAGE_OPTIONS, CAMPAIGN_TYPES, TIMEZONE_OPTIONS,
+  OUTBOUND_REQUIRED_FIELDS,
   type Clinic, type Campaign, type IntakeField, type Agent, type FieldType,
   type PromptResult, type RetellConfig, type CallLog, type AppointmentRequest, type OptOut, type Overview,
+  type RetellStatus, type OutboundCampaign, type OutboundRequiredField, type OutboundBookingMode,
+  type CallTarget, type BookingRequest, type BookingRequestStatus, type OutboundCampaignInput,
 } from '../lib/receptionist';
 
-type Tab = 'clinic' | 'campaign' | 'intake' | 'preview' | 'retell' | 'activity';
+type Tab = 'clinic' | 'campaign' | 'intake' | 'preview' | 'retell' | 'outbound' | 'activity';
 
 const TABS: Array<{ id: Tab; label: string; icon: React.ElementType }> = [
   { id: 'clinic', label: 'Clinic Profile', icon: Building2 },
@@ -22,6 +26,7 @@ const TABS: Array<{ id: Tab; label: string; icon: React.ElementType }> = [
   { id: 'intake', label: 'Intake Builder', icon: ListChecks },
   { id: 'preview', label: 'Preview', icon: Eye },
   { id: 'retell', label: 'RetellAI Export', icon: Code2 },
+  { id: 'outbound', label: 'Outbound Calls', icon: PhoneOutgoing },
   { id: 'activity', label: 'Activity', icon: Activity },
 ];
 
@@ -255,6 +260,10 @@ export default function ReceptionistStudio() {
             )}
             {tab === 'retell' && (
               activeCampaign ? <RetellPanel key={activeCampaign.id} campaignId={activeCampaign.id} /> : <EmptyState text="Select a campaign to export its RetellAI configuration." />
+            )}
+            {tab === 'outbound' && (
+              activeClinic ? <OutboundPanel key={activeClinic.id} clinic={activeClinic} />
+                : <EmptyState text="Create a clinic profile first to configure outbound calling." />
             )}
             {tab === 'activity' && activeClinic && (
               <ActivityPanel clinicId={activeClinic.id} />
@@ -987,6 +996,445 @@ function ActivityPanel({ clinicId }: { clinicId: string }) {
                 </div>
               </div>
               <button type="button" aria-label="Remove do-not-contact entry" title="Remove" onClick={() => removeOptOut(o.id)} className="text-t3 hover:text-red-v shrink-0"><Trash2 className="w-3.5 h-3.5" /></button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ===========================================================================
+// Outbound calling panel: Retell setup status, campaign builder, target list,
+// test-call launcher, call logs, and the appointment-request review queue.
+// ===========================================================================
+
+const requestBadge: Record<BookingRequestStatus, string> = {
+  PENDING_REVIEW: 'badge badge-amber', BOOKED: 'badge badge-emerald', REJECTED: 'badge badge-red',
+  MISSING_INFO: 'badge badge-violet', DUPLICATE: 'badge badge-blue',
+};
+
+const EMPTY_CAMPAIGN: OutboundCampaignInput = {
+  clinicId: '', name: '', script: '', requiredFields: ['firstName', 'lastName', 'phone'],
+  consentText: '', humanHandoffInstruction: '', bookingMode: 'APPOINTMENT_REQUEST_ONLY',
+  defaultBranchId: '', defaultService: '', quietHoursStart: '', quietHoursEnd: '', maxRetryAttempts: 1,
+};
+
+function OutboundPanel({ clinic }: { clinic: Clinic }) {
+  const [status, setStatus] = useState<RetellStatus | null>(null);
+  const [campaigns, setCampaigns] = useState<OutboundCampaign[]>([]);
+  const [requests, setRequests] = useState<BookingRequest[]>([]);
+  const [selectedId, setSelectedId] = useState<string>('');
+  const [creating, setCreating] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  const reload = useCallback(async () => {
+    const [st, camps, reqs] = await Promise.all([
+      api.retellStatus().catch(() => null),
+      api.listOutboundCampaigns(clinic.id).catch(() => [] as OutboundCampaign[]),
+      api.listBookingRequests().catch(() => [] as BookingRequest[]),
+    ]);
+    setStatus(st);
+    setCampaigns(camps);
+    setRequests(reqs);
+    setSelectedId(prev => (prev && camps.some(c => c.id === prev) ? prev : camps[0]?.id ?? ''));
+    setLoading(false);
+  }, [clinic.id]);
+
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      const [st, camps, reqs] = await Promise.all([
+        api.retellStatus().catch(() => null),
+        api.listOutboundCampaigns(clinic.id).catch(() => [] as OutboundCampaign[]),
+        api.listBookingRequests().catch(() => [] as BookingRequest[]),
+      ]);
+      if (!active) return;
+      setStatus(st);
+      setCampaigns(camps);
+      setRequests(reqs);
+      setSelectedId(prev => (prev && camps.some(c => c.id === prev) ? prev : camps[0]?.id ?? ''));
+      setLoading(false);
+    })();
+    return () => { active = false; };
+  }, [clinic.id]);
+
+  const selected = campaigns.find(c => c.id === selectedId) ?? null;
+
+  if (loading) return <div className="cc-card p-10 text-center text-sm text-t3"><Loader2 className="w-5 h-5 animate-spin inline" /></div>;
+
+  return (
+    <div className="space-y-5">
+      <RetellStatusCard status={status} />
+
+      <div className="grid lg:grid-cols-[260px_1fr] gap-5">
+        {/* Campaign list */}
+        <div className="cc-card p-3 space-y-1.5 h-max">
+          <div className="flex items-center justify-between px-1 pb-1">
+            <span className="text-[11px] font-bold uppercase tracking-wide text-t3">Campaigns</span>
+            <button type="button" aria-label="New outbound campaign" title="New outbound campaign" onClick={() => { setCreating(true); setSelectedId(''); }} className="text-indigo hover:opacity-80"><Plus className="w-4 h-4" /></button>
+          </div>
+          {campaigns.length === 0 && !creating && <p className="px-1 py-3 text-xs text-t3">No outbound campaigns yet.</p>}
+          {campaigns.map(c => (
+            <button
+              key={c.id}
+              type="button"
+              onClick={() => { setSelectedId(c.id); setCreating(false); }}
+              className={`w-full rounded-lg px-2.5 py-2 text-left text-sm transition-colors ${selectedId === c.id && !creating ? 'bg-[var(--s2)] text-t1' : 'text-t2 hover:bg-[var(--s2)]'}`}
+            >
+              <span className="block font-semibold truncate">{c.name}</span>
+              <span className="text-[10px] text-t3">{c.status} · {c._count?.targets ?? 0} targets · {c._count?.callLogs ?? 0} calls</span>
+            </button>
+          ))}
+        </div>
+
+        {/* Builder / detail */}
+        <div className="space-y-5">
+          {creating && (
+            <CampaignBuilder
+              clinicId={clinic.id}
+              onCancel={() => setCreating(false)}
+              onSaved={async (id) => { setCreating(false); await reload(); setSelectedId(id); }}
+            />
+          )}
+          {!creating && selected && (
+            <CampaignDetail key={selected.id} campaign={selected} status={status} onChanged={reload} />
+          )}
+          {!creating && !selected && (
+            <div className="cc-card p-10 text-center text-sm text-t3">Select a campaign or create one to configure outbound calls.</div>
+          )}
+        </div>
+      </div>
+
+      <BookingRequestQueue requests={requests} onChanged={reload} />
+    </div>
+  );
+}
+
+function RetellStatusCard({ status }: { status: RetellStatus | null }) {
+  if (!status) return null;
+  const ok = status.configured;
+  return (
+    <div className={`cc-card p-4 border-l-4 ${ok ? 'border-l-emerald-v' : 'border-l-amber-v'}`}>
+      <div className="flex items-start gap-3">
+        {ok ? <CircleCheck className="w-5 h-5 text-emerald-v shrink-0" /> : <CircleAlert className="w-5 h-5 text-amber-v shrink-0" />}
+        <div className="flex-1">
+          <div className="flex items-center gap-2">
+            <h3 className="text-sm font-bold text-t1">Retell outbound calling {ok ? 'is ready' : 'needs setup'}</h3>
+            {status.mock && <span className="badge badge-violet">mock mode</span>}
+          </div>
+          <p className="text-xs text-t3 mt-0.5">
+            {ok
+              ? 'Credentials are configured server-side. Launching a call will place a real outbound call via Retell.'
+              : 'Set the missing environment variables on the server to enable live outbound calls. Secrets are never sent to the browser.'}
+          </p>
+          <div className="flex flex-wrap gap-2 mt-3">
+            {status.checklist.map(item => (
+              <span key={item.key} className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[11px] font-semibold ${item.set ? 'border-[var(--b1)] text-t2' : 'border-amber-v/40 text-amber-v'}`}>
+                {item.set ? <Check className="w-3 h-3 text-emerald-v" /> : <AlertCircle className="w-3 h-3" />}
+                {item.label}
+              </span>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RequiredFieldPicker({ value, onChange }: { value: OutboundRequiredField[]; onChange: (next: OutboundRequiredField[]) => void }) {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {OUTBOUND_REQUIRED_FIELDS.map(f => {
+        const on = value.includes(f.key);
+        return (
+          <button
+            key={f.key}
+            type="button"
+            onClick={() => onChange(on ? value.filter(k => k !== f.key) : [...value, f.key])}
+            className={`rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition-colors ${on ? 'border-indigo bg-[var(--indigo-soft)] text-indigo' : 'border-[var(--b1)] bg-[var(--s3)] text-t3'}`}
+          >
+            {f.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function CampaignFormFields({ form, set }: { form: OutboundCampaignInput; set: (patch: Partial<OutboundCampaignInput>) => void }) {
+  return (
+    <>
+      <Field label="Campaign name" required>
+        <TextInput value={form.name} onChange={e => set({ name: e.target.value })} placeholder="June reactivation outreach" />
+      </Field>
+      <Field label="Call script" required hint="What the agent should say. Keep it scheduling-focused — the AI must not give medical advice.">
+        <TextArea rows={4} value={form.script} onChange={e => set({ script: e.target.value })} placeholder="Hi, this is {{agent_name}} calling from {{clinic_name}}..." />
+      </Field>
+      <Field label="Required fields to collect" hint="The agent will route to staff review if any of these are missing.">
+        <RequiredFieldPicker value={form.requiredFields ?? []} onChange={v => set({ requiredFields: v })} />
+      </Field>
+      <Field label="Consent / disclaimer text" hint="Spoken disclosure the agent reads at the start of the call.">
+        <TextArea rows={2} value={form.consentText ?? ''} onChange={e => set({ consentText: e.target.value })} placeholder="This call may be recorded. You can opt out at any time." />
+      </Field>
+      <Field label="Human handoff instruction" hint="When the agent should transfer to a human.">
+        <TextInput value={form.humanHandoffInstruction ?? ''} onChange={e => set({ humanHandoffInstruction: e.target.value })} placeholder="Transfer if the caller asks clinical questions." />
+      </Field>
+      <Field label="Booking mode" required hint="Direct booking only books when a branch, a valid time, and a free slot are all available; otherwise it routes to staff review.">
+        <Select aria-label="Booking mode" value={form.bookingMode} onChange={e => set({ bookingMode: e.target.value as OutboundBookingMode })}>
+          <option value="APPOINTMENT_REQUEST_ONLY">Appointment request only (staff books)</option>
+          <option value="DIRECT_BOOKING_IF_SLOT_AVAILABLE">Direct booking if a slot is available</option>
+        </Select>
+      </Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Default branch ID" hint="Required for direct booking.">
+          <TextInput value={form.defaultBranchId ?? ''} onChange={e => set({ defaultBranchId: e.target.value })} placeholder="branch uuid (optional)" />
+        </Field>
+        <Field label="Default service">
+          <TextInput value={form.defaultService ?? ''} onChange={e => set({ defaultService: e.target.value })} placeholder="Consultation" />
+        </Field>
+      </div>
+      <div className="grid grid-cols-3 gap-3">
+        <Field label="Quiet hours start"><TextInput value={form.quietHoursStart ?? ''} onChange={e => set({ quietHoursStart: e.target.value })} placeholder="21:00" /></Field>
+        <Field label="Quiet hours end"><TextInput value={form.quietHoursEnd ?? ''} onChange={e => set({ quietHoursEnd: e.target.value })} placeholder="08:00" /></Field>
+        <Field label="Max retries"><TextInput type="number" min={0} max={10} value={form.maxRetryAttempts ?? 1} onChange={e => set({ maxRetryAttempts: Number(e.target.value) })} /></Field>
+      </div>
+    </>
+  );
+}
+
+function CampaignBuilder({ clinicId, onSaved, onCancel }: { clinicId: string; onSaved: (id: string) => void; onCancel: () => void }) {
+  const [form, setForm] = useState<OutboundCampaignInput>({ ...EMPTY_CAMPAIGN, clinicId });
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const set = (patch: Partial<OutboundCampaignInput>) => setForm(prev => ({ ...prev, ...patch }));
+
+  async function save() {
+    setSaving(true); setErr(null);
+    try {
+      const payload: OutboundCampaignInput = {
+        ...form,
+        clinicId,
+        defaultBranchId: form.defaultBranchId || null,
+        defaultService: form.defaultService || null,
+        consentText: form.consentText || null,
+        humanHandoffInstruction: form.humanHandoffInstruction || null,
+        quietHoursStart: form.quietHoursStart || null,
+        quietHoursEnd: form.quietHoursEnd || null,
+      };
+      const row = await api.createOutboundCampaign(payload);
+      onSaved(row.id);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Failed to save campaign');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="cc-card p-5 space-y-4">
+      <h3 className="text-sm font-bold text-t1 flex items-center gap-2"><Megaphone className="w-4 h-4 text-indigo" /> New outbound campaign</h3>
+      <CampaignFormFields form={form} set={set} />
+      {err && <p className="text-xs text-red-v">{err}</p>}
+      <div className="flex gap-2">
+        <button type="button" disabled={saving || !form.name || !form.script} onClick={save} className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50">
+          {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Create campaign
+        </button>
+        <button type="button" onClick={onCancel} className="rounded-xl border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s2)]">Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+function CampaignDetail({ campaign, status, onChanged }: { campaign: OutboundCampaign; status: RetellStatus | null; onChanged: () => void }) {
+  const [targets, setTargets] = useState<CallTarget[]>([]);
+  const [logs, setLogs] = useState<CallLog[]>([]);
+  const [phone, setPhone] = useState('');
+  const [firstName, setFirstName] = useState('');
+  const [launchMsg, setLaunchMsg] = useState<{ kind: 'ok' | 'warn' | 'err'; text: string } | null>(null);
+  const [launching, setLaunching] = useState(false);
+
+  const reloadDetail = useCallback(async () => {
+    const [t, l] = await Promise.all([
+      api.listTargets(campaign.id).catch(() => [] as CallTarget[]),
+      api.listOutboundCallLogs(campaign.id).catch(() => [] as CallLog[]),
+    ]);
+    setTargets(t); setLogs(l);
+  }, [campaign.id]);
+
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      const [t, l] = await Promise.all([
+        api.listTargets(campaign.id).catch(() => [] as CallTarget[]),
+        api.listOutboundCallLogs(campaign.id).catch(() => [] as CallLog[]),
+      ]);
+      if (!active) return;
+      setTargets(t);
+      setLogs(l);
+    })();
+    return () => { active = false; };
+  }, [campaign.id]);
+
+  async function launch(targetId?: string, toPhone?: string) {
+    const dial = toPhone ?? phone;
+    if (!dial) return;
+    setLaunching(true); setLaunchMsg(null);
+    try {
+      const res = await api.launchCall(campaign.id, { phone: dial, firstName: firstName || undefined, targetId });
+      if (res.status === 'setup_required') {
+        setLaunchMsg({ kind: 'warn', text: `Retell not configured. Missing: ${res.missing.join(', ')}.` });
+      } else if (res.status === 'launched') {
+        setLaunchMsg({ kind: 'ok', text: `Call launched${res.mock ? ' (mock)' : ''} — call id ${res.callId}.` });
+        setPhone('');
+        await reloadDetail();
+        onChanged();
+      }
+    } catch (e) {
+      setLaunchMsg({ kind: 'err', text: e instanceof Error ? e.message : 'Call failed to launch.' });
+    } finally {
+      setLaunching(false);
+    }
+  }
+
+  const configured = status?.configured ?? false;
+
+  return (
+    <div className="space-y-5">
+      <div className="cc-card p-5 space-y-3">
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-bold text-t1">{campaign.name}</h3>
+          <span className="badge badge-blue">{campaign.status}</span>
+        </div>
+        <p className="text-xs text-t3 whitespace-pre-wrap">{campaign.script}</p>
+        <div className="flex flex-wrap gap-1.5">
+          {campaign.requiredFields.map(f => <span key={f} className="badge badge-violet">{f}</span>)}
+          <span className="badge badge-blue">{campaign.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE' ? 'Direct booking' : 'Request only'}</span>
+        </div>
+      </div>
+
+      {/* Launch test call */}
+      <div className="cc-card p-5 space-y-3">
+        <h4 className="text-sm font-bold text-t1 flex items-center gap-2"><PhoneCall className="w-4 h-4 text-indigo" /> Launch a call</h4>
+        {!configured && (
+          <div className="flex items-center gap-2 rounded-lg border border-amber-v/40 bg-amber-v/5 px-3 py-2 text-xs text-amber-v">
+            <AlertCircle className="w-4 h-4" /> Retell isn’t configured — launching returns a setup-required notice instead of placing a call.
+          </div>
+        )}
+        <div className="grid grid-cols-[1fr_1fr_auto] gap-2 items-end">
+          <Field label="Phone number"><TextInput value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 010 0000" /></Field>
+          <Field label="First name (optional)"><TextInput value={firstName} onChange={e => setFirstName(e.target.value)} placeholder="Jordan" /></Field>
+          <button type="button" disabled={launching || !phone} onClick={() => launch()} className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50 h-[38px]">
+            {launching ? <Loader2 className="w-4 h-4 animate-spin" /> : <PhoneOutgoing className="w-4 h-4" />} Call
+          </button>
+        </div>
+        {launchMsg && (
+          <p className={`text-xs ${launchMsg.kind === 'ok' ? 'text-emerald-v' : launchMsg.kind === 'warn' ? 'text-amber-v' : 'text-red-v'}`}>{launchMsg.text}</p>
+        )}
+      </div>
+
+      {/* Targets */}
+      <TargetList campaign={campaign} targets={targets} onAdded={reloadDetail} onCall={(t) => launch(t.id, t.phone)} canCall={!launching} />
+
+      {/* Call logs */}
+      <div className="cc-card p-5">
+        <h4 className="text-sm font-bold text-t1 mb-3 flex items-center gap-2"><Activity className="w-4 h-4 text-indigo" /> Call logs</h4>
+        {logs.length === 0 ? <p className="text-xs text-t3">No calls placed yet.</p> : (
+          <div className="space-y-1.5">
+            {logs.map(l => (
+              <div key={l.id} className="flex items-center justify-between rounded-lg border border-[var(--b1)] px-3 py-2 text-xs">
+                <div className="flex items-center gap-2">
+                  <span className={outcomeBadge[l.outcome] ?? 'badge badge-blue'}>{l.outcome}</span>
+                  <span className="text-t2">{l.callerName || l.callerPhone || '—'}</span>
+                </div>
+                <span className="text-t3 font-mono text-[10px]">{l.retellCallId ?? 'no call id'}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign: OutboundCampaign; targets: CallTarget[]; onAdded: () => void; onCall: (t: CallTarget) => void; canCall: boolean }) {
+  const [phone, setPhone] = useState('');
+  const [first, setFirst] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function add() {
+    if (!phone) return;
+    setBusy(true);
+    try {
+      await api.addTargets(campaign.id, [{ phone, firstName: first || undefined }]);
+      setPhone(''); setFirst('');
+      onAdded();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="cc-card p-5 space-y-3">
+      <h4 className="text-sm font-bold text-t1 flex items-center gap-2"><Phone className="w-4 h-4 text-indigo" /> Target list ({targets.length})</h4>
+      <div className="grid grid-cols-[1fr_1fr_auto] gap-2 items-end">
+        <Field label="Phone"><TextInput value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 010 0001" /></Field>
+        <Field label="First name"><TextInput value={first} onChange={e => setFirst(e.target.value)} placeholder="Optional" /></Field>
+        <button type="button" disabled={busy || !phone} onClick={add} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50 h-[38px]"><Plus className="w-4 h-4" /> Add</button>
+      </div>
+      {targets.length > 0 && (
+        <div className="space-y-1.5">
+          {targets.map(t => (
+            <div key={t.id} className="flex items-center justify-between rounded-lg border border-[var(--b1)] px-3 py-2 text-xs">
+              <div className="flex items-center gap-2">
+                <span className="badge badge-blue">{t.status}</span>
+                <span className="text-t2">{[t.firstName, t.lastName].filter(Boolean).join(' ') || t.phone}</span>
+                <span className="text-t3">{t.phone}</span>
+              </div>
+              <button type="button" disabled={!canCall} onClick={() => onCall(t)} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 font-semibold text-indigo hover:bg-[var(--s2)] disabled:opacity-50">
+                <PhoneOutgoing className="w-3 h-3" /> Call
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BookingRequestQueue({ requests, onChanged }: { requests: BookingRequest[]; onChanged: () => void }) {
+  async function update(id: string, status: BookingRequestStatus) {
+    await api.updateBookingRequest(id, { status });
+    onChanged();
+  }
+  return (
+    <div className="cc-card p-5">
+      <h3 className="text-sm font-bold text-t1 mb-3 flex items-center gap-2"><CalendarClock className="w-4 h-4 text-indigo" /> Appointment requests ({requests.length})</h3>
+      {requests.length === 0 ? <p className="text-xs text-t3">No appointment requests collected yet. They appear here after calls complete.</p> : (
+        <div className="space-y-2">
+          {requests.map(r => (
+            <div key={r.id} className="rounded-lg border border-[var(--b1)] px-3 py-2.5">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className={requestBadge[r.status]}>{r.status.replace('_', ' ')}</span>
+                  <span className="text-sm text-t1 font-semibold truncate">{r.collectedName || r.collectedPhone || 'Unknown contact'}</span>
+                  {r.requestedService && <span className="text-xs text-t3 truncate">· {r.requestedService}</span>}
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  {r.status === 'PENDING_REVIEW' && (
+                    <>
+                      <button type="button" onClick={() => update(r.id, 'BOOKED')} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-emerald-v hover:bg-[var(--s2)]">Mark booked</button>
+                      <button type="button" onClick={() => update(r.id, 'REJECTED')} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--s2)]">Reject</button>
+                    </>
+                  )}
+                </div>
+              </div>
+              <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-t3">
+                {r.requestedDateTime && <span>{new Date(r.requestedDateTime).toLocaleString()}</span>}
+                {r.collectedPhone && <span>{r.collectedPhone}</span>}
+                {r.missingFields.length > 0 && <span className="text-amber-v">Missing: {r.missingFields.join(', ')}</span>}
+                {r.outcomeReason && <span className="italic">{r.outcomeReason}</span>}
+              </div>
             </div>
           ))}
         </div>

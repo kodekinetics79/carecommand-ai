@@ -6,14 +6,16 @@ import { db } from '../lib/db';
 import { audit } from '../lib/audit';
 import { assertBranchAccess } from '../lib/scope';
 import { requireRoles } from '../plugins/roles';
+import { requireFeature } from '../lib/entitlements';
 import { runWithTenantContext } from '../lib/tenantContext';
+import { recordWorkflowEvent } from '../lib/intelligence';
 import type { Prisma } from '../generated/prisma/client';
 
 // --- Idempotency -----------------------------------------------------------
 // Claims a unique (scope,key). Returns claimed=false on redelivery, exposing
 // the original resultId so callers can return the first result instead of
 // creating a duplicate record.
-async function claimIdempotency(scope: string, key: string, tenantId?: string): Promise<{ claimed: boolean; resultId: string | null }> {
+export async function claimIdempotency(scope: string, key: string, tenantId?: string): Promise<{ claimed: boolean; resultId: string | null }> {
   try {
     await db.idempotencyKey.create({ data: { scope, key, tenantId } });
     return { claimed: true, resultId: null };
@@ -53,7 +55,7 @@ function verifyStripeSignature(rawBody: Buffer | undefined, signatureHeader: str
   return timingSafeEqual(expectedBuffer, signatureBuffer);
 }
 
-type ProviderMode = 'mock' | 'sandbox' | 'live';
+export type ProviderMode = 'mock' | 'sandbox' | 'live';
 type EligibilityPayload = {
   [key: string]: unknown;
   benefitsInformation?: Record<string, unknown> | Record<string, unknown>[];
@@ -86,6 +88,8 @@ const listLimit = z.object({
 
 const editRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK');
 const adminRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
+// Payments & deposits routes additionally require the payments_deposits entitlement.
+const paymentsFeature = requireFeature('payments_deposits');
 
 type RevenueContext = {
   tenantId: string;
@@ -130,7 +134,7 @@ type EligibilityCheckContext = RevenueContext & {
   };
 };
 
-type PaymentRequestContext = RevenueContext & {
+export type PaymentRequestContext = RevenueContext & {
   amount: number;
   reason: string;
   patient?: {
@@ -204,7 +208,7 @@ type EligibilityOutcome = {
   storeRawResponse: boolean;
 };
 
-type PaymentOutcome = {
+export type PaymentOutcome = {
   amount: number;
   currency: string;
   status: string;
@@ -870,7 +874,7 @@ function createInsuranceProvider() {
   }
 }
 
-function createPaymentProvider() {
+export function createPaymentProvider() {
   switch (env.PAYMENT_PROVIDER) {
     case 'stripe':
       return env.STRIPE_SECRET_KEY ? new StripePaymentProvider() : new MockPaymentProvider();
@@ -1919,7 +1923,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     });
   });
 
-  app.get('/payments', async request => {
+  app.get('/payments', { preHandler: paymentsFeature }, async request => {
     const query = listLimit.parse(request.query);
     const filter = branchFilter(request, query.branchId);
     const [paymentRequests, paymentTransactions, depositRequirements] = await Promise.all([
@@ -1951,7 +1955,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     };
   });
 
-  app.post('/payment/request', { preHandler: editRoles }, async (request, reply) => {
+  app.post('/payment/request', { preHandler: [paymentsFeature, editRoles] }, async (request, reply) => {
     const body = z.object({
       branchId: uuid.optional(),
       patientId: uuid.optional(),
@@ -2113,7 +2117,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     });
   });
 
-  app.post('/payment-link', { preHandler: editRoles }, async (request, reply) => {
+  app.post('/payment-link', { preHandler: [paymentsFeature, editRoles] }, async (request, reply) => {
     const body = z.object({
       branchId: uuid.optional(),
       patientId: uuid.optional(),
@@ -2231,7 +2235,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     });
   });
 
-  app.patch('/payment/:id/status', { preHandler: editRoles }, async (request, reply) => {
+  app.patch('/payment/:id/status', { preHandler: [paymentsFeature, editRoles] }, async (request, reply) => {
     const params = z.object({ id: uuid }).parse(request.params);
     const body = z.object({
       status: z.string().min(2).max(80),
@@ -2288,7 +2292,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
   // `revenueProtectionWebhookRoutes` (registered outside the authenticated
   // scope, since Stripe cannot present a JWT).
 
-  app.get('/deposit-rules', async request => {
+  app.get('/deposit-rules', { preHandler: paymentsFeature }, async request => {
     const query = listLimit.parse(request.query);
     const filter = branchFilter(request, query.branchId);
     const rows = await runWithTenantContext(request.auth.tenantId, tx => tx.depositRule.findMany({
@@ -2300,7 +2304,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     return { depositRules: rows.map(mapDepositRule) };
   });
 
-  app.post('/deposit-rules', { preHandler: adminRoles }, async (request, reply) => {
+  app.post('/deposit-rules', { preHandler: [paymentsFeature, adminRoles] }, async (request, reply) => {
     const body = z.object({
       branchId: uuid.optional(),
       name: z.string().min(2).max(160),
@@ -2347,7 +2351,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     return reply.code(201).send(mapDepositRule(row));
   });
 
-  app.patch('/deposit-rules/:id', { preHandler: adminRoles }, async (request, reply) => {
+  app.patch('/deposit-rules/:id', { preHandler: [paymentsFeature, adminRoles] }, async (request, reply) => {
     const params = z.object({ id: uuid }).parse(request.params);
     const body = z.object({
       branchId: uuid.optional(),
@@ -2384,7 +2388,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     return reply.send(mapDepositRule(row));
   });
 
-  app.patch('/deposit-requirements/:id/status', { preHandler: editRoles }, async (request, reply) => {
+  app.patch('/deposit-requirements/:id/status', { preHandler: [paymentsFeature, editRoles] }, async (request, reply) => {
     const params = z.object({ id: uuid }).parse(request.params);
     const body = z.object({
       status: z.string().min(2).max(80),
@@ -2542,8 +2546,14 @@ export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
       return reply.code(200).send({ received: true });
     }
 
+    // Audit receipt of the verified webhook (no PHI — ids + event type only).
+    await db.auditEvent.create({ data: { tenantId: paymentRequest.tenantId, action: 'payment.webhook.received', resource: 'paymentRequest', resourceId: paymentRequest.id, ipAddress: request.ip, metadata: { eventId: event.id, type: event.type } } }).catch(() => {});
+
     const succeeded = ['checkout.session.completed', 'payment_intent.succeeded', 'charge.succeeded'].includes(event.type)
       || object.payment_status === 'paid';
+    const failed = ['payment_intent.payment_failed', 'charge.failed'].includes(event.type);
+    const expired = ['checkout.session.expired', 'payment_link.expired'].includes(event.type);
+
     if (succeeded) {
       await db.$transaction([
         db.paymentTransaction.create({
@@ -2563,6 +2573,11 @@ export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
           },
         }),
         db.paymentRequest.update({ where: { id: paymentRequest.id }, data: { status: 'collected' } }),
+        // Appointment Checkout: settle the linked deposit requirement(s).
+        db.depositRequirement.updateMany({
+          where: { tenantId: paymentRequest.tenantId, paymentRequestId: paymentRequest.id, status: { notIn: ['collected', 'waived'] } },
+          data: { status: 'collected', collectedAmount: paymentRequest.amount, collectedAt: new Date() },
+        }),
         db.integrationRunLog.create({
           data: {
             tenantId: paymentRequest.tenantId,
@@ -2576,6 +2591,37 @@ export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
           },
         }),
       ]);
+      await db.auditEvent.create({ data: { tenantId: paymentRequest.tenantId, action: 'payment.succeeded', resource: 'paymentRequest', resourceId: paymentRequest.id, metadata: { eventId: event.id, appointmentId: paymentRequest.appointmentId } } }).catch(() => {});
+      await recordWorkflowEvent(paymentRequest.tenantId, { eventType: 'payment.succeeded', entityType: 'paymentRequest', entityId: paymentRequest.id, sourceModule: 'payments', payload: { appointmentId: paymentRequest.appointmentId } });
+    } else if (failed || expired) {
+      const newStatus = failed ? 'failed' : 'expired';
+      await db.paymentRequest.update({ where: { id: paymentRequest.id }, data: { status: newStatus } });
+      // Surface to revenue protection: a follow-up task + an alert so unpaid /
+      // failed deposits become visible operational risk (no fake recovery value).
+      await db.staffTask.create({
+        data: {
+          tenantId: paymentRequest.tenantId, branchId: paymentRequest.branchId,
+          title: failed ? 'Review failed deposit payment' : 'Resend expired deposit link',
+          priority: failed ? 'high' : 'normal', status: 'OPEN',
+          metadata: { source: 'payment_webhook', paymentRequestId: paymentRequest.id, appointmentId: paymentRequest.appointmentId, event: event.type },
+        },
+      }).catch(() => {});
+      if (paymentRequest.appointmentId || paymentRequest.patientId) {
+        await runWithTenantContext(paymentRequest.tenantId, tx => tx.revenueProtectionAlert.create({
+          data: {
+            tenantId: paymentRequest.tenantId, branchId: paymentRequest.branchId,
+            patientId: paymentRequest.patientId ?? undefined, appointmentId: paymentRequest.appointmentId ?? undefined,
+            sourceType: 'deposit_payment', severity: failed ? 'high' : 'medium',
+            title: failed ? 'Deposit payment failed' : 'Deposit link expired unpaid',
+            description: failed ? 'A patient deposit payment failed and needs follow-up.' : 'A deposit payment link expired before payment.',
+            estimatedValue: paymentRequest.amount, status: 'open',
+            recommendedAction: failed ? 'Contact the patient and resend a payment link.' : 'Resend a fresh deposit payment link.',
+            actionLink: paymentRequest.appointmentId ? `appointment/${paymentRequest.appointmentId}` : null,
+          },
+        })).catch(() => {});
+      }
+      await db.auditEvent.create({ data: { tenantId: paymentRequest.tenantId, action: failed ? 'payment.failed' : 'payment.expired', resource: 'paymentRequest', resourceId: paymentRequest.id, metadata: { eventId: event.id, type: event.type } } }).catch(() => {});
+      await recordWorkflowEvent(paymentRequest.tenantId, { eventType: failed ? 'payment.failed' : 'payment.expired', entityType: 'paymentRequest', entityId: paymentRequest.id, sourceModule: 'payments', payload: { appointmentId: paymentRequest.appointmentId } });
     }
 
     return reply.code(200).send({ received: true });

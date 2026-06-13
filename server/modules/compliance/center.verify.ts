@@ -11,6 +11,7 @@ import { randomUUID } from 'node:crypto';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '../../generated/prisma/client';
 import { buildApp } from '../../app';
+import { recomputeEntitlements } from '../../lib/entitlements';
 
 const ownerUrl = process.env.DATABASE_MIGRATION_URL ?? process.env.DATABASE_URL;
 const ownerDb = new PrismaClient({ adapter: new PrismaPg({ connectionString: ownerUrl }) });
@@ -23,22 +24,46 @@ function check(label: string, ok: boolean) {
 
 const TENANT_A = process.env.DEV_TENANT_ID ?? '11111111-1111-4111-8111-111111111111';
 const TENANT_B = randomUUID();
+// Isolated tenant for truthful-state reporting assertions (MFA/backup/scans).
+// Using a dedicated tenant with a known user/policy set makes the derived
+// adoption/enforcement values deterministic instead of relying on the shared
+// dev tenant's accumulated data.
+const TENANT_RPT = randomUUID();
 
 type Body = Record<string, unknown> | undefined;
 
 async function main() {
   // Fixtures: Tenant B + users in A and B.
   await ownerDb.tenant.create({ data: { id: TENANT_B, name: 'C1B Tenant B', slug: `c1b-${TENANT_B.slice(0, 8)}` } });
+  // Tenant B needs the compliance entitlement to exercise its own routes (the
+  // compliance surface is feature-gated). Mirror the dev tenant's Enterprise plan.
+  const enterprise = await ownerDb.subscriptionPlan.findUnique({ where: { key: 'enterprise' } });
+  if (enterprise) {
+    await ownerDb.tenantSubscription.create({ data: { tenantId: TENANT_B, planId: enterprise.id, status: 'ACTIVE', startedAt: new Date() } });
+    await recomputeEntitlements(TENANT_B);
+  }
   const bEvidence = await ownerDb.complianceEvidence.create({ data: { tenantId: TENANT_B, title: 'B-only evidence' } });
 
-  const mkUser = (tenantId: string, role: string) =>
-    ownerDb.user.create({ data: { tenantId, role: role as never, email: `${role.toLowerCase()}-${randomUUID().slice(0, 8)}@c1b.test`, displayName: `${role} user`, active: true } });
+  // Isolated reporting tenant: entitlement + a known security policy + exactly
+  // two active users (one MFA-enrolled) → deterministic 50% adoption, MFA
+  // enforced. This proves the reports derive truthfully from real users/policy.
+  await ownerDb.tenant.create({ data: { id: TENANT_RPT, name: 'Rpt Tenant', slug: `rpt-${TENANT_RPT.slice(0, 8)}` } });
+  if (enterprise) {
+    await ownerDb.tenantSubscription.create({ data: { tenantId: TENANT_RPT, planId: enterprise.id, status: 'ACTIVE', startedAt: new Date() } });
+    await recomputeEntitlements(TENANT_RPT);
+  }
+  await ownerDb.tenantSecurityPolicy.create({ data: { tenantId: TENANT_RPT, requireMfa: true, failedLoginLockout: false, passwordExpiryDays: null } });
+
+  const mkUser = (tenantId: string, role: string, extra: Record<string, unknown> = {}) =>
+    ownerDb.user.create({ data: { tenantId, role: role as never, email: `${role.toLowerCase()}-${randomUUID().slice(0, 8)}@c1b.test`, displayName: `${role} user`, active: true, ...extra } });
   const owner = await mkUser(TENANT_A, 'OWNER');
   const officerA = await mkUser(TENANT_A, 'COMPLIANCE_OFFICER');
   const auditorA = await mkUser(TENANT_A, 'AUDITOR');
   const normalA = await mkUser(TENANT_A, 'FRONT_DESK');
   const officerB = await mkUser(TENANT_B, 'COMPLIANCE_OFFICER');
-  const createdUserIds = [owner.id, officerA.id, auditorA.id, normalA.id, officerB.id];
+  const rptOwner = await mkUser(TENANT_RPT, 'OWNER', { mfaEnabled: false });
+  const rptEnrolled = await mkUser(TENANT_RPT, 'FRONT_DESK', { mfaEnabled: true });
+  const createdUserIds = [owner.id, officerA.id, auditorA.id, normalA.id, officerB.id, rptOwner.id, rptEnrolled.id];
 
   const app = await buildApp();
   const token = (u: { id: string; tenantId: string; role: string }) => app.jwt.sign({ userId: u.id, tenantId: u.tenantId, role: u.role, type: 'access' });
@@ -99,24 +124,30 @@ async function main() {
   check('AuditEvent recorded for evidence.created', !!auditCreate);
   check('AuditEvent recorded for evidence.deleted', !!auditDelete);
 
-  // 9) Dashboard truthful percentages.
-  const dash = (await call('GET', '/dashboard', owner)).json;
+  // 9) Dashboard truthful percentages + truthful MFA state (isolated tenant).
+  // After Auth Hardening Phase A, MFA is INTEGRATED; adoption/enforcement are
+  // derived from real users/policy. Asserted against TENANT_RPT (2 users, 1
+  // enrolled, policy requires MFA) so the values are deterministic, not stale.
+  const dash = (await call('GET', '/dashboard', rptOwner)).json;
   const pctOk = [dash.soc2ReadinessPct, dash.hipaaAlignmentPct, dash.internalBaselinePct, dash.overallReadinessScore].every((p: number) => typeof p === 'number' && p >= 0 && p <= 100);
   check('dashboard scores are valid percentages', pctOk);
-  check('dashboard MFA truthfully not enforced', dash.mfaStatus?.enforced === false && dash.mfaStatus?.integrated === false);
-  check('dashboard backup truthfully unverified', dash.backupStatus?.integrated === false);
+  check('dashboard MFA integrated + truthfully derived (enforced, 50% of 2 users)',
+    dash.mfaStatus?.integrated === true && dash.mfaStatus?.enforced === true && dash.mfaStatus?.adoptionPct === 50 && dash.mfaStatus?.enrolledUsers === 1 && dash.mfaStatus?.totalUsers === 2);
+  check('dashboard backup truthfully unverified (not integrated)', dash.backupStatus?.integrated === false);
 
-  // 10) Reports show truthful not-integrated where applicable.
-  const mfa = (await call('GET', '/reports/mfa', owner)).json;
-  check('MFA report not_integrated', mfa.integrated === false && mfa.status === 'not_integrated' && mfa.adoptionPct === 0);
-  const backup = (await call('GET', '/reports/backup-status', owner)).json;
+  // 10) Reports reflect the real product state: MFA integrated (derived),
+  // other un-integrated systems still truthfully not_integrated.
+  const mfa = (await call('GET', '/reports/mfa', rptOwner)).json;
+  check('MFA report integrated + derived (enforced, 1/2 enrolled = 50%)',
+    mfa.integrated === true && mfa.status === 'integrated' && mfa.enforced === true && mfa.adoptionPct === 50 && mfa.mfaEnabledUsers === 1 && mfa.totalUsers === 2);
+  const backup = (await call('GET', '/reports/backup-status', rptOwner)).json;
   check('backup report unverified/not-integrated', backup.integrated === false);
-  const scans = (await call('GET', '/reports/security-scans', owner)).json;
+  const scans = (await call('GET', '/reports/security-scans', rptOwner)).json;
   check('security-scans report not_integrated', scans.integrated === false && scans.status === 'not_integrated');
-  const deploy = (await call('GET', '/reports/deployment-history', owner)).json;
+  const deploy = (await call('GET', '/reports/deployment-history', rptOwner)).json;
   check('deployment-history not_integrated (schema migrations proxy)', deploy.integrated === false && Array.isArray(deploy.schemaMigrations));
-  const pwd = (await call('GET', '/reports/password-policy', owner)).json;
-  check('password-policy truthful (no expiry/lockout/history)', pwd.expiryDays === null && pwd.lockoutEnabled === false && pwd.historyEnforced === false);
+  const pwd = (await call('GET', '/reports/password-policy', rptOwner)).json;
+  check('password-policy truthful (policy-derived: no expiry/lockout/history)', pwd.expiryDays === null && pwd.lockoutEnabled === false && pwd.historyEnforced === false);
 
   // Cleanup.
   await app.close();
@@ -131,7 +162,9 @@ async function main() {
   } catch {
     await ownerDb.user.updateMany({ where: { id: { in: createdUserIds } }, data: { active: false } });
   }
+  await ownerDb.tenantSecurityPolicy.deleteMany({ where: { tenantId: TENANT_RPT } }).catch(() => {});
   await ownerDb.tenant.delete({ where: { id: TENANT_B } }).catch(() => {});
+  await ownerDb.tenant.delete({ where: { id: TENANT_RPT } }).catch(() => {});
   await ownerDb.$disconnect();
 
   console.log(`\n${failures === 0 ? 'ALL C-1B API CHECKS PASSED' : `${failures} CHECK(S) FAILED`}`);

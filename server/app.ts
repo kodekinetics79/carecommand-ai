@@ -24,9 +24,14 @@ import { complianceCenterRoutes } from './modules/compliance/center';
 import { settingsRoutes, adminRoutes, securityRoutes } from './modules/settings/routes';
 import { advisoryRoutes } from './modules/advisory/routes';
 import { revenueProtectionRoutes, revenueProtectionWebhookRoutes } from './modules/revenue-protection';
+import { paymentsCheckoutRoutes, paymentsPublicRoutes } from './modules/payments/checkout';
+import { serviceCatalogRoutes } from './modules/services/routes';
 import { controlPlaneRoutes } from './modules/control-plane/routes';
 import { insuranceRoutes } from './modules/insurance/routes';
 import { receptionistRoutes, receptionistWebhookRoutes } from './modules/receptionist/routes';
+import { subscriptionRoutes } from './modules/subscriptions/routes';
+import { onboardingRoutes } from './modules/onboarding/routes';
+import { platformRoutes } from './modules/platform/routes';
 import { autopilotQueue } from './workers/queues';
 
 // Webhook signature verification (Stripe/Retell) needs the exact bytes that were
@@ -123,6 +128,12 @@ export async function buildApp() {
   // Stripe posts payment events here without a JWT; the handler verifies the
   // Stripe signature and attributes the tenant via the matched payment request.
   await app.register(revenueProtectionWebhookRoutes, { prefix: '/v1/revenue-protection' });
+  // Patient-safe, tokenized public checkout status (no JWT, no guessable ids).
+  await app.register(paymentsPublicRoutes, { prefix: '/v1/payments' });
+  // Platform operator + onboarding APIs: gated by the platform token (NOT a
+  // tenant JWT), so they live outside the tenant-authenticated scope.
+  await app.register(onboardingRoutes, { prefix: '/v1/onboarding' });
+  await app.register(platformRoutes, { prefix: '/v1/platform' });
 
   await app.register(async protectedApi => {
     protectedApi.addHook('preHandler', protectedApi.authenticate);
@@ -131,6 +142,7 @@ export async function buildApp() {
     await protectedApi.register(staffRoutes, { prefix: '/staff' });
     await protectedApi.register(patientRoutes, { prefix: '/patients' });
     await protectedApi.register(appointmentRoutes, { prefix: '/appointments' });
+    await protectedApi.register(serviceCatalogRoutes, { prefix: '/services' });
     await protectedApi.register(autopilotRoutes, { prefix: '/autopilot' });
     await protectedApi.register(telehealthRoutes, { prefix: '/telehealth' });
     await protectedApi.register(complianceRoutes, { prefix: '/compliance' });
@@ -141,8 +153,10 @@ export async function buildApp() {
     await protectedApi.register(controlPlaneRoutes, { prefix: '/control-plane' });
     await protectedApi.register(advisoryRoutes, { prefix: '/advisory' });
     await protectedApi.register(revenueProtectionRoutes, { prefix: '/revenue-protection' });
+    await protectedApi.register(paymentsCheckoutRoutes, { prefix: '/payments' });
     await protectedApi.register(insuranceRoutes, { prefix: '/insurance' });
     await protectedApi.register(receptionistRoutes, { prefix: '/receptionist' });
+    await protectedApi.register(subscriptionRoutes, { prefix: '/subscriptions' });
     await protectedApi.register(operationsRoutes);
     await protectedApi.register(dashboardRoutes);
   }, { prefix: '/v1' });

@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { CalendarDays, Sparkles, Zap, AlertCircle, CheckCircle2, Clock, Users, DollarSign, ArrowRight, RefreshCw } from 'lucide-react';
+import { CalendarDays, Sparkles, Zap, AlertCircle, CheckCircle2, Clock, Users, DollarSign, ArrowRight, RefreshCw, CreditCard } from 'lucide-react';
+import AppointmentPaymentCard from '../components/payments/AppointmentPaymentCard';
+import PaymentRequestsPanel from '../components/payments/PaymentRequestsPanel';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
@@ -60,6 +62,7 @@ export default function Scheduling() {
   const { data: patientRecords } = useApiResource<ApiPatient, typeof patients[number]>('/v1/patients?limit=100', patients, mapPatient);
 
   const [showBooking, setShowBooking] = useState(false);
+  const [paymentApptId, setPaymentApptId] = useState<string | null>(null);
   const [booking, setBooking] = useState(emptyBooking);
   const [saving, setSaving] = useState(false);
   const [bookingError, setBookingError] = useState<string | null>(null);
@@ -322,7 +325,15 @@ export default function Scheduling() {
                             <Zap className="w-2.5 h-2.5" /> Send reminder
                           </button>
                         )}
+                        <button type="button" onClick={() => setPaymentApptId(prev => (prev === appt.id ? null : appt.id))} className="inline-flex items-center gap-1 text-[10px] font-semibold text-t2 bg-[var(--s2)] border border-[var(--b1)] px-2 py-0.5 rounded-full hover:bg-[var(--s3)] transition-colors">
+                          <CreditCard className="w-2.5 h-2.5" /> {paymentApptId === appt.id ? 'Hide deposit' : 'Deposit'}
+                        </button>
                       </div>
+                      {paymentApptId === appt.id && (
+                        <div className="mt-2.5">
+                          <AppointmentPaymentCard appointmentId={appt.id} />
+                        </div>
+                      )}
                     </div>
                   </div>
                 );
@@ -333,6 +344,9 @@ export default function Scheduling() {
 
         {/* Right sidebar */}
         <div className="space-y-4">
+          {/* Deposit payment requests queue */}
+          <PaymentRequestsPanel />
+
           {/* AI Slot-Filling Panel */}
           <BentoCard title="AI Slot-Filling Engine" subtitle="Optimisation recommendations" headerRight={<Sparkles className="w-4 h-4 text-violet-v" />}>
             <div className="space-y-3">

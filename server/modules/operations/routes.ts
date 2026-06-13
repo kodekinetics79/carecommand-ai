@@ -6,6 +6,7 @@ import { audit } from '../../lib/audit';
 import { assertBranchAccess, branchScope } from '../../lib/scope';
 import { requireRoles } from '../../plugins/roles';
 import { runWithTenantContext } from '../../lib/tenantContext';
+import { requireFeature } from '../../lib/entitlements';
 
 const channel = z.enum(['WHATSAPP', 'SMS', 'EMAIL', 'PUSH', 'CALL', 'VIDEO']);
 const uuid = z.string().uuid();
@@ -186,6 +187,15 @@ const integrationCatalog: IntegrationCatalogEntry[] = [
     envVars: ['AI_PROVIDER', 'CLAUDE_API_KEY', 'CLAUDE_BASE_URL', 'CLAUDE_MODEL'],
     providerType: 'ai',
   },
+  {
+    key: 'retell',
+    name: 'Retell AI Voice',
+    category: 'AI Voice',
+    description: 'Outbound AI receptionist voice calls and webhook handoff.',
+    supportedWorkflows: ['Outbound calling', 'Appointment request capture', 'Call webhook handoff'],
+    envVars: ['RETELL_API_KEY', 'RETELL_AGENT_ID', 'RETELL_FROM_NUMBER'],
+    providerType: 'integration',
+  },
 ] as const;
 
 function scopedBranch(request: FastifyRequest, branchId?: string) {
@@ -261,6 +271,11 @@ async function buildIntegrationStatuses(tenantId: string) {
     } else if (entry.key === 'claude') {
       configured = env.AI_PROVIDER === 'claude' && Boolean(env.CLAUDE_API_KEY);
       mode = configured ? 'live' : 'mock';
+      health = configured ? 'healthy' : 'not_configured';
+      lastSyncAt = latestLog?.createdAt.toISOString() ?? null;
+    } else if (entry.key === 'retell') {
+      configured = Boolean(env.RETELL_API_KEY && env.RETELL_AGENT_ID && env.RETELL_FROM_NUMBER);
+      mode = !configured ? 'mock' : env.RETELL_API_KEY!.startsWith('mock') ? 'sandbox' : 'live';
       health = configured ? 'healthy' : 'not_configured';
       lastSyncAt = latestLog?.createdAt.toISOString() ?? null;
     } else if (entry.providerType === 'placeholder') {
@@ -429,11 +444,13 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     return row;
   });
 
-  app.get('/campaigns', async request => {
+  // Campaign automation is feature-gated (campaign_automation entitlement).
+  const campaignFeature = requireFeature('campaign_automation');
+  app.get('/campaigns', { preHandler: campaignFeature }, async request => {
     const { limit } = listLimit.parse(request.query);
     return db.campaign.findMany({ where: { tenantId: request.auth.tenantId }, take: limit, orderBy: { createdAt: 'desc' } });
   });
-  app.post('/campaigns', { preHandler: adminRoles }, async (request, reply) => {
+  app.post('/campaigns', { preHandler: [adminRoles, campaignFeature] }, async (request, reply) => {
     const input = z.object({
       name: z.string().min(2).max(160), goal: z.string().min(2).max(300),
       status: z.enum(['DRAFT', 'ACTIVE', 'PAUSED', 'COMPLETED', 'SCHEDULED']).default('DRAFT'),
@@ -444,7 +461,7 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     await audit(request, { action: 'campaign.created', resource: 'campaign', resourceId: row.id });
     return reply.code(201).send(row);
   });
-  app.patch('/campaigns/:id', { preHandler: adminRoles }, async request => {
+  app.patch('/campaigns/:id', { preHandler: [adminRoles, campaignFeature] }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const input = z.object({
       status: z.enum(['DRAFT', 'ACTIVE', 'PAUSED', 'COMPLETED', 'SCHEDULED']).optional(),
@@ -725,5 +742,78 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     });
     await audit(request, { action: 'conversation.replied', resource: 'conversation', resourceId: row.id });
     return reply.send(updated);
+  });
+
+  // ===== AI-ready operational briefing (RULE-BASED — no LLM) ===============
+  // Real data only: pending requests, unpaid deposits, failed/expired payments,
+  // receptionist handoffs, revenue alerts/tasks, and top rule-based recs.
+  app.get('/briefing', async request => {
+    const tenantId = request.auth.tenantId;
+    const [
+      appointmentRequestsPending, receptionistHandoffPending, unpaidDeposits,
+      failedPayments, expiredPayments, revenueAlertsOpen, openTasks, recommendations, openSignals,
+    ] = await Promise.all([
+      db.appointmentRequest.count({ where: { tenantId, status: 'PENDING_REVIEW' } }),
+      db.appointmentRequest.count({ where: { tenantId, source: 'ai_receptionist', status: { in: ['PENDING_REVIEW', 'MISSING_INFO'] } } }),
+      db.depositRequirement.count({ where: { tenantId, status: { in: ['required', 'requested', 'link_sent'] } } }),
+      db.paymentRequest.count({ where: { tenantId, status: 'failed' } }),
+      db.paymentRequest.count({ where: { tenantId, status: 'expired' } }),
+      runWithTenantContext(tenantId, tx => tx.revenueProtectionAlert.count({ where: { tenantId, status: 'open' } })),
+      db.staffTask.count({ where: { tenantId, status: 'OPEN' } }),
+      db.aIRecommendation.findMany({ where: { tenantId, status: 'pending' }, orderBy: [{ confidence: 'desc' }, { createdAt: 'desc' }], take: 8 }),
+      db.operationalSignal.count({ where: { tenantId, status: 'open' } }),
+    ]);
+    return {
+      label: 'Rule-based morning briefing',
+      generatedAt: new Date().toISOString(),
+      aiProviderConfigured: env.AI_PROVIDER !== 'mock',
+      summary: {
+        appointmentRequestsPending,
+        receptionistHandoffPending,
+        unpaidDeposits,
+        failedPayments,
+        expiredPayments,
+        revenueAlertsOpen,
+        openTasks,
+        openSignals,
+      },
+      topRecommendations: recommendations.map(r => ({
+        id: r.id, title: r.title, recommendationType: r.recommendationType, reason: r.reason,
+        expectedImpact: r.expectedImpact, confidence: r.confidence, requiresHumanReview: r.requiresHumanReview,
+        allowedActionType: r.allowedActionType, createdBy: r.createdBy, status: r.status,
+        deepLinkTarget: `recommendation/${r.id}`,
+      })),
+    };
+  });
+
+  // ===== Operational signals + AI recommendations (read + triage) =========
+  app.get('/signals', async request => {
+    const query = z.object({ status: z.string().optional(), limit: z.coerce.number().int().min(1).max(200).default(100) }).parse(request.query);
+    return db.operationalSignal.findMany({ where: { tenantId: request.auth.tenantId, ...(query.status ? { status: query.status } : {}) }, orderBy: [{ severity: 'desc' }, { createdAt: 'desc' }], take: query.limit });
+  });
+
+  app.get('/recommendations', async request => {
+    const query = z.object({ status: z.string().optional(), limit: z.coerce.number().int().min(1).max(200).default(100) }).parse(request.query);
+    return db.aIRecommendation.findMany({ where: { tenantId: request.auth.tenantId, ...(query.status ? { status: query.status } : {}) }, orderBy: [{ confidence: 'desc' }, { createdAt: 'desc' }], take: query.limit });
+  });
+
+  app.patch('/recommendations/:id', { preHandler: writeRoles }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const input = z.object({ status: z.enum(['pending', 'accepted', 'rejected', 'executed', 'dismissed']) }).parse(request.body);
+    const existing = await db.aIRecommendation.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    if (!existing) throw app.httpErrors.notFound('Recommendation not found');
+    const row = await db.aIRecommendation.update({ where: { id }, data: { status: input.status } });
+    await audit(request, { action: 'aiRecommendation.statusChanged', resource: 'aiRecommendation', resourceId: id, metadata: { status: input.status } });
+    return row;
+  });
+
+  app.patch('/signals/:id', { preHandler: writeRoles }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const input = z.object({ status: z.enum(['open', 'acknowledged', 'resolved', 'dismissed']) }).parse(request.body);
+    const existing = await db.operationalSignal.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    if (!existing) throw app.httpErrors.notFound('Signal not found');
+    const row = await db.operationalSignal.update({ where: { id }, data: { status: input.status } });
+    await audit(request, { action: 'operationalSignal.statusChanged', resource: 'operationalSignal', resourceId: id, metadata: { status: input.status } });
+    return row;
   });
 };

@@ -43,8 +43,12 @@ async function main() {
   check('DB UserRole enum has AUDITOR', labels.has('AUDITOR'));
 
   // 2-5) Per-tenant baseline seeded (and idempotent — exact expected counts).
-  const tenants = await db.tenant.findMany({ select: { id: true } });
-  check('at least one tenant exists', tenants.length > 0);
+  // Scope to the seeded dev tenant: ephemeral verify-script tenants (which can't
+  // be deleted once they have append-only AuditEvents) would otherwise pollute
+  // an "all tenants" assertion.
+  const devTenantId = process.env.DEV_TENANT_ID ?? '11111111-1111-4111-8111-111111111111';
+  const tenants = await db.tenant.findMany({ where: { id: devTenantId }, select: { id: true } });
+  check('dev tenant exists', tenants.length === 1);
   for (const t of tenants) {
     const [fw, ctrl, pol, ret] = await Promise.all([
       db.complianceFramework.count({ where: { tenantId: t.id } }),

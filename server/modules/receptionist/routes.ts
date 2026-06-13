@@ -5,6 +5,7 @@ import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { env } from '../../config/env';
 import { requireRoles } from '../../plugins/roles';
+import { requireFeature } from '../../lib/entitlements';
 import {
   generateSystemPrompt,
   generateSamples,
@@ -13,6 +14,8 @@ import {
   type PromptIntakeField,
   type PromptBookingRules,
 } from './promptService';
+import { outboundRoutes } from './outbound';
+import { runBookingHandoff } from './handoff';
 
 const uuid = z.string().uuid();
 const idParam = z.object({ id: uuid });
@@ -122,6 +125,10 @@ async function loadCampaign(tenantId: string, campaignId: string) {
 }
 
 export const receptionistRoutes: FastifyPluginAsync = async app => {
+  // Feature gate: the entire authenticated AI receptionist surface requires the
+  // ai_receptionist entitlement (the public Retell webhook is a separate plugin).
+  app.addHook('preHandler', requireFeature('ai_receptionist'));
+
   // ===== Clinics ==========================================================
   const clinicCreate = z.object({
     name: z.string().trim().min(2).max(160),
@@ -567,6 +574,10 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
       avgDurationSeconds: avgDuration,
     };
   });
+
+  // ===== Outbound calling (campaigns, targets, launch, booking queue) =====
+  // Registered here so it inherits the ai_receptionist feature gate above.
+  await app.register(outboundRoutes);
 };
 
 // --- Idempotency + signature helpers for the public webhook ----------------
@@ -650,6 +661,19 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
 
     if (!tenantId) return reply.code(202).send({ ok: true, ignored: true });
 
+    // Audit receipt of the (verified) webhook. No PHI — call id + event only.
+    await db.auditEvent.create({
+      data: {
+        tenantId,
+        action: 'receptionist.webhook.received',
+        resource: 'receptionistWebhook',
+        resourceId: call.call_id,
+        ipAddress: request.ip,
+        userAgent: typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : undefined,
+        metadata: { event: body.event ?? null },
+      },
+    }).catch(() => {});
+
     const analysis = call.call_analysis ?? {};
     const custom = (analysis.custom_analysis_data ?? {}) as Record<string, unknown>;
     const outcomeRaw = String(custom.outcome ?? '').toUpperCase();
@@ -697,6 +721,9 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     // Opt-out and booking writes are guarded by the call id so webhook
     // redelivery cannot create duplicate records.
     const idempotencyAnchor = call.call_id ?? `${call.from_number ?? 'unknown'}:${body.event ?? 'event'}`;
+    // Outbound campaign calls are owned by the booking handoff below (new
+    // AppointmentRequest workflow); only studio calls use the legacy request.
+    const isOutbound = !!existingCall?.outboundCampaignId;
 
     if (outcome === 'OPTED_OUT' && (call.from_number || custom.email)) {
       if (await claimWebhookIdempotency('retell.optout', `${tenantId}:${idempotencyAnchor}`, tenantId)) {
@@ -706,7 +733,7 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       }
     }
 
-    if (outcome === 'BOOKED') {
+    if (outcome === 'BOOKED' && !isOutbound) {
       if (await claimWebhookIdempotency('retell.booking', `${tenantId}:${idempotencyAnchor}`, tenantId)) {
         await db.receptionistAppointmentRequest.create({
           data: {
@@ -722,6 +749,20 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
             source: 'retell',
           },
         });
+      }
+    }
+
+    // Outbound campaign calls run the booking handoff: link/create patient or
+    // lead, create an AppointmentRequest, and book only when safe. The handoff
+    // is a no-op for studio (non-outbound) calls and is idempotent on call id.
+    if (call.call_id && ended) {
+      try {
+        const result = await runBookingHandoff(call.call_id, custom);
+        if (result.handled && result.reason !== 'duplicate_webhook') {
+          request.log.info({ status: result.status }, 'Receptionist booking handoff completed');
+        }
+      } catch (error) {
+        request.log.error({ err: error }, 'Receptionist booking handoff failed');
       }
     }
 

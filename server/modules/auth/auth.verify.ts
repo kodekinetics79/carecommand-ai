@@ -13,6 +13,7 @@ import { PrismaClient } from '../../generated/prisma/client';
 import { buildApp } from '../../app';
 import { generatePasswordHash, decryptSecret } from '../../lib/security';
 import { generateTotp } from '../../lib/totp';
+import { recomputeEntitlements } from '../../lib/entitlements';
 
 const ownerDb = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_MIGRATION_URL ?? process.env.DATABASE_URL }) });
 let fail = 0;
@@ -25,6 +26,10 @@ async function main() {
   await ownerDb.tenant.create({ data: { id: tB, name: 'Auth B', slug: `authb-${tB.slice(0, 8)}` } });
   await ownerDb.tenantSecurityPolicy.create({ data: { tenantId: tA, failedLoginLockout: true, requireMfa: false, sessionTimeoutMinutes: 30 } });
   await ownerDb.tenantSecurityPolicy.create({ data: { tenantId: tB, failedLoginLockout: false, requireMfa: true, sessionTimeoutMinutes: 15 } });
+  // Give tenant A an Enterprise subscription so the compliance reports (now
+  // feature-gated by compliance_readiness) are reachable for the report checks.
+  const enterprisePlan = await ownerDb.subscriptionPlan.findUnique({ where: { key: 'enterprise' } });
+  if (enterprisePlan) { await ownerDb.tenantSubscription.create({ data: { tenantId: tA, planId: enterprisePlan.id, status: 'ACTIVE', startedAt: new Date() } }); await recomputeEntitlements(tA); }
   const hash = await generatePasswordHash(PW);
   const mkUser = (tenantId: string, tag: string) => ownerDb.user.create({ data: { tenantId, role: 'ADMIN', email: `${tag}-${randomUUID().slice(0, 8)}@auth.test`, displayName: tag, active: true, passwordHash: hash, passwordChangedAt: new Date() } });
   const uValid = await mkUser(tA, 'valid');

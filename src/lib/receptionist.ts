@@ -173,6 +173,113 @@ export interface Overview {
   avgDurationSeconds: number;
 }
 
+// --- Outbound calling (Phase A) --------------------------------------------
+
+export type OutboundRequiredField =
+  | 'firstName' | 'lastName' | 'phone' | 'email' | 'preferredBranch' | 'preferredService' | 'preferredDateTime';
+
+export type OutboundCampaignStatus = 'DRAFT' | 'SCHEDULED' | 'RUNNING' | 'PAUSED' | 'COMPLETED' | 'FAILED';
+export type OutboundBookingMode = 'APPOINTMENT_REQUEST_ONLY' | 'DIRECT_BOOKING_IF_SLOT_AVAILABLE';
+export type CallTargetStatus = 'PENDING' | 'CALLING' | 'COMPLETED' | 'FAILED' | 'OPTED_OUT';
+export type BookingRequestStatus = 'PENDING_REVIEW' | 'BOOKED' | 'REJECTED' | 'MISSING_INFO' | 'DUPLICATE';
+
+export const OUTBOUND_REQUIRED_FIELDS: Array<{ key: OutboundRequiredField; label: string }> = [
+  { key: 'firstName', label: 'First name' },
+  { key: 'lastName', label: 'Last name' },
+  { key: 'phone', label: 'Phone' },
+  { key: 'email', label: 'Email' },
+  { key: 'preferredBranch', label: 'Preferred branch' },
+  { key: 'preferredService', label: 'Preferred service' },
+  { key: 'preferredDateTime', label: 'Preferred date/time' },
+];
+
+export interface RetellStatus {
+  configured: boolean;
+  mock: boolean;
+  missing: string[];
+  checklist: Array<{ key: string; label: string; set: boolean }>;
+}
+
+export interface OutboundCampaign {
+  id: string;
+  clinicId: string;
+  agentId: string | null;
+  name: string;
+  script: string;
+  requiredFields: OutboundRequiredField[];
+  customQuestions: unknown;
+  consentText: string | null;
+  humanHandoffInstruction: string | null;
+  bookingMode: OutboundBookingMode;
+  defaultBranchId: string | null;
+  defaultService: string | null;
+  quietHoursStart: string | null;
+  quietHoursEnd: string | null;
+  maxRetryAttempts: number;
+  status: OutboundCampaignStatus;
+  createdAt: string;
+  updatedAt: string;
+  targets?: CallTarget[];
+  _count?: { targets: number; callLogs: number };
+}
+
+export interface CallTarget {
+  id: string;
+  campaignId: string;
+  patientId: string | null;
+  leadId: string | null;
+  firstName: string | null;
+  lastName: string | null;
+  phone: string;
+  email: string | null;
+  status: CallTargetStatus;
+  attempts: number;
+  lastOutcome: string | null;
+  createdAt: string;
+}
+
+export interface BookingRequest {
+  id: string;
+  branchId: string | null;
+  patientId: string | null;
+  leadId: string | null;
+  campaignId: string | null;
+  callLogId: string | null;
+  requestedService: string | null;
+  requestedDateTime: string | null;
+  collectedName: string | null;
+  collectedPhone: string | null;
+  collectedEmail: string | null;
+  status: BookingRequestStatus;
+  source: string;
+  missingFields: string[];
+  outcomeReason: string | null;
+  bookedAppointmentId: string | null;
+  createdAt: string;
+}
+
+export type LaunchCallResult =
+  | { status: 'launched'; callId: string; callLogId: string; mock: boolean }
+  | { status: 'setup_required'; missing: string[] }
+  | { status: 'failed'; error: string; callLogId?: string };
+
+export interface OutboundCampaignInput {
+  clinicId: string;
+  agentId?: string | null;
+  name: string;
+  script: string;
+  requiredFields?: OutboundRequiredField[];
+  consentText?: string | null;
+  humanHandoffInstruction?: string | null;
+  bookingMode?: OutboundBookingMode;
+  defaultBranchId?: string | null;
+  defaultService?: string | null;
+  quietHoursStart?: string | null;
+  quietHoursEnd?: string | null;
+  maxRetryAttempts?: number;
+  status?: OutboundCampaignStatus;
+}
+
 // --- Field catalog (UI metadata) -------------------------------------------
 
 export const FIELD_CATALOG: Array<{ type: FieldType; label: string; question: string; group: string; hasOptions?: boolean }> = [
@@ -270,4 +377,20 @@ export const receptionistApi = {
   listOptOuts: () => apiRequest<OptOut[]>(`${base}/opt-outs`),
   createOptOut: (body: Partial<OptOut> & { clinicId?: string }) => apiRequest<OptOut>(`${base}/opt-outs`, { method: 'POST', body: JSON.stringify(body) }),
   deleteOptOut: (id: string) => apiRequest<void>(`${base}/opt-outs/${id}`, { method: 'DELETE' }),
+
+  // --- Outbound calling ----------------------------------------------------
+  retellStatus: () => apiRequest<RetellStatus>(`${base}/retell-status`),
+  listOutboundCampaigns: (clinicId?: string) => apiRequest<OutboundCampaign[]>(`${base}/outbound-campaigns${clinicId ? `?clinicId=${clinicId}` : ''}`),
+  getOutboundCampaign: (id: string) => apiRequest<OutboundCampaign>(`${base}/outbound-campaigns/${id}`),
+  createOutboundCampaign: (body: OutboundCampaignInput) => apiRequest<OutboundCampaign>(`${base}/outbound-campaigns`, { method: 'POST', body: JSON.stringify(body) }),
+  updateOutboundCampaign: (id: string, body: Partial<OutboundCampaignInput>) => apiRequest<OutboundCampaign>(`${base}/outbound-campaigns/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  listTargets: (campaignId: string) => apiRequest<CallTarget[]>(`${base}/outbound-campaigns/${campaignId}/targets`),
+  addTargets: (campaignId: string, targets: Array<Partial<CallTarget> & { phone: string }>) =>
+    apiRequest<{ added: number }>(`${base}/outbound-campaigns/${campaignId}/targets`, { method: 'POST', body: JSON.stringify({ targets }) }),
+  launchCall: (campaignId: string, body: { phone: string; firstName?: string; lastName?: string; email?: string; targetId?: string }) =>
+    apiRequest<LaunchCallResult>(`${base}/outbound-campaigns/${campaignId}/call`, { method: 'POST', body: JSON.stringify(body) }),
+  listOutboundCallLogs: (campaignId: string) => apiRequest<CallLog[]>(`${base}/outbound-campaigns/${campaignId}/call-logs`),
+  listBookingRequests: (status?: BookingRequestStatus) => apiRequest<BookingRequest[]>(`${base}/booking-requests${status ? `?status=${status}` : ''}`),
+  updateBookingRequest: (id: string, body: { status?: BookingRequestStatus; outcomeReason?: string }) =>
+    apiRequest<BookingRequest>(`${base}/booking-requests/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
 };

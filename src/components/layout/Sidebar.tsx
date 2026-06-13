@@ -2,9 +2,21 @@ import { useLocation, Link, useNavigate } from 'react-router-dom';
 import {
   LayoutDashboard, Radar, Users2, Megaphone, TrendingUp,
   CalendarDays, ClipboardList, Puzzle, Settings,
-  Star, ChevronDown, Hexagon, Orbit, Target, UserCircle2, ShieldCheck, Sparkles, BadgeCheck, Bot, FileText,
+  Star, ChevronDown, Hexagon, Orbit, Target, UserCircle2, ShieldCheck, Sparkles, BadgeCheck, Bot, FileText, CreditCard, Lock,
 } from 'lucide-react';
 import { useSession } from '../../hooks/useSession';
+import { useEntitlements } from '../../hooks/useEntitlements';
+
+// Nav paths gated by a subscription feature. Locked items show a lock and route
+// to /subscription (backend still enforces access regardless of the UI).
+const NAV_FEATURE: Record<string, string> = {
+  '/receptionist-studio': 'ai_receptionist',
+  '/ai-receptionist': 'ai_receptionist',
+  '/campaigner': 'campaign_automation',
+  '/compliance': 'compliance_readiness',
+  '/insurance': 'insurance_eligibility',
+  '/revenue-protection': 'revenue_protection',
+};
 
 interface NavItem {
   label: string;
@@ -63,6 +75,7 @@ const nav: NavSection[] = [
     items: [
       { label: 'Control Plane', path: '/control-plane', icon: ShieldCheck },
       { label: 'Compliance Readiness', path: '/compliance', icon: FileText, badge: 'New', badgeColor: 'indigo' },
+      { label: 'Subscription',  path: '/subscription', icon: CreditCard },
       { label: 'Integrations',  path: '/integrations', icon: Puzzle },
       { label: 'Settings',      path: '/settings',     icon: Settings },
     ],
@@ -79,6 +92,7 @@ export default function Sidebar() {
   const { pathname } = useLocation();
   const navigate = useNavigate();
   const { user } = useSession();
+  const entitlements = useEntitlements();
   const isAdmin = user ? ['OWNER', 'ADMIN'].includes(user.role) : false;
   // Compliance Readiness Center is visible only to compliance roles; normal
   // users (manager/provider/front-desk/billing/analyst) never see it.
@@ -121,6 +135,17 @@ export default function Sidebar() {
             {section.items.map((item) => {
               const isActive = item.path === '/' ? pathname === '/' : pathname.startsWith(item.path);
               const Icon = item.icon;
+              const feature = NAV_FEATURE[item.path];
+              const locked = !!feature && entitlements !== null && !entitlements.has(feature);
+              if (locked) {
+                return (
+                  <Link key={item.path} to="/subscription" title={`${item.label} requires a plan upgrade or add-on`} className="nav-item opacity-60">
+                    <Icon className="w-[15px] h-[15px] shrink-0 text-t3" />
+                    <span className="flex-1 truncate">{item.label}</span>
+                    <Lock className="w-3 h-3 shrink-0 text-t3" />
+                  </Link>
+                );
+              }
               return (
                 <Link key={item.path} to={item.path} className={`nav-item ${isActive ? 'active' : ''}`}>
                   <Icon className={`w-[15px] h-[15px] shrink-0 ${isActive ? 'text-indigo' : 'text-t3'}`} />

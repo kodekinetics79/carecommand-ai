@@ -5,6 +5,7 @@ import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { env } from '../../config/env';
 import { requireRoles } from '../../plugins/roles';
+import { requireFeature } from '../../lib/entitlements';
 import type { Prisma } from '../../generated/prisma/client';
 
 const PASSWORD_MIN_LENGTH = env.PASSWORD_MIN_LENGTH;
@@ -70,6 +71,10 @@ function tenant(request: FastifyRequest) {
 }
 
 export const complianceCenterRoutes: FastifyPluginAsync = async app => {
+  // Feature gate: the Compliance Readiness Center requires the
+  // compliance_readiness entitlement (in addition to the per-route RBAC below).
+  app.addHook('preHandler', requireFeature('compliance_readiness'));
+
   // ===== Dashboard =========================================================
   app.get('/dashboard', { preHandler: complianceRead }, async request => {
     const tenantId = tenant(request);

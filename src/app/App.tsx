@@ -28,6 +28,8 @@ const Labs = lazy(() => import('../pages/Labs'));
 const Telehealth = lazy(() => import('../pages/Telehealth'));
 const ComplianceCenter = lazy(() => import('../pages/ComplianceCenter'));
 const Integrations = lazy(() => import('../pages/Integrations'));
+const Subscription = lazy(() => import('../pages/Subscription'));
+const Platform = lazy(() => import('../pages/Platform'));
 const Settings = lazy(() => import('../pages/Settings'));
 const ControlPlane = lazy(() => import('../pages/ControlPlane'));
 
@@ -158,6 +160,9 @@ export default function App() {
           <Route path="/compliance" element={<ComplianceRoute />} />
           <Route path="/compliance/:section" element={<ComplianceRoute />} />
           <Route path="/integrations" element={<Integrations />} />
+          <Route path="/subscription" element={<Subscription />} />
+          {/* Operator-only console — gated by a platform token, not a tenant role; not in the sidebar. */}
+          <Route path="/platform" element={<Platform />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/control-plane" element={<AdminRoute />} />
           <Route path="/admin" element={<AdminRoute />} />
