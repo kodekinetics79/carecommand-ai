@@ -142,6 +142,7 @@ interface FinanceRail {
 interface SystemHealth {
   apiStatus: string;
   databaseStatus: string;
+  dbLatencyMs: number | null;
   migrationStatus: string;
   latestMigration: string | null;
   authStatus: string;
@@ -995,7 +996,7 @@ export default function ControlPlane() {
         <div className="space-y-4">
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <StatCard title="API" value={systemHealth.apiStatus} subtitle="Service status" icon={<ServerCog className="w-4 h-4" />} accent="blue" />
-            <StatCard title="Database" value={systemHealth.databaseStatus} subtitle="Connectivity" icon={<Database className="w-4 h-4" />} accent="emerald" />
+            <StatCard title="Database" value={systemHealth.databaseStatus} subtitle={systemHealth.dbLatencyMs != null ? `${systemHealth.dbLatencyMs}ms latency` : 'Connectivity'} icon={<Database className="w-4 h-4" />} accent={systemHealth.databaseStatus === 'healthy' ? 'emerald' : 'red'} />
             <StatCard title="Auth" value={systemHealth.authStatus} subtitle="Secrets and sessions" icon={<Lock className="w-4 h-4" />} accent="violet" />
             <StatCard title="Environment" value={systemHealth.environmentMode} subtitle="Running mode" icon={<Globe2 className="w-4 h-4" />} accent="amber" />
           </div>

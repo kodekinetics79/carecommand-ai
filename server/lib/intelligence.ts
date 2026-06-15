@@ -24,7 +24,11 @@ export type WorkflowEventType =
   | 'campaign.created' | 'campaign.approved' | 'campaign.scheduled' | 'campaign.launched'
   | 'campaign.delivery.sent' | 'campaign.delivery.failed' | 'campaign.delivery.suppressed' | 'campaign.completed'
   | 'patient.reactivation.recommended' | 'no_show.recovery.recommended' | 'unpaid_deposit.followup.recommended'
-  | 'failed_payment.followup.recommended' | 'insurance_update.followup.recommended' | 'review_request.recommended' | 'empty_slot.fill.recommended';
+  | 'failed_payment.followup.recommended' | 'insurance_update.followup.recommended' | 'review_request.recommended' | 'empty_slot.fill.recommended'
+  // Patient Intake + Consent engine events.
+  | 'intake.packet.created' | 'intake.packet.sent' | 'intake.packet.started' | 'intake.section.completed'
+  | 'intake.packet.submitted' | 'intake.packet.reviewed' | 'intake.consent.accepted' | 'intake.consent.declined'
+  | 'intake.insurance.updated' | 'intake.estimate.acknowledged' | 'intake.gap_detected';
 
 interface EventInput {
   eventType: WorkflowEventType;

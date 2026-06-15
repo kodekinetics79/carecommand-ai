@@ -26,13 +26,22 @@ import { advisoryRoutes } from './modules/advisory/routes';
 import { revenueProtectionRoutes, revenueProtectionWebhookRoutes } from './modules/revenue-protection';
 import { paymentsCheckoutRoutes, paymentsPublicRoutes } from './modules/payments/checkout';
 import { serviceCatalogRoutes } from './modules/services/routes';
-import { crmRoutes } from './modules/campaigns/routes';
+import { crmRoutes, crmWebhookRoutes } from './modules/campaigns/routes';
+import { intakeRoutes, intakePublicRoutes } from './modules/intake/routes';
 import { controlPlaneRoutes } from './modules/control-plane/routes';
 import { insuranceRoutes } from './modules/insurance/routes';
+import { deviceRoutes } from './modules/devices/routes';
+import { monitoringRoutes } from './modules/monitoring/routes';
+import { connectedCareRoutes, connectedCareWebhookRoutes } from './modules/connected-care/routes';
+import { aiRoutes } from './modules/ai/routes';
 import { receptionistRoutes, receptionistWebhookRoutes } from './modules/receptionist/routes';
 import { subscriptionRoutes } from './modules/subscriptions/routes';
 import { onboardingRoutes } from './modules/onboarding/routes';
 import { platformRoutes } from './modules/platform/routes';
+import { platformAuthRoutes } from './modules/platform/auth';
+import { portalAuthRoutes } from './modules/portal/auth';
+import { portalRoutes } from './modules/portal/routes';
+import { portalAdminRoutes } from './modules/portal/admin';
 import { autopilotQueue } from './workers/queues';
 
 // Webhook signature verification (Stripe/Retell) needs the exact bytes that were
@@ -87,10 +96,16 @@ export async function buildApp() {
   if (!rateLimitRedis && env.NODE_ENV === 'production') {
     app.log.error('Rate limiter falling back to in-memory store in production: Redis unreachable');
   }
+  const isProd = env.NODE_ENV === 'production';
   await app.register(rateLimit, {
-    max: 200,
+    // The app shell (sidebar badges, topbar, dashboard widgets) fans out many
+    // parallel calls per navigation, so a low global ceiling trips 429s during
+    // normal/demo use. Keep production strict; give dev plenty of headroom.
+    max: isProd ? 200 : 2000,
     timeWindow: '1 minute',
     ...(rateLimitRedis ? { redis: rateLimitRedis } : {}),
+    // In non-production, never rate-limit loopback (local demos/tests).
+    ...(isProd ? {} : { allowList: ['127.0.0.1', '::1'] }),
     // Never fail a request because the rate-limit store hiccups; fail open.
     skipOnError: true,
     nameSpace: 'cc-ratelimit:',
@@ -129,12 +144,24 @@ export async function buildApp() {
   // Stripe posts payment events here without a JWT; the handler verifies the
   // Stripe signature and attributes the tenant via the matched payment request.
   await app.register(revenueProtectionWebhookRoutes, { prefix: '/v1/revenue-protection' });
+  await app.register(connectedCareWebhookRoutes, { prefix: '/v1/connected-care' });
   // Patient-safe, tokenized public checkout status (no JWT, no guessable ids).
   await app.register(paymentsPublicRoutes, { prefix: '/v1/payments' });
+  // Placeholder comms delivery webhook (no provider integrated; never fakes state).
+  await app.register(crmWebhookRoutes, { prefix: '/v1/crm' });
+  // Patient-facing intake via hashed, expiring, packet-scoped token (no JWT).
+  await app.register(intakePublicRoutes, { prefix: '/v1/intake' });
   // Platform operator + onboarding APIs: gated by the platform token (NOT a
   // tenant JWT), so they live outside the tenant-authenticated scope.
   await app.register(onboardingRoutes, { prefix: '/v1/onboarding' });
+  // Platform Admin auth (PlatformUser identity) — separate from tenant auth.
+  await app.register(platformAuthRoutes, { prefix: '/v1/platform/auth' });
   await app.register(platformRoutes, { prefix: '/v1/platform' });
+
+  // Patient / Client Portal — separate identity; portal JWT (type:'portal')
+  // cannot access staff APIs and staff JWT cannot access these.
+  await app.register(portalAuthRoutes, { prefix: '/v1/portal/auth' });
+  await app.register(portalRoutes, { prefix: '/v1/portal' });
 
   await app.register(async protectedApi => {
     protectedApi.addHook('preHandler', protectedApi.authenticate);
@@ -145,6 +172,7 @@ export async function buildApp() {
     await protectedApi.register(appointmentRoutes, { prefix: '/appointments' });
     await protectedApi.register(serviceCatalogRoutes, { prefix: '/services' });
     await protectedApi.register(crmRoutes, { prefix: '/crm' });
+    await protectedApi.register(intakeRoutes, { prefix: '/intake' });
     await protectedApi.register(autopilotRoutes, { prefix: '/autopilot' });
     await protectedApi.register(telehealthRoutes, { prefix: '/telehealth' });
     await protectedApi.register(complianceRoutes, { prefix: '/compliance' });
@@ -157,6 +185,11 @@ export async function buildApp() {
     await protectedApi.register(revenueProtectionRoutes, { prefix: '/revenue-protection' });
     await protectedApi.register(paymentsCheckoutRoutes, { prefix: '/payments' });
     await protectedApi.register(insuranceRoutes, { prefix: '/insurance' });
+    await protectedApi.register(deviceRoutes, { prefix: '/devices' });
+    await protectedApi.register(monitoringRoutes, { prefix: '/monitoring' });
+    await protectedApi.register(connectedCareRoutes, { prefix: '/connected-care' });
+    await protectedApi.register(aiRoutes, { prefix: '/ai' });
+    await protectedApi.register(portalAdminRoutes, { prefix: '/portal-admin' });
     await protectedApi.register(receptionistRoutes, { prefix: '/receptionist' });
     await protectedApi.register(subscriptionRoutes, { prefix: '/subscriptions' });
     await protectedApi.register(operationsRoutes);

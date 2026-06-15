@@ -24,8 +24,15 @@ const envSchema = z.object({
   CORS_ORIGINS: z.string().default('http://localhost:12000'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
   AI_PROVIDER: z.enum(['mock', 'ollama', 'openai', 'claude']).default('mock'),
+  OLLAMA_MODE: z.enum(['local', 'cloud']).default('local'),
   OLLAMA_BASE_URL: z.string().url().default('http://localhost:11434'),
+  OLLAMA_API_KEY: z.string().optional(),
   OLLAMA_MODEL: z.string().default('llama3.1'),
+  OLLAMA_DEFAULT_MODEL: z.string().default('llama3.1'),
+  // Governance: keep PHI out of AI by default; cap daily spend; gate sensitive actions.
+  AI_ENABLE_PHI: z.coerce.boolean().default(false),
+  AI_COST_BUDGET_DAILY_USD: z.coerce.number().nonnegative().default(5),
+  AI_REQUIRE_HUMAN_APPROVAL: z.coerce.boolean().default(true),
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_BASE_URL: z.string().url().default('https://api.openai.com/v1'),
   OPENAI_MODEL: z.string().default('gpt-4.1-mini'),
@@ -47,6 +54,14 @@ const envSchema = z.object({
   TWILIO_ACCOUNT_SID: z.string().optional(),
   TWILIO_AUTH_TOKEN: z.string().optional(),
   TWILIO_FROM_NUMBER: z.string().optional(),
+  TWILIO_BASE_URL: z.string().url().default('https://api.twilio.com'),
+  // Optional HTTP email API (e.g. SendGrid) so email can really send without an
+  // SMTP TCP library. If unset, email stays configured_pending_provider.
+  EMAIL_HTTP_API_URL: z.string().url().optional(),
+  EMAIL_HTTP_API_KEY: z.string().optional(),
+  EMAIL_FROM_ADDRESS: z.string().optional(),
+  // Signing secret for the campaign delivery/status webhook (provider callbacks).
+  CAMPAIGN_WEBHOOK_SECRET: z.string().optional(),
   SMTP_HOST: z.string().optional(),
   SMTP_USER: z.string().optional(),
   SMTP_PASS: z.string().optional(),
@@ -66,6 +81,11 @@ const envSchema = z.object({
   // this token on /v1/platform/* and /v1/onboarding/*. In non-production a dev
   // default is allowed; production MUST set a strong token.
   PLATFORM_API_TOKEN: z.string().optional(),
+  // Platform Admin Console: first PLATFORM_OWNER is seeded ONLY from these env
+  // vars (no weak default in production). Static token above is legacy/dev-only.
+  PLATFORM_OWNER_EMAIL: z.string().optional(),
+  PLATFORM_OWNER_NAME: z.string().optional(),
+  PLATFORM_OWNER_PASSWORD: z.string().optional(),
   TRIAL_DAYS: z.coerce.number().int().min(1).max(365).default(14),
 });
 

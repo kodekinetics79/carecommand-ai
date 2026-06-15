@@ -97,9 +97,22 @@ export const DELIVERY_STATUS_META: Record<string, { label: string; badge: string
   failed: { label: 'Failed', badge: 'badge-red' },
 };
 
+export interface ProviderReadiness {
+  smsConfigured: boolean;
+  emailConfigured: boolean;
+  voiceConfigured: boolean;
+  providerMode: Record<string, 'unconfigured' | 'mock_dev' | 'configured_pending_provider' | 'live_supported'>;
+  missingEnvKeys: string[];
+  supportedChannels: string[];
+  unsupportedChannels: string[];
+  schedulerEnforced: boolean;
+  liveSendingSupported: boolean;
+}
+
 const base = '/v1/crm';
 
 export const crmApi = {
+  providerStatus: () => apiRequest<ProviderReadiness>(`${base}/provider-status`),
   listCampaigns: () => apiRequest<Campaign[]>(`${base}/campaigns`),
   getCampaign: (id: string) => apiRequest<Campaign>(`${base}/campaigns/${id}`),
   createCampaign: (body: { name: string; campaignType: CampaignType; audienceType?: AudienceType; channel?: CommChannel }) =>
@@ -110,6 +123,9 @@ export const crmApi = {
   launch: (id: string, force = false) => apiRequest<LaunchResult>(`${base}/campaigns/${id}/launch`, { method: 'POST', body: JSON.stringify({ force }) }),
   pause: (id: string) => apiRequest<Campaign>(`${base}/campaigns/${id}/pause`, { method: 'POST' }),
   cancel: (id: string) => apiRequest<Campaign>(`${base}/campaigns/${id}/cancel`, { method: 'POST' }),
+  updateCampaign: (id: string, body: { name?: string; messageSubject?: string; messageTemplate?: string; channel?: CommChannel; scheduledAt?: string }) =>
+    apiRequest<Campaign>(`${base}/campaigns/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  deleteCampaign: (id: string) => apiRequest<void>(`${base}/campaigns/${id}`, { method: 'DELETE' }),
   listDeliveries: (id: string) => apiRequest<CampaignDelivery[]>(`${base}/campaigns/${id}/deliveries`),
   listSuppressions: () => apiRequest<Array<{ id: string; channel: string; reason: string; patientId: string | null }>>(`${base}/suppressions`),
 };

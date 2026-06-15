@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Megaphone, Plus, Loader2, Users, ShieldAlert, Send, CheckCircle2, Pause, Sparkles, AlertCircle } from 'lucide-react';
+import { Megaphone, Plus, Loader2, Users, ShieldAlert, Send, CheckCircle2, Pause, Sparkles, AlertCircle, Pencil, Trash2, Ban, X, Save } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import {
   crmApi, AUDIENCE_TYPES, CAMPAIGN_TYPES, CAMPAIGN_STATUS_META, DELIVERY_STATUS_META,
@@ -77,7 +77,7 @@ export default function CampaignEngine() {
 
           <div className="space-y-5">
             {creating && <CampaignCreator onCancel={() => setCreating(false)} onCreated={async (id) => { setCreating(false); await reload(); setSelectedId(id); }} />}
-            {!creating && selected && <CampaignDetail key={selected.id} campaign={selected} onChanged={reload} />}
+            {!creating && selected && <CampaignDetail key={selected.id} campaign={selected} onChanged={reload} onDeleted={async () => { setSelectedId(''); await reload(); }} />}
             {!creating && !selected && <div className="cc-card p-10 text-center text-sm text-t3">Select or create a campaign.</div>}
           </div>
         </div>
@@ -129,7 +129,7 @@ function CampaignCreator({ onCreated, onCancel }: { onCreated: (id: string) => v
   );
 }
 
-function CampaignDetail({ campaign, onChanged }: { campaign: Campaign; onChanged: () => void }) {
+function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign; onChanged: () => void; onDeleted: () => void }) {
   const [preview, setPreview] = useState<AudiencePreview | null>(null);
   const [draft, setDraft] = useState<CampaignDraft | null>(null);
   const [launch, setLaunch] = useState<LaunchResult | null>(null);
@@ -137,6 +137,8 @@ function CampaignDetail({ campaign, onChanged }: { campaign: Campaign; onChanged
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   const meta = CAMPAIGN_STATUS_META[campaign.status] ?? { label: campaign.status, badge: 'badge-blue' };
   const audienceType = (campaign.audienceType ?? 'inactive_patients') as AudienceType;
@@ -201,7 +203,26 @@ function CampaignDetail({ campaign, onChanged }: { campaign: Campaign; onChanged
           {actions.includes('pause') && (
             <button type="button" disabled={busy} onClick={() => run(async () => { await crmApi.pause(campaign.id); onChanged(); })} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50"><Pause className="w-3.5 h-3.5" /> Pause</button>
           )}
+          {actions.includes('edit') && (
+            <button type="button" disabled={busy} onClick={() => { setEditing(v => !v); setError(null); setNotice(null); }} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50"><Pencil className="w-3.5 h-3.5" /> {editing ? 'Close editor' : 'Edit'}</button>
+          )}
+          {actions.includes('cancel') && (
+            <button type="button" disabled={busy} onClick={() => run(async () => { await crmApi.cancel(campaign.id); setNotice('Campaign cancelled.'); onChanged(); })} className="inline-flex items-center gap-1.5 rounded-lg border border-amber-v/30 text-amber-v px-2.5 py-1.5 text-[11px] font-semibold hover:bg-amber-v/5 disabled:opacity-50"><Ban className="w-3.5 h-3.5" /> Cancel campaign</button>
+          )}
+          <button type="button" disabled={busy} onClick={() => setConfirmDelete(true)} className="inline-flex items-center gap-1.5 rounded-lg border border-red-v/30 text-red-v px-2.5 py-1.5 text-[11px] font-semibold hover:bg-red-v/5 disabled:opacity-50"><Trash2 className="w-3.5 h-3.5" /> Delete</button>
         </div>
+        {confirmDelete && (
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-red-v/30 bg-red-v/5 px-3 py-2 text-[11px]">
+            <span className="text-red-v font-semibold">Delete “{campaign.name}” and its delivery log? This cannot be undone.</span>
+            <span className="flex gap-1.5 shrink-0">
+              <button type="button" disabled={busy} onClick={() => run(async () => { await crmApi.deleteCampaign(campaign.id); onDeleted(); })} className="rounded-md bg-red-v px-2.5 py-1 font-semibold text-white hover:opacity-90 disabled:opacity-50">Delete</button>
+              <button type="button" onClick={() => setConfirmDelete(false)} className="rounded-md border border-[var(--b1)] px-2.5 py-1 font-semibold text-t2 hover:bg-[var(--s2)]">Keep</button>
+            </span>
+          </div>
+        )}
+        {editing && (
+          <CampaignEditForm campaign={campaign} onSaved={() => { setEditing(false); setNotice('Changes saved.'); onChanged(); }} onError={setError} />
+        )}
         {draft && (
           <div className="rounded-lg border border-amber-v/30 bg-amber-v/5 p-2.5 text-[11px] text-t2 space-y-1">
             <p className="font-semibold text-t1">Draft ({draft.draftSource}) — requires approval</p>
@@ -247,6 +268,52 @@ function CampaignDetail({ campaign, onChanged }: { campaign: Campaign; onChanged
             })}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function CampaignEditForm({ campaign, onSaved, onError }: { campaign: Campaign; onSaved: () => void; onError: (msg: string | null) => void }) {
+  const [name, setName] = useState(campaign.name);
+  const [subject, setSubject] = useState(campaign.messageSubject ?? '');
+  const [template, setTemplate] = useState(campaign.messageTemplate ?? '');
+  const [channel, setChannel] = useState<CommChannel>((campaign.channel ?? 'sms') as CommChannel);
+  const [saving, setSaving] = useState(false);
+
+  async function save() {
+    setSaving(true); onError(null);
+    try {
+      await crmApi.updateCampaign(campaign.id, {
+        name: name.trim(),
+        messageSubject: subject.trim() || undefined,
+        messageTemplate: template.trim() || undefined,
+        channel,
+      });
+      onSaved();
+    } catch (e) {
+      onError(e instanceof Error ? e.message : 'Failed to save changes');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const inputCls = 'w-full rounded-lg border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-sm text-t1 outline-none focus:border-indigo';
+  return (
+    <div className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] p-3 space-y-3">
+      <p className="text-[11px] font-bold uppercase tracking-wide text-t3">Edit campaign</p>
+      <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Name</span>
+        <input className={inputCls} value={name} onChange={e => setName(e.target.value)} /></label>
+      <div className="grid grid-cols-2 gap-3">
+        <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Message subject (email)</span>
+          <input className={inputCls} value={subject} onChange={e => setSubject(e.target.value)} placeholder="Optional" /></label>
+        <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Channel</span>
+          <select aria-label="Channel" className={inputCls} value={channel} onChange={e => setChannel(e.target.value as CommChannel)}>{CHANNELS.map(c => <option key={c} value={c}>{c}</option>)}</select></label>
+      </div>
+      <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Message template</span>
+        <textarea className={`${inputCls} min-h-[80px] resize-y`} value={template} onChange={e => setTemplate(e.target.value)} placeholder="Hi {{firstName}}, …" /></label>
+      <div className="flex gap-2">
+        <button type="button" disabled={saving || name.trim().length < 2} onClick={save} className="inline-flex items-center gap-1.5 rounded-lg bg-indigo px-3 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 disabled:opacity-50">{saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />} Save changes</button>
+        <button type="button" onClick={() => onSaved()} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)]"><X className="w-3.5 h-3.5" /> Close</button>
       </div>
     </div>
   );

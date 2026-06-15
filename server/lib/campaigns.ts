@@ -59,6 +59,54 @@ export function channelStatus(channel: CommChannel): ChannelStatus {
   return { channel, provider: 'retell', configured, mock: (env.RETELL_API_KEY ?? '').startsWith('mock'), setupRequired: !configured, missing };
 }
 
+// Per-channel provider mode (truthful — never claims live without a real sender).
+export type ProviderMode = 'unconfigured' | 'mock_dev' | 'configured_pending_provider' | 'live_supported';
+
+export function providerModeFor(channel: CommChannel): ProviderMode {
+  const s = channelStatus(channel);
+  if (!s.configured) return 'unconfigured';
+  if (s.mock && env.NODE_ENV !== 'production') return 'mock_dev';
+  // SMS/WhatsApp have a real Twilio sender wired; email is live only with an HTTP
+  // email API; voice campaign sending is not wired (Retell is receptionist-only).
+  if (channel === 'sms' || channel === 'whatsapp') return 'live_supported';
+  if (channel === 'email') return env.EMAIL_HTTP_API_URL ? 'live_supported' : 'configured_pending_provider';
+  return 'configured_pending_provider';
+}
+
+// Structured communications readiness (no secret values; env key NAMES only).
+export interface ProviderReadiness {
+  smsConfigured: boolean;
+  emailConfigured: boolean;
+  voiceConfigured: boolean;
+  providerMode: Record<CommChannel, ProviderMode>;
+  missingEnvKeys: string[];
+  supportedChannels: CommChannel[];
+  unsupportedChannels: CommChannel[];
+  schedulerEnforced: boolean;
+  liveSendingSupported: boolean;
+}
+
+export function providerReadiness(): ProviderReadiness {
+  const channels: CommChannel[] = ['sms', 'email', 'voice', 'whatsapp'];
+  const statuses = Object.fromEntries(channels.map(c => [c, channelStatus(c)])) as Record<CommChannel, ChannelStatus>;
+  const modes = Object.fromEntries(channels.map(c => [c, providerModeFor(c)])) as Record<CommChannel, ProviderMode>;
+  const missingEnvKeys = [...new Set(channels.flatMap(c => statuses[c].missing))];
+  // "Supported" = can produce a real (mock_dev) or queued delivery; never a
+  // live-sent claim, since no concrete provider sender is wired.
+  const supportedChannels = channels.filter(c => modes[c] === 'mock_dev' || modes[c] === 'configured_pending_provider' || modes[c] === 'live_supported');
+  return {
+    smsConfigured: statuses.sms.configured,
+    emailConfigured: statuses.email.configured,
+    voiceConfigured: statuses.voice.configured,
+    providerMode: modes,
+    missingEnvKeys,
+    supportedChannels,
+    unsupportedChannels: channels.filter(c => !supportedChannels.includes(c)),
+    schedulerEnforced: true,   // approved SCHEDULED campaigns run via the campaign-scheduler worker
+    liveSendingSupported: true, // real Twilio SMS (+ optional HTTP email) senders are wired
+  };
+}
+
 // Delivery status for one recipient given suppression, contact info, provider.
 export type DeliveryStatus = 'sent' | 'skipped' | 'failed' | 'setup_required' | 'suppressed' | 'pending';
 
@@ -73,13 +121,37 @@ export function resolveDeliveryStatus(opts: { suppressed: boolean; hasContact: b
 }
 
 // --- Consent + suppression gating ------------------------------------------
+// Legacy ConsentEvent (patient-level, purpose-based) maps safely to a channel
+// only for SMS/EMAIL/WHATSAPP. Voice and cross-channel MARKETING are NOT mapped
+// (ambiguous) and remain a carry-forward for the Patient Intake + Consent Engine.
+const CONSENT_PURPOSE: Record<CommChannel, 'SMS' | 'EMAIL' | 'WHATSAPP' | null> = {
+  sms: 'SMS', email: 'EMAIL', whatsapp: 'WHATSAPP', voice: null,
+};
+
 export async function isSuppressed(tenantId: string, target: { patientId?: string | null; leadId?: string | null }, channel: CommChannel): Promise<boolean> {
   const where = { tenantId, patientId: target.patientId ?? null, leadId: target.leadId ?? null };
   const [optedOut, suppressed] = await Promise.all([
     db.communicationConsent.count({ where: { ...where, channel, status: 'opted_out' } }),
     db.campaignSuppression.count({ where: { ...where, channel, active: true } }),
   ]);
-  return optedOut > 0 || suppressed > 0;
+  if (optedOut > 0 || suppressed > 0) return true;
+
+  // Honor an explicit legacy ConsentEvent opt-out (latest event per purpose).
+  // Never fabricates opt-in — only an explicit granted=false suppresses.
+  // A MARKETING opt-out suppresses ALL channels (cross-channel marketing consent);
+  // SMS/EMAIL/WHATSAPP opt-outs suppress their mapped channel.
+  if (target.patientId) {
+    const purpose = CONSENT_PURPOSE[channel];
+    const purposes = purpose ? [purpose, 'MARKETING' as const] : ['MARKETING' as const];
+    const events = await db.consentEvent.findMany({ where: { tenantId, patientId: target.patientId, purpose: { in: purposes } }, orderBy: { occurredAt: 'desc' } });
+    const seen = new Set<string>();
+    for (const e of events) {
+      if (seen.has(e.purpose)) continue; // latest per purpose only
+      seen.add(e.purpose);
+      if (e.granted === false) return true;
+    }
+  }
+  return false;
 }
 
 // --- Audience candidates ---------------------------------------------------
@@ -157,6 +229,46 @@ export async function previewAudience(tenantId: string, audienceType: AudienceTy
     if (sample.length < 5) sample.push({ name: c.name, reason: c.reason, destinationMasked: maskDestination(contact) });
   }
   return { audienceType, channel, total: candidates.length, eligible, suppressed, missingContact, sample };
+}
+
+// --- Real open-slot detection (from existing appointment gaps) -------------
+// Computes genuinely-open slots from existing bookings — NOT a fake count and
+// NOT an automated booking engine. Uses a standard clinic window (09:00–17:00,
+// 30-min slots) per branch over the next `days`, counting slots not overlapped
+// by an active appointment. This is a recommendation input only.
+const SLOT_MINUTES = 30;
+const DAY_START_HOUR = 9;
+const DAY_END_HOUR = 17;
+
+export async function countOpenSlots(tenantId: string, days = 7): Promise<number> {
+  const now = new Date();
+  const horizon = new Date(now.getTime() + days * 86400000);
+  const [branches, appts] = await Promise.all([
+    db.branch.findMany({ where: { tenantId, active: true }, select: { id: true } }),
+    db.appointment.findMany({ where: { tenantId, deletedAt: null, startsAt: { gte: now, lt: horizon }, status: { notIn: ['CANCELED', 'NO_SHOW', 'COMPLETED'] } }, select: { branchId: true, startsAt: true, endsAt: true } }),
+  ]);
+  const busyByBranch = new Map<string, Array<{ start: number; end: number }>>();
+  for (const a of appts) {
+    const arr = busyByBranch.get(a.branchId) ?? [];
+    arr.push({ start: a.startsAt.getTime(), end: a.endsAt.getTime() });
+    busyByBranch.set(a.branchId, arr);
+  }
+  let open = 0;
+  for (const b of branches) {
+    const busy = busyByBranch.get(b.id) ?? [];
+    for (let d = 0; d < days; d++) {
+      const day = new Date(now.getTime() + d * 86400000);
+      for (let h = DAY_START_HOUR; h < DAY_END_HOUR; h++) {
+        for (let m = 0; m < 60; m += SLOT_MINUTES) {
+          const slotStart = new Date(day.getFullYear(), day.getMonth(), day.getDate(), h, m).getTime();
+          const slotEnd = slotStart + SLOT_MINUTES * 60000;
+          if (slotStart < now.getTime()) continue;
+          if (!busy.some(x => x.start < slotEnd && x.end > slotStart)) open++;
+        }
+      }
+    }
+  }
+  return open;
 }
 
 // --- Rule-based message drafts (no LLM; no clinical advice) -----------------

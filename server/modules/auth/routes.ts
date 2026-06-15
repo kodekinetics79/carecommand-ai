@@ -185,6 +185,13 @@ export const authRoutes: FastifyPluginAsync = async app => {
     // Password verified — clear failed counters.
     await db.user.update({ where: { id: user.id }, data: { failedLoginCount: 0, lockedUntil: null } });
 
+    // Platform-controlled suspension blocks tenant login (reactivate via Platform Admin).
+    const tenantStatus = await db.tenant.findUnique({ where: { id: user.tenantId }, select: { status: true } });
+    if (tenantStatus?.status === 'suspended') {
+      await auditAuth(request, user.tenantId, user.id, 'auth.login.failed', { reason: 'suspended_tenant' });
+      return reply.code(403).send({ status: 'suspended_tenant', message: 'This account is suspended. Please contact support.' });
+    }
+
     // Password expiry → require reset (no session issued).
     if (policy?.passwordExpiryDays && policy.passwordExpiryDays > 0 && user.passwordChangedAt) {
       const expiresAt = new Date(user.passwordChangedAt.getTime() + policy.passwordExpiryDays * 86400000);

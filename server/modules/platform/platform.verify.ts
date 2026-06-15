@@ -126,9 +126,11 @@ async function main() {
 
   // 12) Audit events for lifecycle
   const actions = new Set((await ownerDb.auditEvent.findMany({ where: { tenantId: tenantA }, select: { action: true } })).map(a => a.action));
+  // Platform operator actions now write to PlatformAuditEvent (Phase B console).
+  const platformActions = new Set((await ownerDb.platformAuditEvent.findMany({ where: { tenantId: tenantA }, select: { action: true } })).map(a => a.action));
   check('audit: tenant.created + owner.created', actions.has('tenant.created') && actions.has('tenant.owner.created'));
-  check('audit: requested + approved + rejected', actions.has('subscription.requested') && actions.has('subscription.request.approved') && actions.has('subscription.request.rejected'));
-  check('audit: suspended + reactivated', actions.has('tenant.suspended') && actions.has('tenant.reactivated'));
+  check('audit: requested + approved + rejected', actions.has('subscription.requested') && platformActions.has('subscription.request.approved') && platformActions.has('subscription.request.rejected'));
+  check('audit: suspended + reactivated', platformActions.has('tenant.suspended') && platformActions.has('tenant.reactivated'));
 
   await app.close();
   await ownerDb.tenant.delete({ where: { id: tenantA } }).catch(() => {});

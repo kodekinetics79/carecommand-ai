@@ -1,0 +1,3 @@
+ALTER TABLE "PlatformIntegration" ADD COLUMN IF NOT EXISTS "label" TEXT;
+ALTER TABLE "PlatformIntegration" ADD COLUMN IF NOT EXISTS "isCustom" BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE "PlatformIntegration" ADD COLUMN IF NOT EXISTS "fieldSchema" JSONB;

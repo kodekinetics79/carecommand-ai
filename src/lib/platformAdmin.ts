@@ -1,0 +1,151 @@
+// Platform Admin Console client. Uses a PlatformUser JWT (NOT a tenant session,
+// NOT the legacy static token). Token is held in localStorage and sent as Bearer.
+const API = (import.meta.env.VITE_API_URL as string | undefined) ?? 'http://localhost:3001';
+const TOKEN_KEY = 'cc_platform_token';
+
+export function getPlatformToken(): string | null { return localStorage.getItem(TOKEN_KEY); }
+export function setPlatformToken(t: string | null) { if (t) localStorage.setItem(TOKEN_KEY, t); else localStorage.removeItem(TOKEN_KEY); }
+
+async function pf<T>(path: string, init?: RequestInit & { auth?: boolean }): Promise<T> {
+  const token = getPlatformToken();
+  const res = await fetch(`${API}${path}`, {
+    ...init,
+    headers: {
+      ...(init?.body != null ? { 'Content-Type': 'application/json' } : {}),
+      ...(init?.auth !== false && token ? { Authorization: `Bearer ${token}` } : {}),
+      ...init?.headers,
+    },
+  });
+  if (res.status === 401) { setPlatformToken(null); throw new Error('Platform session expired. Please sign in again.'); }
+  const body = res.status === 204 ? null : await res.json().catch(() => null);
+  if (!res.ok) { const e = body as { message?: string; error?: string } | null; throw new Error(e?.message ?? e?.error ?? `Request failed (${res.status})`); }
+  return body as T;
+}
+
+export interface PlatformMe { id: string; email: string | null; name: string; role: string; legacy: boolean; mfaEnabled: boolean }
+export interface TenantSummary {
+  tenant: { id: string; name: string; slug: string; status: string; createdAt: string; lastActivityAt: string } | null;
+  subscription: { planKey: string; planName: string; status: string; trialEndsAt: string | null; addons: string[] } | null;
+  activeUsers: number; branches: number; enabledFeatures: number; setupStatus: string; deepLinkTarget: string | null;
+  entitlements?: Array<{ featureKey: string; enabled: boolean; source: string; limitValue: number | null }>;
+}
+
+export interface SystemHealth { api: string; database: string; redis: string; dbLatencyMs: number | null; responseMs: number; checkedAt: string }
+
+// Mirrors server/modules/subscriptions/catalog.ts FEATURE_LABELS (premium feature catalog).
+export const FEATURE_LABELS: Record<string, string> = {
+  appointments: 'Appointments & Scheduling',
+  patient_crm: 'Patient CRM',
+  basic_reports: 'Basic Reports',
+  payments_deposits: 'Payments & Deposits',
+  revenue_protection: 'Revenue Protection',
+  campaign_automation: 'Campaign Automation',
+  ai_receptionist: 'AI Receptionist',
+  device_integration: 'Device Integration Center',
+  insurance_eligibility: 'Insurance Eligibility',
+  advanced_reports: 'Advanced Reports',
+  multi_location: 'Multi-Location',
+  compliance_readiness: 'Compliance Readiness Center',
+  staff_kpis: 'Staff KPIs',
+  api_access: 'API Access',
+  custom_integrations: 'Custom Integrations',
+};
+
+export const TENANT_STATUS_BADGE: Record<string, string> = { active: 'badge-emerald', suspended: 'badge-red', cancelled: 'badge-red' };
+export const SUB_STATUS_BADGE: Record<string, string> = { ACTIVE: 'badge-emerald', TRIAL: 'badge-violet', PAST_DUE: 'badge-amber', SUSPENDED: 'badge-red', CANCELLED: 'badge-red' };
+
+export const platformAdmin = {
+  login: (email: string, password: string) => pf<{ token?: string; mfaRequired?: boolean; mfaToken?: string; user?: PlatformMe }>(`/v1/platform/auth/login`, { method: 'POST', auth: false, body: JSON.stringify({ email, password }) }),
+  mfaVerify: (code: string, mfaToken: string) => pf<{ token: string; user: PlatformMe }>(`/v1/platform/auth/mfa/verify`, { method: 'POST', auth: false, headers: { Authorization: `Bearer ${mfaToken}` }, body: JSON.stringify({ code }) }),
+  me: () => pf<PlatformMe>(`/v1/platform/auth/me`),
+  logout: () => pf<{ loggedOut: boolean }>(`/v1/platform/auth/logout`, { method: 'POST' }),
+
+  overview: () => pf<{ tenants: number; activeTenants: number; suspendedTenants: number; pendingRequests: number; platformUsers: number }>(`/v1/platform/overview`),
+  health: () => pf<SystemHealth>(`/v1/platform/health`),
+  tenants: () => pf<TenantSummary[]>(`/v1/platform/tenants`),
+  tenant: (id: string) => pf<TenantSummary>(`/v1/platform/tenants/${id}`),
+  createTenant: (body: { name: string; slug: string; planKey?: string; ownerName: string; ownerEmail: string; ownerPassword: string; defaultBranchName?: string }) =>
+    pf<TenantSummary>(`/v1/platform/tenants`, { method: 'POST', body: JSON.stringify(body) }),
+  suspend: (id: string) => pf<{ status: string }>(`/v1/platform/tenants/${id}/suspend`, { method: 'POST' }),
+  reactivate: (id: string) => pf<{ status: string }>(`/v1/platform/tenants/${id}/reactivate`, { method: 'POST' }),
+  changePlan: (id: string, planKey: string) => pf<TenantSummary>(`/v1/platform/tenants/${id}/subscription/change-plan`, { method: 'POST', body: JSON.stringify({ planKey }) }),
+  addAddon: (id: string, addonKey: string) => pf<TenantSummary>(`/v1/platform/tenants/${id}/addons`, { method: 'POST', body: JSON.stringify({ addonKey }) }),
+  removeAddon: (id: string, addonKey: string) => pf<TenantSummary>(`/v1/platform/tenants/${id}/addons/${addonKey}`, { method: 'DELETE' }),
+  overrideEntitlement: (id: string, featureKey: string, enabled: boolean) => pf<unknown>(`/v1/platform/tenants/${id}/entitlements/${featureKey}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
+  plans: () => pf<Array<{ key: string; name: string; monthlyPrice: number; features: string[] }>>(`/v1/platform/subscriptions/plans`),
+  addons: () => pf<Array<{ key: string; name: string; featureKey: string | null }>>(`/v1/platform/subscriptions/addons`),
+  requests: (status?: string) => pf<Array<{ id: string; tenantName: string; requestType: string; status: string; requestedPlanKey: string | null; createdAt: string }>>(`/v1/platform/subscription-requests${status ? `?status=${status}` : ''}`),
+  approveRequest: (id: string) => pf<{ status: string }>(`/v1/platform/subscription-requests/${id}/approve`, { method: 'POST' }),
+  rejectRequest: (id: string) => pf<{ status: string }>(`/v1/platform/subscription-requests/${id}/reject`, { method: 'POST' }),
+  users: () => pf<Array<{ id: string; email: string; name: string; role: string; status: string; mfaEnabled: boolean; lastLoginAt: string | null }>>(`/v1/platform/users`),
+  createUser: (body: { email: string; name: string; password: string; role: string }) => pf<unknown>(`/v1/platform/users`, { method: 'POST', body: JSON.stringify(body) }),
+  updateUser: (id: string, body: { status?: string; role?: string }) => pf<unknown>(`/v1/platform/users/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  audit: (limit = 100) => pf<Array<{ id: string; action: string; targetType: string; targetId: string | null; tenantId: string | null; metadata: unknown; createdAt: string }>>(`/v1/platform/audit?limit=${limit}`),
+
+  // ── Control Tower (Phase 2) ──────────────────────────────────────────
+  getBilling: (id: string) => pf<TenantBilling>(`/v1/platform/tenants/${id}/billing`),
+  updateBilling: (id: string, body: { cycle?: 'monthly' | 'annual'; paymentStatus?: 'ok' | 'failed' | 'no_method'; gracePeriodDays?: number; reason: string }) =>
+    pf<TenantBilling>(`/v1/platform/tenants/${id}/billing`, { method: 'PATCH', body: JSON.stringify(body) }),
+  extendTrial: (id: string, days: number, reason: string) => pf<{ trialEndsAt: string }>(`/v1/platform/tenants/${id}/billing/extend-trial`, { method: 'POST', body: JSON.stringify({ days, reason }) }),
+
+  getUsageLimits: (id: string) => pf<Array<{ key: string; used: number; limit: number | null }>>(`/v1/platform/tenants/${id}/usage-limits`),
+  setUsageLimit: (id: string, key: string, limit: number | null) => pf<{ key: string; used: number; limit: number | null }>(`/v1/platform/tenants/${id}/usage-limits/${key}`, { method: 'PATCH', body: JSON.stringify({ limit }) }),
+
+  getAiUsage: (id: string) => pf<AiUsageView>(`/v1/platform/tenants/${id}/ai-usage`),
+  updateAiUsage: (id: string, body: { aiCreditsLimit?: number | null; modelTier?: string; overageAllowed?: boolean }) => pf<unknown>(`/v1/platform/tenants/${id}/ai-usage`, { method: 'PATCH', body: JSON.stringify(body) }),
+  aiKillSwitch: (id: string, on: boolean, reason: string) => pf<{ killSwitch: boolean }>(`/v1/platform/tenants/${id}/ai-usage/kill-switch`, { method: 'POST', body: JSON.stringify({ on, reason }) }),
+
+  getSecurity: (id: string) => pf<SecurityView>(`/v1/platform/tenants/${id}/security`),
+  updateSecurity: (id: string, body: { forceMfa?: boolean; passwordExpiryDays?: number | null; sessionTimeoutMinutes?: number; failedLoginLockout?: boolean; ipAllowlist?: string[]; reason: string }) =>
+    pf<{ ok: boolean }>(`/v1/platform/tenants/${id}/security`, { method: 'PATCH', body: JSON.stringify(body) }),
+  revokeSessions: (id: string, reason: string) => pf<{ revokedAt: string }>(`/v1/platform/tenants/${id}/security/revoke-sessions`, { method: 'POST', body: JSON.stringify({ reason }) }),
+
+  startSupport: (id: string, reason: string, minutes: number) => pf<{ id: string; expiresAt: string }>(`/v1/platform/tenants/${id}/support-session`, { method: 'POST', body: JSON.stringify({ reason, minutes }) }),
+  supportSessions: () => pf<Array<{ id: string; tenantId: string; operatorEmail: string | null; reason: string; startedAt: string; expiresAt: string }>>(`/v1/platform/support-sessions`),
+  endSupport: (sessionId: string) => pf<{ ended: boolean }>(`/v1/platform/support-session/${sessionId}`, { method: 'DELETE' }),
+
+  archiveTenant: (id: string, reason: string) => pf<{ status: string }>(`/v1/platform/tenants/${id}/archive`, { method: 'POST', body: JSON.stringify({ reason }) }),
+
+  providerHealth: () => pf<{ providers: Array<{ key: string; label: string; status: string; detail: string }>; failedJobs: number }>(`/v1/platform/health/providers`),
+  retryJobs: (queue = 'autopilot') => pf<{ queue: string; retried: number }>(`/v1/platform/health/retry-jobs`, { method: 'POST', body: JSON.stringify({ queue }) }),
+
+  announcements: () => pf<Array<{ id: string; title: string; body: string; severity: string; audience: string; active: boolean; createdByName: string | null; createdAt: string }>>(`/v1/platform/announcements`),
+  createAnnouncement: (body: { title: string; body: string; severity?: string; audience?: string }) => pf<unknown>(`/v1/platform/announcements`, { method: 'POST', body: JSON.stringify(body) }),
+  toggleAnnouncement: (id: string, active: boolean) => pf<unknown>(`/v1/platform/announcements/${id}`, { method: 'PATCH', body: JSON.stringify({ active }) }),
+
+  getSettings: () => pf<PlatformSettings>(`/v1/platform/settings`),
+  updateSettings: (body: Partial<Omit<PlatformSettings, 'updatedAt'>>) => pf<PlatformSettings>(`/v1/platform/settings`, { method: 'PATCH', body: JSON.stringify(body) }),
+
+  integrations: () => pf<IntegrationView[]>(`/v1/platform/integrations`),
+  saveIntegration: (key: string, fields: Record<string, string>) => pf<IntegrationView>(`/v1/platform/integrations/${key}`, { method: 'PUT', body: JSON.stringify({ fields }) }),
+  disconnectIntegration: (key: string) => pf<IntegrationView | { deleted: boolean }>(`/v1/platform/integrations/${key}`, { method: 'DELETE' }),
+  testIntegration: (key: string) => pf<{ key: string; status: string; detail: string; testedAt: string }>(`/v1/platform/integrations/${key}/test`, { method: 'POST' }),
+  addService: (label: string, fields: Array<{ label: string; secret: boolean; required: boolean; value?: string }>) => pf<IntegrationView>(`/v1/platform/integrations`, { method: 'POST', body: JSON.stringify({ label, fields }) }),
+  addIntegrationField: (key: string, body: { label: string; secret: boolean; required: boolean }) => pf<IntegrationView>(`/v1/platform/integrations/${key}/fields`, { method: 'PATCH', body: JSON.stringify(body) }),
+};
+
+export interface PlatformSettings { platformName: string; supportEmail: string | null; defaultTrialDays: number; defaultPlanKey: string; updatedAt: string }
+export interface IntegrationView {
+  key: string; label: string; status: string; source: 'db' | 'env' | null; isCustom?: boolean;
+  fields: Array<{ key: string; label: string; secret: boolean; isSet: boolean; masked: string | null }>;
+  required: string[]; lastTestAt: string | null; lastTestStatus: string | null; lastTestDetail: string | null;
+}
+
+export interface TenantBilling { status: string; cycle: 'monthly' | 'annual'; currency: string; mrr: number; arr: number; renewalDate: string | null; paymentStatus: string; gracePeriodDays: number; provider: string | null }
+export interface AiUsageView { aiCreditsUsed: number; aiCreditsLimit: number | null; receptionistMinutes: number; campaignGenerations: number; reportGenerations: number; modelTier: string; overageAllowed: boolean; killSwitch: boolean }
+export interface SecurityView { forceMfa: boolean; passwordExpiryDays: number | null; sessionTimeoutMinutes: number; ipAllowlist: string[]; failedLoginLockout: boolean; sessionsRevokedAt: string | null }
+
+// Authenticated CSV download (pf parses JSON, so audit export needs a raw fetch).
+export async function downloadAuditCsv(params: { tenantId?: string; action?: string } = {}) {
+  const token = getPlatformToken();
+  const qs = new URLSearchParams();
+  if (params.tenantId) qs.set('tenantId', params.tenantId);
+  if (params.action) qs.set('action', params.action);
+  const res = await fetch(`${API}/v1/platform/audit/export.csv?${qs.toString()}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+  if (!res.ok) throw new Error(`Export failed (${res.status})`);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'platform-audit.csv'; a.click();
+  URL.revokeObjectURL(url);
+}

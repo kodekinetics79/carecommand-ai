@@ -1,354 +1,180 @@
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
-  ArrowRight, CalendarDays, DollarSign, Phone, Sparkles, TrendingUp,
-  Users, Zap, AlertCircle, CheckCircle2, BarChart3, Star, Clock
+  TrendingUp, DollarSign, CalendarDays, Users, AlertCircle, Phone,
+  Coins, Globe, Sparkles, Gauge, BarChart3, LineChart,
 } from 'lucide-react';
-import PageHeader from '../components/ui/PageHeader';
-import StatCard from '../components/ui/StatCard';
-import InsightCard from '../components/ui/InsightCard';
+import { usePreferences, CURRENCIES, LANGUAGES } from '../lib/preferences';
 import BentoCard from '../components/ui/BentoCard';
-import ProgressBar from '../components/ui/ProgressBar';
-import RevenueChart from '../components/charts/RevenueChart';
-import UtilizationChart from '../components/charts/UtilizationChart';
-import { branches, appointments, patients, radarAlerts, campaigns } from '../data/seedData';
+import SkeletonPanel from '../components/ui/SkeletonPanel';
+import PremiumMetricCard from '../components/dashboard/PremiumMetricCard';
+import AIBriefingCard from '../components/dashboard/AIBriefingCard';
+import PriorityActionRail from '../components/dashboard/PriorityActionRail';
+import ActionDrawer from '../components/dashboard/ActionDrawer';
+import BranchHealthCard from '../components/dashboard/BranchHealthCard';
+import CampaignROIPanel from '../components/dashboard/CampaignROIPanel';
 import { formatCurrency } from '../utils/formatters';
-import { apiRequest } from '../lib/api';
-import { useApiResource } from '../hooks/useApiResource';
-import { mapCampaign, type ApiCampaign } from '../lib/apiAdapters';
+import {
+  dashboardService,
+  type DashboardSummary, type BranchHealth, type ProviderUtilization, type CampaignROI, type PriorityAction,
+} from '../lib/dashboardService';
 
-const todayDate = '2025-05-26';
-const todayAppts = appointments.filter(a => a.date === todayDate).length;
-const activeCustomers = patients.filter(p => p.lifecycleStage === 'active' || p.lifecycleStage === 'retained').length;
-const revenueRecovered = 27200;
-const missedCallRecovery = 19;
-const noShowRisk = appointments.filter(a => a.status === 'risky' || a.status === 'no-show').length;
-const totalRevenue = branches.reduce((s, b) => s + b.revenue, 0);
-const avgHealthScore = Math.round(branches.reduce((s, b) => s + b.healthScore, 0) / branches.length);
-
-interface DashboardSummary {
-  generatedAt: string;
-  networkRevenue: number;
-  revenueRecovered: number;
-  activeCustomers: number;
-  todaysAppointments: number;
-  noShowRisk: number;
-  callsRecovered: number;
-  missedCalls: number;
-  activeOpportunities: number;
-  pendingApprovals: number;
-}
-
-const fallbackSummary: DashboardSummary = {
-  generatedAt: new Date().toISOString(),
-  networkRevenue: totalRevenue,
-  revenueRecovered,
-  activeCustomers,
-  todaysAppointments: todayAppts,
-  noShowRisk,
-  callsRecovered: missedCallRecovery,
-  missedCalls: 23,
-  activeOpportunities: 28350,
-  pendingApprovals: 1,
-};
-
-const priorityActions = [
-  { id: 'p1', title: 'Run 90-day inactive customer campaign', description: `187 customers eligible. Historical conversion: 18%. Est. ${formatCurrency(18700)} in recoverable revenue.`, impact: formatCurrency(18700), urgency: 'high' as const, action: 'Activate Winback Campaign', icon: <Users className="w-3.5 h-3.5" /> },
-  { id: 'p2', title: 'Westside has 31 empty slots this week', description: `At ${formatCurrency(200)}/slot, ${formatCurrency(6200)} is at risk. Recommend limited weekday offer for skin services.`, impact: formatCurrency(6200), urgency: 'high' as const, action: 'Create Slot-Fill Campaign', icon: <CalendarDays className="w-3.5 h-3.5" /> },
-  { id: 'p3', title: '23 missed calls still uncontacted', description: `42 calls this month. 19 recovered. 23 remain — est. ${formatCurrency(3450)} in lost opportunity.`, impact: formatCurrency(3450), urgency: 'medium' as const, action: 'Review Missed-Call Queue', icon: <Phone className="w-3.5 h-3.5" /> },
-  { id: 'p4', title: 'Dr. Mitchell: high repeat rate, low reviews', description: '78% repeat-visit rate. Only 12 review requests sent vs 89 consultations. Est. 28 new reviews.', impact: 'Reputation', urgency: 'medium' as const, action: 'Launch Review Campaign', icon: <Star className="w-3.5 h-3.5" /> },
-  { id: 'p5', title: '14 follow-up opportunities not yet rebooked', description: "Post-service customers who haven't scheduled their next visit. Est. value: $4,800.", impact: formatCurrency(4800), urgency: 'low' as const, action: 'Assign Follow-Up Tasks', icon: <CheckCircle2 className="w-3.5 h-3.5" /> },
-];
-
-const actionRoute: Record<string, string> = {
-  p1: '/campaigner',
-  p2: '/scheduling',
-  p3: '/ai-receptionist',
-  p4: '/reviews',
-  p5: '/staff',
-};
-
-const urgencyClass: Record<'high' | 'medium' | 'low', string> = {
-  high: 'urgency-high',
-  medium: 'urgency-medium',
-  low: 'urgency-low',
-};
-const urgencyDot: Record<'high' | 'medium' | 'low', string> = {
-  high: 'bg-[var(--red)]',
-  medium: 'bg-[var(--amber)]',
-  low: 'bg-[var(--emerald)]',
-};
-
-function branchCls(score: number) {
-  if (score >= 75) return 'branch-ok';
-  if (score >= 55) return 'branch-warn';
-  return 'branch-crit';
-}
-function branchScoreColor(score: number) {
-  if (score >= 75) return 'text-emerald-v';
-  if (score >= 55) return 'text-amber-v';
-  return 'text-red-v';
-}
+// Charts / heavy panels are code-split so they don't bloat the route bundle.
+const ProviderUtilizationPanel = lazy(() => import('../components/dashboard/ProviderUtilizationPanel'));
+const RevenueChart = lazy(() => import('../components/charts/RevenueChart'));
 
 export default function Dashboard() {
   const navigate = useNavigate();
-  const [summary, setSummary] = useState(fallbackSummary);
-  const [summarySource, setSummarySource] = useState<'live' | 'demo'>('demo');
-  const { data: campaignRecords } = useApiResource<ApiCampaign, typeof campaigns[number]>('/v1/campaigns?limit=3', campaigns, mapCampaign);
+  const [summary, setSummary] = useState<DashboardSummary | null>(null);
+  const [branches, setBranches] = useState<BranchHealth[]>([]);
+  const [providers, setProviders] = useState<ProviderUtilization[]>([]);
+  const [campaigns, setCampaigns] = useState<CampaignROI[]>([]);
+  const [actions, setActions] = useState<PriorityAction[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [actionsLoading, setActionsLoading] = useState(true);
+  const [drawerAction, setDrawerAction] = useState<PriorityAction | null>(null);
 
   useEffect(() => {
     let active = true;
-    apiRequest<DashboardSummary>('/v1/dashboard/summary')
-      .then(row => {
-        if (!active) return;
-        setSummary(row);
-        setSummarySource('live');
-      })
-      .catch(() => undefined);
+    void (async () => {
+      const [s, b, p, c] = await Promise.all([
+        dashboardService.getSummary().catch(() => null),
+        dashboardService.getBranchHealth().catch(() => []),
+        dashboardService.getProviderUtilization().catch(() => []),
+        dashboardService.getCampaignROI().catch(() => []),
+      ]);
+      if (!active) return;
+      setSummary(s); setBranches(b); setProviders(p); setCampaigns(c); setLoading(false);
+    })();
+    void (async () => {
+      const a = await dashboardService.getPriorityActions().catch(() => []);
+      if (active) { setActions(a); setActionsLoading(false); }
+    })();
     return () => { active = false; };
   }, []);
 
-  const reportDate = new Date(summary.generatedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
-  const totalCalls = summary.callsRecovered + summary.missedCalls;
+  const reportDate = summary ? new Date(summary.generatedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+  const avgHealth = branches.length ? Math.round(branches.reduce((s, b) => s + b.healthScore, 0) / branches.length) : 0;
+  const openCta = (a: PriorityAction) => navigate(a.cta.route);
 
   return (
-    <div className="space-y-6 pb-8">
-      <PageHeader
-        title="Command Center"
-        subtitle={`Growth cockpit for your multi-location clinic network · ${reportDate}`}
-        badge={summarySource === 'live' ? 'Live DB' : 'Demo'}
-        badgeColor={summarySource === 'live' ? 'emerald' : 'blue'}
-        actions={
-          <div className="flex flex-wrap gap-2">
-            <button type="button" onClick={() => navigate('/opportunities')} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
-              <AlertCircle className="w-4 h-4" /> View Leaks
-            </button>
-            <button type="button" onClick={() => navigate('/crm')} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
-              <Users className="w-4 h-4" /> Open CRM
-            </button>
-            <button type="button" onClick={() => navigate('/campaigner')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-[rgba(99,102,241,0.25)] hover:opacity-90 transition-opacity">
-              <Sparkles className="w-4 h-4" /> Launch Campaign
-            </button>
-          </div>
-        }
-      />
-
-      {/* Hero Growth Briefing */}
-      <div className="hero-panel">
-        <div className="relative flex items-start justify-between gap-6">
-          <div>
-            <div className="flex items-center gap-2 mb-2">
-              <Sparkles className="w-4 h-4 text-indigo-200" />
-              <p className="text-xs font-bold uppercase tracking-widest text-indigo-200">Today's Growth Briefing</p>
-            </div>
-            <h2 className="text-xl font-bold text-white mb-1 leading-snug">
-              {formatCurrency(summary.revenueRecovered)} recovered this month · {formatCurrency(summary.activeOpportunities)} in active opportunities
-            </h2>
-            <p className="text-sm text-white/70 leading-relaxed max-w-2xl">
-              Your live operating data shows <span className="text-white font-medium">{summary.pendingApprovals} governed action{summary.pendingApprovals === 1 ? '' : 's'}</span> awaiting review and {summary.missedCalls} missed calls needing follow-up. Open the advisory team when you want a revenue, growth, front desk, or operations readout.
-            </p>
-          </div>
-          <div className="shrink-0 flex flex-col items-end gap-2">
-            <div className="text-right">
-              <p className="text-2xl font-bold text-white tabular-nums">{formatCurrency(summary.networkRevenue)}</p>
-              <p className="text-xs text-white/65">Network revenue this month</p>
-            </div>
-            <div className="flex flex-wrap items-center justify-end gap-3">
-              <button type="button" onClick={() => navigate('/advisory')} className="inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-white/10 px-3 py-1.5 text-xs font-semibold text-white hover:bg-white/15 transition-colors">
-                <Sparkles className="w-3.5 h-3.5" /> Ask Advisors
-              </button>
-              <button type="button" onClick={() => navigate('/revenue')} className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-200 hover:text-white transition-colors">
-                View full report <ArrowRight className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          </div>
+    <div className="space-y-4 pb-4 animate-fade-up">
+      {/* Slim toolbar — the topbar carries the page title; this row holds context + actions. */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-[13px] text-t3">{reportDate ? `Network overview · updated ${reportDate}` : 'Network overview'}</p>
+        <div className="flex flex-wrap items-center gap-2">
+          <CurrencyLanguagePicker />
+          <button type="button" onClick={() => navigate('/opportunities')} className="inline-flex items-center gap-2 rounded-lg border border-[var(--b1)] bg-white px-3.5 py-2 text-[13px] font-semibold text-t1 hover:bg-[var(--s2)] transition">
+            <AlertCircle className="w-4 h-4 text-t3" /> Revenue Leaks
+          </button>
+          <button type="button" onClick={() => navigate('/campaigner')} className="inline-flex items-center gap-2 rounded-lg bg-[var(--indigo)] px-3.5 py-2 text-[13px] font-semibold text-white hover:opacity-90 transition">
+            <Sparkles className="w-4 h-4" /> Launch Campaign
+          </button>
         </div>
       </div>
 
-      {/* KPI Strip — 6 stats */}
-      <div className="grid gap-3 grid-cols-2 sm:grid-cols-3 xl:grid-cols-6">
-        <StatCard title="Network Revenue" value={formatCurrency(summary.networkRevenue)} subtitle="Latest snapshot" icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Revenue Recovered" value={formatCurrency(summary.revenueRecovered)} subtitle="By automation" icon={<DollarSign className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Today's Appointments" value={summary.todaysAppointments} subtitle="Across your scope" icon={<CalendarDays className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Active Customers" value={summary.activeCustomers} subtitle="Engaged base" icon={<Users className="w-4 h-4" />} accent="violet" />
-        <StatCard title="No-Show Risk" value={summary.noShowRisk} subtitle="Flagged today" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
-        <StatCard title="Calls Recovered" value={`${summary.callsRecovered}/${totalCalls}`} subtitle="Follow-up queue" icon={<Phone className="w-4 h-4" />} accent="cyan" />
-      </div>
+      {/* PRIMARY OBJECT — AI Briefing */}
+      {summary ? (
+        <AIBriefingCard summary={summary} onAskAdvisors={() => navigate('/advisory')} onViewReport={() => navigate('/revenue')} />
+      ) : (
+        <div className="skeleton-line h-44 rounded-2xl" />
+      )}
 
-      {/* Main Bento Grid */}
-      <div className="grid gap-4 xl:grid-cols-[1fr_380px]">
+      {/* KPIs — 3 primary + 4 secondary, compact for single-screen density */}
+      {loading || !summary ? (
+        <div className="grid gap-2.5 grid-cols-2 lg:grid-cols-3">{[0, 1, 2].map(i => <div key={i} className="skeleton-line h-24 rounded-xl" />)}</div>
+      ) : (
+        <div className="space-y-2.5">
+          <div className="grid gap-2.5 grid-cols-2 lg:grid-cols-3">
+            {/* Trends are null until /v1/dashboard/summary returns prior-period deltas — no faked trends. */}
+            <PremiumMetricCard primary label="Network revenue" value={summary.networkRevenue} format={formatCurrency} subtitle="This month" icon={<TrendingUp className="w-4 h-4" />} accent="emerald" trend={summary.networkRevenueTrend ?? null} onClick={() => navigate('/revenue')} />
+            <PremiumMetricCard primary label="Revenue recovered" value={summary.revenueRecovered} format={formatCurrency} subtitle="By automation" icon={<DollarSign className="w-4 h-4" />} accent="indigo" trend={summary.revenueRecoveredTrend ?? null} onClick={() => navigate('/revenue-protection')} />
+            <PremiumMetricCard primary label="Open opportunity" value={summary.activeOpportunities} format={formatCurrency} subtitle="Actionable now" icon={<Sparkles className="w-4 h-4" />} accent="violet" trend={summary.activeOpportunitiesTrend ?? null} onClick={() => navigate('/opportunities')} />
+          </div>
+          <div className="grid gap-2.5 grid-cols-2 lg:grid-cols-4">
+            <PremiumMetricCard label="Today's appointments" value={summary.todaysAppointments} subtitle="Across your scope" icon={<CalendarDays className="w-4 h-4" />} accent="blue" onClick={() => navigate('/scheduling')} />
+            <PremiumMetricCard label="Active patients" value={summary.activeCustomers} subtitle="Engaged base" icon={<Users className="w-4 h-4" />} accent="cyan" onClick={() => navigate('/patients')} />
+            <PremiumMetricCard label="Patients at risk" value={summary.noShowRisk} subtitle="No-show flagged today" icon={<AlertCircle className="w-4 h-4" />} accent="red" onClick={() => navigate('/scheduling')} />
+            <PremiumMetricCard label="Calls recovered" value={summary.callsRecovered} format={n => `${Math.round(n)}/${summary.callsRecovered + summary.missedCalls}`} subtitle="Follow-up queue" icon={<Phone className="w-4 h-4" />} accent="amber" onClick={() => navigate('/ai-receptionist')} />
+          </div>
+        </div>
+      )}
 
+      {/* MAIN GRID */}
+      <div className="grid gap-3 xl:grid-cols-[1fr_360px] items-start">
         {/* Left column */}
-        <div className="space-y-4">
-
-          {/* Branch Health Grid */}
-          <BentoCard title="Branch Health Scores" subtitle="Network-wide operating health" headerRight={
-            <span className="text-xs font-semibold text-t3 bg-[var(--s3)] px-2.5 py-1 rounded-full">Avg {avgHealthScore}/100</span>
-          }>
-            <div className="grid gap-3 sm:grid-cols-2">
-              {branches.map((branch) => (
-                <div key={branch.id} className={`rounded-xl p-4 ${branchCls(branch.healthScore)}`}>
-                  <div className="flex items-start justify-between gap-2 mb-3">
-                    <div>
-                      <p className="text-sm font-bold text-t1 leading-tight">{branch.name}</p>
-                      <p className="text-[11px] text-t3 mt-0.5">{branch.location}</p>
-                    </div>
-                    <span className={`text-xs font-bold px-2 py-0.5 rounded-full bg-[var(--s3)] ${branchScoreColor(branch.healthScore)}`}>{branch.healthScore}</span>
-                  </div>
-                  <div className="mb-3">
-                    <ProgressBar value={branch.healthScore} color={branch.healthScore >= 75 ? 'emerald' : branch.healthScore >= 55 ? 'amber' : 'red'} />
-                  </div>
-                  <div className="grid grid-cols-3 gap-2 text-center">
-                    <div>
-                      <p className="text-sm font-bold text-t1">{branch.utilization}%</p>
-                      <p className="text-[10px] text-t3">Utilised</p>
-                    </div>
-                    <div>
-                      <p className="text-sm font-bold text-t1">{branch.todayAppointments}</p>
-                      <p className="text-[10px] text-t3">Today</p>
-                    </div>
-                    <div>
-                      <p className={`text-sm font-bold ${branch.missedCalls > 10 ? 'text-red-v' : 'text-t1'}`}>{branch.missedCalls}</p>
-                      <p className="text-[10px] text-t3">Missed calls</p>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
+        <div className="space-y-3 min-w-0">
+          {/* Branch health */}
+          <BentoCard title="Branch Health" subtitle="Network-wide operating health · derived from provider capacity"
+            headerRight={<span className="text-xs font-semibold text-t3 bg-[var(--s3)] px-2.5 py-1 rounded-full">Avg {avgHealth}/100</span>}>
+            {loading ? (
+              <div className="grid gap-3 sm:grid-cols-2"><div className="skeleton-line h-40 rounded-2xl" /><div className="skeleton-line h-40 rounded-2xl" /></div>
+            ) : branches.length === 0 ? (
+              <p className="text-xs text-t3 py-4 text-center">No branch data available.</p>
+            ) : (
+              <div className="grid gap-3 sm:grid-cols-2">
+                {branches.map(b => <BranchHealthCard key={b.id} branch={b} onOpen={() => navigate('/scheduling')} />)}
+              </div>
+            )}
           </BentoCard>
 
-          {/* Charts Row */}
+          {/* Provider utilization (lazy) + Revenue trend (lazy) */}
           <div className="grid gap-4 lg:grid-cols-2">
-            <BentoCard title="Provider Utilisation" subtitle="Capacity heatmap" headerRight={
-              <span className="badge badge-emerald">Avg 72%</span>
-            }>
-              <UtilizationChart />
+            <BentoCard title="Provider Capacity" subtitle="Utilization ranking" headerRight={<Gauge className="w-4 h-4 text-indigo" />}>
+              {loading ? <div className="skeleton-line h-56 rounded-xl" /> : (
+                <Suspense fallback={<div className="skeleton-line h-56 rounded-xl" />}>
+                  <ProviderUtilizationPanel providers={providers} />
+                </Suspense>
+              )}
             </BentoCard>
-            <BentoCard title="Revenue Performance" subtitle="Recovery & growth trends" headerRight={
-              <span className="badge badge-violet">+18% campaign revenue</span>
-            }>
-              <RevenueChart />
+            <BentoCard title="Revenue Performance" subtitle="Recovery & growth trends" headerRight={<LineChart className="w-4 h-4 text-violet-v" />}>
+              <Suspense fallback={<div className="skeleton-line h-56 rounded-xl" />}>
+                <RevenueChart />
+              </Suspense>
             </BentoCard>
           </div>
 
           {/* Campaign ROI */}
-          <BentoCard title="Active Campaign ROI" subtitle="Campaign performance" headerRight={
-            <button type="button" onClick={() => navigate('/campaigner')} className="text-xs font-semibold text-indigo hover:opacity-75 flex items-center gap-1 transition-opacity">
-              View all <ArrowRight className="w-3 h-3" />
-            </button>
-          }>
-            <div className="space-y-3">
-              {campaignRecords.slice(0, 3).map((c) => {
-                const convRate = c.audienceSize > 0 ? Math.round((c.booked / c.audienceSize) * 100) : 0;
-                return (
-                  <div key={c.id} className="flex items-center gap-4 p-3 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] transition-colors">
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 mb-0.5">
-                        <p className="text-sm font-semibold text-t1 truncate">{c.name}</p>
-                        <span className={`badge ${
-                          c.status === 'active' ? 'badge-emerald' :
-                          c.status === 'completed' ? 'badge-blue' :
-                          'badge-amber'
-                        }`}>{c.status}</span>
-                      </div>
-                      <div className="flex items-center gap-3 text-xs text-t3">
-                        <span>{c.audienceSize} audience</span>
-                        <span>·</span>
-                        <span className="text-emerald-v font-medium">{convRate}% booked</span>
-                      </div>
-                    </div>
-                    <div className="text-right shrink-0">
-                      <p className="text-sm font-bold text-t1">{formatCurrency(c.revenue)}</p>
-                      <p className="text-[10px] text-t3">Revenue</p>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
+          <BentoCard title="Campaign ROI" subtitle="Reactivation & recall performance"
+            headerRight={<button type="button" onClick={() => navigate('/campaigner')} className="text-xs font-semibold text-indigo hover:opacity-75 inline-flex items-center gap-1"><BarChart3 className="w-3.5 h-3.5" /> All campaigns</button>}>
+            {loading ? <SkeletonPanel rows={3} className="!border-0 !shadow-none !p-0" />
+              : <CampaignROIPanel campaigns={campaigns} onViewAll={() => navigate('/campaigner')} onCreate={() => navigate('/campaigner')} />}
           </BentoCard>
         </div>
 
-        {/* Right column */}
-        <div className="space-y-4">
-
-          {/* Owner's Priority List */}
-          <BentoCard title="Owner's Priority List" subtitle="Top actions to recover revenue" headerRight={<span className="badge badge-violet">Live priorities</span>}>
-            <div className="space-y-2.5">
-              {priorityActions.map((item) => (
-                <div key={item.id} className={`rounded-xl p-3.5 cursor-pointer hover:opacity-90 transition-opacity ${urgencyClass[item.urgency]}`}>
-                  <div className="flex items-start gap-2.5 mb-2">
-                    <span className={`w-2 h-2 rounded-full mt-1 shrink-0 ${urgencyDot[item.urgency]}`} />
-                    <div className="flex-1 min-w-0">
-                      <p className="text-xs font-bold text-t1 leading-tight">{item.title}</p>
-                      <p className="text-[11px] text-t3 mt-0.5 leading-relaxed">{item.description}</p>
-                    </div>
-                    {item.impact && (
-                      <span className="badge badge-emerald shrink-0">{item.impact}</span>
-                    )}
-                  </div>
-                  <button type="button" onClick={() => navigate(actionRoute[item.id] ?? '/autopilot')} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[var(--indigo)] text-white text-[11px] font-semibold hover:opacity-90 transition-opacity">
-                    <Zap className="w-3 h-3" />
-                    {item.action}
-                  </button>
-                </div>
-              ))}
-            </div>
-          </BentoCard>
-
-          {/* AI Growth Signals */}
-          <BentoCard title="Key Growth Signals" subtitle="ClinicRadar signals from live data" headerRight={
-            <span className="flex items-center gap-1 text-[10px] font-bold text-emerald-v bg-[var(--emerald-soft)] px-2 py-1 rounded-full">
-              <span className="w-1.5 h-1.5 rounded-full bg-[var(--emerald)]" /> Live
-            </span>
-          }>
-            <div className="space-y-2.5">
-              {radarAlerts.slice(0, 4).map((alert) => (
-                <InsightCard
-                  key={alert.id}
-                  title={alert.title}
-                  description={alert.description}
-                  impact={alert.estimatedValue ? formatCurrency(alert.estimatedValue) : undefined}
-                  variant={alert.severity === 'high' ? 'risk' : alert.category === 'revenue' ? 'opportunity' : 'info'}
-                  action="Take action"
-                  confidence={alert.severity === 'high' ? 88 : alert.severity === 'medium' ? 72 : 61}
-                />
-              ))}
-              <button type="button" onClick={() => navigate('/clinic-radar')} className="w-full text-center text-xs font-semibold text-indigo py-2 border border-dashed border-[var(--indigo-mid)] rounded-xl hover:bg-[var(--indigo-soft)] transition-colors flex items-center justify-center gap-1.5">
-                <BarChart3 className="w-3.5 h-3.5" />
-                View all signals in ClinicRadar
-              </button>
-            </div>
-          </BentoCard>
-
-          {/* Staff SLA */}
-          <BentoCard title="Staff Response SLA" subtitle="Front desk performance">
-            <div className="space-y-3">
-              {[
-                { name: 'Emily Watts', branch: 'Downtown', time: '1.8 min', score: 94, ok: true },
-                { name: "Sarah O'Brien", branch: 'Northgate', time: '3.2 min', score: 78, ok: true },
-                { name: 'Jake Williams', branch: 'Westside', time: '6.4 min', score: 49, ok: false },
-                { name: 'Amara Osei', branch: 'Southbank', time: '4.7 min', score: 61, ok: true },
-              ].map((s) => (
-                <div key={s.name} className="flex items-center gap-3">
-                  <div className="w-7 h-7 rounded-full bg-[var(--indigo-soft)] border border-[var(--indigo-mid)] flex items-center justify-center text-[10px] font-bold text-indigo shrink-0">
-                    {s.name.split(' ').map(n => n[0]).join('')}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center justify-between gap-2 mb-1">
-                      <p className="text-xs font-semibold text-t1">{s.name}</p>
-                      <div className="flex items-center gap-1.5">
-                        <Clock className="w-3 h-3 text-t3" />
-                        <span className={`text-xs font-bold ${s.ok ? 'text-t2' : 'text-red-v'}`}>{s.time}</span>
-                      </div>
-                    </div>
-                    <ProgressBar value={s.score} />
-                  </div>
-                  <span className={`text-[11px] font-bold shrink-0 ${s.ok ? 'text-t3' : 'text-red-v'}`}>{s.score}</span>
-                </div>
-              ))}
-            </div>
-          </BentoCard>
+        {/* Right column — sticky priority rail */}
+        <div className="sticky-rail">
+          <PriorityActionRail
+            actions={actions}
+            loading={actionsLoading}
+            onOpen={setDrawerAction}
+            onCta={openCta}
+            onCreateCampaign={() => navigate('/campaigner')}
+          />
         </div>
+      </div>
+
+      {drawerAction && <ActionDrawer action={drawerAction} onClose={() => setDrawerAction(null)} onNavigate={(r) => { setDrawerAction(null); navigate(r); }} />}
+    </div>
+  );
+}
+
+function CurrencyLanguagePicker() {
+  const { currency, language, setCurrency, setLanguage } = usePreferences();
+  const selectCls = 'appearance-none rounded-lg border border-[var(--b1)] bg-white pl-7 pr-6 py-2 text-[13px] font-semibold text-t1 hover:bg-[var(--s2)] cursor-pointer outline-none';
+  return (
+    <div className="flex items-center gap-2">
+      <div className="relative">
+        <Coins className="w-4 h-4 text-t3 absolute left-2 top-1/2 -translate-y-1/2 pointer-events-none" aria-hidden="true" />
+        <select aria-label="Display currency" value={currency} onChange={e => setCurrency(e.target.value)} className={selectCls}>
+          {CURRENCIES.map(c => <option key={c.code} value={c.code}>{c.label}</option>)}
+        </select>
+      </div>
+      <div className="relative">
+        <Globe className="w-4 h-4 text-t3 absolute left-2 top-1/2 -translate-y-1/2 pointer-events-none" aria-hidden="true" />
+        <select aria-label="Language" value={language} onChange={e => setLanguage(e.target.value)} className={selectCls}>
+          {LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
+        </select>
       </div>
     </div>
   );

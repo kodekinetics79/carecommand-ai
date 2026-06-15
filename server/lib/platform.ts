@@ -5,11 +5,13 @@ import { db } from './db';
 import type { Prisma } from '../generated/prisma/client';
 
 // ===========================================================================
-// Platform operator access — DELIBERATELY separate from tenant UserRole.
-// Operators authenticate with a static platform token (env PLATFORM_API_TOKEN)
-// presented as `X-Platform-Token` (or Bearer). This is NOT a tenant role and
-// tenant JWTs can never satisfy it. In production the token MUST be set; in
-// dev a clearly-marked default is allowed for local operator testing.
+// LEGACY / DEV-ONLY platform operator access. The production-grade path is the
+// Platform Admin Console (PlatformUser identity + platform JWT, see
+// server/lib/platformAuth.ts). This static `PLATFORM_API_TOKEN` is retained for
+// backward compatibility and local dev only — `requirePlatformAccess` accepts it
+// and maps it to a synthetic PLATFORM_OWNER. It is NOT a tenant role and tenant
+// JWTs can never satisfy it. Do not expose this token in the UI; remove once all
+// operators have migrated to PlatformUser accounts.
 // ===========================================================================
 
 const DEV_PLATFORM_TOKEN = 'dev-platform-operator-token';

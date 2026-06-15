@@ -6,6 +6,7 @@ import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { requireRoles } from '../../plugins/roles';
 import { assertRoleChangeSafe, assertDeactivateSafe } from '../../lib/adminSafety';
+import { autopilotQueue } from '../../workers/queues';
 
 const ownerAdminRoles = requireRoles('OWNER', 'ADMIN');
 const uuid = z.string().uuid();
@@ -394,22 +395,42 @@ async function buildFinanceRails(tenantId: string) {
 }
 
 async function buildSystemHealth(tenantId: string) {
-  const [auditCount, integrationCount, migrationRows, latestMigrationRows] = await Promise.all([
+  const withTimeout = <T,>(p: Promise<T>, ms: number) => Promise.race([p, new Promise<T>((_r, reject) => setTimeout(() => reject(new Error('timeout')), ms))]);
+
+  // Real runtime checks (no hardcoded statuses).
+  let databaseStatus: string;
+  let dbLatencyMs: number | null = null;
+  try {
+    const t0 = Date.now();
+    await withTimeout(db.$queryRaw`SELECT 1`, 2000);
+    dbLatencyMs = Date.now() - t0;
+    databaseStatus = 'healthy';
+  } catch { databaseStatus = 'down'; }
+
+  let backgroundJobs: string;
+  try {
+    const client = (await withTimeout(Promise.resolve(autopilotQueue.client), 1000)) as unknown as { ping(): Promise<string> };
+    backgroundJobs = (await withTimeout(client.ping(), 1000)) === 'PONG' ? 'available' : 'unavailable';
+  } catch { backgroundJobs = 'unavailable'; }
+
+  const [auditCount, integrationCount, rpEntitlement, migrationRows, latestMigrationRows] = await Promise.all([
     db.auditEvent.count({ where: { tenantId } }),
     db.integration.count({ where: { tenantId } }),
-    db.$queryRawUnsafe<Array<{ count: number }>>('SELECT COUNT(*)::int AS count FROM "_prisma_migrations"'),
-    db.$queryRawUnsafe<Array<{ migration_name: string; finished_at: Date | null }>>('SELECT migration_name, finished_at FROM "_prisma_migrations" ORDER BY finished_at DESC NULLS LAST LIMIT 1'),
+    db.tenantFeatureEntitlement.findUnique({ where: { tenantId_featureKey: { tenantId, featureKey: 'revenue_protection' } } }).catch(() => null),
+    db.$queryRawUnsafe<Array<{ count: number }>>('SELECT COUNT(*)::int AS count FROM "_prisma_migrations"').catch(() => [] as Array<{ count: number }>),
+    db.$queryRawUnsafe<Array<{ migration_name: string; finished_at: Date | null }>>('SELECT migration_name, finished_at FROM "_prisma_migrations" ORDER BY finished_at DESC NULLS LAST LIMIT 1').catch(() => [] as Array<{ migration_name: string; finished_at: Date | null }>),
   ]);
 
   return {
-    apiStatus: 'healthy',
-    databaseStatus: 'healthy',
+    apiStatus: 'healthy', // reaching this handler means the API is serving requests
+    databaseStatus,
+    dbLatencyMs,
     migrationStatus: migrationRows[0]?.count ? 'applied' : 'unknown',
     latestMigration: latestMigrationRows[0]?.migration_name ?? null,
     authStatus: env.JWT_SECRET && env.JWT_REFRESH_SECRET ? 'configured' : 'missing-secrets',
-    revenueProtectionStatus: 'available',
+    revenueProtectionStatus: rpEntitlement?.enabled ? 'available' : 'not-entitled',
     integrationStatus: integrationCount > 0 ? 'available' : 'not-configured',
-    backgroundJobs: 'not-available',
+    backgroundJobs,
     environmentMode: env.NODE_ENV,
     buildVersion: process.env.npm_package_version ?? null,
     auditEventCount: auditCount,

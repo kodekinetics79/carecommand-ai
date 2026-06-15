@@ -17,6 +17,8 @@ const { PrismaClient } = await import('../../generated/prisma/client');
 const { buildApp } = await import('../../app');
 const { env } = await import('../../config/env');
 const { recomputeEntitlements } = await import('../../lib/entitlements');
+const { runScheduledCampaigns, isWithinQuietHours } = await import('../../modules/campaigns/jobs');
+const { createHmac } = await import('node:crypto');
 
 const ownerDb = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_MIGRATION_URL ?? process.env.DATABASE_URL }) });
 let fail = 0;
@@ -177,6 +179,77 @@ async function main() {
   check('19b. consent.updated + suppression.created audited', actions2.has('consent.updated') && actions2.has('suppression.created'));
 
   (env as any).TWILIO_ACCOUNT_SID = savedSid; (env as any).TWILIO_AUTH_TOKEN = savedTok; (env as any).TWILIO_FROM_NUMBER = savedFrom;
+
+  // ===== Post-CRM audit gate closures ======================================
+  // A2) Provider readiness exposes truthful fields + no secret values.
+  const prov = JSON.parse((await call('GET', '/v1/crm/provider-status', aTok)).body);
+  const provStr = JSON.stringify(prov);
+  const noSecrets = ['mock_sid', 'mock_tok', savedSid, savedTok].every(v => !v || !provStr.includes(String(v)));
+  check('A2. provider-status truthful fields + no secret values (live SMS + scheduler real)', typeof prov.smsConfigured === 'boolean' && Array.isArray(prov.missingEnvKeys) && Array.isArray(prov.supportedChannels) && ['unconfigured', 'mock_dev', 'configured_pending_provider', 'live_supported'].includes(prov.providerMode.sms) && prov.liveSendingSupported === true && prov.schedulerEnforced === true && noSecrets);
+
+  // A3) Delivery webhook: no provider secret configured → provider_not_integrated.
+  const wh = await app.inject({ method: 'POST', url: '/v1/crm/webhooks/delivery', headers: { 'content-type': 'application/json', 'x-forwarded-for': ip() }, payload: JSON.stringify({ providerMessageId: 'x', status: 'delivered' }) });
+  check('A3. delivery webhook returns provider_not_integrated when unconfigured', wh.statusCode === 501 && JSON.parse(wh.body).status === 'provider_not_integrated');
+
+  // A5) Legacy ConsentEvent opt-out (granted=false) suppresses delivery.
+  const pLegacy = await ownerDb.patient.create({ data: { tenantId: tA.id, branchId: tA.branchId, firstName: 'Lana', lastName: 'Legacy', phone: '+15551110100', lastVisitAt: old, lifecycleStage: 'AT_RISK' } });
+  await ownerDb.consentEvent.create({ data: { tenantId: tA.id, patientId: pLegacy.id, purpose: 'SMS', granted: false, source: 'patient' } });
+  const legacyCamp = JSON.parse((await call('POST', '/v1/crm/campaigns', aTok, { name: 'Legacy consent', campaignType: 'inactive_patient_reactivation', audienceType: 'inactive_patients', channel: 'sms' })).body);
+  await call('POST', `/v1/crm/campaigns/${legacyCamp.id}/approve`, aTok);
+  await call('POST', `/v1/crm/campaigns/${legacyCamp.id}/launch`, aTok);
+  const legacyDelivery = await ownerDb.campaignDelivery.findFirst({ where: { tenantId: tA.id, campaignId: legacyCamp.id, patientId: pLegacy.id } });
+  check('A5. legacy ConsentEvent opt-out suppresses delivery (safely mapped channel)', legacyDelivery?.status === 'suppressed');
+
+  // A6) MARKETING opt-out suppresses ALL channels (cross-channel).
+  const pMkt = await ownerDb.patient.create({ data: { tenantId: tA.id, branchId: tA.branchId, firstName: 'Mara', lastName: 'Mkt', phone: '+15551110200', email: 'mara@x.test', lastVisitAt: old, lifecycleStage: 'AT_RISK' } });
+  await ownerDb.consentEvent.create({ data: { tenantId: tA.id, patientId: pMkt.id, purpose: 'MARKETING', granted: false, source: 'patient' } });
+  const mktCamp = JSON.parse((await call('POST', '/v1/crm/campaigns', aTok, { name: 'Mkt optout', campaignType: 'inactive_patient_reactivation', audienceType: 'inactive_patients', channel: 'email' })).body);
+  await call('POST', `/v1/crm/campaigns/${mktCamp.id}/approve`, aTok);
+  await call('POST', `/v1/crm/campaigns/${mktCamp.id}/launch`, aTok);
+  const mktDelivery = await ownerDb.campaignDelivery.findFirst({ where: { tenantId: tA.id, campaignId: mktCamp.id, patientId: pMkt.id } });
+  check('A6. MARKETING opt-out suppresses all channels (email)', mktDelivery?.status === 'suppressed');
+
+  // A7) Per-recipient delivery BusinessEvents (PHI-safe: no destination).
+  const sentDeliv = await ownerDb.campaignDelivery.findFirst({ where: { tenantId: tA.id, status: 'sent' } });
+  const perRecipEvent = sentDeliv ? await ownerDb.businessEvent.findFirst({ where: { tenantId: tA.id, eventType: 'campaign.delivery.sent', entityId: sentDeliv.id } }) : null;
+  const evtStr = JSON.stringify(perRecipEvent?.payload ?? {});
+  check('A7. per-recipient delivery event exists + no PHI (no destination)', !!perRecipEvent && !evtStr.includes('@') && !evtStr.includes('+1555'));
+
+  // A8) Real signed, idempotent delivery webhook updates status by providerMessageId.
+  (env as any).CAMPAIGN_WEBHOOK_SECRET = 'whsec_campaign_test';
+  const liveDeliv = await ownerDb.campaignDelivery.findFirst({ where: { tenantId: tA.id, status: 'sent', providerMessageId: { not: null } } });
+  const evtId = `evt_${randomUUID().slice(0, 10)}`;
+  const raw = JSON.stringify({ eventId: evtId, providerMessageId: liveDeliv!.providerMessageId, status: 'failed' });
+  const sig = createHmac('sha256', 'whsec_campaign_test').update(raw).digest('hex');
+  const badSig = await app.inject({ method: 'POST', url: '/v1/crm/webhooks/delivery', headers: { 'content-type': 'application/json', 'x-provider-signature': 'deadbeef', 'x-forwarded-for': ip() }, payload: raw });
+  const wh1 = await app.inject({ method: 'POST', url: '/v1/crm/webhooks/delivery', headers: { 'content-type': 'application/json', 'x-provider-signature': sig, 'x-forwarded-for': ip() }, payload: raw });
+  const wh2 = await app.inject({ method: 'POST', url: '/v1/crm/webhooks/delivery', headers: { 'content-type': 'application/json', 'x-provider-signature': sig, 'x-forwarded-for': ip() }, payload: raw });
+  const updatedDeliv = await ownerDb.campaignDelivery.findUnique({ where: { id: liveDeliv!.id } });
+  check('A8. signed idempotent delivery webhook updates status (bad sig 401, dup acknowledged)', badSig.statusCode === 401 && wh1.statusCode === 200 && JSON.parse(wh2.body).duplicate === true && updatedDeliv?.status === 'failed');
+  (env as any).CAMPAIGN_WEBHOOK_SECRET = undefined;
+
+  // A9) Scheduler: approved SCHEDULED + due campaign dispatches once (idempotent).
+  (env as any).TWILIO_ACCOUNT_SID = 'mock_sid'; (env as any).TWILIO_AUTH_TOKEN = 'mock_tok'; (env as any).TWILIO_FROM_NUMBER = '+15550000000';
+  const schedCamp = JSON.parse((await call('POST', '/v1/crm/campaigns', aTok, { name: 'Scheduled', campaignType: 'inactive_patient_reactivation', audienceType: 'inactive_patients', channel: 'sms' })).body);
+  await call('POST', `/v1/crm/campaigns/${schedCamp.id}/approve`, aTok); // → SCHEDULED
+  await ownerDb.campaign.update({ where: { id: schedCamp.id }, data: { scheduledAt: new Date(Date.now() - 60000) } });
+  const run1 = await runScheduledCampaigns(new Date());
+  const afterRun = await ownerDb.campaign.findUnique({ where: { id: schedCamp.id } });
+  const deliv1 = await ownerDb.campaignDelivery.count({ where: { tenantId: tA.id, campaignId: schedCamp.id } });
+  await runScheduledCampaigns(new Date());
+  const deliv2 = await ownerDb.campaignDelivery.count({ where: { tenantId: tA.id, campaignId: schedCamp.id } });
+  const schedAudit = await ownerDb.auditEvent.findFirst({ where: { tenantId: tA.id, action: 'campaign.scheduled_run', resourceId: schedCamp.id } });
+  check('A9. scheduler dispatches due approved campaign once (idempotent + audited)', run1.dispatched >= 1 && afterRun?.status === 'ACTIVE' && deliv1 === deliv2 && !!schedAudit && isWithinQuietHours({ start: '00:00', end: '23:59' }, new Date()) === true);
+  (env as any).TWILIO_ACCOUNT_SID = savedSid; (env as any).TWILIO_AUTH_TOKEN = savedTok; (env as any).TWILIO_FROM_NUMBER = savedFrom;
+
+  // A10) Real open-slot detection from appointment gaps (non-zero, deterministic).
+  const openSlots = await (await import('../../lib/campaigns')).countOpenSlots(tA.id, 7);
+  check('A10. real open-slot detection returns slots from appointment gaps', openSlots > 0);
+
+  // A11) AI draft is rule_based when no LLM provider configured (dev).
+  const draftCamp = JSON.parse((await call('POST', '/v1/crm/campaigns', aTok, { name: 'Draft test', campaignType: 'review_request', audienceType: 'review_request', channel: 'sms' })).body);
+  const draftRes = JSON.parse((await call('POST', `/v1/crm/campaigns/${draftCamp.id}/draft`, aTok)).body);
+  check('A11. AI draft is rule_based without configured LLM provider', draftRes.draftSource === 'rule_based' && draftRes.requiresApproval === true);
 
   await app.close();
   for (const t of [tA, tB, tLock]) await ownerDb.tenant.delete({ where: { id: t.id } }).catch(() => {});

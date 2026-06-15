@@ -1,129 +1,123 @@
 import { useState } from 'react';
-import { useLocation } from 'react-router-dom';
-import { Search, Bell, Command, Zap, LogOut, UserCircle2 } from 'lucide-react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { Search, Command, ChevronDown, ChevronRight, LogOut, Settings as SettingsIcon } from 'lucide-react';
 import CommandPalette from '../ui/CommandPalette';
-import { useBackendHealth } from '../../hooks/useBackendHealth';
-import { formatCurrency } from '../../utils/formatters';
 import { useSession } from '../../hooks/useSession';
 
 const routeLabels: Record<string, string> = {
-  '/':                 'Dashboard',
+  '/':                 'Command Center',
+  '/advisory':         'AI Briefing',
   '/opportunities':    'Opportunity Center',
   '/clinic-radar':     'Clinic Radar',
   '/benchmarking':     'Multi-Clinic Benchmarking',
   '/autopilot':        'Autopilot',
   '/crm':              'CRM',
+  '/receptionist-studio': 'Receptionist Studio',
   '/campaigner':       'Campaigner',
+  '/reactivation':     'Reactivation',
   '/reviews':          'Reviews',
   '/revenue':          'Revenue Leaks',
+  '/revenue-protection': 'Revenue Protection',
+  '/insurance':        'Insurance',
+  '/insurance-eligibility': 'Insurance Eligibility',
+  '/integration-setup': 'Integration Setup',
+  '/enrollments':      'Device Enrollments',
+  '/sync-logs':        'Provider Sync Logs',
+  '/rpm-readiness':    'RPM Billing Readiness',
   '/doctor-workspace': 'Provider Performance',
   '/patients':         'Patients',
-  '/scheduling':       'Scheduling',
-  '/staff':            'Staff',
+  '/patient-intake':   'Patient Intake',
+  '/scheduling':       'Appointments',
+  '/staff':            'Staff Tasks',
+  '/compliance':       'Compliance Readiness',
   '/control-plane':    'Control Plane',
   '/admin':            'Control Plane',
+  '/subscription':     'Subscription',
   '/integrations':     'Integrations',
+  '/devices':          'Device Integration',
+  '/monitoring':       'Remote Monitoring',
   '/settings':         'Settings',
 };
 
-const notifs = [
-  { title: '3 critical stock alerts',    desc: 'Botox critically low at Downtown',          time: '2m', dotCls: 'pf-red' },
-  { title: 'SLA breach — Jake Williams', desc: 'Response time exceeds 6-min threshold',     time: '8m', dotCls: 'pf-amber' },
-  { title: `AI recovered ${formatCurrency(840)} today`, desc: '6 missed-call bookings converted', time: '1h', dotCls: 'pf-emerald' },
-  { title: 'New 1-star review',          desc: 'Unresponded negative review — Southbank',   time: '2h', dotCls: 'pf-red' },
-];
+function initials(name: string): string {
+  return name.trim().split(/\s+/).slice(0, 2).map(p => p[0]?.toUpperCase() ?? '').join('') || '·';
+}
 
 export default function Topbar() {
   const { pathname } = useLocation();
-  const [cmdOpen,   setCmdOpen]   = useState(false);
-  const [notifOpen, setNotifOpen] = useState(false);
-  const backendReady = useBackendHealth();
+  const navigate = useNavigate();
+  const [cmdOpen, setCmdOpen] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
   const { user, signOut } = useSession();
 
   const pageLabel = pathname === '/'
-    ? 'Dashboard'
+    ? 'Command Center'
     : (routeLabels[Object.keys(routeLabels).find(k => k !== '/' && pathname.startsWith(k)) ?? ''] ?? 'CareCommand');
+
+  const workspace = user?.tenant?.name;
+  const locationLabel = user?.branch?.name ?? user?.branch?.location ?? null;
 
   return (
     <>
       <header className="topbar">
-        {/* Breadcrumb */}
-        <div className="flex items-center gap-2 flex-1 min-w-0">
-          <span className="text-xs font-medium text-t3">CareCommand</span>
-          <span className="text-t3 opacity-40 select-none">/</span>
-          <span className="text-sm font-semibold text-t1 truncate">{pageLabel}</span>
-          <div className="flex items-center gap-1.5 ml-2 px-2 py-0.5 rounded-full topbar-live">
-            <span className="w-1.5 h-1.5 rounded-full live-dot pf-emerald" />
-            <span className="text-[10px] font-semibold topbar-live-text">{backendReady ? 'API Live' : 'Demo Mode'}</span>
-          </div>
-        </div>
+        {/* Breadcrumb: workspace › section, with location context chip */}
+        <nav aria-label="Breadcrumb" className="flex items-center gap-1.5 min-w-0 flex-1 text-[13px]">
+          {workspace && (
+            <>
+              <span className="text-t3 truncate max-w-[160px] hidden sm:inline">{workspace}</span>
+              <ChevronRight className="w-3.5 h-3.5 text-t3 shrink-0 hidden sm:inline opacity-60" aria-hidden="true" />
+            </>
+          )}
+          <span className="font-semibold text-t1 truncate">{pageLabel}</span>
+          {locationLabel && (
+            <span className="ml-1.5 hidden md:inline-flex items-center rounded-md border border-[var(--b1)] bg-[var(--s2)] px-2 py-0.5 text-[11px] font-medium text-t2 shrink-0">{locationLabel}</span>
+          )}
+        </nav>
 
-        {/* Search */}
+        {/* Command search */}
         <button type="button" onClick={() => setCmdOpen(true)} className="topbar-search">
           <Search className="w-3.5 h-3.5 shrink-0" />
-          <span className="topbar-search-text">Search or run a command…</span>
+          <span className="topbar-search-text">Search</span>
           <kbd className="topbar-kbd"><Command className="w-2.5 h-2.5" />K</kbd>
         </button>
 
-        {/* Actions */}
-          <div className="flex items-center gap-1.5">
-          {user && (
-            <div className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-full border border-[var(--b1)] bg-[var(--s2)]">
-              <UserCircle2 className="w-4 h-4 text-t3" />
-              <div className="min-w-0">
-                <p className="text-[11px] font-semibold leading-none text-t1 truncate">{user.displayName}</p>
-                <p className="text-[10px] leading-none mt-0.5 text-t3">{user.role}</p>
-              </div>
-            </div>
-          )}
-
-          {user && (
-            <button type="button" onClick={() => void signOut()} className="topbar-ai-btn">
-              <LogOut className="w-3.5 h-3.5" /> Logout
-            </button>
-          )}
-
-          <button type="button" onClick={() => setCmdOpen(true)} className="topbar-ai-btn">
-            <Zap className="w-3.5 h-3.5" /> AI Actions
-          </button>
-
-          <div className="relative">
-            <button
-              type="button"
-              title="Notifications"
-              aria-label="Notifications"
-              onClick={() => setNotifOpen(v => !v)}
-              className="topbar-icon-btn"
-            >
-              <Bell className="w-4 h-4" />
-              <span className="notif-badge" />
+        {/* User menu */}
+        {user && (
+          <div className="relative shrink-0">
+            <button type="button" onClick={() => setMenuOpen(v => !v)} aria-haspopup="menu" aria-expanded={menuOpen ? 'true' : 'false'}
+              className="flex items-center gap-2.5 rounded-lg border border-[var(--b1)] bg-white px-2 py-1.5 hover:bg-[var(--s2)] transition">
+              <span className="logo-user w-7 h-7 rounded-full grid place-items-center text-[10px] font-bold text-white shrink-0">{initials(user.displayName)}</span>
+              <span className="hidden md:flex flex-col items-start min-w-0">
+                <span className="text-[12px] font-semibold leading-none text-t1 truncate max-w-[140px]">{user.displayName}</span>
+                <span className="text-[10px] leading-none mt-0.5 text-t3 capitalize">{user.role.toLowerCase().replace(/_/g, ' ')}</span>
+              </span>
+              <ChevronDown className="w-3.5 h-3.5 text-t3 shrink-0" />
             </button>
 
-            {notifOpen && (
+            {menuOpen && (
               <>
-                <button
-                  type="button"
-                  aria-label="Close notifications"
-                  className="fixed inset-0 z-20"
-                  onClick={() => setNotifOpen(false)}
-                />
-                <div className="notif-panel animate-fade-up">
-                  <p className="notif-header">Notifications</p>
-                  {notifs.map((n) => (
-                    <div key={n.title} className="notif-item">
-                      <span className={`w-1.5 h-1.5 rounded-full mt-1.5 shrink-0 prog-fill ${n.dotCls}`} />
-                      <div className="flex-1 min-w-0">
-                        <p className="text-xs font-semibold text-t1">{n.title}</p>
-                        <p className="text-[11px] mt-0.5 text-t3 truncate">{n.desc}</p>
-                      </div>
-                      <span className="text-[10px] text-t3 shrink-0">{n.time}</span>
-                    </div>
-                  ))}
+                <button type="button" aria-label="Close menu" className="fixed inset-0 z-20" onClick={() => setMenuOpen(false)} />
+                <div className="absolute right-0 top-[calc(100%+6px)] z-30 w-60 rounded-xl border border-[var(--b1)] bg-white shadow-[0_20px_48px_rgba(15,23,42,0.12),0_4px_12px_rgba(15,23,42,0.06)] overflow-hidden animate-fade-up">
+                  <div className="px-4 py-3 border-b border-[var(--b1)]">
+                    <p className="text-[13px] font-semibold text-t1 truncate">{user.displayName}</p>
+                    <p className="text-[11px] text-t3 truncate">{user.email}</p>
+                    {workspace && <p className="text-[11px] text-t3 truncate mt-1">{workspace}</p>}
+                  </div>
+                  <div className="p-1.5">
+                    <button type="button" onClick={() => { setMenuOpen(false); navigate('/settings'); }}
+                      className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-[13px] text-t2 hover:bg-[var(--s2)] transition">
+                      <SettingsIcon className="w-4 h-4 text-t3" /> Account &amp; settings
+                    </button>
+                    <button type="button" onClick={() => { setMenuOpen(false); void signOut(); }}
+                      className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-[13px] text-red-v hover:bg-[var(--red-soft)] transition">
+                      <LogOut className="w-4 h-4" /> Sign out
+                    </button>
+                  </div>
                 </div>
               </>
             )}
           </div>
-        </div>
+        )}
       </header>
 
       <CommandPalette isOpen={cmdOpen} onClose={() => setCmdOpen(false)} />

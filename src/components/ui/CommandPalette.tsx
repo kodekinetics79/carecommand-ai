@@ -77,7 +77,7 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
   return (
     <div className="fixed inset-0 z-[100] flex items-start justify-center pt-[15vh] cmd-backdrop" onClick={onClose}>
       <div
-        className="w-full max-w-xl bg-[var(--s2)] rounded-2xl shadow-2xl border border-[var(--b2)] overflow-hidden animate-fade-in"
+        className="w-full max-w-xl glass-surface rounded-2xl overflow-hidden animate-fade-in"
         onClick={e => e.stopPropagation()}
       >
         {/* Search input */}

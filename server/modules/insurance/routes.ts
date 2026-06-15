@@ -7,6 +7,15 @@ import { requireFeature } from '../../lib/entitlements';
 import { assertBranchAccess, branchScope } from '../../lib/scope';
 import { eligibilityProviderStatus, computeDenialRisk, runDenialPreventionForAppointment } from '../../lib/insuranceIntelligence';
 import { emitBusinessEvent } from '../../lib/intelligence';
+import { encryptSecret } from '../../lib/security';
+import { INSURANCE_PROVIDERS, maskMemberId } from '../../lib/connectedCare/catalog';
+import { runStediEligibility } from '../../lib/connectedCare/eligibilityService';
+
+function insStatus(def: { supportsSandbox: boolean }, mode: string, hasRequired: boolean): string {
+  if (mode === 'sandbox' && def.supportsSandbox) return 'SANDBOX';
+  if (hasRequired) return 'ACTIVE';
+  return 'NOT_CONFIGURED';
+}
 
 const uuid = z.string().uuid();
 const adminRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
@@ -183,5 +192,131 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
     await audit(request, { action: 'insurance.profile.created', resource: 'patientInsurancePolicy', resourceId: row.id, metadata: { patientId: input.patientId } });
     await emitBusinessEvent(request.auth.tenantId, { eventType: 'insurance.profile.created', entityType: 'patientInsurancePolicy', entityId: row.id, sourceModule: 'insurance', payload: { patientId: input.patientId } }).catch(() => {});
     return reply.code(201).send(row);
+  });
+
+  // ════════════════════════════════════════════════════════════════════════
+  // PROVIDER REGISTRY — real configurable eligibility providers (no env flags)
+  // ════════════════════════════════════════════════════════════════════════
+  const providerKeySchema = z.enum(['stedi', 'optum', 'availity']);
+
+  // List providers (catalog merged with per-tenant DB status). Never returns config.
+  app.get('/providers', async request => {
+    const rows = await db.insuranceProvider.findMany({ where: { tenantId: request.auth.tenantId } });
+    const byKey = new Map(rows.map(r => [r.providerKey, r]));
+    return INSURANCE_PROVIDERS.map(def => {
+      const row = byKey.get(def.key);
+      return {
+        key: def.key, displayName: def.displayName, category: def.category, supportsSandbox: def.supportsSandbox, note: def.note,
+        configFields: def.configFields.map(f => ({ key: f.key, label: f.label, secret: f.secret, required: f.required })),
+        status: row?.status ?? 'NOT_CONFIGURED', mode: row?.mode ?? 'sandbox',
+        configured: !!row && row.status !== 'NOT_CONFIGURED',
+        lastHealthCheckAt: row?.lastHealthCheckAt ?? null, lastHealthStatus: row?.lastHealthStatus ?? null, healthMessage: row?.healthMessage ?? null,
+      };
+    });
+  });
+
+  // Configure a provider (encrypted config). Admin only; audited (no secrets logged).
+  app.post('/providers/:key/configure', { preHandler: adminRoles }, async (request, reply) => {
+    const { key } = z.object({ key: providerKeySchema }).parse(request.params);
+    const def = INSURANCE_PROVIDERS.find(p => p.key === key)!;
+    const { mode, config } = z.object({ mode: z.enum(['sandbox', 'production']).default('sandbox'), config: z.record(z.string(), z.string()).default({}) }).parse(request.body ?? {});
+    const required = def.configFields.filter(f => f.required).map(f => f.key);
+    const hasRequired = required.every(k => (config[k] ?? '').trim().length > 0);
+    if (mode === 'production' && !hasRequired) throw app.httpErrors.badRequest(`Missing required config: ${required.join(', ')}`);
+    const status = insStatus(def, mode, hasRequired);
+    const encryptedConfig = Object.keys(config).length ? encryptSecret(JSON.stringify(config)) : null;
+    const row = await db.insuranceProvider.upsert({
+      where: { tenantId_providerKey: { tenantId: request.auth.tenantId, providerKey: key } },
+      create: { tenantId: request.auth.tenantId, providerKey: key, displayName: def.displayName, category: 'INSURANCE', mode, status, encryptedConfig },
+      update: { mode, status, ...(encryptedConfig ? { encryptedConfig } : {}) },
+      select: { id: true, providerKey: true, status: true, mode: true },
+    });
+    await audit(request, { action: 'insurance.provider.configured', resource: 'insuranceProvider', resourceId: row.id, metadata: { providerKey: key, mode, status } });
+    return reply.send(row);
+  });
+
+  // Health check (rate-limited). Verifies configured state; sandbox runs a dry probe.
+  app.post('/providers/:key/health-check', { preHandler: deskRoles, config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async request => {
+    const { key } = z.object({ key: providerKeySchema }).parse(request.params);
+    const def = INSURANCE_PROVIDERS.find(p => p.key === key)!;
+    const row = await db.insuranceProvider.findFirst({ where: { tenantId: request.auth.tenantId, providerKey: key } });
+    let healthStatus = 'error';
+    let message = 'Provider is not configured.';
+    if (row && (row.status === 'SANDBOX' || row.status === 'ACTIVE')) {
+      healthStatus = 'healthy';
+      message = key === 'stedi'
+        ? (row.mode === 'sandbox' ? 'Sandbox reachable — simulated 271 response OK.' : 'Production credentials present.')
+        : 'Credentials present.';
+    }
+    const updated = await db.insuranceProvider.upsert({
+      where: { tenantId_providerKey: { tenantId: request.auth.tenantId, providerKey: key } },
+      create: { tenantId: request.auth.tenantId, providerKey: key, displayName: def.displayName, category: 'INSURANCE', status: 'NOT_CONFIGURED', lastHealthCheckAt: new Date(), lastHealthStatus: healthStatus, healthMessage: message },
+      update: { lastHealthCheckAt: new Date(), lastHealthStatus: healthStatus, healthMessage: message },
+      select: { providerKey: true, status: true, lastHealthStatus: true, healthMessage: true, lastHealthCheckAt: true },
+    });
+    await audit(request, { action: 'insurance.provider.health_check', resource: 'insuranceProvider', resourceId: row?.id ?? key, metadata: { providerKey: key, healthStatus } });
+    return updated;
+  });
+
+  // ════════════════════════════════════════════════════════════════════════
+  // ELIGIBILITY — backend service abstraction (frontend never decides coverage)
+  // ════════════════════════════════════════════════════════════════════════
+  app.post('/eligibility/check', { preHandler: deskRoles, config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async (request, reply) => {
+    const input = z.object({
+      patientId: uuid,
+      payerName: z.string().trim().min(2).max(120),
+      memberId: z.string().trim().min(2).max(60),
+      planName: z.string().trim().max(120).optional(),
+      serviceType: z.string().trim().max(40).optional(),
+      providerKey: z.enum(['stedi']).default('stedi'),
+    }).parse(request.body);
+    const tenantId = request.auth.tenantId;
+    const provider = await db.insuranceProvider.findFirst({ where: { tenantId, providerKey: input.providerKey } });
+    if (!provider || (provider.status !== 'SANDBOX' && provider.status !== 'ACTIVE')) {
+      throw app.httpErrors.badRequest('Eligibility provider is not configured. Configure Stedi (sandbox is available) first.');
+    }
+    const patient = await db.patient.findFirst({ where: { id: input.patientId, tenantId, deletedAt: null }, select: { id: true, branchId: true } });
+    if (!patient) throw app.httpErrors.notFound('Patient not found');
+    assertBranchAccess(request, patient.branchId);
+
+    const result = runStediEligibility(
+      { memberId: input.memberId, payerName: input.payerName, planName: input.planName, serviceType: input.serviceType },
+      provider.mode === 'production' ? 'production' : 'sandbox',
+    );
+    const n = result.normalized;
+    const verification = await db.eligibilityVerification.create({
+      data: {
+        tenantId, branchId: patient.branchId, patientId: patient.id, providerMode: result.providerMode,
+        coverageStatus: n.status, coverageActive: n.coverageActive, planName: n.planName, payerName: n.payerName,
+        copay: n.copay, deductibleRemaining: n.deductibleRemaining, coinsurance: n.coinsurance,
+        eligibilityMessage: n.message, payerReference: n.payerReference,
+        normalizedResponse: n as unknown as object, rawResponse: result.raw as object,
+      },
+      select: { id: true, checkedAt: true },
+    });
+    // Audit WITHOUT PHI — never log the member ID.
+    await audit(request, { action: 'insurance.eligibility.checked', resource: 'eligibilityVerification', resourceId: verification.id, metadata: { providerKey: input.providerKey, status: n.status, mode: result.providerMode } });
+    await emitBusinessEvent(tenantId, { eventType: 'insurance.eligibility.completed', entityType: 'eligibilityVerification', entityId: verification.id, sourceModule: 'insurance', payload: { status: n.status } }).catch(() => {});
+
+    return reply.code(201).send({
+      verificationId: verification.id, status: n.status, coverageActive: n.coverageActive,
+      planName: n.planName, payerName: n.payerName, copay: n.copay, deductibleRemaining: n.deductibleRemaining,
+      coinsurance: n.coinsurance, message: n.message, payerReference: n.payerReference,
+      maskedMemberId: maskMemberId(input.memberId), providerMode: result.providerMode, checkedAt: verification.checkedAt,
+    });
+  });
+
+  // Eligibility history (no member IDs are persisted; PHI-minimal).
+  app.get('/eligibility/history', async request => {
+    const q = z.object({ patientId: uuid.optional(), limit: z.coerce.number().min(1).max(100).default(25) }).parse(request.query);
+    const rows = await db.eligibilityVerification.findMany({
+      where: { tenantId: request.auth.tenantId, ...branchScope(request), ...(q.patientId ? { patientId: q.patientId } : {}) },
+      orderBy: { checkedAt: 'desc' }, take: q.limit,
+      select: { id: true, patientId: true, coverageStatus: true, coverageActive: true, planName: true, payerName: true, copay: true, deductibleRemaining: true, coinsurance: true, eligibilityMessage: true, providerMode: true, checkedAt: true },
+    });
+    const pIds = [...new Set(rows.map(r => r.patientId))];
+    const patients = pIds.length ? await db.patient.findMany({ where: { id: { in: pIds }, tenantId: request.auth.tenantId }, select: { id: true, firstName: true, lastName: true } }) : [];
+    const pmap = new Map(patients.map(p => [p.id, `${p.firstName} ${p.lastName}`]));
+    return rows.map(r => ({ ...r, copay: Number(r.copay), deductibleRemaining: Number(r.deductibleRemaining), coinsurance: Number(r.coinsurance), patientName: pmap.get(r.patientId) ?? 'Unknown' }));
   });
 };

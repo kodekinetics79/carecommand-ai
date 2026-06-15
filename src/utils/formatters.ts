@@ -1,7 +1,9 @@
+import { getCurrency, getCurrencyLocale } from '../lib/preferences';
+
 export const formatCurrency = (value: number): string => {
-  return new Intl.NumberFormat('en-US', {
+  return new Intl.NumberFormat(getCurrencyLocale(), {
     style: 'currency',
-    currency: 'USD',
+    currency: getCurrency(),
     minimumFractionDigits: 0,
     maximumFractionDigits: 0,
   }).format(value);

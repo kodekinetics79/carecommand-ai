@@ -22,6 +22,7 @@ export interface ProvisionInput {
   phone?: string;
   address?: string;
   planKey?: string;
+  trialDays?: number;
   status?: 'TRIAL' | 'ACTIVE';
   actorLabel?: string;
 }
@@ -62,7 +63,8 @@ export async function provisionTenant(input: ProvisionInput) {
   await seedComplianceBaseline(db, tenant.id);
 
   const now = new Date();
-  const trialEndsAt = new Date(now.getTime() + env.TRIAL_DAYS * 86400000);
+  const trialDays = input.trialDays ?? env.TRIAL_DAYS;
+  const trialEndsAt = new Date(now.getTime() + trialDays * 86400000);
   const status = input.status ?? 'TRIAL';
   const subscription = await db.tenantSubscription.create({
     data: { tenantId: tenant.id, planId: plan.id, status, startedAt: now, trialEndsAt: status === 'TRIAL' ? trialEndsAt : null, currentPeriodEnd: status === 'TRIAL' ? trialEndsAt : null },

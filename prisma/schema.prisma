@@ -102,6 +102,8 @@ model Tenant {
   id           String          @id @default(uuid()) @db.Uuid
   name         String
   slug         String          @unique
+  // Platform-controlled lifecycle status: active | suspended | cancelled.
+  status       String          @default("active")
   createdAt    DateTime        @default(now())
   updatedAt    DateTime        @updatedAt
   branches     Branch[]
@@ -186,6 +188,26 @@ model Tenant {
   communicationConsents CommunicationConsent[]
   campaignSuppressions CampaignSuppression[]
   campaignDeliveries CampaignDelivery[]
+  intakePackets PatientIntakePacket[]
+  intakeSections PatientIntakeSection[]
+  intakeDocuments PatientIntakeDocument[]
+  patientConsentRecords PatientConsentRecord[]
+  devices Device[]
+  deviceEvents DeviceEvent[]
+  monitoringRules MonitoringRule[]
+  deviceReadings DeviceReading[]
+  readingAlerts ReadingAlert[]
+  notificationEvents NotificationEvent[]
+  morningBriefingSignals MorningBriefingSignal[]
+  insuranceProviders InsuranceProvider[]
+  deviceProviders DeviceProvider[]
+  patientDeviceEnrollments PatientDeviceEnrollment[]
+  deviceProviderSyncLogs DeviceProviderSyncLog[]
+  patientConsents PatientConsent[]
+  rpmBillingReadiness RPMBillingReadiness[]
+  aiUsageLogs AIUsageLog[]
+  aiEvaluations AIEvaluation[]
+  portalAccessRequests PortalAccessRequest[]
 }
 
 model User {
@@ -265,6 +287,7 @@ model Branch {
   reviewRequests ReviewRequest[]
   userClinicAccesses UserClinicAccess[]
   appointmentRequests AppointmentRequest[]
+  devices Device[]
 
   @@unique([tenantId, name])
   @@index([tenantId, active])
@@ -315,6 +338,8 @@ model Patient {
 
   communicationConsents CommunicationConsent[]
   campaignSuppressions CampaignSuppression[]
+  intakePackets PatientIntakePacket[]
+  patientConsentRecords PatientConsentRecord[]
 
   @@unique([tenantId, externalRef])
   @@index([tenantId, branchId, deletedAt])
@@ -866,6 +891,7 @@ model PatientResponsibilityEstimate {
   estimatedPatientResponsibility Decimal @default(0) @db.Decimal(12, 2)
   recommendedCollectAmount    Decimal  @default(0) @db.Decimal(12, 2)
   reason                      String
+  acknowledgedAt              DateTime?
   createdAt                   DateTime @default(now())
   tenant                      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   branch                      Branch   @relation(fields: [branchId], references: [id], onDelete: Restrict)
@@ -1799,6 +1825,9 @@ model TenantSecurityPolicy {
   dataRetentionDays       Int      @default(2555)
   backupFrequency         String   @default("daily")
   evidenceReviewFrequency String   @default("quarterly")
+  // Platform-triggered "revoke all sessions": access tokens issued before this
+  // instant are rejected by the tenant authenticate hook.
+  sessionsRevokedAt       DateTime?
   createdAt               DateTime @default(now())
   updatedAt               DateTime @updatedAt
   tenant                  Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
@@ -2154,12 +2183,19 @@ model AIRecommendation {
   allowedActionType  String
   createdBy          String   @default("system")
   sourceData         Json?
+  // AI provenance (null for rule-based rows). Every AI rec carries evidence refs.
+  aiProvider         String?
+  aiModel            String?
+  promptVersion      String?
+  aiUsageLogId       String?  @db.Uuid
+  evidence           Json?
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
   tenant             Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   signal             OperationalSignal? @relation(fields: [signalId], references: [id], onDelete: SetNull)
 
   @@index([tenantId, status, recommendationType])
+  @@index([tenantId, createdBy, createdAt])
 }
 
 // ===========================================================================
@@ -2223,5 +2259,695 @@ model CampaignDelivery {
   campaign          Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
 
   @@unique([campaignId, patientId, leadId, channel])
+  @@index([tenantId, status, createdAt])
+}
+
+// ===========================================================================
+// Patient Intake + Consent Engine (Phase A). Tenant-scoped, RLS-ready (RLS NOT
+// enabled this phase). No PHI in logs; documents are metadata-only unless real
+// object storage exists. Public access is via a hashed, expiring, packet-scoped
+// token. Reuses Patient/Appointment/Insurance/Payment/Consent foundations.
+// ===========================================================================
+model PatientIntakePacket {
+  id                   String   @id @default(uuid()) @db.Uuid
+  tenantId             String   @db.Uuid
+  patientId            String?  @db.Uuid
+  leadId               String?  @db.Uuid
+  appointmentId        String?  @db.Uuid
+  appointmentRequestId String?  @db.Uuid
+  status               String   @default("draft")
+  source               String   @default("staff")
+  publicTokenHash      String?  @unique
+  tokenExpiresAt       DateTime?
+  startedAt            DateTime?
+  submittedAt          DateTime?
+  reviewedAt           DateTime?
+  reviewedByUserId     String?  @db.Uuid
+  createdByUserId      String?  @db.Uuid
+  readinessScore       Int      @default(0)
+  metadata             Json?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  tenant               Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  patient              Patient? @relation(fields: [patientId], references: [id], onDelete: SetNull)
+  sections             PatientIntakeSection[]
+  documents            PatientIntakeDocument[]
+  consentRecords       PatientConsentRecord[]
+
+  @@index([tenantId, status, createdAt])
+  @@index([tenantId, appointmentId])
+  @@index([tenantId, appointmentRequestId])
+}
+
+model PatientIntakeSection {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @db.Uuid
+  packetId    String   @db.Uuid
+  sectionType String
+  status      String   @default("pending")
+  data        Json?
+  completedAt DateTime?
+  reviewedAt  DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  packet      PatientIntakePacket @relation(fields: [packetId], references: [id], onDelete: Cascade)
+
+  @@unique([packetId, sectionType])
+  @@index([tenantId, status])
+}
+
+model PatientIntakeDocument {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  packetId        String   @db.Uuid
+  sectionId       String?  @db.Uuid
+  documentType    String
+  fileName        String?
+  mimeType        String?
+  fileSize        Int?
+  storageProvider String?
+  storageKey      String?
+  fileHash        String?
+  status          String   @default("metadata_only")
+  uploadedAt      DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  packet          PatientIntakePacket @relation(fields: [packetId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, packetId])
+}
+
+model PatientConsentRecord {
+  id                 String   @id @default(uuid()) @db.Uuid
+  tenantId           String   @db.Uuid
+  packetId           String?  @db.Uuid
+  patientId          String?  @db.Uuid
+  leadId             String?  @db.Uuid
+  consentType        String
+  status             String   @default("unknown")
+  version            String   @default("v1")
+  consentTextSnapshot String?
+  source             String   @default("intake")
+  acceptedAt         DateTime?
+  revokedAt          DateTime?
+  ipAddressHash      String?
+  userAgentHash      String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  tenant             Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  patient            Patient? @relation(fields: [patientId], references: [id], onDelete: SetNull)
+  packet             PatientIntakePacket? @relation(fields: [packetId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, consentType, status])
+  @@index([tenantId, patientId])
+}
+
+// ===========================================================================
+// Platform Admin / Super Admin Console (Phase B). Platform identity is DELIBER-
+// ATELY separate from tenant Users — a PlatformUser is a CareCommand operator,
+// never a clinic user, and platform JWTs (type:'platform') are never accepted as
+// tenant sessions. No PHI is ever stored here.
+// ===========================================================================
+model PlatformUser {
+  id                String   @id @default(uuid()) @db.Uuid
+  email             String   @unique
+  name              String
+  passwordHash      String
+  role              String   @default("PLATFORM_SUPPORT")
+  status            String   @default("active")
+  mfaEnabled        Boolean  @default(false)
+  mfaSecretEnc      String?
+  failedLoginCount  Int      @default(0)
+  lockedUntil       DateTime?
+  passwordChangedAt DateTime @default(now())
+  lastLoginAt       DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([status])
+}
+
+model PlatformAuditEvent {
+  id             String   @id @default(uuid()) @db.Uuid
+  platformUserId String?  @db.Uuid
+  action         String
+  targetType     String
+  targetId       String?
+  tenantId       String?  @db.Uuid
+  metadata       Json?
+  ipHash         String?
+  userAgentHash  String?
+  createdAt      DateTime @default(now())
+
+  @@index([action, createdAt])
+  @@index([tenantId, createdAt])
+}
+
+// ===========================================================================
+// Platform Control Tower (Phase 2). Platform-managed, tenant-scoped commercial
+// + governance tables. No Prisma relation to Tenant (platform-owned lifecycle);
+// rows are keyed by tenantId and managed only via platform-authed routes.
+// ===========================================================================
+model TenantBilling {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @unique @db.Uuid
+  cycle           String   @default("monthly") // monthly | annual
+  currency        String   @default("USD")
+  mrr             Decimal  @default(0) @db.Decimal(12, 2)
+  paymentStatus   String   @default("ok")      // ok | failed | no_method
+  renewalDate     DateTime?
+  gracePeriodDays Int      @default(0)
+  provider        String?                       // stripe | metronome | manual
+  externalRef     String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([paymentStatus])
+}
+
+model TenantUsageLimit {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @db.Uuid
+  key       String   // seats | locations | storage_gb | sms | voice_minutes | ai_credits | devices
+  limitValue Int?    // null = unlimited
+  used      Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([tenantId, key])
+  @@index([tenantId])
+}
+
+model TenantAiUsage {
+  id                  String   @id @default(uuid()) @db.Uuid
+  tenantId            String   @unique @db.Uuid
+  aiCreditsUsed       Int      @default(0)
+  aiCreditsLimit      Int?
+  receptionistMinutes Int      @default(0)
+  campaignGenerations Int      @default(0)
+  reportGenerations   Int      @default(0)
+  modelTier           String   @default("standard") // standard | advanced | premium
+  overageAllowed      Boolean  @default(false)
+  killSwitch          Boolean  @default(false)
+  killSwitchReason    String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+}
+
+model SupportAccessSession {
+  id             String   @id @default(uuid()) @db.Uuid
+  tenantId       String   @db.Uuid
+  platformUserId String?  @db.Uuid
+  operatorEmail  String?
+  reason         String
+  startedAt      DateTime @default(now())
+  expiresAt      DateTime
+  endedAt        DateTime?
+  createdAt      DateTime @default(now())
+
+  @@index([tenantId, endedAt])
+  @@index([expiresAt])
+}
+
+model PlatformIntegration {
+  id             String   @id @default(uuid()) @db.Uuid
+  key            String   @unique // catalog key (sms|email|…) or a custom slug
+  label          String?  // display name for custom services
+  isCustom       Boolean  @default(false)
+  fieldSchema    Json?    // custom services: [{ k, label, secret, required }]
+  configEnc      String?  // AES-256-GCM encrypted JSON of provider fields (never returned)
+  setFields      String[] // names of fields that have a stored value (non-secret metadata)
+  status         String   @default("disconnected") // connected | disconnected
+  lastTestAt     DateTime?
+  lastTestStatus String?  // ok | failed
+  lastTestDetail String?
+  updatedById    String?  @db.Uuid
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+// CRM automation rules (trigger → action). Tenant-scoped; evaluated on demand
+// (or by a future worker). Actions that create tasks run for real; campaign/
+// segment actions return a preview + route to the owning module.
+model AutomationRule {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @db.Uuid
+  templateKey   String   // catalog key (e.g. hot_lead_not_booked)
+  name          String
+  triggerType   String
+  actionType    String
+  config        Json?    // thresholds (hours, days, priority…)
+  enabled       Boolean  @default(false)
+  lastRunAt     DateTime?
+  lastMatchCount Int     @default(0)
+  runCount      Int      @default(0)
+  createdById   String?  @db.Uuid
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([tenantId, enabled])
+}
+
+// ===========================================================================
+// Patient / Client Portal (MVP). Portal identity is DELIBERATELY separate from
+// the staff User: a PatientPortalAccount maps 1:1 to a Patient within a tenant.
+// Magic-link tokens are stored hashed, expire, and are single-use. No portal
+// JWT can access staff APIs and no staff JWT can access portal APIs.
+// ===========================================================================
+model PatientPortalAccount {
+  id               String   @id @default(uuid()) @db.Uuid
+  tenantId         String   @db.Uuid
+  patientId        String   @db.Uuid
+  email            String?
+  phone            String?
+  status           String   @default("invited") // invited | active | disabled | locked
+  lastLoginAt      DateTime?
+  failedLoginCount Int      @default(0)
+  lockedUntil      DateTime?
+  paymentPolicyAckAt DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([tenantId, patientId])
+  @@index([tenantId, status])
+}
+
+model PatientPortalToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @db.Uuid
+  accountId String   @db.Uuid
+  tokenHash String   @unique // sha256 of the raw token; raw token never stored
+  type      String   @default("magic_login") // magic_login | session | password_reset
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([accountId, type, createdAt])
+}
+
+model PlatformConfig {
+  id               String   @id @default("singleton")
+  platformName     String   @default("CareCommand")
+  supportEmail     String?
+  defaultTrialDays Int      @default(14)
+  defaultPlanKey   String   @default("starter")
+  updatedAt        DateTime @updatedAt
+  updatedById      String?  @db.Uuid
+}
+
+model PlatformAnnouncement {
+  id            String   @id @default(uuid()) @db.Uuid
+  title         String
+  body          String
+  severity      String   @default("info") // info | warning | critical
+  audience      String   @default("all")  // all | operators | tenants
+  active        Boolean  @default(true)
+  createdById   String?  @db.Uuid
+  createdByName String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([active, createdAt])
+}
+
+// Connected IoT / clinical & front-desk device registry (Device Integration Center).
+// Gated by the device_integration entitlement. Tenant-scoped; branch optional.
+model Device {
+  id             String    @id @default(uuid()) @db.Uuid
+  tenantId       String    @db.Uuid
+  branchId       String?   @db.Uuid
+  name           String
+  deviceType     String    // vitals_monitor | lab_analyzer | check_in_kiosk | document_scanner | imaging | wearable_gateway
+  vendor         String?
+  model          String?
+  serialNumber   String?
+  connectionType String    @default("network") // network | usb | bluetooth | cloud_api
+  status         String    @default("pending")  // online | offline | error | pending
+  location       String?
+  firmwareVersion String?
+  notes          String?
+  lastSeenAt     DateTime?
+  lastTestStatus String?   // passed | failed (local readiness only — not external telemetry)
+  lastTestedAt   DateTime?
+  active         Boolean   @default(true)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  tenant         Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch         Branch?   @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  events         DeviceEvent[]
+
+  @@index([tenantId, active])
+  @@index([tenantId, branchId])
+  @@index([tenantId, status])
+}
+
+// Append-only status / config / audit timeline for a device.
+model DeviceEvent {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @db.Uuid
+  deviceId    String   @db.Uuid
+  type        String   // registered | status_changed | config_updated | connection_test | deactivated
+  fromStatus  String?
+  toStatus    String?
+  message     String?
+  actorUserId String?  @db.Uuid
+  createdAt   DateTime @default(now())
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  device      Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, deviceId, createdAt])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REMOTE MONITORING COMMAND CENTER (operational visibility layer, RPM)
+// Gated by device_integration. FKs are scalar (app-level scoping + manual joins)
+// except the Tenant relation for cascade. Severity/routing are backend-decided.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Patient/device-type/branch/org threshold + routing rules.
+model MonitoringRule {
+  id                String   @id @default(uuid()) @db.Uuid
+  tenantId          String   @db.Uuid
+  scope             String   @default("organization") // organization | branch | patient | device_type
+  branchId          String?  @db.Uuid
+  patientId         String?  @db.Uuid
+  deviceType        String?
+  readingType       String
+  minValue          Float?
+  maxValue          Float?
+  criticalMin       Float?
+  criticalMax       Float?
+  missedAfterHours  Int?
+  quietHoursStart   Int?
+  quietHoursEnd     Int?
+  escalationMinutes Int?
+  assignedRole      String?  // doctor | nurse | care_coordinator
+  assignedToUserId  String?  @db.Uuid
+  notifyChannels    String?  // csv: in_app,email,sms,push
+  priority          Int      @default(0)
+  active            Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  tenant            Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, readingType, active])
+}
+
+// Individual device/patient readings.
+model DeviceReading {
+  id               String   @id @default(uuid()) @db.Uuid
+  tenantId         String   @db.Uuid
+  patientId        String?  @db.Uuid
+  deviceId         String?  @db.Uuid
+  branchId         String?  @db.Uuid
+  readingType      String   // glucose | blood_pressure | oxygen | weight | temperature | heart_rate | ecg
+  value            String
+  numericValue     Float?
+  valueSecondary   Float?
+  unit             String?
+  capturedAt       DateTime
+  receivedAt       DateTime @default(now())
+  source           String   @default("device") // device | webhook | manual | import
+  validationStatus String   @default("valid")  // valid | suspect | invalid
+  rawPayload       Json?
+  createdAt        DateTime @default(now())
+  tenant           Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, capturedAt])
+  @@index([tenantId, patientId, readingType, capturedAt])
+}
+
+// Backend-generated alerts (severity/type decided server-side).
+model ReadingAlert {
+  id               String    @id @default(uuid()) @db.Uuid
+  tenantId         String    @db.Uuid
+  patientId        String?   @db.Uuid
+  deviceId         String?   @db.Uuid
+  readingId        String?   @db.Uuid
+  branchId         String?   @db.Uuid
+  severity         String    // normal | warning | high | critical
+  alertType        String    // abnormal_reading | missed_reading | device_offline | device_error | trend_risk
+  status           String    @default("open") // open | acknowledged | assigned | resolved
+  assignedToUserId String?   @db.Uuid
+  generatedReason  String?
+  createdAt        DateTime  @default(now())
+  acknowledgedAt   DateTime?
+  resolvedAt       DateTime?
+  tenant           Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, status, severity])
+  @@index([tenantId, patientId])
+}
+
+// Notification + delivery attempt log (consent-checked; channel + retry status).
+model NotificationEvent {
+  id              String    @id @default(uuid()) @db.Uuid
+  tenantId        String    @db.Uuid
+  alertId         String?   @db.Uuid
+  patientId       String?   @db.Uuid
+  recipientType   String    // patient | doctor | nurse | care_coordinator
+  recipientUserId String?   @db.Uuid
+  recipientLabel  String?
+  channel         String    // in_app | email | sms | push
+  status          String    @default("queued") // queued | sent | delivered | failed | retrying
+  attempts        Int       @default(0)
+  failureReason   String?
+  consentChecked  Boolean   @default(false)
+  consentResult   String?   // granted | denied | not_required
+  createdAt       DateTime  @default(now())
+  sentAt          DateTime?
+  tenant          Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, alertId])
+}
+
+// Precomputed daily operational briefing signals (summary only — no diagnosis).
+model MorningBriefingSignal {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String   @db.Uuid
+  branchId    String?  @db.Uuid
+  signalType  String   // critical_review | nurse_followup | missed_high_risk | offline_impact | trending_worse | rpm_opportunity
+  title       String
+  detail      String?
+  severity    String   @default("info") // info | warning | critical
+  metricValue Int?
+  patientId   String?  @db.Uuid
+  forDate     DateTime
+  createdAt   DateTime @default(now())
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, forDate])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONNECTED CARE — PROVIDER REGISTRY (real, configurable; not env flags)
+// Credentials are stored encrypted (encryptSecret). Status is backend-owned.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Insurance eligibility providers (stedi | optum | availity).
+model InsuranceProvider {
+  id                String    @id @default(uuid()) @db.Uuid
+  tenantId          String    @db.Uuid
+  providerKey       String    // stedi | optum | availity
+  displayName       String
+  category          String    @default("INSURANCE")
+  mode              String    @default("sandbox")          // sandbox | production
+  status            String    @default("NOT_CONFIGURED")   // NOT_CONFIGURED | SANDBOX | ACTIVE | ERROR | DISABLED
+  encryptedConfig   String?
+  lastHealthCheckAt DateTime?
+  lastHealthStatus  String?   // healthy | degraded | error
+  healthMessage     String?
+  active            Boolean   @default(true)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  tenant            Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, providerKey])
+  @@index([tenantId, status])
+}
+
+// Connected-device providers (direct API / aggregator / RPM vendor / manual).
+model DeviceProvider {
+  id                String    @id @default(uuid()) @db.Uuid
+  tenantId          String    @db.Uuid
+  providerKey       String    // dexcom | withings | validic | terra | tenovi | manual
+  displayName       String
+  category          String    // DIRECT_API | AGGREGATOR | RPM_VENDOR | MANUAL
+  mode              String    @default("sandbox")          // sandbox | production
+  status            String    @default("NOT_CONFIGURED")   // NOT_CONFIGURED | SANDBOX | ACTIVE | ERROR | DISABLED
+  encryptedConfig   String?
+  webhookConfigured Boolean   @default(false)
+  lastHealthCheckAt DateTime?
+  lastHealthStatus  String?
+  healthMessage     String?
+  lastSyncAt        DateTime?
+  active            Boolean   @default(true)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  tenant            Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, providerKey])
+  @@index([tenantId, status])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONNECTED CARE — ENROLLMENT, SYNC, RPM, CONSENT (operational backend)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// A patient enrolled into remote monitoring via a device provider.
+model PatientDeviceEnrollment {
+  id             String    @id @default(uuid()) @db.Uuid
+  tenantId       String    @db.Uuid
+  patientId      String    @db.Uuid
+  branchId       String?   @db.Uuid
+  providerKey    String    // dexcom | withings | validic | terra | tenovi | manual
+  deviceId       String?   @db.Uuid
+  programType    String    @default("rpm") // rpm | ccm | general
+  status         String    @default("active") // active | paused | ended
+  externalRef    String?
+  consentId      String?   @db.Uuid
+  enrolledAt     DateTime  @default(now())
+  endedAt        DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  tenant         Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, patientId, providerKey])
+  @@index([tenantId, status])
+}
+
+// Every inbound provider event (webhook / sync / health) is logged.
+model DeviceProviderSyncLog {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  providerKind    String   // device | insurance
+  providerKey     String
+  direction       String   @default("inbound") // inbound | outbound
+  event           String   // webhook | sync | health_check
+  status          String   // received | processed | error | rejected
+  httpStatus      Int?
+  signatureValid  Boolean?
+  readingsIngested Int     @default(0)
+  alertsCreated   Int      @default(0)
+  message         String?
+  payload         Json?
+  createdAt       DateTime @default(now())
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, providerKey, createdAt])
+}
+
+// Patient consent (RPM / communication). Required for RPM billing readiness.
+model PatientConsent {
+  id          String    @id @default(uuid()) @db.Uuid
+  tenantId    String    @db.Uuid
+  patientId   String    @db.Uuid
+  consentType String    @default("rpm") // rpm | communication | data_sharing
+  granted     Boolean   @default(false)
+  method      String?   // verbal | written | portal | esign
+  grantedAt   DateTime?
+  revokedAt   DateTime?
+  active      Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  tenant      Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, patientId, consentType])
+  @@index([tenantId, consentType, granted])
+}
+
+// RPM billing readiness snapshot + provider signoff. Never auto-submits claims.
+model RPMBillingReadiness {
+  id                  String    @id @default(uuid()) @db.Uuid
+  tenantId            String    @db.Uuid
+  patientId           String    @db.Uuid
+  periodStart         DateTime
+  periodEnd           DateTime
+  readingDays         Int       @default(0)
+  reviewMinutes       Int       @default(0)
+  communicationFlag   Boolean   @default(false)
+  providerSignoffUserId String? @db.Uuid
+  providerSignoffAt   DateTime?
+  status              String    @default("MISSING_REQUIREMENTS") // READY | NEEDS_REVIEW | MISSING_REQUIREMENTS
+  missingRequirements Json?
+  updatedAt           DateTime  @updatedAt
+  createdAt           DateTime  @default(now())
+  tenant              Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, patientId, periodStart])
+  @@index([tenantId, status])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AI MODEL GATEWAY — usage metering + evaluation (provider-agnostic)
+// API keys are read from backend env only; never stored here, never logged.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Metadata for every AI request/response. No prompt/response bodies or PHI.
+model AIUsageLog {
+  id               String   @id @default(uuid()) @db.Uuid
+  tenantId         String   @db.Uuid
+  provider         String   // mock | ollama | openai | claude
+  mode             String?  // local | cloud (ollama)
+  model            String
+  operation        String   // recommendation | morning_briefing | evaluation | health_check
+  promptVersion    String?
+  status           String   // ok | error | blocked
+  phiIncluded      Boolean  @default(false)
+  promptTokens     Int?
+  completionTokens Int?
+  totalTokens      Int?
+  estimatedCostUsd Decimal  @default(0) @db.Decimal(12, 6)
+  latencyMs        Int?
+  error            String?
+  actorUserId      String?  @db.Uuid
+  createdAt        DateTime @default(now())
+  tenant           Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, operation, createdAt])
+}
+
+// Automated quality/safety evaluation of an AI output (groundedness, evidence,
+// PHI-safety, budget). Operational guardrail — not clinical judgement.
+model AIEvaluation {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @db.Uuid
+  usageLogId    String?  @db.Uuid
+  subjectType   String   // recommendation | morning_briefing
+  subjectId     String?  @db.Uuid
+  evidenceCount Int      @default(0)
+  grounded      Boolean  @default(false)
+  phiSafe       Boolean  @default(true)
+  withinBudget  Boolean  @default(true)
+  score         Int      @default(0)
+  passed        Boolean  @default(false)
+  notes         String?
+  createdAt     DateTime @default(now())
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt])
+}
+
+// Mobile/self-signup access request for the patient portal. Created ONLY when a
+// signup attempt does NOT uniquely match one existing patient (0 or >1) — these
+// require staff review before any PHI access is granted.
+model PortalAccessRequest {
+  id               String    @id @default(uuid()) @db.Uuid
+  tenantId         String    @db.Uuid
+  email            String?
+  phone            String?
+  status           String    @default("pending") // pending | approved | rejected
+  matchCount       Int       @default(0)
+  note             String?
+  resolvedByUserId String?   @db.Uuid
+  resolvedAt       DateTime?
+  createdAt        DateTime  @default(now())
+  tenant           Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
   @@index([tenantId, status, createdAt])
 }

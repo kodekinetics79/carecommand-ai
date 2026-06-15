@@ -754,6 +754,7 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
       failedPayments, expiredPayments, revenueAlertsOpen, openTasks, recommendations, openSignals,
       insuranceGaps, priorAuthAttention, highResponsibilityEstimates, ineligibleVerifications,
       inactivePatients, noShowRecoveryCandidates, reviewRequestOpportunities, campaignDeliveryFailures, pendingCampaignApprovals,
+      intakePacketsPending, intakePacketsNeedingReview, intakeConsentMissing, intakeInsuranceCardReview, intakeEstimateAckMissing, intakeHighRiskGaps,
     ] = await Promise.all([
       db.appointmentRequest.count({ where: { tenantId, status: 'PENDING_REVIEW' } }),
       db.appointmentRequest.count({ where: { tenantId, source: 'ai_receptionist', status: { in: ['PENDING_REVIEW', 'MISSING_INFO'] } } }),
@@ -774,8 +775,23 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
       db.appointment.count({ where: { tenantId, status: 'NO_SHOW', deletedAt: null } }),
       db.appointment.count({ where: { tenantId, status: 'COMPLETED', deletedAt: null } }),
       db.campaignDelivery.count({ where: { tenantId, status: 'failed' } }),
-      db.campaign.count({ where: { tenantId, campaignType: { not: null }, requiresApproval: true, approvedByUserId: null, status: 'DRAFT' } }),
+      db.campaign.count({ where: { tenantId, campaignType: { not: null }, requiresApproval: true, approvedByUserId: null, status: { in: ['DRAFT', 'APPROVAL_REQUIRED'] } } }),
+      // Patient intake gaps — real counts only.
+      db.patientIntakePacket.count({ where: { tenantId, status: { in: ['draft', 'sent', 'in_progress'] } } }),
+      db.patientIntakePacket.count({ where: { tenantId, status: { in: ['submitted', 'needs_review'] } } }),
+      db.operationalSignal.count({ where: { tenantId, status: 'open', signalType: 'consent_missing' } }),
+      db.operationalSignal.count({ where: { tenantId, status: 'open', signalType: 'insurance_card_missing' } }),
+      db.operationalSignal.count({ where: { tenantId, status: 'open', signalType: 'estimate_ack_missing' } }),
+      db.operationalSignal.count({ where: { tenantId, status: 'open', signalType: { in: ['previsit_risk', 'intake_needs_review'] } } }),
     ]);
+    // Appointments tomorrow with no intake packet (real diff — no intake relation on Appointment).
+    const tomorrowStart = new Date(Date.now() + 86400000); const tomorrowEnd = new Date(Date.now() + 2 * 86400000);
+    const tomorrowAppts = await db.appointment.findMany({ where: { tenantId, deletedAt: null, status: { notIn: ['CANCELED', 'NO_SHOW', 'COMPLETED'] }, startsAt: { gte: tomorrowStart, lt: tomorrowEnd } }, select: { id: true } });
+    let appointmentsTomorrowMissingIntake = 0;
+    if (tomorrowAppts.length > 0) {
+      const withIntake = new Set((await db.patientIntakePacket.findMany({ where: { tenantId, appointmentId: { in: tomorrowAppts.map(a => a.id) } }, select: { appointmentId: true } })).map(p => p.appointmentId));
+      appointmentsTomorrowMissingIntake = tomorrowAppts.filter(a => !withIntake.has(a.id)).length;
+    }
     return {
       label: 'Rule-based morning briefing',
       generatedAt: new Date().toISOString(),
@@ -800,6 +816,23 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
         appointmentRequestFollowupCandidates: appointmentRequestsPending,
         campaignDeliveryFailures,
         pendingCampaignApprovals,
+        intakePacketsPending,
+        intakePacketsNeedingReview,
+        appointmentsTomorrowMissingIntake,
+        intakeConsentMissing,
+        intakeInsuranceCardReview,
+        intakeEstimateAckMissing,
+        intakeHighRiskGaps,
+      },
+      // Reports 360 hooks (lightweight pre-visit readiness summary — real data only).
+      reports360Hooks: {
+        intakePending: intakePacketsPending,
+        intakeNeedingReview: intakePacketsNeedingReview,
+        appointmentsTomorrowMissingIntake,
+        consentMissing: intakeConsentMissing,
+        insuranceCardReview: intakeInsuranceCardReview,
+        estimateAckMissing: intakeEstimateAckMissing,
+        preVisitHighRiskGaps: intakeHighRiskGaps,
       },
       topRecommendations: recommendations.map(r => ({
         id: r.id, title: r.title, recommendationType: r.recommendationType, reason: r.reason,

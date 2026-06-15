@@ -2,6 +2,8 @@ import 'dotenv/config';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '../server/generated/prisma/client';
 import { generatePasswordHash } from '../server/lib/security';
+import { evaluateSeverity } from '../server/lib/monitoring';
+import { normalizeWebhook } from '../server/lib/connectedCare/deviceAdapters';
 
 const tenantId = process.env.DEV_TENANT_ID ?? '11111111-1111-4111-8111-111111111111';
 const userId = process.env.DEV_USER_ID ?? '22222222-2222-4222-8222-222222222222';
@@ -40,7 +42,7 @@ async function ensureClinicAccess(userId: string, branchId: string, isPrimary = 
 await db.tenant.upsert({
   where: { id: tenantId },
   update: {},
-  create: { id: tenantId, name: 'CareCommand Demo Clinics', slug: 'carecommand-demo' },
+  create: { id: tenantId, name: 'Harley Street Medical Group', slug: 'harley-street-medical' },
 });
 
 await db.branch.upsert({
@@ -54,7 +56,7 @@ await db.user.upsert({
   update: {
     tenantId,
     email: 'admin@carecommand.ai',
-    displayName: 'Demo Admin',
+    displayName: 'Olivia Bennett',
     role: 'OWNER',
     passwordHash: await generatePasswordHash('ChangeMe123!'),
     active: true,
@@ -63,7 +65,7 @@ await db.user.upsert({
     id: userId,
     tenantId,
     email: 'admin@carecommand.ai',
-    displayName: 'Demo Admin',
+    displayName: 'Olivia Bennett',
     role: 'OWNER',
     passwordHash: await generatePasswordHash('ChangeMe123!'),
   },
@@ -214,13 +216,13 @@ await db.patient.upsert({
     tenantId,
     branchId,
     firstName: 'Charlotte',
-    lastName: 'Live',
-    email: 'charlotte.live@carecommand.local',
+    lastName: 'Whitmore',
+    email: 'charlotte.whitmore@carecommand.local',
     phone: '+44 7700 900100',
     lifecycleStage: 'ACTIVE',
     churnRisk: 12,
     lifetimeValue: 4250,
-    tags: ['live-db', 'wellness'],
+    tags: ['vip', 'wellness'],
   },
 });
 
@@ -232,11 +234,11 @@ for (const consent of [
   if (!existing) await db.consentEvent.create({ data: { tenantId, patientId, source: 'seed', ...consent } });
 }
 
-const appointment = await db.appointment.findFirst({ where: { tenantId, patientId, service: 'Live Wellness Review' } });
+const appointment = await db.appointment.findFirst({ where: { tenantId, patientId, service: 'Wellness Review' } });
 if (!appointment) {
   await db.appointment.create({
     data: {
-      tenantId, branchId, patientId, service: 'Live Wellness Review',
+      tenantId, branchId, patientId, service: 'Wellness Review',
       startsAt: new Date('2026-06-03T09:00:00Z'), endsAt: new Date('2026-06-03T09:30:00Z'),
       channel: 'EMAIL', value: 180, noShowRisk: 12,
     },
@@ -271,14 +273,14 @@ await db.integration.upsert({
   },
 });
 
-const review = await db.review.findFirst({ where: { tenantId, patientId, text: 'Live database review: smooth booking and thoughtful follow-up.' } });
-if (!review) await db.review.create({ data: { tenantId, branchId, patientId, rating: 5, text: 'Live database review: smooth booking and thoughtful follow-up.', platform: 'google', sentiment: 'positive' } });
+const review = await db.review.findFirst({ where: { tenantId, patientId, text: 'Smooth booking and genuinely thoughtful follow-up throughout.' } });
+if (!review) await db.review.create({ data: { tenantId, branchId, patientId, rating: 5, text: 'Smooth booking and genuinely thoughtful follow-up throughout.', platform: 'google', sentiment: 'positive' } });
 
-const report = await db.partnerReport.findFirst({ where: { tenantId, patientId, reportType: 'Live partner wellness report' } });
-if (!report) await db.partnerReport.create({ data: { tenantId, branchId, patientId, reportType: 'Live partner wellness report', partner: 'TDL London', urgency: 'routine', status: 'result-received', summary: 'Live operational document ready for provider review.', reviewedAt: new Date('2026-06-02T10:20:00Z'), reviewedByUserId: userId } });
+const report = await db.partnerReport.findFirst({ where: { tenantId, patientId, reportType: 'Partner wellness report' } });
+if (!report) await db.partnerReport.create({ data: { tenantId, branchId, patientId, reportType: 'Partner wellness report', partner: 'TDL London', urgency: 'routine', status: 'result-received', summary: 'Wellness panel results ready for provider review.', reviewedAt: new Date('2026-06-02T10:20:00Z'), reviewedByUserId: userId } });
 
-const task = await db.staffTask.findFirst({ where: { tenantId, title: 'Live DB: confirm wellness follow-up' } });
-if (!task) await db.staffTask.create({ data: { tenantId, branchId, assignedToId: userId, title: 'Live DB: confirm wellness follow-up', priority: 'medium', dueAt: new Date('2026-06-01T12:00:00Z') } });
+const task = await db.staffTask.findFirst({ where: { tenantId, title: 'Confirm wellness follow-up with Charlotte Whitmore' } });
+if (!task) await db.staffTask.create({ data: { tenantId, branchId, assignedToId: userId, title: 'Confirm wellness follow-up with Charlotte Whitmore', priority: 'medium', dueAt: new Date('2026-06-01T12:00:00Z') } });
 
 for (const seededTask of [
   { title: 'Follow up: Marcus Thompson (missed call)', branchId, priority: 'high', dueAt: new Date('2026-06-02T10:00:00Z'), assignedToEmail: 'aaron.mensah@carecommand.local', status: 'OPEN' },
@@ -307,7 +309,7 @@ for (const seededTask of [
 const snapshot = await db.revenueSnapshot.findFirst({ where: { tenantId, branchId: null, period: new Date('2026-06-01T00:00:00Z') } });
 if (!snapshot) await db.revenueSnapshot.create({ data: { tenantId, period: new Date('2026-06-01T00:00:00Z'), revenue: 332000, recovered: 28600, lost: 24100, campaigns: 18200 } });
 
-const conversation = await db.conversation.findFirst({ where: { tenantId, patientId, latestMessage: 'Live DB enquiry: can I book a wellness review this week?' } });
+const conversation = await db.conversation.findFirst({ where: { tenantId, patientId, latestMessage: 'Hi, can I book a wellness review this week?' } });
 if (!conversation) await db.conversation.create({
   data: {
     tenantId,
@@ -316,7 +318,7 @@ if (!conversation) await db.conversation.create({
     channel: 'WHATSAPP',
     status: 'unread',
     intent: 'Booking inquiry',
-    latestMessage: 'Live DB enquiry: can I book a wellness review this week?',
+    latestMessage: 'Hi, can I book a wellness review this week?',
     lastAgentMessage: 'Absolutely — we have openings on Thursday and Friday this week.',
     lastAgentMessageAt: new Date('2026-06-02T09:40:00Z'),
     estimatedValue: 180,
@@ -649,37 +651,51 @@ for (const opportunity of [
   }
 }
 
+// Autopilot playbooks carry their operating metrics in `config` so the
+// Autopilot page renders real DB-backed cards + derives KPIs (no hardcoded
+// dashboard numbers). status: LIVE | DRAFT.
 for (const playbook of [
-  { key: 'empty-slot-rescue', name: 'Empty Slot Rescue', description: 'Match released capacity with consent-safe customer outreach.' },
-  { key: 'missed-call-recovery', name: 'Missed Call Recovery', description: 'Recover missed inquiries with channel-aware follow-up.' },
-  { key: 'customer-winback', name: 'Customer Winback', description: 'Escalate or automate reactivation based on customer value.' },
+  { key: 'empty-slot-rescue', name: 'Empty Slot Rescue', description: 'Match released capacity with consent-safe customer outreach.', status: 'LIVE' as const,
+    config: { autonomyLevel: 2, icon: 'clock', trigger: 'Cancellation or under-utilised diary', action: 'Match waitlist, score fit, send consent-safe offer', runs: 34, successRate: 76, outcomeValue: 8420, monthlyHoursSaved: 14, guardrailBlocks: 6 } },
+  { key: 'missed-call-recovery', name: 'Missed Call Recovery', description: 'Recover missed inquiries with channel-aware follow-up.', status: 'LIVE' as const,
+    config: { autonomyLevel: 2, icon: 'activity', trigger: 'Call unanswered for 90 seconds', action: 'Identify intent, send WhatsApp/SMS, offer booking', runs: 51, successRate: 63, outcomeValue: 5880, monthlyHoursSaved: 12, guardrailBlocks: 4 } },
+  { key: 'customer-winback', name: 'Customer Winback', description: 'Escalate or automate reactivation based on customer value.', status: 'LIVE' as const,
+    config: { autonomyLevel: 2, icon: 'users', trigger: 'High-value customer inactive for 90 days', action: 'Build personal outreach journey with branch offer', runs: 187, successRate: 18, outcomeValue: 12900, monthlyHoursSaved: 11, guardrailBlocks: 5 } },
+  { key: 'reputation-flywheel', name: 'Reputation Flywheel', description: 'Request reviews and route detractors to private recovery.', status: 'DRAFT' as const,
+    config: { autonomyLevel: 1, icon: 'wand', trigger: 'Positive post-visit signal detected', action: 'Request review, route detractors to private recovery', runs: 96, successRate: 44, outcomeValue: 0, outcomeLabel: '42 reviews', monthlyHoursSaved: 5, guardrailBlocks: 2 } },
 ]) {
   await db.autopilotPlaybook.upsert({
     where: { tenantId_key: { tenantId, key: playbook.key } },
-    update: {},
-    create: { tenantId, ...playbook, status: 'LIVE', config: { autonomyLevel: 2 } },
+    update: { name: playbook.name, description: playbook.description, status: playbook.status, config: playbook.config },
+    create: { tenantId, ...playbook },
   });
 }
 
-const slotFillPlaybook = await db.autopilotPlaybook.findUniqueOrThrow({
-  where: { tenantId_key: { tenantId, key: 'empty-slot-rescue' } },
-});
+const playbookByKey: Record<string, string> = {};
+for (const key of ['empty-slot-rescue', 'missed-call-recovery', 'customer-winback', 'reputation-flywheel']) {
+  const pb = await db.autopilotPlaybook.findUnique({ where: { tenantId_key: { tenantId, key } } });
+  if (pb) playbookByKey[key] = pb.id;
+}
 
-const pendingApproval = await db.autopilotApproval.findFirst({
-  where: { tenantId, title: 'Activate Westside weekday slot-fill offer', status: 'PENDING' },
-});
+// Pending approvals (Approval Inbox — human-in-the-loop, real).
+for (const ap of [
+  { key: 'empty-slot-rescue', title: 'Activate Westside weekday slot-fill offer', reason: '31 empty slots detected · estimated £6,200 at risk', payload: { scope: 'Send to 84 matched customers', value: '£6,200' }, confidence: 91 },
+  { key: 'customer-winback', title: 'Escalate 14 customers for personal follow-up', reason: 'High-LTV customers need a human touch after two automated attempts', payload: { scope: 'Create tasks for branch coordinators', value: '£4,800' }, confidence: 86 },
+]) {
+  const exists = await db.autopilotApproval.findFirst({ where: { tenantId, title: ap.title, status: 'PENDING' } });
+  if (!exists) await db.autopilotApproval.create({ data: { tenantId, playbookId: playbookByKey[ap.key], title: ap.title, reason: ap.reason, payload: ap.payload, confidence: ap.confidence } });
+}
 
-if (!pendingApproval) {
-  await db.autopilotApproval.create({
-    data: {
-      tenantId,
-      playbookId: slotFillPlaybook.id,
-      title: 'Activate Westside weekday slot-fill offer',
-      reason: '31 empty slots detected · estimated £6,200 at risk',
-      payload: { scope: 'Send to 84 matched customers', value: '£6,200' },
-      confidence: 91,
-    },
-  });
+// Executed/approved actions power the Live Audit Trail (real, explainable rows).
+for (const ev of [
+  { key: 'empty-slot-rescue', title: 'Booked a released Downtown slot from the waitlist', payload: { value: '+£320', kind: 'success' }, status: 'EXECUTED' as const, hoursAgo: 1.5, confidence: 88 },
+  { key: 'empty-slot-rescue', title: 'Suppressed outreach: marketing consent not present', payload: { value: 'Blocked', kind: 'guardrail' }, status: 'EXECUTED' as const, hoursAgo: 1.7, confidence: 99 },
+  { key: 'missed-call-recovery', title: 'Recovered a missed call with a WhatsApp booking link', payload: { value: '+£180', kind: 'success' }, status: 'EXECUTED' as const, hoursAgo: 2.4, confidence: 81 },
+  { key: 'customer-winback', title: 'Created a personal follow-up task for a branch coordinator', payload: { value: 'Human step', kind: 'human' }, status: 'APPROVED' as const, hoursAgo: 3.1, confidence: 86 },
+  { key: 'empty-slot-rescue', title: 'Filled a cancellation from a priority waitlist match', payload: { value: '+£480', kind: 'success' }, status: 'EXECUTED' as const, hoursAgo: 4.0, confidence: 84 },
+]) {
+  const exists = await db.autopilotApproval.findFirst({ where: { tenantId, title: ev.title } });
+  if (!exists) await db.autopilotApproval.create({ data: { tenantId, playbookId: playbookByKey[ev.key], title: ev.title, reason: ev.title, payload: ev.payload, confidence: ev.confidence, status: ev.status, reviewedById: userId, reviewedAt: new Date(Date.now() - ev.hoursAgo * 3_600_000) } });
 }
 
 // ---- Demo population: customers, schedule, pipeline, stock, revenue ---------
@@ -707,7 +723,7 @@ const extraPatients = [
 ] as const;
 
 const patientPool: { id: string; branchId: string; name: string }[] = [
-  { id: patientId, branchId, name: 'Charlotte Live' },
+  { id: patientId, branchId, name: 'Charlotte Whitmore' },
 ];
 for (const p of extraPatients) {
   const row = await db.patient.upsert({
@@ -785,6 +801,73 @@ if (await db.campaign.count({ where: { tenantId } }) === 0) {
       { tenantId, name: 'Referral Reward Drive', goal: 'Encourage VIP patient referrals', status: 'PAUSED', channels: ['WHATSAPP', 'EMAIL'], audienceSize: 95, sent: 60, opened: 44, responded: 18, booked: 9, revenue: 6300, aiGenerated: false, startsAt: new Date(NOW - 20 * DAY) },
     ],
   });
+}
+
+// Reactivation engine campaigns (campaignType IS NOT NULL — surfaced by the
+// /v1/crm reactivation engine, distinct from the legacy Campaigner rows above).
+// Test data for formal testing: realistic states, rule-based drafts, consent-
+// aware deliveries. No fake "sent" without a matching delivery record.
+if (await db.campaign.count({ where: { tenantId, campaignType: { not: null } } }) === 0) {
+  const reactivationCampaigns = [
+    {
+      name: '90-Day Inactive Win-Back', campaignType: 'inactive_patient_reactivation', audienceType: 'inactive_patients',
+      campaignChannel: 'email', status: 'APPROVAL_REQUIRED' as const, requiresApproval: true, approved: false,
+      messageSubject: 'We’d love to see you back, {{firstName}}',
+      messageTemplate: 'Hi {{firstName}}, it’s been a while since your last visit to {{clinicName}}. Reply BOOK and we’ll find a time that works for you.',
+      deliveries: [] as Array<{ idx: number; channel: string; status: string }>,
+    },
+    {
+      name: 'No-Show Recovery — This Week', campaignType: 'no_show_recovery', audienceType: 'no_show_recovery',
+      campaignChannel: 'sms', status: 'ACTIVE' as const, requiresApproval: true, approved: true,
+      messageSubject: null, messageTemplate: 'Hi {{firstName}}, we missed you at your appointment. Reply RESCHEDULE to grab a new slot — no charge.',
+      deliveries: [{ idx: 8, channel: 'sms', status: 'delivered' }, { idx: 1, channel: 'sms', status: 'sent' }, { idx: 4, channel: 'sms', status: 'failed' }],
+    },
+    {
+      name: 'Post-Visit Review Requests', campaignType: 'review_request', audienceType: 'review_request',
+      campaignChannel: 'email', status: 'COMPLETED' as const, requiresApproval: true, approved: true,
+      messageSubject: 'How was your visit, {{firstName}}?',
+      messageTemplate: 'Thanks for visiting {{clinicName}}, {{firstName}}. We’d be grateful for a quick review — it really helps our team.',
+      deliveries: [{ idx: 5, channel: 'email', status: 'delivered' }, { idx: 3, channel: 'email', status: 'delivered' }, { idx: 9, channel: 'email', status: 'opened' }],
+    },
+    {
+      name: 'Outstanding Deposit Follow-up', campaignType: 'unpaid_deposit_followup', audienceType: 'unpaid_deposit_followup',
+      campaignChannel: 'whatsapp', status: 'DRAFT' as const, requiresApproval: true, approved: false,
+      messageSubject: null, messageTemplate: 'Hi {{firstName}}, your booking is held pending a deposit. Tap the secure link to confirm your spot.',
+      deliveries: [],
+    },
+    {
+      name: 'Appointment Confirmations (48h)', campaignType: 'appointment_confirmation', audienceType: 'appointment_request_followup',
+      campaignChannel: 'sms', status: 'SCHEDULED' as const, requiresApproval: true, approved: true,
+      messageSubject: null, messageTemplate: 'Reminder: your appointment at {{clinicName}} is in 48 hours. Reply C to confirm or R to reschedule.',
+      deliveries: [{ idx: 7, channel: 'sms', status: 'pending' }],
+    },
+  ];
+
+  for (const c of reactivationCampaigns) {
+    const campaign = await db.campaign.create({
+      data: {
+        tenantId, name: c.name, goal: c.campaignType, status: c.status, channels: [],
+        campaignType: c.campaignType, audienceType: c.audienceType, campaignChannel: c.campaignChannel,
+        messageSubject: c.messageSubject, messageTemplate: c.messageTemplate,
+        draftSource: 'rule_based', requiresApproval: c.requiresApproval,
+        ...(c.approved ? { approvedByUserId: userId, approvedAt: new Date(NOW - 2 * DAY) } : {}),
+        ...(c.status === 'SCHEDULED' ? { scheduledAt: new Date(NOW + 2 * DAY) } : {}),
+        createdByUserId: userId,
+      },
+    });
+    for (const d of c.deliveries) {
+      const p = patientPool[d.idx % patientPool.length];
+      await db.campaignDelivery.create({
+        data: {
+          tenantId, campaignId: campaign.id, patientId: p.id, channel: d.channel,
+          destinationMasked: d.channel === 'email' ? '•••@example.com' : '••• ••• ••12',
+          status: d.status, provider: d.channel === 'email' ? 'http_email' : 'twilio',
+          ...(d.status !== 'pending' && d.status !== 'failed' ? { sentAt: new Date(NOW - 1 * DAY) } : {}),
+          ...(d.status === 'failed' ? { failureReason: 'carrier_rejected' } : {}),
+        },
+      });
+    }
+  }
 }
 
 if (await db.review.count({ where: { tenantId } }) < 4) {
@@ -874,11 +957,23 @@ for (const payer of payerSeeds) {
 
 const payerMap = new Map((await db.insurancePayer.findMany({ where: { tenantId, active: true } })).map(row => [row.name, row]));
 
-const policySeeds = [
-  { patientId: patientPool[0].id, branchId: patientPool[0].branchId, payerName: 'Cigna', planName: 'Cigna Choice Gold', memberId: 'CIG-428194', groupNumber: 'GRP-9012', subscriberName: 'Charlotte Live' },
-  { patientId: patientPool[1].id, branchId: patientPool[1].branchId, payerName: 'Aetna', planName: 'Aetna Core Plus', memberId: 'AET-110293', groupNumber: 'GRP-2411', subscriberName: 'Amelia Hughes' },
-  { patientId: patientPool[2].id, branchId: patientPool[2].branchId, payerName: 'UnitedHealthcare', planName: 'UHC Balance Plan', memberId: 'UHC-551028', groupNumber: 'GRP-7740', subscriberName: 'Daniel Okoro' },
+const policyDefs = [
+  { idx: 0, payerName: 'Cigna', planName: 'Cigna Choice Gold', memberId: 'CIG-428194', groupNumber: 'GRP-9012', verificationStatus: 'verified' },
+  { idx: 1, payerName: 'Aetna', planName: 'Aetna Core Plus', memberId: 'AET-110293', groupNumber: 'GRP-2411', verificationStatus: 'verified' },
+  { idx: 2, payerName: 'UnitedHealthcare', planName: 'UHC Balance Plan', memberId: 'UHC-551028', groupNumber: 'GRP-7740', verificationStatus: 'pending' },
+  { idx: 3, payerName: 'Blue Cross Blue Shield', planName: 'BCBS PPO Silver', memberId: 'BCBS-773201', groupNumber: 'GRP-5521', verificationStatus: 'verified' },
+  { idx: 4, payerName: 'Humana', planName: 'Humana Gold Plus HMO', memberId: 'HUM-660934', groupNumber: 'GRP-3088', verificationStatus: 'failed' },
+  { idx: 5, payerName: 'Kaiser Permanente', planName: 'Kaiser Signature', memberId: 'KP-902187', groupNumber: 'GRP-1190', verificationStatus: 'verified' },
+  { idx: 6, payerName: 'Cigna', planName: 'Cigna Open Access Plus', memberId: 'CIG-551240', groupNumber: 'GRP-8841', verificationStatus: 'verified' },
+  { idx: 7, payerName: 'Aetna', planName: 'Aetna Select HMO', memberId: 'AET-330927', groupNumber: 'GRP-6610', verificationStatus: 'pending' },
+  { idx: 8, payerName: 'UnitedHealthcare', planName: 'UHC Navigate Plus', memberId: 'UHC-884510', groupNumber: 'GRP-4402', verificationStatus: 'verified' },
 ];
+const policySeeds = policyDefs
+  .filter(d => patientPool[d.idx])
+  .map(d => {
+    const p = patientPool[d.idx];
+    return { ...d, patientId: p.id, branchId: p.branchId, subscriberName: p.name };
+  });
 for (const policy of policySeeds) {
   const existing = await db.patientInsurancePolicy.findFirst({ where: { tenantId, patientId: policy.patientId, active: true } });
   if (!existing) {
@@ -894,10 +989,56 @@ for (const policy of policySeeds) {
         relationship: 'self',
         subscriberName: policy.subscriberName,
         payerReference: policy.memberId,
-        verificationStatus: 'pending',
+        verificationStatus: policy.verificationStatus,
+        verifiedAt: policy.verificationStatus === 'verified' ? new Date() : null,
         active: true,
       },
     });
+  } else if (existing.verificationStatus !== policy.verificationStatus) {
+    // Refresh verification status on re-seed so the overview shows verified coverage.
+    await db.patientInsurancePolicy.update({
+      where: { id: existing.id },
+      data: { verificationStatus: policy.verificationStatus, verifiedAt: policy.verificationStatus === 'verified' ? new Date() : null },
+    });
+  }
+}
+
+// ---- Device Integration Center (connected IoT / clinical devices) -----------
+const deviceSeeds = [
+  { name: 'Welch Allyn Connex Spot Monitor', deviceType: 'vitals_monitor', vendor: 'Hillrom', model: 'Connex 7100', serialNumber: 'WA-7100-0481', connectionType: 'network', status: 'online', location: 'Triage Room 1', firmwareVersion: '2.41.00' },
+  { name: 'Abbott i-STAT Analyzer', deviceType: 'lab_analyzer', vendor: 'Abbott', model: 'i-STAT 1', serialNumber: 'IS1-22910', connectionType: 'cloud_api', status: 'online', location: 'Lab Bench A', firmwareVersion: 'JAMS-168' },
+  { name: 'Front Desk Check-in Kiosk', deviceType: 'check_in_kiosk', vendor: 'CareCommand', model: 'CC-Kiosk Mini', serialNumber: 'KIOSK-014', connectionType: 'network', status: 'online', location: 'Reception', firmwareVersion: '1.8.2' },
+  { name: 'Fujitsu fi-8170 Scanner', deviceType: 'document_scanner', vendor: 'Fujitsu', model: 'fi-8170', serialNumber: 'FJ-8170-3320', connectionType: 'usb', status: 'offline', location: 'Records Office', firmwareVersion: '0140' },
+  { name: 'Mindray Resona Ultrasound', deviceType: 'imaging', vendor: 'Mindray', model: 'Resona I9', serialNumber: 'MR-I9-7741', connectionType: 'network', status: 'error', location: 'Imaging Suite', firmwareVersion: '3.02.10', notes: 'DICOM node unreachable — check network route' },
+  { name: 'Withings Patient Gateway', deviceType: 'wearable_gateway', vendor: 'Withings', model: 'Hub Pro', serialNumber: 'WH-PRO-0099', connectionType: 'bluetooth', status: 'pending', location: 'Remote Monitoring', firmwareVersion: '4.1.0' },
+];
+for (const device of deviceSeeds) {
+  let existing = await db.device.findFirst({ where: { tenantId, name: device.name } });
+  if (!existing) {
+    existing = await db.device.create({
+      data: {
+        tenantId,
+        branchId,
+        ...device,
+        lastSeenAt: device.status === 'online' ? new Date() : device.status === 'error' ? new Date(Date.now() - 36e5) : null,
+        lastTestStatus: device.status === 'online' ? 'passed' : null,
+        lastTestedAt: device.status === 'online' ? new Date() : null,
+        active: true,
+      },
+    });
+  }
+  // Backfill a starter timeline so the detail drawer isn't empty.
+  const eventCount = await db.deviceEvent.count({ where: { tenantId, deviceId: existing.id } });
+  if (eventCount === 0) {
+    const base = Date.now() - 72e5; // ~2h ago
+    await db.deviceEvent.create({ data: { tenantId, deviceId: existing.id, type: 'registered', toStatus: 'pending', message: `Registered via ${device.connectionType}`, createdAt: new Date(base) } });
+    if (device.status === 'online') {
+      await db.deviceEvent.create({ data: { tenantId, deviceId: existing.id, type: 'connection_test', fromStatus: 'pending', toStatus: 'online', message: 'Local readiness check passed', createdAt: new Date(base + 36e5) } });
+    } else if (device.status === 'error') {
+      await db.deviceEvent.create({ data: { tenantId, deviceId: existing.id, type: 'status_changed', fromStatus: 'pending', toStatus: 'error', message: device.notes ?? 'Connection error detected', createdAt: new Date(base + 36e5) } });
+    } else if (device.status === 'offline') {
+      await db.deviceEvent.create({ data: { tenantId, deviceId: existing.id, type: 'status_changed', fromStatus: 'online', toStatus: 'offline', message: 'Device went offline', createdAt: new Date(base + 36e5) } });
+    }
   }
 }
 
@@ -1117,7 +1258,7 @@ for (const alert of [
 if (await db.paymentProviderConnection.count({ where: { tenantId } }) === 0) {
   await db.paymentProviderConnection.createMany({
     data: [
-      { tenantId, providerKey: 'mock', displayName: 'Mock Payments', mode: 'mock', status: 'connected', baseUrl: null, connectedAt: new Date(NOW - DAY), lastSyncAt: new Date(NOW - DAY / 2), configuration: { description: 'Safe fallback for local demo runs.' } },
+      { tenantId, providerKey: 'mock', displayName: 'Mock Payments', mode: 'mock', status: 'connected', baseUrl: null, connectedAt: new Date(NOW - DAY), lastSyncAt: new Date(NOW - DAY / 2), configuration: { description: 'Sandbox payment provider for evaluation environments.' } },
       { tenantId, providerKey: 'stripe', displayName: 'Stripe Test Mode', mode: 'sandbox', status: 'connected', baseUrl: 'https://api.stripe.com', connectedAt: new Date(NOW - 5 * DAY), lastSyncAt: new Date(NOW - DAY), configuration: { description: 'Sandbox-ready payment link and checkout session mode.' } },
     ],
   });
@@ -1354,6 +1495,227 @@ for (const t of await db.tenant.findMany({ select: { id: true } })) {
     });
     await recomputeEntitlements(tenantId);
   }
+}
+
+// ---- Service catalog (drives scheduling/checkout service picker) -----------
+if (await db.serviceCatalogItem.count({ where: { tenantId } }) === 0) {
+  await db.serviceCatalogItem.createMany({
+    data: [
+      { tenantId, name: 'New Patient Consultation', category: 'consultation', defaultDurationMinutes: 30, defaultAppointmentValue: 120 },
+      { tenantId, name: 'Wellness Review', category: 'wellness', defaultDurationMinutes: 30, defaultAppointmentValue: 180 },
+      { tenantId, name: 'Skin Resurfacing', category: 'aesthetics', defaultDurationMinutes: 60, defaultAppointmentValue: 420 },
+      { tenantId, name: 'Dental Implant Assessment', category: 'dental', defaultDurationMinutes: 45, defaultAppointmentValue: 260 },
+      { tenantId, name: 'Physiotherapy Session', category: 'physio', defaultDurationMinutes: 45, defaultAppointmentValue: 95 },
+      { tenantId, name: 'Telehealth Follow-up', category: 'telehealth', defaultDurationMinutes: 20, defaultAppointmentValue: 80 },
+    ],
+  });
+}
+
+// ---- Patient intake packets (Patient Intake module) ------------------------
+if (await db.patientIntakePacket.count({ where: { tenantId } }) === 0) {
+  const intakeSeed = [
+    { idx: 2, status: 'submitted', source: 'public', readinessScore: 92, submitted: -1 },
+    { idx: 4, status: 'submitted', source: 'public', readinessScore: 78, submitted: -2 },
+    { idx: 0, status: 'in_progress', source: 'staff', readinessScore: 45, submitted: null },
+    { idx: 7, status: 'reviewed', source: 'public', readinessScore: 100, submitted: -5 },
+    { idx: 9, status: 'draft', source: 'staff', readinessScore: 10, submitted: null },
+  ];
+  for (const p of intakeSeed) {
+    const patient = patientPool[p.idx % patientPool.length];
+    await db.patientIntakePacket.create({
+      data: {
+        tenantId, patientId: patient.id, status: p.status, source: p.source, readinessScore: p.readinessScore,
+        createdByUserId: userId, startedAt: new Date(NOW - 6 * DAY),
+        ...(p.submitted !== null ? { submittedAt: new Date(NOW + p.submitted * DAY) } : {}),
+        ...(p.status === 'reviewed' ? { reviewedAt: new Date(NOW - 4 * DAY), reviewedByUserId: userId } : {}),
+        metadata: { contactName: patient.name },
+      },
+    });
+  }
+}
+
+// ---- AI recommendations (Advisory Room + Morning Briefing). Rule-based only;
+// every recommendation requires human review (no autonomous execution). -------
+if (await db.aIRecommendation.count({ where: { tenantId } }) === 0) {
+  await db.aIRecommendation.createMany({
+    data: [
+      { tenantId, title: 'Re-engage 187 lapsed patients', recommendationType: 'inactive_patient_reactivation', reason: '187 patients have not visited in 90+ days and still hold marketing consent.', expectedImpact: 'Recover an estimated £9,600 in bookings', confidence: 72, requiresHumanReview: true, status: 'pending', allowedActionType: 'create_reactivation_campaign', createdBy: 'system', sourceData: { audience: 'inactive_patients', size: 187 } },
+      { tenantId, title: 'Recover 3 failed deposit payments', recommendationType: 'review_failed_payment', reason: '3 deposit payments failed in the last 7 days; links can be resent.', expectedImpact: 'Protect £540 in at-risk deposits', confidence: 68, requiresHumanReview: true, status: 'pending', allowedActionType: 'resend_payment_link', createdBy: 'system', sourceData: { count: 3 } },
+      { tenantId, title: 'Fill 12 open weekday slots', recommendationType: 'fill_open_slots', reason: 'Downtown has 12 unbooked weekday slots over the next 14 days.', expectedImpact: 'Up to £2,160 in additional revenue', confidence: 61, requiresHumanReview: true, status: 'pending', allowedActionType: 'create_reactivation_campaign', createdBy: 'system', sourceData: { branch: 'downtown', openSlots: 12 } },
+      { tenantId, title: 'Respond to 2 negative reviews', recommendationType: 'reputation_followup', reason: '2 reviews rated ≤ 2 stars are awaiting a response.', expectedImpact: 'Protect online reputation and retention', confidence: 80, requiresHumanReview: true, status: 'pending', allowedActionType: 'review_reputation_case', createdBy: 'system', sourceData: { unresolved: 2 } },
+    ],
+  });
+}
+
+// ---- CRM automation rules (the 6 catalog rules, disabled by default) -------
+if (await db.automationRule.count({ where: { tenantId } }) === 0) {
+  const { RULE_CATALOG } = await import('../server/lib/automationRules');
+  for (const t of RULE_CATALOG) {
+    await db.automationRule.create({ data: { tenantId, templateKey: t.key, name: t.name, triggerType: t.triggerType, actionType: t.actionType, config: t.config, enabled: false, createdById: userId } });
+  }
+}
+
+// ---- Patient portal account for the demo patient (active) ------------------
+{
+  const demoPatient = await db.patient.findUnique({ where: { id: patientId }, select: { email: true, phone: true } });
+  await db.patientPortalAccount.upsert({
+    where: { tenantId_patientId: { tenantId, patientId } },
+    update: { status: 'active' },
+    create: { tenantId, patientId, email: demoPatient?.email ?? null, phone: demoPatient?.phone ?? null, status: 'active' },
+  });
+}
+
+// ---- Remote Monitoring Command Center (RPM demo data) -----------------------
+{
+  const existingReadings = await db.deviceReading.count({ where: { tenantId } });
+  if (existingReadings === 0 && patientPool.length >= 6) {
+    const devs = await db.device.findMany({ where: { tenantId, active: true }, select: { id: true, deviceType: true, status: true } });
+    const vitals = devs.find(d => d.deviceType === 'vitals_monitor')?.id ?? null;
+    const gateway = devs.find(d => d.deviceType === 'wearable_gateway')?.id ?? null;
+    const offlineDev = devs.find(d => d.status === 'offline' || d.status === 'error') ?? null;
+    const provider = await db.user.findFirst({ where: { tenantId, role: 'PROVIDER', active: true }, select: { id: true } });
+    const assignee = provider?.id ?? userId;
+    const now = Date.now();
+    const ago = (mins: number) => new Date(now - mins * 60000);
+
+    // Threshold + routing rules (org defaults + one patient-specific).
+    await db.monitoringRule.createMany({ data: [
+      { tenantId, scope: 'organization', readingType: 'glucose', minValue: 70, maxValue: 180, criticalMin: 54, criticalMax: 300, missedAfterHours: 12, escalationMinutes: 30, assignedRole: 'nurse', assignedToUserId: assignee, notifyChannels: 'in_app,sms', priority: 0 },
+      { tenantId, scope: 'organization', readingType: 'oxygen', minValue: 92, maxValue: 100, criticalMin: 88, criticalMax: 101, missedAfterHours: 8, escalationMinutes: 15, assignedRole: 'nurse', assignedToUserId: assignee, notifyChannels: 'in_app', priority: 0 },
+      { tenantId, scope: 'organization', readingType: 'blood_pressure', minValue: 90, maxValue: 140, criticalMin: 80, criticalMax: 180, missedAfterHours: 24, escalationMinutes: 45, assignedRole: 'doctor', assignedToUserId: assignee, notifyChannels: 'in_app,email', priority: 0 },
+      { tenantId, scope: 'patient', patientId: patientPool[0].id, readingType: 'glucose', minValue: 80, maxValue: 160, criticalMin: 60, criticalMax: 260, missedAfterHours: 6, escalationMinutes: 20, assignedRole: 'doctor', assignedToUserId: assignee, notifyChannels: 'in_app,sms', priority: 10 },
+    ] });
+
+    // Readings — mix of normal + abnormal, captured over the last few hours.
+    const readingDefs: Array<{ p: number; type: string; value: string; num: number; sec?: number; unit: string; dev: string | null; mins: number; status?: string }> = [
+      { p: 0, type: 'glucose', value: '248', num: 248, unit: 'mg/dL', dev: gateway, mins: 25 },
+      { p: 0, type: 'glucose', value: '176', num: 176, unit: 'mg/dL', dev: gateway, mins: 220 },
+      { p: 1, type: 'oxygen', value: '89', num: 89, unit: '%', dev: vitals, mins: 40 },
+      { p: 1, type: 'heart_rate', value: '104', num: 104, unit: 'bpm', dev: vitals, mins: 41 },
+      { p: 2, type: 'blood_pressure', value: '186/98', num: 186, sec: 98, unit: 'mmHg', dev: vitals, mins: 65 },
+      { p: 3, type: 'oxygen', value: '97', num: 97, unit: '%', dev: vitals, mins: 90 },
+      { p: 3, type: 'glucose', value: '112', num: 112, unit: 'mg/dL', dev: gateway, mins: 130 },
+      { p: 4, type: 'temperature', value: '38.6', num: 38.6, unit: '°C', dev: vitals, mins: 150 },
+      { p: 5, type: 'blood_pressure', value: '124/79', num: 124, sec: 79, unit: 'mmHg', dev: vitals, mins: 175 },
+      { p: 2, type: 'heart_rate', value: '72', num: 72, unit: 'bpm', dev: vitals, mins: 200 },
+      { p: 0, type: 'glucose', value: '205', num: 205, unit: 'mg/dL', dev: gateway, mins: 300 },
+      { p: 4, type: 'oxygen', value: '95', num: 95, unit: '%', dev: vitals, mins: 360 },
+    ];
+    const createdReadings: { id: string; p: number; type: string; value: string; unit: string }[] = [];
+    for (const r of readingDefs) {
+      const pt = patientPool[r.p];
+      // Flow each reading through the real adapter normalization (same path a
+      // provider webhook uses) so seeded data is pipeline-produced, not hand-built.
+      const { readings: norm } = normalizeWebhook('manual', { readings: [{ readingType: r.type, value: r.value, numericValue: r.num, valueSecondary: r.sec, unit: r.unit }] });
+      const nr = norm[0];
+      const reading = await db.deviceReading.create({
+        data: { tenantId, patientId: pt.id, branchId: pt.branchId, deviceId: r.dev, readingType: nr.readingType, value: nr.value, numericValue: nr.numericValue ?? null, valueSecondary: nr.valueSecondary ?? null, unit: nr.unit ?? r.unit, capturedAt: ago(r.mins), receivedAt: ago(r.mins - 1), source: 'device', validationStatus: 'valid', rawPayload: { raw: r.value, deviceTs: ago(r.mins).toISOString() } },
+        select: { id: true },
+      });
+      createdReadings.push({ id: reading.id, p: r.p, type: r.type, value: r.value, unit: r.unit });
+    }
+
+    // Alerts — severity DECIDED BY THE ENGINE (evaluateSeverity), not hand-coded.
+    let critCount = 0;
+    for (let i = 0; i < createdReadings.length; i++) {
+      const r = createdReadings[i];
+      const rd = readingDefs[i];
+      const pt = patientPool[r.p];
+      const { severity, reason } = evaluateSeverity(rd.type, rd.num, null);
+      if (severity === 'normal') continue;
+      const status = severity === 'critical' && critCount === 0 ? 'open' : (i % 3 === 0 ? 'acknowledged' : 'open');
+      if (severity === 'critical') critCount++;
+      await db.readingAlert.create({ data: { tenantId, patientId: pt.id, branchId: pt.branchId, readingId: r.id, severity, alertType: 'abnormal_reading', status, generatedReason: reason, assignedToUserId: severity === 'critical' ? assignee : (i % 2 ? assignee : null), acknowledgedAt: status !== 'open' ? ago(15) : null } });
+    }
+    // Missed reading + device-offline alerts (operational, no reading attached).
+    await db.readingAlert.create({ data: { tenantId, patientId: patientPool[1].id, branchId: patientPool[1].branchId, severity: 'high', alertType: 'missed_reading', status: 'open', generatedReason: 'No glucose reading received in 14h for a high-risk patient (expected every 12h).', assignedToUserId: assignee } });
+    if (offlineDev) {
+      await db.readingAlert.create({ data: { tenantId, patientId: patientPool[5].id, branchId: patientPool[5].branchId, deviceId: offlineDev.id, severity: 'warning', alertType: 'device_offline', status: 'open', generatedReason: 'Monitoring device is offline — patient readings are not being received.' } });
+    }
+
+    // Notification + delivery log (consent-checked).
+    const firstAlert = await db.readingAlert.findFirst({ where: { tenantId, severity: 'critical' }, select: { id: true, patientId: true } });
+    await db.notificationEvent.createMany({ data: [
+      { tenantId, alertId: firstAlert?.id ?? null, patientId: firstAlert?.patientId ?? null, recipientType: 'doctor', recipientUserId: assignee, channel: 'in_app', status: 'delivered', attempts: 1, consentChecked: true, consentResult: 'not_required', sentAt: ago(24) },
+      { tenantId, alertId: firstAlert?.id ?? null, patientId: firstAlert?.patientId ?? null, recipientType: 'doctor', recipientUserId: assignee, channel: 'sms', status: 'sent', attempts: 1, consentChecked: true, consentResult: 'not_required', sentAt: ago(23) },
+      { tenantId, patientId: patientPool[0].id, recipientType: 'patient', recipientLabel: patientPool[0].name, channel: 'sms', status: 'delivered', attempts: 1, consentChecked: true, consentResult: 'granted', sentAt: ago(22) },
+      { tenantId, patientId: patientPool[1].id, recipientType: 'patient', recipientLabel: patientPool[1].name, channel: 'sms', status: 'failed', attempts: 3, failureReason: 'Carrier rejected — invalid number', consentChecked: true, consentResult: 'granted', sentAt: ago(20) },
+      { tenantId, recipientType: 'nurse', recipientLabel: 'Nurse queue', channel: 'in_app', status: 'delivered', attempts: 1, consentChecked: true, consentResult: 'not_required', sentAt: ago(18) },
+      { tenantId, patientId: patientPool[3].id, recipientType: 'patient', recipientLabel: patientPool[3].name, channel: 'email', status: 'queued', attempts: 0, consentChecked: true, consentResult: 'granted' },
+    ] });
+
+    // Morning briefing signals for today.
+    const today = new Date(); today.setHours(6, 0, 0, 0);
+    await db.morningBriefingSignal.createMany({ data: [
+      { tenantId, signalType: 'critical_review', title: '2 patients need doctor review', detail: 'Critical glucose and blood-pressure readings are open and unresolved.', severity: 'critical', metricValue: 2, patientId: patientPool[0].id, forDate: today },
+      { tenantId, signalType: 'nurse_followup', title: 'Nurse follow-up queue: 2 alerts', detail: 'Low oxygen and elevated temperature awaiting nurse action.', severity: 'warning', metricValue: 2, forDate: today },
+      { tenantId, signalType: 'missed_high_risk', title: '1 missed reading from a high-risk patient', detail: 'No glucose reading in 14h — outreach recommended.', severity: 'warning', metricValue: 1, patientId: patientPool[1].id, forDate: today },
+      { tenantId, signalType: 'offline_impact', title: '1 monitoring device offline', detail: 'A patient monitoring device is offline and not reporting.', severity: 'warning', metricValue: 1, forDate: today },
+      { tenantId, signalType: 'trending_worse', title: '1 patient trending worse', detail: 'Repeated above-range glucose readings over the last 5 hours.', severity: 'warning', metricValue: 1, patientId: patientPool[0].id, forDate: today },
+      { tenantId, signalType: 'rpm_opportunity', title: 'RPM billing opportunity', detail: '4 enrolled patients have ≥16 monitoring days this cycle — eligible for RPM reimbursement review.', severity: 'info', metricValue: 4, forDate: today },
+    ] });
+    console.log('[seed] remote monitoring: seeded readings/alerts/notifications/briefing');
+
+    // ── Real connected-care records: enrollments, consent, RPM device-days ──
+    const periodStart = new Date(); periodStart.setHours(0, 0, 0, 0); periodStart.setDate(periodStart.getDate() - 29);
+    const periodEnd = new Date();
+    for (const i of [0, 1, 3, 4]) {
+      const pt = patientPool[i];
+      await db.patientDeviceEnrollment.upsert({
+        where: { tenantId_patientId_providerKey: { tenantId, patientId: pt.id, providerKey: 'manual' } },
+        create: { tenantId, patientId: pt.id, branchId: pt.branchId, providerKey: 'manual', programType: 'rpm', status: 'active', externalRef: `EXT-${i}` },
+        update: { status: 'active' },
+      });
+      await db.patientConsent.upsert({
+        where: { tenantId_patientId_consentType: { tenantId, patientId: pt.id, consentType: 'rpm' } },
+        create: { tenantId, patientId: pt.id, consentType: 'rpm', granted: true, method: 'written', grantedAt: new Date(Date.now() - 30 * 86400000) },
+        update: { granted: true },
+      });
+    }
+    // Give patient[0] a real 18-day reading history so RPM device-days qualify.
+    for (let d = 1; d <= 18; d++) {
+      const captured = new Date(); captured.setHours(8, 0, 0, 0); captured.setDate(captured.getDate() - d);
+      await db.deviceReading.create({ data: { tenantId, patientId: patientPool[0].id, branchId: patientPool[0].branchId, deviceId: gateway, readingType: 'glucose', value: String(120 + (d % 5) * 6), numericValue: 120 + (d % 5) * 6, unit: 'mg/dL', capturedAt: captured, receivedAt: captured, source: 'device', validationStatus: 'valid' } });
+    }
+    // RPM readiness: patient[0] has the review minutes + signoff to reach READY.
+    await db.rPMBillingReadiness.upsert({
+      where: { tenantId_patientId_periodStart: { tenantId, patientId: patientPool[0].id, periodStart } },
+      create: { tenantId, patientId: patientPool[0].id, periodStart, periodEnd, readingDays: 18, reviewMinutes: 24, communicationFlag: true, providerSignoffUserId: assignee, providerSignoffAt: new Date(), status: 'READY' },
+      update: { reviewMinutes: 24, communicationFlag: true, providerSignoffUserId: assignee, providerSignoffAt: new Date() },
+    });
+    // A real inbound sync-log entry for the manual import of these readings.
+    await db.deviceProviderSyncLog.create({ data: { tenantId, providerKind: 'device', providerKey: 'manual', direction: 'inbound', event: 'sync', status: 'processed', signatureValid: null, readingsIngested: createdReadings.length + 18, alertsCreated: 0, message: `Manual import normalized ${createdReadings.length + 18} reading(s)`, payload: { source: 'seed', count: createdReadings.length + 18 } } });
+    console.log('[seed] connected-care: enrollments + consent + RPM device-days + sync log');
+  }
+}
+
+// ---- Connected Care provider registry (real catalog; not fake "active") -----
+for (const def of [
+  { providerKey: 'stedi', displayName: 'Stedi', category: 'INSURANCE', mode: 'sandbox', status: 'SANDBOX' },
+  { providerKey: 'optum', displayName: 'Optum', category: 'INSURANCE', mode: 'sandbox', status: 'NOT_CONFIGURED' },
+  { providerKey: 'availity', displayName: 'Availity', category: 'INSURANCE', mode: 'sandbox', status: 'NOT_CONFIGURED' },
+]) {
+  const existing = await db.insuranceProvider.findFirst({ where: { tenantId, providerKey: def.providerKey } });
+  if (!existing) await db.insuranceProvider.create({ data: { tenantId, ...def } });
+}
+for (const def of [
+  { providerKey: 'dexcom', displayName: 'Dexcom', category: 'DIRECT_API', status: 'NOT_CONFIGURED' },
+  { providerKey: 'withings', displayName: 'Withings', category: 'DIRECT_API', status: 'NOT_CONFIGURED' },
+  { providerKey: 'validic', displayName: 'Validic', category: 'AGGREGATOR', status: 'NOT_CONFIGURED' },
+  { providerKey: 'terra', displayName: 'Terra', category: 'AGGREGATOR', status: 'NOT_CONFIGURED' },
+  { providerKey: 'tenovi', displayName: 'Tenovi', category: 'RPM_VENDOR', status: 'NOT_CONFIGURED' },
+  { providerKey: 'manual', displayName: 'Manual entry', category: 'MANUAL', status: 'ACTIVE' },
+]) {
+  const existing = await db.deviceProvider.findFirst({ where: { tenantId, providerKey: def.providerKey } });
+  if (!existing) await db.deviceProvider.create({ data: { tenantId, mode: 'sandbox', ...def } });
+}
+console.log('[seed] connected-care provider registry');
+
+// Seed the first PLATFORM_OWNER from secure env vars only (no weak default).
+{
+  const { ensurePlatformOwnerSeed } = await import('../server/lib/platformAuth');
+  const result = await ensurePlatformOwnerSeed();
+  console.log(`[seed] platform owner: ${result.reason}`);
 }
 
 await db.$disconnect();

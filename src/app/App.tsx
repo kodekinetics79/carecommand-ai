@@ -3,6 +3,11 @@ import { BrowserRouter, Routes, Route, Navigate, Outlet, useLocation } from 'rea
 import Sidebar from '../components/layout/Sidebar';
 import Topbar from '../components/layout/Topbar';
 import { useSession } from '../hooks/useSession';
+import { usePreferences } from '../lib/preferences';
+import {
+  ClientDashboard, ClientAppointments, ClientRequests, ClientIntake,
+  ClientInsurance, ClientPayments, ClientProfile, ClientPreferences,
+} from '../pages/client/ClientSections';
 
 const Login = lazy(() => import('../pages/Login'));
 const Dashboard = lazy(() => import('../pages/Dashboard'));
@@ -17,6 +22,8 @@ const Patients = lazy(() => import('../pages/Patients'));
 const PatientProfile = lazy(() => import('../pages/PatientProfile'));
 const Campaigner = lazy(() => import('../pages/Campaigner'));
 const CampaignEngine = lazy(() => import('../pages/CampaignEngine'));
+const IntakeQueue = lazy(() => import('../pages/IntakeQueue'));
+const PublicIntake = lazy(() => import('../pages/PublicIntake'));
 const Revenue = lazy(() => import('../pages/Revenue'));
 const RevenueProtection = lazy(() => import('../pages/RevenueProtection'));
 const Insurance = lazy(() => import('../pages/Insurance'));
@@ -29,14 +36,28 @@ const Labs = lazy(() => import('../pages/Labs'));
 const Telehealth = lazy(() => import('../pages/Telehealth'));
 const ComplianceCenter = lazy(() => import('../pages/ComplianceCenter'));
 const Integrations = lazy(() => import('../pages/Integrations'));
+const DeviceIntegration = lazy(() => import('../pages/DeviceIntegration'));
+const RemoteMonitoring = lazy(() => import('../pages/RemoteMonitoring'));
+const IntegrationSetup = lazy(() => import('../pages/IntegrationSetup'));
+const InsuranceEligibility = lazy(() => import('../pages/InsuranceEligibility'));
+const PatientEnrollments = lazy(() => import('../pages/PatientEnrollments'));
+const DeviceSyncLogs = lazy(() => import('../pages/DeviceSyncLogs'));
+const RpmBillingReadiness = lazy(() => import('../pages/RpmBillingReadiness'));
 const Subscription = lazy(() => import('../pages/Subscription'));
 const Platform = lazy(() => import('../pages/Platform'));
+const PlatformLogin = lazy(() => import('../pages/PlatformLogin'));
+const PlatformConsole = lazy(() => import('../pages/PlatformConsole'));
+const ClientLogin = lazy(() => import('../pages/client/ClientLogin'));
+const ClientLayout = lazy(() => import('../pages/client/ClientLayout'));
 const Settings = lazy(() => import('../pages/Settings'));
 const ControlPlane = lazy(() => import('../pages/ControlPlane'));
 
 function ProtectedLayout() {
   const { loading, isAuthenticated } = useSession();
   const location = useLocation();
+  // Remount page content when currency/language changes so all formatted
+  // figures (formatCurrency) re-render with the new preference immediately.
+  const { currency, language } = usePreferences();
 
   if (loading) {
     return <div className="min-h-screen flex items-center justify-center text-sm text-t3">Loading session…</div>;
@@ -54,7 +75,7 @@ function ProtectedLayout() {
         <div className="app-scroll">
           <div className="app-inner">
             <Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}>
-              <Outlet />
+              <div key={`${currency}-${language}`}><Outlet /></div>
             </Suspense>
           </div>
         </div>
@@ -135,8 +156,26 @@ export default function App() {
             </PublicRoute>
           }
         />
+        {/* Patient-facing intake via tokenized link (no auth). */}
+        <Route path="/intake/:token" element={<Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}><PublicIntake /></Suspense>} />
+        {/* Platform Admin Console — separate PlatformUser identity (NOT tenant auth). */}
+        <Route path="/platform/login" element={<Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}><PlatformLogin /></Suspense>} />
+        <Route path="/platform" element={<Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}><PlatformConsole /></Suspense>} />
+        {/* Patient / Client Portal — separate PatientPortalAccount identity (NOT staff auth). */}
+        <Route path="/client/login" element={<Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}><ClientLogin /></Suspense>} />
+        <Route path="/client" element={<Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}><ClientLayout /></Suspense>}>
+          <Route index element={<ClientDashboard />} />
+          <Route path="appointments" element={<ClientAppointments />} />
+          <Route path="requests" element={<ClientRequests />} />
+          <Route path="intake" element={<ClientIntake />} />
+          <Route path="insurance" element={<ClientInsurance />} />
+          <Route path="payments" element={<ClientPayments />} />
+          <Route path="profile" element={<ClientProfile />} />
+          <Route path="preferences" element={<ClientPreferences />} />
+        </Route>
         <Route element={<ProtectedLayout />}>
           <Route path="/" element={<Dashboard />} />
+          <Route path="/patient-intake" element={<IntakeQueue />} />
           <Route path="/advisory" element={<AdvisoryRoom />} />
           <Route path="/clinic-radar" element={<ClinicRadar />} />
           <Route path="/benchmarking" element={<ClinicRadar />} />
@@ -162,9 +201,16 @@ export default function App() {
           <Route path="/compliance" element={<ComplianceRoute />} />
           <Route path="/compliance/:section" element={<ComplianceRoute />} />
           <Route path="/integrations" element={<Integrations />} />
+          <Route path="/devices" element={<DeviceIntegration />} />
+          <Route path="/monitoring" element={<RemoteMonitoring />} />
+          <Route path="/integration-setup" element={<IntegrationSetup />} />
+          <Route path="/insurance-eligibility" element={<InsuranceEligibility />} />
+          <Route path="/enrollments" element={<PatientEnrollments />} />
+          <Route path="/sync-logs" element={<DeviceSyncLogs />} />
+          <Route path="/rpm-readiness" element={<RpmBillingReadiness />} />
           <Route path="/subscription" element={<Subscription />} />
           {/* Operator-only console — gated by a platform token, not a tenant role; not in the sidebar. */}
-          <Route path="/platform" element={<Platform />} />
+          <Route path="/platform-legacy" element={<Platform />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/control-plane" element={<AdminRoute />} />
           <Route path="/admin" element={<AdminRoute />} />

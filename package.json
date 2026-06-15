@@ -11,13 +11,17 @@
     "api:typecheck": "tsc -p tsconfig.server.json",
     "worker:dev": "tsx watch server/workers/autopilot.worker.ts",
     "worker:start": "tsx server/workers/autopilot.worker.ts",
+    "worker:campaign": "tsx server/workers/campaign.worker.ts",
     "db:generate": "prisma generate",
     "db:validate": "prisma validate",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
     "db:seed": "tsx prisma/seed.ts",
+    "demo:sandbox": "tsx server/scripts/seedDemoSandbox.ts",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "check": "npm run db:validate && npm run api:typecheck && npm run lint && npm run build",
     "preview": "vite preview"
   },
@@ -66,6 +70,7 @@
     "tsx": "^4.22.4",
     "typescript": "~6.0.2",
     "typescript-eslint": "^8.59.2",
-    "vite": "^8.0.12"
+    "vite": "^8.0.12",
+    "vitest": "^2.1.9"
   }
 }

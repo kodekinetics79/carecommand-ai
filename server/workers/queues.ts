@@ -70,3 +70,17 @@ export async function registerComplianceSchedules() {
     await complianceQueue.upsertJobScheduler(schedule.id, { pattern: schedule.pattern }, { name: schedule.name, data: {} });
   }
 }
+
+// ---- CRM campaign scheduler queue -----------------------------------------
+// Dispatches approved SCHEDULED campaigns whose scheduledAt has passed, honoring
+// quiet hours. The job iterates tenants and is idempotent (delivery uniqueness +
+// status transition to ACTIVE prevents re-dispatch).
+export const campaignQueue = new Queue<Record<string, never>, void, string>('campaign-scheduler', {
+  connection: redisConnection,
+  defaultJobOptions: { attempts: 3, backoff: { type: 'exponential', delay: 2000 }, removeOnComplete: 500, removeOnFail: 1000 },
+});
+
+export async function registerCampaignSchedules() {
+  // Every 5 minutes — picks up due scheduled campaigns.
+  await campaignQueue.upsertJobScheduler('campaign-dispatch', { pattern: '*/5 * * * *' }, { name: 'dispatch-scheduled', data: {} });
+}

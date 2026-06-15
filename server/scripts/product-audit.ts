@@ -51,9 +51,12 @@ const FEATURES: Feature[] = [
   { phase: 1, name: 'CRM campaign / reactivation engine', models: ['Campaign', 'CommunicationConsent', 'CampaignDelivery'], routes: ["'/audiences/:type/preview'", "'/campaigns/:id/launch'"], pages: ['CampaignEngine.tsx'], userFacing: true, note: 'reactivation engine: audiences, consent, delivery, approval, RBAC, audit, verified' },
   { phase: 1, name: 'Compliance Readiness Center', models: ['ComplianceControl', 'ComplianceEvidence', 'ComplianceFramework'], routes: ["'/dashboard'", "'/controls'"], pages: ['ComplianceCenter.tsx'], userFacing: true },
   { phase: 1, name: 'Integration Hub foundation', models: ['Integration', 'IntegrationRunLog'], routes: ["'/integrations/status'"], pages: ['Integrations.tsx'], userFacing: true },
-  { phase: 1, name: 'Patient portal MVP', routes: ["'/public/checkout/:token'"], pages: ['PatientPortal.tsx'], userFacing: true, note: 'only tokenized public checkout; no portal page' },
+  { phase: 1, name: 'Patient Intake + Consent Engine', models: ['PatientIntakePacket', 'PatientConsentRecord', 'PatientIntakeDocument'], routes: ["'/intake/public/:token'", "'/packets'"], pages: ['IntakeQueue.tsx', 'PublicIntake.tsx'], userFacing: true, note: 'packets, consent reconciliation, tokenized public intake, staff review, RBAC, audit, verified' },
+  { phase: 1, name: 'Patient portal MVP', models: ['PatientPortalAccount', 'PatientPortalToken'], routes: ["'/request-link'", 'requirePortalAccess'], pages: ['client'], userFacing: true, note: 'authenticated patient portal: separate PatientPortalAccount identity + magic-link auth (hashed single-use tokens), patient-safe dashboard/appointments/requests/intake/insurance/payments/profile/preferences, token separation + tenant isolation + audit, verified (portal.verify). Client UI at /client/*' },
   { phase: 1, name: 'Multi-location dashboard', models: ['Branch'], routes: ["'/multi-location'"], pages: ['Dashboard.tsx'], userFacing: true, note: 'branch scoping + dashboard exist; dedicated cross-location analytics partial' },
   { phase: 1, name: 'Audit logs + RBAC hardening', models: ['AuditEvent', 'TenantSecurityPolicy', 'RoleDefinition'], routes: ['requireRoles', 'requireFeature'], userFacing: false },
+  { phase: 1, name: 'Platform Admin / Super Admin Console', models: ['PlatformUser', 'PlatformAuditEvent'], routes: ['signPlatformToken', "subscription/change-plan'"], pages: ['PlatformConsole.tsx', 'PlatformLogin.tsx'], userFacing: true, note: 'PlatformUser auth+MFA+RBAC, tenant/subscription mgmt, suspension, audit, verified; static token now legacy/dev-only' },
+  { phase: 2, name: 'SaaS billing checkout / invoices / dunning', routes: ["'/stripe-subscription-checkout'"], userFacing: true, note: 'subscription requests + entitlements exist; no Stripe subscription checkout / invoices / dunning' },
   // Phase 2
   { phase: 2, name: 'EHR/PMS connector framework', models: [], routes: [], userFacing: true },
   { phase: 2, name: 'FHIR/HL7-ready data model', models: [], routes: [], userFacing: false },
@@ -65,7 +68,7 @@ const FEATURES: Feature[] = [
   { phase: 2, name: 'Patient mobile app', userFacing: true, note: 'mobile-ready API fields only; no app' },
   // Phase 3
   { phase: 3, name: 'Autonomous AI advisor', models: ['AIRecommendation'], routes: ["'/autonomousAdvisor'"], pages: ['AdvisoryRoom.tsx'], userFacing: true, note: 'rule-based recs + advisory room exist; autonomy NOT built' },
-  { phase: 3, name: 'AI campaign generator', models: ['Campaign'], routes: ["'/llmCampaignGenerate'"], pages: ['CampaignEngine.tsx'], userFacing: true, note: 'rule-based draft generation + approval exists; no LLM generation yet' },
+  { phase: 3, name: 'AI campaign generator', models: ['Campaign'], routes: ["'/llmCampaignGenerate'"], pages: ['CampaignEngine.tsx'], userFacing: true, note: 'rule-based + real LLM draft path gated on configured AI provider; PARTIAL until a provider is configured' },
   { phase: 3, name: 'AI denial-prevention assistant', models: ['AIRecommendation', 'OperationalSignal'], routes: ["'/denial-prevention/:appointmentId'"], pages: ['InsuranceCommandCenter.tsx'], userFacing: true, note: 'rule-based denial-prevention foundation + intake card; no dedicated AI page yet' },
   { phase: 3, name: 'AI payer performance analysis', models: [], routes: [], userFacing: true },
   { phase: 3, name: 'Referral network intelligence', models: [], routes: [], userFacing: true },

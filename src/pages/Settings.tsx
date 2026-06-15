@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import {
   Building2, Users, Lock, Bell, Cable, ShieldCheck, CheckCircle2, Circle, RefreshCw,
-  Trash2, Plus, MapPin, Activity, AlertTriangle, KeyRound, Clock,
+  Trash2, Plus, MapPin, Activity, AlertTriangle, KeyRound, Clock, Coins, Globe, Check,
 } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import BentoCard from '../components/ui/BentoCard';
@@ -9,6 +9,8 @@ import StatCard from '../components/ui/StatCard';
 import { apiRequest } from '../lib/api';
 import { useApiData } from '../hooks/useApiData';
 import { useCrudResource } from '../hooks/useCrudResource';
+import { usePreferences, CURRENCIES, LANGUAGES } from '../lib/preferences';
+import { formatCurrency } from '../utils/formatters';
 
 /* ------------------------------------------------------------------ types */
 interface Branch { id: string; name: string; location: string; active?: boolean }
@@ -60,6 +62,7 @@ const modeBadge: Record<string, string> = {
 
 const NAV = [
   { id: 'overview', label: 'Overview', icon: Building2 },
+  { id: 'preferences', label: 'Display & Currency', icon: Coins },
   { id: 'team', label: 'Team & Users', icon: Users },
   { id: 'roles', label: 'Roles & Access', icon: Lock },
   { id: 'notifications', label: 'Notifications', icon: Bell },
@@ -109,6 +112,7 @@ export default function Settings() {
         {/* Section content */}
         <div className="min-w-0 space-y-4">
           {section === 'overview' && <OverviewSection />}
+          {section === 'preferences' && <PreferencesSection />}
           {section === 'team' && <TeamSection />}
           {section === 'roles' && <RolesSection />}
           {section === 'notifications' && <NotificationsSection />}
@@ -168,6 +172,50 @@ function SettingsSummary() {
         </div>
       </div>
     </BentoCard>
+  );
+}
+
+/* --------------------------------------------------------- Display & Currency */
+function PreferencesSection() {
+  const { currency, language, setCurrency, setLanguage } = usePreferences();
+  const active = CURRENCIES.find(c => c.code === currency) ?? CURRENCIES[1];
+  return (
+    <div className="space-y-4">
+      <BentoCard title="Display currency" subtitle="Choose how monetary figures are shown across the app. Amounts are formatted (not converted) — your operating currency stays the same.">
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+          {CURRENCIES.map(c => {
+            const on = c.code === currency;
+            return (
+              <button key={c.code} type="button" onClick={() => setCurrency(c.code)} aria-pressed={on ? 'true' : 'false'}
+                className={`flex items-center justify-between gap-2 rounded-xl border px-3 py-2.5 text-sm font-semibold transition-all focus-visible:outline-2 focus-visible:outline-[var(--indigo)] ${on ? 'border-[var(--indigo)] bg-[var(--indigo-soft)] text-indigo' : 'border-[var(--b1)] bg-[var(--s1)] text-t1 hover:border-[var(--b2)]'}`}>
+                <span className="inline-flex items-center gap-2"><Coins className="w-4 h-4 text-t3" aria-hidden="true" /> {c.label}</span>
+                {on && <Check className="w-4 h-4" aria-hidden="true" />}
+              </button>
+            );
+          })}
+        </div>
+        <div className="mt-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-3">
+          <p className="text-[11px] uppercase tracking-wide text-t3">Preview</p>
+          <p className="text-lg font-bold text-t1 tabular-nums">{formatCurrency(27200)} <span className="text-[11px] font-normal text-t3">· {active.code} ({active.locale})</span></p>
+        </div>
+      </BentoCard>
+
+      <BentoCard title="Language" subtitle="Sets the interface locale. Right-to-left languages adjust layout automatically.">
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+          {LANGUAGES.map(l => {
+            const on = l.code === language;
+            return (
+              <button key={l.code} type="button" onClick={() => setLanguage(l.code)} aria-pressed={on ? 'true' : 'false'}
+                className={`flex items-center justify-between gap-2 rounded-xl border px-3 py-2.5 text-sm font-semibold transition-all focus-visible:outline-2 focus-visible:outline-[var(--indigo)] ${on ? 'border-[var(--indigo)] bg-[var(--indigo-soft)] text-indigo' : 'border-[var(--b1)] bg-[var(--s1)] text-t1 hover:border-[var(--b2)]'}`}>
+                <span className="inline-flex items-center gap-2"><Globe className="w-4 h-4 text-t3" aria-hidden="true" /> {l.label}</span>
+                {on && <Check className="w-4 h-4" aria-hidden="true" />}
+              </button>
+            );
+          })}
+        </div>
+        <p className="mt-3 text-[11px] text-t3">Full UI translation is rolling out; the language preference is saved now and applies as locale + text direction. Number and currency formatting follow your selections immediately.</p>
+      </BentoCard>
+    </div>
   );
 }
 

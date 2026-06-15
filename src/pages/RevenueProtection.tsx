@@ -13,7 +13,6 @@ import {
   RefreshCw,
   Wallet,
 } from 'lucide-react';
-import PageHeader from '../components/ui/PageHeader';
 import BentoCard from '../components/ui/BentoCard';
 import StatCard from '../components/ui/StatCard';
 import ProgressBar from '../components/ui/ProgressBar';
@@ -146,6 +145,7 @@ function useRevenueProtectionData(selectedClinicId: 'all' | string) {
 export default function RevenueProtection() {
   const navigate = useNavigate();
   const [selectedClinicId, setSelectedClinicId] = useState<'all' | string>('all');
+  const [section, setSection] = useState<'insurance' | 'payments'>('insurance');
   const { overview, integrationStatus, loading, error, reload } = useRevenueProtectionData(selectedClinicId);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -317,64 +317,43 @@ export default function RevenueProtection() {
   };
 
   return (
-    <div className="space-y-6 pb-8">
-      <PageHeader
-        title="Revenue Protection Command Center"
-        subtitle="Insurance readiness, copay capture, prior auth tracking, and deposit collection in one place."
-        badge={integrationStatus ? modeBanner(integrationStatus) : 'Loading'}
-        badgeColor={integrationStatus?.insurance.mode === 'mock' && integrationStatus?.payment.mode === 'mock' ? 'amber' : 'emerald'}
-        actions={
-          <div className="flex flex-wrap gap-2">
-            <button type="button" onClick={() => navigate('/advisory')} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
-              <Sparkles className="w-4 h-4" /> Ask Advisors
-            </button>
-            <button type="button" onClick={() => navigate('/crm')} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
-              <ExternalLink className="w-4 h-4" /> Open CRM
-            </button>
-            <button type="button" onClick={() => navigate('/opportunities')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
-              <AlertTriangle className="w-4 h-4" /> Open Revenue Leaks
-            </button>
-          </div>
-        }
-      />
-
-      <div className="hero-panel">
-        <div className="flex flex-wrap items-center justify-between gap-4">
-          <div>
-            <div className="flex items-center gap-2 mb-2">
-              <ShieldCheck className="w-4 h-4 text-indigo-200" />
-              <p className="text-xs font-bold uppercase tracking-widest text-indigo-200">Integration Status Banner</p>
-            </div>
-            <h2 className="text-xl font-bold text-white leading-snug">
-              Protect today’s revenue with eligibility checks, deposit rules, and payment follow-up.
-            </h2>
-            <p className="mt-2 text-sm text-white/70 max-w-3xl">
-              {integrationStatus?.insurance.label ?? 'Mock Mode'} · {integrationStatus?.payment.label ?? 'Mock Mode'} · {openAlerts} open alerts
-            </p>
-          </div>
-          <div className="text-right">
-            <p className="text-2xl font-bold text-white">{formatCurrency(overview?.summary.revenueProtected ?? 0)}</p>
-            <p className="text-xs text-white/65">Revenue protected in queue</p>
-          </div>
+    <div className="space-y-3 pb-6">
+      {/* Slim toolbar — the topbar breadcrumb carries the page title. */}
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className={`badge ph-badge-${integrationStatus?.insurance.mode === 'mock' && integrationStatus?.payment.mode === 'mock' ? 'amber' : 'emerald'}`}>{integrationStatus ? modeBanner(integrationStatus) : 'Loading'}</span>
+        <div className="flex flex-wrap gap-2">
+          <button type="button" onClick={() => navigate('/advisory')} className="inline-flex items-center gap-2 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-[13px] font-semibold text-t1 hover:bg-[var(--s2)] transition">
+            <Sparkles className="w-4 h-4 text-t3" /> Ask Advisors
+          </button>
+          <button type="button" onClick={() => navigate('/crm')} className="inline-flex items-center gap-2 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-[13px] font-semibold text-t1 hover:bg-[var(--s2)] transition">
+            <ExternalLink className="w-4 h-4 text-t3" /> Open CRM
+          </button>
+          <button type="button" onClick={() => navigate('/opportunities')} className="inline-flex items-center gap-2 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[13px] font-semibold text-white hover:opacity-90 transition">
+            <AlertTriangle className="w-4 h-4" /> Revenue Leaks
+          </button>
         </div>
-        {message && <p className="mt-3 text-xs font-semibold text-indigo-100">{message}</p>}
-        {(error || actionError) && <p className="mt-3 text-xs font-semibold text-red-200">{actionError ?? error}</p>}
       </div>
 
-      <div className="flex flex-wrap items-center gap-2">
-        <p className="text-xs font-semibold text-t2">Clinic scope</p>
-        <select
-          value={selectedClinicId}
-          onChange={e => setSelectedClinicId(e.target.value)}
-          className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs text-t1 outline-none"
-        >
-          {clinicOptions.map(clinic => <option key={clinic.id} value={clinic.id}>{clinic.name}</option>)}
-        </select>
-        <button type="button" onClick={() => void reload()} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s3)] transition">
-          <RefreshCw className="w-3.5 h-3.5" /> Refresh
-        </button>
-        {loading && <span className="badge badge-blue">Loading data</span>}
+      {/* Compact status + scope bar */}
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-4 py-2.5">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 min-w-0">
+          <span className="inline-flex items-center gap-1.5 text-[13px] font-semibold text-t1"><ShieldCheck className="w-4 h-4 text-indigo" /> Revenue protection</span>
+          <span className="text-[12px] text-t3">{integrationStatus?.insurance.label ?? 'Mock Mode'} · {integrationStatus?.payment.label ?? 'Mock Mode'} · {openAlerts} open alert{openAlerts === 1 ? '' : 's'}</span>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <select value={selectedClinicId} onChange={e => setSelectedClinicId(e.target.value)} aria-label="Clinic scope"
+            className="rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-xs text-t1 outline-none">
+            {clinicOptions.map(clinic => <option key={clinic.id} value={clinic.id}>{clinic.name}</option>)}
+          </select>
+          <button type="button" onClick={() => void reload()} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition">
+            <RefreshCw className="w-3.5 h-3.5" /> Refresh
+          </button>
+          {loading && <span className="badge badge-blue">Loading</span>}
+        </div>
       </div>
+      {(message || error || actionError) && (
+        <p className={`text-xs font-semibold ${error || actionError ? 'text-red-v' : 'text-indigo'}`}>{actionError ?? error ?? message}</p>
+      )}
 
       <div className="grid gap-3 grid-cols-2 xl:grid-cols-7">
         <StatCard title="Payments Due Today" value={overview?.summary.paymentsDueToday ?? 0} subtitle="Copay / deposit queue" icon={<CreditCard className="w-4 h-4" />} accent="blue" />
@@ -386,8 +365,14 @@ export default function RevenueProtection() {
         <StatCard title="At Risk" value={formatCurrency(overview?.summary.revenueAtRisk ?? 0)} subtitle="Open alerts" icon={<AlertTriangle className="w-4 h-4" />} accent="red" />
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-[1fr_380px]">
-        <div className="space-y-4">
+      {/* Section tabs — view one group at a glance */}
+      <div className="flex items-center gap-1 bg-[var(--s1)] border border-[var(--b1)] p-1 rounded-xl w-fit" role="tablist" aria-label="Revenue protection sections">
+        <button type="button" role="tab" aria-selected={section === 'insurance' ? 'true' : 'false'} onClick={() => setSection('insurance')} className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition ${section === 'insurance' ? 'bg-[var(--indigo)] text-white shadow-sm' : 'text-t3 hover:text-t1 hover:bg-[var(--s3)]'}`}><ShieldCheck className="w-3.5 h-3.5" /> Insurance &amp; Eligibility</button>
+        <button type="button" role="tab" aria-selected={section === 'payments' ? 'true' : 'false'} onClick={() => setSection('payments')} className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition ${section === 'payments' ? 'bg-[var(--indigo)] text-white shadow-sm' : 'text-t3 hover:text-t1 hover:bg-[var(--s3)]'}`}><CreditCard className="w-3.5 h-3.5" /> Payments &amp; Deposits</button>
+      </div>
+
+      <div>
+        <div className={`space-y-3 ${section === 'insurance' ? '' : 'hidden'}`}>
           <BentoCard title="Appointment Verification Queue" subtitle="Real appointments awaiting insurance checks">
             {queueError && <p className="mb-3 text-xs text-red-v">{queueError}</p>}
             <div className="grid gap-3 md:grid-cols-3">
@@ -688,7 +673,7 @@ export default function RevenueProtection() {
           </BentoCard>
         </div>
 
-        <div className="space-y-4">
+        <div className={`space-y-3 ${section === 'payments' ? '' : 'hidden'}`}>
           <BentoCard title="Payment Command Center" subtitle="Collect copays, deposit payments, and follow up on failures">
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">

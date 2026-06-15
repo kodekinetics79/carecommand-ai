@@ -3,7 +3,6 @@ import { useNavigate } from 'react-router-dom';
 import {
   ShieldCheck, Plus, CheckCircle2, BadgeCheck, FileText, Users, Building2, ArrowRight, Globe,
 } from 'lucide-react';
-import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import { apiRequest } from '../lib/api';
@@ -64,18 +63,14 @@ export default function Insurance() {
   const activePayers = data.payers.filter(p => p.active);
 
   return (
-    <div className="space-y-6 pb-8">
-      <PageHeader
-        title="Insurance"
-        subtitle="Accepted insurers, patient coverage, and eligibility — accept more plans, capture more patients."
-        badge={`${s.acceptedPayers} accepted`}
-        badgeColor="emerald"
-        actions={
-          <button type="button" onClick={() => navigate('/revenue-protection')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
-            <BadgeCheck className="w-4 h-4" /> Verify Eligibility
-          </button>
-        }
-      />
+    <div className="space-y-4 pb-6">
+      {/* Slim toolbar — the topbar breadcrumb carries the page title. */}
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="badge badge-emerald">{s.acceptedPayers} accepted insurers</span>
+        <button type="button" onClick={() => navigate('/revenue-protection')} className="inline-flex items-center gap-2 rounded-lg bg-[var(--indigo)] px-3.5 py-2 text-[13px] font-semibold text-white hover:opacity-90 transition">
+          <BadgeCheck className="w-4 h-4" /> Verify Eligibility
+        </button>
+      </div>
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
         <StatCard title="Accepted Insurers" value={s.acceptedPayers} subtitle={`of ${s.totalPayers} configured`} icon={<ShieldCheck className="w-4 h-4" />} accent="emerald" />
