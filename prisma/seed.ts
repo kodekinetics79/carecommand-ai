@@ -5,6 +5,13 @@ import { generatePasswordHash } from '../server/lib/security';
 import { evaluateSeverity } from '../server/lib/monitoring';
 import { normalizeWebhook } from '../server/lib/connectedCare/deviceAdapters';
 
+// Production guard: never load demo/seed data into a production database by
+// accident. Explicit opt-in (ALLOW_PROD_SEED=true) is required.
+if (process.env.NODE_ENV === 'production' && process.env.ALLOW_PROD_SEED !== 'true') {
+  console.error('[seed] Refusing to seed demo data in production. Set ALLOW_PROD_SEED=true to override.');
+  process.exit(1);
+}
+
 const tenantId = process.env.DEV_TENANT_ID ?? '11111111-1111-4111-8111-111111111111';
 const userId = process.env.DEV_USER_ID ?? '22222222-2222-4222-8222-222222222222';
 const branchId = '33333333-3333-4333-8333-333333333333';

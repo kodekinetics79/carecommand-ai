@@ -1,0 +1,25 @@
+# gitleaks config — fail CI if a real secret is committed. Test fixtures,
+# examples, seeds, and docs use clearly-non-production placeholders.
+title = "CareCommand secret scan"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Placeholders / test-only values are not production secrets."
+paths = [
+  '''\.env\.example$''',
+  '''.*\.test\.ts$''',
+  '''server/test/.*''',
+  '''server/scripts/.*''',
+  '''prisma/seed\.ts$''',
+  '''docs/.*''',
+  '''package-lock\.json$''',
+]
+regexes = [
+  '''ChangeMe123!''',
+  '''ci-only-[a-z0-9-]+''',
+  '''replace-with-[a-z0-9-]+''',
+  '''CHANGE_ME''',
+  '''mock[-_a-z0-9]*''',
+]
