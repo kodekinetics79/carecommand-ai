@@ -14,4 +14,6 @@ async function shutdown() {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-await app.listen({ host: env.API_HOST, port: env.API_PORT });
+// Honor the platform-injected PORT (Railway/Render/Fly) and fall back to API_PORT.
+const port = Number(process.env.PORT) || env.API_PORT;
+await app.listen({ host: env.API_HOST, port });
