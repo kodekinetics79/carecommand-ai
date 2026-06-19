@@ -791,10 +791,12 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     }
     if (!tenantId) return reply.code(202).send({ message: "I'm sorry, I can't access this clinic right now." });
 
-    // Verify the Retell signature when a key is configured (prod). Dev/mock: allow.
-    if (env.RETELL_API_KEY && !(env.RETELL_API_KEY).startsWith('mock')) {
-      const sig = request.headers['x-retell-signature'];
-      const sigHeader = Array.isArray(sig) ? sig[0] : sig;
+    // Verify the Retell signature WHEN one is provided (Retell signs event
+    // webhooks; custom-function calls may not, so an absent signature is allowed
+    // — the unguessable clinic id on the URL is the soft guard).
+    const sig = request.headers['x-retell-signature'];
+    const sigHeader = Array.isArray(sig) ? sig[0] : sig;
+    if (sigHeader && env.RETELL_API_KEY && !env.RETELL_API_KEY.startsWith('mock')) {
       if (!verifyRetellSignature(request.rawBody, sigHeader, env.RETELL_API_KEY)) {
         return reply.code(401).send({ error: 'INVALID_SIGNATURE' });
       }
