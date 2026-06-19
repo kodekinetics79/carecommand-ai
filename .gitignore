@@ -32,3 +32,4 @@ server/generated
 .env
 .env.*
 !.env.example
+api/_bundle.mjs

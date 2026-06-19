@@ -1,5 +1,5 @@
 {
-  "buildCommand": "prisma generate && npm run build",
+  "buildCommand": "prisma generate && npm run build && npx esbuild server/vercelHandler.ts --bundle --platform=node --format=esm --packages=external --outfile=api/_bundle.mjs",
   "outputDirectory": "dist",
   "functions": {
     "api/index.ts": { "maxDuration": 60, "memory": 1024 }
