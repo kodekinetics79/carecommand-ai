@@ -33,8 +33,11 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgresql://carecommand:carecommand@localhost:5432/carecommand?schema=public
+      DATABASE_MIGRATION_URL: postgresql://carecommand:carecommand@localhost:5432/carecommand?schema=public
       REDIS_URL: redis://localhost:6379
       JWT_SECRET: ci-only-secret-with-more-than-32-characters
+      JWT_REFRESH_SECRET: ci-only-refresh-secret-more-than-32-characters
+      AUTH_ENCRYPTION_KEY: ci-only-encryption-key-needs-32+bytes!
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -46,4 +49,5 @@ jobs:
       - run: npm run db:deploy
       - run: npm run api:typecheck
       - run: npm run lint
+      - run: npm test
       - run: npm run build
