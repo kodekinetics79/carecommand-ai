@@ -36,6 +36,10 @@ Legend: ✅ done · 🟡 in progress · ⬜ todo
 - ⬜ **HIPAA posture**: vendor **BAAs** (Neon, Retell, Twilio, Stedi, AI provider), encryption review, audit-log retention policy, formal security/privacy review.
 
 ## Cross-cutting
+- 🟡 **Backend-enforcement test coverage** (proves rules can't be bypassed by direct API calls):
+  - ✅ `server/test/security.integration.test.ts` — unauthenticated → 401, forged token → 401, **RBAC** (PROVIDER cannot create patient → 403, ADMIN → 201), **tenant isolation** (tenant A cannot read tenant B by id → 404, nor via list), suspended tenant → 403.
+  - ✅ `server/test/rls.test.ts` — DB-level isolation (see Phase 1).
+  - ⬜ Extend to money paths (payments, eligibility), mobile/loading/error UI states, and large-dataset pagination.
 - ⬜ Expand test coverage on the money paths (payments, eligibility, booking, RLS).
 - ⬜ Performance: serverless cold-start budget; bundle size; key DB indexes.
 - ⬜ Runbooks: incident, rollback, on-call, data-subject requests.
