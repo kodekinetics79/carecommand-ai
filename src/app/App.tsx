@@ -4,6 +4,7 @@ import Sidebar from '../components/layout/Sidebar';
 import Topbar from '../components/layout/Topbar';
 import { useSession } from '../hooks/useSession';
 import { usePreferences } from '../lib/preferences';
+import AutoTranslate from '../components/AutoTranslate';
 import {
   ClientDashboard, ClientAppointments, ClientRequests, ClientIntake,
   ClientInsurance, ClientPayments, ClientProfile, ClientPreferences,
@@ -145,6 +146,8 @@ function ComplianceRoute() {
 export default function App() {
   return (
     <BrowserRouter>
+      {/* Runtime auto-translation across login, staff app, and patient portal. */}
+      <AutoTranslate />
       <Routes>
         <Route
           path="/login"

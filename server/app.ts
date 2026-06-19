@@ -34,6 +34,7 @@ import { deviceRoutes } from './modules/devices/routes';
 import { monitoringRoutes } from './modules/monitoring/routes';
 import { connectedCareRoutes, connectedCareWebhookRoutes } from './modules/connected-care/routes';
 import { aiRoutes } from './modules/ai/routes';
+import { i18nRoutes } from './modules/i18n/routes';
 import { receptionistRoutes, receptionistWebhookRoutes } from './modules/receptionist/routes';
 import { subscriptionRoutes } from './modules/subscriptions/routes';
 import { onboardingRoutes } from './modules/onboarding/routes';
@@ -137,6 +138,7 @@ export async function buildApp() {
   await app.register(authPlugin);
 
   await app.register(healthRoutes);
+  await app.register(i18nRoutes, { prefix: '/v1/i18n' });
   await app.register(authRoutes, { prefix: '/v1/auth' });
   // Retell posts call events here without a JWT, so it stays outside the
   // authenticated scope and attributes the tenant via clinic/campaign query ids.

@@ -36,6 +36,14 @@ const envSchema = z.object({
   AI_ENABLE_PHI: z.coerce.boolean().default(false),
   AI_COST_BUDGET_DAILY_USD: z.coerce.number().nonnegative().default(5),
   AI_REQUIRE_HUMAN_APPROVAL: z.coerce.boolean().default(true),
+  // ── Translation gateway ──────────────────────────────────────────────────
+  // `auto` picks the first configured provider; MyMemory needs no key so the
+  // app translates out of the box. Add a DeepL/Google key for higher quality.
+  TRANSLATION_PROVIDER: z.enum(['auto', 'deepl', 'google', 'mymemory', 'off']).default('auto'),
+  DEEPL_API_KEY: z.string().optional(),
+  DEEPL_API_URL: z.string().url().default('https://api-free.deepl.com'),
+  GOOGLE_TRANSLATE_API_KEY: z.string().optional(),
+  MYMEMORY_EMAIL: z.string().optional(),
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_BASE_URL: z.string().url().default('https://api.openai.com/v1'),
   OPENAI_MODEL: z.string().default('gpt-4.1-mini'),

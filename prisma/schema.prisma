@@ -2951,3 +2951,18 @@ model PortalAccessRequest {
 
   @@index([tenantId, status, createdAt])
 }
+
+// Global UI translation cache — avoids re-translating identical strings (cost +
+// latency). Not tenant-scoped: UI copy is generic, shared across tenants.
+model TranslationCache {
+  id             String   @id @default(uuid()) @db.Uuid
+  targetLang     String
+  sourceHash     String   // sha256 of the source text
+  sourceText     String
+  translatedText String
+  provider       String
+  createdAt      DateTime @default(now())
+
+  @@unique([targetLang, sourceHash])
+  @@index([targetLang])
+}

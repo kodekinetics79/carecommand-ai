@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { Search, Command, ChevronDown, ChevronRight, LogOut, Settings as SettingsIcon } from 'lucide-react';
+import { Search, Command, ChevronDown, ChevronRight, LogOut, Settings as SettingsIcon, Globe } from 'lucide-react';
 import CommandPalette from '../ui/CommandPalette';
 import { useSession } from '../../hooks/useSession';
+import { usePreferences, LANGUAGES } from '../../lib/preferences';
 
 const routeLabels: Record<string, string> = {
   '/':                 'Command Center',
@@ -49,6 +50,7 @@ export default function Topbar() {
   const [cmdOpen, setCmdOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const { user, signOut } = useSession();
+  const { language, setLanguage } = usePreferences();
 
   const pageLabel = pathname === '/'
     ? 'Command Center'
@@ -80,6 +82,15 @@ export default function Topbar() {
           <span className="topbar-search-text">Search</span>
           <kbd className="topbar-kbd"><Command className="w-2.5 h-2.5" />K</kbd>
         </button>
+
+        {/* Language switcher — auto-translates the whole app */}
+        <label className="hidden sm:inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-white px-2 py-1.5" title="Language" data-no-translate>
+          <Globe className="w-3.5 h-3.5 text-t3 shrink-0" aria-hidden="true" />
+          <select aria-label="Language" value={language} onChange={e => setLanguage(e.target.value)}
+            className="bg-transparent text-[12px] font-medium text-t2 outline-none cursor-pointer pr-1">
+            {LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
+          </select>
+        </label>
 
         {/* User menu */}
         {user && (
