@@ -1,6 +1,6 @@
 // Platform Admin Console client. Uses a PlatformUser JWT (NOT a tenant session,
 // NOT the legacy static token). Token is held in localStorage and sent as Bearer.
-const API = (import.meta.env.VITE_API_URL as string | undefined) ?? 'http://localhost:3001';
+const API = (import.meta.env.VITE_API_URL as string | undefined) ?? (import.meta.env.PROD ? '' : 'http://localhost:3001');
 const TOKEN_KEY = 'cc_platform_token';
 
 export function getPlatformToken(): string | null { return localStorage.getItem(TOKEN_KEY); }

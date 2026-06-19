@@ -1,6 +1,6 @@
 // Patient/Client Portal API client. Uses a SEPARATE token (cc_portal_token) from
 // the staff session — a portal token can never be used for staff APIs.
-const API = (import.meta.env.VITE_API_URL as string | undefined) ?? 'http://localhost:3001';
+const API = (import.meta.env.VITE_API_URL as string | undefined) ?? (import.meta.env.PROD ? '' : 'http://localhost:3001');
 const TOKEN_KEY = 'cc_portal_token';
 
 export function getPortalToken(): string | null { return localStorage.getItem(TOKEN_KEY); }

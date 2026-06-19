@@ -12,7 +12,7 @@ import {
   type PortalInsurance, type PortalPayment, type PortalEstimate, type PortalPreferences,
 } from '../../lib/portalClient';
 
-const API = (import.meta.env.VITE_API_URL as string | undefined) ?? 'http://localhost:3001';
+const API = (import.meta.env.VITE_API_URL as string | undefined) ?? (import.meta.env.PROD ? '' : 'http://localhost:3001');
 function Skel({ n = 3 }: { n?: number }) { return <div className="space-y-2">{Array.from({ length: n }).map((_, i) => <div key={i} className="skeleton-line h-16 rounded-xl" />)}</div>; }
 function H({ icon: Icon, title, sub }: { icon: React.ElementType; title: string; sub?: string }) {
   return <div className="mb-4"><h1 className="text-lg font-bold text-t1 flex items-center gap-2"><Icon className="w-5 h-5 text-indigo" /> {title}</h1>{sub && <p className="text-[13px] text-t3 mt-0.5">{sub}</p>}</div>;

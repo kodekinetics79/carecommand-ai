@@ -1,6 +1,6 @@
 import { clearSession, getAccessToken, refreshSession, setAccessTokenOnly } from './session';
 
-const apiBaseUrl = import.meta.env.VITE_API_URL ?? 'http://localhost:3001';
+const apiBaseUrl = import.meta.env.VITE_API_URL ?? (import.meta.env.PROD ? '' : 'http://localhost:3001');
 const authMode = import.meta.env.VITE_AUTH_MODE ?? 'login-required';
 
 async function bootstrapDevToken() {

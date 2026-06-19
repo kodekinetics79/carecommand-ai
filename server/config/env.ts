@@ -11,6 +11,9 @@ const envSchema = z.object({
   // changes and seeding keep running as the owner. Falls back to DATABASE_URL.
   DATABASE_MIGRATION_URL: z.string().optional(),
   REDIS_URL: z.string().url().default('redis://localhost:6379'),
+  // Set false on Redis-less deploys (e.g. serverless). The app boots and all
+  // request routes work; background jobs are simply not enqueued.
+  QUEUES_ENABLED: z.coerce.boolean().default(true),
   JWT_SECRET: z.string().min(32),
   JWT_REFRESH_SECRET: z.string().min(32),
   // Auth hardening (Phase A). Optional dedicated key for encrypting MFA secrets

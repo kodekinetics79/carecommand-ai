@@ -1,10 +1,12 @@
 {
-  "buildCommand": "npm run build",
+  "buildCommand": "prisma generate && npm run build",
   "outputDirectory": "dist",
+  "functions": {
+    "api/index.ts": { "maxDuration": 60, "memory": 1024 }
+  },
   "rewrites": [
-    {
-      "source": "/(.*)",
-      "destination": "/"
-    }
+    { "source": "/v1/:path*", "destination": "/api" },
+    { "source": "/health/:path*", "destination": "/api" },
+    { "source": "/(.*)", "destination": "/" }
   ]
 }

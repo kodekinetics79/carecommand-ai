@@ -6,26 +6,43 @@ export interface AutopilotExecutionJob {
   tenantId: string;
 }
 
-const redisUrl = new URL(env.REDIS_URL);
+// Queues need Redis. On Redis-less deploys (serverless) set QUEUES_ENABLED=false:
+// no connection is opened, the app boots, request routes all work, and background
+// jobs are simply not enqueued (there is no worker to consume them anyway).
+const QUEUES_ENABLED = env.QUEUES_ENABLED;
+const redisUrl = QUEUES_ENABLED ? new URL(env.REDIS_URL) : null;
 
-export const redisConnection: ConnectionOptions = {
+export const redisConnection: ConnectionOptions = redisUrl ? {
   host: redisUrl.hostname,
   port: Number(redisUrl.port || 6379),
   username: redisUrl.username || undefined,
   password: redisUrl.password || undefined,
   maxRetriesPerRequest: null,
   enableReadyCheck: false,
-};
+} : {};
 
-export const autopilotQueue = new Queue<AutopilotExecutionJob, void, 'execute-approved-action'>('autopilot-execution', {
-  connection: redisConnection,
-  defaultJobOptions: {
-    attempts: 5,
-    backoff: { type: 'exponential', delay: 1000 },
-    removeOnComplete: 1000,
-    removeOnFail: 5000,
-  },
-});
+// Typed no-op queue used when QUEUES_ENABLED=false (opens no Redis connection).
+function disabledQueue<R, V, N extends string>(name: string): Queue<R, V, N> {
+  return {
+    name,
+    client: Promise.resolve(undefined),
+    add: async () => undefined,
+    close: async () => undefined,
+    upsertJobScheduler: async () => undefined,
+  } as unknown as Queue<R, V, N>;
+}
+
+export const autopilotQueue: Queue<AutopilotExecutionJob, void, 'execute-approved-action'> = QUEUES_ENABLED
+  ? new Queue('autopilot-execution', {
+      connection: redisConnection,
+      defaultJobOptions: {
+        attempts: 5,
+        backoff: { type: 'exponential', delay: 1000 },
+        removeOnComplete: 1000,
+        removeOnFail: 5000,
+      },
+    })
+  : disabledQueue('autopilot-execution');
 
 export async function enqueueAutopilotExecution(data: AutopilotExecutionJob) {
   await autopilotQueue.add('execute-approved-action', data, {
@@ -44,15 +61,17 @@ export type ComplianceJobName =
 
 // NameType is `string` so scheduler ids and job names can differ freely;
 // ComplianceJobName still types the schedule config and worker dispatch.
-export const complianceQueue = new Queue<Record<string, never>, void, string>('compliance-maintenance', {
-  connection: redisConnection,
-  defaultJobOptions: {
-    attempts: 3,
-    backoff: { type: 'exponential', delay: 2000 },
-    removeOnComplete: 500,
-    removeOnFail: 1000,
-  },
-});
+export const complianceQueue: Queue<Record<string, never>, void, string> = QUEUES_ENABLED
+  ? new Queue('compliance-maintenance', {
+      connection: redisConnection,
+      defaultJobOptions: {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 2000 },
+        removeOnComplete: 500,
+        removeOnFail: 1000,
+      },
+    })
+  : disabledQueue('compliance-maintenance');
 
 // Cron schedules. upsertJobScheduler is idempotent on the scheduler id, so
 // re-registering on every boot does NOT create duplicate schedules.
@@ -75,10 +94,12 @@ export async function registerComplianceSchedules() {
 // Dispatches approved SCHEDULED campaigns whose scheduledAt has passed, honoring
 // quiet hours. The job iterates tenants and is idempotent (delivery uniqueness +
 // status transition to ACTIVE prevents re-dispatch).
-export const campaignQueue = new Queue<Record<string, never>, void, string>('campaign-scheduler', {
-  connection: redisConnection,
-  defaultJobOptions: { attempts: 3, backoff: { type: 'exponential', delay: 2000 }, removeOnComplete: 500, removeOnFail: 1000 },
-});
+export const campaignQueue: Queue<Record<string, never>, void, string> = QUEUES_ENABLED
+  ? new Queue('campaign-scheduler', {
+      connection: redisConnection,
+      defaultJobOptions: { attempts: 3, backoff: { type: 'exponential', delay: 2000 }, removeOnComplete: 500, removeOnFail: 1000 },
+    })
+  : disabledQueue('campaign-scheduler');
 
 export async function registerCampaignSchedules() {
   // Every 5 minutes — picks up due scheduled campaigns.

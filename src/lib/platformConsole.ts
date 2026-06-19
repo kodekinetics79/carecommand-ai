@@ -1,7 +1,7 @@
 // Platform operator console client. Auth is a static platform token presented
 // as X-Platform-Token — deliberately NOT a tenant session. The token is held in
 // memory by the page only (never persisted). Backend enforces access.
-const apiBaseUrl = import.meta.env.VITE_API_URL ?? 'http://localhost:3001';
+const apiBaseUrl = import.meta.env.VITE_API_URL ?? (import.meta.env.PROD ? '' : 'http://localhost:3001');
 
 async function platformFetch<T>(path: string, token: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${apiBaseUrl}${path}`, {
