@@ -258,6 +258,8 @@ export interface RetellConfig {
   dynamicVariables: Record<string, string>;
   webhookUrl: string;
   bookingFunction: Record<string, unknown>;
+  /** Live custom-function tools the agent calls DURING the call (real-time). */
+  tools: Array<Record<string, unknown>>;
   callOutcomeFields: Array<Record<string, unknown>>;
 }
 
@@ -314,6 +316,44 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     },
   };
 
+  // Live custom-function tools: Retell calls these URLs DURING the call so the
+  // agent checks real availability and books in real time (then texts a confirm).
+  const fnUrl = `${options.webhookBaseUrl.replace(/\/$/, '')}/v1/receptionist/webhooks/retell/fn?clinicId=${clinic.id}`;
+  const tools: Array<Record<string, unknown>> = [
+    {
+      type: 'function',
+      name: 'check_availability',
+      description: `Check real-time open appointment slots at ${clinic.name} for a date. ALWAYS call this before offering times or booking.`,
+      url: fnUrl,
+      speak_during_execution: true,
+      parameters: {
+        type: 'object',
+        properties: { appointment_date: { type: 'string', description: 'Date to check (YYYY-MM-DD).' } },
+        required: ['appointment_date'],
+      },
+    },
+    {
+      type: 'function',
+      name: 'book_appointment',
+      description: `Book a ${campaign.appointmentType} at ${clinic.name} once the caller chose an available time from check_availability and gave their name. Books in real time and texts a confirmation.`,
+      url: fnUrl,
+      speak_during_execution: true,
+      speak_after_execution: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          first_name: { type: 'string', description: "Caller's first name." },
+          last_name: { type: 'string', description: "Caller's last name." },
+          phone: { type: 'string', description: "Caller's mobile number for the SMS confirmation." },
+          appointment_date: { type: 'string', description: 'Chosen date (YYYY-MM-DD).' },
+          appointment_time: { type: 'string', description: 'Chosen time (HH:mm, 24h).' },
+          service: { type: 'string', description: `The service, e.g. ${campaign.appointmentType}.` },
+        },
+        required: ['first_name', 'last_name', 'appointment_date', 'appointment_time'],
+      },
+    },
+  ];
+
   const callOutcomeFields = [
     { name: 'outcome', type: 'enum', choices: ['booked', 'not_interested', 'no_answer', 'voicemail', 'escalated', 'opted_out', 'failed'], description: 'Final disposition of the call.' },
     { name: 'appointment_booked', type: 'boolean', description: 'Whether an appointment was successfully booked.' },
@@ -331,6 +371,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     dynamicVariables,
     webhookUrl: `${options.webhookBaseUrl.replace(/\/$/, '')}/v1/receptionist/webhooks/retell?clinicId=${clinic.id}&campaignId=${campaign.id}`,
     bookingFunction,
+    tools,
     callOutcomeFields,
   };
 }

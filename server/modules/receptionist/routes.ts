@@ -16,6 +16,7 @@ import {
 } from './promptService';
 import { outboundRoutes } from './outbound';
 import { runBookingHandoff } from './handoff';
+import { handleAgentTool } from '../../lib/receptionist/liveTools';
 
 const uuid = z.string().uuid();
 const idParam = z.object({ id: uuid });
@@ -767,5 +768,43 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     }
 
     return reply.code(200).send({ ok: true });
+  });
+
+  // ── Live agent tools (Retell custom functions invoked DURING a call) ──────
+  // check_availability / book_appointment. Signature-verified when a Retell key
+  // is configured; tenant resolved from the clinic/campaign on the URL.
+  app.post('/webhooks/retell/fn', async (request, reply) => {
+    const query = z.object({ clinicId: uuid.optional(), campaignId: uuid.optional() }).parse(request.query);
+    const body = z.object({
+      name: z.string(),
+      args: z.record(z.string(), z.unknown()).default({}),
+      call: z.object({ call_id: z.string().optional(), from_number: z.string().optional() }).optional(),
+    }).parse(request.body);
+
+    let tenantId: string | null = null;
+    if (query.campaignId) {
+      const c = await db.receptionistCampaign.findUnique({ where: { id: query.campaignId }, select: { tenantId: true } });
+      tenantId = c?.tenantId ?? null;
+    } else if (query.clinicId) {
+      const c = await db.receptionistClinic.findUnique({ where: { id: query.clinicId }, select: { tenantId: true } });
+      tenantId = c?.tenantId ?? null;
+    }
+    if (!tenantId) return reply.code(202).send({ message: "I'm sorry, I can't access this clinic right now." });
+
+    // Verify the Retell signature when a key is configured (prod). Dev/mock: allow.
+    if (env.RETELL_API_KEY && !(env.RETELL_API_KEY).startsWith('mock')) {
+      const sig = request.headers['x-retell-signature'];
+      const sigHeader = Array.isArray(sig) ? sig[0] : sig;
+      if (!verifyRetellSignature(request.rawBody, sigHeader, env.RETELL_API_KEY)) {
+        return reply.code(401).send({ error: 'INVALID_SIGNATURE' });
+      }
+    }
+
+    const result = await handleAgentTool(
+      { tenantId, callId: body.call?.call_id ?? null, callerPhone: body.call?.from_number ?? null },
+      body.name,
+      body.args,
+    );
+    return reply.code(200).send(result);
   });
 };
