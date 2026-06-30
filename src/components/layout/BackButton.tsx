@@ -37,18 +37,15 @@ export default function BackButton({ home = '/', className = '' }: BackButtonPro
   const navigate = useNavigate();
   const location = useLocation();
 
-  const parent = parentRouteFor(location.pathname, home);
-  // Contextual: only render on drill-down / sub-routes (a real parent exists).
-  // Top-level modules are reached from the sidebar and don't need a Back here —
-  // the breadcrumb provides their wayfinding.
-  if (location.pathname === home || parent === home) return null;
+  // Shown on every screen except the home/landing (nothing to go "back" to there).
+  if (location.pathname === home) return null;
 
   // location.key === 'default' means this is the first entry (no prior in-app
   // navigation to pop back to).
   const hasHistory = location.key !== 'default';
   const onBack = () => {
     if (hasHistory) navigate(-1);
-    else navigate(parent);
+    else navigate(parentRouteFor(location.pathname, home));
   };
 
   return (
