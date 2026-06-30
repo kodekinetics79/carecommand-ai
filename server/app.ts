@@ -6,6 +6,7 @@ import sensible from '@fastify/sensible';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
 import { env } from './config/env';
+import { loggerOptions } from './config/logger';
 import { authPlugin } from './plugins/auth';
 import { errorPlugin } from './plugins/errors';
 import { healthRoutes } from './modules/health/routes';
@@ -55,9 +56,13 @@ declare module 'fastify' {
 
 export async function buildApp() {
   const app = Fastify({
-    logger: { level: env.LOG_LEVEL },
+    logger: loggerOptions,
     trustProxy: true,
     requestIdHeader: 'x-request-id',
+    // Explicit request-body cap (defends against oversized-payload memory
+    // exhaustion). 1 MiB is ample for this JSON API; webhooks/intake stay well
+    // under it. Make it intentional rather than relying on the framework default.
+    bodyLimit: 1_048_576,
   });
 
   // Preserve the raw body so webhook handlers can verify HMAC signatures,
