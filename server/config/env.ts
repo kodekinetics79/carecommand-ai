@@ -31,6 +31,11 @@ const envSchema = z.object({
   PASSWORD_RESET_TTL_MINUTES: z.coerce.number().int().min(5).max(1440).default(60),
   MFA_ISSUER: z.string().default('CareCommand AI'),
   CORS_ORIGINS: z.string().default('http://localhost:12000'),
+  // Auth cookie SameSite policy. Use 'lax' for same-origin deploys; set 'none'
+  // when the frontend and API are on different sites (e.g. Vercel UI + Render
+  // API) so the refresh/CSRF cookies are sent on cross-site requests. 'none'
+  // forces Secure (HTTPS required).
+  COOKIE_SAMESITE: z.enum(['lax', 'none', 'strict']).default('lax'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
   // Observability. When SENTRY_DSN is set, an error reporter should be wired at
   // boot (registerSentry in server/lib/observability.ts is the seam); unhandled

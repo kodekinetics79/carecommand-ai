@@ -31,14 +31,19 @@ function isProduction() {
   return env.NODE_ENV === 'production';
 }
 
+// SameSite policy (env.COOKIE_SAMESITE): 'lax' for same-origin; 'none' for a
+// cross-site frontend (e.g. Vercel UI + Render API). 'none' requires Secure.
+const sameSiteAttr = `SameSite=${env.COOKIE_SAMESITE.charAt(0).toUpperCase()}${env.COOKIE_SAMESITE.slice(1)}`;
+function cookieSecure() { return isProduction() || env.COOKIE_SAMESITE === 'none'; }
+
 function cookieFlags(httpOnly: boolean, maxAgeSeconds: number, value: string) {
   const attributes = [
     `${httpOnly ? refreshCookieName : csrfCookieName}=${encodeURIComponent(value)}`,
     `Max-Age=${maxAgeSeconds}`,
     httpOnly ? 'HttpOnly' : undefined,
     `Path=${refreshCookiePath}`,
-    'SameSite=Lax',
-    isProduction() ? 'Secure' : undefined,
+    sameSiteAttr,
+    cookieSecure() ? 'Secure' : undefined,
   ].filter(Boolean);
   return attributes.join('; ');
 }
@@ -52,8 +57,8 @@ function setAuthCookies(reply: FastifyReply, refreshToken: string, csrfToken: st
 
 function clearAuthCookies(reply: FastifyReply) {
   reply.raw.setHeader('Set-Cookie', [
-    `${refreshCookieName}=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Path=${refreshCookiePath}; SameSite=Lax${isProduction() ? '; Secure' : ''}`,
-    `${csrfCookieName}=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=${refreshCookiePath}; SameSite=Lax${isProduction() ? '; Secure' : ''}`,
+    `${refreshCookieName}=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Path=${refreshCookiePath}; ${sameSiteAttr}${cookieSecure() ? '; Secure' : ''}`,
+    `${csrfCookieName}=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=${refreshCookiePath}; ${sameSiteAttr}${cookieSecure() ? '; Secure' : ''}`,
   ]);
 }
 
