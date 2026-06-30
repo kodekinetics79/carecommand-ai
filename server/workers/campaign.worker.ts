@@ -1,23 +1,23 @@
 import { Worker } from 'bullmq';
-import { redisConnection, registerCampaignSchedules } from './queues';
+import { captureException } from '../lib/observability';
+import { redisConnection } from './queues';
 import { runScheduledCampaigns } from '../modules/campaigns/jobs';
 
-// Processes the campaign-scheduler queue. The repeatable job dispatches approved
-// SCHEDULED campaigns that are due, across all tenants (the job scopes every
-// write by tenantId). Idempotent — see runScheduledCampaigns.
-const worker = new Worker<Record<string, never>, void, string>(
-  'campaign-scheduler',
-  async () => { await runScheduledCampaigns(); },
-  { connection: redisConnection, concurrency: 1 },
-);
+// Consumer for the campaign-scheduler queue. The repeatable job dispatches
+// approved SCHEDULED campaigns that are due, across all tenants (each write is
+// scoped by tenantId). Idempotent — see runScheduledCampaigns. Exported as a
+// factory; schedule registration + shutdown are owned by the worker runtime.
+export function createCampaignWorker(): Worker<Record<string, never>, void, string> {
+  const worker = new Worker<Record<string, never>, void, string>(
+    'campaign-scheduler',
+    async () => { await runScheduledCampaigns(); },
+    { connection: redisConnection, concurrency: 1 },
+  );
 
-worker.on('completed', job => console.info({ jobId: job.id, name: job.name }, 'campaign scheduler run completed'));
-worker.on('failed', (job, error) => console.error({ jobId: job?.id, name: job?.name, error }, 'campaign scheduler run failed'));
+  worker.on('completed', job => console.info({ jobId: job.id, name: job.name }, 'campaign scheduler run completed'));
+  worker.on('failed', (job, error) => {
+    captureException(error, { route: 'worker:campaign-scheduler', requestId: job?.id });
+  });
 
-void registerCampaignSchedules().catch(err => console.error({ err }, 'failed to register campaign schedules'));
-
-async function shutdown() {
-  await worker.close();
+  return worker;
 }
-process.on('SIGTERM', () => void shutdown());
-process.on('SIGINT', () => void shutdown());
