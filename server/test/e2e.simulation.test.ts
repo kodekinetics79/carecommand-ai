@@ -1,15 +1,19 @@
 import 'dotenv/config';
+// Enforce signed Stripe webhooks for the payments leg (set before app/env import).
+process.env.STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || 'whsec_sim_secret';
+
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHmac } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 
 // End-to-end, MULTI-TENANT, CONCURRENT simulation. Drives many modules together
 // in one realistic clinic journey — insurance eligibility, provider scheduling,
-// patient portal self-booking, connected-care/RPM device ingest, and the HIPAA
-// data export — for several tenants at once (Promise.all), then verifies the
-// shared audit trail captured the cross-module activity and that tenant
-// isolation holds under concurrent load. This is the "all modules together"
-// integration proof on top of the per-module unit tests.
+// patient portal self-booking, intake, a deposit payment collected via a signed
+// Stripe webhook, and connected-care/RPM device ingest, plus the HIPAA data
+// export — for several tenants AT ONCE (Promise.all). Then verifies the shared
+// audit trail captured the cross-module activity and that tenant isolation holds
+// under concurrent load. This is the "all modules together" proof on top of the
+// per-module unit tests. Scale with SIM_CLINICS (default 6).
 vi.mock('../workers/queues', () => ({
   redisConnection: {},
   autopilotQueue: { client: Promise.resolve(undefined), add: async () => undefined },
@@ -26,6 +30,8 @@ const { recomputeEntitlements } = await import('../lib/entitlements');
 
 let app: FastifyInstance;
 const createdTenantIds: string[] = [];
+const SECRET = process.env.STRIPE_WEBHOOK_SECRET!;
+const N = Math.min(Math.max(Number(process.env.SIM_CLINICS) || 6, 1), 16);
 
 function nextMondayISO(): string {
   const d = new Date();
@@ -40,6 +46,10 @@ const at = (hhmm: string) => `${MONDAY}T${hhmm}:00.000Z`;
 const staffTok = (tenantId: string, userId: string) => app.jwt.sign({ userId, tenantId, type: 'access' });
 const portalTok = (a: { tenantId: string; patientId: string; accountId: string }) => app.jwt.sign({ portalAccountId: a.accountId, patientId: a.patientId, tenantId: a.tenantId, type: 'portal' });
 const bearer = (t: string, ip: string) => ({ authorization: `Bearer ${t}`, 'x-forwarded-for': ip });
+function stripeSig(body: string) {
+  const ts = Math.floor(Date.now() / 1000);
+  return `t=${ts},v1=${createHmac('sha256', SECRET).update(`${ts}.${body}`).digest('hex')}`;
+}
 
 interface Clinic {
   id: string; branchId: string; providerId: string; patientId: string; accountId: string;
@@ -59,7 +69,7 @@ async function provisionClinic(seq: number): Promise<Clinic> {
   const patient = await db.patient.create({ data: { tenantId: id, branchId: branch.id, firstName: 'Sim', lastName: `Patient${seq}`, lifecycleStage: 'NEW' } });
   const account = await db.patientPortalAccount.create({ data: { tenantId: id, patientId: patient.id, status: 'active', email: `sp-${id.slice(0, 8)}@sim.test` } });
   const admin = await db.user.create({ data: { tenantId: id, role: 'ADMIN', active: true, email: `ad-${id.slice(0, 8)}@sim.test`, displayName: 'Admin' } });
-  return { id, branchId: branch.id, providerId: provider.id, patientId: patient.id, accountId: account.id, adminId: admin.id, externalRef: `EXT-${id.slice(0, 8)}`, ip: `203.0.113.${seq + 10}` };
+  return { id, branchId: branch.id, providerId: provider.id, patientId: patient.id, accountId: account.id, adminId: admin.id, externalRef: `EXT-${id.slice(0, 8)}`, ip: `203.0.113.${(seq % 240) + 10}` };
 }
 
 type StepResult = { ok: boolean; detail: string };
@@ -75,25 +85,55 @@ async function runJourney(c: Clinic): Promise<Record<string, StepResult>> {
   const elig = await app.inject({ method: 'POST', url: '/v1/insurance/eligibility/check', headers: admin, payload: { patientId: c.patientId, payerName: 'Aetna', memberId: 'AET-110293' } });
   steps.eligibility = ok(elig.statusCode === 201 && elig.json().status === 'ACTIVE', `status=${elig.statusCode}`);
 
-  // 2) Scheduling: provider availability (Mon 09:00–12:00).
+  // 2) Revenue policy: a new-patient deposit rule (so a deposit applies below).
+  await app.inject({ method: 'POST', url: '/v1/revenue-protection/deposit-rules', headers: admin, payload: { name: 'New patient deposit', ruleType: 'new_patient', description: 'Collect a deposit from new patients', depositRequired: true, amountType: 'fixed', amountValue: 50, appliesToNewPatients: true } });
+
+  // 3) Scheduling: provider availability (Mon 09:00–12:00).
   const avail = await app.inject({ method: 'PUT', url: `/v1/scheduling/providers/${c.providerId}/availability`, headers: admin, payload: { windows: [{ dayOfWeek: 1, startMinute: 540, endMinute: 720, slotMinutes: 30 }] } });
   steps.availability = ok(avail.statusCode === 200, `status=${avail.statusCode}`);
 
-  // 3) Portal self-book: patient views slots and books 09:00 for themselves.
+  // 4) Portal self-book: patient views slots and books 09:00 for themselves.
   const slots = await app.inject({ method: 'GET', url: `/v1/portal/booking/providers/${c.providerId}/slots?date=${MONDAY}`, headers: portal });
-  const hasNine = (slots.json().slots ?? []).some((s: { startsAt: string }) => s.startsAt === at('09:00'));
   const book = await app.inject({ method: 'POST', url: `/v1/portal/booking/providers/${c.providerId}/book`, headers: portal, payload: { startsAt: at('09:00'), durationMin: 30, reason: 'Annual physical' } });
-  steps.selfBook = ok(hasNine && book.statusCode === 201, `slots=${(slots.json().slots ?? []).length} book=${book.statusCode}`);
+  const appointmentId = book.statusCode === 201 ? (book.json().id as string) : null;
+  steps.selfBook = ok(Boolean(appointmentId) && (slots.json().slots ?? []).length === 6, `slots=${(slots.json().slots ?? []).length} book=${book.statusCode}`);
 
-  // 4) Connected care / RPM: enroll + ingest a critical reading via webhook.
+  // 5) Intake: staff create a packet, patient fills the demographics section.
+  const packet = await app.inject({ method: 'POST', url: '/v1/intake/packets', headers: admin, payload: { patientId: c.patientId, issueToken: false } });
+  const packetId = (packet.statusCode === 201 || packet.statusCode === 200) ? (packet.json().intakePacketId as string) : null;
+  let intakeOk = false; let intakeDetail = `packet=${packet.statusCode}`;
+  if (packetId) {
+    const section = await app.inject({ method: 'POST', url: `/v1/portal/intake/${packetId}/sections`, headers: portal, payload: { sectionType: 'demographics', data: { confirmed: true } } });
+    intakeOk = section.statusCode === 200;
+    intakeDetail += ` section=${section.statusCode}:${section.body.slice(0, 90)}`;
+  }
+  steps.intake = ok(intakeOk, intakeDetail);
+
+  // 6) Payments: generate the deposit link, then collect it via a signed webhook.
+  let paymentsOk = false; let payDetail = '';
+  if (appointmentId) {
+    const link = await app.inject({ method: 'POST', url: `/v1/payments/appointments/${appointmentId}/payment-link`, headers: admin, payload: {} });
+    const pr = await db.paymentRequest.findFirst({ where: { tenantId: c.id, appointmentId }, orderBy: { createdAt: 'desc' }, select: { id: true, providerReference: true } });
+    payDetail = `link=${link.statusCode} ref=${pr?.providerReference ? 'y' : 'n'}`;
+    if (pr?.providerReference) {
+      const evt = JSON.stringify({ id: `evt_${randomUUID()}`, type: 'checkout.session.completed', data: { object: { id: pr.providerReference } } });
+      const hook = await app.inject({ method: 'POST', url: '/v1/revenue-protection/webhooks/stripe', headers: { 'content-type': 'application/json', 'stripe-signature': stripeSig(evt) }, payload: evt });
+      const after = await db.paymentRequest.findUnique({ where: { id: pr.id }, select: { status: true } });
+      paymentsOk = hook.statusCode === 200 && after?.status === 'collected';
+      payDetail += ` hook=${hook.statusCode} status=${after?.status}`;
+    }
+  }
+  steps.paymentCollected = ok(paymentsOk, payDetail);
+
+  // 7) Connected care / RPM: enroll + ingest a critical reading via webhook.
   await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: admin, payload: { patientId: c.patientId, providerKey: 'manual', externalRef: c.externalRef } });
   const hook = await app.inject({ method: 'POST', url: `/v1/connected-care/${c.id}/providers/manual/webhook`, payload: { readings: [{ patientExternalRef: c.externalRef, readingType: 'glucose', value: '330', numericValue: 330, unit: 'mg/dL' }] } });
   steps.deviceAlert = ok(hook.statusCode === 200 && hook.json().alertsCreated === 1, `ingested=${hook.json().ingested} alerts=${hook.json().alertsCreated}`);
 
-  // 5) Compliance: HIPAA data-access export compiles the cross-module record.
+  // 8) Compliance: HIPAA data-access export compiles the cross-module record.
   const exp = await app.inject({ method: 'GET', url: `/v1/patients/${c.patientId}/data-export`, headers: admin });
   const body = exp.statusCode === 200 ? exp.json() : { counts: {} };
-  steps.dataExport = ok(exp.statusCode === 200 && body.counts.appointments >= 1 && body.counts.eligibilityVerifications >= 1, `status=${exp.statusCode}`);
+  steps.dataExport = ok(exp.statusCode === 200 && body.counts.appointments >= 1 && body.counts.eligibilityVerifications >= 1 && body.counts.paymentRequests >= 1, `status=${exp.statusCode}`);
 
   return steps;
 }
@@ -105,47 +145,43 @@ afterAll(async () => {
   await db.$disconnect();
 });
 
-const N = 4; // concurrent clinics
-
 describe('e2e simulation — many modules, many tenants, concurrently', () => {
   it(`runs ${N} clinic journeys in parallel and every cross-module step succeeds`, async () => {
+    const start = Date.now();
     const clinics = await Promise.all(Array.from({ length: N }, (_, i) => provisionClinic(i)));
     const reports = await Promise.all(clinics.map(runJourney));
 
-    // Human-readable simulation report.
     reports.forEach((r, i) => {
       const line = Object.entries(r).map(([k, v]) => `${k}:${v.ok ? 'ok' : `FAIL(${v.detail})`}`).join('  ');
       console.info(`[sim] clinic ${i}: ${line}`);
     });
+    console.info(`[sim] ${N} clinics × ${Object.keys(reports[0]).length} module steps in ${Date.now() - start}ms`);
 
     for (const r of reports) {
       for (const [step, result] of Object.entries(r)) {
         expect(result.ok, `${step} → ${result.detail}`).toBe(true);
       }
     }
-  }, 60_000);
+  }, 120_000);
 
   it('captured cross-module audit activity and kept tenants isolated under concurrency', async () => {
-    // Re-provision a small concurrent batch and verify per-tenant invariants.
     const clinics = await Promise.all(Array.from({ length: N }, (_, i) => provisionClinic(100 + i)));
     await Promise.all(clinics.map(runJourney));
 
     for (const c of clinics) {
-      // Each tenant has exactly its own single booked appointment, for its patient.
       const appts = await db.appointment.findMany({ where: { tenantId: c.id }, select: { patientId: true, providerRef: true } });
       expect(appts).toHaveLength(1);
       expect(appts[0].patientId).toBe(c.patientId);
       expect(appts[0].providerRef).toBe(c.providerId);
 
-      // The shared audit trail captured activity from multiple modules for this tenant.
       const actions = new Set((await db.auditEvent.findMany({ where: { tenantId: c.id }, select: { action: true } })).map(a => a.action));
-      expect(actions.has('schedule.availability.updated')).toBe(true);
-      expect(actions.has('portal.appointment.booked')).toBe(true);
-      expect(actions.has('patient.data_exported')).toBe(true);
+      for (const expected of ['schedule.availability.updated', 'portal.appointment.booked', 'portal.intake.updated', 'payment.succeeded', 'patient.data_exported']) {
+        expect(actions.has(expected), `missing audit action ${expected}`).toBe(true);
+      }
 
-      // Eligibility history is exactly this tenant's (no cross-tenant bleed).
-      const eligCount = await db.eligibilityVerification.count({ where: { tenantId: c.id } });
-      expect(eligCount).toBe(1);
+      expect(await db.eligibilityVerification.count({ where: { tenantId: c.id } })).toBe(1);
+      // exactly one deposit collected per tenant — no cross-tenant double-collect
+      expect(await db.paymentTransaction.count({ where: { tenantId: c.id, status: 'succeeded' } })).toBe(1);
     }
-  }, 60_000);
+  }, 120_000);
 });
