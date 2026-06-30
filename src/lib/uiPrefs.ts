@@ -5,6 +5,7 @@ import { useSyncExternalStore } from 'react';
 
 const COLLAPSE_KEY = 'cc_sidebar_collapsed';
 const ACCENT_KEY = 'cc_accent';
+const SECTIONS_KEY = 'cc_nav_sections_collapsed';
 const EVENT = 'cc-ui-changed';
 
 export interface Accent { key: string; label: string; color: string; base: string; soft: string; mid: string; glow: string }
@@ -32,6 +33,19 @@ function applyAccent(key: string) {
 export function setCollapsed(v: boolean) { localStorage.setItem(COLLAPSE_KEY, v ? '1' : '0'); applyCollapsed(v); window.dispatchEvent(new Event(EVENT)); }
 export function setAccent(key: string) { localStorage.setItem(ACCENT_KEY, key); applyAccent(key); window.dispatchEvent(new Event(EVENT)); }
 
+// Per-section collapse state for the sidebar nav (persisted, comma-joined labels).
+export function getCollapsedSections(): string[] {
+  if (typeof localStorage === 'undefined') return [];
+  const raw = localStorage.getItem(SECTIONS_KEY);
+  return raw ? raw.split(',').filter(Boolean) : [];
+}
+export function toggleSection(label: string) {
+  const current = new Set(getCollapsedSections());
+  if (current.has(label)) current.delete(label); else current.add(label);
+  localStorage.setItem(SECTIONS_KEY, [...current].join(','));
+  window.dispatchEvent(new Event(EVENT));
+}
+
 // Apply saved prefs at startup (call once before first paint).
 export function initUiPrefs() { applyCollapsed(getCollapsed()); applyAccent(getAccent()); }
 
@@ -40,10 +54,17 @@ function subscribe(cb: () => void) {
   window.addEventListener('storage', cb);
   return () => { window.removeEventListener(EVENT, cb); window.removeEventListener('storage', cb); };
 }
-function snapshot() { return `${getCollapsed() ? '1' : '0'}|${getAccent()}`; }
+function snapshot() { return `${getCollapsed() ? '1' : '0'}|${getAccent()}|${getCollapsedSections().join(',')}`; }
 
 export function useUiPrefs() {
-  const snap = useSyncExternalStore(subscribe, snapshot, () => '0|indigo');
-  const [c, accent] = snap.split('|');
-  return { collapsed: c === '1', accent, setCollapsed, setAccent };
+  const snap = useSyncExternalStore(subscribe, snapshot, () => '0|indigo|');
+  const [c, accent, sections] = snap.split('|');
+  return {
+    collapsed: c === '1',
+    accent,
+    collapsedSections: sections ? sections.split(',').filter(Boolean) : [],
+    setCollapsed,
+    setAccent,
+    toggleSection,
+  };
 }

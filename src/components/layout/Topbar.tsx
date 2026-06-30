@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate, Link } from 'react-router-dom';
 import { Search, Command, ChevronDown, ChevronRight, LogOut, Settings as SettingsIcon, Globe } from 'lucide-react';
 import CommandPalette from '../ui/CommandPalette';
 import BackButton from './BackButton';
@@ -45,6 +45,24 @@ function initials(name: string): string {
   return name.trim().split(/\s+/).slice(0, 2).map(p => p[0]?.toUpperCase() ?? '').join('') || '·';
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Longest matching top-level route (segment-aware, so /revenue does not shadow
+// /revenue-protection).
+function matchRoute(pathname: string): { key: string; label: string } {
+  let best = '';
+  for (const k of Object.keys(routeLabels)) {
+    if (k === '/') continue;
+    if ((pathname === k || pathname.startsWith(k + '/')) && k.length > best.length) best = k;
+  }
+  return best ? { key: best, label: routeLabels[best] } : { key: '/', label: routeLabels['/'] };
+}
+
+function prettySegment(seg: string): string {
+  if (UUID_RE.test(seg) || /^\d+$/.test(seg)) return 'Details';
+  return seg.replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
 export default function Topbar() {
   const { pathname } = useLocation();
   const navigate = useNavigate();
@@ -53,9 +71,9 @@ export default function Topbar() {
   const { user, signOut } = useSession();
   const { language, setLanguage } = usePreferences();
 
-  const pageLabel = pathname === '/'
-    ? 'Command Center'
-    : (routeLabels[Object.keys(routeLabels).find(k => k !== '/' && pathname.startsWith(k)) ?? ''] ?? 'CareCommand');
+  const matched = pathname === '/' ? { key: '/', label: routeLabels['/'] } : matchRoute(pathname);
+  const isDetail = pathname !== matched.key && matched.key !== '/';
+  const detailLabel = isDetail ? prettySegment(pathname.split('/').filter(Boolean).pop() ?? '') : null;
 
   const workspace = user?.tenant?.name;
   const locationLabel = user?.branch?.name ?? user?.branch?.location ?? null;
@@ -73,7 +91,15 @@ export default function Topbar() {
               <ChevronRight className="w-3.5 h-3.5 text-t3 shrink-0 hidden sm:inline opacity-60" aria-hidden="true" />
             </>
           )}
-          <span className="font-semibold text-t1 truncate">{pageLabel}</span>
+          {isDetail ? (
+            <>
+              <Link to={matched.key} className="text-t2 hover:text-t1 hover:underline truncate transition-colors">{matched.label}</Link>
+              <ChevronRight className="w-3.5 h-3.5 text-t3 shrink-0 opacity-60" aria-hidden="true" />
+              <span className="font-semibold text-t1 truncate">{detailLabel}</span>
+            </>
+          ) : (
+            <span className="font-semibold text-t1 truncate">{matched.label}</span>
+          )}
           {locationLabel && (
             <span className="ml-1.5 hidden md:inline-flex items-center rounded-md border border-[var(--b1)] bg-[var(--s2)] px-2 py-0.5 text-[11px] font-medium text-t2 shrink-0">{locationLabel}</span>
           )}
