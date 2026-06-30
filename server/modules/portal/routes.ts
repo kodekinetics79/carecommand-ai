@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { requirePortalAccess, requirePortalFeature, portalAudit } from '../../lib/portalAuth';
 import { publicView, submitSection, submitPacket, readinessScore } from '../../lib/intake';
+import { computeProviderSlots, findSlotConflict } from '../../lib/scheduling';
 
 const n = (v: unknown): number => typeof v === 'object' && v !== null && 'toString' in v ? Number(v) : Number(v) || 0;
 
@@ -102,6 +103,72 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     const row = await db.appointmentRequest.create({ data: { tenantId, branchId: patient?.branchId ?? null, patientId, requestedService: body.service, requestedDateTime: body.requestedDateTime, collectedName: `${patient?.firstName ?? ''} ${patient?.lastName ?? ''}`.trim(), collectedEmail: patient?.email ?? null, collectedPhone: patient?.phone ?? null, source: 'patient_portal', status: 'PENDING_REVIEW', rawCollectedFields: body.notes ? { notes: body.notes } : undefined } });
     await portalAudit(tenantId, 'portal.appointmentRequest.created', row.id, request, { service: body.service });
     return reply.code(201).send({ id: row.id, status: row.status, deduped: false });
+  });
+
+  // ===== Self-scheduling (direct booking on real availability) ===========
+  // Patient books a real open slot for THEMSELVES (patientId from the portal
+  // session, never the body), against providers in their own clinic. Slot math
+  // + conflict checks are backend-owned (lib/scheduling.ts); booking is
+  // conflict-safe in a transaction. This is distinct from request-mode above.
+  const SELF_BOOK_HORIZON_DAYS = 90;
+
+  app.get('/booking/providers', async request => {
+    const { tenantId, patientId } = request.portal!;
+    const patient = await db.patient.findUnique({ where: { id: patientId }, select: { branchId: true } });
+    if (!patient) return [];
+    const providers = await db.providerProfile.findMany({
+      where: { tenantId, branchId: patient.branchId },
+      select: { id: true, specialty: true, rating: true, reviewCount: true, user: { select: { displayName: true } } },
+      orderBy: { rating: 'desc' },
+    });
+    // Patient-safe fields only — no utilization/revenue/internal metrics.
+    return providers.map(p => ({ id: p.id, name: p.user.displayName, specialty: p.specialty, rating: n(p.rating), reviewCount: p.reviewCount }));
+  });
+
+  async function loadBookableProvider(tenantId: string, patientId: string, providerId: string) {
+    const patient = await db.patient.findUnique({ where: { id: patientId }, select: { branchId: true } });
+    if (!patient) return null;
+    return db.providerProfile.findFirst({ where: { id: providerId, tenantId, branchId: patient.branchId }, select: { id: true, branchId: true } });
+  }
+
+  app.get('/booking/providers/:providerId/slots', async (request, reply) => {
+    const { tenantId, patientId } = request.portal!;
+    const { providerId } = z.object({ providerId: z.string().uuid() }).parse(request.params);
+    const { date, durationMin } = z.object({ date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), durationMin: z.coerce.number().int().min(5).max(240).optional() }).parse(request.query);
+    const provider = await loadBookableProvider(tenantId, patientId, providerId);
+    if (!provider) return reply.code(404).send({ error: 'not_found' });
+    const slots = await computeProviderSlots({ tenantId, providerProfileId: providerId, dateISO: date, durationMin });
+    return { providerId, date, slots: slots.map(s => ({ startsAt: s.startsAt.toISOString(), endsAt: s.endsAt.toISOString() })) };
+  });
+
+  app.post('/booking/providers/:providerId/book', async (request, reply) => {
+    const { tenantId, patientId } = request.portal!;
+    const { providerId } = z.object({ providerId: z.string().uuid() }).parse(request.params);
+    const body = z.object({
+      startsAt: z.coerce.date(),
+      durationMin: z.number().int().min(5).max(240).default(30),
+      reason: z.string().trim().min(2).max(160),
+      channel: z.enum(['WHATSAPP', 'SMS', 'EMAIL', 'PUSH', 'CALL', 'VIDEO']).default('EMAIL'),
+    }).parse(request.body);
+    const provider = await loadBookableProvider(tenantId, patientId, providerId);
+    if (!provider) return reply.code(404).send({ error: 'not_found' });
+
+    const horizon = new Date(Date.now() + SELF_BOOK_HORIZON_DAYS * 86400000);
+    if (body.startsAt > horizon) return reply.code(400).send({ error: 'too_far_out', message: `Bookings are limited to the next ${SELF_BOOK_HORIZON_DAYS} days.` });
+    const endsAt = new Date(body.startsAt.getTime() + body.durationMin * 60_000);
+
+    const result = await db.$transaction(async tx => {
+      const conflict = await findSlotConflict({ tenantId, providerProfileId: providerId, startsAt: body.startsAt, durationMin: body.durationMin }, tx);
+      if (conflict) return { conflict } as const;
+      const appointment = await tx.appointment.create({
+        data: { tenantId, branchId: provider.branchId, patientId, providerRef: providerId, service: body.reason, startsAt: body.startsAt, endsAt, status: 'CONFIRMED', channel: body.channel },
+      });
+      return { appointment } as const;
+    });
+    if ('conflict' in result) return reply.code(409).send({ error: 'slot_unavailable', reason: result.conflict });
+
+    await portalAudit(tenantId, 'portal.appointment.booked', result.appointment.id, request, { providerId });
+    return reply.code(201).send(safeAppt(result.appointment));
   });
 
   // ===== Intake (reuse the Patient Intake engine) ========================

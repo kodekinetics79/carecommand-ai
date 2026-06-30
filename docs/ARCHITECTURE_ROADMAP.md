@@ -111,8 +111,13 @@ validated.
   `/v1/scheduling` routes — manage weekly hours, add time-off, query open slots,
   and **conflict-safe booking** (double-book → 409 in a transaction). Permission-
   (`schedule:manage` / `appointment:write`) and tenant/branch-scoped; proven by
-  `scheduling.integration.test.ts`. **Next:** patient-facing self-book via the
-  portal identity plane + pre-visit requirements; per-clinic timezones.
+  `scheduling.integration.test.ts`. **Patient self-book shipped:** on the portal
+  identity plane (`/v1/portal/booking/*`) a patient lists bookable providers
+  (patient-safe fields), views real open slots, and books **for themselves**
+  (patientId from the portal session, never the body), conflict-safe, scoped to
+  their own clinic, audited as a patient action — distinct from the existing
+  request-mode. Proven by `portalBooking.integration.test.ts`. **Next:** pre-visit
+  requirements (intake/eligibility gating before confirm); per-clinic timezones.
 - Unified **intake → eligibility → estimate → deposit** state machine (all engines
   exist; orchestrate + surface in morning briefing).
 - RPM **time-accrual → CPT evidence export** (extend `RPMBillingReadiness`; never
