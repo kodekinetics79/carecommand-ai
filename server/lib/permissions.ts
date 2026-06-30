@@ -23,6 +23,10 @@ import { db } from './db';
 export const PERMISSIONS = [
   'patient:read',
   'patient:write',
+  // Full PHI export for a patient (HIPAA right-of-access / data-subject request)
+  // — more sensitive than read, so least-privilege by default (owner/admin/
+  // compliance only).
+  'patient:export',
   'appointment:read',
   'appointment:write',
   'billing:read',
@@ -64,7 +68,7 @@ export const ROLE_PERMISSIONS: Record<UserRole, Permission[]> = {
   PROVIDER: ['patient:read', 'appointment:read', 'appointment:write', 'staff:read', 'settings:read'],
   FRONT_DESK: ['patient:read', 'patient:write', 'appointment:read', 'appointment:write', 'staff:read'],
   ANALYST: ['patient:read', 'appointment:read', 'billing:read', 'staff:read', 'settings:read', 'audit:read'],
-  COMPLIANCE_OFFICER: ['compliance:read', 'compliance:manage', 'audit:read'],
+  COMPLIANCE_OFFICER: ['compliance:read', 'compliance:manage', 'audit:read', 'patient:export'],
   AUDITOR: ['compliance:read', 'audit:read'],
 };
 

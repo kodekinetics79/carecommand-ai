@@ -11,6 +11,9 @@ import { assertBranchAccess, branchScope } from '../../lib/scope';
 // rather than a hardcoded role list, so a tenant's custom role grants/revokes
 // are actually enforced here. Read routes remain open to any authenticated user.
 const canWritePatients = requirePermission('patient:write');
+// Full PHI export is least-privilege (owner/admin/compliance) and audited as an
+// access disclosure — see the data-export route below.
+const canExportPatients = requirePermission('patient:export');
 
 const patientQuery = paginationSchema.extend({
   branchId: z.string().uuid().optional(),
@@ -115,6 +118,74 @@ export const patientRoutes: FastifyPluginAsync = async app => {
     });
     await audit(request, { action: 'patient.consent.recorded', resource: 'patient', resourceId: patient.id, metadata: { purpose: input.purpose, granted: input.granted } });
     return reply.code(201).send(consent);
+  });
+
+  // ----- HIPAA right-of-access / data-subject export (read-only, audited) -----
+  // Compiles a patient's record across PHI domains into a single export. Gated by
+  // patient:export (owner/admin/compliance by default), tenant- + branch-scoped,
+  // and logged as a disclosure (accounting-of-disclosures evidence). Returns 404
+  // for another tenant's patient (no cross-tenant existence leak).
+  app.get('/:id/data-export', { preHandler: canExportPatients }, async request => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const CAP = 1000; // bound each category to keep an export finite
+    const patient = await db.patient.findFirst({
+      where: { id, tenantId: request.auth.tenantId, deletedAt: null, ...branchScope(request) },
+      include: {
+        appointments: { where: { deletedAt: null }, take: CAP },
+        appointmentRequests: { take: CAP },
+        consentEvents: { take: CAP },
+        communicationConsents: { take: CAP },
+        patientConsentRecords: { take: CAP },
+        patientInsurancePolicies: { take: CAP },
+        eligibilityVerifications: { take: CAP },
+        priorAuthorizations: { take: CAP },
+        patientResponsibilityEstimates: { take: CAP },
+        paymentRequests: { take: CAP },
+        paymentTransactions: { take: CAP },
+        intakePackets: { include: { sections: true }, take: CAP },
+      },
+    });
+    if (!patient) throw app.httpErrors.notFound('Patient not found');
+
+    const { appointments, appointmentRequests, consentEvents, communicationConsents, patientConsentRecords,
+      patientInsurancePolicies, eligibilityVerifications, priorAuthorizations, patientResponsibilityEstimates,
+      paymentRequests, paymentTransactions, intakePackets, ...demographics } = patient;
+
+    const records = {
+      appointments,
+      appointmentRequests,
+      consents: { events: consentEvents, communications: communicationConsents, records: patientConsentRecords },
+      insurance: { policies: patientInsurancePolicies, eligibility: eligibilityVerifications, priorAuthorizations, responsibilityEstimates: patientResponsibilityEstimates },
+      payments: { requests: paymentRequests, transactions: paymentTransactions },
+      intake: intakePackets,
+    };
+    const counts = {
+      appointments: appointments.length,
+      appointmentRequests: appointmentRequests.length,
+      consentEvents: consentEvents.length,
+      communicationConsents: communicationConsents.length,
+      patientConsentRecords: patientConsentRecords.length,
+      insurancePolicies: patientInsurancePolicies.length,
+      eligibilityVerifications: eligibilityVerifications.length,
+      priorAuthorizations: priorAuthorizations.length,
+      responsibilityEstimates: patientResponsibilityEstimates.length,
+      paymentRequests: paymentRequests.length,
+      paymentTransactions: paymentTransactions.length,
+      intakePackets: intakePackets.length,
+    };
+
+    // Disclosure accounting: who exported which patient, when (no PHI in the log).
+    await audit(request, { action: 'patient.data_exported', resource: 'patient', resourceId: id, metadata: { counts } });
+
+    return {
+      exportType: 'patient_data_access',
+      standard: 'HIPAA right-of-access (45 CFR 164.524)',
+      generatedAt: new Date().toISOString(),
+      generatedByUserId: request.auth.userId,
+      patient: demographics,
+      records,
+      counts,
+    };
   });
 
   app.post('/:id/follow-up-task', { preHandler: canWritePatients }, async (request, reply) => {
