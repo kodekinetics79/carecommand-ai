@@ -615,9 +615,48 @@ model ProviderProfile {
   tenant                Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   branch                Branch   @relation(fields: [branchId], references: [id], onDelete: Restrict)
   user                  User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  availability          ProviderAvailability[]
+  timeOff               ProviderTimeOff[]
 
   @@index([tenantId, branchId, utilization])
   @@index([tenantId, revenueThisMonth])
+}
+
+// Recurring weekly working hours for a provider (one row per open window per
+// weekday). Minutes are measured from local-clinic midnight; slotMinutes is the
+// granularity the slot service tiles each window into. Tenant cleanup cascades
+// transitively via ProviderProfile.
+model ProviderAvailability {
+  id                String   @id @default(uuid()) @db.Uuid
+  tenantId          String   @db.Uuid
+  branchId          String   @db.Uuid
+  providerProfileId String   @db.Uuid
+  dayOfWeek         Int      // 0=Sunday .. 6=Saturday
+  startMinute       Int      // minutes from midnight, clinic-local
+  endMinute         Int
+  slotMinutes       Int      @default(30)
+  active            Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  provider          ProviderProfile @relation(fields: [providerProfileId], references: [id], onDelete: Cascade)
+
+  @@unique([providerProfileId, dayOfWeek, startMinute])
+  @@index([tenantId, providerProfileId, dayOfWeek])
+}
+
+// One-off provider unavailability (vacation, blocked time). Overlapping slots are
+// removed from availability for the covered range.
+model ProviderTimeOff {
+  id                String   @id @default(uuid()) @db.Uuid
+  tenantId          String   @db.Uuid
+  providerProfileId String   @db.Uuid
+  startsAt          DateTime
+  endsAt            DateTime
+  reason            String?
+  createdAt         DateTime @default(now())
+  provider          ProviderProfile @relation(fields: [providerProfileId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, providerProfileId, startsAt])
 }
 
 model StaffProfile {

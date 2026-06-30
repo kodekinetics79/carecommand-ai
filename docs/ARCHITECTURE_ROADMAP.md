@@ -104,8 +104,15 @@ validated.
 ## 4. Phased build roadmap (from competitive intel, clinically gated)
 
 **Phase A — Access & revenue flywheel (build-now)**
-- Patient self-scheduling on real provider availability (guardrails per
-  CLINICAL_VALIDATION §3).
+- 🟡 Patient self-scheduling on real provider availability (guardrails per
+  CLINICAL_VALIDATION §3). **Foundation shipped:** `ProviderAvailability` +
+  `ProviderTimeOff` models, a backend-owned slot service (`lib/scheduling.ts`,
+  availability − time-off − booked appointments, no client-trusted math), and
+  `/v1/scheduling` routes — manage weekly hours, add time-off, query open slots,
+  and **conflict-safe booking** (double-book → 409 in a transaction). Permission-
+  (`schedule:manage` / `appointment:write`) and tenant/branch-scoped; proven by
+  `scheduling.integration.test.ts`. **Next:** patient-facing self-book via the
+  portal identity plane + pre-visit requirements; per-clinic timezones.
 - Unified **intake → eligibility → estimate → deposit** state machine (all engines
   exist; orchestrate + surface in morning briefing).
 - RPM **time-accrual → CPT evidence export** (extend `RPMBillingReadiness`; never

@@ -16,6 +16,7 @@ import { providerRoutes } from './modules/providers/routes';
 import { staffRoutes } from './modules/staff/routes';
 import { patientRoutes } from './modules/patients/routes';
 import { appointmentRoutes } from './modules/appointments/routes';
+import { schedulingRoutes } from './modules/scheduling/routes';
 import { autopilotRoutes } from './modules/autopilot/routes';
 import { operationsRoutes } from './modules/operations/routes';
 import { dashboardRoutes } from './modules/dashboard/routes';
@@ -177,6 +178,7 @@ export async function buildApp() {
     await protectedApi.register(staffRoutes, { prefix: '/staff' });
     await protectedApi.register(patientRoutes, { prefix: '/patients' });
     await protectedApi.register(appointmentRoutes, { prefix: '/appointments' });
+    await protectedApi.register(schedulingRoutes, { prefix: '/scheduling' });
     await protectedApi.register(serviceCatalogRoutes, { prefix: '/services' });
     await protectedApi.register(crmRoutes, { prefix: '/crm' });
     await protectedApi.register(intakeRoutes, { prefix: '/intake' });
