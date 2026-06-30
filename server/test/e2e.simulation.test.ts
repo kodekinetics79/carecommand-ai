@@ -31,7 +31,7 @@ const { recomputeEntitlements } = await import('../lib/entitlements');
 let app: FastifyInstance;
 const createdTenantIds: string[] = [];
 const SECRET = process.env.STRIPE_WEBHOOK_SECRET!;
-const N = Math.min(Math.max(Number(process.env.SIM_CLINICS) || 6, 1), 16);
+const N = Math.min(Math.max(Number(process.env.SIM_CLINICS) || 6, 1), 24);
 
 function nextMondayISO(): string {
   const d = new Date();
@@ -135,6 +135,13 @@ async function runJourney(c: Clinic): Promise<Record<string, StepResult>> {
   const body = exp.statusCode === 200 ? exp.json() : { counts: {} };
   steps.dataExport = ok(exp.statusCode === 200 && body.counts.appointments >= 1 && body.counts.eligibilityVerifications >= 1 && body.counts.paymentRequests >= 1, `status=${exp.statusCode}`);
 
+  // 9) Intelligence: the morning briefing reacted to this activity — its LIVE
+  // counts surface the backend-decided critical reading, today's eligibility
+  // check, and the open device alert (all produced above, not seeded).
+  const brief = await app.inject({ method: 'GET', url: '/v1/monitoring/morning-briefing', headers: admin });
+  const bc = brief.statusCode === 200 ? brief.json().counts : {};
+  steps.briefingReacted = ok(brief.statusCode === 200 && bc.criticalOpen >= 1 && bc.insuranceChecksToday >= 1 && bc.unresolvedDeviceAlerts >= 1, `critical=${bc.criticalOpen} elig=${bc.insuranceChecksToday} alerts=${bc.unresolvedDeviceAlerts}`);
+
   return steps;
 }
 
@@ -182,6 +189,13 @@ describe('e2e simulation — many modules, many tenants, concurrently', () => {
       expect(await db.eligibilityVerification.count({ where: { tenantId: c.id } })).toBe(1);
       // exactly one deposit collected per tenant — no cross-tenant double-collect
       expect(await db.paymentTransaction.count({ where: { tenantId: c.id, status: 'succeeded' } })).toBe(1);
+
+      // Intelligence layer reacted to this tenant's activity:
+      // (a) revenue intelligence recorded the money movement as a BusinessEvent,
+      const bizTypes = new Set((await db.businessEvent.findMany({ where: { tenantId: c.id }, select: { eventType: true } })).map(e => e.eventType));
+      expect(bizTypes.has('payment.succeeded'), 'no payment.succeeded BusinessEvent').toBe(true);
+      // (b) monitoring decided exactly one critical reading alert (glucose 330),
+      expect(await db.readingAlert.count({ where: { tenantId: c.id, severity: 'critical', status: 'open' } })).toBe(1);
     }
   }, 120_000);
 });
