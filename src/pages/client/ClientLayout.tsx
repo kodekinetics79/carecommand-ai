@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { HeartPulse, Home, CalendarDays, ClipboardList, FileText, ShieldCheck, CreditCard, User, Bell, LogOut, Loader2 } from 'lucide-react';
 import { portalClient, getPortalToken, setPortalToken } from '../../lib/portalClient';
+import BackButton from '../../components/layout/BackButton';
 
 // Patient-safe navigation only — no staff/admin/AI/revenue/compliance/audit.
 const NAV = [
@@ -39,6 +40,7 @@ export default function ClientLayout() {
     <div className="min-h-screen bg-[var(--bg)] flex flex-col">
       <header className="sticky top-0 z-30 bg-[var(--s1)] border-b border-[var(--b1)] px-4 sm:px-6 h-14 flex items-center justify-between">
         <div className="flex items-center gap-2.5 min-w-0">
+          <BackButton home="/client" />
           <div className="w-8 h-8 rounded-lg bg-[var(--indigo)] grid place-items-center shrink-0"><HeartPulse className="w-4 h-4 text-white" /></div>
           <div className="min-w-0 leading-tight"><p className="text-sm font-bold text-t1 truncate">{me?.clinicName ?? 'Patient Portal'}</p><p className="text-[10px] text-t3">Patient portal</p></div>
         </div>

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { Search, Command, ChevronDown, ChevronRight, LogOut, Settings as SettingsIcon, Globe } from 'lucide-react';
 import CommandPalette from '../ui/CommandPalette';
+import BackButton from './BackButton';
 import { useSession } from '../../hooks/useSession';
 import { usePreferences, LANGUAGES } from '../../lib/preferences';
 
@@ -62,6 +63,8 @@ export default function Topbar() {
   return (
     <>
       <header className="topbar">
+        {/* Smart back control — true previous screen, parent fallback on deep link */}
+        <BackButton className="mr-1" />
         {/* Breadcrumb: workspace › section, with location context chip */}
         <nav aria-label="Breadcrumb" className="flex items-center gap-1.5 min-w-0 flex-1 text-[13px]">
           {workspace && (
