@@ -5,7 +5,7 @@ import { audit } from '../../lib/audit';
 import { requirePermission } from '../../lib/permissions';
 import { assertBranchAccess } from '../../lib/scope';
 import { recordWorkflowEvent } from '../../lib/intelligence';
-import { computeProviderSlots, findSlotConflict } from '../../lib/scheduling';
+import { computeProviderSlots, findSlotConflict, getSchedulingPolicy } from '../../lib/scheduling';
 
 // ===========================================================================
 // Provider scheduling — recurring availability, one-off time-off, open-slot
@@ -39,6 +39,26 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
     assertBranchAccess(request, provider.branchId);
     return provider;
   }
+
+  // ----- Self-scheduling policy (per tenant) --------------------------------
+  app.get('/policy', async request => getSchedulingPolicy(request.auth.tenantId));
+
+  app.put('/policy', { preHandler: canManageSchedule }, async request => {
+    const input = z.object({
+      selfBookEnabled: z.boolean().optional(),
+      requireEligibilityForSelfBook: z.boolean().optional(),
+      requireIntakeForSelfBook: z.boolean().optional(),
+      maxHorizonDays: z.number().int().min(1).max(365).optional(),
+      minNoticeHours: z.number().int().min(0).max(720).optional(),
+    }).parse(request.body);
+    await db.schedulingPolicy.upsert({
+      where: { tenantId: request.auth.tenantId },
+      update: input,
+      create: { tenantId: request.auth.tenantId, ...input },
+    });
+    await audit(request, { action: 'schedule.policy.updated', resource: 'schedulingPolicy', resourceId: request.auth.tenantId, metadata: input });
+    return getSchedulingPolicy(request.auth.tenantId);
+  });
 
   // ----- Weekly availability (replace-all) ----------------------------------
   app.put('/providers/:providerId/availability', { preHandler: canManageSchedule }, async request => {

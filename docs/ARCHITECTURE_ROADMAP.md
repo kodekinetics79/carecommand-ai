@@ -116,8 +116,13 @@ validated.
   (patient-safe fields), views real open slots, and books **for themselves**
   (patientId from the portal session, never the body), conflict-safe, scoped to
   their own clinic, audited as a patient action — distinct from the existing
-  request-mode. Proven by `portalBooking.integration.test.ts`. **Next:** pre-visit
-  requirements (intake/eligibility gating before confirm); per-clinic timezones.
+  request-mode. Proven by `portalBooking.integration.test.ts`. **Pre-visit gating
+  shipped:** a per-tenant `SchedulingPolicy` (self-book toggle, booking
+  horizon/notice, and `requireEligibility`/`requireIntake` gates) is enforced on
+  the portal book — unmet requirements → 422 `pre_visit_requirements_unmet`;
+  managed via `/v1/scheduling/policy` (`schedule:manage`). Proven by
+  `schedulingPolicy.integration.test.ts`. **Next:** per-clinic timezones;
+  configurable patient-bookable visit types.
 - Unified **intake → eligibility → estimate → deposit** state machine (all engines
   exist; orchestrate + surface in morning briefing).
 - RPM **time-accrual → CPT evidence export** (extend `RPMBillingReadiness`; never

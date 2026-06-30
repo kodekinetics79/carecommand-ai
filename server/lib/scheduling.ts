@@ -15,6 +15,57 @@ import type { Prisma } from '../generated/prisma/client';
 
 export interface Slot { startsAt: Date; endsAt: Date }
 
+export interface SchedulingPolicy {
+  selfBookEnabled: boolean;
+  requireEligibilityForSelfBook: boolean;
+  requireIntakeForSelfBook: boolean;
+  maxHorizonDays: number;
+  minNoticeHours: number;
+}
+
+export const DEFAULT_SCHEDULING_POLICY: SchedulingPolicy = {
+  selfBookEnabled: true,
+  requireEligibilityForSelfBook: false,
+  requireIntakeForSelfBook: false,
+  maxHorizonDays: 90,
+  minNoticeHours: 0,
+};
+
+/** The tenant's self-scheduling policy, or safe defaults when none is set. */
+export async function getSchedulingPolicy(tenantId: string, client: Client = db): Promise<SchedulingPolicy> {
+  const row = await client.schedulingPolicy.findUnique({ where: { tenantId } });
+  if (!row) return DEFAULT_SCHEDULING_POLICY;
+  return {
+    selfBookEnabled: row.selfBookEnabled,
+    requireEligibilityForSelfBook: row.requireEligibilityForSelfBook,
+    requireIntakeForSelfBook: row.requireIntakeForSelfBook,
+    maxHorizonDays: row.maxHorizonDays,
+    minNoticeHours: row.minNoticeHours,
+  };
+}
+
+export type PreVisitRequirement = 'eligibility' | 'intake';
+
+/**
+ * Pre-visit requirements the patient has NOT yet satisfied, per the tenant policy.
+ * Empty array = clear to self-book. Eligibility = an active (coverageActive)
+ * verification on file; intake = a submitted/approved intake packet.
+ */
+export async function unmetPreVisitRequirements(
+  tenantId: string, patientId: string, policy: SchedulingPolicy, client: Client = db,
+): Promise<PreVisitRequirement[]> {
+  const unmet: PreVisitRequirement[] = [];
+  if (policy.requireEligibilityForSelfBook) {
+    const elig = await client.eligibilityVerification.findFirst({ where: { tenantId, patientId, coverageActive: true }, select: { id: true } });
+    if (!elig) unmet.push('eligibility');
+  }
+  if (policy.requireIntakeForSelfBook) {
+    const intake = await client.patientIntakePacket.findFirst({ where: { tenantId, patientId, status: { in: ['submitted', 'approved'] } }, select: { id: true } });
+    if (!intake) unmet.push('intake');
+  }
+  return unmet;
+}
+
 export type SlotConflict = 'in_past' | 'outside_availability' | 'time_off' | 'already_booked';
 
 // Appointment statuses that still occupy the provider's calendar.

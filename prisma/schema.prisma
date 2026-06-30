@@ -174,6 +174,7 @@ model Tenant {
   backupVerifications BackupVerification[]
   securityScanResults SecurityScanResult[]
   tenantSecurityPolicy TenantSecurityPolicy?
+  schedulingPolicy SchedulingPolicy?
   tenantSubscription TenantSubscription?
   tenantSubscriptionAddons TenantSubscriptionAddon[]
   tenantFeatureEntitlements TenantFeatureEntitlement[]
@@ -642,6 +643,23 @@ model ProviderAvailability {
 
   @@unique([providerProfileId, dayOfWeek, startMinute])
   @@index([tenantId, providerProfileId, dayOfWeek])
+}
+
+// Per-tenant self-scheduling policy: whether patients may self-book, the booking
+// horizon/notice, and which pre-visit requirements must be satisfied before a
+// patient self-book is allowed to confirm. One row per tenant; absence = defaults
+// (self-book on, no pre-visit gating) so existing behaviour is unchanged.
+model SchedulingPolicy {
+  id                            String   @id @default(uuid()) @db.Uuid
+  tenantId                      String   @unique @db.Uuid
+  selfBookEnabled               Boolean  @default(true)
+  requireEligibilityForSelfBook Boolean  @default(false)
+  requireIntakeForSelfBook      Boolean  @default(false)
+  maxHorizonDays                Int      @default(90)
+  minNoticeHours                Int      @default(0)
+  createdAt                     DateTime @default(now())
+  updatedAt                     DateTime @updatedAt
+  tenant                        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 }
 
 // One-off provider unavailability (vacation, blocked time). Overlapping slots are

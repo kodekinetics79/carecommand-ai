@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { requirePortalAccess, requirePortalFeature, portalAudit } from '../../lib/portalAuth';
 import { publicView, submitSection, submitPacket, readinessScore } from '../../lib/intake';
-import { computeProviderSlots, findSlotConflict } from '../../lib/scheduling';
+import { computeProviderSlots, findSlotConflict, getSchedulingPolicy, unmetPreVisitRequirements } from '../../lib/scheduling';
 
 const n = (v: unknown): number => typeof v === 'object' && v !== null && 'toString' in v ? Number(v) : Number(v) || 0;
 
@@ -109,8 +109,9 @@ export const portalRoutes: FastifyPluginAsync = async app => {
   // Patient books a real open slot for THEMSELVES (patientId from the portal
   // session, never the body), against providers in their own clinic. Slot math
   // + conflict checks are backend-owned (lib/scheduling.ts); booking is
-  // conflict-safe in a transaction. This is distinct from request-mode above.
-  const SELF_BOOK_HORIZON_DAYS = 90;
+  // conflict-safe in a transaction, and gated by the tenant's SchedulingPolicy
+  // (self-book toggle, horizon/notice, pre-visit requirements). Distinct from
+  // request-mode above.
 
   app.get('/booking/providers', async request => {
     const { tenantId, patientId } = request.portal!;
@@ -153,8 +154,26 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     const provider = await loadBookableProvider(tenantId, patientId, providerId);
     if (!provider) return reply.code(404).send({ error: 'not_found' });
 
-    const horizon = new Date(Date.now() + SELF_BOOK_HORIZON_DAYS * 86400000);
-    if (body.startsAt > horizon) return reply.code(400).send({ error: 'too_far_out', message: `Bookings are limited to the next ${SELF_BOOK_HORIZON_DAYS} days.` });
+    // Per-tenant self-scheduling policy: toggle, booking horizon/notice, and
+    // pre-visit requirement gates — all backend-enforced.
+    const policy = await getSchedulingPolicy(tenantId);
+    if (!policy.selfBookEnabled) return reply.code(403).send({ error: 'self_book_disabled', message: 'Online self-booking is not available at this clinic.' });
+
+    const now = Date.now();
+    if (body.startsAt.getTime() < now + policy.minNoticeHours * 3600_000) {
+      return reply.code(400).send({ error: 'too_soon', message: `Bookings require at least ${policy.minNoticeHours} hours notice.` });
+    }
+    if (body.startsAt > new Date(now + policy.maxHorizonDays * 86400000)) {
+      return reply.code(400).send({ error: 'too_far_out', message: `Bookings are limited to the next ${policy.maxHorizonDays} days.` });
+    }
+
+    // Block confirmation until pre-visit requirements (intake/eligibility) are met.
+    const unmet = await unmetPreVisitRequirements(tenantId, patientId, policy);
+    if (unmet.length > 0) {
+      await portalAudit(tenantId, 'portal.appointment.book_blocked', null, request, { providerId, unmet });
+      return reply.code(422).send({ error: 'pre_visit_requirements_unmet', unmet, message: 'Please complete the required pre-visit steps before booking.' });
+    }
+
     const endsAt = new Date(body.startsAt.getTime() + body.durationMin * 60_000);
 
     const result = await db.$transaction(async tx => {
