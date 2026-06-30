@@ -1,0 +1,87 @@
+# Render Blueprint (Infrastructure as Code) for CareCommand AI.
+# Deploy via Render → New → Blueprint, pointed at this repo/branch. Defines the
+# API web service, the always-on background worker (drains the BullMQ queues),
+# and a managed Key Value (Redis) instance. Secrets are set in the dashboard.
+#
+# NOTE: this lives on the feature branch — merge to `main` (or connect the
+# Blueprint to this branch) before deploying.
+
+services:
+  # ── Managed Redis (queues + rate limiting) ────────────────────────────────
+  - type: keyvalue
+    name: carecommand-redis
+    region: oregon
+    plan: free            # upgrade for persistence/HA
+    ipAllowList: []       # internal-only (reachable by the services below)
+    maxmemoryPolicy: noeviction   # required by BullMQ
+
+  # ── API (Fastify, serverless-style web service) ───────────────────────────
+  - type: web
+    name: carecommand-ai
+    runtime: node
+    region: oregon
+    plan: free            # fine for testing; spins down when idle
+    buildCommand: npm ci && npm run db:generate
+    preDeployCommand: npm run db:deploy   # runs migrations (paid plans only — else run once manually)
+    startCommand: npm run api:start
+    healthCheckPath: /health/live          # liveness; /health/ready 503s until Redis is wired
+    autoDeploy: true
+    envVars:
+      - fromGroup: carecommand-shared
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: carecommand-redis
+          property: connectionString
+      - key: CORS_ORIGINS
+        sync: false        # set to your frontend origin, e.g. https://app.vercel.app
+      - key: PUBLIC_API_URL
+        sync: false        # https://carecommand-ai.onrender.com
+
+  # ── Background worker (autopilot + compliance + campaign queues) ───────────
+  - type: worker
+    name: carecommand-worker
+    runtime: node
+    region: oregon
+    plan: starter         # do NOT use free — a spun-down worker never drains the queue
+    buildCommand: npm ci && npm run db:generate
+    startCommand: npm run worker:start
+    autoDeploy: true
+    envVars:
+      - fromGroup: carecommand-shared
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: carecommand-redis
+          property: connectionString
+
+# ── Shared env (same DB/secrets across API + worker) ─────────────────────────
+envVarGroups:
+  - name: carecommand-shared
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: QUEUES_ENABLED
+        value: "true"
+      - key: RLS_ENFORCE_RUNTIME_ROLE
+        value: "false"     # keep false until DATABASE_URL is the restricted app_rls role
+      - key: LOG_LEVEL
+        value: info
+      - key: AI_PROVIDER
+        value: mock
+      - key: INSURANCE_PROVIDER
+        value: mock
+      - key: PAYMENT_PROVIDER
+        value: mock
+      # Secrets — set in the Render dashboard (Neon connection strings):
+      - key: DATABASE_URL
+        sync: false        # postgresql://<role>:<pw>@<neon-host>/<db>?sslmode=require
+      - key: DATABASE_MIGRATION_URL
+        sync: false        # Neon OWNER role (used only by migrations)
+      # Auto-generated 32+ char secrets (shared by the group):
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: AUTH_ENCRYPTION_KEY
+        generateValue: true
