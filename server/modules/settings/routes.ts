@@ -3,13 +3,16 @@ import { z } from 'zod';
 import { env } from '../../config/env';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
-import { requireRoles } from '../../plugins/roles';
+import { requirePermission, PERMISSIONS, ROLE_PERMISSIONS, sanitizePermissions } from '../../lib/permissions';
 import { runWithTenantContext } from '../../lib/tenantContext';
+import { checkRlsRuntimeRole } from '../../lib/rlsGuard';
 import { assertRoleChangeSafe, assertDeactivateSafe } from '../../lib/adminSafety';
 
 const uuid = z.string().uuid();
-const writeRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
-const ownerAdminRoles = requireRoles('OWNER', 'ADMIN');
+// Permission-gated (defaults preserve the prior role membership):
+//   settings:write → OWNER/ADMIN/MANAGER · admin:manage → OWNER/ADMIN
+const writeRoles = requirePermission('settings:write');
+const ownerAdminRoles = requirePermission('admin:manage');
 const idParam = z.object({ id: uuid });
 const accessTokenTtlMinutes = 15;
 
@@ -529,8 +532,18 @@ export const settingsRoutes: FastifyPluginAsync = async app => {
     description: z.string().trim().min(2).max(500),
     accent: z.string().trim().min(2).max(20).default('blue'),
     sortOrder: z.number().int().min(0).default(0),
+    // Optional per-tenant permission override. Sanitised against the vocabulary
+    // before persistence; null/omitted leaves the code-default matrix in effect.
+    permissions: z.array(z.string()).max(PERMISSIONS.length).optional(),
   });
   const roleUpdate = roleCreate.partial();
+
+  // Read-only catalogue so an admin UI can build a real permission editor:
+  // the full vocabulary + the default grant matrix the override replaces.
+  app.get('/permissions/catalog', { preHandler: ownerAdminRoles }, async () => ({
+    permissions: PERMISSIONS,
+    defaultMatrix: ROLE_PERMISSIONS,
+  }));
 
   app.get('/roles', async request => {
     const [roles, counts] = await Promise.all([
@@ -551,19 +564,31 @@ export const settingsRoutes: FastifyPluginAsync = async app => {
   });
 
   app.post('/roles', { preHandler: writeRoles }, async (request, reply) => {
-    const input = roleCreate.parse(request.body);
-    const row = await db.roleDefinition.create({ data: { tenantId: request.auth.tenantId, ...input } });
-    await audit(request, { action: 'role.created', resource: 'roleDefinition', resourceId: row.id });
+    const { permissions, ...input } = roleCreate.parse(request.body);
+    const row = await db.roleDefinition.create({
+      data: {
+        tenantId: request.auth.tenantId,
+        ...input,
+        ...(permissions !== undefined ? { permissions: sanitizePermissions(permissions) } : {}),
+      },
+    });
+    await audit(request, { action: 'role.created', resource: 'roleDefinition', resourceId: row.id, metadata: permissions !== undefined ? { permissions: sanitizePermissions(permissions) } : undefined });
     return reply.code(201).send(row);
   });
 
   app.patch('/roles/:id', { preHandler: writeRoles }, async request => {
     const { id } = idParam.parse(request.params);
-    const input = roleUpdate.parse(request.body);
+    const { permissions, ...input } = roleUpdate.parse(request.body);
     const existing = await db.roleDefinition.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!existing) throw app.httpErrors.notFound('Role not found');
-    const row = await db.roleDefinition.update({ where: { id }, data: input });
-    await audit(request, { action: 'role.updated', resource: 'roleDefinition', resourceId: id });
+    const row = await db.roleDefinition.update({
+      where: { id },
+      data: {
+        ...input,
+        ...(permissions !== undefined ? { permissions: sanitizePermissions(permissions) } : {}),
+      },
+    });
+    await audit(request, { action: 'role.updated', resource: 'roleDefinition', resourceId: id, metadata: permissions !== undefined ? { permissions: sanitizePermissions(permissions) } : undefined });
     return row;
   });
 
@@ -823,7 +848,7 @@ export const securityRoutes: FastifyPluginAsync = async app => {
   });
 
   app.get('/posture', { preHandler: ownerAdminRoles }, async request => {
-    const [integrationRows, paymentRows, auditCount, loginCount] = await Promise.all([
+    const [integrationRows, paymentRows, auditCount, loginCount, rlsRole] = await Promise.all([
       db.integration.findMany({ where: { tenantId: request.auth.tenantId } }),
       db.paymentProviderConnection.findMany({ where: { tenantId: request.auth.tenantId } }),
       db.auditEvent.count({ where: { tenantId: request.auth.tenantId } }),
@@ -833,9 +858,17 @@ export const securityRoutes: FastifyPluginAsync = async app => {
           action: { startsWith: 'auth.login' },
         },
       }),
+      checkRlsRuntimeRole(),
     ]);
 
     const alerts = [
+      rlsRole.bypassesRls
+        ? {
+            severity: env.NODE_ENV === 'production' ? 'high' : 'low',
+            title: 'Database role bypasses row-level security',
+            message: `Runtime role "${rlsRole.role}" can bypass RLS (${rlsRole.isSuperuser ? 'superuser' : 'rolbypassrls'}); tenant RLS policies are not enforced at the DB. Use the restricted app_rls role for the runtime DATABASE_URL.`,
+          }
+        : null,
       env.NODE_ENV === 'production'
         ? null
         : {
@@ -921,6 +954,11 @@ export const securityRoutes: FastifyPluginAsync = async app => {
         strategy: 'double-submit cookie/header',
       },
       rbacEnabled: true,
+      rlsRuntimeRole: {
+        role: rlsRole.role,
+        bypassesRls: rlsRole.bypassesRls,
+        enforced: !rlsRole.bypassesRls,
+      },
       auditLoggingEnabled: true,
       rateLimitingEnabled: true,
       devTokenDisabledInProduction: env.NODE_ENV === 'production',

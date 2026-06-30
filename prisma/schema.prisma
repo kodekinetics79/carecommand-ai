@@ -1220,6 +1220,11 @@ model RoleDefinition {
   description String
   accent      String   @default("blue")
   sortOrder   Int      @default(0)
+  // Optional per-tenant action-permission override (string[] of permission keys
+  // from server/lib/permissions.ts). NULL/empty → the code default matrix applies.
+  // When set, it REPLACES the defaults for this role in this tenant and is
+  // enforced server-side by requirePermission().
+  permissions Json?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
   tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)

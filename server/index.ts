@@ -1,9 +1,14 @@
 import { buildApp } from './app';
 import { env } from './config/env';
 import { db } from './lib/db';
+import { assertRlsRuntimeRole } from './lib/rlsGuard';
 import { autopilotQueue } from './workers/queues';
 
 const app = await buildApp();
+
+// Fail closed (when RLS_ENFORCE_RUNTIME_ROLE=true) or loudly warn if the runtime
+// DB role can bypass tenant RLS. Surfaces the prod cutover requirement at boot.
+await assertRlsRuntimeRole({ logger: app.log });
 
 async function shutdown() {
   await app.close();

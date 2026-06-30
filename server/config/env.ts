@@ -14,6 +14,12 @@ const envSchema = z.object({
   // Set false on Redis-less deploys (e.g. serverless). The app boots and all
   // request routes work; background jobs are simply not enqueued.
   QUEUES_ENABLED: z.coerce.boolean().default(true),
+  // RLS runtime-role guard. When the runtime DATABASE_URL role can bypass RLS
+  // (superuser or rolbypassrls), tenant RLS policies are silently ineffective.
+  // The guard always surfaces this at boot (error log in prod, warn otherwise).
+  // Set true to FAIL CLOSED — refuse to boot — once the prod role is `app_rls`.
+  // Default false so it can't brick a deploy that hasn't cut over yet.
+  RLS_ENFORCE_RUNTIME_ROLE: z.coerce.boolean().default(false),
   JWT_SECRET: z.string().min(32),
   JWT_REFRESH_SECRET: z.string().min(32),
   // Auth hardening (Phase A). Optional dedicated key for encrypting MFA secrets
@@ -26,6 +32,14 @@ const envSchema = z.object({
   MFA_ISSUER: z.string().default('CareCommand AI'),
   CORS_ORIGINS: z.string().default('http://localhost:12000'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
+  // Observability. When SENTRY_DSN is set, an error reporter should be wired at
+  // boot (registerSentry in server/lib/observability.ts is the seam); unhandled
+  // 5xx errors are captured with id-only context (never PHI). Unset → structured
+  // error logs only. SERVICE_ENV/RELEASE tag events for triage when present.
+  SENTRY_DSN: z.string().optional(),
+  SENTRY_TRACES_SAMPLE_RATE: z.coerce.number().min(0).max(1).default(0),
+  SERVICE_ENV: z.string().optional(),
+  RELEASE: z.string().optional(),
   AI_PROVIDER: z.enum(['mock', 'ollama', 'openai', 'claude']).default('mock'),
   OLLAMA_MODE: z.enum(['local', 'cloud']).default('local'),
   OLLAMA_BASE_URL: z.string().url().default('http://localhost:11434'),

@@ -3,6 +3,7 @@
 // extensionless relative imports left for Node's ESM loader to choke on.
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { buildApp } from './app';
+import { assertRlsRuntimeRole } from './lib/rlsGuard';
 
 type App = Awaited<ReturnType<typeof buildApp>>;
 let appPromise: Promise<App> | null = null;
@@ -11,6 +12,10 @@ async function getApp(): Promise<App> {
   if (!appPromise) {
     appPromise = buildApp().then(async app => {
       await app.ready();
+      // Boot-time RLS runtime-role guard (see server/lib/rlsGuard.ts). On a
+      // cold start this loudly surfaces — or, when enforced, rejects — a DB role
+      // that can bypass tenant RLS.
+      await assertRlsRuntimeRole({ logger: app.log });
       return app;
     });
   }

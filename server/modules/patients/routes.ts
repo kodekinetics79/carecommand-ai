@@ -3,8 +3,14 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { cursorPage, paginationSchema } from '../../lib/pagination';
-import { requireRoles } from '../../plugins/roles';
+import { requirePermission } from '../../lib/permissions';
 import { assertBranchAccess, branchScope } from '../../lib/scope';
+
+// Patient mutations now gate on the action permission `patient:write` (default
+// matrix: OWNER/ADMIN/MANAGER/FRONT_DESK — preserving prior role membership)
+// rather than a hardcoded role list, so a tenant's custom role grants/revokes
+// are actually enforced here. Read routes remain open to any authenticated user.
+const canWritePatients = requirePermission('patient:write');
 
 const patientQuery = paginationSchema.extend({
   branchId: z.string().uuid().optional(),
@@ -78,7 +84,7 @@ export const patientRoutes: FastifyPluginAsync = async app => {
     return patient;
   });
 
-  app.post('/', { preHandler: requireRoles('OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK') }, async (request, reply) => {
+  app.post('/', { preHandler: canWritePatients }, async (request, reply) => {
     const input = patientInput.parse(request.body);
     assertBranchAccess(request, input.branchId);
     const branch = await db.branch.findFirst({ where: { id: input.branchId, tenantId: request.auth.tenantId } });
@@ -91,7 +97,7 @@ export const patientRoutes: FastifyPluginAsync = async app => {
     return reply.code(201).send(patient);
   });
 
-  app.post('/:id/consents', { preHandler: requireRoles('OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK') }, async (request, reply) => {
+  app.post('/:id/consents', { preHandler: canWritePatients }, async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = z.object({
       purpose: z.enum(['SMS', 'WHATSAPP', 'EMAIL', 'MARKETING']),
@@ -111,7 +117,7 @@ export const patientRoutes: FastifyPluginAsync = async app => {
     return reply.code(201).send(consent);
   });
 
-  app.post('/:id/follow-up-task', { preHandler: requireRoles('OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK') }, async (request, reply) => {
+  app.post('/:id/follow-up-task', { preHandler: canWritePatients }, async (request, reply) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = z.object({
       title: z.string().trim().min(2).max(240).optional(),
