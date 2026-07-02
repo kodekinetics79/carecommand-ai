@@ -1,62 +1,44 @@
-import { ArrowUpRight, Activity } from 'lucide-react';
-import ProgressBar from '../ui/ProgressBar';
+import { ArrowUpRight, CircleCheck, CircleAlert, TriangleAlert } from 'lucide-react';
+import HealthRing, { type RingTone } from './HealthRing';
 import { formatCurrency } from '../../utils/formatters';
 import type { BranchHealth } from '../../lib/dashboardService';
 
-function tier(score: number): { color: 'emerald' | 'amber' | 'red'; label: string } {
-  if (score >= 75) return { color: 'emerald', label: 'Healthy' };
-  if (score >= 55) return { color: 'amber', label: 'Watch' };
-  return { color: 'red', label: 'At risk' };
+function tier(score: number): { tone: RingTone; label: string; chip: string; icon: typeof CircleCheck } {
+  if (score >= 75) return { tone: 'emerald', label: 'Healthy', chip: 'badge-emerald', icon: CircleCheck };
+  if (score >= 55) return { tone: 'amber', label: 'Watch', chip: 'badge-amber', icon: CircleAlert };
+  return { tone: 'red', label: 'At risk', chip: 'badge-red', icon: TriangleAlert };
 }
-const scoreText: Record<string, string> = { emerald: 'text-emerald-v', amber: 'text-amber-v', red: 'text-red-v' };
 
 export default function BranchHealthCard({ branch, onOpen }: { branch: BranchHealth; onOpen: (b: BranchHealth) => void }) {
   const t = tier(branch.healthScore);
+  const TierIcon = t.icon;
   return (
     <div
       role="button" tabIndex={0}
       onClick={() => onOpen(branch)}
       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen(branch); } }}
       aria-label={`Open ${branch.name} command center — health ${branch.healthScore}, ${t.label}`}
-      className="hover-lift cursor-pointer rounded-2xl border border-[var(--b1)] bg-[var(--s1)] p-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--indigo)] focus-visible:outline-offset-2"
+      className="hover-lift group cursor-pointer rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3.5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--indigo)] focus-visible:outline-offset-2"
     >
-      <div className="flex items-start justify-between gap-2 mb-2.5">
-        <div className="min-w-0">
-          <p className="text-sm font-bold text-t1 leading-tight truncate">{branch.name}</p>
+      <div className="flex items-center gap-3.5">
+        <div className="shrink-0"><HealthRing value={branch.healthScore} tone={t.tone} /></div>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-[13.5px] font-bold text-t1 leading-tight truncate">{branch.name}</p>
+            <span className={`badge ${t.chip} shrink-0`}>
+              <TierIcon className="w-3 h-3" aria-hidden="true" /> {t.label}
+            </span>
+          </div>
           <p className="text-[11px] text-t3 mt-0.5 truncate">{branch.location}</p>
+          <div className="flex items-center gap-x-3 gap-y-1 flex-wrap mt-1.5 text-[11px] text-t2">
+            <span><strong className="text-t1 font-bold">{branch.utilization}%</strong> utilised</span>
+            <span><strong className="text-t1 font-bold">{branch.appointmentsToday}</strong> today</span>
+            <span><strong className="text-t1 font-bold">{branch.providers}</strong> providers</span>
+            <span><strong className="text-t1 font-bold">{formatCurrency(branch.monthlyRevenue)}</strong> / mo</span>
+          </div>
         </div>
-        <div className="text-right shrink-0">
-          <p className={`text-lg font-bold tabular-nums ${scoreText[t.color]}`}>{branch.healthScore}</p>
-          <p className="text-[10px] font-semibold text-t3">{t.label}</p>
-        </div>
+        <ArrowUpRight className="w-4 h-4 text-t3 opacity-0 group-hover:opacity-100 transition shrink-0" aria-hidden="true" />
       </div>
-
-      <ProgressBar value={branch.healthScore} color={t.color} size="md" />
-
-      <div className="grid grid-cols-4 gap-2 mt-3 text-center">
-        <Metric value={`${branch.utilization}%`} label="Utilised" />
-        <Metric value={String(branch.appointmentsToday)} label="Today" />
-        <Metric value={String(branch.providers)} label="Providers" />
-        <Metric value={formatCurrency(branch.monthlyRevenue)} label="Revenue" />
-      </div>
-
-      <div className="flex items-center justify-between mt-3 pt-2.5 border-t border-[var(--b1)]">
-        <span className="inline-flex items-center gap-1 text-[10px] text-t3">
-          <Activity className="w-3 h-3" aria-hidden="true" /> Staff load {branch.staffLoad != null ? `${branch.staffLoad}%` : '—'}
-        </span>
-        <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-indigo">
-          Open Command Center <ArrowUpRight className="w-3.5 h-3.5" aria-hidden="true" />
-        </span>
-      </div>
-    </div>
-  );
-}
-
-function Metric({ value, label }: { value: string; label: string }) {
-  return (
-    <div className="min-w-0">
-      <p className="text-[13px] font-bold text-t1 truncate">{value}</p>
-      <p className="text-[10px] text-t3">{label}</p>
     </div>
   );
 }

@@ -448,6 +448,7 @@ export function mapRevenueSnapshot(row: ApiRevenueSnapshot): RevenueData & { id:
   return {
     id: row.id,
     month: new Date(row.period).toLocaleDateString('en-GB', { month: 'short', year: '2-digit' }),
+    periodTs: new Date(row.period).getTime(),
     revenue: Number(row.revenue),
     recovered: Number(row.recovered),
     lost: Number(row.lost),

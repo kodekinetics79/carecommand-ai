@@ -1,4 +1,4 @@
-import { useEffect, useState, type ElementType } from 'react';
+import { useCallback, useEffect, useState, type ElementType } from 'react';
 import {
   X, Cpu, Wifi, WifiOff, AlertTriangle, Clock, Activity, FlaskConical, MonitorSmartphone,
   ScanLine, Radio, Watch, CheckCircle2, Trash2, Settings, Plus, History, Save, Loader2,
@@ -64,7 +64,7 @@ export default function DeviceDetailDrawer({ deviceId, onClose, onChanged }: { d
   const [firmware, setFirmware] = useState('');
   const [status, setStatus] = useState('');
 
-  async function load() {
+  const load = useCallback(async () => {
     try {
       const res = await apiRequest<DetailResponse>(`/v1/devices/${deviceId}`);
       setDetail(res);
@@ -77,15 +77,17 @@ export default function DeviceDetailDrawer({ deviceId, onClose, onChanged }: { d
     } finally {
       setLoading(false);
     }
-  }
+  }, [deviceId]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
     window.addEventListener('keydown', onKey);
-    // Fetch-on-mount: load() only setState after an await (same pattern as useApiData).
-    // eslint-disable-next-line react-hooks/set-state-in-effect, react-hooks/exhaustive-deps
-    void load();
     return () => window.removeEventListener('keydown', onKey);
-  }, [deviceId]);
+  }, [onClose]);
+  useEffect(() => {
+    // Fetch-on-mount: load() only setStates after an await (same pattern as useApiData).
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void load();
+  }, [load]);
 
   const d = detail?.device;
   const dirty = !!d && (notes !== (d.notes ?? '') || firmware !== (d.firmwareVersion ?? '') || status !== d.status);

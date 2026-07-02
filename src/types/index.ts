@@ -197,6 +197,8 @@ export interface Integration {
 
 export interface RevenueData {
   month: string;
+  /** Sortable timestamp of the period start — charts sort ascending on this. */
+  periodTs?: number;
   revenue: number;
   recovered: number;
   lost: number;

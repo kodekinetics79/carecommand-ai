@@ -9,6 +9,16 @@ export const formatCurrency = (value: number): string => {
   }).format(value);
 };
 
+// Compact form ($12K / $1.2M) for axis ticks and dense chart chrome.
+export const formatCurrencyCompact = (value: number): string => {
+  return new Intl.NumberFormat(getCurrencyLocale(), {
+    style: 'currency',
+    currency: getCurrency(),
+    notation: 'compact',
+    maximumFractionDigits: 1,
+  }).format(value);
+};
+
 export const formatNumber = (value: number): string => {
   return new Intl.NumberFormat('en-US').format(value);
 };

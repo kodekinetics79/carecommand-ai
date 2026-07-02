@@ -36,7 +36,10 @@ export default function PatientProfile() {
   const { id } = useParams();
   const navigate = useNavigate();
   const [patient, setPatient] = useState<ReturnType<typeof mapPatient> | null>(null);
-  const [loading, setLoading] = useState(true);
+  // Loading is derived: the profile for `id` is loading until its fetch
+  // settles (avoids a synchronous setState inside the effect body).
+  const [loadedId, setLoadedId] = useState<string | null>(null);
+  const loading = !!id && loadedId !== id;
   const [liveVisitHistory, setLiveVisitHistory] = useState<ReturnType<typeof mapAppointment>[]>([]);
   const [eligibilityHistory, setEligibilityHistory] = useState<EligibilityVerification[]>([]);
   const [policyRow, setPolicyRow] = useState<{
@@ -61,7 +64,6 @@ export default function PatientProfile() {
   useEffect(() => {
     if (!id) return;
     let active = true;
-    setLoading(true);
     apiRequest<ApiPatient>(`/v1/patients/${id}`)
       .then(row => {
         if (!active) return;
@@ -103,10 +105,11 @@ export default function PatientProfile() {
       })
       .catch(() => undefined)
       .finally(() => {
-        if (active) setLoading(false);
+        if (active) setLoadedId(id);
       });
     return () => { active = false; };
-  }, [id]);
+    // branch?.name backfills eligibility rows once branch options resolve.
+  }, [id, branch?.name]);
 
   useEffect(() => {
     let active = true;

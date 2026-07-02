@@ -748,3 +748,176 @@ button, a, [role="button"] {
   color: var(--gold-ink);
   border-color: var(--gold);
 }
+
+/* ═══════════════════════════════════════════════════════
+   COMMAND DECK — Dashboard hero (light, on-theme)
+   ═══════════════════════════════════════════════════════ */
+.command-deck {
+  position: relative;
+  overflow: hidden;
+  border-radius: 14px;
+  border: 1px solid var(--b1);
+  background:
+    radial-gradient(720px 320px at 88% -20%, rgba(124,58,237,0.07), transparent 60%),
+    radial-gradient(640px 300px at -10% 110%, rgba(79,70,229,0.08), transparent 55%),
+    linear-gradient(135deg, #F5F6FE 0%, #FFFFFF 55%);
+  box-shadow: 0 1px 3px rgba(15,23,42,0.05), 0 12px 32px rgba(79,70,229,0.06);
+}
+/* Faint blueprint grid, masked toward the hero figure so it reads as depth,
+   not texture. Pointer-events off; purely decorative. */
+.command-deck-grid {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(79,70,229,0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(79,70,229,0.05) 1px, transparent 1px);
+  background-size: 32px 32px;
+  -webkit-mask-image: radial-gradient(ellipse at 80% 18%, #000 4%, transparent 66%);
+  mask-image: radial-gradient(ellipse at 80% 18%, #000 4%, transparent 66%);
+}
+/* Hero figure — the one number the dashboard leads with. Proportional
+   figures on purpose (tabular digits look loose at display sizes). Sized to
+   the cockpit's slim deck band. */
+.hero-figure {
+  font-size: clamp(28px, 2.6vw, 38px);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1;
+  color: var(--t1);
+}
+/* Mini stat chips along the deck footer — hairline, ink text, identity
+   carried by the small colored dot beside the label (never colored text). */
+.deck-chip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--b1);
+  background: rgba(255,255,255,0.72);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+}
+.deck-dot { width: 8px; height: 8px; border-radius: 99px; flex-shrink: 0; }
+
+/* ═══════════════════════════════════════════════════════
+   DASHBOARD COCKPIT — single-viewport layout
+   The page never scrolls on desktop; dense panels scroll
+   internally. Below xl (or very short windows) it degrades
+   to a normal stacked, scrolling page.
+   ═══════════════════════════════════════════════════════ */
+.dash-cockpit {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+@media (min-width: 1280px) and (min-height: 640px) {
+  .dash-cockpit {
+    display: grid;
+    /* 100dvh − topbar (56px) − .app-inner vertical padding (48px) */
+    height: calc(100dvh - var(--topbar-h) - 48px);
+    grid-template-columns: minmax(0, 1fr) 336px;
+    grid-template-rows: auto auto auto minmax(0, 1.25fr) minmax(0, 1fr);
+    grid-template-areas:
+      "bar  bar"
+      "deck rail"
+      "kpis rail"
+      "viz  rail"
+      "ops  rail";
+    overflow: hidden;
+  }
+  .dash-bar  { grid-area: bar; }
+  .dash-deck { grid-area: deck; min-height: 0; }
+  .dash-kpis { grid-area: kpis; }
+  .dash-viz  { grid-area: viz;  min-height: 0; }
+  .dash-ops  { grid-area: ops;  min-height: 0; }
+  .dash-rail { grid-area: rail; min-height: 0; }
+}
+.dash-viz, .dash-ops {
+  display: grid;
+  gap: 12px;
+}
+@media (min-width: 1024px) {
+  .dash-viz, .dash-ops { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .dash-viz > *, .dash-ops > * { min-height: 0; }
+}
+
+/* Short-height compaction — 13" laptops (≤800px viewport height): the deck,
+   chips, and tiles slim down so the chart rows keep real estate. */
+@media (min-width: 1280px) and (min-height: 640px) and (max-height: 800px) {
+  .command-deck { padding-top: 12px; padding-bottom: 12px; }
+  .command-deck .hero-figure { font-size: clamp(24px, 2.2vw, 30px); }
+  .command-deck .deck-chips { margin-top: 10px; }
+  .deck-chip { padding-top: 6px; padding-bottom: 6px; }
+  .stat-tile { padding: 10px 12px; }
+  .stat-tile .tile-sub, .spark-caption { display: none; }
+}
+
+/* Cockpit card: a BentoCard that fills its grid cell — fixed header,
+   internally scrolling body. Harmless outside the cockpit (height auto). */
+.cockpit-card {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+.cockpit-card > .bento-header { padding: 12px 14px 10px; flex-shrink: 0; }
+.cockpit-card > .bento-body {
+  padding: 12px 14px;
+  /* basis:auto so the card still sizes from content when the page stacks
+     (mobile); in the fixed-height cockpit it grows/shrinks to fit and
+     scrolls internally. */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* ═══════════════════════════════════════════════════════
+   STAT TILE — KPI ribbon
+   ═══════════════════════════════════════════════════════ */
+.stat-tile {
+  position: relative;
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: #FFFFFF;
+  border: 1px solid var(--b1);
+  border-radius: 12px;
+  padding: 12px 14px;
+  box-shadow: 0 1px 2px rgba(15,23,42,0.03);
+  transition: transform 0.18s cubic-bezier(0.4,0,0.2,1), box-shadow 0.18s, border-color 0.18s;
+}
+.stat-tile:hover {
+  transform: translateY(-2px);
+  border-color: var(--b2);
+  box-shadow: 0 10px 24px rgba(15,23,42,0.09);
+}
+.stat-tile-go {
+  opacity: 0;
+  transform: translateX(-2px);
+  transition: opacity 0.15s, transform 0.15s;
+}
+.stat-tile:hover .stat-tile-go { opacity: 1; transform: translateX(0); }
+
+/* ═══════════════════════════════════════════════════════
+   CAPACITY DISTRIBUTION BAR — stacked ratio strip
+   ═══════════════════════════════════════════════════════ */
+.cap-bar {
+  display: flex;
+  height: 12px;
+  border-radius: 99px;
+  overflow: hidden;
+  background: var(--s3);
+}
+.cap-seg { height: 100%; transition: width 0.5s cubic-bezier(0.4,0,0.2,1); }
+/* 2px surface gap between touching segments — the separator is the card
+   surface itself, never a stroke around the mark. */
+.cap-seg + .cap-seg { border-left: 2px solid #FFFFFF; }
+
+@media (prefers-reduced-motion: reduce) {
+  .stat-tile { transition: none !important; }
+  .stat-tile:hover { transform: none !important; }
+  .cap-seg { transition: none !important; }
+}
