@@ -387,6 +387,8 @@ export const receptionistApi = {
   listTargets: (campaignId: string) => apiRequest<CallTarget[]>(`${base}/outbound-campaigns/${campaignId}/targets`),
   addTargets: (campaignId: string, targets: Array<Partial<CallTarget> & { phone: string }>) =>
     apiRequest<{ added: number }>(`${base}/outbound-campaigns/${campaignId}/targets`, { method: 'POST', body: JSON.stringify({ targets }) }),
+  deleteTarget: (campaignId: string, id: string) =>
+    apiRequest<void>(`${base}/outbound-campaigns/${campaignId}/targets/${id}`, { method: 'DELETE' }),
   launchCall: (campaignId: string, body: { phone: string; firstName?: string; lastName?: string; email?: string; targetId?: string }) =>
     apiRequest<LaunchCallResult>(`${base}/outbound-campaigns/${campaignId}/call`, { method: 'POST', body: JSON.stringify(body) }),
   listOutboundCallLogs: (campaignId: string) => apiRequest<CallLog[]>(`${base}/outbound-campaigns/${campaignId}/call-logs`),

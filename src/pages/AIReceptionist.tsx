@@ -26,16 +26,6 @@ interface ConversationCard {
   lastAgentMessageAt?: string;
 }
 
-const fallbackConversations: ConversationCard[] = [
-  { id: 'c1', name: 'Rebecca Walsh', channel: 'whatsapp', message: "Hi, I'd like to book a skin consultation this week", time: '2 min ago', createdAt: '2026-06-02T09:00:00.000Z', updatedAt: '2026-06-02T09:02:00.000Z', status: 'unread', aiHandled: true, intent: 'Booking inquiry', suggestedSlot: 'Wed 28 May, 10:30am', value: '$320', lastAgentMessage: 'We have a couple of openings later this week.', lastAgentMessageAt: '2026-06-02T09:01:00.000Z' },
-  { id: 'c2', name: 'Kevin Addo', channel: 'call', message: 'Missed call — AI follow-up sent via SMS', time: '14 min ago', createdAt: '2026-06-02T08:35:00.000Z', updatedAt: '2026-06-02T08:49:00.000Z', status: 'ai-recovered', aiHandled: true, intent: 'Missed call recovery', suggestedSlot: 'Thu 29 May, 2:00pm', value: '$180', lastAgentMessage: 'Sorry we missed you — reply with a good time and we will call you back.', lastAgentMessageAt: '2026-06-02T08:48:00.000Z' },
-  { id: 'c3', name: 'Lara Petrov', channel: 'email', message: 'Can I reschedule my Botox appointment?', time: '28 min ago', createdAt: '2026-06-02T08:00:00.000Z', updatedAt: '2026-06-02T08:28:00.000Z', status: 'replied', aiHandled: false, intent: 'Reschedule', suggestedSlot: 'Fri 30 May, 11:00am', value: '$480', lastAgentMessage: 'Yes — Friday at 11:00 is available if you want to move it.', lastAgentMessageAt: '2026-06-02T08:26:00.000Z' },
-  { id: 'c4', name: 'Michael Owusu', channel: 'whatsapp', message: 'What are your weekend availability hours?', time: '45 min ago', createdAt: '2026-06-02T07:45:00.000Z', updatedAt: '2026-06-02T08:30:00.000Z', status: 'pending', aiHandled: true, intent: 'Availability enquiry', suggestedSlot: 'Sat 31 May, 9:00am', value: '$150', lastAgentMessage: 'Weekend slots are open Saturday morning and early afternoon.', lastAgentMessageAt: '2026-06-02T08:29:00.000Z' },
-  { id: 'c5', name: 'Chloe Bennett', channel: 'sms', message: 'Missed call — 3rd attempt. Escalate to manager.', time: '1 hr ago', createdAt: '2026-06-02T07:00:00.000Z', updatedAt: '2026-06-02T08:00:00.000Z', status: 'escalated', aiHandled: false, intent: 'Escalation needed', suggestedSlot: null, value: '$240', lastAgentMessage: 'Escalated to the manager for a callback today.', lastAgentMessageAt: '2026-06-02T08:00:00.000Z' },
-  { id: 'c6', name: 'Paul Nguyen', channel: 'email', message: 'Do you offer a family discount on wellness packages?', time: '2 hr ago', createdAt: '2026-06-02T06:00:00.000Z', updatedAt: '2026-06-02T08:00:00.000Z', status: 'replied', aiHandled: true, intent: 'Pricing inquiry', suggestedSlot: 'Mon 2 Jun, 9:30am', value: '$580', lastAgentMessage: 'I can share the current package options and family pricing.', lastAgentMessageAt: '2026-06-02T06:08:00.000Z' },
-  { id: 'c7', name: 'Harriet Cole', channel: 'whatsapp', message: 'I saw your offer on Instagram. Are there slots this week?', time: '2 hr ago', createdAt: '2026-06-02T06:15:00.000Z', updatedAt: '2026-06-02T08:10:00.000Z', status: 'unread', aiHandled: true, intent: 'Booking inquiry', suggestedSlot: 'Wed 28 May, 3:00pm', value: '$290', lastAgentMessage: 'We have a few slots left this week — want me to hold one?', lastAgentMessageAt: '2026-06-02T06:18:00.000Z' },
-];
-
 const channelIcon: Record<string, React.ReactNode> = {
   whatsapp: <MessageSquare className="w-3.5 h-3.5 text-emerald-v" />,
   phone: <Phone className="w-3.5 h-3.5 text-indigo" />,
@@ -79,11 +69,12 @@ export default function AIReceptionist() {
   const [replyText, setReplyText] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
-  const { data: conversationRecords, source, reload } = useApiResource<ApiConversation, ConversationCard>(
+  const { data: conversationRecords, source, error, reload } = useApiResource<ApiConversation, ReturnType<typeof mapConversation>>(
     '/v1/conversations?limit=100',
-    fallbackConversations,
+    [],
     mapConversation,
   );
+  const loadError = error;
   const effectiveSelectedId = selectedId || conversationRecords[0]?.id || '';
   const selectedConv = conversationRecords.find(item => item.id === effectiveSelectedId) ?? conversationRecords[0];
   const replyPreview = buildReplyDraft(selectedConv);
@@ -141,14 +132,20 @@ export default function AIReceptionist() {
       <PageHeader
         title="AI Front Desk"
         subtitle="Live conversation inbox, missed-call recovery, and AI reply automation."
-        badge={`Unread: ${unresolved} · ${source === 'live' ? 'Live DB' : 'Demo'}`}
-        badgeColor="red"
+        badge={loadError ? 'Live Data Error' : `Unread: ${unresolved} · ${source === 'live' ? 'Live DB' : 'Loading'}`}
+        badgeColor={loadError ? 'red' : 'red'}
         actions={
           <button type="button" onClick={() => navigate('/settings')} className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-violet-600 px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
             <Bot className="w-4 h-4" /> CareDesk AI Settings
           </button>
         }
       />
+
+      {loadError && (
+        <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          Conversation data could not be loaded from the live API: {loadError}
+        </div>
+      )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
         <StatCard title="Missed Calls Today" value={String(callConversations.length)} subtitle="Calls needing recovery" icon={<Phone className="w-4 h-4" />} accent="red" />
@@ -173,7 +170,9 @@ export default function AIReceptionist() {
               <ModuleTabs tabs={channelTabs} activeTab={activeChannel} onChange={setActiveChannel} variant="pills" />
             </div>
             <div className="divide-y divide-[var(--b0)]">
-              {filtered.map((conv) => {
+              {filtered.length === 0 ? (
+                <p className="px-4 py-6 text-sm text-t3">No live conversations returned for this clinic.</p>
+              ) : filtered.map((conv) => {
                 const status = statusConfig[conv.status] ?? statusConfig.pending;
                 const isSelected = selectedConv?.id === conv.id;
                 return (
@@ -293,7 +292,9 @@ export default function AIReceptionist() {
             <span className="text-xs font-bold text-emerald-v bg-[var(--emerald-soft)] px-2 py-1 rounded-full border border-[var(--b1)]">{recovered}/{callConversations.length || 1} recovered</span>
           }>
             <div className="space-y-3">
-              {(callConversations.length ? callConversations : conversationRecords.slice(0, 5)).map((call, index) => {
+              {(callConversations.length ? callConversations : conversationRecords.slice(0, 5)).length === 0 ? (
+                <p className="text-xs text-t3">No live call recovery entries are available yet.</p>
+              ) : (callConversations.length ? callConversations : conversationRecords.slice(0, 5)).map((call, index) => {
                 const recoveredCall = call.aiHandled || call.status === 'ai-recovered' || Boolean(call.lastAgentMessage);
                 return (
                   <div key={call.id} className="flex items-start gap-3">

@@ -83,8 +83,9 @@ async function main() {
   check('appointments list → 200', (await get('/v1/portal/appointments', session)).statusCode === 200);
 
   // 10) Appointment request create + idempotent
-  const ar1 = await post('/v1/portal/appointment-requests', { service: 'Portal QA visit', requestedDateTime: '2026-09-01T10:00:00Z' }, session);
-  const ar2 = await post('/v1/portal/appointment-requests', { service: 'Portal QA visit', requestedDateTime: '2026-09-01T10:00:00Z' }, session);
+  const requestService = `Portal QA visit ${randomUUID().slice(0, 6)}`;
+  const ar1 = await post('/v1/portal/appointment-requests', { service: requestService, requestedDateTime: '2026-09-01T10:00:00Z' }, session);
+  const ar2 = await post('/v1/portal/appointment-requests', { service: requestService, requestedDateTime: '2026-09-01T10:00:00Z' }, session);
   check('appointment request create → 201', ar1.statusCode === 201);
   check('appointment request is idempotent (2nd → deduped)', ar2.statusCode === 200 && JSON.parse(ar2.body).deduped === true);
 
@@ -93,8 +94,9 @@ async function main() {
 
   // 12) Insurance view + update (patient-safe; idempotent by memberId)
   check('insurance list → 200', (await get('/v1/portal/insurance', session)).statusCode === 200);
-  const ins1 = await post('/v1/portal/insurance', { planName: 'QA Plan', memberId: 'QA-123456' }, session);
-  const ins2 = await post('/v1/portal/insurance', { planName: 'QA Plan', memberId: 'QA-123456' }, session);
+  const memberId = `QA-${randomUUID().slice(0, 8)}`;
+  const ins1 = await post('/v1/portal/insurance', { planName: 'QA Plan', memberId }, session);
+  const ins2 = await post('/v1/portal/insurance', { planName: 'QA Plan', memberId }, session);
   check('insurance add → 201; same memberId → deduped (no duplicate)', ins1.statusCode === 201 && JSON.parse(ins2.body).deduped === true);
   const insList = JSON.parse((await get('/v1/portal/insurance', session)).body);
   check('insurance memberId is masked', insList.every((p: any) => p.memberId.includes('••')));
@@ -115,6 +117,12 @@ async function main() {
   check('preferences opt-out records ConsentEvent(granted=false)', !!ce);
   const { isSuppressed } = await import('../../lib/campaigns');
   check('marketing opt-out suppresses campaigns', await isSuppressed(tenantA, { patientId: patientA.id }, 'email'));
+
+  // 15b) Voice preference is truly persisted in CommunicationConsent.
+  const voiceOn = JSON.parse((await patch('/v1/portal/preferences', { voice: true }, session)).body);
+  const voiceConsent = await ownerDb.communicationConsent.findFirst({ where: { tenantId: tenantA, patientId: patientA.id, channel: 'voice' }, orderBy: { capturedAt: 'desc' } });
+  const prefAfterVoice = JSON.parse((await get('/v1/portal/preferences', session)).body);
+  check('voice preference persists via CommunicationConsent + reloads true', voiceOn.ok === true && voiceConsent?.status === 'opted_in' && prefAfterVoice.voice === true);
 
   // 16) Disabled account cannot login
   await ownerDb.patientPortalAccount.update({ where: { id: acctA.id }, data: { status: 'disabled' } });

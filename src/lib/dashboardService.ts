@@ -1,7 +1,7 @@
 import { apiRequest } from './api';
 
 // ============================================================================
-// Dashboard data service. All page data flows through here (no hardcoded demo
+// Dashboard data service. All page data flows through here (no hardcoded sample
 // data in components). [LIVE] = backed by a real endpoint; [TODO] = typed
 // contract for a not-yet-built route (throws NotImplemented so the UI surfaces
 // an honest state instead of silently no-op'ing).

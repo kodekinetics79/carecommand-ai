@@ -11,6 +11,7 @@ import { aiMorningBriefingService } from '../../lib/ai/services';
 const uuid = z.string().uuid();
 const readRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'PROVIDER');
 const ingestRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
+const writeRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
 
 const OPEN_STATUSES = ['open', 'acknowledged', 'assigned'];
 const READING_TYPES = ['glucose', 'blood_pressure', 'oxygen', 'weight', 'temperature', 'heart_rate', 'ecg'] as const;
@@ -261,6 +262,116 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
       signals: signals.map(s => ({ id: s.id, signalType: s.signalType, title: s.title, detail: s.detail, severity: s.severity, metricValue: s.metricValue, patientName: s.patientId ? pNames.get(s.patientId) ?? null : null })),
       disclaimer: 'Operational summary only. Does not provide diagnosis, treatment, or emergency dispatch.',
     };
+  });
+
+  // ── Morning briefing signal CRUD ──────────────────────────────────────────
+  async function loadBriefingSignal(request: { auth: { tenantId: string } }, id: string) {
+    const signal = await db.morningBriefingSignal.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    if (!signal) throw app.httpErrors.notFound('Morning briefing signal not found');
+    return signal;
+  }
+
+  app.get('/morning-briefing/signals', async request => {
+    const q = z.object({
+      forDate: z.coerce.date().optional(),
+      signalType: z.string().trim().max(120).optional(),
+      limit: z.coerce.number().int().min(1).max(200).default(100),
+    }).parse(request.query);
+    const forDateFilter = q.forDate ? (() => {
+      const start = new Date(q.forDate);
+      start.setHours(0, 0, 0, 0);
+      const end = new Date(start);
+      end.setDate(end.getDate() + 1);
+      return { gte: start, lt: end };
+    })() : undefined;
+    const rows = await db.morningBriefingSignal.findMany({
+      where: {
+        tenantId: request.auth.tenantId,
+        ...branchScope(request),
+        ...(forDateFilter ? { forDate: forDateFilter } : {}),
+        ...(q.signalType ? { signalType: q.signalType } : {}),
+      },
+      orderBy: [{ forDate: 'desc' }, { severity: 'desc' }, { createdAt: 'asc' }],
+      take: q.limit,
+    });
+    return rows;
+  });
+
+  app.post('/morning-briefing/signals', { preHandler: writeRoles }, async request => {
+    const body = z.object({
+      branchId: uuid.optional(),
+      signalType: z.string().trim().min(2).max(120),
+      title: z.string().trim().min(2).max(200),
+      detail: z.string().trim().max(500).optional(),
+      severity: z.enum(['info', 'warning', 'critical']).default('info'),
+      metricValue: z.coerce.number().int().optional(),
+      patientId: uuid.optional(),
+      forDate: z.coerce.date().optional(),
+    }).parse(request.body);
+    if (body.branchId) assertBranchAccess(request, body.branchId);
+    if (body.patientId) {
+      const patient = await db.patient.findFirst({ where: { id: body.patientId, tenantId: request.auth.tenantId }, select: { id: true } });
+      if (!patient) throw app.httpErrors.badRequest('Patient not found in this workspace');
+    }
+    const row = await db.morningBriefingSignal.create({
+      data: {
+        tenantId: request.auth.tenantId,
+        branchId: body.branchId ?? null,
+        signalType: body.signalType,
+        title: body.title,
+        detail: body.detail ?? null,
+        severity: body.severity,
+        metricValue: body.metricValue ?? null,
+        patientId: body.patientId ?? null,
+        forDate: body.forDate ?? new Date(),
+      },
+    });
+    await audit(request, { action: 'monitoring.morning_briefing_signal.created', resource: 'morningBriefingSignal', resourceId: row.id, metadata: { signalType: row.signalType, severity: row.severity } });
+    return row;
+  });
+
+  app.patch('/morning-briefing/signals/:id', { preHandler: writeRoles }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const body = z.object({
+      branchId: uuid.nullish(),
+      signalType: z.string().trim().min(2).max(120).optional(),
+      title: z.string().trim().min(2).max(200).optional(),
+      detail: z.string().trim().max(500).nullable().optional(),
+      severity: z.enum(['info', 'warning', 'critical']).optional(),
+      metricValue: z.coerce.number().int().nullable().optional(),
+      patientId: uuid.nullish(),
+      forDate: z.coerce.date().optional(),
+    }).parse(request.body ?? {});
+    const current = await loadBriefingSignal(request, id);
+    const nextBranchId = body.branchId === undefined ? current.branchId : body.branchId;
+    if (nextBranchId) assertBranchAccess(request, nextBranchId);
+    if (body.patientId) {
+      const patient = await db.patient.findFirst({ where: { id: body.patientId, tenantId: request.auth.tenantId }, select: { id: true } });
+      if (!patient) throw app.httpErrors.badRequest('Patient not found in this workspace');
+    }
+    const row = await db.morningBriefingSignal.update({
+      where: { id },
+      data: {
+        branchId: body.branchId !== undefined ? body.branchId : undefined,
+        signalType: body.signalType,
+        title: body.title,
+        detail: body.detail,
+        severity: body.severity,
+        metricValue: body.metricValue,
+        patientId: body.patientId !== undefined ? body.patientId : undefined,
+        forDate: body.forDate,
+      },
+    });
+    await audit(request, { action: 'monitoring.morning_briefing_signal.updated', resource: 'morningBriefingSignal', resourceId: id, metadata: { signalType: row.signalType, severity: row.severity } });
+    return row;
+  });
+
+  app.delete('/morning-briefing/signals/:id', { preHandler: writeRoles }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const current = await loadBriefingSignal(request, id);
+    await db.morningBriefingSignal.delete({ where: { id } });
+    await audit(request, { action: 'monitoring.morning_briefing_signal.deleted', resource: 'morningBriefingSignal', resourceId: id, metadata: { signalType: current.signalType, severity: current.severity } });
+    return { deleted: true };
   });
 
   // ── Ingest a reading (rate-limited). Backend evaluates severity + alerts. ──

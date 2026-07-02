@@ -64,3 +64,19 @@ export async function apiHealth() {
   const response = await fetch(`${apiBaseUrl}/health/ready`);
   return response.ok;
 }
+
+export async function downloadCsv(path: string, filename: string) {
+  const token = await resolveAccessToken();
+  const response = await fetch(`${apiBaseUrl}${path}`, {
+    credentials: 'include',
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) throw new Error(`Export failed (${response.status})`);
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}

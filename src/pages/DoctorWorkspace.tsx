@@ -4,14 +4,17 @@ import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
-import { doctors, branches } from '../data/seedData';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapProviderProfile, type ApiProviderProfile } from '../lib/apiAdapters';
 import { formatCurrency } from '../utils/formatters';
 
+interface ApiBranchOption { id: string; name: string }
+
 export default function DoctorWorkspace() {
   const navigate = useNavigate();
-  const { data: providerRecords, source } = useApiResource<ApiProviderProfile, typeof doctors[number]>('/v1/providers/overview?limit=100', doctors, mapProviderProfile);
+  const { data: providerRecords, source, error } = useApiResource<ApiProviderProfile, ReturnType<typeof mapProviderProfile>>('/v1/providers/overview?limit=100', [], mapProviderProfile);
+  const { data: branchOptions } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
+  const loadError = error;
   const totalRevenue = providerRecords.reduce((s, d) => s + d.revenueThisMonth, 0);
   const avgUtilization = providerRecords.length > 0 ? Math.round(providerRecords.reduce((s, d) => s + d.utilization, 0) / providerRecords.length) : 0;
   const avgRating = providerRecords.length > 0 ? (providerRecords.reduce((s, d) => s + d.rating, 0) / providerRecords.length).toFixed(1) : '0.0';
@@ -21,14 +24,20 @@ export default function DoctorWorkspace() {
       <PageHeader
         title="Provider Productivity"
         subtitle="Utilisation, appointment volume, repeat customer rates, and review performance across all providers."
-        badge={`${source === 'live' ? 'Live DB' : 'Demo'} · ${providerRecords.length} providers`}
-        badgeColor={source === 'live' ? 'emerald' : 'blue'}
+        badge={loadError ? 'Live Data Error' : `${source === 'live' ? 'Live DB' : 'Loading'} · ${providerRecords.length} providers`}
+        badgeColor={loadError ? 'red' : 'emerald'}
         actions={
           <button type="button" onClick={() => window.print()} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
             <Sparkles className="w-4 h-4" /> Generate Productivity Report
           </button>
         }
       />
+
+      {loadError && (
+        <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          Provider data could not be loaded from the live API: {loadError}
+        </div>
+      )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
         <StatCard title="Total Providers" value={providerRecords.length} subtitle="Across all branches" icon={<Users className="w-4 h-4" />} accent="blue" />
@@ -50,7 +59,7 @@ export default function DoctorWorkspace() {
             </thead>
             <tbody className="divide-y divide-[var(--b0)]">
               {providerRecords.map((doc) => {
-                const branch = branches.find(b => b.id === doc.branchId);
+                const branch = branchOptions.find(b => b.id === doc.branchId);
                 return (
                   <tr key={doc.id} className="hover:bg-[var(--s3)] transition-colors group">
                     <td className="py-3 px-3">
@@ -64,7 +73,7 @@ export default function DoctorWorkspace() {
                         </div>
                       </div>
                     </td>
-                    <td className="py-3 px-3 text-xs text-t3 whitespace-nowrap">{branch?.name.split(' ')[0]}</td>
+                    <td className="py-3 px-3 text-xs text-t3 whitespace-nowrap">{branch?.name.split(' ')[0] ?? 'Live'}</td>
                     <td className="py-3 px-3">
                       <div className="flex items-center gap-2">
                         <div className="w-16">
@@ -100,6 +109,11 @@ export default function DoctorWorkspace() {
                   </tr>
                 );
               })}
+              {providerRecords.length === 0 && (
+                <tr>
+                  <td colSpan={8} className="py-6 px-3 text-center text-xs text-t3">No live provider profiles returned.</td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
@@ -124,6 +138,7 @@ export default function DoctorWorkspace() {
                 </div>
               </div>
             ))}
+            {providerRecords.length === 0 && <p className="text-sm text-t3 text-center py-4">No live provider rankings available.</p>}
           </div>
         </BentoCard>
 

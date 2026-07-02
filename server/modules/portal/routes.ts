@@ -51,7 +51,7 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     const branchName = patient?.branchId ? (await db.branch.findUnique({ where: { id: patient.branchId }, select: { name: true } }))?.name ?? null : null;
     const unpaidTotal = payments.reduce((s, p) => s + n(p.amount), 0);
     const cards = {
-      nextAppointment: upcoming[0] ? { service: upcoming[0].service, startsAt: upcoming[0].startsAt.toISOString(), status: 'completed' } : { state: 'unavailable' },
+      nextAppointment: upcoming[0] ? { service: upcoming[0].service, startsAt: upcoming[0].startsAt.toISOString(), state: 'scheduled' } : { state: 'unavailable' },
       intake: packet ? { state: intakeLabel(packet.status) } : { state: 'unavailable' },
       insurance: { state: safeInsuranceStatus(policy) === 'needs_update' ? 'needs_update' : 'completed', detail: safeInsuranceStatus(policy) },
       payment: unpaidTotal > 0 ? { state: 'payment_required', amount: unpaidTotal, currency: payments[0]?.currency ?? 'USD' } : { state: 'completed' },
@@ -307,22 +307,31 @@ export const portalRoutes: FastifyPluginAsync = async app => {
 
   app.get('/preferences', async request => {
     const { tenantId, patientId } = request.portal!;
-    const events = await db.consentEvent.findMany({ where: { tenantId, patientId }, orderBy: { occurredAt: 'desc' } });
+    const [events, voiceConsents] = await Promise.all([
+      db.consentEvent.findMany({ where: { tenantId, patientId }, orderBy: { occurredAt: 'desc' } }),
+      db.communicationConsent.findMany({ where: { tenantId, patientId, channel: 'voice' }, orderBy: { capturedAt: 'desc' }, select: { status: true } }),
+    ]);
     const latest = (purpose: string) => events.find(e => e.purpose === purpose)?.granted ?? false;
-    return { sms: latest('SMS'), email: latest('EMAIL'), whatsapp: latest('WHATSAPP'), voice: false, marketing: latest('MARKETING') };
+    const voice = voiceConsents[0]?.status === 'opted_in';
+    return { sms: latest('SMS'), email: latest('EMAIL'), whatsapp: latest('WHATSAPP'), voice, marketing: latest('MARKETING') };
   });
   app.patch('/preferences', async request => {
     const { tenantId, patientId } = request.portal!;
-    const body = z.object({ sms: z.boolean().optional(), email: z.boolean().optional(), whatsapp: z.boolean().optional(), marketing: z.boolean().optional() }).parse(request.body);
+    const body = z.object({ sms: z.boolean().optional(), email: z.boolean().optional(), whatsapp: z.boolean().optional(), voice: z.boolean().optional(), marketing: z.boolean().optional() }).parse(request.body);
     const updates: Array<[string, boolean]> = [];
     if (body.sms !== undefined) updates.push(['SMS', body.sms]);
     if (body.email !== undefined) updates.push(['EMAIL', body.email]);
     if (body.whatsapp !== undefined) updates.push(['WHATSAPP', body.whatsapp]);
+    if (body.voice !== undefined) updates.push(['VOICE', body.voice]);
     if (body.marketing !== undefined) updates.push(['MARKETING', body.marketing]);
     for (const [purpose, granted] of updates) {
-      // Append-only consent history. isSuppressed() reads the latest ConsentEvent
-      // per purpose, so a granted=false event immediately suppresses outreach (a
-      // MARKETING opt-out suppresses every channel). No history is erased.
+      // Append-only consent history. SMS/EMAIL/WHATSAPP/MARKETING continue to
+      // use ConsentEvent; voice uses CommunicationConsent so the portal can read
+      // and persist it without expanding the legacy enum. No history is erased.
+      if (purpose === 'VOICE') {
+        await upsertVoiceConsent(tenantId, patientId, granted);
+        continue;
+      }
       await db.consentEvent.create({ data: { tenantId, patientId, purpose: purpose as 'SMS' | 'EMAIL' | 'WHATSAPP' | 'MARKETING', granted, source: 'patient_portal' } });
     }
     await portalAudit(tenantId, 'portal.preference.updated', patientId, request, { changed: updates.map(u => u[0]) });
@@ -342,6 +351,18 @@ function safeAppt(a: { id: string; service: string; startsAt: Date; endsAt: Date
 }
 function maskMember(m: string): string { return m.length <= 4 ? '••••' : `••••${m.slice(-4)}`; }
 const insuranceSchema = z.object({ planName: z.string().trim().min(1).max(120), memberId: z.string().trim().min(2).max(80), groupNumber: z.string().trim().max(80).optional(), subscriberName: z.string().trim().max(120).optional() });
+async function upsertVoiceConsent(tenantId: string, patientId: string, granted: boolean) {
+  const existing = await db.communicationConsent.findFirst({ where: { tenantId, patientId, channel: 'voice' } });
+  const data = {
+    status: granted ? 'opted_in' : 'opted_out',
+    source: 'patient_portal',
+    capturedAt: new Date(),
+    revokedAt: granted ? null : new Date(),
+    metadata: { source: 'patient_portal', channel: 'voice' },
+  };
+  if (existing) await db.communicationConsent.update({ where: { id: existing.id }, data });
+  else await db.communicationConsent.create({ data: { tenantId, patientId, channel: 'voice', ...data } });
+}
 async function firstBranch(tenantId: string): Promise<string> {
   const b = await db.branch.findFirst({ where: { tenantId }, select: { id: true } });
   return b!.id;

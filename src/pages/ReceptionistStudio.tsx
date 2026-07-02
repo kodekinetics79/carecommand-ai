@@ -1361,6 +1361,7 @@ function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign:
   const [phone, setPhone] = useState('');
   const [first, setFirst] = useState('');
   const [busy, setBusy] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   async function add() {
     if (!phone) return;
@@ -1374,6 +1375,17 @@ function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign:
     }
   }
 
+  async function remove(target: CallTarget) {
+    if (!window.confirm(`Remove target ${target.phone}?`)) return;
+    setDeletingId(target.id);
+    try {
+      await api.deleteTarget(campaign.id, target.id);
+      onAdded();
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
   return (
     <div className="cc-card p-5 space-y-3">
       <h4 className="text-sm font-bold text-t1 flex items-center gap-2"><Phone className="w-4 h-4 text-indigo" /> Target list ({targets.length})</h4>
@@ -1384,18 +1396,28 @@ function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign:
       </div>
       {targets.length > 0 && (
         <div className="space-y-1.5">
-          {targets.map(t => (
-            <div key={t.id} className="flex items-center justify-between rounded-lg border border-[var(--b1)] px-3 py-2 text-xs">
-              <div className="flex items-center gap-2">
-                <span className="badge badge-blue">{t.status}</span>
-                <span className="text-t2">{[t.firstName, t.lastName].filter(Boolean).join(' ') || t.phone}</span>
-                <span className="text-t3">{t.phone}</span>
-              </div>
-              <button type="button" disabled={!canCall} onClick={() => onCall(t)} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 font-semibold text-indigo hover:bg-[var(--s2)] disabled:opacity-50">
-                <PhoneOutgoing className="w-3 h-3" /> Call
-              </button>
-            </div>
-          ))}
+              {targets.map(t => (
+                <div key={t.id} className="flex items-center justify-between rounded-lg border border-[var(--b1)] px-3 py-2 text-xs">
+                  <div className="flex items-center gap-2">
+                    <span className="badge badge-blue">{t.status}</span>
+                    <span className="text-t2">{[t.firstName, t.lastName].filter(Boolean).join(' ') || t.phone}</span>
+                    <span className="text-t3">{t.phone}</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button type="button" disabled={!canCall} onClick={() => onCall(t)} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 font-semibold text-indigo hover:bg-[var(--s2)] disabled:opacity-50">
+                      <PhoneOutgoing className="w-3 h-3" /> Call
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy || deletingId === t.id}
+                      onClick={() => void remove(t)}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 font-semibold text-red-v hover:bg-[var(--red-soft)] disabled:opacity-50"
+                    >
+                      {deletingId === t.id ? 'Removing…' : 'Remove'}
+                    </button>
+                  </div>
+                </div>
+              ))}
         </div>
       )}
     </div>

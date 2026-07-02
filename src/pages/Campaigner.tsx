@@ -6,7 +6,6 @@ import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ModuleTabs from '../components/ui/ModuleTabs';
 import ProgressBar from '../components/ui/ProgressBar';
-import { campaigns } from '../data/seedData';
 import { formatCurrency } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapCampaign, type ApiCampaign } from '../lib/apiAdapters';
@@ -55,9 +54,10 @@ export default function Campaigner() {
   const [selectedGoal, setSelectedGoal] = useState<string | null>(campaignContext ? 'winback' : null);
   const [previewChannel, setPreviewChannel] = useState('whatsapp');
   const [campaignFilter, setCampaignFilter] = useState('all');
-  const { data: campaignRecords, source, reload } = useApiResource<ApiCampaign, typeof campaigns[number]>('/v1/campaigns?limit=100', campaigns, mapCampaign);
+  const { data: campaignRecords, source, error, reload } = useApiResource<ApiCampaign, ReturnType<typeof mapCampaign>>('/v1/campaigns?limit=100', [], mapCampaign);
   const [pendingId, setPendingId] = useState<string | null>(null);
   const [creatingCampaign, setCreatingCampaign] = useState(false);
+  const loadError = error;
 
   async function setCampaignStatus(id: string, status: 'ACTIVE' | 'PAUSED') {
     setPendingId(id);
@@ -104,8 +104,8 @@ export default function Campaigner() {
       <PageHeader
         title="Campaigner"
         subtitle="Campaign studio — build, launch, and measure multi-channel growth campaigns."
-        badge={`${activeCount} Active · ${source === 'live' ? 'Live DB' : 'Demo'}`}
-        badgeColor="emerald"
+        badge={loadError ? 'Live Data Error' : `${activeCount} Active · ${source === 'live' ? 'Live DB' : 'Loading'}`}
+        badgeColor={loadError ? 'red' : 'emerald'}
         actions={
           <div className="flex gap-2">
             <button type="button" onClick={() => { setSelectedGoal('winback'); window.scrollTo({ top: 320, behavior: 'smooth' }); }} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
@@ -114,6 +114,12 @@ export default function Campaigner() {
           </div>
         }
       />
+
+      {loadError && (
+        <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          Campaign data could not be loaded from the live API: {loadError}
+        </div>
+      )}
 
       {/* KPIs */}
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">

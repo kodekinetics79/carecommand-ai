@@ -3,10 +3,11 @@ import { FileText, Clock, CheckCircle2, Archive, AlertCircle, Sparkles, Upload }
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
-import { labOrders, branches } from '../data/seedData';
 import { useApiResource } from '../hooks/useApiResource';
 import { apiRequest } from '../lib/api';
 import { mapPartnerReport, type ApiPartnerReport } from '../lib/apiAdapters';
+
+interface ApiBranchOption { id: string; name: string }
 
 const statusConfig: Record<string, { label: string; color: string; bg: string; icon: React.ReactNode }> = {
   'ordered':         { label: 'Ordered',       color: 'text-blue-v',    bg: 'badge badge-blue',    icon: <Clock className="w-3 h-3" /> },
@@ -24,7 +25,9 @@ const aiNotes = [
 
 export default function Labs() {
   const [busyId, setBusyId] = useState<string | null>(null);
-  const { data: reportRecords, source, reload } = useApiResource<ApiPartnerReport, typeof labOrders[number]>('/v1/partner-reports?limit=100', labOrders, mapPartnerReport);
+  const { data: reportRecords, source, error, reload } = useApiResource<ApiPartnerReport, ReturnType<typeof mapPartnerReport>>('/v1/partner-reports?limit=100', [], mapPartnerReport);
+  const { data: branchOptions } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
+  const loadError = error;
   const openCount = reportRecords.filter(order => order.status !== 'doctor-reviewed').length;
   const urgentCount = reportRecords.filter(order => order.urgency === 'urgent').length;
   const receivedCount = reportRecords.filter(order => order.status === 'result-received').length;
@@ -48,7 +51,7 @@ export default function Labs() {
       <PageHeader
         title="Documents & Partner Reports"
         subtitle="Uploaded customer documents, external partner reports, and review workflows across all branches."
-        badge={`${urgentCount} Urgent · ${source === 'live' ? 'Live DB' : 'Demo'}`}
+        badge={loadError ? 'Live Data Error' : `${urgentCount} Urgent · ${source === 'live' ? 'Live DB' : 'Loading'}`}
         badgeColor="red"
         actions={
           <button type="button" onClick={() => document.getElementById('upload-zone')?.scrollIntoView({ behavior: 'smooth', block: 'start' })} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition">
@@ -56,6 +59,12 @@ export default function Labs() {
           </button>
         }
       />
+
+      {loadError && (
+        <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          Partner report data could not be loaded from the live API: {loadError}
+        </div>
+      )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
         <StatCard title="Open Reports" value={openCount} subtitle="Awaiting review" icon={<FileText className="w-4 h-4" />} accent="blue" />
@@ -70,7 +79,7 @@ export default function Labs() {
           <div className="space-y-2.5">
             {reportRecords.map((order) => {
               const sc = statusConfig[order.status];
-              const branch = branches.find(b => b.id === order.branchId);
+              const branch = branchOptions.find(b => b.id === order.branchId);
               const isUrgent = order.urgency === 'urgent';
               return (
                 <div key={order.id} className={`p-4 rounded-2xl border transition-all hover:bg-[var(--s3)] ${
@@ -152,6 +161,7 @@ export default function Labs() {
                 );
               })}
             </div>
+            {reportRecords.length === 0 && <p className="text-xs text-t3 mt-3">No live partner reports returned for this clinic.</p>}
           </BentoCard>
 
           {/* Upload zone */}

@@ -131,7 +131,7 @@ export default function PlatformLogin() {
 
           <div className="mt-8 flex items-center gap-2 rounded-xl bg-[var(--s2)] border border-[var(--b1)] px-3.5 py-2.5">
             <ShieldCheck className="w-4 h-4 text-emerald-v shrink-0" />
-            <p className="text-[11px] text-t3 leading-snug">Platform operators only. Clinic staff sign in at the standard clinic login.</p>
+            <p className="text-[11px] text-t3 leading-snug">Platform operators only. For pilot handoff, create the clinic in Control Tower and share the owner login shown after provisioning.</p>
           </div>
         </div>
       </main>

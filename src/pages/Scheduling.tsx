@@ -9,7 +9,6 @@ import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import RiskBadge from '../components/ui/RiskBadge';
 import ProgressBar from '../components/ui/ProgressBar';
-import { appointments, patients, branches, doctors } from '../data/seedData';
 import { formatCurrency } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapAppointment, mapProviderProfile, mapPatient, type ApiAppointment, type ApiProviderProfile, type ApiPatient } from '../lib/apiAdapters';
@@ -38,6 +37,8 @@ const statusConfig: Record<string, { label: string; dot: string; bg: string; tex
   waitlist:   { label: 'Waitlist',  dot: 'bg-amber-500',   bg: 'bg-[var(--amber-soft)]',    text: 'text-amber-v' },
 };
 
+interface ApiBranchOption { id: string; name: string }
+
 const waitlistSlots = [
   { name: 'Isabelle Dubois', service: 'Nutrition Consultation', preferred: 'Mon–Wed afternoon', value: formatCurrency(180) },
   { name: 'Jack Harrison', service: 'Annual Wellness Review', preferred: 'Any weekday AM', value: formatCurrency(200) },
@@ -58,9 +59,10 @@ export default function Scheduling() {
   const [queueLoading, setQueueLoading] = useState(true);
   const [queueError, setQueueError] = useState<string | null>(null);
   const [queueBusy, setQueueBusy] = useState<string | null>(null);
-  const { data: appointmentRecords, source, reload } = useApiResource<ApiAppointment, typeof appointments[number]>('/v1/appointments?limit=100', appointments, mapAppointment);
-  const { data: providerRecords } = useApiResource<ApiProviderProfile, typeof doctors[number]>('/v1/providers/overview?limit=100', doctors, mapProviderProfile);
-  const { data: patientRecords } = useApiResource<ApiPatient, typeof patients[number]>('/v1/patients?limit=100', patients, mapPatient);
+  const { data: appointmentRecords, source, error: appointmentError, reload } = useApiResource<ApiAppointment, ReturnType<typeof mapAppointment>>('/v1/appointments?limit=100', [], mapAppointment);
+  const { data: providerRecords, error: providerError } = useApiResource<ApiProviderProfile, ReturnType<typeof mapProviderProfile>>('/v1/providers/overview?limit=100', [], mapProviderProfile);
+  const { data: patientRecords, error: patientError } = useApiResource<ApiPatient, ReturnType<typeof mapPatient>>('/v1/patients?limit=100', [], mapPatient);
+  const { data: branchRecords, error: branchError } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
 
   const [showBooking, setShowBooking] = useState(false);
   const [paymentApptId, setPaymentApptId] = useState<string | null>(null);
@@ -133,6 +135,7 @@ export default function Scheduling() {
   const riskyCount = todayAppts.filter(a => a.status === 'risky').length;
   const confirmedCount = todayAppts.filter(a => a.status === 'confirmed' || a.status === 'arrived').length;
   const queueMode = insuranceQueue.some(row => row.providerMode !== 'mock') ? 'Sandbox Active' : 'Mock Mode';
+  const loadError = appointmentError || providerError || patientError || branchError;
 
   async function verifyInsurance(row: AppointmentVerificationQueueRow) {
     setQueueBusy(row.id);
@@ -158,8 +161,8 @@ export default function Scheduling() {
       <PageHeader
         title="Smart Scheduling"
         subtitle="AI-optimised appointment calendar with no-show prediction and slot-filling intelligence."
-        badge={source === 'live' ? 'Live DB' : 'Demo'}
-        badgeColor={source === 'live' ? 'emerald' : 'blue'}
+        badge={loadError ? 'Live Data Error' : source === 'live' ? 'Live DB' : 'Loading'}
+        badgeColor={loadError ? 'red' : source === 'live' ? 'emerald' : 'blue'}
         actions={
           <div className="flex gap-2">
             <button type="button" onClick={() => setShowBooking(true)} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
@@ -204,6 +207,12 @@ export default function Scheduling() {
         <StatCard title="Today's Value" value={formatCurrency(totalValue)} subtitle="Appointment revenue" icon={<DollarSign className="w-4 h-4" />} accent="violet" />
       </div>
 
+      {loadError && (
+        <div className="rounded-2xl border border-[rgba(220,38,38,0.18)] bg-red-soft px-4 py-3 text-xs font-semibold text-red-v">
+          Scheduling data could not be loaded from the live API: {loadError}
+        </div>
+      )}
+
       {/* Filters */}
       <div className="flex items-center gap-3 flex-wrap">
         <div className="flex items-center gap-1 bg-[var(--s2)] border border-[var(--b1)] p-1 rounded-xl">
@@ -213,7 +222,7 @@ export default function Scheduling() {
         </div>
         <div className="flex items-center gap-1 bg-[var(--s2)] border border-[var(--b1)] p-1 rounded-xl">
           <button type="button" onClick={() => setSelectedBranch('all')} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedBranch === 'all' ? 'bg-[var(--s3)] text-t1' : 'text-t3 hover:text-t1'}`}>All Branches</button>
-          {branches.map(b => (
+          {branchRecords.map(b => (
             <button key={b.id} type="button" onClick={() => setSelectedBranch(b.id)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all truncate max-w-[120px] ${selectedBranch === b.id ? 'bg-[var(--s3)] text-t1' : 'text-t3 hover:text-t1'}`}>
               {b.name.split(' ')[0]}
             </button>

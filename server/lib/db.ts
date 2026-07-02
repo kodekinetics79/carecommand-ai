@@ -4,4 +4,7 @@ import { env } from '../config/env';
 
 const adapter = new PrismaPg({ connectionString: env.DATABASE_URL });
 
-export const db = new PrismaClient({ adapter });
+export const db = new PrismaClient({ adapter }) as PrismaClient & {
+  pilotImportPreset: any;
+  pilotStatusShare: any;
+};

@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
   CalendarDays, ClipboardList, FileText, ShieldCheck, CreditCard, User, Bell, Loader2,
-  CheckCircle2, ChevronRight, Plus, ExternalLink,
+  ChevronRight, Plus, ExternalLink, Info, ShieldAlert,
 } from 'lucide-react';
 import EmptyStatePremium from '../../components/ui/EmptyStatePremium';
 import { formatCurrency } from '../../utils/formatters';
@@ -22,11 +22,51 @@ function StateBadge({ state }: { state: string }) {
   return <span className={`badge ${m.badge}`}>{m.label}</span>;
 }
 
+function StatPill({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-2xl border border-[var(--b1)] bg-white/70 px-4 py-3 shadow-sm backdrop-blur">
+      <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-t3">{label}</p>
+      <p className="mt-1 text-sm font-semibold text-t1 truncate">{value}</p>
+    </div>
+  );
+}
+
+function LoadError({ title, message }: { title: string; message: string }) {
+  return (
+    <div className="rounded-2xl border border-[rgba(220,38,38,0.18)] bg-red-soft px-4 py-4">
+      <p className="text-sm font-bold text-red-v">{title}</p>
+      <p className="mt-1 text-[12px] leading-6 text-t2">{message}</p>
+    </div>
+  );
+}
+
 /* ----------------------------------------------------------------- Dashboard */
 export function ClientDashboard() {
   const [d, setD] = useState<PortalDashboard | null>(null);
-  useEffect(() => { let a = true; void (async () => { try { const x = await portalClient.dashboard(); if (a) setD(x); } catch { /* layout handles auth */ } })(); return () => { a = false; }; }, []);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  useEffect(() => {
+    let a = true;
+    void (async () => {
+      setLoadError(null);
+      try {
+        const x = await portalClient.dashboard();
+        if (a) setD(x);
+      } catch (e) {
+        if (a) setLoadError(e instanceof Error ? e.message : 'Failed to load portal dashboard');
+      }
+    })();
+    return () => { a = false; };
+  }, []);
+  if (loadError) return <LoadError title="Dashboard unavailable" message={loadError} />;
   if (!d) return <Skel n={4} />;
+  const nextSteps: Array<{ action: string; label: string }> = [
+    { action: 'request_appointment', label: 'Request an appointment' },
+    { action: 'continue_intake', label: 'Continue intake' },
+    { action: 'update_insurance', label: 'Update insurance' },
+    { action: 'view_payments', label: 'Review payments' },
+    { action: 'acknowledge_estimate', label: 'Acknowledge estimate' },
+    { action: 'update_preferences', label: 'Update preferences' },
+  ].filter(step => d.allowedActions.includes(step.action));
   const CARDS: Array<{ key: string; label: string; to: string }> = [
     { key: 'nextAppointment', label: 'Next appointment', to: '/client/appointments' },
     { key: 'appointmentRequests', label: 'Appointment requests', to: '/client/requests' },
@@ -37,7 +77,46 @@ export function ClientDashboard() {
   ];
   return (
     <div>
-      <H icon={CheckCircle2} title={`Hi ${d.displayName.split(' ')[0]}`} sub={`Your care at ${d.clinicName}${d.branchName ? ` · ${d.branchName}` : ''}`} />
+      <div className="rounded-[2rem] border border-[var(--b1)] bg-[linear-gradient(135deg,rgba(255,255,255,0.92),rgba(245,247,255,0.88))] p-5 sm:p-6 mb-5 shadow-[0_18px_55px_rgba(15,23,42,0.08)]">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="min-w-0 max-w-2xl">
+            <p className="text-[11px] font-bold uppercase tracking-[0.24em] text-t3">Pilot dashboard</p>
+            <h1 className="mt-1 text-2xl sm:text-[2rem] font-black tracking-tight text-t1">Hi {d.displayName.split(' ')[0]}, your care is in one place.</h1>
+            <p className="mt-2 text-[13px] text-t2 leading-relaxed">You can review appointments, request visits, update insurance, and manage reminders in the same portal the clinic configured for your account.</p>
+          </div>
+          <StateBadge state={d.paymentPolicyAcknowledged ? 'completed' : 'action_required'} />
+        </div>
+        <div className="mt-4 grid gap-3 sm:grid-cols-3">
+          <StatPill label="Clinic" value={`${d.clinicName}${d.branchName ? ` · ${d.branchName}` : ''}`} />
+          <StatPill label="Portal state" value={d.paymentPolicyAcknowledged ? 'Billing policy acknowledged' : 'Billing policy pending'} />
+          <StatPill label="Action set" value={`${nextSteps.length} next steps available`} />
+        </div>
+        {!d.paymentPolicyAcknowledged && (
+          <div className="mt-4 rounded-2xl border border-[var(--b1)] bg-white/75 px-4 py-3">
+            <p className="text-[12px] text-t2 flex items-start gap-2">
+              <Info className="w-4 h-4 text-indigo shrink-0 mt-0.5" />
+              The payments module will still show balances and estimates, but the portal has not yet recorded the policy acknowledgment step.
+            </p>
+          </div>
+        )}
+        {nextSteps.length > 0 && (
+          <div className="mt-4 flex flex-wrap gap-2">
+            {nextSteps.slice(0, 4).map(step => (
+              <Link
+                key={step.action}
+                to={d.deepLinkTargets[step.action === 'request_appointment' ? 'requests' :
+                  step.action === 'continue_intake' ? 'intake' :
+                  step.action === 'update_insurance' ? 'insurance' :
+                  step.action === 'view_payments' ? 'payments' :
+                  step.action === 'acknowledge_estimate' ? 'payments' : 'preferences']}
+                className="inline-flex items-center gap-1.5 rounded-full border border-[var(--b1)] bg-white/80 px-3 py-1.5 text-[12px] font-semibold text-t2 shadow-sm hover:bg-[var(--s2)]"
+              >
+                <ChevronRight className="w-3.5 h-3.5" /> {step.label}
+              </Link>
+            ))}
+          </div>
+        )}
+      </div>
       <div className="grid sm:grid-cols-2 gap-3">
         {CARDS.map(c => {
           const card = d.cards[c.key] ?? { state: 'unavailable' };
@@ -64,7 +143,21 @@ export function ClientDashboard() {
 /* -------------------------------------------------------------- Appointments */
 export function ClientAppointments() {
   const [data, setData] = useState<{ upcoming: PortalAppt[]; past: PortalAppt[] } | null>(null);
-  useEffect(() => { let a = true; void (async () => { try { const x = await portalClient.appointments(); if (a) setData(x); } catch { /* */ } })(); return () => { a = false; }; }, []);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  useEffect(() => {
+    let a = true;
+    void (async () => {
+      setLoadError(null);
+      try {
+        const x = await portalClient.appointments();
+        if (a) setData(x);
+      } catch (e) {
+        if (a) setLoadError(e instanceof Error ? e.message : 'Failed to load appointments');
+      }
+    })();
+    return () => { a = false; };
+  }, []);
+  if (loadError) return <LoadError title="Appointments unavailable" message={loadError} />;
   if (!data) return <Skel />;
   const Row = (a: PortalAppt) => (
     <div key={a.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3.5 flex items-center justify-between gap-3">
@@ -87,8 +180,21 @@ export function ClientRequests() {
   const [rows, setRows] = useState<PortalRequest[] | null>(null);
   const [service, setService] = useState(''); const [when, setWhen] = useState(''); const [notes, setNotes] = useState('');
   const [busy, setBusy] = useState(false); const [msg, setMsg] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   async function load() { setRows(await portalClient.requests()); }
-  useEffect(() => { let a = true; void (async () => { try { const x = await portalClient.requests(); if (a) setRows(x); } catch { /* */ } })(); return () => { a = false; }; }, []);
+  useEffect(() => {
+    let a = true;
+    void (async () => {
+      setLoadError(null);
+      try {
+        const x = await portalClient.requests();
+        if (a) setRows(x);
+      } catch (e) {
+        if (a) setLoadError(e instanceof Error ? e.message : 'Failed to load requests');
+      }
+    })();
+    return () => { a = false; };
+  }, []);
   async function submit() {
     setBusy(true); setMsg(null);
     try { const r = await portalClient.createRequest({ service: service.trim(), requestedDateTime: when || undefined, notes: notes.trim() || undefined }); setMsg(r.deduped ? 'You already have a matching request pending review.' : 'Request submitted — the clinic will be in touch.'); setService(''); setWhen(''); setNotes(''); await load(); }
@@ -107,7 +213,7 @@ export function ClientRequests() {
         <button type="button" disabled={busy || service.trim().length < 2} onClick={submit} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50"><Plus className="w-4 h-4" /> Submit request</button>
         {msg && <p className="text-[12px] text-emerald-v">{msg}</p>}
       </div>
-      {!rows ? <Skel /> : rows.length === 0 ? <EmptyStatePremium icon={<ClipboardList className="w-5 h-5" />} title="No requests yet" description="Submit a request above and track its status here." /> :
+      {loadError ? <LoadError title="Appointment requests unavailable" message={loadError} /> : !rows ? <Skel /> : rows.length === 0 ? <EmptyStatePremium icon={<ClipboardList className="w-5 h-5" />} title="No requests yet" description="Submit a request above and track its status here." /> :
         <div className="space-y-2">{rows.map(r => (
           <div key={r.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3.5 flex items-center justify-between gap-3">
             <div><p className="text-[13px] font-bold text-t1">{r.service ?? 'Appointment request'}</p><p className="text-[12px] text-t3">{r.requestedDateTime ? new Date(r.requestedDateTime).toLocaleString() : 'Flexible'} · {new Date(r.createdAt).toLocaleDateString()}</p></div>
@@ -121,7 +227,21 @@ export function ClientRequests() {
 /* -------------------------------------------------------------------- Intake */
 export function ClientIntake() {
   const [rows, setRows] = useState<PortalIntake[] | null>(null);
-  useEffect(() => { let a = true; void (async () => { try { const x = await portalClient.intake(); if (a) setRows(x); } catch { /* */ } })(); return () => { a = false; }; }, []);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  useEffect(() => {
+    let a = true;
+    void (async () => {
+      setLoadError(null);
+      try {
+        const x = await portalClient.intake();
+        if (a) setRows(x);
+      } catch (e) {
+        if (a) setLoadError(e instanceof Error ? e.message : 'Failed to load intake forms');
+      }
+    })();
+    return () => { a = false; };
+  }, []);
+  if (loadError) return <LoadError title="Intake unavailable" message={loadError} />;
   if (!rows) return <Skel />;
   return (
     <div>
@@ -148,10 +268,24 @@ export function ClientInsurance() {
   const [adding, setAdding] = useState(false);
   const [form, setForm] = useState({ planName: '', memberId: '', groupNumber: '', subscriberName: '' });
   const [busy, setBusy] = useState(false); const [msg, setMsg] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   async function load() { setRows(await portalClient.insurance()); }
-  useEffect(() => { let a = true; void (async () => { try { const x = await portalClient.insurance(); if (a) setRows(x); } catch { /* */ } })(); return () => { a = false; }; }, []);
+  useEffect(() => {
+    let a = true;
+    void (async () => {
+      setLoadError(null);
+      try {
+        const x = await portalClient.insurance();
+        if (a) setRows(x);
+      } catch (e) {
+        if (a) setLoadError(e instanceof Error ? e.message : 'Failed to load insurance');
+      }
+    })();
+    return () => { a = false; };
+  }, []);
   async function save() { setBusy(true); setMsg(null); try { await portalClient.saveInsurance(form); setMsg('Saved — the clinic will verify your coverage.'); setAdding(false); setForm({ planName: '', memberId: '', groupNumber: '', subscriberName: '' }); await load(); } catch (e) { setMsg(e instanceof Error ? e.message : 'Could not save'); } finally { setBusy(false); } }
   const inp = 'w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--indigo)]';
+  if (loadError) return <LoadError title="Insurance unavailable" message={loadError} />;
   if (!rows) return <Skel />;
   return (
     <div>
@@ -186,14 +320,41 @@ export function ClientInsurance() {
 export function ClientPayments() {
   const [payments, setPayments] = useState<PortalPayment[] | null>(null);
   const [estimates, setEstimates] = useState<PortalEstimate[]>([]);
+  const [dashboard, setDashboard] = useState<PortalDashboard | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  async function load() { const [p, e] = await Promise.all([portalClient.payments(), portalClient.estimates()]); setPayments(p); setEstimates(e); }
-  useEffect(() => { let a = true; void (async () => { try { const [p, e] = await Promise.all([portalClient.payments(), portalClient.estimates()]); if (a) { setPayments(p); setEstimates(e); } } catch { /* */ } })(); return () => { a = false; }; }, []);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  async function load() { const [p, e, d] = await Promise.all([portalClient.payments(), portalClient.estimates(), portalClient.dashboard()]); setPayments(p); setEstimates(e); setDashboard(d); }
+  useEffect(() => {
+    let a = true;
+    void (async () => {
+      setLoadError(null);
+      try {
+        const [p, e, d] = await Promise.all([portalClient.payments(), portalClient.estimates(), portalClient.dashboard()]);
+        if (a) { setPayments(p); setEstimates(e); setDashboard(d); }
+      } catch (err) {
+        if (a) setLoadError(err instanceof Error ? err.message : 'Failed to load payments');
+      }
+    })();
+    return () => { a = false; };
+  }, []);
   async function ackEstimate(id: string) { setBusy(id); try { await portalClient.acknowledgeEstimate(id); await load(); } finally { setBusy(null); } }
+  async function ackPolicy() { setBusy('policy'); try { await portalClient.acknowledgePaymentPolicy(); await load(); } finally { setBusy(null); } }
+  if (loadError) return <LoadError title="Payments unavailable" message={loadError} />;
   if (!payments) return <Skel />;
   return (
     <div>
       <H icon={CreditCard} title="Payments & estimates" sub="Pay securely — payments are confirmed by your provider, never marked paid here" />
+      {dashboard && !dashboard.paymentPolicyAcknowledged && (
+        <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4 mb-4 flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-[13px] font-semibold text-t1">Payment policy acknowledgment needed</p>
+            <p className="text-[12px] text-t3 mt-0.5">This is part of the live portal handoff. It keeps the billing flow honest before a customer starts testing scenarios.</p>
+          </div>
+          <button type="button" disabled={busy === 'policy'} onClick={ackPolicy} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-2 text-[12px] font-semibold text-white hover:opacity-90 disabled:opacity-50">
+            {busy === 'policy' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />} Acknowledge
+          </button>
+        </div>
+      )}
       <p className="text-[11px] font-bold uppercase tracking-wide text-t3 mb-2">Balances</p>
       {payments.length === 0 ? <p className="text-[13px] text-t3">No payments due.</p> :
         <div className="space-y-2">{payments.map(p => (
@@ -222,7 +383,21 @@ export function ClientProfile() {
   const [p, setP] = useState<{ firstName: string; lastName: string; email: string; phone: string } | null>(null);
   const [email, setEmail] = useState(''); const [phone, setPhone] = useState('');
   const [busy, setBusy] = useState(false); const [msg, setMsg] = useState<string | null>(null);
-  useEffect(() => { let a = true; void (async () => { try { const x = await portalClient.profile(); if (a) { setP(x); setEmail(x.email); setPhone(x.phone); } } catch { /* */ } })(); return () => { a = false; }; }, []);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  useEffect(() => {
+    let a = true;
+    void (async () => {
+      setLoadError(null);
+      try {
+        const x = await portalClient.profile();
+        if (a) { setP(x); setEmail(x.email); setPhone(x.phone); }
+      } catch (e) {
+        if (a) setLoadError(e instanceof Error ? e.message : 'Failed to load profile');
+      }
+    })();
+    return () => { a = false; };
+  }, []);
+  if (loadError) return <LoadError title="Profile unavailable" message={loadError} />;
   async function save() { setBusy(true); setMsg(null); try { await portalClient.saveProfile({ email: email.trim() || undefined, phone: phone.trim() || undefined }); setMsg('Saved.'); } catch (e) { setMsg(e instanceof Error ? e.message : 'Could not save'); } finally { setBusy(false); } }
   const inp = 'w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--indigo)]';
   if (!p) return <Skel n={2} />;
@@ -244,14 +419,29 @@ export function ClientPreferences() {
   const [prefs, setPrefs] = useState<PortalPreferences | null>(null);
   const [history, setHistory] = useState<Array<{ purpose: string; granted: boolean; at: string }>>([]);
   const [busy, setBusy] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   async function load() { const [p, h] = await Promise.all([portalClient.preferences(), portalClient.consents()]); setPrefs(p); setHistory(h); }
-  useEffect(() => { let a = true; void (async () => { try { const [p, h] = await Promise.all([portalClient.preferences(), portalClient.consents()]); if (a) { setPrefs(p); setHistory(h); } } catch { /* */ } })(); return () => { a = false; }; }, []);
+  useEffect(() => {
+    let a = true;
+    void (async () => {
+      setLoadError(null);
+      try {
+        const [p, h] = await Promise.all([portalClient.preferences(), portalClient.consents()]);
+        if (a) { setPrefs(p); setHistory(h); }
+      } catch (e) {
+        if (a) setLoadError(e instanceof Error ? e.message : 'Failed to load preferences');
+      }
+    })();
+    return () => { a = false; };
+  }, []);
   async function toggle(key: keyof PortalPreferences) { if (!prefs) return; setBusy(key); try { await portalClient.savePreferences({ [key]: !prefs[key] }); await load(); } finally { setBusy(null); } }
+  if (loadError) return <LoadError title="Preferences unavailable" message={loadError} />;
   if (!prefs) return <Skel n={2} />;
   const ROWS: Array<{ key: keyof PortalPreferences; label: string; desc: string }> = [
     { key: 'email', label: 'Email', desc: 'Appointment reminders & updates by email' },
     { key: 'sms', label: 'SMS', desc: 'Text message reminders' },
     { key: 'whatsapp', label: 'WhatsApp', desc: 'WhatsApp messages' },
+    { key: 'voice', label: 'Voice calls', desc: 'Phone calls and voice reminders' },
     { key: 'marketing', label: 'Marketing', desc: 'Offers & news (opting out stops all campaigns)' },
   ];
   return (

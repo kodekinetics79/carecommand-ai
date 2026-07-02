@@ -41,6 +41,8 @@ import { receptionistRoutes, receptionistWebhookRoutes } from './modules/recepti
 import { subscriptionRoutes } from './modules/subscriptions/routes';
 import { onboardingRoutes } from './modules/onboarding/routes';
 import { platformRoutes } from './modules/platform/routes';
+import { pilotRoutes } from './modules/platform/pilot.routes';
+import { pilotPublicRoutes } from './modules/platform/pilot.public.routes';
 import { platformAuthRoutes } from './modules/platform/auth';
 import { portalAuthRoutes } from './modules/portal/auth';
 import { portalRoutes } from './modules/portal/routes';
@@ -159,12 +161,15 @@ export async function buildApp() {
   await app.register(crmWebhookRoutes, { prefix: '/v1/crm' });
   // Patient-facing intake via hashed, expiring, packet-scoped token (no JWT).
   await app.register(intakePublicRoutes, { prefix: '/v1/intake' });
+  // Customer-facing pilot share link (hashed token, no auth, no PHI).
+  await app.register(pilotPublicRoutes, { prefix: '/v1/pilot' });
   // Platform operator + onboarding APIs: gated by the platform token (NOT a
   // tenant JWT), so they live outside the tenant-authenticated scope.
   await app.register(onboardingRoutes, { prefix: '/v1/onboarding' });
   // Platform Admin auth (PlatformUser identity) — separate from tenant auth.
   await app.register(platformAuthRoutes, { prefix: '/v1/platform/auth' });
   await app.register(platformRoutes, { prefix: '/v1/platform' });
+  await app.register(pilotRoutes, { prefix: '/v1/platform' });
 
   // Patient / Client Portal — separate identity; portal JWT (type:'portal')
   // cannot access staff APIs and staff JWT cannot access these.

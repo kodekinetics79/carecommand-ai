@@ -2,7 +2,7 @@ import { apiRequest } from './api';
 
 // ============================================================================
 // GrowthPulse CRM service — AI patient growth, retention & revenue recovery.
-// All page data flows through here (no hardcoded demo data in components).
+// All page data flows through here (no hardcoded sample data in components).
 // [LIVE] = real endpoint; [TODO] = typed contract for a not-yet-built route.
 // ============================================================================
 

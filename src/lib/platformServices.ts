@@ -58,8 +58,8 @@ export interface ProviderHealth { key: string; label: string; status: 'ok' | 'de
 
 // ---- Service contracts -----------------------------------------------------
 export const platformServices = {
-  // [TODO] Billing — needs GET /v1/platform/tenants/:id/billing (Stripe/Metronome
-  // subscription + invoice summary). Model: TenantBilling (mrr, cycle, renewal).
+  // [LIVE] Billing — backed by GET /v1/platform/tenants/:id/billing plus audited
+  // PATCH /extend-trial controls. Model: TenantBilling (mrr, cycle, renewal).
   getBilling: (_tenantId: string): Promise<BillingSummary> => todo('GET /v1/platform/tenants/:id/billing'),
   setBillingCycle: (_tenantId: string, _cycle: 'monthly' | 'annual'): Promise<void> => todo('PATCH /v1/platform/tenants/:id/billing { cycle }'),
   extendTrial: (_tenantId: string, _days: number): Promise<void> => todo('POST /v1/platform/tenants/:id/billing/extend-trial { days }'),

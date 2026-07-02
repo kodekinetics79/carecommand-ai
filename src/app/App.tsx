@@ -48,6 +48,7 @@ const Subscription = lazy(() => import('../pages/Subscription'));
 const Platform = lazy(() => import('../pages/Platform'));
 const PlatformLogin = lazy(() => import('../pages/PlatformLogin'));
 const PlatformConsole = lazy(() => import('../pages/PlatformConsole'));
+const PilotStatusShare = lazy(() => import('../pages/PilotStatusShare'));
 const ClientLogin = lazy(() => import('../pages/client/ClientLogin'));
 const ClientLayout = lazy(() => import('../pages/client/ClientLayout'));
 const Settings = lazy(() => import('../pages/Settings'));
@@ -161,6 +162,8 @@ export default function App() {
         />
         {/* Patient-facing intake via tokenized link (no auth). */}
         <Route path="/intake/:token" element={<Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}><PublicIntake /></Suspense>} />
+        {/* Customer-facing pilot proof-of-concept view (hashed share token). */}
+        <Route path="/pilot/:token" element={<Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}><PilotStatusShare /></Suspense>} />
         {/* Platform Admin Console — separate PlatformUser identity (NOT tenant auth). */}
         <Route path="/platform/login" element={<Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}><PlatformLogin /></Suspense>} />
         <Route path="/platform" element={<Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}><PlatformConsole /></Suspense>} />

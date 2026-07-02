@@ -9,6 +9,8 @@ import {
   Globe2,
   KeyRound,
   Lock,
+  Loader2,
+  Plus,
   RefreshCw,
   Search,
   ServerCog,
@@ -25,7 +27,7 @@ import {
 import PageHeader from '../components/ui/PageHeader';
 import BentoCard from '../components/ui/BentoCard';
 import StatCard from '../components/ui/StatCard';
-import { apiRequest } from '../lib/api';
+import { apiRequest, downloadCsv } from '../lib/api';
 import { useSession } from '../hooks/useSession';
 import type { AdminAuditEvent, AdminRole, AdminUser, IntegrationStatus, SecurityPosture, SecuritySession } from '../types';
 
@@ -206,6 +208,17 @@ export default function ControlPlane() {
   const [accessDraft, setAccessDraft] = useState<{ branchIds: string[]; primaryBranchId?: string }>({ branchIds: [] });
   const [auditFilters, setAuditFilters] = useState({ userId: '', module: '', action: '', from: '', to: '' });
   const [selectedUserAudit, setSelectedUserAudit] = useState<Array<{ id: string; action: string; resource: string; actor: string; occurredAt: string; metadata: unknown }> | null>(null);
+  const [inviteOpen, setInviteOpen] = useState(false);
+  const [inviteBusy, setInviteBusy] = useState(false);
+  const [inviteError, setInviteError] = useState<string | null>(null);
+  const [inviteForm, setInviteForm] = useState({
+    name: '',
+    email: '',
+    password: '',
+    role: 'FRONT_DESK',
+    branchIds: [] as string[],
+    primaryBranchId: '',
+  });
 
   const canManage = !!user && ['OWNER', 'ADMIN'].includes(user.role);
 
@@ -261,6 +274,8 @@ export default function ControlPlane() {
   const selectedRoleDetails = useMemo(() => rolesPayload?.roles.find(role => role.enumValue === selectedRole) ?? rolesPayload?.roles[0], [rolesPayload, selectedRole]);
 
   const postureAlerts = posture?.alerts ?? [];
+  const activeBranches = useMemo(() => (usersPayload?.branches ?? []).filter(branch => branch.active), [usersPayload]);
+  const inviteValid = inviteForm.name.trim().length >= 2 && /.+@.+\..+/.test(inviteForm.email) && inviteForm.password.length >= 8;
 
   async function updateUserRole(userId: string, role: string) {
     if (!canManage) return;
@@ -311,6 +326,32 @@ export default function ControlPlane() {
     const logs = await apiRequest<Array<{ id: string; action: string; resource: string; actor: string; occurredAt: string; metadata: unknown }>>(`/v1/control-plane/users/${userId}/audit-trail`);
     setSelectedUserAudit(logs);
     setActiveTab('audit');
+  }
+
+  async function createUserInvite() {
+    if (!canManage) return;
+    setInviteBusy(true);
+    setInviteError(null);
+    try {
+      await apiRequest('/v1/control-plane/users', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: inviteForm.name.trim(),
+          email: inviteForm.email.trim().toLowerCase(),
+          password: inviteForm.password,
+          role: inviteForm.role,
+          branchIds: inviteForm.branchIds,
+          primaryBranchId: inviteForm.primaryBranchId || undefined,
+        }),
+      });
+      setInviteOpen(false);
+      setInviteForm({ name: '', email: '', password: '', role: 'FRONT_DESK', branchIds: [], primaryBranchId: '' });
+      await loadData();
+    } catch (err) {
+      setInviteError(err instanceof Error ? err.message : 'Invite failed');
+    } finally {
+      setInviteBusy(false);
+    }
   }
 
   async function applyAuditFilters() {
@@ -494,8 +535,110 @@ export default function ControlPlane() {
               <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-t3" />
               <input value={userSearch} onChange={event => setUserSearch(event.target.value)} placeholder="Search users" className="w-full rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-10 py-2 text-sm text-t1 outline-none focus:border-[var(--b3)]" />
             </div>
-            <button type="button" disabled title="Invite user flow is not implemented yet" className="rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t3 opacity-60">Invite user</button>
+            <button type="button" onClick={() => setInviteOpen(v => !v)} disabled={!canManage} className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition disabled:cursor-not-allowed disabled:opacity-50">
+              <Plus className="w-3.5 h-3.5" /> Invite user
+            </button>
           </div>
+
+          {inviteOpen && canManage && (
+            <div className="mt-4 rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-t1">Invite a new clinic user</p>
+                  <p className="text-xs text-t3">Creates a real tenant user with a temporary password and optional clinic access.</p>
+                </div>
+                <button type="button" onClick={() => setInviteOpen(false)} className="text-xs font-semibold text-t3 hover:text-t1">Close</button>
+              </div>
+              {inviteError && <div className="mt-3 rounded-xl border border-[rgba(220,38,38,0.18)] bg-red-soft px-3 py-2 text-xs text-red-v">{inviteError}</div>}
+              <div className="mt-4 grid gap-3 md:grid-cols-2">
+                <input
+                  value={inviteForm.name}
+                  onChange={event => setInviteForm(current => ({ ...current, name: event.target.value }))}
+                  placeholder="Full name"
+                  className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--b3)]"
+                />
+                <input
+                  value={inviteForm.email}
+                  onChange={event => setInviteForm(current => ({ ...current, email: event.target.value }))}
+                  placeholder="name@clinic.com"
+                  type="email"
+                  className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--b3)]"
+                />
+                <input
+                  value={inviteForm.password}
+                  onChange={event => setInviteForm(current => ({ ...current, password: event.target.value }))}
+                  placeholder="Temporary password"
+                  type="text"
+                  className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--b3)]"
+                />
+                <select
+                  value={inviteForm.role}
+                  onChange={event => setInviteForm(current => ({ ...current, role: event.target.value }))}
+                  className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--b3)]"
+                >
+                  <option value="FRONT_DESK">Front Desk</option>
+                  <option value="PROVIDER">Provider</option>
+                  <option value="MANAGER">Manager</option>
+                  <option value="BILLING">Billing</option>
+                  <option value="ANALYST">Analyst</option>
+                  <option value="ADMIN">Admin</option>
+                  <option value="OWNER">Owner</option>
+                  <option value="COMPLIANCE_OFFICER">Compliance Officer</option>
+                  <option value="AUDITOR">Auditor</option>
+                </select>
+              </div>
+              <div className="mt-4">
+                <p className="text-xs font-semibold text-t2">Clinic access</p>
+                <div className="mt-2 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                  {activeBranches.map(branch => (
+                    <label key={branch.id} className="flex items-center justify-between gap-3 rounded-xl border border-[var(--b1)] px-3 py-2 text-sm text-t2">
+                      <span className="min-w-0">
+                        <span className="block truncate font-semibold text-t1">{branch.name}</span>
+                        <span className="block text-[11px] text-t3">{branch.location}</span>
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={inviteForm.branchIds.includes(branch.id)}
+                        onChange={event => setInviteForm(current => {
+                          const branchIds = event.target.checked
+                            ? [...current.branchIds, branch.id]
+                            : current.branchIds.filter(id => id !== branch.id);
+                          const nextPrimary = current.primaryBranchId && branchIds.includes(current.primaryBranchId) ? current.primaryBranchId : branchIds[0] ?? '';
+                          return { ...current, branchIds, primaryBranchId: nextPrimary };
+                        })}
+                      />
+                    </label>
+                  ))}
+                </div>
+                <div className="mt-3 max-w-sm">
+                  <label className="text-xs font-semibold text-t2">Primary branch</label>
+                  <select
+                    value={inviteForm.primaryBranchId}
+                    onChange={event => setInviteForm(current => ({ ...current, primaryBranchId: event.target.value }))}
+                    className="mt-1 w-full rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--b3)]"
+                  >
+                    <option value="">Auto-select first branch</option>
+                    {inviteForm.branchIds.map(branchId => {
+                      const branch = activeBranches.find(item => item.id === branchId);
+                      return branch ? <option key={branch.id} value={branch.id}>{branch.name}</option> : null;
+                    })}
+                  </select>
+                </div>
+              </div>
+              <div className="mt-4 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  disabled={!inviteValid || inviteBusy}
+                  onClick={() => void createUserInvite()}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition disabled:opacity-50"
+                >
+                  {inviteBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+                  Create user
+                </button>
+                <button type="button" onClick={() => setInviteOpen(false)} className="rounded-xl border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s3)] transition">Cancel</button>
+              </div>
+            </div>
+          )}
 
           <div className="mt-4 overflow-hidden rounded-2xl border border-[var(--b1)]">
             <table className="min-w-full text-sm">
@@ -756,11 +899,23 @@ export default function ControlPlane() {
               <input value={auditFilters.from} onChange={event => setAuditFilters(current => ({ ...current, from: event.target.value }))} placeholder="From" type="date" className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm" />
               <input value={auditFilters.to} onChange={event => setAuditFilters(current => ({ ...current, to: event.target.value }))} placeholder="To" type="date" className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm" />
             </div>
-            <div className="flex gap-2">
-              <button type="button" onClick={() => void applyAuditFilters()} className="rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white">Apply filters</button>
-              <button type="button" disabled title="Audit export endpoint not implemented yet" className="rounded-xl border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t3 opacity-60">Export</button>
-            </div>
+          <div className="flex gap-2">
+            <button type="button" onClick={() => void applyAuditFilters()} className="rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white">Apply filters</button>
+            <button
+              type="button"
+              onClick={() => void downloadCsv(`/v1/control-plane/audit-logs/export.csv?${new URLSearchParams({
+                ...(auditFilters.userId ? { userId: auditFilters.userId } : {}),
+                ...(auditFilters.module ? { module: auditFilters.module } : {}),
+                ...(auditFilters.action ? { action: auditFilters.action } : {}),
+                ...(auditFilters.from ? { from: auditFilters.from } : {}),
+                ...(auditFilters.to ? { to: auditFilters.to } : {}),
+              }).toString()}`, 'control-plane-audit.csv')}
+              className="rounded-xl border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s3)] transition"
+            >
+              Export
+            </button>
           </div>
+        </div>
 
           {selectedUserAudit && (
             <div className="mt-4 rounded-2xl border border-[var(--b1)] p-4">

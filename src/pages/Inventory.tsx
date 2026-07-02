@@ -3,12 +3,13 @@ import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
-import { inventoryItems, branches } from '../data/seedData';
 import { useState } from 'react';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapInventoryItem, type ApiInventoryItem } from '../lib/apiAdapters';
 import { apiRequest } from '../lib/api';
 import { formatCurrency } from '../utils/formatters';
+
+interface ApiBranchOption { id: string; name: string }
 
 const statusConfig: Record<string, { label: string; badge: string; border: string; bg: string }> = {
   ok:       { label: 'In Stock',  badge: 'badge badge-emerald', border: 'border-[var(--b1)]',        bg: 'bg-[var(--s2)]' },
@@ -24,8 +25,10 @@ const aiRecommendations = [
 ];
 
 export default function Inventory() {
-  const { data: stockItems, source, reload } = useApiResource<ApiInventoryItem, typeof inventoryItems[number]>('/v1/inventory?limit=100', inventoryItems, mapInventoryItem);
+  const { data: stockItems, source, error, reload } = useApiResource<ApiInventoryItem, ReturnType<typeof mapInventoryItem>>('/v1/inventory?limit=100', [], mapInventoryItem);
+  const { data: branchOptions } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
   const [reorderingId, setReorderingId] = useState<string | null>(null);
+  const loadError = error;
 
   async function reorder(id: string, reorderLevel: number) {
     setReorderingId(id);
@@ -62,7 +65,7 @@ export default function Inventory() {
       <PageHeader
         title="Inventory Intelligence"
         subtitle="Stock levels, expiry risk, reorder alerts, and AI supply recommendations across all branches."
-        badge={`${criticalCount + expiringCount} Alerts · ${source === 'live' ? 'Live DB' : 'Demo'}`}
+        badge={loadError ? 'Live Data Error' : `${criticalCount + expiringCount} Alerts · ${source === 'live' ? 'Live DB' : 'Loading'}`}
         badgeColor="red"
         actions={
           <button type="button" disabled={reorderingId === 'bulk'} onClick={() => void reorderAll()} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition disabled:opacity-40">
@@ -70,6 +73,12 @@ export default function Inventory() {
           </button>
         }
       />
+
+      {loadError && (
+        <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          Inventory data could not be loaded from the live API: {loadError}
+        </div>
+      )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
         <StatCard title="Total Items Tracked" value={stockItems.length} subtitle="Across all branches" icon={<Package className="w-4 h-4" />} accent="blue" />
@@ -84,7 +93,7 @@ export default function Inventory() {
           <div className="space-y-2.5">
             {stockItems.map((item) => {
               const sc = statusConfig[item.status];
-              const branch = branches.find(b => b.id === item.branchId);
+              const branch = branchOptions.find(b => b.id === item.branchId);
               const stockPct = Math.min(100, Math.round((item.currentStock / (item.reorderLevel * 2)) * 100));
               const weeksLeft = Math.round(item.currentStock / Math.max(item.usagePerWeek, 0.1));
               return (

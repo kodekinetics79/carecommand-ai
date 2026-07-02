@@ -2,14 +2,14 @@ import { useCallback, useEffect, useState } from 'react';
 import { apiRequest } from '../lib/api';
 
 /**
- * Live, editable list resource. Unlike useApiResource (read-only with demo
+ * Live, editable list resource. Unlike useApiResource (read-only with offline
  * fallback), this hook owns create/update/delete and refreshes from the API
  * after each mutation. Falls back to the provided seed list only until the
  * first successful load, so the UI is never empty while offline.
  */
 export function useCrudResource<T extends { id: string }>(path: string, fallback: T[]) {
   const [data, setData] = useState<T[]>(fallback);
-  const [source, setSource] = useState<'live' | 'demo'>('demo');
+  const [source, setSource] = useState<'live' | 'offline'>('offline');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 

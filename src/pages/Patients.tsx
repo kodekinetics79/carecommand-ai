@@ -5,7 +5,6 @@ import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
-import { patients, branches } from '../data/seedData';
 import { formatCurrency } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapPatient, type ApiPatient } from '../lib/apiAdapters';
@@ -26,12 +25,13 @@ export default function Patients() {
   const navigate = useNavigate();
   const [query, setQuery] = useState('');
   const [activeLifecycle, setActiveLifecycle] = useState<string>('all');
-  const { data: customerRecords, source, reload } = useApiResource<ApiPatient, typeof patients[number]>('/v1/patients?limit=100', patients, mapPatient);
+  const { data: customerRecords, source, error, reload } = useApiResource<ApiPatient, ReturnType<typeof mapPatient>>('/v1/patients?limit=100', [], mapPatient);
   const { data: branchOptions } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], b => b);
   const [showAddForm, setShowAddForm] = useState(false);
   const [form, setForm] = useState(emptyForm);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const loadError = error;
 
   async function createPatient() {
     const branchId = form.branchId || branchOptions[0]?.id;
@@ -91,7 +91,7 @@ export default function Patients() {
       <PageHeader
         title="Customer360"
         subtitle="Customer intelligence, lifecycle insights, consent-aware outreach, and LTV management."
-        badge={`${highRisk} At Risk · ${source === 'live' ? 'Live DB' : 'Demo'}`}
+        badge={loadError ? 'Live Data Error' : `${highRisk} At Risk · ${source === 'live' ? 'Live DB' : 'Loading'}`}
         badgeColor="red"
         actions={
           <button type="button" onClick={() => setShowAddForm(true)} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
@@ -99,6 +99,12 @@ export default function Patients() {
           </button>
         }
       />
+
+      {loadError && (
+        <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          Customer data could not be loaded from the live API: {loadError}
+        </div>
+      )}
 
       {showAddForm && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setShowAddForm(false)}>
@@ -255,13 +261,14 @@ export default function Patients() {
           {/* Branch coverage */}
           <BentoCard title="Branch Coverage" subtitle="Customers per location">
             <div className="space-y-2.5">
-              {branches.map((branch) => (
+              {branchOptions.map((branch) => (
                 <div key={branch.id} className="flex items-center justify-between gap-3 p-2.5 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors">
                   <div>
-                    <p className="text-xs font-bold text-t1">{branch.name.split(' ')[0]}</p>
-                    <p className="text-[10px] text-t3">{branch.todayAppointments} appts today</p>
+                    <p className="text-xs font-bold text-t1">{branch.name}</p>
                   </div>
-                  <span className="text-xs font-bold text-t2">{branch.patientCount}</span>
+                  <span className="text-xs font-bold text-t2">
+                    {customerRecords.filter(patient => patient.branchId === branch.id).length}
+                  </span>
                 </div>
               ))}
             </div>

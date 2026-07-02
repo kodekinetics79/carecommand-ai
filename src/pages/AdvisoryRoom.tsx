@@ -4,7 +4,6 @@ import { Sparkles, BrainCircuit, ArrowRight, ShieldCheck, TrendingUp, Users2, Ra
 import PageHeader from '../components/ui/PageHeader';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
-import { branches } from '../data/seedData';
 import { useApiResource } from '../hooks/useApiResource';
 import { formatCurrency } from '../utils/formatters';
 import { askAdvisory, fetchAdvisoryBrief, getAdvisorDisplay, getAdvisorSampleQuestions } from '../lib/advisory';
@@ -25,7 +24,7 @@ const advisorOrder: AdvisorType[] = ['revenue', 'growth', 'front-desk', 'competi
 export default function AdvisoryRoom() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { data: clinicOptions } = useApiResource<BranchOption, BranchOption>('/v1/branches?limit=100', branches, row => row);
+  const { data: clinicOptions } = useApiResource<BranchOption, BranchOption>('/v1/branches?limit=100', [], row => row);
   const initialState = (location.state as { question?: string; advisorType?: AdvisorType } | null) ?? null;
   const [selectedClinicId, setSelectedClinicId] = useState<'all' | string>('all');
   const [selectedAdvisor, setSelectedAdvisor] = useState<AdvisorType>(initialState?.advisorType ?? 'revenue');
@@ -84,6 +83,8 @@ export default function AdvisoryRoom() {
       const response = await askAdvisory(nextQuestion, advisorType, selectedClinicId === 'all' ? undefined : selectedClinicId);
       setActiveAnswer(response);
       setSelectedAdvisor(advisorType);
+    } catch (error) {
+      setBriefError(error instanceof Error ? error.message : 'Unable to load advisory answer');
     } finally {
       setAskLoading(false);
     }

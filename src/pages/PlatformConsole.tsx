@@ -4,18 +4,19 @@ import {
   ShieldCheck, Loader2, LogOut, Building2, FileCheck2, Users2, ScrollText, Ban, Play,
   Search, CircleCheck, CircleSlash, Clock3, UserCog, Activity, ChevronRight, ChevronDown,
   Database, Server, Wifi, SlidersHorizontal, RefreshCw, LayoutDashboard, CreditCard, Cpu,
-  HardDrive, Lock, Plug, Megaphone, Settings, Gauge, X, Crown, Receipt, Download, Plus,
+  HardDrive, Lock, Plug, Megaphone, Settings, Gauge, X, Crown, Receipt, Download, Plus, Upload,
 } from 'lucide-react';
 import {
   platformAdmin, setPlatformToken, downloadAuditCsv, TENANT_STATUS_BADGE, SUB_STATUS_BADGE, FEATURE_LABELS,
   type PlatformMe, type TenantSummary, type SystemHealth, type TenantBilling, type AiUsageView, type SecurityView, type IntegrationView,
 } from '../lib/platformAdmin';
 import { healthScore } from '../lib/platformServices';
+import PlatformPilot from './PlatformPilot';
 
 type Overview = { tenants: number; activeTenants: number; suspendedTenants: number; pendingRequests: number; platformUsers: number };
 
 type SectionId =
-  | 'overview' | 'tenants' | 'requests' | 'plans' | 'entitlements' | 'billing' | 'ai_usage'
+  | 'overview' | 'tenants' | 'pilot' | 'requests' | 'plans' | 'entitlements' | 'billing' | 'ai_usage'
   | 'device_usage' | 'operators' | 'security' | 'integrations' | 'health' | 'audit'
   | 'announcements' | 'settings';
 
@@ -23,6 +24,7 @@ interface SectionDef { id: SectionId; label: string; icon: React.ElementType; gr
 const SECTIONS: SectionDef[] = [
   { id: 'overview', label: 'Platform Overview', icon: LayoutDashboard, group: 'Operations', live: true },
   { id: 'tenants', label: 'Tenants', icon: Building2, group: 'Operations', live: true },
+  { id: 'pilot', label: 'Pilot Launchpad', icon: Upload, group: 'Operations', live: true },
   { id: 'requests', label: 'Subscription Requests', icon: FileCheck2, group: 'Operations', live: true },
   { id: 'plans', label: 'Plans & Pricing', icon: Receipt, group: 'Commercial', live: true },
   { id: 'entitlements', label: 'Feature Entitlements', icon: SlidersHorizontal, group: 'Commercial', live: true },
@@ -132,6 +134,7 @@ export default function PlatformConsole() {
         <div className="max-w-6xl mx-auto px-6 py-6 space-y-6 animate-fade-up">
           {section === 'overview' && <OverviewSection overview={overview} onGoTenants={() => setSection('tenants')} />}
           {section === 'tenants' && <TenantsTab onOpenTenant={openTenant} />}
+          {section === 'pilot' && <PlatformPilot />}
           {section === 'requests' && <RequestsTab />}
           {section === 'plans' && <PlansSection />}
           {section === 'entitlements' && <TenantPicker title="Feature entitlements" subtitle="Open a tenant to toggle any of the 15 premium features (platform override)" hint="features" onOpenTenant={openTenant} />}
@@ -497,7 +500,7 @@ function TenantDrawer({ tenant, canManage, onClose }: { tenant: TenantSummary; c
                   </select>
                 </label>
               )}
-              <p className="text-[11px] text-t3">Billing cycle, trial extension, grace period, renewal date & seat/limit editing are a pending backend contract — <code className="font-mono">platformServices.setBillingCycle / extendTrial</code>.</p>
+              <p className="text-[11px] text-t3">Billing cycle, trial extension, grace period, renewal date & seat/limit editing are live, audited controls — <code className="font-mono">platformAdmin.getBilling / updateBilling / extendTrial</code>.</p>
             </div>
           )}
 
@@ -960,7 +963,7 @@ function TenantsTab({ onOpenTenant }: { onOpenTenant?: (t: TenantSummary) => voi
                   {t.subscription && <span className={`badge ${SUB_STATUS_BADGE[t.subscription.status] ?? 'badge-blue'}`}>{t.subscription.planKey} · {t.subscription.status.toLowerCase()}</span>}
                 </div>
               </div>
-              <p className="text-[10px] text-t3 pl-12 mt-1">Last activity {new Date(t.tenant.lastActivityAt).toLocaleDateString()} · billing/MRR pending backend (platformServices.getBilling)</p>
+              <p className="text-[10px] text-t3 pl-12 mt-1">Last activity {new Date(t.tenant.lastActivityAt).toLocaleDateString()} · billing/MRR available via platformAdmin.getBilling</p>
               <div className="mt-2.5 flex flex-wrap items-center gap-2 pl-12">
                 <select aria-label="Change plan" disabled={busy === t.tenant.id} defaultValue=""
                   onChange={e => e.target.value && act(t.tenant!.id, () => platformAdmin.changePlan(t.tenant!.id, e.target.value))}
@@ -1012,7 +1015,7 @@ function CreateCompanyForm({ plans, onCancel, onCreated }: { plans: Array<{ key:
   const [branch, setBranch] = useState('Main Branch');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [done, setDone] = useState<string | null>(null);
+  const [done, setDone] = useState<{ email: string; password: string } | null>(null);
 
   const autoSlug = (v: string) => v.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
   const inputCls = 'w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--indigo)]';
@@ -1021,7 +1024,7 @@ function CreateCompanyForm({ plans, onCancel, onCreated }: { plans: Array<{ key:
     setBusy(true); setError(null);
     try {
       await platformAdmin.createTenant({ name: name.trim(), slug: slug.trim(), planKey, ownerName: ownerName.trim(), ownerEmail: ownerEmail.trim(), ownerPassword, defaultBranchName: branch.trim() || 'Main Branch' });
-      setDone(ownerEmail.trim());
+      setDone({ email: ownerEmail.trim(), password: ownerPassword });
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to create company');
     } finally { setBusy(false); }
@@ -1031,7 +1034,12 @@ function CreateCompanyForm({ plans, onCancel, onCreated }: { plans: Array<{ key:
     return (
       <div className="mb-4 rounded-xl border border-[rgba(5,150,105,0.25)] bg-emerald-soft p-4">
         <p className="text-sm font-bold text-emerald-v flex items-center gap-2"><CircleCheck className="w-4 h-4" /> Company created</p>
-        <p className="text-[12px] text-t2 mt-1.5">The client can now sign in at the clinic login with <span className="font-semibold">{done}</span> and the password you set. They'll see their plan and can request upgrades from their Subscription page.</p>
+        <p className="text-[12px] text-t2 mt-1.5">The client can now sign in at the clinic login with <span className="font-semibold">{done.email}</span> and the temporary password below.</p>
+        <div className="mt-3 rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-[12px] text-t2">
+          <p><span className="font-semibold text-t1">Email:</span> {done.email}</p>
+          <p className="mt-1"><span className="font-semibold text-t1">Password:</span> {done.password}</p>
+        </div>
+        <p className="mt-2 text-[11px] text-t3">Have the client change this password after first sign-in.</p>
         <button type="button" onClick={onCreated} className="mt-3 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90">Done</button>
       </div>
     );

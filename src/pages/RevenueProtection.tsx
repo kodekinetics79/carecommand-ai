@@ -16,8 +16,8 @@ import {
 import BentoCard from '../components/ui/BentoCard';
 import StatCard from '../components/ui/StatCard';
 import ProgressBar from '../components/ui/ProgressBar';
-import { branches } from '../data/seedData';
 import { formatCurrency } from '../utils/formatters';
+import { useApiResource } from '../hooks/useApiResource';
 import {
   checkEligibility,
   createDepositRule,
@@ -63,7 +63,7 @@ type PaymentActionRow = {
   dueAt?: string | null;
 };
 
-const clinicOptions: ClinicOption[] = [{ id: 'all', name: 'All clinics', location: 'Network-wide' }, ...branches];
+const clinicOptions: ClinicOption[] = [{ id: 'all', name: 'All clinics', location: 'Network-wide' }];
 
 const advisorPrompts = [
   { label: 'Which appointments should require deposits?', question: 'Which appointments should require deposits?', advisorType: 'revenue' as const },
@@ -144,6 +144,7 @@ function useRevenueProtectionData(selectedClinicId: 'all' | string) {
 
 export default function RevenueProtection() {
   const navigate = useNavigate();
+  const { data: branchOptions } = useApiResource<ClinicOption, ClinicOption>('/v1/branches?limit=100', [], row => row);
   const [selectedClinicId, setSelectedClinicId] = useState<'all' | string>('all');
   const [section, setSection] = useState<'insurance' | 'payments'>('insurance');
   const { overview, integrationStatus, loading, error, reload } = useRevenueProtectionData(selectedClinicId);
@@ -343,7 +344,7 @@ export default function RevenueProtection() {
         <div className="flex flex-wrap items-center gap-2">
           <select value={selectedClinicId} onChange={e => setSelectedClinicId(e.target.value)} aria-label="Clinic scope"
             className="rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-xs text-t1 outline-none">
-            {clinicOptions.map(clinic => <option key={clinic.id} value={clinic.id}>{clinic.name}</option>)}
+            {[...clinicOptions, ...branchOptions].map(clinic => <option key={clinic.id} value={clinic.id}>{clinic.name}</option>)}
           </select>
           <button type="button" onClick={() => void reload()} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition">
             <RefreshCw className="w-3.5 h-3.5" /> Refresh

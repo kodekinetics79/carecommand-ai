@@ -5,22 +5,12 @@ import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
-import { branches, staffMembers as staffFallback } from '../data/seedData';
 import { apiRequest } from '../lib/api';
 import { mapStaffProfile, mapStaffTask, type ApiStaffProfile, type ApiStaffTask } from '../lib/apiAdapters';
 import type { StaffMember } from '../types';
 
 type StaffView = StaffMember & { branch?: string };
 type TaskView = ReturnType<typeof mapStaffTask>;
-
-const taskFallback: Array<ApiStaffTask> = [
-  { id: 't1', title: 'Follow up: Marcus Thompson (missed call)', branchId: 'b1', priority: 'high', dueAt: '2026-06-02T10:00:00Z', status: 'OPEN', branch: { name: 'Downtown Medical Centre' }, assignedTo: { displayName: 'Aaron Mensah' } },
-  { id: 't2', title: 'Send reactivation message to Yuki Tanaka', branchId: 'b2', priority: 'high', dueAt: '2026-06-02T15:00:00Z', status: 'OPEN', branch: { name: 'Westside Family Clinic' }, assignedTo: { displayName: 'Sara Haddad' } },
-  { id: 't3', title: 'Confirm Botox reorder with Allergan UK', branchId: 'b1', priority: 'medium', dueAt: '2026-06-02T17:00:00Z', status: 'IN_PROGRESS', branch: { name: 'Downtown Medical Centre' }, assignedTo: { displayName: 'Karen Bloom' } },
-  { id: 't4', title: 'Review Dr. Mitchell appointment schedule gaps', branchId: 'b1', priority: 'medium', dueAt: '2026-06-03T10:00:00Z', status: 'OPEN', branch: { name: 'Downtown Medical Centre' }, assignedTo: { displayName: 'Tanya Obi' } },
-  { id: 't5', title: 'Send post-visit review request to Sophie Laurent', branchId: 'b3', priority: 'low', dueAt: '2026-06-03T11:00:00Z', status: 'COMPLETED', branch: { name: 'Northgate Derma & Dental' }, assignedTo: { displayName: 'Mia Larsson' } },
-  { id: 't6', title: 'Assign 14 follow-up customers to coordinators', branchId: 'b1', priority: 'high', dueAt: '2026-06-02T08:00:00Z', status: 'OPEN', branch: { name: 'Downtown Medical Centre' }, assignedTo: { displayName: 'Blessing Eze' } },
-];
 
 const statusStyles: Record<TaskView['status'], { label: string; badge: string; border: string }> = {
   open: { label: 'Open', badge: 'badge badge-blue', border: 'border-l-blue-500' },
@@ -35,22 +25,16 @@ const priorityStyles = {
   low: { badge: 'badge badge-blue', border: 'border-l-[var(--b2)]' },
 };
 
-function mapFallbackStaff(): StaffView[] {
-  return staffFallback.map(member => ({
-    ...member,
-    branch: branches.find(branch => branch.id === member.branchId)?.name ?? 'All branches',
-  }));
-}
-
 function extractRows<T>(payload: T[] | { data: T[] }) {
   return Array.isArray(payload) ? payload : payload.data;
 }
 
 export default function StaffWorkflow() {
   const navigate = useNavigate();
-  const [staffRecords, setStaffRecords] = useState<StaffView[]>(mapFallbackStaff());
-  const [taskRecords, setTaskRecords] = useState<TaskView[]>(taskFallback.map(mapStaffTask));
-  const [source, setSource] = useState<'live' | 'demo'>('demo');
+  const [staffRecords, setStaffRecords] = useState<StaffView[]>([]);
+  const [taskRecords, setTaskRecords] = useState<TaskView[]>([]);
+  const [source, setSource] = useState<'live' | 'loading'>('loading');
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -61,10 +45,12 @@ export default function StaffWorkflow() {
       if (!active) return;
       const staffRows = extractRows(staffResponse).map(row => mapStaffProfile(row));
       const tasks = extractRows(taskResponse).map(row => mapStaffTask(row));
-      if (staffRows.length > 0) setStaffRecords(staffRows);
-      if (tasks.length > 0) setTaskRecords(tasks);
+      setStaffRecords(staffRows);
+      setTaskRecords(tasks);
       setSource('live');
-    }).catch(() => undefined);
+    }).catch(error => {
+      if (active) setLoadError(error instanceof Error ? error.message : 'Unable to load staff workflow');
+    });
 
     return () => { active = false; };
   }, []);
@@ -109,7 +95,7 @@ export default function StaffWorkflow() {
       <PageHeader
         title="Staff Workflow"
         subtitle="Task board, response SLA tracking, booking conversion, and coaching recommendations."
-        badge={`${totals.overdueCount} Overdue · ${source === 'live' ? 'Live DB' : 'Demo'}`}
+        badge={loadError ? 'Live Data Error' : `${totals.overdueCount} Overdue · ${source === 'live' ? 'Live DB' : 'Loading'}`}
         badgeColor="red"
         actions={
           <button type="button" onClick={() => navigate('/autopilot')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
@@ -117,6 +103,12 @@ export default function StaffWorkflow() {
           </button>
         }
       />
+
+      {loadError && (
+        <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          Staff workflow data could not be loaded from the live API: {loadError}
+        </div>
+      )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
         <StatCard title="Avg Response Time" value={`${totals.avgResponse} min`} subtitle="Network average" icon={<Clock className="w-4 h-4" />} accent="blue" />
@@ -129,7 +121,9 @@ export default function StaffWorkflow() {
         <div className="space-y-4">
           <BentoCard title="Task Board" subtitle="Open tasks · All branches">
             <div className="space-y-2.5">
-              {taskRecords.map(task => {
+              {taskRecords.length === 0 ? (
+                <p className="text-sm text-t3 py-4 text-center">No live tasks returned for this clinic.</p>
+              ) : taskRecords.map(task => {
                 const priorityStyle = priorityStyles[task.priority as keyof typeof priorityStyles] ?? priorityStyles.low;
                 const statusStyle = statusStyles[task.status] ?? statusStyles.open;
                 const isOverdue = task.due === 'Overdue';
@@ -172,7 +166,7 @@ export default function StaffWorkflow() {
                 </thead>
                 <tbody className="divide-y divide-[var(--b0)]">
                   {[...staffRecords].sort((a, b) => b.bookingConversionRate - a.bookingConversionRate).map(member => {
-                    const branchName = member.branch ?? branches.find(branch => branch.id === member.branchId)?.name ?? 'Live branch';
+                    const branchName = member.branch ?? 'Live branch';
                     const score = Math.round((member.bookingConversionRate * 0.4) + (member.followUpRate * 0.3) + (member.patientFeedbackScore * 10 * 0.3));
                     return (
                       <tr key={member.id} className="hover:bg-[var(--s3)] transition-colors group">
@@ -200,6 +194,7 @@ export default function StaffWorkflow() {
                   })}
                 </tbody>
               </table>
+              {staffRecords.length === 0 && <p className="text-sm text-t3 text-center py-4">No live staff profiles returned.</p>}
             </div>
           </BentoCard>
         </div>

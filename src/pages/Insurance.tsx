@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   ShieldCheck, Plus, CheckCircle2, BadgeCheck, FileText, Users, Building2, ArrowRight, Globe,
@@ -6,7 +6,6 @@ import {
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import { apiRequest } from '../lib/api';
-import { useApiData } from '../hooks/useApiData';
 
 interface Payer {
   id: string;
@@ -23,15 +22,52 @@ interface InsuranceOverview {
 }
 
 const PROVIDERS = ['mock', 'stedi', 'availity', 'pverify', 'optum'];
-const fallback: InsuranceOverview = { summary: { acceptedPayers: 0, totalPayers: 0, totalPolicies: 0, verifiedPolicies: 0, verifiedPct: 0 }, payers: [] };
 
 export default function Insurance() {
   const navigate = useNavigate();
-  const { data, loading, reload } = useApiData<InsuranceOverview>('/v1/insurance/overview', fallback);
+  const [data, setData] = useState<InsuranceOverview | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [pendingId, setPendingId] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ name: '', sourceProvider: 'mock' });
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      setLoading(true);
+      setLoadError(null);
+      try {
+        const overview = await apiRequest<InsuranceOverview>('/v1/insurance/overview');
+        if (!active) return;
+        setData(overview);
+      } catch (err) {
+        if (!active) return;
+        setData(null);
+        setLoadError(err instanceof Error ? err.message : 'Failed to load insurance overview');
+      } finally {
+        if (active) setLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  async function reload() {
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const overview = await apiRequest<InsuranceOverview>('/v1/insurance/overview');
+      setData(overview);
+    } catch (err) {
+      setData(null);
+      setLoadError(err instanceof Error ? err.message : 'Failed to load insurance overview');
+    } finally {
+      setLoading(false);
+    }
+  }
 
   async function addPayer() {
     if (!form.name.trim()) return;
@@ -59,25 +95,39 @@ export default function Insurance() {
     }
   }
 
-  const s = data.summary;
-  const activePayers = data.payers.filter(p => p.active);
+  const summary = data?.summary;
+  const activePayers = data?.payers.filter(p => p.active) ?? [];
 
   return (
     <div className="space-y-4 pb-6">
       {/* Slim toolbar — the topbar breadcrumb carries the page title. */}
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="badge badge-emerald">{s.acceptedPayers} accepted insurers</span>
+        {loading ? (
+          <span className="badge badge-emerald">Loading live insurer summary...</span>
+        ) : summary ? (
+          <span className="badge badge-emerald">{summary.acceptedPayers} accepted insurers</span>
+        ) : (
+          <span className="badge badge-red">No live insurer summary</span>
+        )}
         <button type="button" onClick={() => navigate('/revenue-protection')} className="inline-flex items-center gap-2 rounded-lg bg-[var(--indigo)] px-3.5 py-2 text-[13px] font-semibold text-white hover:opacity-90 transition">
           <BadgeCheck className="w-4 h-4" /> Verify Eligibility
         </button>
       </div>
 
-      <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Accepted Insurers" value={s.acceptedPayers} subtitle={`of ${s.totalPayers} configured`} icon={<ShieldCheck className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Policies on File" value={s.totalPolicies} subtitle="Patient coverage records" icon={<FileText className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Verified Coverage" value={`${s.verifiedPct}%`} subtitle={`${s.verifiedPolicies} verified`} icon={<CheckCircle2 className="w-4 h-4" />} accent="violet" />
-        <StatCard title="Insured Patients" value={s.totalPolicies} subtitle="Covered by a plan" icon={<Users className="w-4 h-4" />} accent="amber" />
-      </div>
+      {summary ? (
+        <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
+          <StatCard title="Accepted Insurers" value={summary.acceptedPayers} subtitle={`of ${summary.totalPayers} configured`} icon={<ShieldCheck className="w-4 h-4" />} accent="emerald" />
+          <StatCard title="Policies on File" value={summary.totalPolicies} subtitle="Patient coverage records" icon={<FileText className="w-4 h-4" />} accent="blue" />
+          <StatCard title="Verified Coverage" value={`${summary.verifiedPct}%`} subtitle={`${summary.verifiedPolicies} verified`} icon={<CheckCircle2 className="w-4 h-4" />} accent="violet" />
+          <StatCard title="Insured Patients" value={summary.totalPolicies} subtitle="Covered by a plan" icon={<Users className="w-4 h-4" />} accent="amber" />
+        </div>
+      ) : (
+        <div className="rounded-2xl border border-dashed border-[var(--b1)] bg-[var(--s2)] px-4 py-5 text-xs text-t3">
+          {loading
+            ? 'Loading the live insurance command center from the backend.'
+            : 'No live insurance overview is available yet, so no summary metrics are being fabricated.'}
+        </div>
+      )}
 
       <div className="rounded-2xl border border-[var(--b1)] bg-[var(--blue-soft)] p-4 flex items-start gap-3">
         <Building2 className="w-5 h-5 text-blue-v shrink-0 mt-0.5" />
@@ -87,13 +137,19 @@ export default function Insurance() {
         </p>
       </div>
 
+      {loadError && (
+        <div className="rounded-2xl border border-[var(--b1)] bg-[var(--red-soft)] px-4 py-3 text-xs font-semibold text-red-v">
+          Insurance overview could not be loaded from the API. The Insurance Command Center is offline until the live backend recovers: {loadError}
+        </div>
+      )}
+
       <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
         {/* Accepted insurers directory */}
         <BentoCard title="Accepted Insurers" subtitle="Plans this practice accepts · drives eligibility checks" headerRight={<ShieldCheck className="w-4 h-4 text-t3" />}>
           {error && <p className="text-[11px] text-red-v mb-2">{error}</p>}
           <div className="space-y-2.5">
-            {loading && data.payers.length === 0 && <div className="skeleton h-16 rounded-xl" />}
-            {data.payers.map(payer => (
+            {loading && <div className="skeleton h-16 rounded-xl" />}
+            {!loading && data && data.payers.map(payer => (
               <div key={payer.id} className={`flex items-center justify-between gap-3 p-3.5 rounded-xl border transition-all ${payer.active ? 'border-[var(--b1)] hover:border-[var(--b2)]' : 'border-[var(--b1)] bg-[var(--s2)] opacity-70'}`}>
                 <div className="flex items-center gap-3 min-w-0">
                   <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-emerald-500 to-blue-500 flex items-center justify-center text-white text-[10px] font-bold shrink-0">
@@ -116,6 +172,11 @@ export default function Insurance() {
                 </div>
               </div>
             ))}
+            {!loading && !data && !loadError && (
+              <div className="rounded-xl border border-dashed border-[var(--b1)] px-3 py-4 text-xs text-t3">
+                No live insurance overview is loaded.
+              </div>
+            )}
           </div>
 
           {showForm ? (
@@ -143,7 +204,9 @@ export default function Insurance() {
                   <CheckCircle2 className="w-3 h-3" /> {p.name}
                 </span>
               ))}
-              {activePayers.length === 0 && <p className="text-xs text-t3">No insurers accepted yet.</p>}
+              {activePayers.length === 0 && !loading && (
+                <p className="text-xs text-t3">No insurers are currently accepted.</p>
+              )}
             </div>
             <p className="text-[10px] text-t3 mt-3">Prospective patients see this list when they book — confirming they're covered before they ever call.</p>
           </BentoCard>

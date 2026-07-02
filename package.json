@@ -19,6 +19,7 @@
     "db:seed:coverage": "tsx prisma/seedModuleCoverage.ts",
     "verify:modules": "tsx server/scripts/verifyModuleCoverage.ts",
     "simulate": "vitest run server/test/e2e.simulation.test.ts",
+    "pilot:simulate": "tsx server/scripts/pilotSimulation.ts",
     "demo:sandbox": "tsx server/scripts/seedDemoSandbox.ts",
     "build": "tsc -b && vite build",
     "lint": "eslint .",

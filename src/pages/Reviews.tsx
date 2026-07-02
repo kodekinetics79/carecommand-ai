@@ -5,9 +5,8 @@ import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
-import { reviews, branches, doctors } from '../data/seedData';
 import { useApiResource } from '../hooks/useApiResource';
-import { mapReview, type ApiReview } from '../lib/apiAdapters';
+import { mapProviderProfile, mapReview, type ApiProviderProfile, type ApiReview } from '../lib/apiAdapters';
 import { apiRequest } from '../lib/api';
 import { formatCurrency } from '../utils/formatters';
 
@@ -55,7 +54,9 @@ interface ReputationResponse {
 
 export default function Reviews() {
   const navigate = useNavigate();
-  const { data: reviewRecords, source, reload } = useApiResource<ApiReview, typeof reviews[number]>('/v1/reviews?limit=100', reviews, mapReview);
+  const { data: reviewRecords, source, error: reviewError, reload } = useApiResource<ApiReview, ReturnType<typeof mapReview>>('/v1/reviews?limit=100', [], mapReview);
+  const { data: branchOptions, error: branchError } = useApiResource<{ id: string; name: string }, { id: string; name: string }>('/v1/branches?limit=100', [], row => row);
+  const { data: providerRecords, error: providerError } = useApiResource<ApiProviderProfile, ReturnType<typeof mapProviderProfile>>('/v1/providers/overview?limit=100', [], mapProviderProfile);
   const [respondingId, setRespondingId] = useState<string | null>(null);
 
   async function respondToReview(id: string, draft?: string) {
@@ -75,7 +76,8 @@ export default function Reviews() {
     cases: [],
     reviewRequests: [],
   });
-  const [reputationSource, setReputationSource] = useState<'live' | 'demo'>('demo');
+  const [reputationSource, setReputationSource] = useState<'live' | 'loading'>('loading');
+  const [reputationError, setReputationError] = useState<string | null>(null);
   const avgRating = reviewRecords.length > 0 ? (reviewRecords.reduce((sum, review) => sum + review.rating, 0) / reviewRecords.length).toFixed(1) : '0.0';
   const positiveCount = reviewRecords.filter(review => review.sentiment === 'positive').length;
   const negativeCount = reviewRecords.filter(review => review.sentiment === 'negative').length;
@@ -87,20 +89,29 @@ export default function Reviews() {
     let active = true;
     apiRequest<ReputationResponse>('/v1/reputation?limit=10')
       .then(row => {
-        if (!active || !row.cases.length) return;
+        if (!active) return;
+        if (!row.cases.length && !row.reviewRequests.length) {
+          setReputationError('No live reputation cases returned.');
+          return;
+        }
         setReputation(row);
         setReputationSource('live');
       })
-      .catch(() => undefined);
+      .catch(error => {
+        if (!active) return;
+        setReputationError(error instanceof Error ? error.message : 'Unable to load reputation data');
+      });
     return () => { active = false; };
   }, []);
+
+  const loadError = reviewError || branchError || providerError || reputationError;
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Reviews & Referrals"
         subtitle="Reputation management, review automation, negative feedback recovery, and referral tracking."
-        badge={`${reputation.summary.unresolvedCases || unrespondedNegative.length} Needs Response · ${source === 'live' || reputationSource === 'live' ? 'Live DB' : 'Demo'}`}
+        badge={loadError ? 'Live Data Error' : `${reputation.summary.unresolvedCases || unrespondedNegative.length} Needs Response · ${source === 'live' || reputationSource === 'live' ? 'Live DB' : 'Loading'}`}
         badgeColor="red"
         actions={
           <button type="button" onClick={() => navigate('/campaigner')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
@@ -108,6 +119,12 @@ export default function Reviews() {
           </button>
         }
       />
+
+      {loadError && (
+        <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          Review data could not be loaded from the live API: {loadError}
+        </div>
+      )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
         <StatCard title="Avg Rating" value={avgRating} subtitle="All platforms" trend={4} icon={<Star className="w-4 h-4" />} accent="amber" />
@@ -170,7 +187,7 @@ export default function Reviews() {
 
         <div className="space-y-4">
           <BentoCard title="Reputation Defense" subtitle="Unresolved cases and recovery workflow" headerRight={
-            <span className={`badge ${reputationSource === 'live' ? 'badge-emerald' : 'badge-blue'}`}>{reputationSource === 'live' ? 'Live DB' : 'Demo'}</span>
+          <span className={`badge ${reputationSource === 'live' ? 'badge-emerald' : 'badge-blue'}`}>{reputationSource === 'live' ? 'Live DB' : 'Loading'}</span>
           }>
             <div className="space-y-3">
               {reputation.cases.map((item) => (
@@ -192,7 +209,7 @@ export default function Reviews() {
                 </div>
               ))}
               {reputation.cases.length === 0 && (
-                <p className="text-xs text-t3">No live reputation cases yet. Seed data will appear here once the API is seeded.</p>
+                <p className="text-xs text-t3">No live reputation cases returned for this clinic.</p>
               )}
             </div>
           </BentoCard>
@@ -234,7 +251,7 @@ export default function Reviews() {
 
           <BentoCard title="Branch Reputation" subtitle="Avg rating by location">
             <div className="space-y-2.5">
-              {branches.map((b) => {
+              {branchOptions.map((b) => {
                 const br = reviewRecords.filter(r => r.branchId === b.id);
                 const avg = br.length > 0 ? (br.reduce((s, r) => s + r.rating, 0) / br.length).toFixed(1) : 'N/A';
                 const score = parseFloat(avg);
@@ -256,7 +273,7 @@ export default function Reviews() {
 
           <BentoCard title="Top Provider Ratings" subtitle="By review score">
             <div className="space-y-2.5">
-              {[...doctors].sort((a, b) => b.rating - a.rating).slice(0, 5).map((doc) => (
+              {[...providerRecords].sort((a, b) => b.rating - a.rating).slice(0, 5).map((doc) => (
                 <div key={doc.id} className="flex items-center justify-between gap-3">
                   <p className="text-xs font-semibold text-t1 truncate">{doc.name}</p>
                   <div className="flex items-center gap-1.5 shrink-0">
@@ -266,6 +283,7 @@ export default function Reviews() {
                   </div>
                 </div>
               ))}
+              {providerRecords.length === 0 && <p className="text-xs text-t3">No live provider ratings returned.</p>}
             </div>
           </BentoCard>
 

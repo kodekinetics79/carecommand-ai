@@ -8,13 +8,6 @@ import { useApiResource } from '../hooks/useApiResource';
 import { mapTelehealthSession, type ApiTelehealthSession, type TelehealthSession } from '../lib/apiAdapters';
 import { formatCurrency } from '../utils/formatters';
 
-const fallbackSessions: TelehealthSession[] = [
-  { id: 't1', patient: 'Rowan Brooks', initials: 'RB', service: 'Virtual Dermatology Review', date: '2026-05-26', time: '10:00', status: 'Confirmed', provider: 'Dr. Priya Sharma', value: 220, intakeComplete: true },
-  { id: 't2', patient: 'Nora Steele', initials: 'NS', service: 'Telehealth Nutrition Follow-up', date: '2026-05-26', time: '14:00', status: 'Pending', provider: 'Dr. Lisa Wong', value: 180, intakeComplete: false },
-  { id: 't3', patient: 'Oliver Chen', initials: 'OC', service: 'Virtual GP Consultation', date: '2026-05-27', time: '09:30', status: 'Confirmed', provider: 'Dr. James Okafor', value: 150, intakeComplete: true },
-  { id: 't4', patient: 'Isabelle Dubois', initials: 'ID', service: 'Wellness Check-in (Virtual)', date: '2026-05-27', time: '11:00', status: 'Confirmed', provider: 'Dr. Lisa Wong', value: 95, intakeComplete: true },
-];
-
 const conversionOpportunities = [
   { patient: 'Rowan Brooks', suggestion: 'Book in-person Botox consultation following virtual review', value: 480 },
   { patient: 'Nora Steele', suggestion: 'Schedule 12-week nutrition programme after follow-up', value: 960 },
@@ -30,22 +23,23 @@ export default function Telehealth() {
   const navigate = useNavigate();
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [sentIntakeIds, setSentIntakeIds] = useState<string[]>([]);
-  const { data: sessions } = useApiResource<ApiTelehealthSession, TelehealthSession>(
+  const { data: sessions, error: loadError } = useApiResource<ApiTelehealthSession, TelehealthSession>(
     '/v1/telehealth/sessions?limit=100',
-    fallbackSessions,
+    [],
     mapTelehealthSession,
   );
 
   const intakeComplete = sessions.filter(s => s.intakeComplete).length;
   const confirmedCount = sessions.filter(s => s.status === 'Confirmed').length;
   const totalValue = sessions.reduce((s, sess) => s + sess.value, 0);
+  const intakePercent = sessions.length > 0 ? Math.round((intakeComplete / sessions.length) * 100) : 0;
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Virtual Visit Booking"
         subtitle="Virtual appointment scheduling, intake management, waiting room, and in-person conversion tracking."
-        badge={`${sessions.length} Today`}
+        badge={loadError ? 'Live Data Error' : `${sessions.length} Today`}
         badgeColor="blue"
         actions={
           <button type="button" onClick={() => navigate('/scheduling')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition">
@@ -57,15 +51,25 @@ export default function Telehealth() {
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
         <StatCard title="Virtual Sessions" value={sessions.length} subtitle="Booked today" icon={<Video className="w-4 h-4" />} accent="blue" />
         <StatCard title="Confirmed" value={confirmedCount} subtitle="Ready to start" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Intake Complete" value={`${Math.round((intakeComplete / sessions.length) * 100)}%`} subtitle="Pre-visit forms" icon={<Users className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Intake Complete" value={`${intakePercent}%`} subtitle="Pre-visit forms" icon={<Users className="w-4 h-4" />} accent="violet" />
         <StatCard title="Session Revenue" value={formatCurrency(totalValue)} subtitle="Today's virtual visits" icon={<CalendarDays className="w-4 h-4" />} accent="amber" />
       </div>
 
+      {loadError && (
+        <div className="rounded-2xl border border-[rgba(220,38,38,0.18)] bg-red-soft px-4 py-3 text-xs font-semibold text-red-v">
+          Telehealth sessions could not be loaded from the live API: {loadError}
+        </div>
+      )}
+
       <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
         {/* Session queue */}
-        <BentoCard title="Virtual Waiting Room" subtitle="Today's sessions · All providers">
-          <div className="space-y-3">
-            {sessions.map((session) => {
+          <BentoCard title="Virtual Waiting Room" subtitle="Today's sessions · All providers">
+            <div className="space-y-3">
+            {sessions.length === 0 ? (
+              <div className="rounded-2xl border border-dashed border-[var(--b1)] bg-[var(--s2)] px-4 py-6 text-center text-sm text-t3">
+                No live telehealth sessions are loaded for this clinic.
+              </div>
+            ) : sessions.map((session) => {
               const sc = statusColors[session.status];
               return (
                 <div key={session.id} className={`p-4 rounded-2xl border transition-all hover:bg-[var(--s3)] ${
@@ -115,8 +119,8 @@ export default function Telehealth() {
                 </div>
               );
             })}
-          </div>
-        </BentoCard>
+            </div>
+          </BentoCard>
 
         <div className="space-y-4">
           {/* Conversion opportunities */}

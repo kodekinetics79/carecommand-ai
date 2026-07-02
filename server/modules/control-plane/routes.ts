@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { env } from '../../config/env';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
+import { generatePasswordHash, validatePassword } from '../../lib/security';
 import { requireRoles } from '../../plugins/roles';
 import { assertRoleChangeSafe, assertDeactivateSafe } from '../../lib/adminSafety';
 import { autopilotQueue } from '../../workers/queues';
@@ -554,8 +555,17 @@ function buildSecurityPosture(_tenantId: string, integrationRows: Array<{ health
 
 export const controlPlaneRoutes: FastifyPluginAsync = async app => {
   const userStatusBody = z.object({ active: z.boolean() });
-  const userRoleBody = z.object({ role: z.enum(['OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'PROVIDER', 'FRONT_DESK', 'ANALYST', 'COMPLIANCE_OFFICER', 'AUDITOR']) });
+  const userRoleEnum = z.enum(['OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'PROVIDER', 'FRONT_DESK', 'ANALYST', 'COMPLIANCE_OFFICER', 'AUDITOR']);
+  const userRoleBody = z.object({ role: userRoleEnum });
   const clinicAccessBody = z.object({
+    branchIds: z.array(uuid).default([]),
+    primaryBranchId: uuid.optional(),
+  });
+  const userCreateBody = z.object({
+    email: z.string().email().trim().toLowerCase(),
+    name: z.string().trim().min(2).max(120),
+    password: z.string().min(8).max(200),
+    role: userRoleEnum,
     branchIds: z.array(uuid).default([]),
     primaryBranchId: uuid.optional(),
   });
@@ -644,6 +654,51 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
       },
       users,
     };
+  });
+
+  app.post('/users', { preHandler: ownerAdminRoles }, async (request, reply) => {
+    const body = userCreateBody.parse(request.body);
+    const existing = await db.user.findFirst({ where: { tenantId: request.auth.tenantId, email: body.email } });
+    if (existing) throw app.httpErrors.conflict('User email already exists');
+    const policy = validatePassword(body.password);
+    if (!policy.ok) throw app.httpErrors.badRequest(policy.message ?? 'Weak password');
+
+    const validBranchRows = body.branchIds.length > 0
+      ? await db.branch.findMany({ where: { tenantId: request.auth.tenantId, id: { in: body.branchIds } }, select: { id: true } })
+      : [];
+    let validBranchIds = validBranchRows.map(branch => branch.id);
+    if (validBranchIds.length === 0) {
+      const fallbackBranch = await db.branch.findFirst({ where: { tenantId: request.auth.tenantId, active: true }, orderBy: { name: 'asc' }, select: { id: true } });
+      if (fallbackBranch) validBranchIds = [fallbackBranch.id];
+    }
+    const primaryBranchId = body.primaryBranchId && validBranchIds.includes(body.primaryBranchId) ? body.primaryBranchId : validBranchIds[0] ?? null;
+
+    const created = await db.user.create({
+      data: {
+        tenantId: request.auth.tenantId,
+        email: body.email,
+        displayName: body.name,
+        role: body.role,
+        passwordHash: await generatePasswordHash(body.password),
+        branchId: primaryBranchId,
+      },
+    });
+    if (validBranchIds.length > 0) await replaceClinicAccess(request.auth.tenantId, created.id, validBranchIds, primaryBranchId ?? undefined);
+    await audit(request, {
+      action: 'controlPlane.user.created',
+      resource: 'user',
+      resourceId: created.id,
+      metadata: { email: created.email, role: created.role, branchIds: validBranchIds },
+    });
+    return reply.code(201).send({
+      id: created.id,
+      email: created.email,
+      name: created.displayName,
+      role: created.role,
+      status: created.active ? 'active' : 'inactive',
+      branchIds: validBranchIds,
+      primaryBranchId,
+    });
   });
 
   app.patch('/users/:id/status', { preHandler: ownerAdminRoles }, async (request, reply) => {
@@ -838,6 +893,55 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
       details: event.metadata ?? null,
       occurredAt: event.occurredAt.toISOString(),
     }));
+  });
+
+  app.get('/audit-logs/export.csv', { preHandler: ownerAdminRoles }, async (request, reply) => {
+    const query = z.object({
+      userId: uuid.optional(),
+      module: z.string().trim().optional(),
+      action: z.string().trim().optional(),
+      from: z.string().trim().optional(),
+      to: z.string().trim().optional(),
+    }).parse(request.query);
+    const logs = await db.auditEvent.findMany({
+      where: {
+        tenantId: request.auth.tenantId,
+        ...(query.userId ? { actorUserId: query.userId } : {}),
+        ...(query.module ? { resource: query.module } : {}),
+        ...(query.action ? { action: query.action } : {}),
+        ...(query.from || query.to ? {
+          occurredAt: {
+            ...(query.from ? { gte: new Date(query.from) } : {}),
+            ...(query.to ? { lte: new Date(query.to) } : {}),
+          },
+        } : {}),
+      },
+      orderBy: { occurredAt: 'desc' },
+      take: 500,
+      include: { actorUser: { select: { displayName: true, email: true, role: true } } },
+    });
+    const escapeCsv = (value: unknown) => {
+      const text = value == null ? '' : typeof value === 'string' ? value : JSON.stringify(value);
+      return `"${text.replaceAll('"', '""')}"`;
+    };
+    const rows = [
+      ['occurredAt', 'actor', 'role', 'action', 'module', 'resource', 'result', 'details'],
+      ...logs.map(event => [
+        event.occurredAt.toISOString(),
+        event.actorUser?.displayName ?? safeEmail(event.metadata) ?? 'System',
+        event.actorUser?.role ?? '',
+        event.action,
+        event.resource,
+        event.resourceId ?? '',
+        event.action.includes('failed') ? 'failed' : 'success',
+        event.metadata ?? '',
+      ]),
+    ];
+    const csv = rows.map(row => row.map(escapeCsv).join(',')).join('\n');
+    return reply
+      .header('content-type', 'text/csv; charset=utf-8')
+      .header('content-disposition', 'attachment; filename="control-plane-audit.csv"')
+      .send(csv);
   });
 
   app.get('/security-posture', { preHandler: ownerAdminRoles }, async request => {

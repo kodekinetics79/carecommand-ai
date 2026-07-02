@@ -30,6 +30,92 @@ export interface TenantSummary {
   entitlements?: Array<{ featureKey: string; enabled: boolean; source: string; limitValue: number | null }>;
 }
 
+export type PilotEntityType = 'patients' | 'appointments' | 'insurance';
+
+export interface PilotImportPreset {
+  id: string;
+  tenantId: string;
+  entityType: PilotEntityType;
+  name: string;
+  isDefault: boolean;
+  mapping: Record<string, string>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PilotStatusShare {
+  id: string;
+  tenantId: string;
+  label: string | null;
+  expiresAt: string;
+  lastViewedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  active: boolean;
+  url: string;
+}
+
+export interface PilotStatusShareCreated {
+  id: string;
+  tenantId: string;
+  label: string | null;
+  expiresAt: string;
+  token: string;
+  url: string;
+  clinicName: string;
+  clinicSlug: string;
+}
+
+export interface PilotChecklistItem {
+  key: string;
+  label: string;
+  done: boolean;
+  detail: string;
+}
+
+export interface PilotChecklistView {
+  tenant: { id: string; name: string; slug: string; createdAt: string; updatedAt: string } | null;
+  readinessScore: number;
+  readyCount: number;
+  itemCount: number;
+  items: PilotChecklistItem[];
+  counts: { branches: number; users: number; patients: number; appointments: number; policies: number; audits: number; imports: number };
+  latestImport: { action: string; createdAt: string; metadata: unknown } | null;
+}
+
+export interface PilotImportField {
+  key: string;
+  label: string;
+  required: boolean;
+  example: string | null;
+  mappedHeader: string | null;
+}
+
+export interface PilotImportPreviewRow {
+  index: number;
+  status: 'ok' | 'warning' | 'error';
+  issues: string[];
+  sample: Record<string, unknown>;
+}
+
+export interface PilotImportPreview {
+  entityType: PilotEntityType;
+  headers: string[];
+  fields: PilotImportField[];
+  mapping: Record<string, string>;
+  preset?: { id: string; name: string; isDefault: boolean } | null;
+  summary: { total: number; valid: number; warnings: number; invalid: number };
+  rows: PilotImportPreviewRow[];
+  canCommit: boolean;
+}
+
+export interface PilotImportCommit {
+  entityType: PilotEntityType;
+  preset?: { id: string; name: string; isDefault: boolean } | null;
+  summary: { created: number; updated: number; skipped: number; warnings: number; total: number; validRows: number; invalidRows: number };
+  preview: PilotImportPreviewRow[];
+}
+
 export interface SystemHealth { api: string; database: string; redis: string; dbLatencyMs: number | null; responseMs: number; checkedAt: string }
 
 // Mirrors server/modules/subscriptions/catalog.ts FEATURE_LABELS (premium feature catalog).
@@ -115,6 +201,36 @@ export const platformAdmin = {
 
   getSettings: () => pf<PlatformSettings>(`/v1/platform/settings`),
   updateSettings: (body: Partial<Omit<PlatformSettings, 'updatedAt'>>) => pf<PlatformSettings>(`/v1/platform/settings`, { method: 'PATCH', body: JSON.stringify(body) }),
+
+  getPilotChecklist: (tenantId: string) => pf<PilotChecklistView>(`/v1/platform/tenants/${tenantId}/pilot-checklist`),
+  getPilotImportPresets: (tenantId: string, entityType?: PilotEntityType) =>
+    pf<PilotImportPreset[]>(`/v1/platform/tenants/${tenantId}/pilot-import/presets${entityType ? `?entityType=${encodeURIComponent(entityType)}` : ''}`),
+  savePilotImportPreset: (tenantId: string, body: { entityType: PilotEntityType; name: string; mapping: Record<string, string>; isDefault?: boolean }) =>
+    pf<PilotImportPreset>(`/v1/platform/tenants/${tenantId}/pilot-import/presets`, { method: 'POST', body: JSON.stringify(body) }),
+  deletePilotImportPreset: (tenantId: string, presetId: string) =>
+    pf<void>(`/v1/platform/tenants/${tenantId}/pilot-import/presets/${presetId}`, { method: 'DELETE' }),
+  downloadPilotTemplate: async (tenantId: string, entityType: PilotEntityType) => {
+    const token = getPlatformToken();
+    const res = await fetch(`${API}/v1/platform/tenants/${tenantId}/pilot-import/${entityType}/template.csv`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!res.ok) throw new Error(`Template download failed (${res.status})`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `pilot-${entityType}-template.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  },
+  previewPilotImport: (tenantId: string, entityType: PilotEntityType, body: { csvText: string; mapping: Record<string, string> }) =>
+    pf<PilotImportPreview>(`/v1/platform/tenants/${tenantId}/pilot-import/${entityType}/preview`, { method: 'POST', body: JSON.stringify(body) }),
+  commitPilotImport: (tenantId: string, entityType: PilotEntityType, body: { csvText: string; mapping: Record<string, string> }) =>
+    pf<PilotImportCommit>(`/v1/platform/tenants/${tenantId}/pilot-import/${entityType}/commit`, { method: 'POST', body: JSON.stringify(body) }),
+  getPilotStatusShare: (token: string) => pf<{ link: { label: string | null; expiresAt: string; active: boolean }; clinic: { id: string; name: string; slug: string }; checklist: PilotChecklistView }>(`/v1/pilot/share/${token}`, { auth: false }),
+  createPilotStatusShare: (tenantId: string, body: { label?: string; expiresInDays?: number }) =>
+    pf<PilotStatusShareCreated>(`/v1/platform/tenants/${tenantId}/pilot-status-links`, { method: 'POST', body: JSON.stringify(body) }),
+  listPilotStatusShares: (tenantId: string) => pf<PilotStatusShare[]>(`/v1/platform/tenants/${tenantId}/pilot-status-links`),
 
   integrations: () => pf<IntegrationView[]>(`/v1/platform/integrations`),
   saveIntegration: (key: string, fields: Record<string, string>) => pf<IntegrationView>(`/v1/platform/integrations/${key}`, { method: 'PUT', body: JSON.stringify({ fields }) }),

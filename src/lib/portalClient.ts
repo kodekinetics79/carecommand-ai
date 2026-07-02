@@ -65,6 +65,7 @@ export const portalClient = {
 export const STATE_META: Record<string, { label: string; badge: string }> = {
   action_required: { label: 'Action required', badge: 'badge-amber' },
   pending_review: { label: 'Pending review', badge: 'badge-blue' },
+  scheduled: { label: 'Scheduled', badge: 'badge-blue' },
   completed: { label: 'Up to date', badge: 'badge-emerald' },
   needs_update: { label: 'Needs update', badge: 'badge-amber' },
   payment_required: { label: 'Payment due', badge: 'badge-red' },

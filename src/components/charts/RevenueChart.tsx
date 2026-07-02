@@ -1,11 +1,29 @@
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
-import { revenueData } from '../../data/seedData';
+import { useApiResource } from '../../hooks/useApiResource';
+import { mapRevenueSnapshot, type ApiRevenueSnapshot } from '../../lib/apiAdapters';
 import { formatCurrency } from '../../utils/formatters';
 
-export default function RevenueChart() {
+type RevenueChartRow = {
+  id: string;
+  month: string;
+  revenue: number;
+  recovered: number;
+  lost: number;
+  campaigns: number;
+};
+
+interface RevenueChartProps {
+  data?: RevenueChartRow[];
+}
+
+function RevenueChartView({ data, emptyMessage }: { data: RevenueChartRow[]; emptyMessage: string }) {
+  if (data.length === 0) {
+    return <div className="flex h-[220px] items-center justify-center rounded-xl border border-dashed border-[var(--b1)] text-xs text-t3">{emptyMessage}</div>;
+  }
+
   return (
     <ResponsiveContainer width="100%" height={220}>
-      <AreaChart data={revenueData} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
+      <AreaChart data={data} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
         <defs>
           <linearGradient id="revGrad" x1="0" y1="0" x2="0" y2="1">
             <stop offset="5%" stopColor="#4F46E5" stopOpacity={0.15} />
@@ -28,4 +46,24 @@ export default function RevenueChart() {
       </AreaChart>
     </ResponsiveContainer>
   );
+}
+
+export default function RevenueChart({ data }: RevenueChartProps) {
+  if (data) {
+    return <RevenueChartView data={data} emptyMessage="No revenue data available." />;
+  }
+
+  const { data: liveData, source, loading, error } = useApiResource<ApiRevenueSnapshot, RevenueChartRow>(
+    '/v1/revenue-snapshots?limit=100',
+    [],
+    mapRevenueSnapshot,
+  );
+  const chartData = liveData;
+
+  if (loading && chartData.length === 0) {
+    return <div className="flex h-[220px] items-center justify-center rounded-xl border border-dashed border-[var(--b1)] text-xs text-t3">Loading live revenue snapshots...</div>;
+  }
+
+  const emptyMessage = error ? `Revenue chart unavailable: ${error}` : source === 'offline' ? 'No live revenue snapshots returned.' : 'No revenue data available.';
+  return <RevenueChartView data={chartData} emptyMessage={emptyMessage} />;
 }

@@ -4,6 +4,7 @@ import { PrismaClient } from '../server/generated/prisma/client';
 import { generatePasswordHash } from '../server/lib/security';
 import { evaluateSeverity } from '../server/lib/monitoring';
 import { normalizeWebhook } from '../server/lib/connectedCare/deviceAdapters';
+import { createPilotShareToken } from '../server/lib/pilotStatus';
 
 // Production guard: never load demo/seed data into a production database by
 // accident. Explicit opt-in (ALLOW_PROD_SEED=true) is required.
@@ -1717,6 +1718,60 @@ for (const def of [
   if (!existing) await db.deviceProvider.create({ data: { tenantId, mode: 'sandbox', ...def } });
 }
 console.log('[seed] connected-care provider registry');
+
+// ---- Pilot readiness: seed the pilot import/configuration surfaces ----------
+{
+  const presetMapping = {
+    externalRef: 'external_ref',
+    firstName: 'first_name',
+    lastName: 'last_name',
+    email: 'email',
+    phone: 'phone',
+    lifecycleStage: 'lifecycle_stage',
+    branchName: 'branch_name',
+    tags: 'tags',
+  };
+  const preset = await db.pilotImportPreset.findFirst({ where: { tenantId, entityType: 'patients', name: 'EHR import preset' } });
+  if (!preset) {
+    await db.pilotImportPreset.create({
+      data: {
+        tenantId,
+        entityType: 'patients',
+        name: 'EHR import preset',
+        isDefault: true,
+        mapping: presetMapping,
+        createdById: userId,
+        updatedById: userId,
+      },
+    });
+  } else if (!preset.isDefault || JSON.stringify(preset.mapping) !== JSON.stringify(presetMapping)) {
+    await db.pilotImportPreset.update({
+      where: { id: preset.id },
+      data: {
+        isDefault: true,
+        mapping: presetMapping,
+        updatedById: userId,
+      },
+    });
+  }
+
+  const existingShare = await db.pilotStatusShare.findFirst({ where: { tenantId }, orderBy: { createdAt: 'desc' } });
+  if (!existingShare) {
+    const { token, hash } = createPilotShareToken();
+    const expiresAt = new Date(Date.now() + 14 * 86400000);
+    await db.pilotStatusShare.create({
+      data: {
+        tenantId,
+        tokenHash: hash,
+        label: 'Demo pilot status',
+        expiresAt,
+        createdById: userId,
+      },
+    });
+    console.log(`[seed] pilot handoff: created default share token ${token}`);
+  }
+  console.log('[seed] pilot readiness: preset + share seeded');
+}
 
 // Seed the first PLATFORM_OWNER from secure env vars only (no weak default).
 {

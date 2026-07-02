@@ -115,6 +115,22 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     return reply.code(201).send({ added: created.count });
   });
 
+  app.delete('/outbound-campaigns/:campaignId/targets/:id', { preHandler: writeRoles }, async (request, reply) => {
+    const params = z.object({ campaignId: uuid, id: uuid }).parse(request.params);
+    const target = await db.receptionistCallTarget.findFirst({
+      where: { id: params.id, tenantId: request.auth.tenantId, campaignId: params.campaignId },
+    });
+    if (!target) throw app.httpErrors.notFound('Target not found');
+    await db.receptionistCallTarget.delete({ where: { id: params.id } });
+    await audit(request, {
+      action: 'receptionist.target.deleted',
+      resource: 'receptionistCallTarget',
+      resourceId: params.id,
+      metadata: { campaignId: params.campaignId, phone: target.phone },
+    });
+    return reply.code(204).send();
+  });
+
   // ----- Launch a single outbound call (test call or to a target) ---------
   app.post('/outbound-campaigns/:id/call', { preHandler: writeRoles }, async (request, reply) => {
     const { id } = idParam.parse(request.params);

@@ -1,13 +1,15 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, Star, ShieldCheck, MessageSquare, CalendarDays, TrendingUp, AlertCircle, Sparkles, Zap, CheckCircle2, Mail, Phone, Clock } from 'lucide-react';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
-import { patients, appointments, doctors, branches } from '../data/seedData';
 import { formatCurrency, formatDate } from '../utils/formatters';
 import { apiRequest } from '../lib/api';
-import { mapAppointment, mapPatient, type ApiPatient } from '../lib/apiAdapters';
+import { mapAppointment, mapPatient, mapProviderProfile, type ApiPatient, type ApiProviderProfile } from '../lib/apiAdapters';
 import { checkEligibility, type EligibilityVerification } from '../lib/revenueProtection';
+import { useApiResource } from '../hooks/useApiResource';
+
+interface ApiBranchOption { id: string; name: string }
 
 const lifecycleConfig: Record<string, { label: string; color: string; bg: string }> = {
   new:      { label: 'New',      color: 'text-indigo',    bg: 'badge badge-blue' },
@@ -33,10 +35,9 @@ const commsTimeline = [
 export default function PatientProfile() {
   const { id } = useParams();
   const navigate = useNavigate();
-  const fallbackPatient = patients.find(p => p.id === id);
-  const [patient, setPatient] = useState(fallbackPatient);
-  const [loading, setLoading] = useState(!fallbackPatient);
-  const [liveVisitHistory, setLiveVisitHistory] = useState<typeof appointments>([]);
+  const [patient, setPatient] = useState<ReturnType<typeof mapPatient> | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [liveVisitHistory, setLiveVisitHistory] = useState<ReturnType<typeof mapAppointment>[]>([]);
   const [eligibilityHistory, setEligibilityHistory] = useState<EligibilityVerification[]>([]);
   const [policyRow, setPolicyRow] = useState<{
     payerName: string;
@@ -52,13 +53,15 @@ export default function PatientProfile() {
   const [showPolicyForm, setShowPolicyForm] = useState(false);
   const [policySaving, setPolicySaving] = useState(false);
   const [policyForm, setPolicyForm] = useState({ payerId: '', planName: '', memberId: '', groupNumber: '' });
-  const visitHistory = useMemo(() => appointments.filter(a => a.patientId === id), [id]);
-  const assignedDoctor = doctors.find(d => d.id === patient?.assignedDoctorId);
-  const branch = branches.find(b => b.id === patient?.branchId);
+  const { data: branchOptions } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
+  const { data: providerRecords } = useApiResource<ApiProviderProfile, ReturnType<typeof mapProviderProfile>>('/v1/providers/overview?limit=100', [], mapProviderProfile);
+  const assignedDoctor = providerRecords.find(d => d.branchId === patient?.branchId);
+  const branch = branchOptions.find(b => b.id === patient?.branchId);
 
   useEffect(() => {
     if (!id) return;
     let active = true;
+    setLoading(true);
     apiRequest<ApiPatient>(`/v1/patients/${id}`)
       .then(row => {
         if (!active) return;
@@ -103,7 +106,7 @@ export default function PatientProfile() {
         if (active) setLoading(false);
       });
     return () => { active = false; };
-  }, [id, branch?.name]);
+  }, [id]);
 
   useEffect(() => {
     let active = true;
@@ -233,7 +236,7 @@ export default function PatientProfile() {
   }
 
   const lc = lifecycleConfig[patient.lifecycleStage];
-  const visibleVisitHistory = liveVisitHistory.length > 0 ? liveVisitHistory : visitHistory;
+  const visibleVisitHistory = liveVisitHistory;
   const totalSpend = visibleVisitHistory.reduce((s, v) => s + v.value, 0);
   const latestEligibility = eligibilityHistory[0] ?? null;
   const coverageActive = latestEligibility?.coverageActive ?? policyRow?.verificationStatus === 'verified';
@@ -270,7 +273,7 @@ export default function PatientProfile() {
                 <span className={lc?.bg}>{lc?.label}</span>
                 {patient.familyAccountId && <span className="badge badge-violet">Family Account</span>}
               </div>
-              <p className="text-xs text-t3 mt-0.5">Age {patient.age} · {patient.gender} · {branch?.name}</p>
+              <p className="text-xs text-t3 mt-0.5">Age {patient.age} · {patient.gender} · {branch?.name ?? 'Live branch'}</p>
             </div>
           </div>
         </div>

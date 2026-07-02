@@ -6,10 +6,10 @@ import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
 import RevenueChart from '../components/charts/RevenueChart';
 import BranchComparisonChart from '../components/charts/BranchComparisonChart';
-import { revenueData, branchRevenue, serviceRevenue } from '../data/seedData';
+import type { Appointment, Doctor } from '../types';
 import { formatCurrency } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
-import { mapRevenueSnapshot, type ApiRevenueSnapshot } from '../lib/apiAdapters';
+import { mapAppointment, mapProviderProfile, mapRevenueSnapshot, type ApiAppointment, type ApiProviderProfile, type ApiRevenueSnapshot } from '../lib/apiAdapters';
 
 const lostOpportunities = [
   { label: 'Missed calls — unrecovered', value: 3450, action: 'Launch follow-up' },
@@ -19,11 +19,18 @@ const lostOpportunities = [
 ];
 
 type BarColor = 'blue' | 'violet' | 'emerald' | 'red' | 'teal';
-const revenueFallback = revenueData.map((row, index) => ({ ...row, id: `demo-revenue-${index}` })).reverse();
+interface BranchOption { id: string; name: string }
+
+type RevenueRow = ReturnType<typeof mapRevenueSnapshot>;
 
 export default function Revenue() {
   const navigate = useNavigate();
-  const { data: revenueRecords, source } = useApiResource<ApiRevenueSnapshot, typeof revenueFallback[number]>('/v1/revenue-snapshots?limit=100', revenueFallback, mapRevenueSnapshot);
+  const { data: revenueRecords, source: revenueSource, error: revenueError } = useApiResource<ApiRevenueSnapshot, RevenueRow>('/v1/revenue-snapshots?limit=100', [], mapRevenueSnapshot);
+  const { data: branchOptions, source: branchSource } = useApiResource<BranchOption, BranchOption>('/v1/branches?limit=100', [], row => row);
+  const { data: providerRecords, source: providerSource } = useApiResource<ApiProviderProfile, Doctor>('/v1/providers/overview?limit=100', [], mapProviderProfile);
+  const { data: appointmentRecords, source: appointmentSource } = useApiResource<ApiAppointment, Appointment>('/v1/appointments?limit=100', [], mapAppointment);
+  const loadError = revenueError;
+  const liveReady = revenueSource === 'live' && branchSource === 'live' && providerSource === 'live' && appointmentSource === 'live';
 
   function exportReport() {
     const header = ['Month', 'Revenue', 'Campaigns', 'Recovered', 'Lost'];
@@ -36,26 +43,41 @@ export default function Revenue() {
     link.click();
     URL.revokeObjectURL(url);
   }
-  const latest = revenueRecords[0] ?? revenueRecords[revenueRecords.length - 1] ?? revenueFallback.at(-1)!;
-  const prev = revenueRecords[1] ?? revenueRecords[revenueRecords.length - 2] ?? latest;
-  const revGrowth = prev.revenue > 0 ? Math.round(((latest.revenue - prev.revenue) / prev.revenue) * 100) : 0;
-  const recoveredGrowth = prev.recovered > 0 ? Math.round(((latest.recovered - prev.recovered) / prev.recovered) * 100) : 0;
+  const latest = revenueRecords[0] ?? null;
+  const prev = revenueRecords[1] ?? latest;
+  const revGrowth = latest && prev && prev.revenue > 0 ? Math.round(((latest.revenue - prev.revenue) / prev.revenue) * 100) : 0;
+  const recoveredGrowth = latest && prev && prev.recovered > 0 ? Math.round(((latest.recovered - prev.recovered) / prev.recovered) * 100) : 0;
+  const branchRevenue = branchOptions.map(branch => {
+    const branchProviders = providerRecords.filter(provider => provider.branchId === branch.id);
+    const revenue = Math.round(branchProviders.reduce((sum, provider) => sum + provider.revenueThisMonth, 0));
+    return { name: branch.name, revenue };
+  }).filter(branch => branch.revenue > 0);
+  const totalBranchRevenue = branchRevenue.reduce((sum, branch) => sum + branch.revenue, 0);
+  const serviceRevenue = appointmentRecords.reduce((acc, appointment) => {
+    const key = appointment.service || 'Uncategorized';
+    const current = acc.get(key) ?? 0;
+    acc.set(key, current + appointment.value);
+    return acc;
+  }, new Map<string, number>());
+  const serviceRows = Array.from(serviceRevenue.entries())
+    .map(([service, revenue]) => ({ service, revenue }))
+    .sort((a, b) => b.revenue - a.revenue);
   const waterfall: { label: string; value: number; color: BarColor; positive: boolean }[] = [
-    { label: 'Gross Revenue', value: latest.revenue, color: 'blue', positive: true },
-    { label: '+ Campaign Revenue', value: latest.campaigns, color: 'violet', positive: true },
-    { label: '+ Automation Recovery', value: latest.recovered, color: 'emerald', positive: true },
-    { label: '− Lost Opportunities', value: latest.lost, color: 'red', positive: false },
-    { label: 'Net Revenue', value: latest.revenue + latest.campaigns + latest.recovered - latest.lost, color: 'teal', positive: true },
+    { label: 'Gross Revenue', value: latest?.revenue ?? 0, color: 'blue', positive: true },
+    { label: '+ Campaign Revenue', value: latest?.campaigns ?? 0, color: 'violet', positive: true },
+    { label: '+ Automation Recovery', value: latest?.recovered ?? 0, color: 'emerald', positive: true },
+    { label: '− Lost Opportunities', value: latest?.lost ?? 0, color: 'red', positive: false },
+    { label: 'Net Revenue', value: (latest?.revenue ?? 0) + (latest?.campaigns ?? 0) + (latest?.recovered ?? 0) - (latest?.lost ?? 0), color: 'teal', positive: true },
   ];
-  const maxWaterfall = Math.max(...waterfall.map(item => Math.abs(item.value)));
+  const maxWaterfall = Math.max(...waterfall.map(item => Math.abs(item.value)), 1);
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="RevenuePulse"
-        subtitle="CFO-level revenue intelligence — recovery, attribution, branch comparison, and lost opportunity tracking."
-        badge={source === 'live' ? 'Live DB' : 'Demo'}
-        badgeColor={source === 'live' ? 'emerald' : 'blue'}
+        subtitle="CFO-level revenue intelligence — recovery, attribution, branch mix, and live opportunity tracking."
+        badge={loadError ? 'Live Data Error' : liveReady ? 'Live DB' : 'Loading'}
+        badgeColor={loadError ? 'red' : liveReady ? 'emerald' : 'blue'}
         actions={
           <div className="flex gap-2">
             <button type="button" onClick={exportReport} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] transition">
@@ -68,22 +90,28 @@ export default function Revenue() {
         }
       />
 
+      {loadError && (
+        <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          Revenue data could not be loaded from the live API: {loadError}
+        </div>
+      )}
+
       {/* KPI Strip */}
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-3 xl:grid-cols-6">
-        <StatCard title="Monthly Revenue" value={formatCurrency(latest.revenue)} subtitle="This month" trend={revGrowth} icon={<TrendingUp className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Revenue Recovered" value={formatCurrency(latest.recovered)} subtitle="By automation" trend={recoveredGrowth} icon={<DollarSign className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Campaign Attribution" value={formatCurrency(latest.campaigns)} subtitle="This month" trend={18} icon={<Megaphone className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Monthly Revenue" value={formatCurrency(latest?.revenue ?? 0)} subtitle="This month" trend={revGrowth} icon={<TrendingUp className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Revenue Recovered" value={formatCurrency(latest?.recovered ?? 0)} subtitle="By automation" trend={recoveredGrowth} icon={<DollarSign className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Campaign Attribution" value={formatCurrency(latest?.campaigns ?? 0)} subtitle="This month" trend={18} icon={<Megaphone className="w-4 h-4" />} accent="violet" />
         <StatCard title="Missed-Call Recovery" value={formatCurrency(3840)} subtitle="Follow-up this month" trend={48} icon={<Phone className="w-4 h-4" />} accent="cyan" />
-        <StatCard title="Lost Opportunities" value={formatCurrency(latest.lost)} subtitle="This month" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
+        <StatCard title="Lost Opportunities" value={formatCurrency(latest?.lost ?? 0)} subtitle="This month" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
         <StatCard title="Recovery Rate" value="72%" subtitle="Of identified opportunities" trend={5} icon={<TrendingUp className="w-4 h-4" />} accent="amber" />
       </div>
 
       {/* Charts row */}
       <div className="grid gap-4 lg:grid-cols-[1.4fr_0.6fr]">
         <BentoCard title="Revenue Performance" subtitle="6-month recovery & growth trend" headerRight={
-          <span className="badge badge-violet">+18% campaign revenue</span>
+          <span className="badge badge-violet">{revenueRecords.length ? '+ live revenue snapshots' : 'No snapshots yet'}</span>
         }>
-          <RevenueChart />
+          <RevenueChart data={revenueRecords} />
         </BentoCard>
 
         {/* Revenue waterfall */}
@@ -109,29 +137,25 @@ export default function Revenue() {
 
       {/* Branch comparison + Service breakdown */}
       <div className="grid gap-4 lg:grid-cols-[1.2fr_0.8fr]">
-        <BentoCard title="Branch Revenue Comparison" subtitle="vs target this month" headerRight={
-          <span className="text-xs font-semibold text-t3">{formatCurrency(branchRevenue.reduce((s, b) => s + b.revenue, 0))} total</span>
+        <BentoCard title="Branch Revenue Mix" subtitle="Live provider revenue by branch" headerRight={
+          <span className="text-xs font-semibold text-t3">{formatCurrency(totalBranchRevenue)} total</span>
         }>
-          <BranchComparisonChart />
+          <BranchComparisonChart data={branchRevenue} />
           <div className="mt-4 space-y-3">
-            {branchRevenue.map((b) => {
-              const pct = Math.round((b.revenue / b.target) * 100);
-              const growth = Math.round(((b.revenue - b.lastMonth) / b.lastMonth) * 100);
+            {branchRevenue.length === 0 ? (
+              <p className="text-xs text-t3 py-2">No live branch revenue data returned yet.</p>
+            ) : branchRevenue.map((branch) => {
+              const share = totalBranchRevenue > 0 ? Math.round((branch.revenue / totalBranchRevenue) * 100) : 0;
               return (
-                <div key={b.name}>
+                <div key={branch.name}>
                   <div className="flex items-center justify-between gap-2 mb-1">
-                    <div className="flex items-center gap-2">
-                      <p className="text-xs font-semibold text-t1">{b.name}</p>
-                      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${growth >= 0 ? 'text-emerald-v bg-[var(--emerald-soft)]' : 'text-red-v bg-[var(--red-soft)]'}`}>
-                        {growth >= 0 ? '+' : ''}{growth}%
-                      </span>
-                    </div>
+                    <p className="text-xs font-semibold text-t1">{branch.name}</p>
                     <div className="text-right">
-                      <span className="text-xs font-bold text-t1">{formatCurrency(b.revenue)}</span>
-                      <span className="text-[10px] text-t3 ml-1">/ {formatCurrency(b.target)} target</span>
+                      <span className="text-xs font-bold text-t1">{formatCurrency(branch.revenue)}</span>
+                      <span className="text-[10px] text-t3 ml-1">{share}% of branch revenue</span>
                     </div>
                   </div>
-                  <ProgressBar value={b.revenue} max={b.target} color={pct >= 90 ? 'emerald' : pct >= 70 ? 'amber' : 'red'} />
+                  <ProgressBar value={share} />
                 </div>
               );
             })}
@@ -140,20 +164,28 @@ export default function Revenue() {
 
         <div className="space-y-4">
           {/* Service category revenue */}
-          <BentoCard title="Service Category Revenue" subtitle="This month breakdown">
+          <BentoCard title="Service Category Revenue" subtitle="Live appointment value by service">
             <div className="space-y-3">
-              {serviceRevenue.map((s) => (
-                <div key={s.service}>
-                  <div className="flex items-center justify-between gap-2 mb-1">
-                    <p className="text-xs font-semibold text-t1 truncate">{s.service}</p>
-                    <div className="flex items-center gap-2 shrink-0">
-                      <span className="text-[10px] text-t3">{s.percent}%</span>
-                      <span className="text-xs font-bold text-t1">{formatCurrency(s.revenue)}</span>
+              {serviceRows.length === 0 ? (
+                <p className="text-xs text-t3 py-2">No live appointment revenue is available to break down by service.</p>
+              ) : (() => {
+                const totalServiceRevenue = serviceRows.reduce((sum, service) => sum + service.revenue, 0);
+                return serviceRows.map((s) => {
+                  const share = totalServiceRevenue > 0 ? Math.round((s.revenue / totalServiceRevenue) * 100) : 0;
+                  return (
+                    <div key={s.service}>
+                      <div className="flex items-center justify-between gap-2 mb-1">
+                        <p className="text-xs font-semibold text-t1 truncate">{s.service}</p>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <span className="text-[10px] text-t3">{share}%</span>
+                          <span className="text-xs font-bold text-t1">{formatCurrency(s.revenue)}</span>
+                        </div>
+                      </div>
+                      <ProgressBar value={share} />
                     </div>
-                  </div>
-                  <ProgressBar value={s.percent} />
-                </div>
-              ))}
+                  );
+                });
+              })()}
             </div>
           </BentoCard>
 
@@ -193,7 +225,11 @@ export default function Revenue() {
               </tr>
             </thead>
             <tbody className="divide-y divide-[var(--b0)]">
-              {revenueRecords.map((row) => (
+              {revenueRecords.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="py-6 px-3 text-center text-xs text-t3">No live revenue snapshots returned for this clinic.</td>
+                </tr>
+              ) : revenueRecords.map((row) => (
                 <tr key={row.month} className="hover:bg-[var(--s3)] transition-colors">
                   <td className="py-2.5 px-3 text-xs font-semibold text-t2">{row.month}</td>
                   <td className="py-2.5 px-3 text-xs font-bold text-t1">{formatCurrency(row.revenue)}</td>
