@@ -131,7 +131,7 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
       const appointment = await tx.appointment.create({
         data: {
           tenantId: request.auth.tenantId, branchId: provider.branchId, patientId: body.patientId,
-          providerRef: providerId, service: body.service, startsAt: body.startsAt, endsAt,
+          providerProfileId: providerId, providerRef: providerId, service: body.service, startsAt: body.startsAt, endsAt,
           status: 'CONFIRMED', channel: body.channel,
         },
       });

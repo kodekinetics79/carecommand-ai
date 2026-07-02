@@ -180,7 +180,7 @@ export const portalRoutes: FastifyPluginAsync = async app => {
       const conflict = await findSlotConflict({ tenantId, providerProfileId: providerId, startsAt: body.startsAt, durationMin: body.durationMin }, tx);
       if (conflict) return { conflict } as const;
       const appointment = await tx.appointment.create({
-        data: { tenantId, branchId: provider.branchId, patientId, providerRef: providerId, service: body.reason, startsAt: body.startsAt, endsAt, status: 'CONFIRMED', channel: body.channel },
+        data: { tenantId, branchId: provider.branchId, patientId, providerProfileId: providerId, providerRef: providerId, service: body.reason, startsAt: body.startsAt, endsAt, status: 'CONFIRMED', channel: body.channel },
       });
       return { appointment } as const;
     });

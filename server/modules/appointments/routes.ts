@@ -21,6 +21,9 @@ const appointmentQuery = paginationSchema.extend({
 const appointmentInput = z.object({
   branchId: z.string().uuid(),
   patientId: z.string().uuid(),
+  // Canonical provider link — when supplied, this appointment participates in
+  // cross-path conflict detection (portal self-book, scheduling module).
+  providerProfileId: z.string().uuid().optional(),
   providerRef: z.string().trim().max(120).optional(),
   service: z.string().trim().min(2).max(160),
   startsAt: z.coerce.date(),
@@ -65,6 +68,12 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
       where: { id: input.patientId, branchId: input.branchId, tenantId: request.auth.tenantId, deletedAt: null },
     });
     if (!patient) throw app.httpErrors.badRequest('Patient and branch must belong to this tenant');
+
+    // Guard the provider FK against cross-tenant references (IDOR).
+    if (input.providerProfileId) {
+      const provider = await db.providerProfile.findFirst({ where: { id: input.providerProfileId, tenantId: request.auth.tenantId }, select: { id: true } });
+      if (!provider) throw app.httpErrors.badRequest('Provider does not belong to this tenant');
+    }
 
     const appointment = await db.appointment.create({
       data: { tenantId: request.auth.tenantId, ...input },

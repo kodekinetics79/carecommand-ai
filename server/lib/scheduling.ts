@@ -103,7 +103,7 @@ async function loadProviderDay(client: Client, tenantId: string, providerProfile
       select: { startsAt: true, endsAt: true },
     }),
     client.appointment.findMany({
-      where: { tenantId, providerRef: providerProfileId, deletedAt: null, status: { in: [...BLOCKING_STATUSES] }, startsAt: { lt: dayEnd, gte: new Date(dayStart.getTime() - 12 * 60 * 60 * 1000) } },
+      where: { tenantId, providerProfileId, deletedAt: null, status: { in: [...BLOCKING_STATUSES] }, startsAt: { lt: dayEnd, gte: new Date(dayStart.getTime() - 12 * 60 * 60 * 1000) } },
       select: { startsAt: true, endsAt: true },
     }),
   ]);
@@ -166,7 +166,7 @@ export async function findSlotConflict(
   if (timeOff) return 'time_off';
 
   const clash = await client.appointment.findFirst({
-    where: { tenantId, providerRef: providerProfileId, deletedAt: null, status: { in: [...BLOCKING_STATUSES] }, startsAt: { lt: endsAt }, endsAt: { gt: startsAt } },
+    where: { tenantId, providerProfileId, deletedAt: null, status: { in: [...BLOCKING_STATUSES] }, startsAt: { lt: endsAt }, endsAt: { gt: startsAt } },
     select: { id: true },
   });
   if (clash) return 'already_booked';

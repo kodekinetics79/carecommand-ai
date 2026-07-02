@@ -354,6 +354,10 @@ model Appointment {
   tenantId     String            @db.Uuid
   branchId     String            @db.Uuid
   patientId    String            @db.Uuid
+  // Canonical provider link used for conflict detection across ALL booking
+  // paths (scheduling, portal self-book, staff). providerRef stays as an
+  // optional free-text display label for backward compatibility.
+  providerProfileId String?      @db.Uuid
   providerRef  String?
   service      String
   serviceCatalogItemId String?     @db.Uuid
@@ -380,10 +384,12 @@ model Appointment {
   depositRequirements DepositRequirement[]
   revenueProtectionAlerts RevenueProtectionAlert[]
   serviceCatalogItem ServiceCatalogItem? @relation(fields: [serviceCatalogItemId], references: [id], onDelete: SetNull)
+  providerProfile ProviderProfile? @relation(fields: [providerProfileId], references: [id], onDelete: SetNull)
 
   @@index([tenantId, branchId, startsAt])
   @@index([tenantId, patientId, startsAt])
   @@index([tenantId, status, startsAt])
+  @@index([tenantId, providerProfileId, startsAt])
 }
 
 model ConsentEvent {
@@ -620,6 +626,7 @@ model ProviderProfile {
   user                  User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   availability          ProviderAvailability[]
   timeOff               ProviderTimeOff[]
+  appointments          Appointment[]
 
   @@index([tenantId, branchId, utilization])
   @@index([tenantId, revenueThisMonth])
