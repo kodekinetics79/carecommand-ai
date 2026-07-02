@@ -34,25 +34,37 @@ export interface RlsRoleStatus {
   hasBypassRls: boolean;
   /** True when the role bypasses RLS for any reason (superuser OR rolbypassrls). */
   bypassesRls: boolean;
+  /** The diagnostic query could not run (e.g. DB not reachable at boot). */
+  checkFailed?: boolean;
 }
 
-/** Inspect the RLS-bypass status of the role on a given connection. */
+/**
+ * Inspect the RLS-bypass status of the role on a given connection. This is an
+ * advisory diagnostic: it must NEVER crash the process, so a query failure
+ * (DB not ready at boot, permissions) resolves to a checkFailed status instead
+ * of throwing. The real tenant control (RLS policies + app-level scoping) is
+ * independent of this check.
+ */
 export async function checkRlsRuntimeRole(client: RawQueryClient = db): Promise<RlsRoleStatus> {
-  const rows = await client.$queryRaw<Array<{ role: string; super: boolean; bypass: boolean }>>`
-    SELECT current_user AS role,
-           rolsuper     AS super,
-           rolbypassrls AS bypass
-    FROM pg_roles
-    WHERE rolname = current_user`;
-  const row = rows[0];
-  const isSuperuser = Boolean(row?.super);
-  const hasBypassRls = Boolean(row?.bypass);
-  return {
-    role: row?.role ?? 'unknown',
-    isSuperuser,
-    hasBypassRls,
-    bypassesRls: isSuperuser || hasBypassRls,
-  };
+  try {
+    const rows = await client.$queryRaw<Array<{ role: string; super: boolean; bypass: boolean }>>`
+      SELECT current_user AS role,
+             rolsuper     AS super,
+             rolbypassrls AS bypass
+      FROM pg_roles
+      WHERE rolname = current_user`;
+    const row = rows[0];
+    const isSuperuser = Boolean(row?.super);
+    const hasBypassRls = Boolean(row?.bypass);
+    return {
+      role: row?.role ?? 'unknown',
+      isSuperuser,
+      hasBypassRls,
+      bypassesRls: isSuperuser || hasBypassRls,
+    };
+  } catch {
+    return { role: 'unknown', isSuperuser: false, hasBypassRls: false, bypassesRls: false, checkFailed: true };
+  }
 }
 
 export function rlsRoleMessage(status: RlsRoleStatus): string {
@@ -83,6 +95,11 @@ interface AssertOptions {
  */
 export async function assertRlsRuntimeRole(options: AssertOptions = {}): Promise<RlsRoleStatus> {
   const status = await checkRlsRuntimeRole(options.client ?? db);
+  // Advisory only: if the check couldn't run, warn but never block boot.
+  if (status.checkFailed) {
+    (options.logger ?? console).warn('RLS runtime-role guard: could not verify the DB role at boot (continuing).');
+    return status;
+  }
   if (!status.bypassesRls) return status;
 
   const message = rlsRoleMessage(status);
