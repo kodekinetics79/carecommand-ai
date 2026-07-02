@@ -21,8 +21,10 @@ services:
     runtime: node
     region: oregon
     plan: free            # fine for testing; spins down when idle
-    buildCommand: npm ci && npm run db:generate
-    preDeployCommand: npm run db:deploy   # runs migrations (paid plans only — else run once manually)
+    # prisma CLI is a prod dependency, so `npm ci` (which omits devDeps under
+    # NODE_ENV=production) still installs it. db:deploy runs migrations here
+    # because preDeployCommand is a paid-plan-only feature (skipped on free).
+    buildCommand: npm ci && npm run db:generate && npm run db:deploy
     startCommand: npm run api:start
     healthCheckPath: /health/live          # liveness; /health/ready 503s until Redis is wired
     autoDeploy: true
