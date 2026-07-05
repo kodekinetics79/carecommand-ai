@@ -1,5 +1,6 @@
 import { Worker } from 'bullmq';
 import { captureException } from '../lib/observability';
+import { observed } from './observedJob';
 import { redisConnection } from './queues';
 import {
   runReadinessRecalc,
@@ -16,7 +17,7 @@ import {
 export function createComplianceWorker(): Worker<Record<string, never>, void, string> {
   const worker = new Worker<Record<string, never>, void, string>(
     'compliance-maintenance',
-    async job => {
+    observed('compliance-maintenance', async job => {
       switch (job.name) {
         case 'readiness-recalc': await runReadinessRecalc(); break;
         case 'evidence-expiry': await runEvidenceExpiry(); break;
@@ -28,7 +29,7 @@ export function createComplianceWorker(): Worker<Record<string, never>, void, st
           console.info('[compliance-job] security scanner not integrated; awaiting supplied scan data');
           break;
       }
-    },
+    }),
     { connection: redisConnection, concurrency: 3 },
   );
 

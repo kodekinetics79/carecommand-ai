@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { z } from 'zod';
+import { booleanString } from '../lib/booleanString';
 
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -13,13 +14,13 @@ const envSchema = z.object({
   REDIS_URL: z.string().url().default('redis://localhost:6379'),
   // Set false on Redis-less deploys (e.g. serverless). The app boots and all
   // request routes work; background jobs are simply not enqueued.
-  QUEUES_ENABLED: z.coerce.boolean().default(true),
+  QUEUES_ENABLED: booleanString(true),
   // RLS runtime-role guard. When the runtime DATABASE_URL role can bypass RLS
   // (superuser or rolbypassrls), tenant RLS policies are silently ineffective.
   // The guard always surfaces this at boot (error log in prod, warn otherwise).
   // Set true to FAIL CLOSED — refuse to boot — once the prod role is `app_rls`.
   // Default false so it can't brick a deploy that hasn't cut over yet.
-  RLS_ENFORCE_RUNTIME_ROLE: z.coerce.boolean().default(false),
+  RLS_ENFORCE_RUNTIME_ROLE: booleanString(false),
   JWT_SECRET: z.string().min(32),
   JWT_REFRESH_SECRET: z.string().min(32),
   // Auth hardening (Phase A). Optional dedicated key for encrypting MFA secrets
@@ -45,6 +46,28 @@ const envSchema = z.object({
   SENTRY_TRACES_SAMPLE_RATE: z.coerce.number().min(0).max(1).default(0),
   SERVICE_ENV: z.string().optional(),
   RELEASE: z.string().optional(),
+  // Logical service name stamped on traces/metrics/logs so the API and worker
+  // are distinguishable in one backend. Overridden per-process where needed.
+  OTEL_SERVICE_NAME: z.string().default('carecommand-api'),
+  // ── Distributed tracing (OpenTelemetry) ───────────────────────────────────
+  // Turn on only when an OTLP endpoint is configured; otherwise the SDK is a
+  // no-op and adds zero overhead. The exporter ships spans over OTLP/HTTP to a
+  // collector or vendor (Grafana Tempo, Honeycomb, Axiom, Sentry, …). Head
+  // sampling keeps cost bounded; 1.0 in dev, ~0.1 in prod is a sane start.
+  OTEL_ENABLED: booleanString(false),
+  OTEL_EXPORTER_OTLP_ENDPOINT: z.string().url().optional(),
+  OTEL_EXPORTER_OTLP_HEADERS: z.string().optional(), // "key=value,key2=value2"
+  OTEL_TRACES_SAMPLER_RATIO: z.coerce.number().min(0).max(1).default(1),
+  // ── Metrics (Prometheus) ──────────────────────────────────────────────────
+  // /metrics is always exposed for scraping. In production it MUST be protected:
+  // set METRICS_TOKEN and scrapers send `Authorization: Bearer <token>`. Unset
+  // in production → the route returns 404 rather than leak internal cardinality.
+  METRICS_ENABLED: booleanString(true),
+  METRICS_TOKEN: z.string().optional(),
+  // The worker records job_duration_seconds/jobs_total in ITS process, so it
+  // serves the registry itself on this port (workers/metricsServer.ts) — the
+  // API's /metrics can't see another process's counters.
+  WORKER_METRICS_PORT: z.coerce.number().int().positive().default(9464),
   AI_PROVIDER: z.enum(['mock', 'ollama', 'openai', 'claude']).default('mock'),
   OLLAMA_MODE: z.enum(['local', 'cloud']).default('local'),
   OLLAMA_BASE_URL: z.string().url().default('http://localhost:11434'),
@@ -52,9 +75,9 @@ const envSchema = z.object({
   OLLAMA_MODEL: z.string().default('llama3.1'),
   OLLAMA_DEFAULT_MODEL: z.string().default('llama3.1'),
   // Governance: keep PHI out of AI by default; cap daily spend; gate sensitive actions.
-  AI_ENABLE_PHI: z.coerce.boolean().default(false),
+  AI_ENABLE_PHI: booleanString(false),
   AI_COST_BUDGET_DAILY_USD: z.coerce.number().nonnegative().default(5),
-  AI_REQUIRE_HUMAN_APPROVAL: z.coerce.boolean().default(true),
+  AI_REQUIRE_HUMAN_APPROVAL: booleanString(true),
   // ── Translation gateway ──────────────────────────────────────────────────
   // `auto` picks the first configured provider; MyMemory needs no key so the
   // app translates out of the box. Add a DeepL/Google key for higher quality.
@@ -72,7 +95,7 @@ const envSchema = z.object({
   INSURANCE_PROVIDER: z.enum(['stedi', 'mock', 'availity', 'pverify', 'optum']).default('mock'),
   STEDI_API_KEY: z.string().optional(),
   STEDI_BASE_URL: z.string().url().default('https://healthcare.us.stedi.com'),
-  STEDI_TEST_MODE: z.coerce.boolean().default(true),
+  STEDI_TEST_MODE: booleanString(true),
   PAYMENT_PROVIDER: z.enum(['stripe', 'mock', 'square', 'authorize_net', 'clover', 'paypal']).default('mock'),
   STRIPE_SECRET_KEY: z.string().optional(),
   STRIPE_WEBHOOK_SECRET: z.string().optional(),

@@ -1,6 +1,14 @@
+// Service identity, then tracing — both before bullmq/ioredis/pg are imported —
+// so worker spans carry service.name=carecommand-worker and link to the request
+// that enqueued the job.
+import './otelDefaults';
+import { shutdownTracing } from '../lib/tracing';
 import type { Worker } from 'bullmq';
 import { env } from '../config/env';
 import { db } from '../lib/db';
+import { registerSentry } from '../lib/observability';
+import { sampleQueueDepths } from '../lib/metrics';
+import { startWorkerMetricsServer } from './metricsServer';
 import {
   autopilotQueue,
   campaignQueue,
@@ -34,6 +42,9 @@ export async function startWorkers(): Promise<WorkerRuntime> {
     throw new Error('startWorkers: QUEUES_ENABLED=false — the worker process needs Redis. Enable queues or do not run the worker.');
   }
 
+  // Durable error capture for background failures (no-op without SENTRY_DSN).
+  await registerSentry();
+
   const workers = [createAutopilotWorker(), createComplianceWorker(), createCampaignWorker()];
 
   // Idempotent on every boot — upsertJobScheduler dedupes by scheduler id, so
@@ -41,10 +52,26 @@ export async function startWorkers(): Promise<WorkerRuntime> {
   await registerComplianceSchedules();
   await registerCampaignSchedules();
 
+  // Publish queue backlog to the metrics registry so alerts can fire on a
+  // growing/stuck queue. The worker is the source of truth for depth; sampling
+  // every 15s is negligible Redis load.
+  const queues = [autopilotQueue, campaignQueue, complianceQueue];
+  await sampleQueueDepths(queues);
+  const depthTimer = setInterval(() => { void sampleQueueDepths(queues); }, 15_000);
+  depthTimer.unref?.();
+
+  // Job metrics (jobs_total, job_duration_seconds) only exist in THIS process;
+  // serve them so Prometheus can scrape the worker directly.
+  const metricsServer = startWorkerMetricsServer();
+
   const shutdown = async () => {
+    clearInterval(depthTimer);
     await Promise.allSettled(workers.map(worker => worker.close()));
     await Promise.allSettled([autopilotQueue.close(), complianceQueue.close(), campaignQueue.close()]);
+    if (metricsServer) await new Promise(resolve => metricsServer.close(() => resolve(null)));
     await db.$disconnect();
+    // Last, so spans emitted while draining still flush to the exporter.
+    await shutdownTracing();
   };
 
   return { workers, shutdown };

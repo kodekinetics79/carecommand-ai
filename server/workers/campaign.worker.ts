@@ -1,5 +1,6 @@
 import { Worker } from 'bullmq';
 import { captureException } from '../lib/observability';
+import { observed } from './observedJob';
 import { redisConnection } from './queues';
 import { runScheduledCampaigns } from '../modules/campaigns/jobs';
 
@@ -10,7 +11,7 @@ import { runScheduledCampaigns } from '../modules/campaigns/jobs';
 export function createCampaignWorker(): Worker<Record<string, never>, void, string> {
   const worker = new Worker<Record<string, never>, void, string>(
     'campaign-scheduler',
-    async () => { await runScheduledCampaigns(); },
+    observed('campaign-scheduler', async () => { await runScheduledCampaigns(); }),
     { connection: redisConnection, concurrency: 1 },
   );
 

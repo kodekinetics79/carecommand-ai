@@ -9,6 +9,7 @@ import { env } from './config/env';
 import { loggerOptions } from './config/logger';
 import { authPlugin } from './plugins/auth';
 import { errorPlugin } from './plugins/errors';
+import { metricsPlugin } from './plugins/metrics';
 import { healthRoutes } from './modules/health/routes';
 import { authRoutes } from './modules/auth/routes';
 import { branchRoutes } from './modules/branches/routes';
@@ -143,6 +144,9 @@ export async function buildApp() {
     await app.register(swaggerUi, { routePrefix: '/docs' });
   }
   await app.register(errorPlugin);
+  // Metrics before auth so its onRequest/onResponse hooks time EVERY route
+  // (including public/webhook ones) and /metrics stays outside the JWT scope.
+  await app.register(metricsPlugin);
   await app.register(authPlugin);
 
   await app.register(healthRoutes);

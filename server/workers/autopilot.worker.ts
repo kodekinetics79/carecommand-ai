@@ -1,6 +1,7 @@
 import { Worker } from 'bullmq';
 import { db } from '../lib/db';
 import { captureException } from '../lib/observability';
+import { observed } from './observedJob';
 import { redisConnection, type AutopilotExecutionJob } from './queues';
 
 // Consumer for the autopilot-execution queue: executes an APPROVED action and
@@ -10,7 +11,7 @@ import { redisConnection, type AutopilotExecutionJob } from './queues';
 export function createAutopilotWorker(): Worker<AutopilotExecutionJob> {
   const worker = new Worker<AutopilotExecutionJob>(
     'autopilot-execution',
-    async job => {
+    observed('autopilot-execution', async job => {
       const approval = await db.autopilotApproval.findFirst({
         where: { id: job.data.approvalId, tenantId: job.data.tenantId, status: 'APPROVED' },
       });
@@ -31,7 +32,7 @@ export function createAutopilotWorker(): Worker<AutopilotExecutionJob> {
           },
         }),
       ]);
-    },
+    }),
     { connection: redisConnection, concurrency: 5 },
   );
 

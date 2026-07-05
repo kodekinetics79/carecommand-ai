@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyPluginAsync, FastifyRequest } from 'fastif
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { db } from '../../lib/db';
+import { booleanString } from '../../lib/booleanString';
 import { audit } from '../../lib/audit';
 import { env } from '../../config/env';
 import { requireRoles } from '../../plugins/roles';
@@ -180,7 +181,8 @@ export const complianceCenterRoutes: FastifyPluginAsync = async app => {
 
   // ===== Evidence (metadata/link/hash only; soft delete; version chain) ====
   app.get('/evidence', { preHandler: complianceRead }, async request => {
-    const query = z.object({ includeDeleted: z.coerce.boolean().default(false), reviewStatus: z.enum(REVIEW_STATUSES).optional() }).parse(request.query);
+    // booleanString, not z.coerce.boolean(): the latter coerces "false" → true.
+    const query = z.object({ includeDeleted: booleanString(false), reviewStatus: z.enum(REVIEW_STATUSES).optional() }).parse(request.query);
     return db.complianceEvidence.findMany({
       where: {
         tenantId: tenant(request),

@@ -49,8 +49,14 @@ services:
     buildCommand: npm ci && npm run db:generate
     startCommand: npm run worker:start
     autoDeploy: true
+    # NOTE: Render workers accept no inbound traffic, so the worker's /metrics
+    # listener (WORKER_METRICS_PORT) is not scrapable here. Job metrics need a
+    # private service + in-network Prometheus/agent, or another host. See
+    # docs/OBSERVABILITY.md#worker-metrics.
     envVars:
       - fromGroup: carecommand-shared
+      - key: OTEL_SERVICE_NAME
+        value: carecommand-worker
       - key: REDIS_URL
         fromService:
           type: keyvalue

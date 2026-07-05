@@ -1,9 +1,13 @@
 import { Queue, type ConnectionOptions } from 'bullmq';
 import { env } from '../config/env';
+import { currentTraceCarrier, type TraceCarrier } from '../lib/traceContext';
 
 export interface AutopilotExecutionJob {
   approvalId: string;
   tenantId: string;
+  // W3C trace context captured at enqueue so the worker's span is a child of
+  // the request that triggered it (one trace_id spans request → job → worker).
+  _otel?: TraceCarrier;
 }
 
 // Queues need Redis. On Redis-less deploys (serverless) set QUEUES_ENABLED=false:
@@ -29,6 +33,8 @@ function disabledQueue<R, V, N extends string>(name: string): Queue<R, V, N> {
     add: async () => undefined,
     close: async () => undefined,
     upsertJobScheduler: async () => undefined,
+    // Zeroed backlog so metrics sampling is a safe no-op when queues are disabled.
+    getJobCounts: async () => ({ waiting: 0, active: 0, delayed: 0, failed: 0 }),
   } as unknown as Queue<R, V, N>;
 }
 
@@ -45,9 +51,11 @@ export const autopilotQueue: Queue<AutopilotExecutionJob, void, 'execute-approve
   : disabledQueue('autopilot-execution');
 
 export async function enqueueAutopilotExecution(data: AutopilotExecutionJob) {
-  await autopilotQueue.add('execute-approved-action', data, {
-    jobId: `autopilot-approval-${data.approvalId}`,
-  });
+  await autopilotQueue.add(
+    'execute-approved-action',
+    { ...data, _otel: data._otel ?? currentTraceCarrier() },
+    { jobId: `autopilot-approval-${data.approvalId}` },
+  );
 }
 
 // ---- Compliance maintenance queue -----------------------------------------
