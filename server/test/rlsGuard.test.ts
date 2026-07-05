@@ -78,9 +78,12 @@ describe('RLS runtime-role guard', () => {
     expect(typeof status.bypassesRls).toBe('boolean');
   });
 
-  it('produces an actionable message naming app_rls and the enforce flag', () => {
+  it('produces an actionable message naming app_rls and the fail-closed contract', () => {
     const message = rlsRoleMessage({ role: 'owner', isSuperuser: false, hasBypassRls: true, bypassesRls: true });
     expect(message).toContain('app_rls');
-    expect(message).toContain('RLS_ENFORCE_RUNTIME_ROLE');
+    // Production enforcement is unconditional now — the message points at the
+    // runbook instead of suggesting a flag that production ignores.
+    expect(message).toContain('fails closed');
+    expect(message).toContain('docs/RLS.md');
   });
 });

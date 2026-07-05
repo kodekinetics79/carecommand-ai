@@ -12,11 +12,14 @@ import { env } from '../config/env';
 // a manual checklist item; this turns it into an automated boot-time guard.
 //
 // Behaviour:
-//   - Always inspects the connected role at boot.
-//   - If it bypasses RLS: error-log in production, warn otherwise.
-//   - If RLS_ENFORCE_RUNTIME_ROLE=true: throw (fail closed) — refuse to boot.
-// The enforce flag defaults OFF so it cannot brick a deploy that has not yet
-// migrated its runtime role to app_rls; flip it on after the cutover.
+//   - Always inspects the connected role at boot (API and worker entrypoints).
+//   - PRODUCTION ALWAYS ENFORCES: an unsafe role refuses to boot, and a role
+//     that cannot be verified (DB unreachable) is retried and then refused —
+//     "cannot verify isolation" is not a state production may run in. The
+//     RLS_ENFORCE_RUNTIME_ROLE flag CANNOT disable this in production.
+//   - Non-production: advisory by default (warn and continue, so dev/test on a
+//     single owner role stay usable); RLS_ENFORCE_RUNTIME_ROLE=true opts into
+//     the same fail-closed behavior (staging, or dev already on app_rls).
 // ===========================================================================
 
 // Minimal shape shared by the Prisma client and an interactive-transaction
@@ -72,7 +75,22 @@ export function rlsRoleMessage(status: RlsRoleStatus): string {
   return `RLS runtime-role guard: database role "${status.role}" BYPASSES row-level security (${reason}). `
     + 'Tenant RLS policies are silently ineffective on this connection — the only tenant control is the '
     + 'application-level filter. Use a restricted role (app_rls, NOSUPERUSER NOBYPASSRLS) for the runtime '
-    + 'DATABASE_URL. Set RLS_ENFORCE_RUNTIME_ROLE=true to make this fatal once the cutover is done.';
+    + 'DATABASE_URL; set its password via prisma/rls/app_rls_setup.sql. Production always fails closed on '
+    + 'this condition (see docs/RLS.md).';
+}
+
+/**
+ * Effective enforcement for the runtime-role guard.
+ *
+ * Production ALWAYS enforces — tenant isolation is release-blocking, so an
+ * unsafe runtime role must never boot silently, and no env flag can turn that
+ * off. Outside production the RLS_ENFORCE_RUNTIME_ROLE flag opts in.
+ */
+export function resolveRlsEnforcement(
+  nodeEnv: string = env.NODE_ENV,
+  enforceFlag: boolean = env.RLS_ENFORCE_RUNTIME_ROLE,
+): boolean {
+  return nodeEnv === 'production' || enforceFlag;
 }
 
 interface AssertLogger {
@@ -82,32 +100,70 @@ interface AssertLogger {
 
 interface AssertOptions {
   client?: RawQueryClient;
-  /** Throw when the role bypasses RLS. Defaults to env.RLS_ENFORCE_RUNTIME_ROLE. */
+  /**
+   * Throw when the role bypasses RLS (or cannot be verified). Defaults to
+   * resolveRlsEnforcement(): ALWAYS true in production; the
+   * RLS_ENFORCE_RUNTIME_ROLE flag opts in elsewhere.
+   */
   enforce?: boolean;
-  /** Drives error-vs-warn log level. Defaults to NODE_ENV==='production'. */
+  /** Drives error-vs-warn log level AND implies enforcement. Defaults to NODE_ENV==='production'. */
   isProduction?: boolean;
   logger?: AssertLogger;
+  /** Retries when the verification query fails (DB waking up at boot). */
+  verifyRetries?: number;
+  /** Delay between verification retries, in ms. */
+  verifyRetryDelayMs?: number;
 }
 
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 /**
- * Boot-time assertion. Returns the role status; logs (or throws when enforced)
- * if the role can bypass RLS. Never throws for a correctly-restricted role.
+ * Boot-time assertion. Returns the role status; never throws for a correctly-
+ * restricted role.
+ *
+ * Fail-closed contract (enforcing = production, or enforce/flag opt-in):
+ *   - role bypasses RLS  → throw (refuse to boot).
+ *   - role unverifiable  → retry (default 4×2500ms ≈ 10s for a DB that is
+ *     still waking), then throw. "Could not verify isolation" must not be a
+ *     bootable production state — a crash-looping deploy is loud; a silently
+ *     unverified one is not.
+ * Advisory (non-enforcing, dev/test): warn and continue in both cases.
  */
 export async function assertRlsRuntimeRole(options: AssertOptions = {}): Promise<RlsRoleStatus> {
-  const status = await checkRlsRuntimeRole(options.client ?? db);
-  // Advisory only: if the check couldn't run, warn but never block boot.
+  const logger = options.logger ?? console;
+  const isProduction = options.isProduction ?? (env.NODE_ENV === 'production');
+  const enforce = options.enforce
+    ?? resolveRlsEnforcement(isProduction ? 'production' : env.NODE_ENV, env.RLS_ENFORCE_RUNTIME_ROLE);
+
+  const client = options.client ?? db;
+  let status = await checkRlsRuntimeRole(client);
+
+  if (status.checkFailed && enforce) {
+    const retries = options.verifyRetries ?? 4;
+    const delayMs = options.verifyRetryDelayMs ?? 2500;
+    for (let attempt = 1; attempt <= retries && status.checkFailed; attempt += 1) {
+      logger.warn(`RLS runtime-role guard: verification query failed (attempt ${attempt}/${retries}) — retrying in ${delayMs}ms.`);
+      await sleep(delayMs);
+      status = await checkRlsRuntimeRole(client);
+    }
+  }
+
   if (status.checkFailed) {
-    (options.logger ?? console).warn('RLS runtime-role guard: could not verify the DB role at boot (continuing).');
+    if (enforce) {
+      throw new Error(
+        'RLS runtime-role guard: could not verify the runtime DB role and enforcement is on '
+        + '(production always enforces). Refusing to boot with unverifiable tenant isolation.',
+      );
+    }
+    logger.warn('RLS runtime-role guard: could not verify the DB role at boot (continuing — advisory mode).');
     return status;
   }
+
   if (!status.bypassesRls) return status;
 
   const message = rlsRoleMessage(status);
-  const enforce = options.enforce ?? env.RLS_ENFORCE_RUNTIME_ROLE;
   if (enforce) throw new Error(message);
 
-  const isProduction = options.isProduction ?? (env.NODE_ENV === 'production');
-  const logger = options.logger ?? console;
   if (isProduction) logger.error(message);
   else logger.warn(message);
   return status;

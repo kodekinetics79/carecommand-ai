@@ -1,6 +1,7 @@
 import type { Worker } from 'bullmq';
 import { env } from '../config/env';
 import { db } from '../lib/db';
+import { assertRlsRuntimeRole } from '../lib/rlsGuard';
 import {
   autopilotQueue,
   campaignQueue,
@@ -33,6 +34,11 @@ export async function startWorkers(): Promise<WorkerRuntime> {
   if (!env.QUEUES_ENABLED) {
     throw new Error('startWorkers: QUEUES_ENABLED=false — the worker process needs Redis. Enable queues or do not run the worker.');
   }
+
+  // Same fail-closed RLS guard as the API: the worker writes tenant data on the
+  // same DATABASE_URL, so an unsafe runtime role must not process a single job.
+  // Production refuses to boot; dev/test warn (or enforce via the env flag).
+  await assertRlsRuntimeRole();
 
   const workers = [createAutopilotWorker(), createComplianceWorker(), createCampaignWorker()];
 

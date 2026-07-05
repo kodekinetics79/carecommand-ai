@@ -65,8 +65,13 @@ envVarGroups:
         value: production
       - key: QUEUES_ENABLED
         value: "true"
+      # Production ALWAYS fails closed on an unsafe runtime DB role (the guard
+      # ignores this flag when NODE_ENV=production). Kept "true" so the intent
+      # is explicit and so staging groups copied from this file inherit it.
+      # PREREQUISITE: DATABASE_URL below must be the restricted app_rls role —
+      # see docs/RLS.md#production-cutover.
       - key: RLS_ENFORCE_RUNTIME_ROLE
-        value: "false"     # keep false until DATABASE_URL is the restricted app_rls role
+        value: "true"
       - key: LOG_LEVEL
         value: info
       - key: AI_PROVIDER
@@ -77,9 +82,11 @@ envVarGroups:
         value: mock
       # Secrets — set in the Render dashboard (Neon connection strings):
       - key: DATABASE_URL
-        sync: false        # postgresql://<role>:<pw>@<neon-host>/<db>?sslmode=require
+        sync: false        # RUNTIME role — MUST be app_rls (NOSUPERUSER NOBYPASSRLS):
+                           # postgresql://app_rls:<pw>@<neon-host>/<db>?sslmode=require
+                           # Password: psql "$DATABASE_MIGRATION_URL" -v app_rls_password="..." -f prisma/rls/app_rls_setup.sql
       - key: DATABASE_MIGRATION_URL
-        sync: false        # Neon OWNER role (used only by migrations)
+        sync: false        # Neon OWNER role — migrations/seed ONLY (bypasses RLS by design)
       # Auto-generated 32+ char secrets (shared by the group):
       - key: JWT_SECRET
         generateValue: true

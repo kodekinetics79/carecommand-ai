@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { db } from '../../lib/db';
+import { runWithTenantContext } from '../../lib/tenantContext';
 import { audit } from '../../lib/audit';
 import { requireRoles } from '../../plugins/roles';
 import { requireFeature } from '../../lib/entitlements';
@@ -45,7 +46,12 @@ export const serviceCatalogRoutes: FastifyPluginAsync = async app => {
   app.post('/', { preHandler: writeRoles }, async (request, reply) => {
     const input = createInput.parse(request.body);
     if (input.depositRuleId) {
-      const rule = await db.depositRule.findFirst({ where: { id: input.depositRuleId, tenantId: request.auth.tenantId }, select: { id: true } });
+      // DepositRule is RLS-FORCEd: under the restricted runtime role this lookup
+      // only sees rows inside a tenant-GUC transaction. db.depositRule here
+      // would return zero rows and reject every valid rule.
+      const rule = await runWithTenantContext(request.auth.tenantId, tx =>
+        tx.depositRule.findFirst({ where: { id: input.depositRuleId!, tenantId: request.auth.tenantId }, select: { id: true } }),
+      );
       if (!rule) throw app.httpErrors.badRequest('depositRuleId does not belong to this tenant');
     }
     const existing = await db.serviceCatalogItem.findFirst({ where: { tenantId: request.auth.tenantId, name: input.name }, select: { id: true } });
@@ -63,7 +69,12 @@ export const serviceCatalogRoutes: FastifyPluginAsync = async app => {
     const existing = await db.serviceCatalogItem.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!existing) throw app.httpErrors.notFound('Service not found');
     if (input.depositRuleId) {
-      const rule = await db.depositRule.findFirst({ where: { id: input.depositRuleId, tenantId: request.auth.tenantId }, select: { id: true } });
+      // DepositRule is RLS-FORCEd: under the restricted runtime role this lookup
+      // only sees rows inside a tenant-GUC transaction. db.depositRule here
+      // would return zero rows and reject every valid rule.
+      const rule = await runWithTenantContext(request.auth.tenantId, tx =>
+        tx.depositRule.findFirst({ where: { id: input.depositRuleId!, tenantId: request.auth.tenantId }, select: { id: true } }),
+      );
       if (!rule) throw app.httpErrors.badRequest('depositRuleId does not belong to this tenant');
     }
     const row = await db.serviceCatalogItem.update({

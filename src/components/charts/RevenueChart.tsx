@@ -52,7 +52,12 @@ export default function RevenueChart({ data }: RevenueChartProps) {
   if (data) {
     return <RevenueChartView data={data} emptyMessage="No revenue data available." />;
   }
+  // Hooks cannot sit below a conditional return, so the live-fetching variant
+  // is its own component (identical behavior: the hook only ran on this path).
+  return <LiveRevenueChart />;
+}
 
+function LiveRevenueChart() {
   const { data: liveData, source, loading, error } = useApiResource<ApiRevenueSnapshot, RevenueChartRow>(
     '/v1/revenue-snapshots?limit=100',
     [],

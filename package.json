@@ -18,6 +18,7 @@
     "db:seed": "tsx prisma/seed.ts",
     "db:seed:coverage": "tsx prisma/seedModuleCoverage.ts",
     "verify:modules": "tsx server/scripts/verifyModuleCoverage.ts",
+    "rls:verify": "tsx server/scripts/verifyRlsStatus.ts",
     "simulate": "vitest run server/test/e2e.simulation.test.ts",
     "pilot:simulate": "tsx server/scripts/pilotSimulation.ts",
     "demo:sandbox": "tsx server/scripts/seedDemoSandbox.ts",
