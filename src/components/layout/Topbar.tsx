@@ -1,10 +1,11 @@
-import { useState } from 'react';
+import { lazy, Suspense, useState } from 'react';
 import { useLocation, useNavigate, Link } from 'react-router-dom';
 import { Search, Command, ChevronDown, ChevronRight, LogOut, Settings as SettingsIcon, Globe } from 'lucide-react';
-import CommandPalette from '../ui/CommandPalette';
 import BackButton from './BackButton';
 import { useSession } from '../../hooks/useSession';
 import { usePreferences, LANGUAGES } from '../../lib/preferences';
+
+const CommandPalette = lazy(() => import('../ui/CommandPalette'));
 
 const routeLabels: Record<string, string> = {
   '/':                 'Command Center',
@@ -160,7 +161,9 @@ export default function Topbar() {
         )}
       </header>
 
-      <CommandPalette isOpen={cmdOpen} onClose={() => setCmdOpen(false)} />
+      <Suspense fallback={null}>
+        <CommandPalette isOpen={cmdOpen} onClose={() => setCmdOpen(false)} />
+      </Suspense>
     </>
   );
 }

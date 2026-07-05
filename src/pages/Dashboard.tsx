@@ -14,7 +14,7 @@ import BranchHealthCard from '../components/dashboard/BranchHealthCard';
 import CampaignROIPanel from '../components/dashboard/CampaignROIPanel';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapRevenueSnapshot, type ApiRevenueSnapshot } from '../lib/apiAdapters';
-import RevenueChart, { type RevenueChartRow } from '../components/charts/RevenueChart';
+import type { RevenueChartRow } from '../components/charts/RevenueChart';
 import {
   dashboardService,
   type DashboardSummary, type BranchHealth, type ProviderUtilization, type CampaignROI, type PriorityAction,
@@ -22,6 +22,7 @@ import {
 
 // Heavy panels are code-split so they don't bloat the route bundle.
 const ProviderUtilizationPanel = lazy(() => import('../components/dashboard/ProviderUtilizationPanel'));
+const RevenueChart = lazy(() => import('../components/charts/RevenueChart'));
 
 /**
  * Dashboard — single-viewport cockpit. On desktop everything fits one screen
@@ -108,7 +109,9 @@ export default function Dashboard() {
       <div className="dash-viz">
         <BentoCard className="cockpit-card" title="Revenue Performance" subtitle="Recovery & growth trend"
           headerRight={<LineChart className="w-4 h-4 text-violet-v" aria-hidden="true" />}>
-          <RevenueChart data={snapshots} loading={snapshotsLoading} fitParent />
+          <Suspense fallback={<div className="skeleton-line h-full min-h-[140px] rounded-xl" />}>
+            <RevenueChart data={snapshots} loading={snapshotsLoading} fitParent />
+          </Suspense>
         </BentoCard>
         <BentoCard className="cockpit-card" title="Provider Capacity" subtitle="Utilization mix & ranking"
           headerRight={<Gauge className="w-4 h-4 text-indigo" aria-hidden="true" />}>

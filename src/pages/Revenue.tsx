@@ -1,11 +1,10 @@
+import { lazy, Suspense } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { TrendingUp, DollarSign, Phone, Megaphone, AlertCircle, ArrowRight, Zap, BarChart3 } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
-import RevenueChart from '../components/charts/RevenueChart';
-import BranchComparisonChart from '../components/charts/BranchComparisonChart';
 import type { Appointment, Doctor } from '../types';
 import { formatCurrency } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
@@ -22,6 +21,9 @@ type BarColor = 'blue' | 'violet' | 'emerald' | 'red' | 'teal';
 interface BranchOption { id: string; name: string }
 
 type RevenueRow = ReturnType<typeof mapRevenueSnapshot>;
+
+const RevenueChart = lazy(() => import('../components/charts/RevenueChart'));
+const BranchComparisonChart = lazy(() => import('../components/charts/BranchComparisonChart'));
 
 export default function Revenue() {
   const navigate = useNavigate();
@@ -111,7 +113,9 @@ export default function Revenue() {
         <BentoCard title="Revenue Performance" subtitle="6-month recovery & growth trend" headerRight={
           <span className="badge badge-violet">{revenueRecords.length ? '+ live revenue snapshots' : 'No snapshots yet'}</span>
         }>
-          <RevenueChart data={revenueRecords} />
+          <Suspense fallback={<div className="flex h-[220px] items-center justify-center"><div className="skeleton-line w-full h-full rounded-xl" /></div>}>
+            <RevenueChart data={revenueRecords} />
+          </Suspense>
         </BentoCard>
 
         {/* Revenue waterfall */}
@@ -140,7 +144,9 @@ export default function Revenue() {
         <BentoCard title="Branch Revenue Mix" subtitle="Live provider revenue by branch" headerRight={
           <span className="text-xs font-semibold text-t3">{formatCurrency(totalBranchRevenue)} total</span>
         }>
-          <BranchComparisonChart data={branchRevenue} />
+          <Suspense fallback={<div className="flex h-[200px] items-center justify-center"><div className="skeleton-line w-full h-full rounded-xl" /></div>}>
+            <BranchComparisonChart data={branchRevenue} />
+          </Suspense>
           <div className="mt-4 space-y-3">
             {branchRevenue.length === 0 ? (
               <p className="text-xs text-t3 py-2">No live branch revenue data returned yet.</p>

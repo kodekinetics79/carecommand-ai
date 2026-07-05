@@ -2,13 +2,9 @@ import { lazy, Suspense, type ReactNode } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, Outlet, useLocation } from 'react-router-dom';
 import Sidebar from '../components/layout/Sidebar';
 import Topbar from '../components/layout/Topbar';
+import LazyBoundary from '../components/ui/LazyBoundary';
 import { useSession } from '../hooks/useSession';
 import { usePreferences } from '../lib/preferences';
-import AutoTranslate from '../components/AutoTranslate';
-import {
-  ClientDashboard, ClientAppointments, ClientRequests, ClientIntake,
-  ClientInsurance, ClientPayments, ClientProfile, ClientPreferences,
-} from '../pages/client/ClientSections';
 
 const Login = lazy(() => import('../pages/Login'));
 const Dashboard = lazy(() => import('../pages/Dashboard'));
@@ -53,6 +49,17 @@ const ClientLogin = lazy(() => import('../pages/client/ClientLogin'));
 const ClientLayout = lazy(() => import('../pages/client/ClientLayout'));
 const Settings = lazy(() => import('../pages/Settings'));
 const ControlPlane = lazy(() => import('../pages/ControlPlane'));
+const AutoTranslate = lazy(() => import('../components/AutoTranslate'));
+const ClientDashboard = lazy(() => import('../pages/client/ClientSections').then(m => ({ default: m.ClientDashboard })));
+const ClientAppointments = lazy(() => import('../pages/client/ClientSections').then(m => ({ default: m.ClientAppointments })));
+const ClientRequests = lazy(() => import('../pages/client/ClientSections').then(m => ({ default: m.ClientRequests })));
+const ClientIntake = lazy(() => import('../pages/client/ClientSections').then(m => ({ default: m.ClientIntake })));
+const ClientInsurance = lazy(() => import('../pages/client/ClientSections').then(m => ({ default: m.ClientInsurance })));
+const ClientPayments = lazy(() => import('../pages/client/ClientSections').then(m => ({ default: m.ClientPayments })));
+const ClientProfile = lazy(() => import('../pages/client/ClientSections').then(m => ({ default: m.ClientProfile })));
+const ClientPreferences = lazy(() => import('../pages/client/ClientSections').then(m => ({ default: m.ClientPreferences })));
+
+const routeFallback = <div className="skeleton h-48 rounded-2xl" />;
 
 function ProtectedLayout() {
   const { loading, isAuthenticated } = useSession();
@@ -76,9 +83,13 @@ function ProtectedLayout() {
         <Topbar />
         <div className="app-scroll">
           <div className="app-inner">
-            <Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}>
+            <LazyBoundary
+              fallback={routeFallback}
+              title="Module loading failed"
+              description="The route chunk could not be loaded. Refresh the page to try again."
+            >
               <div key={`${currency}-${language}`}><Outlet /></div>
-            </Suspense>
+            </LazyBoundary>
           </div>
         </div>
       </div>
@@ -118,9 +129,13 @@ function AdminRoute() {
   }
 
   return (
-    <Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}>
+    <LazyBoundary
+      fallback={routeFallback}
+      title="Admin module loading failed"
+      description="The control-plane chunk could not be loaded. Refresh the page to try again."
+    >
       <ControlPlane />
-    </Suspense>
+    </LazyBoundary>
   );
 }
 
@@ -138,9 +153,13 @@ function ComplianceRoute() {
   }
 
   return (
-    <Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}>
+    <LazyBoundary
+      fallback={routeFallback}
+      title="Compliance module loading failed"
+      description="The compliance chunk could not be loaded. Refresh the page to try again."
+    >
       <ComplianceCenter />
-    </Suspense>
+    </LazyBoundary>
   );
 }
 
@@ -148,28 +167,34 @@ export default function App() {
   return (
     <BrowserRouter>
       {/* Runtime auto-translation across login, staff app, and patient portal. */}
-      <AutoTranslate />
+      <Suspense fallback={null}>
+        <AutoTranslate />
+      </Suspense>
       <Routes>
         <Route
           path="/login"
           element={
             <PublicRoute>
-              <Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}>
+              <LazyBoundary
+                fallback={routeFallback}
+                title="Login module loading failed"
+                description="The login chunk could not be loaded. Refresh the page to try again."
+              >
                 <Login />
-              </Suspense>
+              </LazyBoundary>
             </PublicRoute>
           }
         />
         {/* Patient-facing intake via tokenized link (no auth). */}
-        <Route path="/intake/:token" element={<Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}><PublicIntake /></Suspense>} />
+        <Route path="/intake/:token" element={<LazyBoundary fallback={routeFallback} title="Intake module loading failed" description="The intake chunk could not be loaded. Refresh the page to try again."><PublicIntake /></LazyBoundary>} />
         {/* Customer-facing pilot proof-of-concept view (hashed share token). */}
-        <Route path="/pilot/:token" element={<Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}><PilotStatusShare /></Suspense>} />
+        <Route path="/pilot/:token" element={<LazyBoundary fallback={routeFallback} title="Pilot module loading failed" description="The pilot chunk could not be loaded. Refresh the page to try again."><PilotStatusShare /></LazyBoundary>} />
         {/* Platform Admin Console — separate PlatformUser identity (NOT tenant auth). */}
-        <Route path="/platform/login" element={<Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}><PlatformLogin /></Suspense>} />
-        <Route path="/platform" element={<Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}><PlatformConsole /></Suspense>} />
+        <Route path="/platform/login" element={<LazyBoundary fallback={routeFallback} title="Platform login loading failed" description="The platform login chunk could not be loaded. Refresh the page to try again."><PlatformLogin /></LazyBoundary>} />
+        <Route path="/platform" element={<LazyBoundary fallback={routeFallback} title="Platform console loading failed" description="The platform console chunk could not be loaded. Refresh the page to try again."><PlatformConsole /></LazyBoundary>} />
         {/* Patient / Client Portal — separate PatientPortalAccount identity (NOT staff auth). */}
-        <Route path="/client/login" element={<Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}><ClientLogin /></Suspense>} />
-        <Route path="/client" element={<Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}><ClientLayout /></Suspense>}>
+        <Route path="/client/login" element={<LazyBoundary fallback={routeFallback} title="Client login loading failed" description="The client login chunk could not be loaded. Refresh the page to try again."><ClientLogin /></LazyBoundary>} />
+        <Route path="/client" element={<LazyBoundary fallback={routeFallback} title="Client portal loading failed" description="The client portal chunk could not be loaded. Refresh the page to try again."><ClientLayout /></LazyBoundary>}>
           <Route index element={<ClientDashboard />} />
           <Route path="appointments" element={<ClientAppointments />} />
           <Route path="requests" element={<ClientRequests />} />

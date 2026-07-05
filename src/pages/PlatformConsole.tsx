@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   ShieldCheck, Loader2, LogOut, Building2, FileCheck2, Users2, ScrollText, Ban, Play,
@@ -11,7 +11,8 @@ import {
   type PlatformMe, type TenantSummary, type SystemHealth, type TenantBilling, type AiUsageView, type SecurityView, type IntegrationView,
 } from '../lib/platformAdmin';
 import { healthScore } from '../lib/platformServices';
-import PlatformPilot from './PlatformPilot';
+
+const PlatformPilot = lazy(() => import('./PlatformPilot'));
 
 type Overview = { tenants: number; activeTenants: number; suspendedTenants: number; pendingRequests: number; platformUsers: number };
 
@@ -134,7 +135,11 @@ export default function PlatformConsole() {
         <div className="max-w-6xl mx-auto px-6 py-6 space-y-6 animate-fade-up">
           {section === 'overview' && <OverviewSection overview={overview} onGoTenants={() => setSection('tenants')} />}
           {section === 'tenants' && <TenantsTab onOpenTenant={openTenant} />}
-          {section === 'pilot' && <PlatformPilot />}
+          {section === 'pilot' && (
+            <Suspense fallback={<div className="rounded-2xl border border-[var(--b1)] bg-[var(--s1)] px-4 py-4 text-sm text-t3">Loading pilot launchpad…</div>}>
+              <PlatformPilot />
+            </Suspense>
+          )}
           {section === 'requests' && <RequestsTab />}
           {section === 'plans' && <PlansSection />}
           {section === 'entitlements' && <TenantPicker title="Feature entitlements" subtitle="Open a tenant to toggle any of the 15 premium features (platform override)" hint="features" onOpenTenant={openTenant} />}
