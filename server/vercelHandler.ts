@@ -12,9 +12,8 @@ async function getApp(): Promise<App> {
   if (!appPromise) {
     appPromise = buildApp().then(async app => {
       await app.ready();
-      // Boot-time RLS runtime-role guard (see server/lib/rlsGuard.ts). On a
-      // cold start this loudly surfaces — or, when enforced, rejects — a DB role
-      // that can bypass tenant RLS.
+      // Boot-time RLS runtime-role guard. Production always fails closed; dev
+      // can opt in via RLS_ENFORCE_RUNTIME_ROLE.
       await assertRlsRuntimeRole({ logger: app.log });
       return app;
     });

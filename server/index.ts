@@ -13,8 +13,8 @@ const app = await buildApp();
 // Activate durable error capture (no-op unless SENTRY_DSN + @sentry/node present).
 await registerSentry(app.log);
 
-// Fail closed (when RLS_ENFORCE_RUNTIME_ROLE=true) or loudly warn if the runtime
-// DB role can bypass tenant RLS. Surfaces the prod cutover requirement at boot.
+// Fail closed in production, and optionally in non-production via
+// RLS_ENFORCE_RUNTIME_ROLE. Surfaces the prod cutover requirement at boot.
 await assertRlsRuntimeRole({ logger: app.log });
 
 async function shutdown() {

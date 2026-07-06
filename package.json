@@ -21,6 +21,7 @@
     "simulate": "vitest run server/test/e2e.simulation.test.ts",
     "pilot:simulate": "tsx server/scripts/pilotSimulation.ts",
     "demo:sandbox": "tsx server/scripts/seedDemoSandbox.ts",
+    "rls:verify": "tsx server/scripts/verifyRlsStatus.ts",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "test": "vitest run",

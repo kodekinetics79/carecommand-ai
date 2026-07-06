@@ -13,10 +13,9 @@ import { env } from '../config/env';
 //
 // Behaviour:
 //   - Always inspects the connected role at boot.
-//   - If it bypasses RLS: error-log in production, warn otherwise.
-//   - If RLS_ENFORCE_RUNTIME_ROLE=true: throw (fail closed) — refuse to boot.
-// The enforce flag defaults OFF so it cannot brick a deploy that has not yet
-// migrated its runtime role to app_rls; flip it on after the cutover.
+//   - Production always fails closed on unsafe or unverifiable roles.
+//   - Non-production logs unsafe roles unless RLS_ENFORCE_RUNTIME_ROLE=true.
+// The enforce flag only opts non-production into fail-closed mode.
 // ===========================================================================
 
 // Minimal shape shared by the Prisma client and an interactive-transaction
@@ -72,7 +71,7 @@ export function rlsRoleMessage(status: RlsRoleStatus): string {
   return `RLS runtime-role guard: database role "${status.role}" BYPASSES row-level security (${reason}). `
     + 'Tenant RLS policies are silently ineffective on this connection — the only tenant control is the '
     + 'application-level filter. Use a restricted role (app_rls, NOSUPERUSER NOBYPASSRLS) for the runtime '
-    + 'DATABASE_URL. Set RLS_ENFORCE_RUNTIME_ROLE=true to make this fatal once the cutover is done.';
+    + 'DATABASE_URL. Set RLS_ENFORCE_RUNTIME_ROLE=true in non-production to make this fatal before cutover.';
 }
 
 interface AssertLogger {
@@ -94,19 +93,22 @@ interface AssertOptions {
  * if the role can bypass RLS. Never throws for a correctly-restricted role.
  */
 export async function assertRlsRuntimeRole(options: AssertOptions = {}): Promise<RlsRoleStatus> {
+  const isProduction = options.isProduction ?? (env.NODE_ENV === 'production');
+  const enforce = isProduction || (options.enforce ?? env.RLS_ENFORCE_RUNTIME_ROLE);
   const status = await checkRlsRuntimeRole(options.client ?? db);
-  // Advisory only: if the check couldn't run, warn but never block boot.
   if (status.checkFailed) {
-    (options.logger ?? console).warn('RLS runtime-role guard: could not verify the DB role at boot (continuing).');
+    const message = 'RLS runtime-role guard: could not verify the DB role at boot.';
+    if (enforce) {
+      throw new Error(`${message} Refusing to boot.`);
+    }
+    (options.logger ?? console).warn(`${message} Continuing in non-production without enforcement.`);
     return status;
   }
   if (!status.bypassesRls) return status;
 
   const message = rlsRoleMessage(status);
-  const enforce = options.enforce ?? env.RLS_ENFORCE_RUNTIME_ROLE;
   if (enforce) throw new Error(message);
 
-  const isProduction = options.isProduction ?? (env.NODE_ENV === 'production');
   const logger = options.logger ?? console;
   if (isProduction) logger.error(message);
   else logger.warn(message);

@@ -45,18 +45,14 @@ describe('RLS runtime-role guard', () => {
     ).rejects.toThrow(/BYPASSES row-level security/);
   });
 
-  it('in production without enforcement, logs an error instead of throwing', async () => {
-    const errors: string[] = [];
-    const logger = { warn: () => {}, error: (m: string) => errors.push(m) };
-    const status = await assertRlsRuntimeRole({
+  it('in production, unsafe roles always throw even if enforcement is disabled', async () => {
+    const logger = { warn: () => {}, error: () => {} };
+    await expect(assertRlsRuntimeRole({
       enforce: false,
       isProduction: true,
       logger,
       client: roleClient('owner', false, true),
-    });
-    expect(status.bypassesRls).toBe(true);
-    expect(errors).toHaveLength(1);
-    expect(errors[0]).toContain('BYPASSES row-level security');
+    })).rejects.toThrow(/BYPASSES row-level security/);
   });
 
   it('a restricted role is silent and never throws, even when enforced', async () => {

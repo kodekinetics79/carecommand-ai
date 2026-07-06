@@ -6,6 +6,7 @@ import { shutdownTracing } from '../lib/tracing';
 import type { Worker } from 'bullmq';
 import { env } from '../config/env';
 import { db } from '../lib/db';
+import { assertRlsRuntimeRole } from '../lib/rlsGuard';
 import { registerSentry } from '../lib/observability';
 import { sampleQueueDepths } from '../lib/metrics';
 import { startWorkerMetricsServer } from './metricsServer';
@@ -44,6 +45,9 @@ export async function startWorkers(): Promise<WorkerRuntime> {
 
   // Durable error capture for background failures (no-op without SENTRY_DSN).
   await registerSentry();
+  // Match the API boot contract: production always fails closed if the runtime
+  // DB role can bypass RLS, and non-production can opt in via the env flag.
+  await assertRlsRuntimeRole();
 
   const workers = [createAutopilotWorker(), createComplianceWorker(), createCampaignWorker()];
 
