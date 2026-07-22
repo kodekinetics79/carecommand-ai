@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { requirePortalAccess, requirePortalFeature, portalAudit } from '../../lib/portalAuth';
 import { publicView, submitSection, submitPacket, readinessScore } from '../../lib/intake';
-import { computeProviderSlots, findSlotConflict, getSchedulingPolicy, unmetPreVisitRequirements } from '../../lib/scheduling';
+import { computeProviderSlots, findSlotConflict, getSchedulingPolicy, isDoubleBookConflictError, unmetPreVisitRequirements } from '../../lib/scheduling';
 
 const n = (v: unknown): number => typeof v === 'object' && v !== null && 'toString' in v ? Number(v) : Number(v) || 0;
 
@@ -101,7 +101,7 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     const existing = await db.appointmentRequest.findFirst({ where: { tenantId, patientId, status: 'PENDING_REVIEW', requestedService: body.service, requestedDateTime: body.requestedDateTime ?? null } });
     if (existing) return reply.code(200).send({ id: existing.id, status: existing.status, deduped: true });
     const row = await db.appointmentRequest.create({ data: { tenantId, branchId: patient?.branchId ?? null, patientId, requestedService: body.service, requestedDateTime: body.requestedDateTime, collectedName: `${patient?.firstName ?? ''} ${patient?.lastName ?? ''}`.trim(), collectedEmail: patient?.email ?? null, collectedPhone: patient?.phone ?? null, source: 'patient_portal', status: 'PENDING_REVIEW', rawCollectedFields: body.notes ? { notes: body.notes } : undefined } });
-    await portalAudit(tenantId, 'portal.appointmentRequest.created', row.id, request, { service: body.service });
+    await portalAudit(tenantId, 'portal.appointmentRequest.created', row.id, request, { service: body.service }, { critical: true });
     return reply.code(201).send({ id: row.id, status: row.status, deduped: false });
   });
 
@@ -176,17 +176,25 @@ export const portalRoutes: FastifyPluginAsync = async app => {
 
     const endsAt = new Date(body.startsAt.getTime() + body.durationMin * 60_000);
 
-    const result = await db.$transaction(async tx => {
-      const conflict = await findSlotConflict({ tenantId, providerProfileId: providerId, startsAt: body.startsAt, durationMin: body.durationMin }, tx);
-      if (conflict) return { conflict } as const;
-      const appointment = await tx.appointment.create({
-        data: { tenantId, branchId: provider.branchId, patientId, providerProfileId: providerId, providerRef: providerId, service: body.reason, startsAt: body.startsAt, endsAt, status: 'CONFIRMED', channel: body.channel },
+    // DB exclusion constraint is the final guard if a concurrent booking races
+    // past the in-transaction conflict check.
+    let result: { conflict: Awaited<ReturnType<typeof findSlotConflict>> } | { appointment: Awaited<ReturnType<typeof db.appointment.create>> };
+    try {
+      result = await db.$transaction(async tx => {
+        const conflict = await findSlotConflict({ tenantId, providerProfileId: providerId, startsAt: body.startsAt, durationMin: body.durationMin }, tx);
+        if (conflict) return { conflict } as const;
+        const appointment = await tx.appointment.create({
+          data: { tenantId, branchId: provider.branchId, patientId, providerProfileId: providerId, providerRef: providerId, service: body.reason, startsAt: body.startsAt, endsAt, status: 'CONFIRMED', channel: body.channel },
+        });
+        return { appointment } as const;
       });
-      return { appointment } as const;
-    });
+    } catch (error) {
+      if (isDoubleBookConflictError(error)) return reply.code(409).send({ error: 'slot_unavailable', reason: 'already_booked' });
+      throw error;
+    }
     if ('conflict' in result) return reply.code(409).send({ error: 'slot_unavailable', reason: result.conflict });
 
-    await portalAudit(tenantId, 'portal.appointment.booked', result.appointment.id, request, { providerId });
+    await portalAudit(tenantId, 'portal.appointment.booked', result.appointment.id, request, { providerId }, { critical: true });
     return reply.code(201).send(safeAppt(result.appointment));
   });
 
@@ -210,7 +218,7 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     const packet = await db.patientIntakePacket.findFirst({ where: { id: packetId, tenantId, patientId }, select: { id: true } });
     if (!packet) return reply.code(404).send({ error: 'not_found' });
     const result = await submitSection(tenantId, packetId, body.sectionType, body.data as Record<string, unknown>, { source: 'patient_portal' });
-    await portalAudit(tenantId, 'portal.intake.updated', packetId, request, { sectionType: body.sectionType });
+    await portalAudit(tenantId, 'portal.intake.updated', packetId, request, { sectionType: body.sectionType }, { critical: true });
     return result;
   });
   app.post('/intake/:packetId/submit', async (request, reply) => {
@@ -219,7 +227,7 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     const packet = await db.patientIntakePacket.findFirst({ where: { id: packetId, tenantId, patientId }, select: { id: true } });
     if (!packet) return reply.code(404).send({ error: 'not_found' });
     const result = await submitPacket(tenantId, packetId);
-    await portalAudit(tenantId, 'portal.intake.submitted', packetId, request);
+    await portalAudit(tenantId, 'portal.intake.submitted', packetId, request, undefined, { critical: true });
     return result;
   });
 
@@ -237,11 +245,11 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     const existing = await db.patientInsurancePolicy.findFirst({ where: { tenantId, patientId, memberId: body.memberId } });
     if (existing) {
       await db.patientInsurancePolicy.update({ where: { id: existing.id }, data: { planName: body.planName, groupNumber: body.groupNumber, subscriberName: body.subscriberName, verificationStatus: 'pending', active: true } });
-      await portalAudit(tenantId, 'portal.insurance.updated', existing.id, request, { deduped: true });
+      await portalAudit(tenantId, 'portal.insurance.updated', existing.id, request, { deduped: true }, { critical: true });
       return { id: existing.id, status: 'pending_review', deduped: true };
     }
     const row = await db.patientInsurancePolicy.create({ data: { tenantId, branchId: patient?.branchId ?? (await firstBranch(tenantId)), patientId, planName: body.planName, memberId: body.memberId, groupNumber: body.groupNumber, subscriberName: body.subscriberName, verificationStatus: 'pending', active: true } });
-    await portalAudit(tenantId, 'portal.insurance.updated', row.id, request);
+    await portalAudit(tenantId, 'portal.insurance.updated', row.id, request, undefined, { critical: true });
     return reply.code(201).send({ id: row.id, status: 'pending_review', deduped: false });
   });
   app.patch('/insurance/:policyId', async (request, reply) => {
@@ -251,7 +259,7 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     const existing = await db.patientInsurancePolicy.findFirst({ where: { id: policyId, tenantId, patientId } });
     if (!existing) return reply.code(404).send({ error: 'not_found' });
     await db.patientInsurancePolicy.update({ where: { id: policyId }, data: { planName: body.planName, groupNumber: body.groupNumber, subscriberName: body.subscriberName, verificationStatus: 'pending' } });
-    await portalAudit(tenantId, 'portal.insurance.updated', policyId, request);
+    await portalAudit(tenantId, 'portal.insurance.updated', policyId, request, undefined, { critical: true });
     return { id: policyId, status: 'pending_review' };
   });
 
@@ -278,7 +286,7 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     if (!e) return reply.code(404).send({ error: 'not_found' });
     if (e.acknowledgedAt) return { id, acknowledged: true, deduped: true }; // idempotent
     await db.patientResponsibilityEstimate.update({ where: { id }, data: { acknowledgedAt: new Date() } });
-    await portalAudit(tenantId, 'portal.estimate.acknowledged', id, request);
+    await portalAudit(tenantId, 'portal.estimate.acknowledged', id, request, undefined, { critical: true });
     return { id, acknowledged: true, deduped: false };
   });
   app.post('/payment-policy/acknowledge', async request => {
@@ -286,7 +294,7 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     const acct = await db.patientPortalAccount.findUnique({ where: { id: accountId }, select: { paymentPolicyAckAt: true } });
     if (acct?.paymentPolicyAckAt) return { acknowledged: true, deduped: true }; // idempotent
     await db.patientPortalAccount.update({ where: { id: accountId }, data: { paymentPolicyAckAt: new Date() } });
-    await portalAudit(tenantId, 'portal.paymentPolicy.acknowledged', patientId, request);
+    await portalAudit(tenantId, 'portal.paymentPolicy.acknowledged', patientId, request, undefined, { critical: true });
     return { acknowledged: true, deduped: false };
   });
 
@@ -301,7 +309,7 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     const body = z.object({ email: z.string().email().trim().optional(), phone: z.string().trim().max(40).optional() }).parse(request.body);
     await db.patient.update({ where: { id: patientId }, data: { email: body.email, phone: body.phone } });
     await db.patientPortalAccount.updateMany({ where: { tenantId, patientId }, data: { email: body.email, phone: body.phone } });
-    await portalAudit(tenantId, 'portal.profile.updated', patientId, request);
+    await portalAudit(tenantId, 'portal.profile.updated', patientId, request, undefined, { critical: true });
     return { ok: true };
   });
 

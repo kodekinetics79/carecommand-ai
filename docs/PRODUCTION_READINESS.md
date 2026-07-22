@@ -9,6 +9,10 @@ Legend: ✅ done · 🟡 in progress · ⬜ todo
 - ✅ CI runs typecheck + lint + **tests** + build on every push/PR (Postgres + Redis services).
 - ✅ CI **secret scanning** (gitleaks, blocking) + **dependency audit** (`npm audit --audit-level=high --omit=dev`, **blocking** — production tree at 0 high+ after pinning the dev-only `hono`/`@hono/node-server` transitive via `overrides`).
 - ✅ Production **seed guard** — refuses to load demo data into prod unless `ALLOW_PROD_SEED=true`.
+- ✅ Production legacy platform token is disabled by default. `PLATFORM_API_TOKEN`
+  is accepted in production only when the explicit break-glass flag
+  `PLATFORM_LEGACY_TOKEN_ENABLED=true` is set; prefer PlatformUser login +
+  platform JWT. Proof: `server/test/platformLegacyToken.test.ts`.
 - 🟡 **RLS / DB-level tenant isolation** — mechanism live, enforced on 6 tables, now **CI-proven**, expansion in progress (wave rollout).
   - **How it works:** the runtime connects as the non-bypass role `app_rls`; `server/lib/tenantContext.ts` exposes `runWithTenantContext/JobTenantContext/WebhookTenantContext`, which open a Prisma interactive transaction and `set_config('app.current_tenant_id', …, is_local=true)` on the pinned connection. Policies filter `tenantId = current_setting('app.current_tenant_id')` and **fail closed** when unset.
   - **Enforced today (RLS + FORCE):** `NotificationTemplate`, `AiGuardrail`, `CustomerPreference`, `DepositRule`, `RevenueLeak`, `RevenueProtectionAlert` — every access path adopts `runWithTenantContext` (7 modules).
@@ -22,9 +26,24 @@ Legend: ✅ done · 🟡 in progress · ⬜ todo
 ## Phase 2 — Reliability
 - 🟡 **Background workers** — a **unified worker runtime** (`server/workers/index.ts`, `npm run worker:start`) now drains **all three** queues in one always-on process (autopilot execution, campaign scheduler, compliance maintenance) and registers every repeatable schedule idempotently, with a `QUEUES_ENABLED` guard, graceful shutdown, and worker faults routed to `captureException`. Previously `worker:start` booted autopilot + compliance but **not** campaign, so the campaign queue had no consumer. Proven by `server/test/worker.integration.test.ts` — enqueues an APPROVED autopilot action and asserts the worker executes it (status → EXECUTED + audit) against real Redis + Postgres. *Remaining:* deploy this process to a small always-on host (Render/Fly/Railway) next to the serverless API; the API/Vercel deploy does not host it.
 - ⬜ Neon **pooled** runtime URL + connection-limit review; migration safety (no destructive auto-migrate).
-- ⬜ Automated **backups** + restore drill; rate-limit tuning under load.
+- 🟡 Automated **backups** + restore drill; rate-limit tuning under load.
+  Runbook added: [docs/BACKUP_RESTORE_ROLLBACK_RUNBOOK.md](/Users/zackkhan/carecommand-ai/docs/BACKUP_RESTORE_ROLLBACK_RUNBOOK.md).
+  The runbook still needs execution against the actual pilot hosting stack.
 
 ## Phase 3 — Real integrations (config-gated; `mock` stays the safe default)
+- ✅ **Deployment profile gates** — mock integrations can no longer masquerade as
+  a validation environment. `DEPLOYMENT_PROFILE` (`demo`|`pilot`|`enterprise`,
+  default `demo`; independent of `NODE_ENV` so the E2E harness keeps booting)
+  activates a boot-time gate in `server/config/env.ts`: under `pilot`/`enterprise`,
+  any of `PAYMENT_PROVIDER`/`INSURANCE_PROVIDER`/`AI_PROVIDER` still `mock` fails
+  boot unless explicitly acknowledged via `ALLOWED_MOCK_INTEGRATIONS`
+  (comma-separated: `payments,insurance,ai`; unknown tokens always fail boot).
+  `enterprise` additionally **never** allows mock payments, acknowledged or not
+  (money path). Effective posture is truthfully reported at
+  `GET /health/integrations` (provider ids + configured/not_configured flags,
+  no secrets). Proof: `server/test/envSchema.test.ts`,
+  `server/test/observabilityPillars.test.ts`. Contract:
+  [docs/INTEGRATION_MODE_REGISTER.md](/Users/zackkhan/carecommand-ai/docs/INTEGRATION_MODE_REGISTER.md).
 - ⬜ **Stripe** live (deposits, RPM billing export — never auto-submit).
 - ⬜ **Stedi production** eligibility (sandbox already works).
 - ⬜ **Twilio** (SMS/WhatsApp) + email provider + the **Retell** phone number for the receptionist.
@@ -34,6 +53,10 @@ Legend: ✅ done · 🟡 in progress · ⬜ todo
 - ⬜ Self-serve **clinic onboarding** + provisioning + Stripe **subscription billing** + entitlement enforcement.
 - 🟡 Operator-only **pilot launchpad**: tenant provisioning + checklist + downloadable CSV templates + saved clinic mapping presets + shareable customer status links + CSV preview/commit import for patients, appointments, and insurance, with platform audit trail. Still not self-serve, still not generalized ETL.
   - Pilot handoff checklist: [docs/PILOT_HANDOVER_CHECKLIST.md](/Users/zackkhan/carecommand-ai/docs/PILOT_HANDOVER_CHECKLIST.md)
+- 🟡 **Enterprise client validation**: the local synthetic suite is green, but
+  client implementation readiness requires the client to run real-data,
+  real-scenario acceptance testing with evidence capture and formal go/no-go
+  gates. Runbook: [docs/ENTERPRISE_CLIENT_VALIDATION_RUNBOOK.md](/Users/zackkhan/carecommand-ai/docs/ENTERPRISE_CLIENT_VALIDATION_RUNBOOK.md)
 - ⬜ **HIPAA posture**: vendor **BAAs** (Neon, Retell, Twilio, Stedi, AI provider), encryption review, audit-log retention policy, formal security/privacy review.
 
 ## Cross-cutting
@@ -47,4 +70,9 @@ Legend: ✅ done · 🟡 in progress · ⬜ todo
 - ⬜ Expand test coverage on the money paths (payments, eligibility, booking, RLS).
 - ✅ **Module demo-data coverage** — `npm run verify:modules` reports, per the demo tenant, which module tables are empty (a "dead module" renders empty in the UI); it bypasses RLS (owner role) for accurate counts and exits non-zero if any non-ephemeral module is empty. `npm run db:seed:coverage` (idempotent) backfills the modules that had no demo data: compliance policy/risk/task/evidence/exception, security incidents + scans + vendor risk, platform integration, support-access session, the billing/usage/add-on/request commercial layer, outbound-calling targets, consent/intake detail records, and pilot import/share records. Demo tenant now at **107/107 non-ephemeral modules covered**.
 - 🟡 Performance/abuse-hardening: ✅ explicit request **`bodyLimit` (1 MiB)** caps oversized payloads (memory-exhaustion defense), and list pagination is **bounded** (cursor + `limit` max 100). Proven by `server/test/hardening.test.ts` — oversized body → 413; `limit=99999` → 400; a 30-row dataset walks in stable, non-overlapping pages covering every row exactly once. ⬜ still: serverless cold-start budget; bundle size (index chunk ~533 KB); key DB index review.
-- ⬜ Runbooks: incident, rollback, on-call, data-subject requests.
+- 🟡 Runbooks: incident, rollback, on-call, data-subject requests.
+  Added operational runbooks for enterprise validation:
+  [backup/restore/rollback](/Users/zackkhan/carecommand-ai/docs/BACKUP_RESTORE_ROLLBACK_RUNBOOK.md),
+  [incident and integration failure](/Users/zackkhan/carecommand-ai/docs/INCIDENT_AND_INTEGRATION_FAILURE_RUNBOOK.md),
+  and client-run validation in [docs/ENTERPRISE_CLIENT_VALIDATION_RUNBOOK.md](/Users/zackkhan/carecommand-ai/docs/ENTERPRISE_CLIENT_VALIDATION_RUNBOOK.md).
+  These are documented gates until executed in the deployed environment.

@@ -30,10 +30,15 @@ Browser ─► Vercel
 | `AUTH_ENCRYPTION_KEY` | 32 bytes (`openssl rand -base64 32`) |
 | `AI_PROVIDER` | `mock` |
 | `VITE_AUTH_MODE` | `login-required` |
+| `VITE_DEMO_FALLBACK` | `false` |
+| `VITE_DEFAULT_CLINIC_SLUG` | blank, unless the client explicitly wants a prefilled slug |
+| `PLATFORM_LEGACY_TOKEN_ENABLED` | `false` |
 
 > Leave provider keys (Stripe/Twilio/Stedi/Retell…) empty — those modules report
 > `setup_required`; the Stedi sandbox + connected-care sandbox still work.
 > `VITE_*` are build-time, so **redeploy** after changing them. Never put secrets in `VITE_*`.
+> Do not use `PLATFORM_API_TOKEN` in production unless an approved break-glass
+> procedure explicitly sets `PLATFORM_LEGACY_TOKEN_ENABLED=true`.
 
 ### Optional: enable Redis (background jobs)
 Add a serverless Redis (Upstash), set `REDIS_URL=...` and `QUEUES_ENABLED=true`.
@@ -50,7 +55,7 @@ curl -s $APP/health/live                                   # {"status":"ok"}
 curl -s -o /dev/null -w '%{http_code}\n' $APP/v1/auth/me   # 401 (route live)
 ```
 Then in the browser: staff login, and the patient portal at `/client/login`
-(clinic `harley-street-medical`, email `charlotte.whitmore@carecommand.local`).
+using the client-provisioned clinic slug and approved validation patient email.
 
 ## Notes / limits (it's a demo/test env)
 - **No background workers** on serverless — autopilot execution + scheduled

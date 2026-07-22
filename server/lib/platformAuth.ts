@@ -10,8 +10,9 @@ import type { Prisma } from '../generated/prisma/client';
 // Platform Admin identity + RBAC. Separate from tenant auth: platform JWTs use
 // type:'platform' and are never accepted as tenant sessions (the tenant auth
 // plugin rejects any token whose type !== 'access'). The legacy static
-// PLATFORM_API_TOKEN remains accepted (dev/legacy) and maps to a synthetic
-// PLATFORM_OWNER for backward compatibility.
+// PLATFORM_API_TOKEN remains accepted only in non-production or explicit
+// break-glass mode and maps to a synthetic PLATFORM_OWNER for backward
+// compatibility.
 // ===========================================================================
 
 export const PLATFORM_ROLES = ['PLATFORM_OWNER', 'PLATFORM_ADMIN', 'PLATFORM_BILLING', 'PLATFORM_SUPPORT', 'PLATFORM_AUDITOR'] as const;
@@ -44,7 +45,8 @@ export function hashV(value?: string | null): string | null {
   return createHash('sha256').update(value).digest('hex').slice(0, 32);
 }
 
-// preHandler: requires a platform JWT (or legacy static token). Optional role gate.
+// preHandler: requires a platform JWT, or a legacy static token only when
+// explicitly enabled by effectivePlatformToken(). Optional role gate.
 export function requirePlatformAccess(...allowedRoles: PlatformRole[]) {
   return async (request: FastifyRequest, reply: FastifyReply) => {
     let actor: PlatformActor | null = null;

@@ -1,8 +1,9 @@
 # Deploy — Backend on Railway + Frontend on Vercel
 
-The frontend (Vite SPA) already deploys to Vercel. It only breaks because
-`VITE_API_URL` is unset, so it falls back to `http://localhost:3001`. Fix =
-host the backend on Railway, then point Vercel at it.
+The frontend (Vite SPA) already deploys to Vercel. For a split frontend/backend
+pilot, host the backend on Railway, then point Vercel at it with `VITE_API_URL`.
+If `VITE_API_URL` is blank in a production build, the SPA uses same-origin API
+paths, which only works when the API is served from the same origin.
 
 ```
 Browser ──► Vercel (static SPA, VITE_API_URL) ──► Railway API ──► Railway Postgres + Redis
@@ -33,10 +34,16 @@ Browser ──► Vercel (static SPA, VITE_API_URL) ──► Railway API ──
    | `PUBLIC_API_URL` | `https://<your-api>.up.railway.app` (this service's URL) |
    | `AI_PROVIDER` | `mock` (or `ollama` + `OLLAMA_MODE=cloud` + `OLLAMA_API_KEY`) |
    | `VITE_AUTH_MODE` | `login-required` |
+   | `VITE_DEMO_FALLBACK` | `false` |
+   | `VITE_DEFAULT_CLINIC_SLUG` | blank, unless the client explicitly wants a prefilled slug |
+   | `PLATFORM_LEGACY_TOKEN_ENABLED` | `false` |
 
    Optional (seed a platform owner): `PLATFORM_OWNER_EMAIL`, `PLATFORM_OWNER_NAME`,
-   `PLATFORM_OWNER_PASSWORD`. Provider keys (Stripe/Twilio/Stedi…) stay empty —
-   their modules report `setup_required` until set; sandbox flows still work.
+   `PLATFORM_OWNER_PASSWORD`. Do not use `PLATFORM_API_TOKEN` in production
+   unless an approved break-glass procedure explicitly sets
+   `PLATFORM_LEGACY_TOKEN_ENABLED=true`. Provider keys (Stripe/Twilio/Stedi…)
+   stay empty until the client has approved sandbox/live validation; modules
+   report `setup_required` until set.
 
 5. **Settings → Networking → Generate Domain** → that's your `PUBLIC_API_URL`.
 6. **Seed once** (data + sandbox demo). Railway CLI:
@@ -70,6 +77,7 @@ Browser ──► Vercel (static SPA, VITE_API_URL) ──► Railway API ──
    | `VITE_API_URL` | `https://<your-api>.up.railway.app` |
    | `VITE_AUTH_MODE` | `login-required` |
    | `VITE_DEMO_FALLBACK` | `false` |
+   | `VITE_DEFAULT_CLINIC_SLUG` | blank, unless the client explicitly wants a prefilled slug |
 
    > `VITE_*` vars are **build-time** in Vite — you must **redeploy** after adding
    > them. Vars are inlined into the bundle; never put secrets in `VITE_*`.
@@ -85,8 +93,8 @@ API=https://<your-api>.up.railway.app
 curl -s $API/health/live                       # {"status":"ok"}
 curl -s -o /dev/null -w '%{http_code}\n' $API/v1/auth/me   # 401 (route is live)
 ```
-Then in the browser: staff login, and patient portal at `/client/login`
-(clinic `harley-street-medical`, email `charlotte.whitmore@carecommand.local`).
+Then in the browser: staff login, and patient portal at `/client/login` using
+the client-provisioned clinic slug and approved validation patient email.
 
 ## Common gotchas
 - **Still seeing localhost** → `VITE_API_URL` wasn't set, or you didn't redeploy Vercel after setting it.

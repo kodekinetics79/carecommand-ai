@@ -1,4 +1,5 @@
 import type { FastifyPluginAsync } from 'fastify';
+import { appendFile } from 'node:fs/promises';
 import { z } from 'zod';
 import { db } from '../../lib/db';
 import { env } from '../../config/env';
@@ -8,6 +9,11 @@ import { signPortalSession, createMagicToken, hashPortalToken, requirePortalAcce
 // enumeration (we never reveal whether an email/phone matched an account).
 const GENERIC = { status: 'ok', message: 'If an account exists for that clinic, a sign-in link has been sent.' };
 const GENERIC_SIGNUP = { status: 'ok', message: 'Thanks — if your details match a patient record we have sent a sign-in code. Otherwise your clinic will review your request shortly.' };
+
+async function writePortalTokenOutbox(event: { tenantId: string; accountId: string; token: string; channel: 'email' | 'sms'; purpose: 'request-link' | 'signup' }) {
+  if (!env.PORTAL_TOKEN_OUTBOX_PATH) return;
+  await appendFile(env.PORTAL_TOKEN_OUTBOX_PATH, `${JSON.stringify({ ...event, createdAt: new Date().toISOString() })}\n`, { encoding: 'utf8' });
+}
 
 export const portalAuthRoutes: FastifyPluginAsync = async app => {
   // --- Request a magic sign-in link --------------------------------------
@@ -35,6 +41,7 @@ export const portalAuthRoutes: FastifyPluginAsync = async app => {
       await db.patientPortalToken.create({ data: { tenantId: tenant.id, accountId: account.id, tokenHash: t.hash, type: 'magic_login', expiresAt: new Date(Date.now() + portalConfig.MAGIC_TTL_MINUTES * 60_000) } });
     }
     await portalAudit(tenant.id, 'portal.login.requested', account.id, request, { channel: body.email ? 'email' : 'sms', reused: !!recent });
+    if (raw) await writePortalTokenOutbox({ tenantId: tenant.id, accountId: account.id, token: raw, channel: body.email ? 'email' : 'sms', purpose: 'request-link' });
 
     // No portal comms provider is configured, so we never fake delivery. In dev/
     // test only (matching the existing dev-token pattern), surface the raw token
@@ -76,7 +83,9 @@ export const portalAuthRoutes: FastifyPluginAsync = async app => {
         raw = t.raw;
         await db.patientPortalToken.create({ data: { tenantId: tenant.id, accountId: account.id, tokenHash: t.hash, type: 'magic_login', expiresAt: new Date(Date.now() + portalConfig.MAGIC_TTL_MINUTES * 60_000) } });
       }
-      await portalAudit(tenant.id, 'portal.signup.matched', account.id, request, { channel: body.email ? 'email' : 'sms' });
+      // Critical: matching a signup to a patient record starts an access grant.
+      await portalAudit(tenant.id, 'portal.signup.matched', account.id, request, { channel: body.email ? 'email' : 'sms' }, { critical: true });
+      if (raw) await writePortalTokenOutbox({ tenantId: tenant.id, accountId: account.id, token: raw, channel: body.email ? 'email' : 'sms', purpose: 'signup' });
       if (env.NODE_ENV !== 'production' && raw) return { ...GENERIC_SIGNUP, devToken: raw, devNote: 'Dev only — delivery provider not configured.' };
       return GENERIC_SIGNUP;
     }
@@ -99,10 +108,14 @@ export const portalAuthRoutes: FastifyPluginAsync = async app => {
     if (!account || account.status === 'disabled') { await portalAudit(row.tenantId, 'portal.login.failed', row.accountId, request, { reason: 'disabled' }); return reply.code(403).send({ error: 'account_disabled', message: 'This account is disabled.' }); }
     if (account.lockedUntil && account.lockedUntil > new Date()) { await portalAudit(row.tenantId, 'portal.login.failed', account.id, request, { reason: 'locked' }); return reply.code(423).send({ error: 'account_locked', message: 'Account temporarily locked. Try again later.' }); }
 
-    // Single-use: consume the token, then activate + record login.
-    await db.patientPortalToken.update({ where: { id: row.id }, data: { usedAt: new Date() } });
+    // Single-use: consume the token ATOMICALLY. The conditional updateMany only
+    // flips usedAt when it is still NULL, so of N concurrent verifies exactly one
+    // wins (count === 1); every racer that lost the compare-and-set gets 401.
+    const consumed = await db.patientPortalToken.updateMany({ where: { id: row.id, usedAt: null }, data: { usedAt: new Date() } });
+    if (consumed.count !== 1) return reply.code(401).send({ error: 'token_used', message: 'This link has already been used.' });
     await db.patientPortalAccount.update({ where: { id: account.id }, data: { status: 'active', lastLoginAt: new Date(), failedLoginCount: 0, lockedUntil: null } });
-    await portalAudit(account.tenantId, 'portal.login.success', account.id, request);
+    // Critical: a session grant must never proceed unaudited.
+    await portalAudit(account.tenantId, 'portal.login.success', account.id, request, undefined, { critical: true });
 
     const sessionToken = signPortalSession(app, account);
     const patient = await db.patient.findUnique({ where: { id: account.patientId }, select: { firstName: true } });

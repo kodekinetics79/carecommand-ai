@@ -63,6 +63,38 @@ describe('slo — objectives are well-formed and discoverable', () => {
     expect(json.objectives.find((o: { id: string }) => o.id === 'availability')).toBeTruthy();
   });
 
+  it('serves the truthful integration posture at /health/integrations — modes only, never secrets', async () => {
+    const app = Fastify({ logger: false });
+    await app.register(healthRoutes);
+    const res = await app.inject({ method: 'GET', url: '/health/integrations' });
+    await app.close();
+    expect(res.statusCode).toBe(200);
+    const json = res.json();
+
+    // Effective deployment profile is always reported.
+    expect(['demo', 'pilot', 'enterprise']).toContain(json.profile);
+
+    // Provider-mode integrations report the effective provider id.
+    expect(typeof json.integrations.payments).toBe('string');
+    expect(typeof json.integrations.insurance).toBe('string');
+    expect(typeof json.integrations.ai).toBe('string');
+
+    // Channel integrations are presence-derived flags only.
+    for (const channel of ['email', 'sms', 'voice'] as const) {
+      expect(['configured', 'not_configured']).toContain(json.integrations[channel]);
+    }
+
+    expect(Array.isArray(json.acknowledgedMockIntegrations)).toBe(true);
+
+    // No secret material: the response is exactly the documented id/flag shape.
+    expect(Object.keys(json).sort()).toEqual(['acknowledgedMockIntegrations', 'integrations', 'profile']);
+    expect(Object.keys(json.integrations).sort()).toEqual(['ai', 'email', 'insurance', 'payments', 'sms', 'voice']);
+    const body = res.body;
+    for (const secret of [process.env.JWT_SECRET, process.env.STRIPE_SECRET_KEY, process.env.RETELL_API_KEY, process.env.TWILIO_AUTH_TOKEN]) {
+      if (secret) expect(body).not.toContain(secret);
+    }
+  });
+
   it('/health reports release + uptime', async () => {
     const app = Fastify({ logger: false });
     await app.register(healthRoutes);

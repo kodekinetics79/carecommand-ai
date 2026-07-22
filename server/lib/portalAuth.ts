@@ -4,6 +4,7 @@ import type { Prisma } from '../generated/prisma/client';
 import { db } from './db';
 import { env } from '../config/env';
 import { isFeatureEnabled } from './entitlements';
+import { captureException } from './observability';
 
 // Portal identity is separate from staff User. A portal JWT carries type:'portal'
 // so it is rejected by the staff authenticate hook (type must be 'access') and
@@ -77,15 +78,33 @@ export function requirePortalFeature() {
 
 // Tenant-scoped audit (no PHI bodies, no secrets). Writes to the tenant AuditEvent
 // log with a portal.* action; actorUserId stays null (patient, not staff).
-export async function portalAudit(tenantId: string, action: string, resourceId: string | null, request: FastifyRequest | null, metadata?: Prisma.InputJsonObject) {
-  await db.auditEvent.create({
-    data: {
-      tenantId, actorUserId: null, action, resource: 'portal', resourceId,
-      requestId: request?.id ?? null,
-      userAgent: hashUa(request?.headers['user-agent']),
-      metadata: metadata ?? undefined,
-    },
-  }).catch(() => { /* never block a portal action on audit write */ });
+//
+// Audit-loss policy:
+//   critical: true  — the action grants access or touches PHI/payment. The write
+//                     is awaited and a failure THROWS, so the portal action fails
+//                     (500 via the error plugin, which also captures it) rather
+//                     than proceeding unaudited.
+//   default         — never blocks the portal action, but the failure is REPORTED
+//                     through the observability seam with id-only context (never
+//                     swallowed silently).
+export interface PortalAuditOptions { critical?: boolean }
+
+export async function portalAudit(tenantId: string, action: string, resourceId: string | null, request: FastifyRequest | null, metadata?: Prisma.InputJsonObject, options?: PortalAuditOptions) {
+  try {
+    await db.auditEvent.create({
+      data: {
+        tenantId, actorUserId: null, action, resource: 'portal', resourceId,
+        requestId: request?.id ?? null,
+        userAgent: hashUa(request?.headers['user-agent']),
+        metadata: metadata ?? undefined,
+      },
+    });
+  } catch (cause) {
+    // Id-only wrapper: action names and ids are not PHI; the DB error stays in `cause`.
+    const error = new Error(`portal audit write failed (action=${action})`, { cause });
+    if (options?.critical) throw error; // regulated action must not proceed unaudited
+    captureException(error, { requestId: request?.id, tenantId }, request?.log);
+  }
 }
 function hashUa(ua: string | string[] | undefined): string | null {
   const v = Array.isArray(ua) ? ua[0] : ua;

@@ -2,8 +2,37 @@ import 'dotenv/config';
 import { z } from 'zod';
 import { booleanString } from '../lib/booleanString';
 
-const envSchema = z.object({
+// Integrations that have a mock mode and therefore need explicit
+// acknowledgement outside the demo profile (see superRefine below and
+// docs/INTEGRATION_MODE_REGISTER.md).
+export const MOCKABLE_INTEGRATIONS = ['payments', 'insurance', 'ai'] as const;
+export type MockableIntegration = (typeof MOCKABLE_INTEGRATIONS)[number];
+
+// Parse the comma-separated ALLOWED_MOCK_INTEGRATIONS ack list. Trims and
+// lowercases tokens; drops empties. Does NOT validate tokens — the superRefine
+// does that so a typo fails boot with a real message instead of silently
+// acknowledging nothing.
+export function parseAllowedMockIntegrations(raw: string): string[] {
+  return raw
+    .split(',')
+    .map(token => token.trim().toLowerCase())
+    .filter(token => token.length > 0);
+}
+
+const baseEnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  // Deployment posture, NOT runtime mode. Keyed separately from NODE_ENV on
+  // purpose: the local E2E harness runs NODE_ENV=production under the default
+  // 'demo' profile. 'pilot'/'enterprise' activate the integration-mode gate
+  // below (docs/INTEGRATION_MODE_REGISTER.md): mock integrations must be
+  // explicitly acknowledged, and enterprise never allows mock payments.
+  DEPLOYMENT_PROFILE: z.enum(['demo', 'pilot', 'enterprise']).default('demo'),
+  // Comma-separated ack list for the profile gate, e.g. "ai,insurance".
+  // Valid tokens: payments | insurance | ai. Listing an integration here is a
+  // deliberate, buyer-visible statement that this pilot/enterprise environment
+  // knowingly runs it in mock mode. Ignored under the 'demo' profile (but
+  // tokens are still validated so typos never lie in wait).
+  ALLOWED_MOCK_INTEGRATIONS: z.string().default(''),
   API_HOST: z.string().default('0.0.0.0'),
   API_PORT: z.coerce.number().int().positive().default(3001),
   DATABASE_URL: z.string().min(1),
@@ -130,16 +159,100 @@ const envSchema = z.object({
   RETELL_AGENT_ID: z.string().optional(),
   RETELL_FROM_NUMBER: z.string().optional(),
   RETELL_BASE_URL: z.string().url().default('https://api.retellai.com'),
-  // Platform control plane (separate from tenant UserRole). Operators present
-  // this token on /v1/platform/* and /v1/onboarding/*. In non-production a dev
-  // default is allowed; production MUST set a strong token.
+  // Platform control plane legacy token (separate from tenant UserRole). In
+  // production this token is disabled unless PLATFORM_LEGACY_TOKEN_ENABLED=true;
+  // prefer PlatformUser login + platform JWT for all real environments.
   PLATFORM_API_TOKEN: z.string().optional(),
+  PLATFORM_LEGACY_TOKEN_ENABLED: booleanString(false),
+  // Explicit local/test delivery sink for browser E2E. When set, portal magic
+  // login codes are appended as JSONL for the harness to read; they are still
+  // never returned in production API responses. SECURITY: raw patient sign-in
+  // tokens on disk are a credential leak, so with NODE_ENV=production this is
+  // refused at boot unless E2E_TEST_MODE explicitly opts in (see superRefine).
+  PORTAL_TOKEN_OUTBOX_PATH: z.string().optional(),
+  // E2E harness escape hatch. The Playwright harness serves the built app with
+  // NODE_ENV=production; this flag is the ONLY thing that legitimizes
+  // PORTAL_TOKEN_OUTBOX_PATH in that mode. NEVER set on a real deployment.
+  E2E_TEST_MODE: booleanString(false),
   // Platform Admin Console: first PLATFORM_OWNER is seeded ONLY from these env
   // vars (no weak default in production). Static token above is legacy/dev-only.
   PLATFORM_OWNER_EMAIL: z.string().optional(),
   PLATFORM_OWNER_NAME: z.string().optional(),
   PLATFORM_OWNER_PASSWORD: z.string().optional(),
   TRIAL_DAYS: z.coerce.number().int().min(1).max(365).default(14),
+});
+
+// Cross-field production hardening. Exported so tests can exercise the schema
+// in isolation (see server/test/envSchema.test.ts).
+export const envSchema = baseEnvSchema.superRefine((cfg, ctx) => {
+  // PORTAL_TOKEN_OUTBOX_PATH writes RAW patient magic-login tokens to disk —
+  // a PHI/credential leak on any real production host. Fail the boot closed
+  // unless the E2E harness explicitly opted in.
+  if (cfg.NODE_ENV === 'production' && cfg.PORTAL_TOKEN_OUTBOX_PATH && !cfg.E2E_TEST_MODE) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['PORTAL_TOKEN_OUTBOX_PATH'],
+      message:
+        'PORTAL_TOKEN_OUTBOX_PATH must not be set when NODE_ENV=production: it writes raw patient sign-in tokens to disk. ' +
+        'Unset it, or set E2E_TEST_MODE=true ONLY for the local browser E2E harness (never on a real deployment).',
+    });
+  }
+
+  // ── Deployment-profile integration gate (docs/INTEGRATION_MODE_REGISTER.md) ─
+  // Keyed on DEPLOYMENT_PROFILE, never NODE_ENV: the E2E harness runs
+  // NODE_ENV=production with the default 'demo' profile and must keep booting.
+  const allowedMocks = parseAllowedMockIntegrations(cfg.ALLOWED_MOCK_INTEGRATIONS);
+
+  // Unknown ack tokens are always an error (any profile): a typo like
+  // "payment" must fail loudly, not silently acknowledge nothing.
+  const known = new Set<string>(MOCKABLE_INTEGRATIONS);
+  for (const token of allowedMocks) {
+    if (!known.has(token)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['ALLOWED_MOCK_INTEGRATIONS'],
+        message:
+          `ALLOWED_MOCK_INTEGRATIONS contains unknown integration "${token}". ` +
+          `Valid tokens: ${MOCKABLE_INTEGRATIONS.join(', ')} (comma-separated).`,
+      });
+    }
+  }
+
+  if (cfg.DEPLOYMENT_PROFILE === 'pilot' || cfg.DEPLOYMENT_PROFILE === 'enterprise') {
+    const mockModes: Array<{ integration: MockableIntegration; envKey: string }> = [];
+    if (cfg.PAYMENT_PROVIDER === 'mock') mockModes.push({ integration: 'payments', envKey: 'PAYMENT_PROVIDER' });
+    if (cfg.INSURANCE_PROVIDER === 'mock') mockModes.push({ integration: 'insurance', envKey: 'INSURANCE_PROVIDER' });
+    if (cfg.AI_PROVIDER === 'mock') mockModes.push({ integration: 'ai', envKey: 'AI_PROVIDER' });
+
+    for (const { integration, envKey } of mockModes) {
+      // Enterprise: payments are the money path — mock is NEVER acceptable,
+      // acknowledged or not. A validation environment that "collects" fake
+      // money produces buyer-facing claims that are untrue.
+      if (cfg.DEPLOYMENT_PROFILE === 'enterprise' && integration === 'payments') {
+        ctx.addIssue({
+          code: 'custom',
+          path: [envKey],
+          message:
+            'DEPLOYMENT_PROFILE=enterprise forbids mock payments — payments are the money path and cannot be ' +
+            'mocked in an enterprise validation environment, even via ALLOWED_MOCK_INTEGRATIONS. ' +
+            'Fix: set PAYMENT_PROVIDER to a real provider (e.g. stripe, with STRIPE_SECRET_KEY + STRIPE_WEBHOOK_SECRET), ' +
+            'or use DEPLOYMENT_PROFILE=pilot if this environment genuinely is not an enterprise validation.',
+        });
+        continue;
+      }
+      if (!allowedMocks.includes(integration)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: [envKey],
+          message:
+            `Integration "${integration}" is in mock mode (${envKey}=mock) but DEPLOYMENT_PROFILE=${cfg.DEPLOYMENT_PROFILE} ` +
+            'requires every integration to be explicitly live/sandbox/mock-acknowledged (docs/INTEGRATION_MODE_REGISTER.md). ' +
+            `Fix: configure a real provider for ${envKey}, or explicitly acknowledge the mock by adding "${integration}" ` +
+            'to ALLOWED_MOCK_INTEGRATIONS (comma-separated).',
+        });
+      }
+    }
+  }
 });
 
 export const env = envSchema.parse(process.env);

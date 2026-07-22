@@ -65,6 +65,31 @@ describe('patient portal self-signup (mobile, Option A)', () => {
     expect(after?.status).toBe('active'); // first sign-in activates
   });
 
+  it('magic token is strictly single-use under concurrency: two parallel verifies yield exactly one session', async () => {
+    const c = await makeClinic();
+    const signup = await app.inject({ method: 'POST', url: '/v1/portal/auth/signup', payload: { clinicSlug: c.slug, email: c.patientEmail } });
+    const devToken = json(signup).devToken;
+    expect(devToken).toBeTruthy();
+
+    // Fire both verifies in the same tick — before the fix, both passed the
+    // usedAt read and both got sessions. The atomic conditional consume lets
+    // exactly one win.
+    const [a, b] = await Promise.all([
+      app.inject({ method: 'POST', url: '/v1/portal/auth/verify', payload: { token: devToken } }),
+      app.inject({ method: 'POST', url: '/v1/portal/auth/verify', payload: { token: devToken } }),
+    ]);
+    expect([a.statusCode, b.statusCode].sort()).toEqual([200, 401]);
+    const winner = a.statusCode === 200 ? a : b;
+    const loser = a.statusCode === 200 ? b : a;
+    expect(json(winner).token).toBeTruthy();
+    expect(json(loser).error).toBe('token_used');
+
+    // The token row was consumed exactly once and a third attempt also fails.
+    const third = await app.inject({ method: 'POST', url: '/v1/portal/auth/verify', payload: { token: devToken } });
+    expect(third.statusCode).toBe(401);
+    expect(json(third).error).toBe('token_used');
+  });
+
   it('queues a staff review when no patient matches (never auto-grants access)', async () => {
     const c = await makeClinic();
     const res = await app.inject({ method: 'POST', url: '/v1/portal/auth/signup', payload: { clinicSlug: c.slug, email: 'stranger@nobody.test' } });
