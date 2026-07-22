@@ -10,6 +10,7 @@ import { requireFeature } from '../lib/entitlements';
 import { runWithTenantContext } from '../lib/tenantContext';
 import { recordWorkflowEvent, emitBusinessEvent } from '../lib/intelligence';
 import { eligibilityProviderStatus, runDenialPreventionForAppointment } from '../lib/insuranceIntelligence';
+import { paymentProviderStatus } from '../lib/deposits';
 import type { Prisma } from '../generated/prisma/client';
 
 // --- Idempotency -----------------------------------------------------------
@@ -89,6 +90,14 @@ const listLimit = z.object({
 
 const editRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK');
 const adminRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
+// Segregation of duties: marking money as COLLECTED (which mints a succeeded
+// transaction / settles a deposit with no real money movement) is a controller
+// action. FRONT_DESK may edit non-financial status but must NOT self-attest a
+// collection — mirrors the deposit-waiver gate, which also excludes FRONT_DESK.
+const COLLECT_PRIVILEGED_ROLES = ['OWNER', 'ADMIN', 'MANAGER', 'BILLING'] as const;
+// Constrained, auditable status vocabularies (no unvalidated free-string status).
+const PAYMENT_REQUEST_STATUSES = ['pending', 'link_sent', 'collected', 'failed', 'expired', 'cancelled', 'refunded'] as const;
+const DEPOSIT_REQUIREMENT_STATUSES = ['required', 'requested', 'link_sent', 'collected', 'waived', 'cancelled', 'failed', 'expired', 'refunded'] as const;
 // Payments & deposits routes additionally require the payments_deposits entitlement.
 const paymentsFeature = requireFeature('payments_deposits');
 // Insurance/eligibility routes require the insurance_eligibility entitlement.
@@ -208,6 +217,11 @@ type EligibilityOutcome = {
   riskLevel: 'LOW' | 'MEDIUM' | 'HIGH';
   recommendedAction: string;
   revenueAtRisk: number;
+  // Honesty flags: when the live payer 271 omits a benefit field we do NOT invent a
+  // number. `missingBenefitFields` names the omitted fields and `benefitDataIncomplete`
+  // marks the estimate as incomplete so no fabricated dollar figure is shown as real.
+  benefitDataIncomplete: boolean;
+  missingBenefitFields: string[];
   rawResponse?: unknown;
   storeRawResponse: boolean;
 };
@@ -239,6 +253,27 @@ function toNumber(value: unknown) {
 
 function asRecord(value: unknown) {
   return value && typeof value === 'object' ? value as Record<string, unknown> : {};
+}
+
+// --- Money helpers ---------------------------------------------------------
+// Preserve cents. `Math.round(amount)` (whole dollars) silently overbills — a
+// $45.50 charge became $46 and a 15%-of-$150 = $22.50 deposit became $23. Money
+// amounts are rounded to 2 decimals; Stripe minor units are the exact integer
+// cents (`Math.round(amount * 100)`), never `roundedDollars * 100`.
+export function roundMoney(amount: number): number {
+  const value = Number.isFinite(amount) ? amount : 0;
+  return Math.max(0, Math.round(value * 100) / 100);
+}
+export function toMinorUnits(amount: number): string {
+  const value = Number.isFinite(amount) ? amount : 0;
+  return String(Math.max(0, Math.round(value * 100)));
+}
+
+// Decrement a patient's outstanding balance by a collected amount, clamped at 0
+// (the column has a non-negative CHECK constraint). Tenant-scoped. Returns a
+// PrismaPromise so it can be composed inside a $transaction([...]) batch.
+function decrementOutstandingBalance(tenantId: string, patientId: string, amount: number) {
+  return db.$executeRaw`UPDATE "Patient" SET "outstandingBalance" = GREATEST(0, "outstandingBalance" - ${amount}::numeric) WHERE "id" = ${patientId}::uuid AND "tenantId" = ${tenantId}::uuid`;
 }
 
 async function fetchJsonWithTimeout(url: string, init: RequestInit, timeoutMs = 6000) {
@@ -538,6 +573,8 @@ class MockEligibilityProvider {
       riskLevel,
       recommendedAction,
       revenueAtRisk,
+      benefitDataIncomplete: false,
+      missingBenefitFields: [],
       storeRawResponse: false,
     };
   }
@@ -547,7 +584,7 @@ class MockEligibilityProvider {
   }
 }
 
-class StediEligibilityProvider extends MockEligibilityProvider {
+export class StediEligibilityProvider extends MockEligibilityProvider {
   providerKey = 'stedi';
   displayName = 'Stedi Eligibility';
   mode: ProviderMode = env.STEDI_TEST_MODE ? 'sandbox' : 'live';
@@ -618,34 +655,44 @@ class StediEligibilityProvider extends MockEligibilityProvider {
     const planName = String(benefits.planName ?? benefits.planDescription ?? context.policy?.planName ?? 'Stedi Health Plan');
     const payerName = String(benefits.payerName ?? benefits.payer ?? context.payer?.name ?? 'Stedi Test Payer');
     const memberId = String(benefits.memberId ?? context.policy?.memberId ?? inferPayerReference({ payerName, patientId: context.patient?.id, appointmentId: context.appointment?.id }));
-    const copay = toNumber(
+    // Honesty (P0): do NOT invent coverage numbers. A real 271 that omits copay /
+    // deductible / coinsurance is reported as UNKNOWN — never backfilled with a
+    // fabricated dollar figure (previously 25 / 850 / 0.2) presented as real coverage.
+    const copayRaw =
       benefits.copay ??
       benefits.copayAmount ??
       patientResponsibility.copay ??
       asRecord(benefits.financialResponsibility).copayAmount ??
       officeVisit.copay ??
-      25,
-    );
-    const deductibleRemaining = toNumber(
+      null;
+    const deductibleRaw =
       benefits.deductibleRemaining ??
       deductible.remaining ??
       deductible.remainingAmount ??
       benefitsSummary.deductibleRemaining ??
-      850,
-    );
-    const coinsurance = toNumber(
+      null;
+    const coinsuranceRaw =
       benefits.coinsurance ??
       benefits.coInsurance ??
       patientResponsibility.coinsurance ??
-      0.2,
-    );
+      null;
+    const missingBenefitFields: string[] = [];
+    if (copayRaw == null) missingBenefitFields.push('copay');
+    if (deductibleRaw == null) missingBenefitFields.push('deductibleRemaining');
+    if (coinsuranceRaw == null) missingBenefitFields.push('coinsurance');
+    const benefitDataIncomplete = missingBenefitFields.length > 0;
+    // For internal risk math an unknown field is treated as 0 (a conservative,
+    // non-fabricated placeholder), but it is flagged unknown to every consumer.
+    const copay = toNumber(copayRaw ?? 0);
+    const deductibleRemaining = toNumber(deductibleRaw ?? 0);
+    const coinsurance = toNumber(coinsuranceRaw ?? 0);
     const needsPriorAuth = String(
       benefits.authorizationRequired ??
       benefits.priorAuthorizationRequired ??
       payload.authorizationRequired ??
       '',
     ).toLowerCase().includes('true') || deductibleRemaining > 1600 || /surgery|injection|procedure|botox|laser|consultation/i.test(serviceName);
-    const benefitUncertainty = !response || !Object.keys(payload).length || Boolean(payload.warnings?.length);
+    const benefitUncertainty = !response || !Object.keys(payload).length || Boolean(payload.warnings?.length) || benefitDataIncomplete;
     const payerReference = String(
       benefits.payerReference ??
       payload.id ??
@@ -655,7 +702,9 @@ class StediEligibilityProvider extends MockEligibilityProvider {
     const riskLevel = buildEligibilityRiskLevel({ coverageActive, copay, deductibleRemaining, needsPriorAuth, benefitUncertainty });
     const recommendedAction = buildRecommendedAction({ coverageActive, copay, deductibleRemaining, needsPriorAuth });
     const revenueAtRisk = coverageActive ? 0 : Math.max(185, Math.round((context.patient?.outstandingBalance ?? 0) * 0.4 + copay));
-    const eligibilityMessage = deriveCoverageMessage({ coverageActive, copay, deductibleRemaining, needsPriorAuth, benefitUncertainty });
+    const eligibilityMessage = benefitDataIncomplete
+      ? `Payer response did not include ${missingBenefitFields.join(', ')}; benefit estimate is incomplete and must be verified manually before quoting the patient.`
+      : deriveCoverageMessage({ coverageActive, copay, deductibleRemaining, needsPriorAuth, benefitUncertainty });
 
     return {
       coverageStatus: coverageActive ? (benefitUncertainty ? 'uncertain' : 'active') : 'inactive',
@@ -677,6 +726,8 @@ class StediEligibilityProvider extends MockEligibilityProvider {
       riskLevel,
       recommendedAction,
       revenueAtRisk,
+      benefitDataIncomplete,
+      missingBenefitFields,
       rawResponse: payload as Prisma.InputJsonValue,
       storeRawResponse: true,
     };
@@ -695,7 +746,7 @@ class MockPaymentProvider {
   mode: ProviderMode = 'mock';
 
   async createPaymentRequest(input: PaymentRequestContext): Promise<PaymentOutcome> {
-    const amount = Math.max(0, Math.round(input.amount));
+    const amount = roundMoney(input.amount);
     const providerReference = `mock_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
     return {
       amount,
@@ -735,7 +786,7 @@ class MockPaymentProvider {
   normalizePaymentResponse(response: unknown, input: PaymentRequestContext): PaymentOutcome {
     const payload = asRecord(response);
     return {
-      amount: Math.max(0, Math.round(input.amount)),
+      amount: roundMoney(input.amount),
       currency: 'USD',
       status: 'pending',
       provider: this.displayName,
@@ -773,7 +824,7 @@ class StripePaymentProvider extends MockPaymentProvider {
     if (!env.STRIPE_SECRET_KEY) return super.createPaymentRequest(input);
 
     try {
-      const amount = Math.max(0, Math.round(input.amount));
+      const amount = roundMoney(input.amount);
       const payload = await this.stripeForm('/v1/checkout/sessions', {
         mode: 'payment',
         success_url: env.STRIPE_SUCCESS_URL,
@@ -782,7 +833,7 @@ class StripePaymentProvider extends MockPaymentProvider {
         'line_items[0][price_data][currency]': 'usd',
         'line_items[0][price_data][product_data][name]': input.reason || 'CareCommand Payment Request',
         'line_items[0][price_data][product_data][description]': input.patient ? `${input.patient.firstName} ${input.patient.lastName}` : 'Patient payment request',
-        'line_items[0][price_data][unit_amount]': String(amount * 100),
+        'line_items[0][price_data][unit_amount]': toMinorUnits(amount),
         'line_items[0][quantity]': '1',
         'metadata[tenantId]': input.tenantId,
         'metadata[branchId]': input.branchId ?? '',
@@ -810,12 +861,12 @@ class StripePaymentProvider extends MockPaymentProvider {
     if (!env.STRIPE_SECRET_KEY) return super.createPaymentLink(input);
 
     try {
-      const amount = Math.max(0, Math.round(input.amount));
+      const amount = roundMoney(input.amount);
       const payload = await this.stripeForm('/v1/payment_links', {
         'line_items[0][price_data][currency]': 'usd',
         'line_items[0][price_data][product_data][name]': input.reason || 'CareCommand Deposit',
         'line_items[0][price_data][product_data][description]': input.patient ? `${input.patient.firstName} ${input.patient.lastName}` : 'Patient deposit request',
-        'line_items[0][price_data][unit_amount]': String(amount * 100),
+        'line_items[0][price_data][unit_amount]': toMinorUnits(amount),
         'line_items[0][quantity]': '1',
         'after_completion[type]': 'redirect',
         'after_completion[redirect][url]': env.STRIPE_SUCCESS_URL,
@@ -874,7 +925,7 @@ class PlaceholderPaymentProvider extends MockPaymentProvider {
   }
 }
 
-function createInsuranceProvider() {
+export function createInsuranceProvider() {
   switch (env.INSURANCE_PROVIDER) {
     case 'stedi':
       return env.STEDI_API_KEY ? new StediEligibilityProvider() : new MockEligibilityProvider();
@@ -1430,15 +1481,65 @@ async function loadOverview(context: RevenueContext, branchId?: string) {
     }),
   ]);
 
+  // Headline financial totals MUST be computed with DB aggregates, not by summing
+  // the truncated `take: 50` collections above — otherwise the dashboard silently
+  // under-reports past 50 contributing rows. All numbers are tenant-scoped (and,
+  // for RLS tables, read under tenant context). The returned shape is unchanged.
+  const { start: dueStart, end: dueEnd } = todayRange();
+  // Statuses that are NOT genuinely-open AR. `expired`/`failed`/`cancelled` requests
+  // are dead (and expiry spawns a fresh row, so the same balance would otherwise be
+  // counted twice); `collected`/`refunded` are settled. Only truly-open requests are
+  // owed money. This prevents the stale-AR over-count.
+  const NON_OPEN_REQUEST_STATUSES = ['collected', 'failed', 'expired', 'cancelled', 'refunded'];
+  const [
+    paymentsDueTodayCount,
+    unpaidBalancesAgg,
+    depositsCollectedAgg,
+    failedPaymentsCount,
+    succeededTransactionsAgg,
+    refundedTransactionsAgg,
+    revenueAtRiskAgg,
+    collectedDeposits,
+    succeededTxnRequestRows,
+  ] = await Promise.all([
+    db.paymentRequest.count({ where: { tenantId: context.tenantId, ...filter, status: 'pending', dueAt: { gte: dueStart, lt: dueEnd } } }),
+    db.paymentRequest.aggregate({ _sum: { amount: true }, where: { tenantId: context.tenantId, ...filter, status: { notIn: NON_OPEN_REQUEST_STATUSES } } }),
+    runWithTenantContext(context.tenantId, tx => tx.depositRequirement.aggregate({ _sum: { collectedAmount: true }, where: { tenantId: context.tenantId, ...filter, status: 'collected' } })),
+    db.paymentTransaction.count({ where: { tenantId: context.tenantId, ...filter, status: 'failed' } }),
+    db.paymentTransaction.aggregate({ _sum: { amount: true }, where: { tenantId: context.tenantId, ...filter, status: { in: ['succeeded', 'paid'] } } }),
+    db.paymentTransaction.aggregate({ _sum: { amount: true }, where: { tenantId: context.tenantId, ...filter, status: 'refunded' } }),
+    runWithTenantContext(context.tenantId, tx => tx.revenueProtectionAlert.aggregate({ _sum: { estimatedValue: true }, where: { tenantId: context.tenantId, ...filter, status: { not: 'resolved' } } })),
+    // Collected deposits (to add manually-collected ones that have no transaction).
+    runWithTenantContext(context.tenantId, tx => tx.depositRequirement.findMany({ where: { tenantId: context.tenantId, ...filter, status: 'collected' }, select: { paymentRequestId: true, collectedAmount: true } })),
+    // Payment requests that already have a succeeded/paid transaction — a collected
+    // deposit linked to one of these is ALREADY counted in the transaction total.
+    db.paymentTransaction.findMany({ where: { tenantId: context.tenantId, ...filter, status: { in: ['succeeded', 'paid'] }, paymentRequestId: { not: null } }, select: { paymentRequestId: true } }),
+  ]);
+
+  const unpaidBalancesTotal = toNumber(unpaidBalancesAgg._sum.amount);
+  const depositsCollectedTotal = toNumber(depositsCollectedAgg._sum.collectedAmount);
+  // revenueProtected must count each economic event ONCE. A webhook-settled deposit is
+  // written as BOTH a succeeded paymentTransaction AND a collected DepositRequirement,
+  // so naively adding both aggregates double-counts it. The money-movement truth is the
+  // net of transactions (succeeded/paid minus refunded); to that we add only the
+  // manually-collected deposits that have NO linked transaction. Refunds reduce the
+  // total via the refunded transactions (and their deposit flips out of 'collected').
+  const succeededTxnRequestIds = new Set(
+    succeededTxnRequestRows.map(r => r.paymentRequestId).filter((x): x is string => Boolean(x)),
+  );
+  const manualDepositsTotal = collectedDeposits
+    .filter(d => !d.paymentRequestId || !succeededTxnRequestIds.has(d.paymentRequestId))
+    .reduce((sum, d) => sum + toNumber(d.collectedAmount), 0);
+  const netTransactionsTotal = toNumber(succeededTransactionsAgg._sum.amount) - toNumber(refundedTransactionsAgg._sum.amount);
   const summary = {
-    paymentsDueToday: paymentRequests.filter(request => request.status === 'pending' && request.dueAt && request.dueAt >= todayRange().start && request.dueAt < todayRange().end).length,
-    copaysExpected: paymentRequests.filter(request => request.status !== 'collected').reduce((sum, request) => sum + toNumber(request.amount), 0),
-    depositsCollected: depositRequirements.filter(requirement => requirement.status === 'collected').reduce((sum, requirement) => sum + toNumber(requirement.collectedAmount), 0),
-    unpaidBalances: paymentRequests.filter(request => request.status !== 'collected').reduce((sum, request) => sum + toNumber(request.amount), 0),
-    failedPayments: paymentTransactions.filter(transaction => transaction.status === 'failed').length,
-    revenueProtected: depositRequirements.filter(requirement => requirement.status === 'collected').reduce((sum, requirement) => sum + toNumber(requirement.collectedAmount), 0)
-      + paymentTransactions.filter(transaction => transaction.status === 'succeeded' || transaction.status === 'paid').reduce((sum, transaction) => sum + toNumber(transaction.amount), 0),
-    revenueAtRisk: revenueProtectionAlerts.filter(alert => alert.status !== 'resolved').reduce((sum, alert) => sum + toNumber(alert.estimatedValue), 0),
+    paymentsDueToday: paymentsDueTodayCount,
+    // copaysExpected and unpaidBalances share the same definition (genuinely-open requests).
+    copaysExpected: unpaidBalancesTotal,
+    depositsCollected: depositsCollectedTotal,
+    unpaidBalances: unpaidBalancesTotal,
+    failedPayments: failedPaymentsCount,
+    revenueProtected: netTransactionsTotal + manualDepositsTotal,
+    revenueAtRisk: toNumber(revenueAtRiskAgg._sum.estimatedValue),
   };
 
   return {
@@ -1855,13 +1956,19 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
       planName: verificationDetails.planName,
       coverageStatus: verificationDetails.coverageStatus.toUpperCase(),
       coverageActive: verificationDetails.coverageActive,
-      copay: toNumber(verificationDetails.copay),
-      deductibleRemaining: toNumber(verificationDetails.deductibleRemaining),
-      coinsurance: toNumber(verificationDetails.coinsurance),
+      // Honesty: a benefit field the payer omitted is reported as null (unknown),
+      // never as a fabricated dollar figure.
+      copay: outcome.missingBenefitFields.includes('copay') ? null : toNumber(verificationDetails.copay),
+      deductibleRemaining: outcome.missingBenefitFields.includes('deductibleRemaining') ? null : toNumber(verificationDetails.deductibleRemaining),
+      coinsurance: outcome.missingBenefitFields.includes('coinsurance') ? null : toNumber(verificationDetails.coinsurance),
+      benefitDataIncomplete: outcome.benefitDataIncomplete,
+      missingBenefitFields: outcome.missingBenefitFields,
       eligibilityMessage: verificationDetails.eligibilityMessage,
       payerReference: verificationDetails.payerReference ?? outcome.payerReference,
       checkedAt: verificationDetails.checkedAt.toISOString(),
-      providerMode: verificationDetails.providerMode === 'mock' ? 'mock' : 'stedi-sandbox',
+      // Report the TRUE provider mode ('mock' | 'sandbox' | 'live'); never relabel a
+      // genuine live Stedi check as sandbox.
+      providerMode: verificationDetails.providerMode,
       alertId: alert?.id ?? null,
       priorAuthRequired: outcome.priorAuthRequired,
       recommendedAction: outcome.recommendedAction,
@@ -2005,6 +2112,15 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
 
     if (!body.patientId && !body.appointmentId) {
       throw app.httpErrors.badRequest('A patient or appointment context is required');
+    }
+
+    // Truthful provider gating (matches checkout.ts): a placeholder/unconfigured
+    // provider (square/paypal/clover/authorize_net, or Stripe without a key) must
+    // NOT issue a "real" payment request. Fail fast BEFORE claiming idempotency or
+    // persisting anything so no fabricated request is created in a pilot posture.
+    const paymentStatus = paymentProviderStatus();
+    if (paymentStatus.setupRequired) {
+      return reply.code(200).send({ status: 'setup_required', setupRequired: true, provider: paymentStatus.provider, message: `Connect ${paymentStatus.provider} to issue real payment requests.` });
     }
 
     // Optional client idempotency: replays with the same Idempotency-Key return
@@ -2169,6 +2285,13 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
       throw app.httpErrors.badRequest('A patient or appointment context is required');
     }
 
+    // Truthful provider gating (matches checkout.ts): never fabricate a payment
+    // link from a placeholder/unconfigured provider.
+    const linkProviderStatus = paymentProviderStatus();
+    if (linkProviderStatus.setupRequired) {
+      return reply.code(200).send({ status: 'setup_required', setupRequired: true, provider: linkProviderStatus.provider, message: `Connect ${linkProviderStatus.provider} to generate real payment links.` });
+    }
+
     const entities = await resolveBranchIdAndEntities(request, { tenantId: request.auth.tenantId, branchId: request.auth.branchId ?? undefined }, body);
     if (body.patientId && !entities.patient) throw app.httpErrors.notFound('Patient not found');
     if (body.appointmentId && !entities.appointment) throw app.httpErrors.notFound('Appointment not found');
@@ -2274,40 +2397,55 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
   app.patch('/payment/:id/status', { preHandler: [paymentsFeature, editRoles] }, async (request, reply) => {
     const params = z.object({ id: uuid }).parse(request.params);
     const body = z.object({
-      status: z.string().min(2).max(80),
+      status: z.enum(PAYMENT_REQUEST_STATUSES),
       providerReference: z.string().max(120).optional(),
     }).parse(request.body);
+    // Segregation of duties: FRONT_DESK cannot manually attest a collection.
+    if (body.status === 'collected' && !COLLECT_PRIVILEGED_ROLES.includes(request.auth.role as typeof COLLECT_PRIVILEGED_ROLES[number])) {
+      throw app.httpErrors.forbidden('Your role cannot manually mark a payment as collected');
+    }
     const existing = await db.paymentRequest.findFirst({
       where: { id: params.id, tenantId: request.auth.tenantId },
     });
     if (!existing) throw app.httpErrors.notFound('Payment request not found');
     assertBranchAccess(request, existing.branchId);
 
+    const isNewCollection = body.status === 'collected' && existing.status !== 'collected';
+    const collectedAmount = toNumber(existing.amount);
+
     const row = await db.paymentRequest.update({
       where: { id: params.id },
       data: { status: body.status, providerReference: body.providerReference ?? existing.providerReference },
     });
 
-    if (body.status === 'collected') {
-      await db.paymentTransaction.create({
-        data: {
-          tenantId: request.auth.tenantId,
-          branchId: row.branchId,
-          patientId: row.patientId ?? undefined,
-          appointmentId: row.appointmentId ?? undefined,
-          paymentRequestId: row.id,
-          amount: row.amount,
-          currency: row.currency,
-          status: 'succeeded',
-          mode: row.mode,
-          providerReference: body.providerReference ?? row.providerReference ?? undefined,
-          receivedAt: new Date(),
-          rawResponse: {
+    if (isNewCollection) {
+      await db.$transaction([
+        db.paymentTransaction.create({
+          data: {
+            tenantId: request.auth.tenantId,
+            branchId: row.branchId,
+            patientId: row.patientId ?? undefined,
+            appointmentId: row.appointmentId ?? undefined,
+            paymentRequestId: row.id,
+            amount: row.amount,
+            currency: row.currency,
             status: 'succeeded',
-            source: 'manual',
+            mode: row.mode,
+            providerReference: body.providerReference ?? row.providerReference ?? undefined,
+            receivedAt: new Date(),
+            rawResponse: {
+              status: 'succeeded',
+              source: 'manual',
+              actorUserId: request.auth.userId,
+            },
           },
-        },
-      });
+        }),
+        // AR reconciliation: a real collection reduces the patient's outstanding
+        // balance (clamped at 0 — the column is non-negative by constraint).
+        ...(row.patientId
+          ? [decrementOutstandingBalance(request.auth.tenantId, row.patientId, collectedAmount)]
+          : []),
+      ]);
     }
 
     await audit(request, {
@@ -2427,27 +2565,46 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
   app.patch('/deposit-requirements/:id/status', { preHandler: [paymentsFeature, editRoles] }, async (request, reply) => {
     const params = z.object({ id: uuid }).parse(request.params);
     const body = z.object({
-      status: z.string().min(2).max(80),
+      status: z.enum(DEPOSIT_REQUIREMENT_STATUSES),
       reason: z.string().max(240).optional(),
       collectedAmount: z.coerce.number().min(0).optional(),
       waiverReason: z.string().max(240).optional(),
     }).parse(request.body);
+    // Segregation of duties: FRONT_DESK cannot manually attest a collection.
+    if (body.status === 'collected' && !COLLECT_PRIVILEGED_ROLES.includes(request.auth.role as typeof COLLECT_PRIVILEGED_ROLES[number])) {
+      throw app.httpErrors.forbidden('Your role cannot manually mark a deposit as collected');
+    }
     const existing = await db.depositRequirement.findFirst({
       where: { id: params.id, tenantId: request.auth.tenantId },
     });
     if (!existing) throw app.httpErrors.notFound('Deposit requirement not found');
     assertBranchAccess(request, existing.branchId);
 
+    // Integrity: a manual collectedAmount can never exceed the required amount —
+    // otherwise revenue is fabricated beyond what was ever owed.
+    const requiredAmount = toNumber(existing.requiredAmount);
+    if (body.collectedAmount != null && body.collectedAmount > requiredAmount) {
+      throw app.httpErrors.badRequest('collectedAmount cannot exceed the required amount');
+    }
+    const isNewCollection = body.status === 'collected' && existing.status !== 'collected';
+    const collectedAmount = body.collectedAmount ?? (isNewCollection ? requiredAmount : toNumber(existing.collectedAmount));
+
     const row = await db.depositRequirement.update({
       where: { id: params.id },
       data: {
         status: body.status,
-        collectedAmount: body.collectedAmount ?? existing.collectedAmount,
+        collectedAmount,
         waiverReason: body.waiverReason ?? existing.waiverReason,
         collectedAt: body.status === 'collected' ? new Date() : existing.collectedAt,
         reason: body.reason ?? existing.reason,
       },
     });
+
+    // AR reconciliation: a fresh manual deposit collection reduces the patient's
+    // outstanding balance (tenant-scoped, clamped at 0).
+    if (isNewCollection && existing.patientId) {
+      await decrementOutstandingBalance(request.auth.tenantId, existing.patientId, collectedAmount);
+    }
 
     await audit(request, {
       action: 'depositRequirement.status.updated',
@@ -2566,19 +2723,30 @@ export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
     }).partial().parse(request.body ?? {});
     if (!event.id || !event.type) return reply.code(400).send({ error: 'INVALID_EVENT' });
 
-    // Idempotent on the Stripe event id: redelivery is acknowledged, not reprocessed.
+    // Idempotent on the Stripe event id, but crash-safe: a claimed key is only a
+    // true DUPLICATE once processing has COMPLETED (recorded a resultId). A
+    // claimed-but-not-completed key means a prior attempt threw before finishing —
+    // Stripe's retry MUST reprocess it, not be silently skipped (else money is
+    // collected while the DB is never reconciled). Completion is recorded atomically
+    // with the money movement below, so reprocessing can never double-record.
     const claim = await claimIdempotency('stripe.webhook', event.id);
-    if (!claim.claimed) return reply.code(200).send({ received: true, duplicate: true });
+    if (!claim.claimed && claim.resultId) {
+      return reply.code(200).send({ received: true, duplicate: true });
+    }
 
     const object = (event.data?.object ?? {}) as Record<string, unknown>;
     const candidates = [object.id, object.payment_intent, object.client_reference_id].filter(
       (value): value is string => typeof value === 'string',
     );
-    if (candidates.length === 0) return reply.code(200).send({ received: true });
+    if (candidates.length === 0) {
+      await recordIdempotencyResult('stripe.webhook', event.id, event.id);
+      return reply.code(200).send({ received: true });
+    }
 
     const paymentRequest = await db.paymentRequest.findFirst({ where: { providerReference: { in: candidates } } });
     if (!paymentRequest) {
       request.log.info({ eventId: event.id, type: event.type }, 'Stripe webhook: no matching payment request');
+      await recordIdempotencyResult('stripe.webhook', event.id, event.id);
       return reply.code(200).send({ received: true });
     }
 
@@ -2587,8 +2755,17 @@ export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
 
     const succeeded = ['checkout.session.completed', 'payment_intent.succeeded', 'charge.succeeded'].includes(event.type)
       || object.payment_status === 'paid';
+    const refunded = event.type === 'charge.refunded';
+    const disputed = event.type === 'charge.dispute.created';
     const failed = ['payment_intent.payment_failed', 'charge.failed'].includes(event.type);
     const expired = ['checkout.session.expired', 'payment_link.expired'].includes(event.type);
+
+    // Reconcile against the ACTUAL settled amount reported by Stripe (minor units),
+    // not the requested amount — a partial/adjusted settlement must be recorded truthfully.
+    const eventMinorUnits = toNumber(object.amount_total ?? object.amount_received ?? object.amount);
+    const settledAmount = eventMinorUnits > 0 ? eventMinorUnits / 100 : toNumber(paymentRequest.amount);
+    const refundMinorUnits = toNumber(object.amount_refunded ?? object.amount);
+    const refundAmount = refundMinorUnits > 0 ? refundMinorUnits / 100 : toNumber(paymentRequest.amount);
 
     if (succeeded) {
       await db.$transaction([
@@ -2599,21 +2776,27 @@ export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
             patientId: paymentRequest.patientId ?? undefined,
             appointmentId: paymentRequest.appointmentId ?? undefined,
             paymentRequestId: paymentRequest.id,
-            amount: paymentRequest.amount,
+            amount: settledAmount,
             currency: paymentRequest.currency,
             status: 'succeeded',
             mode: paymentRequest.mode,
             providerReference: typeof object.id === 'string' ? object.id : paymentRequest.providerReference ?? undefined,
             receivedAt: new Date(),
-            rawResponse: { eventId: event.id, type: event.type, source: 'stripe-webhook' },
+            rawResponse: { eventId: event.id, type: event.type, source: 'stripe-webhook', settledAmount },
           },
         }),
         db.paymentRequest.update({ where: { id: paymentRequest.id }, data: { status: 'collected' } }),
-        // Appointment Checkout: settle the linked deposit requirement(s).
+        // Appointment Checkout: settle the linked deposit requirement(s) at the
+        // actually-settled amount.
         db.depositRequirement.updateMany({
           where: { tenantId: paymentRequest.tenantId, paymentRequestId: paymentRequest.id, status: { notIn: ['collected', 'waived'] } },
-          data: { status: 'collected', collectedAmount: paymentRequest.amount, collectedAt: new Date() },
+          data: { status: 'collected', collectedAmount: settledAmount, collectedAt: new Date() },
         }),
+        // AR reconciliation (#7): a real settlement reduces the patient's outstanding
+        // balance (clamped at 0 — the column is non-negative by constraint).
+        ...(paymentRequest.patientId
+          ? [decrementOutstandingBalance(paymentRequest.tenantId, paymentRequest.patientId, settledAmount)]
+          : []),
         db.integrationRunLog.create({
           data: {
             tenantId: paymentRequest.tenantId,
@@ -2623,17 +2806,89 @@ export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
             operation: 'webhook.payment',
             status: 'success',
             requestSummary: { eventId: event.id, type: event.type },
-            responseSummary: { paymentRequestId: paymentRequest.id },
+            responseSummary: { paymentRequestId: paymentRequest.id, settledAmount },
           },
         }),
+        // Mark the webhook idempotency key COMPLETED atomically with the money
+        // movement: only now is a redelivery a true duplicate. If any step above
+        // fails, this update rolls back too, leaving the key reprocessable.
+        db.idempotencyKey.updateMany({ where: { scope: 'stripe.webhook', key: event.id }, data: { resultId: paymentRequest.id } }),
       ]);
-      await db.auditEvent.create({ data: { tenantId: paymentRequest.tenantId, action: 'payment.succeeded', resource: 'paymentRequest', resourceId: paymentRequest.id, metadata: { eventId: event.id, appointmentId: paymentRequest.appointmentId } } }).catch(() => {});
+      await db.auditEvent.create({ data: { tenantId: paymentRequest.tenantId, action: 'payment.succeeded', resource: 'paymentRequest', resourceId: paymentRequest.id, metadata: { eventId: event.id, appointmentId: paymentRequest.appointmentId, settledAmount } } }).catch(() => {});
       await recordWorkflowEvent(paymentRequest.tenantId, { eventType: 'payment.succeeded', entityType: 'paymentRequest', entityId: paymentRequest.id, sourceModule: 'payments', payload: { appointmentId: paymentRequest.appointmentId } });
+    } else if (refunded) {
+      // Refund: record a `refunded` transaction (reduces net revenueProtected), reverse
+      // the request/deposit collection state, and restore the patient's AR balance.
+      await db.$transaction([
+        db.paymentTransaction.create({
+          data: {
+            tenantId: paymentRequest.tenantId,
+            branchId: paymentRequest.branchId,
+            patientId: paymentRequest.patientId ?? undefined,
+            appointmentId: paymentRequest.appointmentId ?? undefined,
+            paymentRequestId: paymentRequest.id,
+            amount: refundAmount,
+            currency: paymentRequest.currency,
+            status: 'refunded',
+            mode: paymentRequest.mode,
+            providerReference: typeof object.id === 'string' ? object.id : paymentRequest.providerReference ?? undefined,
+            receivedAt: new Date(),
+            rawResponse: { eventId: event.id, type: event.type, source: 'stripe-webhook', refundAmount },
+          },
+        }),
+        db.paymentRequest.update({ where: { id: paymentRequest.id }, data: { status: 'refunded' } }),
+        db.depositRequirement.updateMany({
+          where: { tenantId: paymentRequest.tenantId, paymentRequestId: paymentRequest.id, status: 'collected' },
+          data: { status: 'refunded', collectedAmount: 0 },
+        }),
+        // AR reconciliation: a refund restores the previously-reduced outstanding balance.
+        ...(paymentRequest.patientId
+          ? [db.patient.updateMany({ where: { id: paymentRequest.patientId, tenantId: paymentRequest.tenantId }, data: { outstandingBalance: { increment: refundAmount } } })]
+          : []),
+        db.integrationRunLog.create({
+          data: {
+            tenantId: paymentRequest.tenantId,
+            branchId: paymentRequest.branchId,
+            provider: 'stripe',
+            providerMode: paymentRequest.mode,
+            operation: 'webhook.refund',
+            status: 'success',
+            requestSummary: { eventId: event.id, type: event.type },
+            responseSummary: { paymentRequestId: paymentRequest.id, refundAmount },
+          },
+        }),
+        db.idempotencyKey.updateMany({ where: { scope: 'stripe.webhook', key: event.id }, data: { resultId: paymentRequest.id } }),
+      ]);
+      await db.auditEvent.create({ data: { tenantId: paymentRequest.tenantId, action: 'payment.refunded', resource: 'paymentRequest', resourceId: paymentRequest.id, metadata: { eventId: event.id, appointmentId: paymentRequest.appointmentId, refundAmount } } }).catch(() => {});
+    } else if (disputed) {
+      // Dispute/chargeback: record it and raise a high-severity revenue protection alert
+      // for staff follow-up. Money movement (if any) is handled by later refund events.
+      await runWithTenantContext(paymentRequest.tenantId, tx => tx.revenueProtectionAlert.create({
+        data: {
+          tenantId: paymentRequest.tenantId, branchId: paymentRequest.branchId,
+          patientId: paymentRequest.patientId ?? undefined, appointmentId: paymentRequest.appointmentId ?? undefined,
+          sourceType: 'payment_dispute', severity: 'high',
+          title: 'Payment dispute opened',
+          description: 'A patient (or their bank) opened a dispute/chargeback on a collected payment. Respond before the evidence deadline.',
+          estimatedValue: refundAmount, status: 'open',
+          recommendedAction: 'Review the dispute in Stripe and submit evidence before the deadline.',
+          actionLink: paymentRequest.appointmentId ? `appointment/${paymentRequest.appointmentId}` : null,
+        },
+      })).catch(() => {});
+      await db.integrationRunLog.create({
+        data: {
+          tenantId: paymentRequest.tenantId, branchId: paymentRequest.branchId,
+          provider: 'stripe', providerMode: paymentRequest.mode, operation: 'webhook.dispute',
+          status: 'success', requestSummary: { eventId: event.id, type: event.type }, responseSummary: { paymentRequestId: paymentRequest.id },
+        },
+      }).catch(() => {});
+      await db.auditEvent.create({ data: { tenantId: paymentRequest.tenantId, action: 'payment.dispute.created', resource: 'paymentRequest', resourceId: paymentRequest.id, metadata: { eventId: event.id, appointmentId: paymentRequest.appointmentId } } }).catch(() => {});
     } else if (failed || expired) {
       const newStatus = failed ? 'failed' : 'expired';
       // Never regress an already-paid request from a late/out-of-order failure
       // or expiry event — acknowledge and stop.
       if (paymentRequest.status === 'collected') {
+        await recordIdempotencyResult('stripe.webhook', event.id, paymentRequest.id);
         return reply.code(200).send({ received: true, ignored: 'already_paid' });
       }
       // Only move OUT of a non-terminal state; the guard prevents clobbering a
@@ -2670,6 +2925,11 @@ export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
       await db.auditEvent.create({ data: { tenantId: paymentRequest.tenantId, action: failed ? 'payment.failed' : 'payment.expired', resource: 'paymentRequest', resourceId: paymentRequest.id, metadata: { eventId: event.id, type: event.type } } }).catch(() => {});
     }
 
+    // Terminal completion for every reconciled path (success already recorded the
+    // result atomically above; this also covers failed/expired and unhandled event
+    // types). Recording a resultId marks the event fully processed so a later
+    // redelivery is acknowledged as a duplicate rather than reprocessed.
+    await recordIdempotencyResult('stripe.webhook', event.id, paymentRequest.id);
     return reply.code(200).send({ received: true });
   });
 };

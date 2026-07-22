@@ -9,7 +9,9 @@ import { eligibilityProviderStatus, computeDenialRisk, runDenialPreventionForApp
 import { emitBusinessEvent } from '../../lib/intelligence';
 import { encryptSecret } from '../../lib/security';
 import { INSURANCE_PROVIDERS, maskMemberId } from '../../lib/connectedCare/catalog';
-import { runStediEligibility } from '../../lib/connectedCare/eligibilityService';
+import { runStediEligibility, type NormalizedEligibility } from '../../lib/connectedCare/eligibilityService';
+import { env } from '../../config/env';
+import { createInsuranceProvider } from '../revenue-protection';
 
 function insStatus(def: { supportsSandbox: boolean }, mode: string, hasRequired: boolean): string {
   if (mode === 'sandbox' && def.supportsSandbox) return 'SANDBOX';
@@ -279,30 +281,74 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
     if (!patient) throw app.httpErrors.notFound('Patient not found');
     assertBranchAccess(request, patient.branchId);
 
-    const result = runStediEligibility(
-      { memberId: input.memberId, payerName: input.payerName, planName: input.planName, serviceType: input.serviceType },
-      provider.mode === 'production' ? 'production' : 'sandbox',
-    );
-    const n = result.normalized;
+    // Split-brain honesty: /v1/revenue-protection/eligibility/check makes a REAL
+    // Stedi call when a live key is configured, while this route historically ran a
+    // deterministic sandbox SIMULATOR — and mislabelled it 'production' when the
+    // per-tenant provider row was in production mode without a live key. Route to the
+    // SAME real Stedi adapter revenue-protection uses when it is genuinely live-
+    // configured; otherwise return an explicitly SIMULATED sandbox result so invented
+    // copay/deductible is never presented as a real payer (271) response. connectedCare/*
+    // is owned elsewhere and is NOT modified — we reuse revenue-protection's provider.
+    const liveConfigured = env.INSURANCE_PROVIDER === 'stedi' && Boolean(env.STEDI_API_KEY);
+    let n: NormalizedEligibility;
+    let providerMode: string;
+    let raw: unknown;
+    let simulated: boolean;
+
+    if (input.providerKey === 'stedi' && provider.mode === 'production' && liveConfigured) {
+      // REAL path — identical adapter to revenue-protection's eligibility check.
+      const payerRow = await db.insurancePayer.findFirst({ where: { tenantId, name: input.payerName } });
+      const outcome = await createInsuranceProvider().runEligibilityCheck({
+        tenantId, branchId: patient.branchId,
+        payer: payerRow
+          ? { id: payerRow.id, name: payerRow.name, tradingPartnerServiceId: payerRow.tradingPartnerServiceId, sourceProvider: payerRow.sourceProvider }
+          : { id: '', name: input.payerName, sourceProvider: 'stedi' },
+        policy: { id: '', planName: input.planName ?? 'Health Plan', memberId: input.memberId },
+        serviceType: input.serviceType,
+      });
+      providerMode = outcome.providerMode;
+      // Only a genuine 'live' payer response is NOT a simulation.
+      simulated = outcome.providerMode !== 'live';
+      n = {
+        status: outcome.coverageActive ? (outcome.coverageStatus === 'uncertain' ? 'NEEDS_REVIEW' : 'ACTIVE') : 'INACTIVE',
+        coverageActive: outcome.coverageActive, planName: outcome.planName, payerName: outcome.payerName,
+        copay: outcome.copay, deductibleRemaining: outcome.deductibleRemaining, coinsurance: outcome.coinsurance,
+        message: outcome.eligibilityMessage, payerReference: outcome.payerReference, checkedAt: outcome.checkedAt,
+      };
+      raw = outcome.storeRawResponse && outcome.rawResponse ? outcome.rawResponse : { note: 'raw payer response withheld' };
+    } else {
+      // SIMULATED path — FORCE sandbox labeling; never present 'production' fabricated
+      // data as a real result.
+      const result = runStediEligibility(
+        { memberId: input.memberId, payerName: input.payerName, planName: input.planName, serviceType: input.serviceType },
+        'sandbox',
+      );
+      n = result.normalized;
+      providerMode = 'sandbox';
+      simulated = true;
+      raw = result.raw;
+    }
+
     const verification = await db.eligibilityVerification.create({
       data: {
-        tenantId, branchId: patient.branchId, patientId: patient.id, providerMode: result.providerMode,
+        tenantId, branchId: patient.branchId, patientId: patient.id, providerMode,
         coverageStatus: n.status, coverageActive: n.coverageActive, planName: n.planName, payerName: n.payerName,
         copay: n.copay, deductibleRemaining: n.deductibleRemaining, coinsurance: n.coinsurance,
         eligibilityMessage: n.message, payerReference: n.payerReference,
-        normalizedResponse: n as unknown as object, rawResponse: result.raw as object,
+        normalizedResponse: { ...n, simulated } as unknown as object, rawResponse: raw as object,
       },
       select: { id: true, checkedAt: true },
     });
     // Audit WITHOUT PHI — never log the member ID.
-    await audit(request, { action: 'insurance.eligibility.checked', resource: 'eligibilityVerification', resourceId: verification.id, metadata: { providerKey: input.providerKey, status: n.status, mode: result.providerMode } });
+    await audit(request, { action: 'insurance.eligibility.checked', resource: 'eligibilityVerification', resourceId: verification.id, metadata: { providerKey: input.providerKey, status: n.status, mode: providerMode, simulated } });
     await emitBusinessEvent(tenantId, { eventType: 'insurance.eligibility.completed', entityType: 'eligibilityVerification', entityId: verification.id, sourceModule: 'insurance', payload: { status: n.status } }).catch(() => {});
 
     return reply.code(201).send({
       verificationId: verification.id, status: n.status, coverageActive: n.coverageActive,
       planName: n.planName, payerName: n.payerName, copay: n.copay, deductibleRemaining: n.deductibleRemaining,
       coinsurance: n.coinsurance, message: n.message, payerReference: n.payerReference,
-      maskedMemberId: maskMemberId(input.memberId), providerMode: result.providerMode, checkedAt: verification.checkedAt,
+      maskedMemberId: maskMemberId(input.memberId), providerMode, mode: providerMode, simulated,
+      checkedAt: verification.checkedAt,
     });
   });
 

@@ -1,5 +1,4 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { env } from '../../config/env';
 import { db } from '../../lib/db';
@@ -8,6 +7,9 @@ import { generatePasswordHash, validatePassword } from '../../lib/security';
 import { requireRoles } from '../../plugins/roles';
 import { assertRoleChangeSafe, assertDeactivateSafe } from '../../lib/adminSafety';
 import { autopilotQueue } from '../../workers/queues';
+import { createPaymentProvider, createInsuranceProvider, type PaymentRequestContext } from '../revenue-protection';
+import { paymentProviderStatus } from '../../lib/deposits';
+import { eligibilityProviderStatus } from '../../lib/insuranceIntelligence';
 
 const ownerAdminRoles = requireRoles('OWNER', 'ADMIN');
 const uuid = z.string().uuid();
@@ -1038,30 +1040,72 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     const integrations = await buildIntegrationRows(request.auth.tenantId);
     const selected = integrations.find(row => row.key === provider);
     if (!selected) throw app.httpErrors.notFound('Integration provider not found');
+    const branchId = request.auth.branchId ?? null;
+
+    const commonFields = {
+      providerKey: provider, providerName: selected.name, modeLabel: selected.modeLabel,
+      health: selected.health, supportedWorkflows: selected.supportedWorkflows,
+      missingEnvVars: selected.missingEnvVars, riskLevel: selected.riskLevel,
+    };
+
+    // Not configured → honest not_configured; never claim a successful test.
+    if (!selected.configured) {
+      const note = `${selected.name} is not configured; no live connection test was performed.${selected.missingEnvVars?.length ? ` Missing: ${selected.missingEnvVars.join(', ')}.` : ''}`;
+      await db.integrationRunLog.create({
+        data: {
+          tenantId: request.auth.tenantId, branchId, provider, providerMode: selected.mode,
+          operation: 'test-connection', status: 'not_configured',
+          requestSummary: { provider }, responseSummary: { status: 'not_configured', note },
+        },
+      });
+      await audit(request, { action: 'controlPlane.integration.tested', resource: 'integration', resourceId: provider, metadata: { status: 'not_configured' } });
+      return reply.send({ ...commonFields, status: 'not_configured', configured: false, verified: false, note, message: note });
+    }
+
+    // Configured + we have a live adapter → make a REAL reachability probe (Stripe).
+    if (provider === 'stripe' && env.STRIPE_SECRET_KEY) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 6000);
+      try {
+        const res = await fetch('https://api.stripe.com/v1/balance', { headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` }, signal: controller.signal });
+        const ok = res.ok;
+        const note = ok ? 'Live Stripe API reachable (GET /v1/balance).' : `Stripe API returned HTTP ${res.status}.`;
+        await db.integrationRunLog.create({
+          data: {
+            tenantId: request.auth.tenantId, branchId, provider, providerMode: selected.mode,
+            operation: 'test-connection', status: ok ? 'success' : 'error',
+            requestSummary: { provider }, responseSummary: { status: ok ? 'success' : 'error', note },
+          },
+        });
+        await audit(request, { action: 'controlPlane.integration.tested', resource: 'integration', resourceId: provider, metadata: { status: ok ? 'success' : 'error' } });
+        return reply.code(ok ? 200 : 502).send({ ...commonFields, status: ok ? 'success' : 'error', configured: true, verified: ok, note, message: note });
+      } catch (error) {
+        const note = `Stripe API unreachable: ${(error as Error).message?.slice(0, 200) ?? 'network error'}.`;
+        await db.integrationRunLog.create({
+          data: {
+            tenantId: request.auth.tenantId, branchId, provider, providerMode: selected.mode,
+            operation: 'test-connection', status: 'error', requestSummary: { provider }, errorMessage: note,
+          },
+        });
+        await audit(request, { action: 'controlPlane.integration.tested', resource: 'integration', resourceId: provider, metadata: { status: 'error' } });
+        return reply.code(502).send({ ...commonFields, status: 'error', configured: true, verified: false, note, message: note });
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    // Configured, but no live connectivity probe is implemented for this provider —
+    // report configuration presence honestly (NOT a verified live connection).
+    const note = `${selected.name} is configured. A live connectivity probe is not implemented for this provider, so configuration presence is reported rather than verified reachability.`;
     await db.integrationRunLog.create({
       data: {
-        tenantId: request.auth.tenantId,
-        branchId: request.auth.branchId ?? null,
-        provider,
-        providerMode: selected.mode,
-        operation: 'test-connection',
-        status: selected.configured ? 'success' : 'warning',
-        requestSummary: { provider, checkedAt: new Date().toISOString() },
-        responseSummary: { modeLabel: selected.modeLabel, configured: selected.configured, health: selected.health },
+        tenantId: request.auth.tenantId, branchId, provider, providerMode: selected.mode,
+        operation: 'test-connection', status: 'configured',
+        requestSummary: { provider }, responseSummary: { status: 'configured', verified: false, note },
       },
     });
-    await audit(request, { action: 'controlPlane.integration.tested', resource: 'integration', resourceId: provider, metadata: { mode: selected.mode } });
-    return reply.send({
-      providerKey: provider,
-      providerName: selected.name,
-      modeLabel: selected.modeLabel,
-      health: selected.health,
-      configured: selected.configured,
-      message: selected.configured ? 'Connection test recorded successfully.' : 'Provider is not fully configured; mock-safe test recorded.',
-      supportedWorkflows: selected.supportedWorkflows,
-      missingEnvVars: selected.missingEnvVars,
-      riskLevel: selected.riskLevel,
-    });
+    await audit(request, { action: 'controlPlane.integration.tested', resource: 'integration', resourceId: provider, metadata: { status: 'configured' } });
+    return reply.send({ ...commonFields, status: 'configured', configured: true, verified: false, note, message: note });
   });
 
   app.get('/integrations/:provider/runs', { preHandler: ownerAdminRoles }, async request => {
@@ -1090,37 +1134,71 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     const { provider } = z.object({ provider: z.enum(insuranceProviders) }).parse(request.params);
     const payers = await db.insurancePayer.findMany({ where: { tenantId: request.auth.tenantId, active: true }, orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }], take: 20 });
     const payer = payers.find(item => item.sourceProvider === provider) ?? payers[0];
-    const patient = await db.patient.findFirst({ where: { tenantId: request.auth.tenantId }, orderBy: { createdAt: 'asc' } });
-    const mode = provider === 'stedi' && env.STEDI_TEST_MODE ? 'sandbox' : env.INSURANCE_PROVIDER === provider ? 'sandbox' : 'mock';
-    const normalizedResponse = {
-      coverageStatus: 'covered',
-      payerName: payer?.name ?? `${provider} payer`,
-      providerMode: mode,
-      checkedAt: new Date().toISOString(),
-      patientId: patient?.id ?? null,
-      testOnly: true,
-    };
-    await db.integrationRunLog.create({
-      data: {
+    const patient = await db.patient.findFirst({ where: { tenantId: request.auth.tenantId }, orderBy: { createdAt: 'asc' }, select: { id: true, branchId: true } });
+    const branchId = patient?.branchId ?? request.auth.branchId ?? null;
+
+    // Honesty gate: only a genuinely configured, credentialed eligibility provider
+    // (the one the app actually uses) can make a REAL payer call. Never claim
+    // 'covered' from a synthesized response.
+    const status = eligibilityProviderStatus();
+    const canRunReal = status.provider === provider && status.configured && !status.mock;
+
+    if (!canRunReal) {
+      const simulated = status.provider === provider && status.mock; // mock/demo mode
+      const outcomeStatus = simulated ? 'simulated' : 'not_configured';
+      const note = simulated
+        ? `${provider} is in mock/demo mode — this is a simulated eligibility check, not a real payer (271) response.`
+        : `${provider} is not configured. Configure it (sandbox available) to run a real eligibility check.`;
+      await db.integrationRunLog.create({
+        data: {
+          tenantId: request.auth.tenantId, branchId, provider, providerMode: simulated ? 'mock' : 'unconfigured',
+          operation: 'test-eligibility', status: outcomeStatus,
+          requestSummary: { provider, patientId: patient?.id ?? null, payerId: payer?.id ?? null },
+          responseSummary: { status: outcomeStatus, note },
+        },
+      });
+      await audit(request, { action: 'controlPlane.insurance.tested', resource: 'insuranceRail', resourceId: provider, metadata: { status: outcomeStatus } });
+      return reply.send({
+        provider, providerName: payer?.sourceProvider ?? provider, status: outcomeStatus,
+        configured: false, coverageStatus: null, note, message: note,
+      });
+    }
+
+    // Real provider path: make an actual eligibility call and report the REAL result.
+    const providerImpl = createInsuranceProvider();
+    try {
+      const outcome = await providerImpl.runEligibilityCheck({
         tenantId: request.auth.tenantId,
-        branchId: patient?.branchId ?? request.auth.branchId ?? null,
-        provider,
-        providerMode: mode,
-        operation: 'test-eligibility',
-        status: 'success',
-        requestSummary: { provider, patientId: patient?.id ?? null, payerId: payer?.id ?? null },
-        responseSummary: normalizedResponse,
-      },
-    });
-    await audit(request, { action: 'controlPlane.insurance.tested', resource: 'insuranceRail', resourceId: provider, metadata: normalizedResponse });
-    return reply.send({
-      provider,
-      providerName: payer?.sourceProvider ?? provider,
-      providerMode: mode,
-      modeLabel: formatMode(mode, mode !== 'mock'),
-      normalizedResponse,
-      message: mode === 'mock' ? 'Mock-safe eligibility test completed.' : 'Sandbox eligibility test completed.',
-    });
+        branchId: branchId ?? '',
+        payer: payer ? { id: payer.id, name: payer.name, tradingPartnerServiceId: payer.tradingPartnerServiceId, sourceProvider: payer.sourceProvider } : undefined,
+      });
+      await db.integrationRunLog.create({
+        data: {
+          tenantId: request.auth.tenantId, branchId, provider, providerMode: outcome.providerMode,
+          operation: 'test-eligibility', status: 'success',
+          requestSummary: { provider, patientId: patient?.id ?? null, payerId: payer?.id ?? null },
+          responseSummary: { coverageStatus: outcome.coverageStatus, coverageActive: outcome.coverageActive, providerMode: outcome.providerMode },
+        },
+      });
+      await audit(request, { action: 'controlPlane.insurance.tested', resource: 'insuranceRail', resourceId: provider, metadata: { status: 'success', coverageStatus: outcome.coverageStatus, mode: outcome.providerMode } });
+      return reply.send({
+        provider, providerName: outcome.providerName, providerMode: outcome.providerMode,
+        modeLabel: formatMode(outcome.providerMode, true), status: 'success', configured: true,
+        coverageStatus: outcome.coverageStatus, coverageActive: outcome.coverageActive,
+        message: 'Live eligibility check completed.',
+      });
+    } catch (error) {
+      await db.integrationRunLog.create({
+        data: {
+          tenantId: request.auth.tenantId, branchId, provider, providerMode: status.provider === 'stedi' ? (env.STEDI_TEST_MODE ? 'sandbox' : 'live') : 'live',
+          operation: 'test-eligibility', status: 'error',
+          requestSummary: { provider, patientId: patient?.id ?? null, payerId: payer?.id ?? null },
+          errorMessage: (error as Error).message?.slice(0, 500) ?? 'Eligibility call failed',
+        },
+      });
+      await audit(request, { action: 'controlPlane.insurance.tested', resource: 'insuranceRail', resourceId: provider, metadata: { status: 'error' } });
+      return reply.code(502).send({ provider, providerName: provider, status: 'error', configured: true, coverageStatus: null, message: 'Live eligibility provider call failed.' });
+    }
   });
 
   app.get('/insurance-rails/logs', { preHandler: ownerAdminRoles }, async request => {
@@ -1148,44 +1226,75 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     const { provider } = z.object({ provider: z.enum(paymentProviders) }).parse(request.params);
     const connections = await db.paymentProviderConnection.findMany({ where: { tenantId: request.auth.tenantId } });
     const connection = connections.find(item => item.providerKey === provider);
-    const patient = await db.patient.findFirst({ where: { tenantId: request.auth.tenantId }, orderBy: { createdAt: 'asc' } });
-    const mode = provider === 'stripe' && env.STRIPE_SECRET_KEY ? (env.STRIPE_SECRET_KEY.startsWith('sk_live_') ? 'live' : 'sandbox') : connection?.mode ?? 'mock';
-    const paymentUrl = provider === 'stripe' && env.STRIPE_SECRET_KEY ? `https://checkout.stripe.com/pay/test-${randomUUID()}` : `https://payments.local/${provider}/test-${randomUUID()}`;
-    const paymentRequest = await db.paymentRequest.create({
-      data: {
+    const patient = await db.patient.findFirst({ where: { tenantId: request.auth.tenantId }, orderBy: { createdAt: 'asc' }, select: { id: true, branchId: true } });
+    const branchId = patient?.branchId ?? request.auth.branchId ?? (await db.branch.findFirst({ where: { tenantId: request.auth.tenantId }, select: { id: true } }))?.id ?? null;
+
+    // Honesty gate: only a genuinely configured, credentialed payment provider
+    // (the one the app actually uses) can make a REAL Stripe call. Never synthesize
+    // a checkout.stripe.com URL and never persist a fabricated payment request.
+    const status = paymentProviderStatus();
+    const canRunReal = status.provider === provider && status.configured && !status.mock;
+
+    if (!canRunReal) {
+      const simulated = status.provider === provider && status.mock; // mock/demo mode
+      const outcomeStatus = simulated ? 'simulated' : 'not_configured';
+      const note = simulated
+        ? `${provider} is in mock/demo mode — no real payment link is created and nothing is persisted.`
+        : `${provider} is not configured. Connect ${provider} (set credentials) to generate a real payment link.`;
+      await db.integrationRunLog.create({
+        data: {
+          tenantId: request.auth.tenantId, branchId, provider, providerMode: simulated ? 'mock' : 'unconfigured',
+          operation: 'test-payment-link', status: outcomeStatus,
+          requestSummary: { provider }, responseSummary: { status: outcomeStatus, note },
+        },
+      });
+      await audit(request, { action: 'controlPlane.finance.tested', resource: 'financeRail', resourceId: provider, metadata: { status: outcomeStatus } });
+      return reply.send({
+        provider, providerName: connection?.displayName ?? provider, status: outcomeStatus,
+        configured: false, paymentUrl: null, note, message: note,
+      });
+    }
+
+    // Real provider path: create an ACTUAL payment link via the live provider and
+    // report the real URL. This is a connectivity test — no PaymentRequest row is
+    // persisted (it is not a collectible patient charge).
+    const providerImpl = createPaymentProvider();
+    try {
+      const outcome = await providerImpl.createPaymentLink({
         tenantId: request.auth.tenantId,
-        branchId: patient?.branchId ?? request.auth.branchId ?? (await db.branch.findFirst({ where: { tenantId: request.auth.tenantId } }))?.id ?? '',
-        patientId: patient?.id ?? null,
-        paymentProviderConnectionId: connection?.id ?? null,
-        amount: 50,
-        status: 'draft',
-        reason: 'Control plane test payment link',
-        mode,
-        paymentUrl,
-        providerReference: `control-plane-${provider}-${randomUUID()}`,
-      },
-    });
-    await db.integrationRunLog.create({
-      data: {
-        tenantId: request.auth.tenantId,
-        branchId: patient?.branchId ?? request.auth.branchId ?? null,
-        provider,
-        providerMode: mode,
-        operation: 'test-payment-link',
-        status: 'success',
-        requestSummary: { provider, paymentRequestId: paymentRequest.id },
-        responseSummary: { paymentUrl },
-      },
-    });
-    await audit(request, { action: 'controlPlane.finance.tested', resource: 'financeRail', resourceId: provider, metadata: { paymentRequestId: paymentRequest.id } });
-    return reply.send({
-      provider,
-      providerName: connection?.displayName ?? provider,
-      providerMode: mode,
-      modeLabel: formatMode(mode, mode !== 'mock'),
-      paymentUrl,
-      message: mode === 'mock' ? 'Mock payment link created safely.' : 'Sandbox payment link created safely.',
-    });
+        branchId: branchId ?? '',
+        amount: 1,
+        reason: 'CareCommand connectivity test',
+      } as PaymentRequestContext);
+      const ok = Boolean(outcome.paymentUrl);
+      await db.integrationRunLog.create({
+        data: {
+          tenantId: request.auth.tenantId, branchId, provider, providerMode: outcome.providerMode,
+          operation: 'test-payment-link', status: ok ? 'success' : 'error',
+          requestSummary: { provider }, responseSummary: { providerReference: outcome.providerReference, paymentUrl: outcome.paymentUrl ?? null },
+        },
+      });
+      await audit(request, { action: 'controlPlane.finance.tested', resource: 'financeRail', resourceId: provider, metadata: { status: ok ? 'success' : 'error', providerReference: outcome.providerReference } });
+      if (!ok) {
+        return reply.code(502).send({ provider, providerName: outcome.provider, status: 'error', configured: true, paymentUrl: null, message: 'Live payment provider returned no link.' });
+      }
+      return reply.send({
+        provider, providerName: outcome.provider, providerMode: outcome.providerMode,
+        modeLabel: formatMode(outcome.providerMode, true), status: 'success', configured: true,
+        paymentUrl: outcome.paymentUrl, providerReference: outcome.providerReference,
+        message: `Live payment link created via ${outcome.provider}.`,
+      });
+    } catch (error) {
+      await db.integrationRunLog.create({
+        data: {
+          tenantId: request.auth.tenantId, branchId, provider, providerMode: status.mode,
+          operation: 'test-payment-link', status: 'error',
+          requestSummary: { provider }, errorMessage: (error as Error).message?.slice(0, 500) ?? 'Payment link call failed',
+        },
+      });
+      await audit(request, { action: 'controlPlane.finance.tested', resource: 'financeRail', resourceId: provider, metadata: { status: 'error' } });
+      return reply.code(502).send({ provider, providerName: connection?.displayName ?? provider, status: 'error', configured: true, paymentUrl: null, message: 'Live payment provider call failed.' });
+    }
   });
 
   app.get('/finance-rails/logs', { preHandler: ownerAdminRoles }, async request => {

@@ -104,6 +104,53 @@ describe('money path — Stripe webhook is signature-verified and idempotent', (
     const res = await webhook(body, { 'stripe-signature': stripeSignature(body) });
     expect(res.statusCode).toBe(200);
   });
+
+  it('is crash-safe: a webhook that throws before completing is REPROCESSED on retry, not permanently skipped', async () => {
+    const t = await makeTenant();
+    const pr = await makePaymentRequest(t.id, t.branchId);
+    const eventId = `evt_${randomUUID()}`;
+    const body = JSON.stringify({ id: eventId, type: 'checkout.session.completed', data: { object: { id: pr.providerReference } } });
+
+    // First delivery: force the money-movement transaction to throw ONCE, AFTER the
+    // idempotency key has already been claimed. Previously this permanently skipped
+    // the event (money collected at Stripe, DB never reconciled). We capture the real
+    // create first, then throw on the first call only and delegate to the real impl
+    // afterwards (avoids Prisma-proxy mockRestore breakage between deliveries).
+    const realCreate = db.paymentTransaction.create.bind(db.paymentTransaction);
+    let createCalls = 0;
+    const spy = vi.spyOn(db.paymentTransaction, 'create').mockImplementation(((...args: unknown[]) => {
+      createCalls += 1;
+      if (createCalls === 1) throw new Error('boom: processing failed after claim');
+      return (realCreate as (...a: unknown[]) => unknown)(...args);
+    }) as typeof db.paymentTransaction.create);
+    const first = await webhook(body, { 'stripe-signature': stripeSignature(body) });
+    expect(first.statusCode).toBeGreaterThanOrEqual(500);
+
+    // Nothing collected, no transaction recorded, and the claim is left INCOMPLETE
+    // (no resultId) so it remains reprocessable.
+    expect((await db.paymentRequest.findUnique({ where: { id: pr.id }, select: { status: true } }))?.status).toBe('link_sent');
+    expect(await db.paymentTransaction.count({ where: { paymentRequestId: pr.id } })).toBe(0);
+    const key = await db.idempotencyKey.findUnique({ where: { scope_key: { scope: 'stripe.webhook', key: eventId } } });
+    expect(key).not.toBeNull();
+    expect(key?.resultId ?? null).toBeNull();
+
+    // Stripe retries the SAME event id → MUST be reprocessed (not acknowledged as a
+    // duplicate) so the payment is finally reconciled exactly once.
+    const retry = await webhook(body, { 'stripe-signature': stripeSignature(body) });
+    expect(retry.statusCode).toBe(200);
+    expect(retry.json().duplicate).toBeUndefined();
+    expect((await db.paymentRequest.findUnique({ where: { id: pr.id }, select: { status: true } }))?.status).toBe('collected');
+    expect(await db.paymentTransaction.count({ where: { paymentRequestId: pr.id, status: 'succeeded' } })).toBe(1);
+
+    // A FURTHER redelivery after completion IS acknowledged as a duplicate — no double record.
+    const dup = await webhook(body, { 'stripe-signature': stripeSignature(body) });
+    expect(dup.statusCode).toBe(200);
+    expect(dup.json().duplicate).toBe(true);
+    expect(await db.paymentTransaction.count({ where: { paymentRequestId: pr.id, status: 'succeeded' } })).toBe(1);
+
+    spy.mockRestore();
+    expect(createCalls).toBe(2); // one throwing call, one successful reprocess
+  });
 });
 
 describe('money path — public checkout is tokenized and patient-safe', () => {

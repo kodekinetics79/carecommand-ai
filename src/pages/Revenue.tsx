@@ -1,5 +1,6 @@
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { TrendingUp, DollarSign, Phone, Megaphone, AlertCircle, ArrowRight, Zap, BarChart3 } from 'lucide-react';
+import { TrendingUp, DollarSign, ShieldCheck, Megaphone, AlertCircle, ArrowRight, Zap, BarChart3 } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
@@ -9,14 +10,28 @@ import BranchComparisonChart from '../components/charts/BranchComparisonChart';
 import type { Appointment, Doctor } from '../types';
 import { formatCurrency } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
+import { apiRequest } from '../lib/api';
 import { mapAppointment, mapProviderProfile, mapRevenueSnapshot, type ApiAppointment, type ApiProviderProfile, type ApiRevenueSnapshot } from '../lib/apiAdapters';
 
-const lostOpportunities = [
+// Illustrative only — NOT live money. These fixed categories are shown as a sample
+// of the kinds of recoverable leakage the product surfaces; they are clearly labelled
+// "Sample" in the UI and are never presented as computed live figures.
+const sampleLostOpportunities = [
   { label: 'Missed calls — unrecovered', value: 3450, action: 'Launch follow-up' },
   { label: 'Empty slots — unfilled this week', value: 6200, action: 'Fill with slot campaign' },
   { label: 'Inactive customers — no outreach', value: 18700, action: 'Run winback campaign' },
   { label: 'Unpaid invoices >30 days', value: 1150, action: 'Send payment reminder' },
 ];
+
+// Genuine revenue-protection aggregates from the DB (server computes these from real
+// transactions/deposits/alerts). Used to drive the money tiles honestly.
+interface RevenueProtectionSummary {
+  revenueProtected: number;
+  depositsCollected: number;
+  unpaidBalances: number;
+  revenueAtRisk: number;
+  failedPayments: number;
+}
 
 type BarColor = 'blue' | 'violet' | 'emerald' | 'red' | 'teal';
 interface BranchOption { id: string; name: string }
@@ -29,8 +44,22 @@ export default function Revenue() {
   const { data: branchOptions, source: branchSource } = useApiResource<BranchOption, BranchOption>('/v1/branches?limit=100', [], row => row);
   const { data: providerRecords, source: providerSource } = useApiResource<ApiProviderProfile, Doctor>('/v1/providers/overview?limit=100', [], mapProviderProfile);
   const { data: appointmentRecords, source: appointmentSource } = useApiResource<ApiAppointment, Appointment>('/v1/appointments?limit=100', [], mapAppointment);
+
+  // Genuine DB-computed revenue-protection money aggregates (single object, not a list).
+  const [rpSummary, setRpSummary] = useState<RevenueProtectionSummary | null>(null);
+  const [rpLive, setRpLive] = useState(false);
+  useEffect(() => {
+    let active = true;
+    apiRequest<{ summary: RevenueProtectionSummary }>('/v1/revenue-protection/overview')
+      .then(res => { if (!active) return; setRpSummary(res.summary); setRpLive(true); })
+      .catch(() => { if (!active) return; setRpSummary(null); setRpLive(false); });
+    return () => { active = false; };
+  }, []);
+
   const loadError = revenueError;
-  const liveReady = revenueSource === 'live' && branchSource === 'live' && providerSource === 'live' && appointmentSource === 'live';
+  // "Live DB" is only truthful when BOTH the snapshot feeds AND the real money
+  // aggregates loaded from the DB. Otherwise the headline money tiles are not live.
+  const liveReady = revenueSource === 'live' && branchSource === 'live' && providerSource === 'live' && appointmentSource === 'live' && rpLive;
 
   function exportReport() {
     const header = ['Month', 'Revenue', 'Campaigns', 'Recovered', 'Lost'];
@@ -46,7 +75,6 @@ export default function Revenue() {
   const latest = revenueRecords[0] ?? null;
   const prev = revenueRecords[1] ?? latest;
   const revGrowth = latest && prev && prev.revenue > 0 ? Math.round(((latest.revenue - prev.revenue) / prev.revenue) * 100) : 0;
-  const recoveredGrowth = latest && prev && prev.recovered > 0 ? Math.round(((latest.recovered - prev.recovered) / prev.recovered) * 100) : 0;
   const branchRevenue = branchOptions.map(branch => {
     const branchProviders = providerRecords.filter(provider => provider.branchId === branch.id);
     const revenue = Math.round(branchProviders.reduce((sum, provider) => sum + provider.revenueThisMonth, 0));
@@ -96,14 +124,15 @@ export default function Revenue() {
         </div>
       )}
 
-      {/* KPI Strip */}
+      {/* KPI Strip — money tiles are wired to real DB aggregates (revenue-protection
+          /overview); snapshot tiles come from live revenue snapshots. No hardcoded money. */}
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-3 xl:grid-cols-6">
-        <StatCard title="Monthly Revenue" value={formatCurrency(latest?.revenue ?? 0)} subtitle="This month" trend={revGrowth} icon={<TrendingUp className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Revenue Recovered" value={formatCurrency(latest?.recovered ?? 0)} subtitle="By automation" trend={recoveredGrowth} icon={<DollarSign className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Campaign Attribution" value={formatCurrency(latest?.campaigns ?? 0)} subtitle="This month" trend={18} icon={<Megaphone className="w-4 h-4" />} accent="violet" />
-        <StatCard title="Missed-Call Recovery" value={formatCurrency(3840)} subtitle="Follow-up this month" trend={48} icon={<Phone className="w-4 h-4" />} accent="cyan" />
-        <StatCard title="Lost Opportunities" value={formatCurrency(latest?.lost ?? 0)} subtitle="This month" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
-        <StatCard title="Recovery Rate" value="72%" subtitle="Of identified opportunities" trend={5} icon={<TrendingUp className="w-4 h-4" />} accent="amber" />
+        <StatCard title="Monthly Revenue" value={formatCurrency(latest?.revenue ?? 0)} subtitle="Live snapshot" trend={revGrowth} icon={<TrendingUp className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Revenue Protected" value={formatCurrency(rpSummary?.revenueProtected ?? 0)} subtitle="Collected + settled (DB)" icon={<ShieldCheck className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Deposits Collected" value={formatCurrency(rpSummary?.depositsCollected ?? 0)} subtitle="Via checkout (DB)" icon={<DollarSign className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Open AR (Unpaid)" value={formatCurrency(rpSummary?.unpaidBalances ?? 0)} subtitle="Genuinely-open requests (DB)" icon={<Megaphone className="w-4 h-4" />} accent="cyan" />
+        <StatCard title="Revenue at Risk" value={formatCurrency(rpSummary?.revenueAtRisk ?? 0)} subtitle="Open protection alerts (DB)" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
+        <StatCard title="Failed Payments" value={String(rpSummary?.failedPayments ?? 0)} subtitle="Need follow-up (DB)" icon={<TrendingUp className="w-4 h-4" />} accent="amber" />
       </div>
 
       {/* Charts row */}
@@ -189,14 +218,12 @@ export default function Revenue() {
             </div>
           </BentoCard>
 
-          {/* Lost opportunity tracker */}
-          <BentoCard title="Lost Opportunity Tracker" subtitle="Recoverable revenue" headerRight={
-            <span className="badge badge-red">
-              {formatCurrency(lostOpportunities.reduce((s, o) => s + o.value, 0))} at risk
-            </span>
+          {/* Lost opportunity tracker — illustrative sample, NOT live money. */}
+          <BentoCard title="Lost Opportunity Tracker" subtitle="Illustrative sample — not live figures" headerRight={
+            <span className="badge badge-amber">Sample</span>
           }>
             <div className="space-y-2.5">
-              {lostOpportunities.map((opp) => (
+              {sampleLostOpportunities.map((opp) => (
                 <div key={opp.label} className="flex items-center justify-between gap-3 p-3 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all">
                   <div className="flex-1 min-w-0">
                     <p className="text-xs font-semibold text-t1">{opp.label}</p>
@@ -251,11 +278,14 @@ export default function Revenue() {
             <TrendingUp className="w-5 h-5 text-indigo" />
           </div>
           <div className="flex-1">
-            <p className="text-xs font-bold uppercase tracking-widest text-blue-v mb-1">Revenue Action Plan</p>
+            <div className="flex items-center gap-2 mb-1">
+              <p className="text-xs font-bold uppercase tracking-widest text-blue-v">Revenue Action Plan</p>
+              <span className="badge badge-amber">Illustrative example</span>
+            </div>
             <p className="text-t1 font-semibold leading-relaxed mb-3">
-              Your network recovered {formatCurrency(27200)} through automation this month — up 12% vs last month.
-              The biggest untapped opportunity is {formatCurrency(18700)} from inactive customers who haven't been contacted.
-              Running a winback campaign today could convert 34 bookings within 14 days.
+              Example scenario (not live figures): a network that recovers revenue through automation and
+              reactivates inactive customers via a winback campaign can convert additional bookings within
+              14 days. Connect your live data to replace this with your clinic's real recovery numbers.
             </p>
             <button type="button" onClick={() => navigate('/campaigner')} className="inline-flex items-center gap-1.5 text-sm font-semibold text-indigo hover:opacity-80 transition-colors">
               Launch winback campaign <ArrowRight className="w-4 h-4" />

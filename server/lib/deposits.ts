@@ -70,7 +70,7 @@ function ruleApplies(rule: RuleRow, ctx: ApptCtx): boolean {
   return false;
 }
 
-function computeRequiredAmount(rule: RuleRow, appointmentValue: number): number {
+export function computeRequiredAmount(rule: RuleRow, appointmentValue: number): number {
   const amt = toAmount(rule.amountValue);
   if (rule.amountType === 'percentage') return Math.round(appointmentValue * (amt / 100) * 100) / 100;
   if (rule.amountType === 'none') return 0;
