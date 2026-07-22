@@ -122,7 +122,7 @@ async function main() {
   console.log(`  curl -X POST http://localhost:3001/v1/connected-care/${tenantId}/providers/dexcom/webhook \\`);
   console.log(`    -H 'content-type: application/json' -H 'x-cc-signature: ${sig}' \\`);
   console.log(`    -d '${sampleBody}'`);
-  console.log(`\n  (manual provider needs no signature: POST .../providers/manual/webhook)\n`);
+  console.log(`\n  (all device webhooks require a valid per-provider HMAC signature — unsigned requests are rejected 401)\n`);
   await db.$disconnect();
 }
 

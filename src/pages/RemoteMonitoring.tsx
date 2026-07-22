@@ -164,7 +164,7 @@ export default function RemoteMonitoring() {
               : (
                 <div className="space-y-2">
                   {alerts.filter(a => a.status !== 'resolved').map(a => (
-                    <div key={a.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3">
+                    <div key={a.id} data-alert-id={a.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3">
                       <div className="flex items-start justify-between gap-3">
                         <div className="min-w-0">
                           <div className="flex items-center gap-2 flex-wrap">

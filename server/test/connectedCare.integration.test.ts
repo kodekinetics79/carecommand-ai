@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHmac } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 
 // Stub the BullMQ queues module so no Redis connection opens (rate-limiter
@@ -18,6 +18,23 @@ vi.mock('../workers/queues', () => ({
 const { buildApp } = await import('../app');
 const { db } = await import('../lib/db');
 const { recomputeEntitlements } = await import('../lib/entitlements');
+const { encryptSecret } = await import('../lib/security');
+
+// Configure a per-tenant device provider row with an encrypted webhook secret,
+// exactly as the devices config route / seed do. This is what makes an inbound
+// webhook verifiable (and therefore ingestible) for that tenant.
+async function configureDeviceProviderSecret(tenantId: string, providerKey: string, webhookSecret: string) {
+  await db.deviceProvider.upsert({
+    where: { tenantId_providerKey: { tenantId, providerKey } },
+    create: { tenantId, providerKey, displayName: providerKey, category: 'DIRECT_API', mode: 'sandbox', status: 'SANDBOX', encryptedConfig: encryptSecret(JSON.stringify({ webhookSecret })), webhookConfigured: true },
+    update: { encryptedConfig: encryptSecret(JSON.stringify({ webhookSecret })), webhookConfigured: true },
+  });
+}
+// Sign exactly what the webhook route verifies: JSON.stringify(request.body).
+function signWebhook(secret: string, payload: unknown): { raw: string; sig: string } {
+  const raw = JSON.stringify(payload);
+  return { raw, sig: createHmac('sha256', secret).update(raw).digest('hex') };
+}
 
 let app: FastifyInstance;
 const createdTenantIds: string[] = [];
@@ -112,14 +129,17 @@ describe('insurance provider registry + eligibility (integration)', () => {
 });
 
 describe('connected care — enrollment, webhook ingest, RPM readiness (integration)', () => {
-  it('enrolls a patient, ingests a webhook reading, and creates a backend-decided alert', async () => {
+  it('enrolls a patient, ingests a correctly-signed webhook reading, and creates a backend-decided alert', async () => {
     const t = await makeTenant('enterprise');
     const admin = tok(t.id, t.adminUserId);
+    const SECRET = `whsec-${randomUUID()}`;
+    await configureDeviceProviderSecret(t.id, 'withings', SECRET);
 
-    const enroll = await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: auth(admin), payload: { patientId: t.patientId, providerKey: 'manual', externalRef: 'EXT-IT-1' } });
+    const enroll = await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: auth(admin), payload: { patientId: t.patientId, providerKey: 'withings', externalRef: 'EXT-IT-1' } });
     expect(enroll.statusCode).toBe(201);
 
-    const hook = await app.inject({ method: 'POST', url: `/v1/connected-care/${t.id}/providers/manual/webhook`, payload: { readings: [{ patientExternalRef: 'EXT-IT-1', readingType: 'glucose', value: '330', numericValue: 330, unit: 'mg/dL' }] } });
+    const { raw, sig } = signWebhook(SECRET, { readings: [{ patientExternalRef: 'EXT-IT-1', readingType: 'glucose', value: '330', numericValue: 330, unit: 'mg/dL' }] });
+    const hook = await app.inject({ method: 'POST', url: `/v1/connected-care/${t.id}/providers/withings/webhook`, headers: { 'content-type': 'application/json', 'x-cc-signature': sig }, payload: raw });
     expect(hook.statusCode).toBe(200);
     const hb = JSON.parse(hook.body);
     expect(hb.ingested).toBe(1);
@@ -127,6 +147,68 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
 
     const logs = JSON.parse((await app.inject({ method: 'GET', url: '/v1/connected-care/sync-logs', headers: auth(admin) })).body);
     expect(logs[0].readingsIngested).toBe(1);
+  });
+
+  it('FAILS CLOSED: rejects an unsigned / unverifiable webhook (P0) and writes no readings; a correctly-signed one still ingests', async () => {
+    const t = await makeTenant('enterprise');
+    const admin = tok(t.id, t.adminUserId);
+    await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: auth(admin), payload: { patientId: t.patientId, providerKey: 'withings', externalRef: 'EXT-CLOSED-1' } });
+
+    const attackPayload = { readings: [{ patientExternalRef: 'EXT-CLOSED-1', readingType: 'glucose', value: '330', numericValue: 330, unit: 'mg/dL' }] };
+
+    // (a) No provider secret configured at all → unverifiable → REJECT. This is
+    // the exact P0: an unauthenticated caller trusting only the URL tenantId.
+    const noSecret = await app.inject({ method: 'POST', url: `/v1/connected-care/${t.id}/providers/withings/webhook`, headers: { 'content-type': 'application/json' }, payload: JSON.stringify(attackPayload) });
+    expect(noSecret.statusCode).toBe(401);
+
+    // Now configure a secret; an unsigned/wrong-signature request must still reject.
+    const SECRET = `whsec-${randomUUID()}`;
+    await configureDeviceProviderSecret(t.id, 'withings', SECRET);
+
+    // (b) Secret configured but NO signature header → REJECT.
+    const unsigned = await app.inject({ method: 'POST', url: `/v1/connected-care/${t.id}/providers/withings/webhook`, headers: { 'content-type': 'application/json' }, payload: JSON.stringify(attackPayload) });
+    expect(unsigned.statusCode).toBe(401);
+
+    // (c) Secret configured but WRONG signature → REJECT.
+    const wrong = await app.inject({ method: 'POST', url: `/v1/connected-care/${t.id}/providers/withings/webhook`, headers: { 'content-type': 'application/json', 'x-cc-signature': 'deadbeef' }, payload: JSON.stringify(attackPayload) });
+    expect(wrong.statusCode).toBe(401);
+
+    // After every rejected attempt: NOT ONE reading or alert was written for this tenant.
+    expect(await db.deviceReading.count({ where: { tenantId: t.id } })).toBe(0);
+    expect(await db.readingAlert.count({ where: { tenantId: t.id } })).toBe(0);
+
+    // (d) A correctly-signed request from the configured provider STILL ingests + alerts.
+    const { raw, sig } = signWebhook(SECRET, attackPayload);
+    const ok = await app.inject({ method: 'POST', url: `/v1/connected-care/${t.id}/providers/withings/webhook`, headers: { 'content-type': 'application/json', 'x-cc-signature': sig }, payload: raw });
+    expect(ok.statusCode).toBe(200);
+    expect(JSON.parse(ok.body).ingested).toBe(1);
+    expect(await db.deviceReading.count({ where: { tenantId: t.id } })).toBe(1);
+    expect(await db.readingAlert.count({ where: { tenantId: t.id } })).toBe(1);
+  });
+
+  it('DEDUP (P1 billing integrity): an identical redelivered webhook reading collapses to one row + one alert', async () => {
+    const t = await makeTenant('enterprise');
+    const admin = tok(t.id, t.adminUserId);
+    const SECRET = `whsec-${randomUUID()}`;
+    await configureDeviceProviderSecret(t.id, 'withings', SECRET);
+    await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: auth(admin), payload: { patientId: t.patientId, providerKey: 'withings', externalRef: 'EXT-DEDUP-1' } });
+
+    // Same measurement (same captured timestamp/value) delivered twice.
+    const payload = { readings: [{ patientExternalRef: 'EXT-DEDUP-1', readingType: 'glucose', value: '330', numericValue: 330, unit: 'mg/dL', capturedAt: '2026-07-20T10:00:00.000Z' }] };
+    const { raw, sig } = signWebhook(SECRET, payload);
+    const url = `/v1/connected-care/${t.id}/providers/withings/webhook`;
+
+    const first = await app.inject({ method: 'POST', url, headers: { 'content-type': 'application/json', 'x-cc-signature': sig }, payload: raw });
+    expect(JSON.parse(first.body).ingested).toBe(1);
+    const second = await app.inject({ method: 'POST', url, headers: { 'content-type': 'application/json', 'x-cc-signature': sig }, payload: raw });
+    const sb = JSON.parse(second.body);
+    expect(sb.ingested).toBe(0);       // redelivery ingests nothing
+    expect(sb.duplicates).toBe(1);
+    expect(sb.alertsCreated).toBe(0);  // no duplicate alert
+
+    // Exactly one reading + one alert for this tenant → device-days not inflated.
+    expect(await db.deviceReading.count({ where: { tenantId: t.id } })).toBe(1);
+    expect(await db.readingAlert.count({ where: { tenantId: t.id } })).toBe(1);
   });
 
   it('computes RPM readiness with consent + signoff and exposes the requirement checklist', async () => {
