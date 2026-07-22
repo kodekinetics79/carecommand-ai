@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 
 // Provider-agnostic device adapter layer. Real provider payloads (Dexcom EGV,
 // Withings measure groups, Validic/Terra/Tenovi events) normalize into the
@@ -8,6 +8,7 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 export interface NormalizedReading {
   patientExternalRef?: string;
   patientId?: string;
+  externalId?: string;   // provider's own reading id, when supplied (strongest dedupe key)
   readingType: string;
   value: string;
   numericValue?: number;
@@ -26,7 +27,12 @@ const READING_TYPES = new Set(['glucose', 'blood_pressure', 'oxygen', 'weight', 
 /**
  * Verify an HMAC-SHA256 webhook signature.
  *   - returns true/false when the provider supplies a signing secret
- *   - returns null when the provider does not sign (sandbox / manual)
+ *   - returns null when there is no usable secret (no provider row / none configured)
+ *
+ * SECURITY: `null` means "cannot verify", NOT "trusted". Callers MUST fail
+ * closed — ingest ONLY on an explicit `true`. A public webhook whose signature
+ * is `null` or `false` is unauthenticated and must be rejected: the verified
+ * secret is what binds the request to its tenant.
  */
 export function verifyWebhookSignature(secret: string | null, rawBody: string, signature: string | null): boolean | null {
   if (!secret) return null;
@@ -41,6 +47,40 @@ export function verifyWebhookSignature(secret: string | null, rawBody: string, s
   }
 }
 
+/**
+ * Deterministic idempotency key for an inbound reading. Webhook redeliveries of
+ * the SAME measurement (same provider/patient/type/timestamp/value) collapse to
+ * one DeviceReading — preventing duplicate alerts and inflated RPM device-days.
+ * Stored on DeviceReading.dedupeKey with a unique (tenantId, dedupeKey) index;
+ * manual/keyless readings leave it null (Postgres treats NULLs as distinct).
+ */
+export function readingDedupeKey(parts: {
+  providerKey?: string | null;
+  externalId?: string | null;
+  patientId?: string | null;
+  patientExternalRef?: string | null;
+  readingType: string;
+  capturedAt: Date;
+  value: string;
+  numericValue?: number | null;
+  valueSecondary?: number | null;
+}): string {
+  // An explicit external reading id (when a provider supplies one) is the
+  // strongest key; otherwise fall back to the natural measurement identity.
+  const identity = parts.externalId
+    ? ['ext', parts.providerKey ?? '', parts.externalId]
+    : [
+        parts.providerKey ?? '',
+        parts.patientId ?? parts.patientExternalRef ?? '',
+        parts.readingType,
+        parts.capturedAt.toISOString(),
+        parts.value,
+        parts.numericValue ?? '',
+        parts.valueSecondary ?? '',
+      ];
+  return createHash('sha256').update(identity.join('|')).digest('hex');
+}
+
 function toNumber(v: unknown): number | undefined {
   if (typeof v === 'number') return Number.isFinite(v) ? v : undefined;
   if (typeof v === 'string') { const n = Number(v); return Number.isFinite(n) ? n : undefined; }
@@ -49,6 +89,7 @@ function toNumber(v: unknown): number | undefined {
 
 interface RawItem {
   patientExternalRef?: string; patient_id?: string; userId?: string; patientId?: string;
+  id?: string; externalId?: string; readingId?: string;
   readingType?: string; type?: string; value?: unknown; measure?: unknown; numericValue?: unknown;
   valueSecondary?: unknown; unit?: string; capturedAt?: string; timestamp?: string;
 }
@@ -76,6 +117,7 @@ export function normalizeWebhook(providerKey: string, body: unknown): WebhookPar
     readings.push({
       patientExternalRef: it.patientExternalRef ?? it.patient_id ?? it.userId ?? undefined,
       patientId: it.patientId ?? undefined,
+      externalId: it.externalId ?? it.readingId ?? it.id ?? undefined,
       readingType,
       value,
       numericValue: toNumber(it.numericValue) ?? toNumber(rawValue),

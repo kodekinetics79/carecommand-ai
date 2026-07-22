@@ -303,6 +303,9 @@ model Patient {
   externalRef    String?
   firstName      String
   lastName       String
+  // Front-desk demographic capture / patient verification. Nullable + additive;
+  // date-only (no time component) so no timezone ambiguity on a birthdate.
+  dateOfBirth    DateTime?       @db.Date
   email          String?
   phone          String?
   lifecycleStage LifecycleStage  @default(NEW)
@@ -2774,10 +2777,15 @@ model DeviceReading {
   receivedAt       DateTime @default(now())
   source           String   @default("device") // device | webhook | manual | import
   validationStatus String   @default("valid")  // valid | suspect | invalid
+  // Idempotency key for provider-sourced readings (webhook redeliveries collapse
+  // to one row). Null for manual/keyless readings — Postgres treats NULLs as
+  // distinct, so the unique index never blocks legitimate manual entries.
+  dedupeKey        String?
   rawPayload       Json?
   createdAt        DateTime @default(now())
   tenant           Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
+  @@unique([tenantId, dedupeKey])
   @@index([tenantId, capturedAt])
   @@index([tenantId, patientId, readingType, capturedAt])
 }

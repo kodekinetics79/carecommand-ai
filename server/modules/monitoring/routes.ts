@@ -5,7 +5,7 @@ import { audit } from '../../lib/audit';
 import { requireRoles } from '../../plugins/roles';
 import { requireFeature } from '../../lib/entitlements';
 import { assertBranchAccess, branchScope } from '../../lib/scope';
-import { resolveRule, evaluateSeverity, computeRiskScore, SEVERITY_RANK, DEFAULT_THRESHOLDS } from '../../lib/monitoring';
+import { resolveRule, evaluateSeverity, computeRiskScore, SEVERITY_RANK, DEFAULT_THRESHOLDS, weightBaselines } from '../../lib/monitoring';
 import { aiMorningBriefingService } from '../../lib/ai/services';
 
 const uuid = z.string().uuid();
@@ -87,6 +87,8 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
     })));
     const offMap = new Map(offlinePatientCounts.map(o => [o.id, o.patients]));
 
+    // HIPAA access accounting — this view surfaces patient names + readings. Id-only.
+    await audit(request, { action: 'monitoring.read', resource: 'monitoring', metadata: { view: 'overview' } });
     return {
       summary: {
         readingsToday, openAlerts, criticalAlerts, missedReadings, offlineDevices, patientsAtRisk: atRiskPatients.filter(a => a.patientId).length,
@@ -112,6 +114,8 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
     });
     const pNames = await patientNameMap(tenantId, rows.map(r => r.patientId));
     const dNames = await deviceNameMap(tenantId, rows.map(r => r.deviceId));
+    // HIPAA access accounting — patient names + clinical readings. Id-only.
+    await audit(request, { action: 'monitoring.read', resource: 'monitoring', metadata: { view: 'readings', count: rows.length } });
     return rows.map(r => ({
       id: r.id, patientName: r.patientId ? pNames.get(r.patientId) ?? 'Unknown' : 'Unassigned',
       deviceName: r.deviceId ? dNames.get(r.deviceId)?.name ?? 'Unknown device' : 'Manual entry',
@@ -133,6 +137,8 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
     const readingIds = rows.map(r => r.readingId).filter((v): v is string => !!v);
     const readings = readingIds.length ? await db.deviceReading.findMany({ where: { id: { in: readingIds }, tenantId }, select: { id: true, readingType: true, value: true, unit: true } }) : [];
     const rMap = new Map(readings.map(r => [r.id, r]));
+    // HIPAA access accounting — alert queue surfaces patient names. Id-only.
+    await audit(request, { action: 'monitoring.read', resource: 'monitoring', metadata: { view: 'alerts', count: rows.length } });
     return rows
       .map(a => {
         const reading = a.readingId ? rMap.get(a.readingId) : null;
@@ -225,6 +231,8 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
       };
     }).filter(r => r.riskScore > 0).sort((a, b) => b.riskScore - a.riskScore);
 
+    // HIPAA access accounting — surfaces at-risk patient names. Id-only.
+    await audit(request, { action: 'monitoring.read', resource: 'monitoring', metadata: { view: 'patients_at_risk', count: rows.length } });
     return rows;
   });
 
@@ -250,6 +258,8 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
     // AI-augmented but evidence-backed: degrades to a deterministic summary if
     // the gateway is blocked/unavailable. Never blocks the briefing.
     const ai = await aiMorningBriefingService.generate(tenantId, request.auth.userId).catch(() => null);
+    // HIPAA access accounting — briefing signals surface patient names. Id-only.
+    await audit(request, { action: 'monitoring.read', resource: 'monitoring', metadata: { view: 'morning_briefing' } });
     return {
       generatedAt: new Date(),
       counts: {
@@ -412,7 +422,17 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
 
     // Backend decides severity — never the client.
     const rule = await resolveRule(tenantId, { readingType: body.readingType, patientId: body.patientId, deviceType: device?.deviceType, branchId });
-    const { severity, reason } = evaluateSeverity(body.readingType, reading.numericValue, rule);
+    // Weight severity is a delta vs the patient's own recent baseline (CHF signal),
+    // so it needs prior readings; BP needs the diastolic half; ECG needs the rhythm label.
+    const weight = body.readingType === 'weight' && body.patientId
+      ? await weightBaselines(tenantId, body.patientId, body.capturedAt ?? new Date())
+      : null;
+    const { severity, reason } = evaluateSeverity(body.readingType, reading.numericValue, rule, {
+      valueSecondary: body.valueSecondary ?? null,
+      ecgClassification: body.readingType === 'ecg' ? body.value : null,
+      unit: body.unit ?? null,
+      weight,
+    });
 
     let alert: { id: string } | null = null;
     if (severity !== 'normal') {

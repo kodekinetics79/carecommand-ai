@@ -6,8 +6,8 @@ import { requireRoles } from '../../plugins/roles';
 import { requireFeature } from '../../lib/entitlements';
 import { assertBranchAccess, branchScope } from '../../lib/scope';
 import { decryptSecret } from '../../lib/security';
-import { verifyWebhookSignature, normalizeWebhook } from '../../lib/connectedCare/deviceAdapters';
-import { resolveRule, evaluateSeverity } from '../../lib/monitoring';
+import { verifyWebhookSignature, normalizeWebhook, readingDedupeKey } from '../../lib/connectedCare/deviceAdapters';
+import { resolveRule, evaluateSeverity, weightBaselines } from '../../lib/monitoring';
 import { computeRpmReadiness, RPM_MIN_READING_DAYS } from '../../lib/connectedCare/rpmReadiness';
 import { DEVICE_KEYS } from '../../lib/connectedCare/catalog';
 
@@ -190,15 +190,32 @@ export const connectedCareWebhookRoutes: FastifyPluginAsync = async app => {
     }
     const signatureValid = verifyWebhookSignature(secret, rawBody, signature);
 
-    // If the provider signs and the signature is invalid → reject + log.
-    if (signatureValid === false) {
-      await db.deviceProviderSyncLog.create({ data: { tenantId, providerKind: 'device', providerKey: key, direction: 'inbound', event: 'webhook', status: 'rejected', httpStatus: 401, signatureValid: false, message: 'Invalid webhook signature' } });
+    // FAIL CLOSED. Ingest ONLY when the signature is explicitly valid.
+    //   • signatureValid === true  → a per-provider secret is configured AND the
+    //     HMAC matches. That verified secret is the ONLY thing binding this
+    //     request to the URL `tenantId`; nothing else here authenticates it.
+    //   • signatureValid === false → a secret exists but the signature is wrong/absent.
+    //   • signatureValid === null  → NO usable secret (no provider row, or a row
+    //     with no webhookSecret/apiKey). The request is unverifiable, so the URL
+    //     `tenantId` is attacker-controlled and MUST NOT be trusted.
+    // Both `false` and `null` REJECT — an unverifiable webhook never writes
+    // readings/alerts. (Previously `null` slipped past the guard and let an
+    // unauthenticated caller inject fabricated readings into any tenant by URL.)
+    if (signatureValid !== true) {
+      // Anti-enumeration: one generic 401 for every rejection reason, so a prober
+      // cannot learn whether the tenant/provider exists or a secret is configured.
+      // Logs are id-only (no PHI) and best-effort — a probe against a non-existent
+      // tenantId cannot satisfy the Tenant FK, so the write silently no-ops.
+      request.log.warn({ ip: request.ip, tenantId, providerKey: key, hasSecret: !!secret }, 'connected-care webhook signature verification failed');
+      await db.deviceProviderSyncLog.create({ data: { tenantId, providerKind: 'device', providerKey: key, direction: 'inbound', event: 'webhook', status: 'rejected', httpStatus: 401, signatureValid, message: 'Webhook signature verification failed' } }).catch(() => {});
+      await db.auditEvent.create({ data: { tenantId, action: 'connectedcare.webhook.verification_failed', resource: 'deviceProviderWebhook', ipAddress: request.ip, userAgent: typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : undefined, metadata: { providerKey: key } } }).catch(() => {});
       return reply.code(401).send({ error: 'Invalid signature' });
     }
 
     const { readings } = normalizeWebhook(key, request.body);
     let ingested = 0;
     let alertsCreated = 0;
+    let duplicates = 0;
     for (const r of readings) {
       // Resolve patient by explicit id or by enrollment external ref.
       let patientId = r.patientId ?? null;
@@ -211,14 +228,34 @@ export const connectedCareWebhookRoutes: FastifyPluginAsync = async app => {
         const p = await db.patient.findFirst({ where: { id: patientId, tenantId }, select: { branchId: true } });
         branchId = p?.branchId ?? null;
       }
-      const reading = await db.deviceReading.create({
-        data: { tenantId, patientId, branchId, readingType: r.readingType, value: r.value, numericValue: r.numericValue ?? null, valueSecondary: r.valueSecondary ?? null, unit: r.unit ?? null, capturedAt: r.capturedAt, source: 'webhook', validationStatus: 'valid', rawPayload: r as unknown as object },
-        select: { id: true, numericValue: true },
-      });
+      // Idempotency: a redelivered webhook for the SAME measurement collapses to
+      // one reading (no duplicate alert, no inflated RPM device-day). Skip on a
+      // pre-existing key, and defensively catch the unique-constraint race.
+      const dedupeKey = readingDedupeKey({ providerKey: key, externalId: r.externalId, patientId, patientExternalRef: r.patientExternalRef, readingType: r.readingType, capturedAt: r.capturedAt, value: r.value, numericValue: r.numericValue ?? null, valueSecondary: r.valueSecondary ?? null });
+      const dup = await db.deviceReading.findFirst({ where: { tenantId, dedupeKey }, select: { id: true } });
+      if (dup) { duplicates++; continue; }
+      let reading: { id: string; numericValue: number | null };
+      try {
+        reading = await db.deviceReading.create({
+          data: { tenantId, patientId, branchId, readingType: r.readingType, value: r.value, numericValue: r.numericValue ?? null, valueSecondary: r.valueSecondary ?? null, unit: r.unit ?? null, capturedAt: r.capturedAt, source: 'webhook', validationStatus: 'valid', dedupeKey, rawPayload: r as unknown as object },
+          select: { id: true, numericValue: true },
+        });
+      } catch (e) {
+        // Unique (tenantId, dedupeKey) violation → concurrent redelivery. No-op.
+        if ((e as { code?: string }).code === 'P2002') { duplicates++; continue; }
+        throw e;
+      }
       ingested++;
-      // Backend decides severity — never the client.
+      // Backend decides severity — never the client. Weight uses a CHF baseline
+      // delta, BP evaluates the diastolic half, ECG uses the rhythm class.
       const rule = await resolveRule(tenantId, { readingType: r.readingType, patientId, branchId });
-      const { severity, reason } = evaluateSeverity(r.readingType, reading.numericValue, rule);
+      const weight = r.readingType === 'weight' && patientId ? await weightBaselines(tenantId, patientId, r.capturedAt) : null;
+      const { severity, reason } = evaluateSeverity(r.readingType, reading.numericValue, rule, {
+        valueSecondary: r.valueSecondary ?? null,
+        ecgClassification: r.readingType === 'ecg' ? r.value : null,
+        unit: r.unit ?? null,
+        weight,
+      });
       if (severity !== 'normal') {
         await db.readingAlert.create({ data: { tenantId, patientId, branchId, readingId: reading.id, severity, alertType: 'abnormal_reading', status: 'open', generatedReason: reason } });
         alertsCreated++;
@@ -226,7 +263,7 @@ export const connectedCareWebhookRoutes: FastifyPluginAsync = async app => {
     }
 
     if (provider) await db.deviceProvider.update({ where: { id: provider.id }, data: { lastSyncAt: new Date() } }).catch(() => {});
-    await db.deviceProviderSyncLog.create({ data: { tenantId, providerKind: 'device', providerKey: key, direction: 'inbound', event: 'webhook', status: 'processed', httpStatus: 200, signatureValid, readingsIngested: ingested, alertsCreated, message: `Normalized ${ingested} reading(s), ${alertsCreated} alert(s)`, payload: (request.body ?? {}) as object } });
-    return reply.send({ received: readings.length, ingested, alertsCreated, signatureValid });
+    await db.deviceProviderSyncLog.create({ data: { tenantId, providerKind: 'device', providerKey: key, direction: 'inbound', event: 'webhook', status: 'processed', httpStatus: 200, signatureValid, readingsIngested: ingested, alertsCreated, message: `Normalized ${ingested} reading(s), ${alertsCreated} alert(s)${duplicates ? `, ${duplicates} duplicate(s) skipped` : ''}`, payload: (request.body ?? {}) as object } });
+    return reply.send({ received: readings.length, ingested, alertsCreated, duplicates, signatureValid });
   });
 };

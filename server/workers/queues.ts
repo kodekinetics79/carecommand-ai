@@ -113,3 +113,27 @@ export async function registerCampaignSchedules() {
   // Every 5 minutes — picks up due scheduled campaigns.
   await campaignQueue.upsertJobScheduler('campaign-dispatch', { pattern: '*/5 * * * *' }, { name: 'dispatch-scheduled', data: {} });
 }
+
+// ---- Monitoring safety-net queue ------------------------------------------
+// Proactive RPM safety detectors: missed-reading + device-offline. The job
+// functions iterate tenants and scope every write by tenantId, and are
+// idempotent (never duplicate an already-open alert), so re-runs are safe.
+export type MonitoringJobName = 'missed-reading-scan' | 'device-offline-scan';
+
+export const monitoringQueue: Queue<Record<string, never>, void, string> = QUEUES_ENABLED
+  ? new Queue('monitoring-safety', {
+      connection: redisConnection,
+      defaultJobOptions: { attempts: 3, backoff: { type: 'exponential', delay: 2000 }, removeOnComplete: 500, removeOnFail: 1000 },
+    })
+  : disabledQueue('monitoring-safety');
+
+const MONITORING_SCHEDULES: Array<{ id: string; name: MonitoringJobName; pattern: string }> = [
+  { id: 'monitoring-missed-reading', name: 'missed-reading-scan', pattern: '*/15 * * * *' },  // every 15 min
+  { id: 'monitoring-device-offline', name: 'device-offline-scan', pattern: '*/15 * * * *' },  // every 15 min
+];
+
+export async function registerMonitoringSchedules() {
+  for (const schedule of MONITORING_SCHEDULES) {
+    await monitoringQueue.upsertJobScheduler(schedule.id, { pattern: schedule.pattern }, { name: schedule.name, data: {} });
+  }
+}

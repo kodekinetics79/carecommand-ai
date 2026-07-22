@@ -14,12 +14,15 @@ import {
   autopilotQueue,
   campaignQueue,
   complianceQueue,
+  monitoringQueue,
   registerCampaignSchedules,
   registerComplianceSchedules,
+  registerMonitoringSchedules,
 } from './queues';
 import { createAutopilotWorker } from './autopilot.worker';
 import { createCampaignWorker } from './campaign.worker';
 import { createComplianceWorker } from './compliance.worker';
+import { createMonitoringWorker } from './monitoring.worker';
 
 // ===========================================================================
 // Unified background-worker runtime.
@@ -49,17 +52,18 @@ export async function startWorkers(): Promise<WorkerRuntime> {
   // DB role can bypass RLS, and non-production can opt in via the env flag.
   await assertRlsRuntimeRole();
 
-  const workers = [createAutopilotWorker(), createComplianceWorker(), createCampaignWorker()];
+  const workers = [createAutopilotWorker(), createComplianceWorker(), createCampaignWorker(), createMonitoringWorker()];
 
   // Idempotent on every boot — upsertJobScheduler dedupes by scheduler id, so
   // restarts never create duplicate schedules.
   await registerComplianceSchedules();
   await registerCampaignSchedules();
+  await registerMonitoringSchedules();
 
   // Publish queue backlog to the metrics registry so alerts can fire on a
   // growing/stuck queue. The worker is the source of truth for depth; sampling
   // every 15s is negligible Redis load.
-  const queues = [autopilotQueue, campaignQueue, complianceQueue];
+  const queues = [autopilotQueue, campaignQueue, complianceQueue, monitoringQueue];
   await sampleQueueDepths(queues);
   const depthTimer = setInterval(() => { void sampleQueueDepths(queues); }, 15_000);
   depthTimer.unref?.();
@@ -71,7 +75,7 @@ export async function startWorkers(): Promise<WorkerRuntime> {
   const shutdown = async () => {
     clearInterval(depthTimer);
     await Promise.allSettled(workers.map(worker => worker.close()));
-    await Promise.allSettled([autopilotQueue.close(), complianceQueue.close(), campaignQueue.close()]);
+    await Promise.allSettled([autopilotQueue.close(), complianceQueue.close(), campaignQueue.close(), monitoringQueue.close()]);
     if (metricsServer) await new Promise(resolve => metricsServer.close(() => resolve(null)));
     await db.$disconnect();
     // Last, so spans emitted while draining still flush to the exporter.
@@ -87,7 +91,7 @@ const isDirectRun = process.argv[1] ? import.meta.url === `file://${process.argv
 if (isDirectRun) {
   startWorkers()
     .then(({ workers, shutdown }) => {
-      console.info(`[workers] runtime started — draining ${workers.length} queues (autopilot, compliance, campaign)`);
+      console.info(`[workers] runtime started — draining ${workers.length} queues (autopilot, compliance, campaign, monitoring-safety)`);
       let closing = false;
       const onSignal = async (signal: string) => {
         if (closing) return;
