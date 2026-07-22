@@ -11,6 +11,10 @@ import { assertBranchAccess, branchScope } from '../../lib/scope';
 // rather than a hardcoded role list, so a tenant's custom role grants/revokes
 // are actually enforced here. Read routes remain open to any authenticated user.
 const canWritePatients = requirePermission('patient:write');
+// PHI reads now ENFORCE `patient:read` (previously a cosmetic toggle) and are
+// audited (HIPAA access accounting). Read RBAC is enforced server-side, never
+// frontend-only.
+const canReadPatients = requirePermission('patient:read');
 // Full PHI export is least-privilege (owner/admin/compliance) and audited as an
 // access disclosure — see the data-export route below.
 const canExportPatients = requirePermission('patient:export');
@@ -26,14 +30,32 @@ const patientInput = z.object({
   externalRef: z.string().trim().max(120).optional(),
   firstName: z.string().trim().min(1).max(80),
   lastName: z.string().trim().min(1).max(80),
+  // Front-desk demographic capture / identity verification. Optional, date-only.
+  dateOfBirth: z.coerce.date().optional(),
   email: z.string().email().optional(),
   phone: z.string().trim().max(40).optional(),
   lifecycleStage: z.enum(['NEW', 'ACTIVE', 'AT_RISK', 'INACTIVE', 'LOST', 'RETAINED']).default('NEW'),
   tags: z.array(z.string().trim().min(1).max(40)).max(30).default([]),
 });
 
+// Edit is a partial correction: every field optional, but at least one required
+// so an empty PATCH is a 400 rather than a silent no-op. branchId is intentionally
+// not editable here (moving a patient across branches is a separate operation).
+const patientUpdateInput = z.object({
+  externalRef: z.string().trim().max(120).optional(),
+  firstName: z.string().trim().min(1).max(80).optional(),
+  lastName: z.string().trim().min(1).max(80).optional(),
+  dateOfBirth: z.coerce.date().optional(),
+  email: z.string().email().optional(),
+  phone: z.string().trim().max(40).optional(),
+  lifecycleStage: z.enum(['NEW', 'ACTIVE', 'AT_RISK', 'INACTIVE', 'LOST', 'RETAINED']).optional(),
+  tags: z.array(z.string().trim().min(1).max(40)).max(30).optional(),
+}).refine(input => Object.keys(input).length > 0, {
+  message: 'At least one field must be provided to update',
+});
+
 export const patientRoutes: FastifyPluginAsync = async app => {
-  app.get('/', async request => {
+  app.get('/', { preHandler: canReadPatients }, async request => {
     const query = patientQuery.parse(request.query);
     const rows = await db.patient.findMany({
       where: {
@@ -53,10 +75,13 @@ export const patientRoutes: FastifyPluginAsync = async app => {
       skip: query.cursor ? 1 : 0,
       take: query.limit + 1,
     });
-    return cursorPage(rows, query.limit);
+    const page = cursorPage(rows, query.limit);
+    // HIPAA access accounting for a PHI list read (id-only, no PHI in the log).
+    await audit(request, { action: 'patient.list', resource: 'patient', metadata: { count: page.data.length } });
+    return page;
   });
 
-  app.get('/:id', async request => {
+  app.get('/:id', { preHandler: canReadPatients }, async request => {
     const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
     const patient = await db.patient.findFirst({
       where: { id, tenantId: request.auth.tenantId, deletedAt: null, ...branchScope(request) },
@@ -84,6 +109,8 @@ export const patientRoutes: FastifyPluginAsync = async app => {
       },
     });
     if (!patient) throw app.httpErrors.notFound('Patient not found');
+    // Audit only an actual disclosure (a 404 above discloses nothing). Id-only.
+    await audit(request, { action: 'patient.read', resource: 'patient', resourceId: patient.id });
     return patient;
   });
 
@@ -98,6 +125,45 @@ export const patientRoutes: FastifyPluginAsync = async app => {
     });
     await audit(request, { action: 'patient.created', resource: 'patient', resourceId: patient.id });
     return reply.code(201).send(patient);
+  });
+
+  // ----- Correct a patient record (name / contact / demographics) -------------
+  app.patch('/:id', { preHandler: canWritePatients }, async request => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const input = patientUpdateInput.parse(request.body);
+    const patient = await db.patient.findFirst({
+      where: { id, tenantId: request.auth.tenantId, deletedAt: null, ...branchScope(request) },
+    });
+    if (!patient) throw app.httpErrors.notFound('Patient not found');
+
+    const updated = await db.patient.update({
+      where: { id: patient.id },
+      data: {
+        externalRef: input.externalRef,
+        firstName: input.firstName,
+        lastName: input.lastName,
+        dateOfBirth: input.dateOfBirth,
+        email: input.email,
+        phone: input.phone,
+        lifecycleStage: input.lifecycleStage,
+        tags: input.tags,
+      },
+    });
+    await audit(request, { action: 'patient.updated', resource: 'patient', resourceId: patient.id, metadata: { fields: Object.keys(input) } });
+    return updated;
+  });
+
+  // ----- Soft-delete a patient (deletedAt convention; never hard-delete PHI) --
+  app.delete('/:id', { preHandler: canWritePatients }, async request => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const patient = await db.patient.findFirst({
+      where: { id, tenantId: request.auth.tenantId, deletedAt: null, ...branchScope(request) },
+    });
+    if (!patient) throw app.httpErrors.notFound('Patient not found');
+
+    await db.patient.update({ where: { id: patient.id }, data: { deletedAt: new Date() } });
+    await audit(request, { action: 'patient.deleted', resource: 'patient', resourceId: patient.id });
+    return { deleted: true, id: patient.id };
   });
 
   app.post('/:id/consents', { preHandler: canWritePatients }, async (request, reply) => {

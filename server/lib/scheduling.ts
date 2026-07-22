@@ -68,6 +68,28 @@ export async function unmetPreVisitRequirements(
 
 export type SlotConflict = 'in_past' | 'outside_availability' | 'time_off' | 'already_booked';
 
+// Name of the Postgres GiST exclusion constraint (see migration
+// 20260721180000_appointment_double_book_exclusion_and_patient_dob). A violation
+// of it means a concurrent create/update raced past the app-level conflict check
+// and tried to double-book a provider slot — the DB is the final arbiter.
+export const DOUBLE_BOOK_CONSTRAINT = 'appointment_no_double_book';
+
+/**
+ * True when an error thrown by an Appointment create/update is the double-book
+ * exclusion-constraint violation. Prisma does not map Postgres exclusion
+ * violations (SQLSTATE 23P01) to a dedicated code, so we match the raw DB code
+ * or the constraint name that surfaces in the error message/meta.
+ */
+export function isDoubleBookConflictError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const anyErr = error as { code?: string; meta?: { code?: string; constraint?: unknown }; message?: string };
+  const dbCode = anyErr.meta?.code ?? anyErr.code;
+  if (dbCode === '23P01') return true;
+  const constraint = anyErr.meta?.constraint;
+  if (typeof constraint === 'string' && constraint === DOUBLE_BOOK_CONSTRAINT) return true;
+  return typeof anyErr.message === 'string' && anyErr.message.includes(DOUBLE_BOOK_CONSTRAINT);
+}
+
 // Appointment statuses that still occupy the provider's calendar.
 const BLOCKING_STATUSES = ['CONFIRMED', 'RISKY', 'ARRIVED', 'COMPLETED', 'WAITLIST'] as const;
 
@@ -139,10 +161,10 @@ export async function computeProviderSlots(
  * conflict check to hold against concurrent bookings.
  */
 export async function findSlotConflict(
-  args: { tenantId: string; providerProfileId: string; startsAt: Date; durationMin: number; now?: Date },
+  args: { tenantId: string; providerProfileId: string; startsAt: Date; durationMin: number; now?: Date; excludeAppointmentId?: string },
   client: Client = db,
 ): Promise<SlotConflict | null> {
-  const { tenantId, providerProfileId, startsAt, durationMin, now = new Date() } = args;
+  const { tenantId, providerProfileId, startsAt, durationMin, now = new Date(), excludeAppointmentId } = args;
   const endsAt = new Date(startsAt.getTime() + durationMin * 60_000);
   if (startsAt < now) return 'in_past';
 
@@ -166,7 +188,9 @@ export async function findSlotConflict(
   if (timeOff) return 'time_off';
 
   const clash = await client.appointment.findFirst({
-    where: { tenantId, providerProfileId, deletedAt: null, status: { in: [...BLOCKING_STATUSES] }, startsAt: { lt: endsAt }, endsAt: { gt: startsAt } },
+    // excludeAppointmentId lets a reschedule ignore the row it is moving so it
+    // does not conflict with itself.
+    where: { tenantId, providerProfileId, deletedAt: null, id: excludeAppointmentId ? { not: excludeAppointmentId } : undefined, status: { in: [...BLOCKING_STATUSES] }, startsAt: { lt: endsAt }, endsAt: { gt: startsAt } },
     select: { id: true },
   });
   if (clash) return 'already_booked';

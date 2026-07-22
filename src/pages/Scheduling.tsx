@@ -313,7 +313,7 @@ export default function Scheduling() {
                 const sc = statusConfig[appt.status] ?? statusConfig['confirmed'];
                 const isRisky = appt.noShowRisk >= 50;
                 return (
-                  <div key={appt.id} className={`flex items-start gap-3 p-3.5 rounded-xl border transition-all hover:bg-[var(--s3)] ${isRisky ? 'border-[var(--b2)] bg-[var(--red-soft)]' : 'border-[var(--b1)]'}`}>
+                  <div key={appt.id} data-appointment-id={appt.id} className={`flex items-start gap-3 p-3.5 rounded-xl border transition-all hover:bg-[var(--s3)] ${isRisky ? 'border-[var(--b2)] bg-[var(--red-soft)]' : 'border-[var(--b1)]'}`}>
                     <div className="text-center shrink-0 w-14">
                       <p className="text-sm font-bold text-t1">{appt.time}</p>
                       <p className="text-[10px] text-t3">{appt.value ? formatCurrency(Number(appt.value)) : ''}</p>

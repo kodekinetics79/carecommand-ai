@@ -5,7 +5,7 @@ import { audit } from '../../lib/audit';
 import { requirePermission } from '../../lib/permissions';
 import { assertBranchAccess } from '../../lib/scope';
 import { recordWorkflowEvent } from '../../lib/intelligence';
-import { computeProviderSlots, findSlotConflict, getSchedulingPolicy } from '../../lib/scheduling';
+import { computeProviderSlots, findSlotConflict, getSchedulingPolicy, isDoubleBookConflictError } from '../../lib/scheduling';
 
 // ===========================================================================
 // Provider scheduling — recurring availability, one-off time-off, open-slot
@@ -124,19 +124,26 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
     const endsAt = new Date(body.startsAt.getTime() + body.durationMin * 60_000);
 
     // Conflict check + create in one transaction so the slot can't be double-booked
-    // between check and insert.
-    const result = await db.$transaction(async tx => {
-      const conflict = await findSlotConflict({ tenantId: request.auth.tenantId, providerProfileId: providerId, startsAt: body.startsAt, durationMin: body.durationMin }, tx);
-      if (conflict) return { conflict } as const;
-      const appointment = await tx.appointment.create({
-        data: {
-          tenantId: request.auth.tenantId, branchId: provider.branchId, patientId: body.patientId,
-          providerProfileId: providerId, providerRef: providerId, service: body.service, startsAt: body.startsAt, endsAt,
-          status: 'CONFIRMED', channel: body.channel,
-        },
+    // between check and insert. The DB exclusion constraint is the final guard if a
+    // concurrent booking still races past the in-transaction check.
+    let result: { conflict: Awaited<ReturnType<typeof findSlotConflict>> } | { appointment: Awaited<ReturnType<typeof db.appointment.create>> };
+    try {
+      result = await db.$transaction(async tx => {
+        const conflict = await findSlotConflict({ tenantId: request.auth.tenantId, providerProfileId: providerId, startsAt: body.startsAt, durationMin: body.durationMin }, tx);
+        if (conflict) return { conflict } as const;
+        const appointment = await tx.appointment.create({
+          data: {
+            tenantId: request.auth.tenantId, branchId: provider.branchId, patientId: body.patientId,
+            providerProfileId: providerId, providerRef: providerId, service: body.service, startsAt: body.startsAt, endsAt,
+            status: 'CONFIRMED', channel: body.channel,
+          },
+        });
+        return { appointment } as const;
       });
-      return { appointment } as const;
-    });
+    } catch (error) {
+      if (isDoubleBookConflictError(error)) return reply.code(409).send({ error: 'slot_unavailable', reason: 'already_booked' });
+      throw error;
+    }
 
     if ('conflict' in result) {
       return reply.code(409).send({ error: 'slot_unavailable', reason: result.conflict });

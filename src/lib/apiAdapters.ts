@@ -111,6 +111,7 @@ export interface ApiAppointment {
   id: string;
   branchId: string;
   patientId: string;
+  patientName?: string | null;
   providerRef?: string | null;
   service: string;
   startsAt: string;
@@ -350,7 +351,9 @@ export function mapAppointment(row: ApiAppointment): Appointment {
   return {
     id: row.id,
     patientId: row.patientId,
-    patientName: 'Live DB Customer',
+    // Real patient name from the API (list/detail now include it); fall back only
+    // when a row genuinely lacks a linked patient name.
+    patientName: row.patientName?.trim() || 'Unknown patient',
     doctorId: row.providerRef ?? '',
     doctorName: row.providerRef ?? 'Assigned provider',
     branchId: row.branchId,

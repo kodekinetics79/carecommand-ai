@@ -4,11 +4,28 @@ import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { cursorPage, paginationSchema } from '../../lib/pagination';
 import { requireRoles } from '../../plugins/roles';
+import { requirePermission } from '../../lib/permissions';
 import { assertBranchAccess, branchScope } from '../../lib/scope';
 import { evaluateDepositForAppointment, getAppointmentPaymentSummaries, handleAppointmentCancellationDeposit } from '../../lib/deposits';
 import { recordWorkflowEvent } from '../../lib/intelligence';
+import { findSlotConflict, isDoubleBookConflictError } from '../../lib/scheduling';
 
 const uuid = z.string().uuid();
+
+// PHI reads now ENFORCE `appointment:read` (previously a cosmetic toggle) and are
+// audited. Lifecycle status transitions gate on `appointment:write`.
+const canReadAppointments = requirePermission('appointment:read');
+const canWriteAppointments = requirePermission('appointment:write');
+
+// Staff-advanceable lifecycle transitions and the states each may originate from.
+// Terminal states (CANCELED, COMPLETED) are absent as sources, so e.g.
+// completed→scheduled or cancelled→completed are rejected. Cancellation has its
+// own route (PATCH /:id/cancel) with deposit handling.
+const STATUS_TRANSITIONS: Record<'ARRIVED' | 'NO_SHOW' | 'COMPLETED', ReadonlyArray<string>> = {
+  ARRIVED: ['CONFIRMED', 'RISKY', 'WAITLIST'],
+  NO_SHOW: ['CONFIRMED', 'RISKY', 'WAITLIST'],
+  COMPLETED: ['ARRIVED', 'CONFIRMED', 'RISKY'],
+};
 
 const appointmentQuery = paginationSchema.extend({
   branchId: z.string().uuid().optional(),
@@ -38,7 +55,7 @@ const appointmentInput = z.object({
 });
 
 export const appointmentRoutes: FastifyPluginAsync = async app => {
-  app.get('/', async request => {
+  app.get('/', { preHandler: canReadAppointments }, async request => {
     const query = appointmentQuery.parse(request.query);
     const rows = await db.appointment.findMany({
       where: {
@@ -50,6 +67,9 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
         status: query.status,
         startsAt: query.from || query.to ? { gte: query.from, lte: query.to } : undefined,
       },
+      // Include the patient's name (only firstName/lastName — no extra PHI) so the
+      // client can show the real customer instead of a hardcoded placeholder.
+      include: { patient: { select: { firstName: true, lastName: true } } },
       orderBy: { id: 'asc' },
       cursor: query.cursor ? { id: query.cursor } : undefined,
       skip: query.cursor ? 1 : 0,
@@ -58,7 +78,24 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
     const page = cursorPage(rows, query.limit);
     // Attach appointment-checkout payment/deposit status (batched, no N+1).
     const summaries = await getAppointmentPaymentSummaries(request.auth.tenantId, page.data.map(a => a.id));
-    return { ...page, data: page.data.map(a => ({ ...a, payment: summaries.get(a.id) ?? null })) };
+    // HIPAA access accounting for a PHI list read (id-only, no PHI in the log).
+    await audit(request, { action: 'appointment.list', resource: 'appointment', metadata: { count: page.data.length } });
+    return { ...page, data: page.data.map(({ patient, ...a }) => ({ ...a, patientName: `${patient.firstName} ${patient.lastName}`.trim(), payment: summaries.get(a.id) ?? null })) };
+  });
+
+  // ----- Single-appointment detail read (PHI: patient identity) --------------
+  app.get('/:id', { preHandler: canReadAppointments }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const appointment = await db.appointment.findFirst({
+      where: { id, tenantId: request.auth.tenantId, deletedAt: null, ...branchScope(request) },
+      include: { patient: { select: { id: true, firstName: true, lastName: true } } },
+    });
+    if (!appointment) throw app.httpErrors.notFound('Appointment not found');
+    const summaries = await getAppointmentPaymentSummaries(request.auth.tenantId, [appointment.id]);
+    // Audit only an actual disclosure (a 404 above discloses nothing). Id-only.
+    await audit(request, { action: 'appointment.read', resource: 'appointment', resourceId: appointment.id });
+    const patientName = appointment.patient ? `${appointment.patient.firstName} ${appointment.patient.lastName}`.trim() : null;
+    return { ...appointment, patientName, payment: summaries.get(appointment.id) ?? null };
   });
 
   app.post('/', { preHandler: requireRoles('OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK') }, async (request, reply) => {
@@ -75,9 +112,24 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
       if (!provider) throw app.httpErrors.badRequest('Provider does not belong to this tenant');
     }
 
-    const appointment = await db.appointment.create({
-      data: { tenantId: request.auth.tenantId, ...input },
-    });
+    // When a provider is linked, this create participates in cross-path conflict
+    // detection: the DB-level exclusion constraint (see migration) is the final
+    // guard against a race, and a pre-check gives a clean 409 in the common case.
+    let appointment: Awaited<ReturnType<typeof db.appointment.create>>;
+    try {
+      if (input.providerProfileId && input.status !== 'CANCELED' && input.status !== 'NO_SHOW') {
+        const durationMin = Math.round((input.endsAt.getTime() - input.startsAt.getTime()) / 60_000);
+        const conflict = await findSlotConflict({ tenantId: request.auth.tenantId, providerProfileId: input.providerProfileId, startsAt: input.startsAt, durationMin, now: input.startsAt });
+        if (conflict === 'already_booked') throw app.httpErrors.conflict('Provider is already booked for this time');
+      }
+      appointment = await db.appointment.create({
+        data: { tenantId: request.auth.tenantId, ...input },
+      });
+    } catch (error) {
+      // Lost the race to a concurrent booking → the exclusion constraint fires.
+      if (isDoubleBookConflictError(error)) return reply.code(409).send({ error: 'already_booked', message: 'Provider is already booked for this time' });
+      throw error;
+    }
     await audit(request, { action: 'appointment.created', resource: 'appointment', resourceId: appointment.id });
 
     // Appointment Checkout: evaluate deposit rules and link a requirement if one
@@ -121,7 +173,24 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
     assertBranchAccess(request, appointment.branchId);
     if (appointment.status === 'CANCELED') throw app.httpErrors.conflict('A cancelled appointment cannot be rescheduled');
 
-    const updated = await db.appointment.update({ where: { id }, data: { startsAt: body.startsAt, endsAt: body.endsAt, status: appointment.status === 'NO_SHOW' ? 'CONFIRMED' : appointment.status } });
+    // Don't drop this appointment onto another for the same provider. Pre-check
+    // (excluding self) for a clean 409; the DB exclusion constraint is the final
+    // guard against a concurrent move. Provider-less appointments keep their prior
+    // unconstrained behavior.
+    const nextStatus = appointment.status === 'NO_SHOW' ? 'CONFIRMED' : appointment.status;
+    if (appointment.providerProfileId) {
+      const durationMin = Math.round((body.endsAt.getTime() - body.startsAt.getTime()) / 60_000);
+      const conflict = await findSlotConflict({ tenantId: request.auth.tenantId, providerProfileId: appointment.providerProfileId, startsAt: body.startsAt, durationMin, now: body.startsAt, excludeAppointmentId: appointment.id });
+      if (conflict === 'already_booked') throw app.httpErrors.conflict('Provider is already booked for this time');
+    }
+
+    let updated: Awaited<ReturnType<typeof db.appointment.update>>;
+    try {
+      updated = await db.appointment.update({ where: { id }, data: { startsAt: body.startsAt, endsAt: body.endsAt, status: nextStatus } });
+    } catch (error) {
+      if (isDoubleBookConflictError(error)) throw app.httpErrors.conflict('Provider is already booked for this time');
+      throw error;
+    }
     // Idempotent: an existing requirement is preserved (never duplicated).
     let depositEvaluation = null;
     try {
@@ -134,5 +203,31 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
 
     const summaries = await getAppointmentPaymentSummaries(request.auth.tenantId, [id]);
     return { ...updated, depositEvaluation, payment: summaries.get(id) ?? null };
+  });
+
+  // ----- Lifecycle status transitions (check-in / no-show / complete) --------
+  // Advances an appointment through the staff-visible lifecycle with validated
+  // transitions. Cancellation stays on its own deposit-aware route.
+  app.patch('/:id/status', { preHandler: canWriteAppointments }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const { status } = z.object({ status: z.enum(['ARRIVED', 'NO_SHOW', 'COMPLETED']) }).parse(request.body);
+    const appointment = await db.appointment.findFirst({ where: { id, tenantId: request.auth.tenantId, deletedAt: null } });
+    if (!appointment) throw app.httpErrors.notFound('Appointment not found');
+    assertBranchAccess(request, appointment.branchId);
+
+    const allowedFrom = STATUS_TRANSITIONS[status];
+    if (!allowedFrom.includes(appointment.status)) {
+      throw app.httpErrors.conflict(`Cannot transition appointment from ${appointment.status} to ${status}`);
+    }
+
+    const updated = await db.appointment.update({ where: { id }, data: { status } });
+    await audit(request, { action: 'appointment.status_changed', resource: 'appointment', resourceId: id, metadata: { from: appointment.status, to: status } });
+    // Feed the intelligence loop the one transition it already models (no-show).
+    if (status === 'NO_SHOW') {
+      await recordWorkflowEvent(request.auth.tenantId, { eventType: 'appointment.no_show', entityType: 'appointment', entityId: id, sourceModule: 'appointments', payload: { from: appointment.status } });
+    }
+
+    const summaries = await getAppointmentPaymentSummaries(request.auth.tenantId, [id]);
+    return { ...updated, payment: summaries.get(id) ?? null };
   });
 };
