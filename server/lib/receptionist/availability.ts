@@ -1,4 +1,7 @@
 import { db } from '../db';
+import type { Prisma } from '../../generated/prisma/client';
+
+type Client = typeof db | Prisma.TransactionClient;
 
 // Real-time appointment availability for the AI receptionist. No dedicated
 // working-hours model exists yet, so we use sensible clinic defaults and
@@ -49,11 +52,16 @@ export async function getOpenSlots(tenantId: string, branchId: string, dateISO: 
   return slots;
 }
 
-/** Is a specific start time still free for the branch? */
-export async function isSlotOpen(tenantId: string, branchId: string, startsAt: Date, durationMin = SLOT_MIN): Promise<boolean> {
+/**
+ * Is a specific start time still free for the branch? Accepts an optional client
+ * so the check can run INSIDE the booking transaction (holding the slot advisory
+ * lock) and see other paths' committed appointments — this is what makes the
+ * live agent participate in the shared Appointment double-booking guard.
+ */
+export async function isSlotOpen(tenantId: string, branchId: string, startsAt: Date, durationMin = SLOT_MIN, client: Client = db): Promise<boolean> {
   if (Number.isNaN(startsAt.getTime())) return false;
   const endsAt = new Date(startsAt.getTime() + durationMin * 60_000);
-  const conflict = await db.appointment.findFirst({
+  const conflict = await client.appointment.findFirst({
     where: { tenantId, branchId, deletedAt: null, status: { in: BLOCKING as never }, startsAt: { lt: endsAt }, endsAt: { gt: startsAt } },
     select: { id: true },
   });

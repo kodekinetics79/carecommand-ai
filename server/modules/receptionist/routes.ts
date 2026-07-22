@@ -771,14 +771,30 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
   });
 
   // ── Live agent tools (Retell custom functions invoked DURING a call) ──────
-  // check_availability / book_appointment. Signature-verified when a Retell key
-  // is configured; tenant resolved from the clinic/campaign on the URL.
-  app.post('/webhooks/retell/fn', async (request, reply) => {
+  // check_availability / book_appointment. This is a live booking + SMS
+  // primitive, so it is signature-verified EXACTLY like the sibling event
+  // webhook (never accept an unsigned/invalid call in production) and carries a
+  // tight per-route rate limit (the global ceiling is far too loose for a
+  // booking primitive). Tenant is resolved from the clinic/campaign on the URL.
+  app.post('/webhooks/retell/fn', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async (request, reply) => {
     const query = z.object({ clinicId: uuid.optional(), campaignId: uuid.optional() }).parse(request.query);
+    // Bounded, typed args replace the loose z.record so a caller cannot smuggle
+    // oversized or wrong-typed fields into the booking/SMS primitives. Unknown
+    // keys pass through (preserving collected intake fields) but the security-
+    // sensitive fields are length-capped; liveTools re-sanitizes on top.
+    const fnArgs = z.object({
+      appointment_date: z.string().max(40).optional(),
+      appointment_time: z.string().max(40).optional(),
+      first_name: z.string().max(80).optional(),
+      last_name: z.string().max(80).optional(),
+      phone: z.string().max(40).optional(),
+      email: z.string().max(160).optional(),
+      service: z.string().max(120).optional(),
+    }).passthrough();
     const body = z.object({
-      name: z.string(),
-      args: z.record(z.string(), z.unknown()).default({}),
-      call: z.object({ call_id: z.string().optional(), from_number: z.string().optional() }).optional(),
+      name: z.string().max(64),
+      args: fnArgs.default({}),
+      call: z.object({ call_id: z.string().max(128).optional(), from_number: z.string().max(40).optional() }).optional(),
     }).parse(request.body);
 
     let tenantId: string | null = null;
@@ -791,15 +807,33 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     }
     if (!tenantId) return reply.code(202).send({ message: "I'm sorry, I can't access this clinic right now." });
 
-    // Verify the Retell signature WHEN one is provided (Retell signs event
-    // webhooks; custom-function calls may not, so an absent signature is allowed
-    // — the unguessable clinic id on the URL is the soft guard).
+    // Signature verification — MIRRORS /webhooks/retell. In production with a
+    // real key, REJECT (401) when the signature is absent OR invalid; 503 when
+    // the key is missing. The unsigned dev bypass applies ONLY when NODE_ENV is
+    // not production. An absent header is NO LONGER a free pass (the prior
+    // `if (sigHeader && …)` gate let anyone with a clinic id book/send SMS).
     const sig = request.headers['x-retell-signature'];
     const sigHeader = Array.isArray(sig) ? sig[0] : sig;
-    if (sigHeader && env.RETELL_API_KEY && !env.RETELL_API_KEY.startsWith('mock')) {
+    if (env.RETELL_API_KEY) {
       if (!verifyRetellSignature(request.rawBody, sigHeader, env.RETELL_API_KEY)) {
+        request.log.warn({ ip: request.ip, clinicId: query.clinicId, campaignId: query.campaignId }, 'Retell fn webhook signature verification failed');
+        await db.auditEvent.create({
+          data: {
+            tenantId,
+            action: 'receptionist.webhook.fn.verification_failed',
+            resource: 'receptionistWebhook',
+            ipAddress: request.ip,
+            userAgent: typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : undefined,
+            metadata: { clinicId: query.clinicId ?? null, campaignId: query.campaignId ?? null, fn: body.name },
+          },
+        }).catch(() => {});
         return reply.code(401).send({ error: 'INVALID_SIGNATURE' });
       }
+    } else if (env.NODE_ENV === 'production') {
+      request.log.error('Retell fn webhook rejected: RETELL_API_KEY not configured in production');
+      return reply.code(503).send({ error: 'WEBHOOK_NOT_CONFIGURED' });
+    } else {
+      request.log.warn('Retell fn webhook accepted WITHOUT verification (non-production; set RETELL_API_KEY to enforce)');
     }
 
     const result = await handleAgentTool(

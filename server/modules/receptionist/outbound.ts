@@ -5,11 +5,47 @@ import { audit } from '../../lib/audit';
 import { env } from '../../config/env';
 import { requireRoles } from '../../plugins/roles';
 import { retellConfigStatus, createPhoneCall } from '../../lib/retell';
+import { isDestinationOptedOut } from '../../lib/campaigns';
 
 const uuid = z.string().uuid();
 const idParam = z.object({ id: uuid });
 const writeRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
 const REQUIRED_FIELD_KEYS = ['firstName', 'lastName', 'phone', 'email', 'preferredBranch', 'preferredService', 'preferredDateTime'] as const;
+
+// --- Quiet-hours enforcement (per outbound campaign, clinic timezone) --------
+function parseHm(value?: string | null): number | null {
+  if (!value) return null;
+  const m = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  if (h > 23 || min > 59) return null;
+  return h * 60 + min;
+}
+
+function nowMinutesInTz(timezone: string): number | null {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: timezone, hour: '2-digit', minute: '2-digit', hour12: false }).formatToParts(new Date());
+    const h = Number(parts.find(p => p.type === 'hour')?.value);
+    const min = Number(parts.find(p => p.type === 'minute')?.value);
+    if (Number.isNaN(h) || Number.isNaN(min)) return null;
+    return (h % 24) * 60 + min;
+  } catch {
+    return null;
+  }
+}
+
+// True when "now" (in the clinic timezone) falls inside the campaign's quiet
+// window. Handles overnight windows (e.g. 21:00–08:00 wraps midnight). An unset
+// or empty window is never quiet.
+export function isWithinQuietHours(start: string | null | undefined, end: string | null | undefined, timezone: string): boolean {
+  const s = parseHm(start);
+  const e = parseHm(end);
+  if (s === null || e === null || s === e) return false;
+  const now = nowMinutesInTz(timezone);
+  if (now === null) return false;
+  return s < e ? now >= s && now < e : now >= s || now < e;
+}
 
 // Registered INSIDE receptionistRoutes, so it inherits the ai_receptionist
 // feature gate and the authenticated scope.
@@ -144,9 +180,33 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
 
     const campaign = await db.receptionistOutboundCampaign.findFirst({
       where: { id, tenantId: request.auth.tenantId },
-      include: { clinic: { select: { name: true, complianceDisclosure: true } }, agent: { select: { name: true, voice: true } } },
+      include: { clinic: { select: { name: true, complianceDisclosure: true, timezone: true } }, agent: { select: { name: true, voice: true } } },
     });
     if (!campaign) throw app.httpErrors.notFound('Campaign not found');
+
+    // ---- Compliance gate: NEVER dial an opted-out number ------------------
+    // Consult ReceptionistOptOut (voice channel; ALL/VOICE suppress it), tenant-
+    // scoped. This closes gap (c): outbound targets are queued without a filter,
+    // so suppression MUST be enforced here at the dial. Record + skip, no dial.
+    if (await isDestinationOptedOut(request.auth.tenantId, body.phone, 'voice')) {
+      const callLog = await db.receptionistCallLog.create({
+        data: {
+          tenantId: request.auth.tenantId, clinicId: campaign.clinicId, outboundCampaignId: campaign.id, targetId: body.targetId,
+          callerName: [body.firstName, body.lastName].filter(Boolean).join(' ') || null, callerPhone: body.phone,
+          direction: 'outbound', outcome: 'OPTED_OUT', startedAt: new Date(), endedAt: new Date(),
+        },
+      });
+      if (body.targetId) await db.receptionistCallTarget.updateMany({ where: { id: body.targetId, tenantId: request.auth.tenantId }, data: { status: 'OPTED_OUT', lastOutcome: 'OPTED_OUT', lastCallLogId: callLog.id } });
+      await audit(request, { action: 'receptionist.call.suppressed', resource: 'receptionistCallLog', resourceId: callLog.id, metadata: { campaignId: campaign.id, reason: 'opted_out' } });
+      return reply.code(200).send({ status: 'skipped', reason: 'opted_out', callLogId: callLog.id });
+    }
+
+    // ---- Quiet-hours gate: never dial during the campaign's quiet window ----
+    // Temporary skip (target stays PENDING for a later retry); recorded via audit.
+    if (isWithinQuietHours(campaign.quietHoursStart, campaign.quietHoursEnd, campaign.clinic.timezone)) {
+      await audit(request, { action: 'receptionist.call.skipped', resource: 'receptionistOutboundCampaign', resourceId: campaign.id, metadata: { reason: 'quiet_hours', targetId: body.targetId ?? null } });
+      return reply.code(200).send({ status: 'skipped', reason: 'quiet_hours' });
+    }
 
     // Do NOT fake a call: if Retell isn't configured, return setup_required.
     const status = retellConfigStatus();

@@ -256,14 +256,15 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     const channel = body.channel ?? channelFor(lead.channel, !!lead.phone, !!lead.email);
     if (!channel) return reply.code(400).send({ status: 'no_destination', message: 'Lead has no phone or email on file.' });
 
+    const destination = channel === 'email' ? lead.email : lead.phone;
+    if (!destination) return reply.code(400).send({ status: 'no_destination', message: `Lead has no ${channel === 'email' ? 'email' : 'phone'} on file.` });
+
     // Consent / suppression gate — never message a suppressed/opted-out contact.
-    if (await isSuppressed(request.auth.tenantId, { leadId: id }, channel)) {
+    // Passing the destination also honors an AI-receptionist opt-out (ReceptionistOptOut).
+    if (await isSuppressed(request.auth.tenantId, { leadId: id, destination }, channel)) {
       await audit(request, { action: 'crm.lead.send.blocked', resource: 'lead', resourceId: id, metadata: { cta: body.cta, channel, reason: 'consent_or_suppression' } });
       return reply.code(409).send({ status: 'blocked', reason: 'consent_or_suppression', message: 'This contact is suppressed or has opted out for this channel.' });
     }
-
-    const destination = channel === 'email' ? lead.email : lead.phone;
-    if (!destination) return reply.code(400).send({ status: 'no_destination', message: `Lead has no ${channel === 'email' ? 'email' : 'phone'} on file.` });
 
     // Provider readiness — truthful; no fake "sent".
     const status = channelStatus(channel);
@@ -277,7 +278,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     const message = tpl.body(lead.name.split(' ')[0], lead.service, tenant?.name ?? 'your clinic');
     const idempotencyKey = `lead-send:${id}:${body.cta}:${new Date().toISOString().slice(0, 10)}`;
 
-    const result = await sendMessage(channel, destination, subject, message, idempotencyKey);
+    const result = await sendMessage(channel, destination, subject, message, idempotencyKey, { tenantId: request.auth.tenantId, leadId: id });
     await audit(request, { action: 'crm.lead.message_sent', resource: 'lead', resourceId: id, metadata: { cta: body.cta, channel, status: result.status, mode: result.mode } });
 
     return reply.code(result.ok ? 200 : 502).send({

@@ -1,5 +1,5 @@
 import { env } from '../config/env';
-import { channelStatus, type CommChannel } from './campaigns';
+import { channelStatus, isSuppressed, toE164, isValidE164, isValidEmail, type CommChannel } from './campaigns';
 
 // ===========================================================================
 // Real communications send abstraction. Dependency-free (raw HTTP, matching the
@@ -8,10 +8,20 @@ import { channelStatus, type CommChannel } from './campaigns';
 //   - sms / whatsapp: real Twilio Messages API (Basic auth).
 //   - email: optional HTTP email API (e.g. SendGrid); else pending (no SMTP dep).
 //   - voice: pending (reuses Retell config for status; campaign voice not wired).
+//
+// Every send passes through ONE consent/suppression + destination gate before a
+// provider is ever contacted (see sendMessage). This is the single choke point
+// that makes suppression (campaign, CRM, and AI-receptionist opt-outs) apply to
+// every outbound path, and rejects a malformed destination before we dial it.
 // ===========================================================================
 
-export type SendMode = 'mock_dev' | 'live' | 'configured_pending_provider' | 'setup_required';
-export interface SendResult { ok: boolean; status: 'sent' | 'pending' | 'failed' | 'setup_required'; providerMessageId?: string; mode: SendMode; failureReason?: string }
+export type SendMode = 'mock_dev' | 'live' | 'configured_pending_provider' | 'setup_required' | 'suppressed';
+export interface SendResult { ok: boolean; status: 'sent' | 'pending' | 'failed' | 'setup_required' | 'suppressed'; providerMessageId?: string; mode: SendMode; failureReason?: string }
+
+// Who a message is for, so the send-time gate can resolve suppression. tenantId
+// is required — a send with no tenant can never be safely consent-checked, and
+// making it required forces every call site to be explicit (fail-closed).
+export interface SendContext { tenantId: string; patientId?: string | null; leadId?: string | null }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 8000): Promise<Response> {
   const controller = new AbortController();
@@ -52,21 +62,38 @@ async function sendEmailHttp(to: string, subject: string, body: string): Promise
 }
 
 // Send one message. `idempotencyKey` makes the dev-mock id deterministic so a
-// retry produces the same providerMessageId.
-export async function sendMessage(channel: CommChannel, destination: string, subject: string, body: string, idempotencyKey: string): Promise<SendResult> {
+// retry produces the same providerMessageId. `context` (required) carries the
+// tenant + recipient identity used by the consent/suppression gate below.
+export async function sendMessage(channel: CommChannel, destination: string, subject: string, body: string, idempotencyKey: string, context: SendContext): Promise<SendResult> {
   const status = channelStatus(channel);
   if (status.setupRequired) return { ok: false, status: 'setup_required', mode: 'setup_required' };
+
+  // ---- Shared suppression gate (runs for EVERY path, incl. the dev mock) ----
+  // Honors CommunicationConsent / CampaignSuppression / ConsentEvent (patient or
+  // lead identity) AND ReceptionistOptOut (destination, channel ALL) — the last
+  // one is what makes an opt-out captured during an AI receptionist call suppress
+  // SMS campaigns, CRM sends, and appointment-confirmation texts alike. Tenant-
+  // scoped. When suppressed we return WITHOUT contacting any provider or minting
+  // a (mock or live) providerMessageId.
+  if (await isSuppressed(context.tenantId, { patientId: context.patientId ?? null, leadId: context.leadId ?? null, destination }, channel)) {
+    return { ok: false, status: 'suppressed', mode: 'suppressed', failureReason: 'suppressed_or_opted_out' };
+  }
 
   // Explicit dev mock (credentials starting with "mock", non-production only).
   if (status.mock && env.NODE_ENV !== 'production') {
     return { ok: true, status: 'sent', providerMessageId: `mock_${idempotencyKey.slice(0, 40)}`, mode: 'mock_dev' };
   }
 
-  if (channel === 'sms' || channel === 'whatsapp') return sendTwilio(destination, body);
+  if (channel === 'sms' || channel === 'whatsapp') {
+    // E.164 destination gate — never dial the provider with a malformed number.
+    const to = toE164(destination);
+    if (!isValidE164(to)) return { ok: false, status: 'failed', mode: 'live', failureReason: 'invalid_destination' };
+    return sendTwilio(to, body);
+  }
   if (channel === 'email') {
-    if (env.EMAIL_HTTP_API_URL) return sendEmailHttp(destination, subject, body);
-    // SMTP credentials recognized but no HTTP email API / SMTP lib wired.
-    return { ok: false, status: 'pending', mode: 'configured_pending_provider' };
+    if (!env.EMAIL_HTTP_API_URL) return { ok: false, status: 'pending', mode: 'configured_pending_provider' };
+    if (!isValidEmail(destination)) return { ok: false, status: 'failed', mode: 'live', failureReason: 'invalid_destination' };
+    return sendEmailHttp(destination.trim(), subject, body);
   }
   // voice campaign sending is not wired (Retell is used for receptionist calls).
   return { ok: false, status: 'pending', mode: 'configured_pending_provider' };

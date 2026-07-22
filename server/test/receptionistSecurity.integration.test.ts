@@ -1,0 +1,167 @@
+import 'dotenv/config';
+
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { randomUUID, createHmac } from 'node:crypto';
+import type { FastifyInstance } from 'fastify';
+
+// FIX 1 proof: the live-agent tool webhook (/webhooks/retell/fn) is a booking +
+// SMS primitive. It must reject unsigned/invalid calls in production EXACTLY like
+// the sibling event webhook, 503 when the key is missing, allow the dev bypass
+// only outside production, and carry a tight per-route rate limit.
+vi.mock('../workers/queues', () => ({
+  redisConnection: {},
+  autopilotQueue: { client: Promise.resolve(undefined), add: async () => undefined },
+  enqueueAutopilotExecution: async () => undefined,
+  complianceQueue: { add: async () => undefined },
+  registerComplianceSchedules: async () => undefined,
+  campaignQueue: { add: async () => undefined },
+  registerCampaignSchedules: async () => undefined,
+}));
+
+const { buildApp } = await import('../app');
+const { db } = await import('../lib/db');
+const { env } = await import('../config/env');
+
+let app: FastifyInstance;
+const tenantIds: string[] = [];
+const original = { NODE_ENV: env.NODE_ENV, RETELL_API_KEY: env.RETELL_API_KEY };
+
+async function makeTenant() {
+  const id = randomUUID();
+  tenantIds.push(id);
+  await db.tenant.create({ data: { id, name: `sec-${id.slice(0, 6)}`, slug: `sec-${id.slice(0, 8)}` } });
+  await db.branch.create({ data: { tenantId: id, name: 'Main', location: 'X' } });
+  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Clinic', phone: '+15550000000' }, select: { id: true } });
+  return { id, clinicId: clinic.id };
+}
+
+function setEnv(patch: { NODE_ENV?: string; RETELL_API_KEY?: string }) {
+  const e = env as typeof env;
+  if (patch.NODE_ENV !== undefined) e.NODE_ENV = patch.NODE_ENV as typeof env.NODE_ENV;
+  if (patch.RETELL_API_KEY !== undefined) e.RETELL_API_KEY = patch.RETELL_API_KEY;
+}
+
+const fnUrl = (clinicId: string) => `/v1/receptionist/webhooks/retell/fn?clinicId=${clinicId}`;
+const body = (name: string, args: Record<string, unknown> = {}) => JSON.stringify({ name, args, call: { call_id: `sec-${randomUUID()}` } });
+const sign = (raw: string, key: string) => createHmac('sha256', key).update(raw).digest('hex');
+
+beforeAll(async () => { app = await buildApp(); }, 60_000);
+afterAll(async () => {
+  setEnv(original);
+  for (const id of tenantIds) await db.tenant.delete({ where: { id } }).catch(() => {});
+  await app?.close();
+  await db.$disconnect();
+});
+
+describe('receptionist /fn — signature enforcement (FIX 1)', () => {
+  it('production + real key + UNSIGNED → 401 (the auth-bypass proof)', async () => {
+    const t = await makeTenant();
+    setEnv({ NODE_ENV: 'production', RETELL_API_KEY: 'retell_real_secret' });
+    try {
+      const res = await app.inject({ method: 'POST', url: fnUrl(t.clinicId), headers: { 'content-type': 'application/json' }, payload: body('check_availability', { appointment_date: '2030-01-01' }) });
+      expect(res.statusCode).toBe(401);
+      expect(res.json().error).toBe('INVALID_SIGNATURE');
+    } finally {
+      setEnv(original);
+    }
+  });
+
+  it('production + missing key → 503 (never accept, never process)', async () => {
+    const t = await makeTenant();
+    setEnv({ NODE_ENV: 'production', RETELL_API_KEY: '' });
+    try {
+      const res = await app.inject({ method: 'POST', url: fnUrl(t.clinicId), headers: { 'content-type': 'application/json' }, payload: body('check_availability') });
+      expect(res.statusCode).toBe(503);
+      expect(res.json().error).toBe('WEBHOOK_NOT_CONFIGURED');
+    } finally {
+      setEnv(original);
+    }
+  });
+
+  it('a correctly-signed call is accepted (200)', async () => {
+    const t = await makeTenant();
+    setEnv({ RETELL_API_KEY: 'retell_real_secret' });
+    try {
+      const raw = body('check_availability', { appointment_date: '2030-01-01' });
+      const res = await app.inject({ method: 'POST', url: fnUrl(t.clinicId), headers: { 'content-type': 'application/json', 'x-retell-signature': sign(raw, 'retell_real_secret') }, payload: raw });
+      expect(res.statusCode).toBe(200);
+    } finally {
+      setEnv(original);
+    }
+  });
+
+  it('a WRONG signature is rejected (401) even outside production', async () => {
+    const t = await makeTenant();
+    setEnv({ RETELL_API_KEY: 'retell_real_secret' });
+    try {
+      const raw = body('check_availability');
+      const res = await app.inject({ method: 'POST', url: fnUrl(t.clinicId), headers: { 'content-type': 'application/json', 'x-retell-signature': sign(raw, 'a_different_key') }, payload: raw });
+      expect(res.statusCode).toBe(401);
+    } finally {
+      setEnv(original);
+    }
+  });
+
+  it('the dev bypass still works: non-production + no key + unsigned → 200', async () => {
+    const t = await makeTenant();
+    setEnv({ NODE_ENV: 'development', RETELL_API_KEY: '' });
+    const res = await app.inject({ method: 'POST', url: fnUrl(t.clinicId), headers: { 'content-type': 'application/json' }, payload: body('check_availability', { appointment_date: '2030-01-01' }) });
+    expect(res.statusCode).toBe(200);
+  });
+});
+
+describe('receptionist event webhook — production fail-closed posture', () => {
+  const eventUrl = (clinicId: string) => `/v1/receptionist/webhooks/retell?clinicId=${clinicId}`;
+  const eventBody = () => JSON.stringify({ event: 'call_started', call: { call_id: `evt-${randomUUID()}`, from_number: '+15551239999', direction: 'inbound' } });
+
+  it('production + real key + UNSIGNED → 401 (no PHI ingested unverified)', async () => {
+    const t = await makeTenant();
+    setEnv({ NODE_ENV: 'production', RETELL_API_KEY: 'retell_real_secret' });
+    try {
+      const res = await app.inject({ method: 'POST', url: eventUrl(t.clinicId), headers: { 'content-type': 'application/json' }, payload: eventBody() });
+      expect(res.statusCode).toBe(401);
+      expect(res.json().error).toBe('INVALID_SIGNATURE');
+    } finally {
+      setEnv(original);
+    }
+  });
+
+  it('production + missing key → 503', async () => {
+    const t = await makeTenant();
+    setEnv({ NODE_ENV: 'production', RETELL_API_KEY: '' });
+    try {
+      const res = await app.inject({ method: 'POST', url: eventUrl(t.clinicId), headers: { 'content-type': 'application/json' }, payload: eventBody() });
+      expect(res.statusCode).toBe(503);
+    } finally {
+      setEnv(original);
+    }
+  });
+
+  it('a correctly-signed event is accepted (200)', async () => {
+    const t = await makeTenant();
+    setEnv({ RETELL_API_KEY: 'retell_real_secret' });
+    try {
+      const raw = eventBody();
+      const res = await app.inject({ method: 'POST', url: eventUrl(t.clinicId), headers: { 'content-type': 'application/json', 'x-retell-signature': sign(raw, 'retell_real_secret') }, payload: raw });
+      expect(res.statusCode).toBe(200);
+    } finally {
+      setEnv(original);
+    }
+  });
+});
+
+describe('receptionist /fn — per-route rate limit engages', () => {
+  it('a non-allowlisted IP is cut off at the 30/min /fn ceiling', async () => {
+    const t = await makeTenant();
+    setEnv({ NODE_ENV: 'development', RETELL_API_KEY: '' });
+    const ip = '203.0.113.77'; // non-loopback → not on the dev allowList
+    const codes: number[] = [];
+    for (let i = 0; i < 31; i++) {
+      const res = await app.inject({ method: 'POST', url: fnUrl(t.clinicId), headers: { 'content-type': 'application/json', 'x-forwarded-for': ip }, payload: body('check_availability', { appointment_date: '2030-01-01' }) });
+      codes.push(res.statusCode);
+    }
+    expect(codes[0]).toBe(200);
+    expect(codes.filter(c => c === 200).length).toBeLessThanOrEqual(30);
+    expect(codes[codes.length - 1]).toBe(429); // the 31st is blocked
+  });
+});

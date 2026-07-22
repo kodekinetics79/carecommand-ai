@@ -1,5 +1,5 @@
 import { db } from './db';
-import { buildAudience, isSuppressed, channelStatus, maskDestination, type AudienceType, type CommChannel } from './campaigns';
+import { buildAudience, channelStatus, maskDestination, type AudienceType, type CommChannel } from './campaigns';
 import { sendMessage } from './commsProvider';
 import { emitBusinessEvent } from './intelligence';
 
@@ -38,16 +38,17 @@ export async function dispatchCampaign(tenantId: string, campaignId: string, opt
     let deliveryStatus: string;
     let providerMessageId: string | null = existing?.providerMessageId ?? null;
     let failureReason: string | null = null;
-    if (await isSuppressed(tenantId, cand, channel)) {
-      deliveryStatus = 'suppressed';
-    } else if (!contact) {
+    if (!contact) {
       deliveryStatus = 'skipped';
     } else {
+      // sendMessage is the SINGLE consent/suppression + destination gate: it
+      // returns 'suppressed' (no provider call) for an opted-out/suppressed
+      // recipient — including a receptionist-call opt-out (ReceptionistOptOut).
       const { subject, body } = renderBody(campaign.messageTemplate, cand.name, clinicName);
-      const result = await sendMessage(channel, contact, subject, body, key); // real provider / dev mock / setup_required
-      deliveryStatus = result.status; // sent | pending | failed | setup_required
+      const result = await sendMessage(channel, contact, subject, body, key, { tenantId, patientId: cand.patientId, leadId: cand.leadId }); // real provider / dev mock / setup_required / suppressed
+      deliveryStatus = result.status; // sent | pending | failed | setup_required | suppressed
       providerMessageId = result.providerMessageId ?? providerMessageId;
-      failureReason = result.failureReason ?? null;
+      failureReason = deliveryStatus === 'failed' ? (result.failureReason ?? null) : null;
     }
 
     const data = { status: deliveryStatus, destinationMasked: maskDestination(contact), provider: status.provider, providerMessageId, failureReason, idempotencyKey: key, sentAt: deliveryStatus === 'sent' ? new Date() : existing?.sentAt ?? null };
