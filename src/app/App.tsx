@@ -87,7 +87,7 @@ function ProtectedLayout() {
 }
 
 function PublicRoute({ children }: { children: ReactNode }) {
-  const { loading, isAuthenticated } = useSession();
+  const { loading, isAuthenticated } = useSession({ hydrate: false });
   const location = useLocation();
 
   if (loading) {

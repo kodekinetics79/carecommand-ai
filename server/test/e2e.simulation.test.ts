@@ -27,6 +27,7 @@ vi.mock('../workers/queues', () => ({
 const { buildApp } = await import('../app');
 const { db } = await import('../lib/db');
 const { recomputeEntitlements } = await import('../lib/entitlements');
+const { encryptSecret } = await import('../lib/security');
 
 let app: FastifyInstance;
 const createdTenantIds: string[] = [];
@@ -125,9 +126,19 @@ async function runJourney(c: Clinic): Promise<Record<string, StepResult>> {
   }
   steps.paymentCollected = ok(paymentsOk, payDetail);
 
-  // 7) Connected care / RPM: enroll + ingest a critical reading via webhook.
-  await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: admin, payload: { patientId: c.patientId, providerKey: 'manual', externalRef: c.externalRef } });
-  const hook = await app.inject({ method: 'POST', url: `/v1/connected-care/${c.id}/providers/manual/webhook`, payload: { readings: [{ patientExternalRef: c.externalRef, readingType: 'glucose', value: '330', numericValue: 330, unit: 'mg/dL' }] } });
+  // 7) Connected care / RPM: enroll + ingest a critical reading via a SIGNED webhook.
+  // The device webhook fails closed — it ingests only when the per-provider secret
+  // verifies the request, so configure that secret, enroll, and sign the payload.
+  const deviceSecret = `whsec-dev-${c.id}`;
+  await db.deviceProvider.upsert({
+    where: { tenantId_providerKey: { tenantId: c.id, providerKey: 'withings' } },
+    create: { tenantId: c.id, providerKey: 'withings', displayName: 'Withings', category: 'DIRECT_API', mode: 'sandbox', status: 'SANDBOX', encryptedConfig: encryptSecret(JSON.stringify({ webhookSecret: deviceSecret })), webhookConfigured: true },
+    update: { encryptedConfig: encryptSecret(JSON.stringify({ webhookSecret: deviceSecret })), webhookConfigured: true },
+  });
+  await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: admin, payload: { patientId: c.patientId, providerKey: 'withings', externalRef: c.externalRef } });
+  const deviceRaw = JSON.stringify({ readings: [{ patientExternalRef: c.externalRef, readingType: 'glucose', value: '330', numericValue: 330, unit: 'mg/dL' }] });
+  const deviceSig = createHmac('sha256', deviceSecret).update(deviceRaw).digest('hex');
+  const hook = await app.inject({ method: 'POST', url: `/v1/connected-care/${c.id}/providers/withings/webhook`, headers: { 'content-type': 'application/json', 'x-cc-signature': deviceSig }, payload: deviceRaw });
   steps.deviceAlert = ok(hook.statusCode === 200 && hook.json().alertsCreated === 1, `ingested=${hook.json().ingested} alerts=${hook.json().alertsCreated}`);
 
   // 8) Compliance: HIPAA data-access export compiles the cross-module record.

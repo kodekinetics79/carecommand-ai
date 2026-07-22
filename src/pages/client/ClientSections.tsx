@@ -10,6 +10,7 @@ import {
   portalClient, STATE_META,
   type PortalDashboard, type PortalAppt, type PortalRequest, type PortalIntake,
   type PortalInsurance, type PortalPayment, type PortalEstimate, type PortalPreferences,
+  type PortalBookingProvider, type PortalBookingSlot,
 } from '../../lib/portalClient';
 
 const API = (import.meta.env.VITE_API_URL as string | undefined) ?? (import.meta.env.PROD ? '' : 'http://localhost:3001');
@@ -178,33 +179,138 @@ export function ClientAppointments() {
 /* ------------------------------------------------------------------ Requests */
 export function ClientRequests() {
   const [rows, setRows] = useState<PortalRequest[] | null>(null);
+  const [providers, setProviders] = useState<PortalBookingProvider[] | null>(null);
+  const [slots, setSlots] = useState<PortalBookingSlot[]>([]);
+  const [providerId, setProviderId] = useState('');
+  const [bookingDate, setBookingDate] = useState(() => {
+    const d = new Date();
+    d.setDate(d.getDate() + 7);
+    return d.toISOString().slice(0, 10);
+  });
+  const [selectedSlot, setSelectedSlot] = useState('');
+  const [bookingReason, setBookingReason] = useState('');
   const [service, setService] = useState(''); const [when, setWhen] = useState(''); const [notes, setNotes] = useState('');
   const [busy, setBusy] = useState(false); const [msg, setMsg] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [bookingMsg, setBookingMsg] = useState<string | null>(null);
+  const [bookingBusy, setBookingBusy] = useState(false);
   async function load() { setRows(await portalClient.requests()); }
+  async function loadSlots(nextProviderId = providerId, nextDate = bookingDate) {
+    if (!nextProviderId || !nextDate) { setSlots([]); setSelectedSlot(''); return; }
+    const data = await portalClient.bookingSlots(nextProviderId, nextDate);
+    setSlots(data.slots);
+    setSelectedSlot(data.slots[0]?.startsAt ?? '');
+  }
   useEffect(() => {
     let a = true;
     void (async () => {
       setLoadError(null);
       try {
-        const x = await portalClient.requests();
-        if (a) setRows(x);
+        const [x, p] = await Promise.all([portalClient.requests(), portalClient.bookingProviders()]);
+        if (a) {
+          setRows(x);
+          setProviders(p);
+          setProviderId(p[0]?.id ?? '');
+        }
       } catch (e) {
         if (a) setLoadError(e instanceof Error ? e.message : 'Failed to load requests');
       }
     })();
     return () => { a = false; };
   }, []);
+  useEffect(() => {
+    let a = true;
+    void (async () => {
+      if (!providerId) { setSlots([]); setSelectedSlot(''); return; }
+      try {
+        const data = await portalClient.bookingSlots(providerId, bookingDate);
+        if (a) {
+          setSlots(data.slots);
+          setSelectedSlot(data.slots[0]?.startsAt ?? '');
+        }
+      } catch (e) {
+        if (a) { setSlots([]); setSelectedSlot(''); setBookingMsg(e instanceof Error ? e.message : 'Could not load slots'); }
+      }
+    })();
+    return () => { a = false; };
+  }, [providerId, bookingDate]);
   async function submit() {
     setBusy(true); setMsg(null);
     try { const r = await portalClient.createRequest({ service: service.trim(), requestedDateTime: when || undefined, notes: notes.trim() || undefined }); setMsg(r.deduped ? 'You already have a matching request pending review.' : 'Request submitted — the clinic will be in touch.'); setService(''); setWhen(''); setNotes(''); await load(); }
     catch (e) { setMsg(e instanceof Error ? e.message : 'Could not submit'); } finally { setBusy(false); }
   }
+  async function book() {
+    setBookingBusy(true); setBookingMsg(null);
+    try {
+      const appt = await portalClient.bookSlot(providerId, { startsAt: selectedSlot, durationMin: 30, reason: bookingReason.trim(), channel: 'EMAIL' });
+      setBookingMsg(`Booked ${appt.service} for ${new Date(appt.startsAt).toLocaleString()}.`);
+      setBookingReason('');
+      await loadSlots(providerId, bookingDate);
+    } catch (e) {
+      setBookingMsg(e instanceof Error ? e.message : 'Could not book this slot');
+    } finally {
+      setBookingBusy(false);
+    }
+  }
   const inp = 'w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--indigo)]';
   return (
     <div>
-      <H icon={ClipboardList} title="Appointment requests" sub="Ask for a time — staff confirm availability (no auto-booking)" />
+      <H icon={ClipboardList} title="Appointments" sub="Book an available slot or ask staff to find a time" />
+      <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4 space-y-3 mb-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="text-[13px] font-bold text-t1">Book an available slot</p>
+            <p className="text-[12px] text-t3 mt-0.5">Choose a provider, date, and open appointment time for your clinic branch.</p>
+          </div>
+          <StateBadge state={providers && providers.length > 0 ? 'scheduled' : 'unavailable'} />
+        </div>
+        {!providers ? <Skel n={2} /> : providers.length === 0 ? (
+          <p className="text-[12px] text-t3">Online booking is not configured for your clinic yet. Use the request form below.</p>
+        ) : (
+          <>
+            <div className="grid gap-2.5 sm:grid-cols-2">
+              <label className="block space-y-1">
+                <span className="text-[11px] font-bold uppercase tracking-wide text-t3">Provider</span>
+                <select
+                  className={inp}
+                  value={providerId}
+                  onChange={e => setProviderId(e.target.value)}
+                  aria-label="Provider"
+                >
+                  {providers.map(p => <option key={p.id} value={p.id}>{p.name}{p.specialty ? ` - ${p.specialty}` : ''}</option>)}
+                </select>
+              </label>
+              <label className="block space-y-1">
+                <span className="text-[11px] font-bold uppercase tracking-wide text-t3">Date</span>
+                <input className={inp} type="date" value={bookingDate} onChange={e => setBookingDate(e.target.value)} />
+              </label>
+            </div>
+            <label className="block space-y-1">
+              <span className="text-[11px] font-bold uppercase tracking-wide text-t3">Open slots</span>
+              <select className={inp} value={selectedSlot} onChange={e => setSelectedSlot(e.target.value)} aria-label="Open slots">
+                {slots.length === 0 ? <option value="">No open slots on this date</option> : slots.map(s => (
+                  <option key={s.startsAt} value={s.startsAt}>{new Date(s.startsAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</option>
+                ))}
+              </select>
+            </label>
+            <label className="block space-y-1">
+              <span className="text-[11px] font-bold uppercase tracking-wide text-t3">Reason for visit</span>
+              <input className={inp} value={bookingReason} onChange={e => setBookingReason(e.target.value)} placeholder="e.g. Annual physical" />
+            </label>
+            <button
+              type="button"
+              disabled={bookingBusy || !providerId || !selectedSlot || bookingReason.trim().length < 2}
+              onClick={book}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50"
+            >
+              {bookingBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <CalendarDays className="w-4 h-4" />} Book appointment
+            </button>
+            {bookingMsg && <p className="text-[12px] text-emerald-v">{bookingMsg}</p>}
+          </>
+        )}
+      </div>
       <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4 space-y-2.5 mb-5">
+        <p className="text-[13px] font-bold text-t1">Ask staff to find a time</p>
         <input className={inp} value={service} onChange={e => setService(e.target.value)} placeholder="What do you need? (e.g. Dental check-up)" />
         <div className="grid grid-cols-2 gap-2.5">
           <input className={inp} type="datetime-local" value={when} onChange={e => setWhen(e.target.value)} aria-label="Preferred date and time" />

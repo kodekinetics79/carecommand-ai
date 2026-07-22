@@ -6,9 +6,10 @@ import { portalClient, setPortalToken } from '../../lib/portalClient';
 
 export default function ClientLogin() {
   const navigate = useNavigate();
+  const defaultClinicSlug = import.meta.env.VITE_DEFAULT_CLINIC_SLUG ?? (import.meta.env.DEV ? 'harley-street-medical' : '');
   const [step, setStep] = useState<'request' | 'verify'>('request');
   const [mode, setMode] = useState<'signin' | 'signup'>('signin');
-  const [clinicSlug, setClinicSlug] = useState('harley-street-medical');
+  const [clinicSlug, setClinicSlug] = useState(defaultClinicSlug);
   const [email, setEmail] = useState('');
   const [token, setToken] = useState('');
   const [busy, setBusy] = useState(false);

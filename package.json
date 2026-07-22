@@ -22,10 +22,12 @@
     "pilot:simulate": "tsx server/scripts/pilotSimulation.ts",
     "demo:sandbox": "tsx server/scripts/seedDemoSandbox.ts",
     "rls:verify": "tsx server/scripts/verifyRlsStatus.ts",
-    "build": "tsc -b && vite build",
+    "build": "NODE_ENV=production tsc -b && NODE_ENV=production vite build",
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
+    "e2e:serve": "mkdir -p .playwright && rm -f .playwright/portal-outbox.jsonl && VITE_API_URL=http://127.0.0.1:3201 VITE_AUTH_MODE=login-required VITE_DEMO_FALLBACK=false VITE_DEFAULT_CLINIC_SLUG= npm run build && concurrently -k -n api,worker,web \"NODE_ENV=production E2E_TEST_MODE=true API_PORT=3201 CORS_ORIGINS=http://127.0.0.1:4173 PORTAL_TOKEN_OUTBOX_PATH=.playwright/portal-outbox.jsonl STRIPE_WEBHOOK_SECRET=whsec_pw_e2e npm run api:start\" \"NODE_ENV=production OTEL_SERVICE_NAME=carecommand-worker STRIPE_WEBHOOK_SECRET=whsec_pw_e2e npm run worker:start\" \"npm run preview -- --host 127.0.0.1 --port 4173\"",
+    "test:e2e": "playwright test",
     "check": "npm run db:validate && npm run api:typecheck && npm run lint && npm run build",
     "preview": "vite preview"
   },
@@ -67,6 +69,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.61.1",
     "@tailwindcss/vite": "^4.3.0",
     "@types/node": "^24.12.4",
     "@types/pg": "^8.20.0",

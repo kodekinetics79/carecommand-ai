@@ -17,7 +17,7 @@ const ECG_PATH = 'M0 40 H70 l6 -3 l4 6 l6 -3 H150 l8 0 l4 -22 l6 40 l5 -18 H250 
 export default function Login() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { signIn } = useSession();
+  const { signIn } = useSession({ hydrate: false });
 
   // "Remember me" pre-fills the email on return (convenience only; no token change).
   const rememberedEmail = typeof localStorage !== 'undefined' ? localStorage.getItem(REMEMBER_KEY) : null;

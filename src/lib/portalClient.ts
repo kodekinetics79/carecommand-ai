@@ -30,6 +30,8 @@ export interface PortalDashboard {
 }
 export interface PortalAppt { id: string; service: string; startsAt: string; endsAt: string; status: string; provider: string | null }
 export interface PortalRequest { id: string; service: string | null; requestedDateTime: string | null; status: string; createdAt: string }
+export interface PortalBookingProvider { id: string; name: string; specialty: string | null; rating: number; reviewCount: number }
+export interface PortalBookingSlot { startsAt: string; endsAt: string }
 export interface PortalIntake { id: string; status: string; label: string; readinessScore: number; createdAt: string }
 export interface PortalInsurance { id: string; planName: string; memberId: string; groupNumber: string | null; subscriberName: string | null; status: string }
 export interface PortalPayment { id: string; amount: number; currency: string; status: string; reason: string; payLink: string | null; dueAt: string | null }
@@ -45,6 +47,10 @@ export const portalClient = {
 
   dashboard: () => pf<PortalDashboard>('/v1/portal/dashboard'),
   appointments: () => pf<{ upcoming: PortalAppt[]; past: PortalAppt[] }>('/v1/portal/appointments'),
+  bookingProviders: () => pf<PortalBookingProvider[]>('/v1/portal/booking/providers'),
+  bookingSlots: (providerId: string, date: string) => pf<{ providerId: string; date: string; slots: PortalBookingSlot[] }>(`/v1/portal/booking/providers/${providerId}/slots?date=${encodeURIComponent(date)}`),
+  bookSlot: (providerId: string, body: { startsAt: string; durationMin?: number; reason: string; channel?: 'WHATSAPP' | 'SMS' | 'EMAIL' | 'PUSH' | 'CALL' | 'VIDEO' }) =>
+    pf<PortalAppt>(`/v1/portal/booking/providers/${providerId}/book`, { method: 'POST', body: JSON.stringify(body) }),
   requests: () => pf<PortalRequest[]>('/v1/portal/appointment-requests'),
   createRequest: (body: { service: string; requestedDateTime?: string; notes?: string }) => pf<{ id: string; status: string; deduped: boolean }>('/v1/portal/appointment-requests', { method: 'POST', body: JSON.stringify(body) }),
   intake: () => pf<PortalIntake[]>('/v1/portal/intake'),
