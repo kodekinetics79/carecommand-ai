@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { CalendarDays, Sparkles, Zap, AlertCircle, CheckCircle2, Clock, Users, DollarSign, ArrowRight, RefreshCw, CreditCard } from 'lucide-react';
+import { CalendarDays, Sparkles, Zap, AlertCircle, CheckCircle2, Clock, Users, DollarSign, ArrowRight, RefreshCw, CreditCard, LogIn, UserX, CheckCheck, XCircle, CalendarClock } from 'lucide-react';
 import AppointmentPaymentCard from '../components/payments/AppointmentPaymentCard';
 import PaymentRequestsPanel from '../components/payments/PaymentRequestsPanel';
 import InsuranceIntakeCard from '../components/insurance/InsuranceIntakeCard';
@@ -12,7 +12,10 @@ import ProgressBar from '../components/ui/ProgressBar';
 import { formatCurrency } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapAppointment, mapProviderProfile, mapPatient, type ApiAppointment, type ApiProviderProfile, type ApiPatient } from '../lib/apiAdapters';
-import { apiRequest } from '../lib/api';
+import { apiRequest, ApiError } from '../lib/api';
+import { appointmentsApi, schedulingApi, type LifecycleStatus, type ProviderSlot } from '../lib/appointments';
+import { intakeApi } from '../lib/intake';
+import { useSession } from '../hooks/useSession';
 import { checkEligibility, fetchAppointmentVerificationQueue, type AppointmentVerificationQueueRow } from '../lib/revenueProtection';
 
 const isoDate = (offsetDays: number) => {
@@ -25,7 +28,19 @@ const dateOptions = [0, 1, 2].map(offset => ({
   label: offset === 0 ? 'Today' : offset === 1 ? 'Tomorrow' : new Date(isoDate(offset)).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric' }),
 }));
 const todayDate = dateOptions[0].value;
-const emptyBooking = { patientId: '', service: '', date: todayDate, time: '10:00', channel: 'WHATSAPP', value: '150' };
+const emptyBooking = { patientId: '', providerId: '', service: '', date: todayDate, time: '10:00', channel: 'EMAIL', value: '150', slotStart: '', slotEnd: '' };
+
+// Client mirror of the backend lifecycle transition rules (appointments/routes.ts)
+// so we only offer actions the server will accept; a race still surfaces as a 409.
+function availableActions(status: string): { checkIn: boolean; noShow: boolean; complete: boolean; cancel: boolean; reschedule: boolean } {
+  return {
+    checkIn: ['confirmed', 'risky', 'waitlist'].includes(status),
+    noShow: ['confirmed', 'risky', 'waitlist'].includes(status),
+    complete: ['arrived', 'confirmed', 'risky'].includes(status),
+    cancel: !['canceled', 'completed'].includes(status),
+    reschedule: !['canceled', 'completed'].includes(status),
+  };
+}
 
 const statusConfig: Record<string, { label: string; dot: string; bg: string; text: string }> = {
   confirmed:  { label: 'Confirmed',  dot: 'bg-emerald-500', bg: 'bg-[var(--emerald-soft)]',  text: 'text-emerald-v' },
@@ -39,6 +54,9 @@ const statusConfig: Record<string, { label: string; dot: string; bg: string; tex
 
 interface ApiBranchOption { id: string; name: string }
 
+// NOTE: waitlistSlots + aiRecommendations are illustrative sample data (no live
+// source yet). The panels rendering them are labelled "Illustrative sample — not
+// live data" so nothing fabricated is presented to staff as real.
 const waitlistSlots = [
   { name: 'Isabelle Dubois', service: 'Nutrition Consultation', preferred: 'Mon–Wed afternoon', value: formatCurrency(180) },
   { name: 'Jack Harrison', service: 'Annual Wellness Review', preferred: 'Any weekday AM', value: formatCurrency(200) },
@@ -53,13 +71,24 @@ const aiRecommendations = [
 
 export default function Scheduling() {
   const navigate = useNavigate();
+  const { user } = useSession();
+  const isFrontDesk = user?.role === 'FRONT_DESK';
   const [selectedBranch, setSelectedBranch] = useState('all');
   const [selectedDate, setSelectedDate] = useState(todayDate);
   const [insuranceQueue, setInsuranceQueue] = useState<AppointmentVerificationQueueRow[]>([]);
   const [queueLoading, setQueueLoading] = useState(true);
   const [queueError, setQueueError] = useState<string | null>(null);
   const [queueBusy, setQueueBusy] = useState<string | null>(null);
-  const { data: appointmentRecords, source, error: appointmentError, reload } = useApiResource<ApiAppointment, ReturnType<typeof mapAppointment>>('/v1/appointments?limit=100', [], mapAppointment);
+  // Server-side day/branch filtering: fetch only the selected UTC day (and branch)
+  // instead of the first 100 rows ordered by id — so a busy day past the first 100
+  // rows is no longer silently dropped. UTC bounds match mapAppointment's date.
+  const appointmentsPath = useMemo(() => {
+    const from = `${selectedDate}T00:00:00.000Z`;
+    const to = `${selectedDate}T23:59:59.999Z`;
+    const branchParam = selectedBranch === 'all' ? '' : `&branchId=${selectedBranch}`;
+    return `/v1/appointments?limit=200&from=${from}&to=${to}${branchParam}`;
+  }, [selectedDate, selectedBranch]);
+  const { data: appointmentRecords, source, error: appointmentError, reload } = useApiResource<ApiAppointment, ReturnType<typeof mapAppointment>>(appointmentsPath, [], mapAppointment);
   const { data: providerRecords, error: providerError } = useApiResource<ApiProviderProfile, ReturnType<typeof mapProviderProfile>>('/v1/providers/overview?limit=100', [], mapProviderProfile);
   const { data: patientRecords, error: patientError } = useApiResource<ApiPatient, ReturnType<typeof mapPatient>>('/v1/patients?limit=100', [], mapPatient);
   const { data: branchRecords, error: branchError } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
@@ -69,6 +98,50 @@ export default function Scheduling() {
   const [booking, setBooking] = useState(emptyBooking);
   const [saving, setSaving] = useState(false);
   const [bookingError, setBookingError] = useState<string | null>(null);
+  // Real provider slots for the conflict-safe booking path.
+  const [slots, setSlots] = useState<ProviderSlot[]>([]);
+  const [slotsLoading, setSlotsLoading] = useState(false);
+  const [slotsError, setSlotsError] = useState<string | null>(null);
+  // Per-row lifecycle action state.
+  const [rowBusy, setRowBusy] = useState<string | null>(null);
+  const [rowNotice, setRowNotice] = useState<{ id: string; kind: 'error' | 'ok'; text: string } | null>(null);
+  const [rescheduleFor, setRescheduleFor] = useState<string | null>(null);
+  const [rescheduleForm, setRescheduleForm] = useState({ date: todayDate, time: '10:00' });
+  const [intakeBusy, setIntakeBusy] = useState<string | null>(null);
+
+  // Providers bookable for the chosen patient (same branch — the book route
+  // requires the patient to belong to the provider's clinic).
+  const bookingPatient = patientRecords.find(p => p.id === booking.patientId);
+  const bookableProviders = useMemo(
+    () => (bookingPatient ? providerRecords.filter(p => p.branchId === bookingPatient.branchId) : []),
+    [providerRecords, bookingPatient],
+  );
+
+  // Load real open slots whenever a provider + date are chosen.
+  useEffect(() => {
+    if (!showBooking || !booking.providerId || !booking.date) {
+      setSlots([]);
+      return;
+    }
+    let active = true;
+    setSlotsLoading(true);
+    setSlotsError(null);
+    void (async () => {
+      try {
+        const res = await schedulingApi.slots(booking.providerId, booking.date);
+        if (!active) return;
+        setSlots(res.slots);
+        if (res.slots.length === 0) setSlotsError('No open slots for this provider on this day. Set availability, pick another day, or use manual time entry below.');
+      } catch (err) {
+        if (!active) return;
+        setSlots([]);
+        setSlotsError(err instanceof Error ? err.message : 'Unable to load slots');
+      } finally {
+        if (active) setSlotsLoading(false);
+      }
+    })();
+    return () => { active = false; };
+  }, [showBooking, booking.providerId, booking.date]);
 
   useEffect(() => {
     let active = true;
@@ -91,6 +164,13 @@ export default function Scheduling() {
     };
   }, [selectedBranch]);
 
+  function closeBooking() {
+    setBooking(emptyBooking);
+    setShowBooking(false);
+    setSlots([]);
+    setSlotsError(null);
+  }
+
   async function bookAppointment() {
     const patient = patientRecords.find(p => p.id === booking.patientId);
     if (!patient || !patient.branchId || !booking.service.trim()) {
@@ -100,35 +180,109 @@ export default function Scheduling() {
     setSaving(true);
     setBookingError(null);
     try {
-      const startsAt = new Date(`${booking.date}T${booking.time}:00`);
-      await apiRequest('/v1/appointments', {
-        method: 'POST',
-        body: JSON.stringify({
-          branchId: patient.branchId,
+      // Preferred path: a provider + a real open slot → conflict-safe booking that
+      // sets providerProfileId and is guarded by the DB exclusion constraint.
+      if (booking.providerId && booking.slotStart) {
+        const durationMin = booking.slotEnd
+          ? Math.max(5, Math.round((new Date(booking.slotEnd).getTime() - new Date(booking.slotStart).getTime()) / 60000))
+          : 30;
+        await schedulingApi.book(booking.providerId, {
           patientId: patient.id,
+          startsAt: booking.slotStart,
+          durationMin,
           service: booking.service.trim(),
-          startsAt: startsAt.toISOString(),
-          endsAt: new Date(startsAt.getTime() + 30 * 60000).toISOString(),
           channel: booking.channel,
-          value: Number(booking.value) || 0,
-          status: 'CONFIRMED',
-        }),
-      });
-      setBooking(emptyBooking);
-      setShowBooking(false);
-      setSelectedDate(booking.date);
+        });
+      } else {
+        // Fallback (noted): no provider availability configured yet, so fall back to
+        // an unconstrained free-time booking. Not cross-path conflict-guarded.
+        const startsAt = new Date(`${booking.date}T${booking.time}:00`);
+        await apiRequest('/v1/appointments', {
+          method: 'POST',
+          body: JSON.stringify({
+            branchId: patient.branchId,
+            patientId: patient.id,
+            service: booking.service.trim(),
+            startsAt: startsAt.toISOString(),
+            endsAt: new Date(startsAt.getTime() + 30 * 60000).toISOString(),
+            channel: booking.channel,
+            value: Number(booking.value) || 0,
+            status: 'CONFIRMED',
+          }),
+        });
+      }
+      const bookedDate = booking.date;
+      closeBooking();
+      setSelectedDate(bookedDate);
       reload();
     } catch (err) {
-      setBookingError(err instanceof Error ? err.message : 'Failed to book appointment');
+      if (err instanceof ApiError && err.status === 409) {
+        setBookingError('That slot was just taken. Pick another open slot.');
+        // Refresh slots so the taken one drops off.
+        if (booking.providerId) {
+          try {
+            const res = await schedulingApi.slots(booking.providerId, booking.date);
+            setSlots(res.slots);
+          } catch { /* keep prior slots */ }
+        }
+      } else {
+        setBookingError(err instanceof Error ? err.message : 'Failed to book appointment');
+      }
     } finally {
       setSaving(false);
     }
   }
 
+  // ----- Lifecycle actions (check-in / no-show / complete / cancel / reschedule)
+  async function runRowAction(id: string, fn: () => Promise<unknown>, okText: string) {
+    setRowBusy(id);
+    setRowNotice(null);
+    try {
+      await fn();
+      setRowNotice({ id, kind: 'ok', text: okText });
+      reload();
+    } catch (err) {
+      const text = err instanceof ApiError && err.status === 409
+        ? (err.message.startsWith('API request failed') ? "You can't do that from the appointment's current state." : err.message)
+        : err instanceof Error ? err.message : 'Action failed';
+      setRowNotice({ id, kind: 'error', text });
+    } finally {
+      setRowBusy(null);
+    }
+  }
+
+  const setLifecycle = (id: string, status: LifecycleStatus, ok: string) => runRowAction(id, () => appointmentsApi.setStatus(id, status), ok);
+  const cancelAppointment = (id: string) => runRowAction(id, () => appointmentsApi.cancel(id), 'Appointment cancelled.');
+
+  async function submitReschedule(id: string) {
+    const startsAt = new Date(`${rescheduleForm.date}T${rescheduleForm.time}:00`);
+    const endsAt = new Date(startsAt.getTime() + 30 * 60000);
+    await runRowAction(id, () => appointmentsApi.reschedule(id, startsAt.toISOString(), endsAt.toISOString()), 'Appointment rescheduled.');
+    setRescheduleFor(null);
+    setSelectedDate(rescheduleForm.date);
+  }
+
+  // ----- Originate an intake link for an appointment's patient ---------------
+  async function sendIntake(appt: ReturnType<typeof mapAppointment>) {
+    setIntakeBusy(appt.id);
+    setRowNotice(null);
+    try {
+      const packet = await intakeApi.createPacket({ appointmentId: appt.id, source: 'staff' });
+      const link = packet.publicUrl || (packet.publicToken ? `/intake/${packet.publicToken}` : null);
+      if (link) await navigator.clipboard.writeText(link).catch(() => undefined);
+      setRowNotice({ id: appt.id, kind: 'ok', text: link ? 'Intake link created and copied to clipboard.' : 'Intake packet created.' });
+    } catch (err) {
+      setRowNotice({ id: appt.id, kind: 'error', text: err instanceof Error ? err.message : 'Failed to create intake' });
+    } finally {
+      setIntakeBusy(null);
+    }
+  }
+
+  // Date + branch are now filtered server-side (see appointmentsPath); just order
+  // the returned day by time.
   const todayAppts = useMemo(() =>
-    appointmentRecords.filter(a => a.date === selectedDate && (selectedBranch === 'all' || a.branchId === selectedBranch))
-      .sort((a, b) => a.time.localeCompare(b.time)),
-    [appointmentRecords, selectedBranch, selectedDate]
+    [...appointmentRecords].sort((a, b) => a.time.localeCompare(b.time)),
+    [appointmentRecords]
   );
 
   const totalValue = todayAppts.reduce((s, a) => s + a.value, 0);
@@ -173,28 +327,61 @@ export default function Scheduling() {
       />
 
       {showBooking && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setShowBooking(false)}>
-          <div className="w-full max-w-md rounded-2xl bg-[var(--s1)] border border-[var(--b2)] p-5 shadow-xl" onClick={e => e.stopPropagation()}>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={closeBooking}>
+          <div className="w-full max-w-md rounded-2xl bg-[var(--s1)] border border-[var(--b2)] p-5 shadow-xl max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
             <p className="text-sm font-bold text-t1 mb-3">Book Appointment</p>
             {bookingError && <p className="text-[11px] text-red-v mb-2">{bookingError}</p>}
             <div className="space-y-2.5">
-              <select aria-label="Customer" title="Customer" value={booking.patientId} onChange={e => setBooking(b => ({ ...b, patientId: e.target.value }))} className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
+              <select aria-label="Customer" title="Customer" value={booking.patientId} onChange={e => setBooking(b => ({ ...b, patientId: e.target.value, providerId: '', slotStart: '', slotEnd: '' }))} className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
                 <option value="">Select customer…</option>
                 {patientRecords.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
               </select>
               <input value={booking.service} onChange={e => setBooking(b => ({ ...b, service: e.target.value }))} placeholder="Service (e.g. Dermatology Review)" className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
               <div className="grid grid-cols-2 gap-2.5">
-                <input type="date" aria-label="Date" value={booking.date} onChange={e => setBooking(b => ({ ...b, date: e.target.value }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
-                <input type="time" aria-label="Time" value={booking.time} onChange={e => setBooking(b => ({ ...b, time: e.target.value }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+                <select aria-label="Provider" title="Provider" disabled={!booking.patientId} value={booking.providerId} onChange={e => setBooking(b => ({ ...b, providerId: e.target.value, slotStart: '', slotEnd: '' }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-40">
+                  <option value="">{booking.patientId ? 'Select provider…' : 'Pick customer first'}</option>
+                  {bookableProviders.map(p => <option key={p.id} value={p.id}>{p.name} · {p.specialty}</option>)}
+                </select>
+                <input type="date" aria-label="Date" value={booking.date} onChange={e => setBooking(b => ({ ...b, date: e.target.value, slotStart: '', slotEnd: '' }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
                 <select aria-label="Channel" title="Channel" value={booking.channel} onChange={e => setBooking(b => ({ ...b, channel: e.target.value }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
                   {['WHATSAPP', 'SMS', 'EMAIL', 'CALL', 'VIDEO'].map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
-                <input type="number" aria-label="Value" value={booking.value} onChange={e => setBooking(b => ({ ...b, value: e.target.value }))} placeholder="Value ($)" className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
               </div>
+
+              {/* Conflict-safe slot picker (real backend availability) */}
+              {booking.providerId && (
+                <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-t3 mb-2">Open slots</p>
+                  {slotsLoading ? (
+                    <p className="text-[11px] text-t3">Loading open slots…</p>
+                  ) : slots.length > 0 ? (
+                    <div className="flex flex-wrap gap-1.5">
+                      {slots.map(s => {
+                        const label = new Date(s.startsAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+                        const active = booking.slotStart === s.startsAt;
+                        return (
+                          <button key={s.startsAt} type="button" onClick={() => setBooking(b => ({ ...b, slotStart: s.startsAt, slotEnd: s.endsAt }))} className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition ${active ? 'bg-[var(--indigo)] text-white' : 'bg-[var(--s3)] text-t2 hover:bg-[var(--b1)]'}`}>{label}</button>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-amber-v">{slotsError ?? 'No open slots.'}</p>
+                  )}
+                </div>
+              )}
+
+              {/* Fallback: manual time entry when no provider/slot is used */}
+              {(!booking.providerId || slots.length === 0) && (
+                <div className="grid grid-cols-2 gap-2.5">
+                  <input type="time" aria-label="Time (manual)" value={booking.time} onChange={e => setBooking(b => ({ ...b, time: e.target.value }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+                  <input type="number" aria-label="Value" value={booking.value} onChange={e => setBooking(b => ({ ...b, value: e.target.value }))} placeholder="Value ($)" className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+                  <p className="col-span-2 text-[10px] text-t3">Manual time is an unconstrained fallback (no cross-path conflict guard). Prefer a provider slot above.</p>
+                </div>
+              )}
             </div>
             <div className="flex gap-2 mt-4">
-              <button type="button" disabled={saving} onClick={bookAppointment} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition disabled:opacity-40">{saving ? 'Booking…' : 'Book Appointment'}</button>
-              <button type="button" onClick={() => setShowBooking(false)} className="px-4 py-2 rounded-lg border border-[var(--b1)] text-t2 text-xs font-semibold hover:bg-[var(--s3)] transition">Cancel</button>
+              <button type="button" disabled={saving} onClick={bookAppointment} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition disabled:opacity-40">{saving ? 'Booking…' : booking.providerId && booking.slotStart ? 'Book slot' : 'Book Appointment'}</button>
+              <button type="button" onClick={closeBooking} className="px-4 py-2 rounded-lg border border-[var(--b1)] text-t2 text-xs font-semibold hover:bg-[var(--s3)] transition">Cancel</button>
             </div>
           </div>
         </div>
@@ -219,6 +406,8 @@ export default function Scheduling() {
           {dateOptions.map(opt => (
             <button key={opt.value} type="button" onClick={() => setSelectedDate(opt.value)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedDate === opt.value ? 'bg-[var(--indigo)] text-white' : 'text-t3 hover:text-t1'}`}>{opt.label}</button>
           ))}
+          {/* Pick any day server-side (not just Today/Tomorrow/+2). */}
+          <input type="date" aria-label="Pick a date" value={selectedDate} onChange={e => setSelectedDate(e.target.value || todayDate)} className={`px-2 py-1.5 rounded-lg text-xs font-semibold bg-transparent outline-none ${dateOptions.some(o => o.value === selectedDate) ? 'text-t3' : 'bg-[var(--indigo)] text-white'}`} />
         </div>
         <div className="flex items-center gap-1 bg-[var(--s2)] border border-[var(--b1)] p-1 rounded-xl">
           <button type="button" onClick={() => setSelectedBranch('all')} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedBranch === 'all' ? 'bg-[var(--s3)] text-t1' : 'text-t3 hover:text-t1'}`}>All Branches</button>
@@ -328,18 +517,62 @@ export default function Scheduling() {
                         </div>
                       </div>
                       <p className="text-xs text-t3">{appt.service} · {appt.doctorName}</p>
-                      <div className="flex items-center gap-2 mt-1.5">
-                        <span className="text-[10px] text-t3 capitalize">{appt.channel}</span>
-                        {isRisky && (
-                          <button type="button" onClick={() => navigate('/ai-receptionist')} className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2 py-0.5 rounded-full hover:opacity-80 transition-colors">
-                            <Zap className="w-2.5 h-2.5" /> Send reminder
-                          </button>
-                        )}
-                        <button type="button" onClick={() => setPaymentApptId(prev => (prev === appt.id ? null : appt.id))} className="inline-flex items-center gap-1 text-[10px] font-semibold text-t2 bg-[var(--s2)] border border-[var(--b1)] px-2 py-0.5 rounded-full hover:bg-[var(--s3)] transition-colors">
-                          <CreditCard className="w-2.5 h-2.5" /> {paymentApptId === appt.id ? 'Hide deposit' : 'Deposit'}
-                        </button>
-                      </div>
-                      {paymentApptId === appt.id && (
+                      {(() => {
+                        const act = availableActions(appt.status);
+                        const busy = rowBusy === appt.id;
+                        return (
+                          <>
+                            <div className="flex items-center gap-1.5 mt-2 flex-wrap">
+                              <span className="text-[10px] text-t3 capitalize mr-1">{appt.channel}</span>
+                              {act.checkIn && (
+                                <button type="button" disabled={busy} onClick={() => void setLifecycle(appt.id, 'ARRIVED', 'Checked in.')} className="inline-flex items-center gap-1 text-[10px] font-semibold text-blue-v bg-[var(--blue-soft)] px-2 py-0.5 rounded-full hover:opacity-80 transition-colors disabled:opacity-40">
+                                  <LogIn className="w-2.5 h-2.5" /> Check-in
+                                </button>
+                              )}
+                              {act.complete && (
+                                <button type="button" disabled={busy} onClick={() => void setLifecycle(appt.id, 'COMPLETED', 'Marked completed.')} className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-v bg-[var(--emerald-soft)] px-2 py-0.5 rounded-full hover:opacity-80 transition-colors disabled:opacity-40">
+                                  <CheckCheck className="w-2.5 h-2.5" /> Complete
+                                </button>
+                              )}
+                              {act.noShow && (
+                                <button type="button" disabled={busy} onClick={() => void setLifecycle(appt.id, 'NO_SHOW', 'Marked no-show.')} className="inline-flex items-center gap-1 text-[10px] font-semibold text-amber-v bg-[var(--amber-soft)] px-2 py-0.5 rounded-full hover:opacity-80 transition-colors disabled:opacity-40">
+                                  <UserX className="w-2.5 h-2.5" /> No-show
+                                </button>
+                              )}
+                              {act.reschedule && (
+                                <button type="button" disabled={busy} onClick={() => { setRescheduleFor(prev => (prev === appt.id ? null : appt.id)); setRescheduleForm({ date: appt.date, time: appt.time }); }} className="inline-flex items-center gap-1 text-[10px] font-semibold text-t2 bg-[var(--s2)] border border-[var(--b1)] px-2 py-0.5 rounded-full hover:bg-[var(--s3)] transition-colors disabled:opacity-40">
+                                  <CalendarClock className="w-2.5 h-2.5" /> {rescheduleFor === appt.id ? 'Close' : 'Reschedule'}
+                                </button>
+                              )}
+                              {act.cancel && (
+                                <button type="button" disabled={busy} onClick={() => void cancelAppointment(appt.id)} className="inline-flex items-center gap-1 text-[10px] font-semibold text-red-v bg-[var(--red-soft)] px-2 py-0.5 rounded-full hover:opacity-80 transition-colors disabled:opacity-40">
+                                  <XCircle className="w-2.5 h-2.5" /> Cancel
+                                </button>
+                              )}
+                              <button type="button" disabled={intakeBusy === appt.id} onClick={() => void sendIntake(appt)} className="inline-flex items-center gap-1 text-[10px] font-semibold text-violet-v bg-[var(--violet-soft)] px-2 py-0.5 rounded-full hover:opacity-80 transition-colors disabled:opacity-40">
+                                <Zap className="w-2.5 h-2.5" /> {intakeBusy === appt.id ? 'Sending…' : 'Send intake'}
+                              </button>
+                              {/* Deposit-evaluate excludes FRONT_DESK by design — hide rather than 403. */}
+                              {!isFrontDesk && (
+                                <button type="button" onClick={() => setPaymentApptId(prev => (prev === appt.id ? null : appt.id))} className="inline-flex items-center gap-1 text-[10px] font-semibold text-t2 bg-[var(--s2)] border border-[var(--b1)] px-2 py-0.5 rounded-full hover:bg-[var(--s3)] transition-colors">
+                                  <CreditCard className="w-2.5 h-2.5" /> {paymentApptId === appt.id ? 'Hide deposit' : 'Deposit'}
+                                </button>
+                              )}
+                            </div>
+                            {rowNotice?.id === appt.id && (
+                              <p className={`mt-1.5 text-[10px] font-semibold ${rowNotice.kind === 'ok' ? 'text-emerald-v' : 'text-red-v'}`}>{rowNotice.text}</p>
+                            )}
+                            {rescheduleFor === appt.id && (
+                              <div className="mt-2 flex items-center gap-1.5 flex-wrap">
+                                <input type="date" aria-label="New date" value={rescheduleForm.date} onChange={e => setRescheduleForm(f => ({ ...f, date: e.target.value }))} className="px-2 py-1 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-[11px] text-t1 outline-none focus:border-[var(--b3)]" />
+                                <input type="time" aria-label="New time" value={rescheduleForm.time} onChange={e => setRescheduleForm(f => ({ ...f, time: e.target.value }))} className="px-2 py-1 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-[11px] text-t1 outline-none focus:border-[var(--b3)]" />
+                                <button type="button" disabled={busy} onClick={() => void submitReschedule(appt.id)} className="px-2.5 py-1 rounded-lg bg-[var(--indigo)] text-white text-[11px] font-semibold hover:opacity-90 disabled:opacity-40">{busy ? 'Saving…' : 'Confirm'}</button>
+                              </div>
+                            )}
+                          </>
+                        );
+                      })()}
+                      {!isFrontDesk && paymentApptId === appt.id && (
                         <div className="mt-2.5 space-y-2.5">
                           <InsuranceIntakeCard appointmentId={appt.id} />
                           <AppointmentPaymentCard appointmentId={appt.id} />
@@ -359,7 +592,7 @@ export default function Scheduling() {
           <PaymentRequestsPanel />
 
           {/* AI Slot-Filling Panel */}
-          <BentoCard title="AI Slot-Filling Engine" subtitle="Optimisation recommendations" headerRight={<Sparkles className="w-4 h-4 text-violet-v" />}>
+          <BentoCard title="AI Slot-Filling Engine" subtitle="Illustrative sample — not live data" headerRight={<Sparkles className="w-4 h-4 text-violet-v" />}>
             <div className="space-y-3">
               {aiRecommendations.map((rec) => (
                 <div key={rec.title} className="p-3.5 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all">
@@ -377,8 +610,8 @@ export default function Scheduling() {
           </BentoCard>
 
           {/* Waitlist */}
-          <BentoCard title="Waitlist Queue" subtitle="Customers ready to book" headerRight={
-            <span className="badge badge-amber">{waitlistSlots.length} waiting</span>
+          <BentoCard title="Waitlist Queue" subtitle="Illustrative sample — not live data" headerRight={
+            <span className="badge badge-amber">Sample</span>
           }>
             <div className="space-y-2.5">
               {waitlistSlots.map((w) => (
@@ -427,11 +660,11 @@ export default function Scheduling() {
             </div>
           </BentoCard>
 
-          {/* Empty slot value */}
+          {/* Empty slot value — illustrative sample, not wired to live utilisation */}
           <div className="rounded-2xl bg-[var(--s2)] border border-[var(--b1)] p-4">
-            <p className="text-[10px] font-bold uppercase tracking-widest text-blue-v mb-1">Empty Slot Value</p>
+            <p className="text-[10px] font-bold uppercase tracking-widest text-blue-v mb-1">Empty Slot Value · Sample</p>
             <p className="text-2xl font-bold text-t1 mb-0.5">{formatCurrency(6200)}</p>
-            <p className="text-xs text-t2 mb-3">31 unfilled slots this week across Westside</p>
+            <p className="text-xs text-t2 mb-3">Illustrative sample — not live data.</p>
             <button type="button" onClick={() => navigate('/campaigner')} className="w-full py-2 rounded-xl bg-[var(--s3)] hover:bg-[var(--b1)] text-t1 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
               <Zap className="w-3.5 h-3.5" /> Activate slot-fill campaign
             </button>

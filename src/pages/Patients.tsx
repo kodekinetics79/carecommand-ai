@@ -11,7 +11,7 @@ import { mapPatient, type ApiPatient } from '../lib/apiAdapters';
 import { apiRequest } from '../lib/api';
 
 interface ApiBranchOption { id: string; name: string }
-const emptyForm = { firstName: '', lastName: '', email: '', phone: '', branchId: '', lifecycleStage: 'NEW' };
+const emptyForm = { firstName: '', lastName: '', email: '', phone: '', dateOfBirth: '', branchId: '', lifecycleStage: 'NEW' };
 
 const lifecycleConfig: Record<string, { label: string; color: string; bg: string }> = {
   new:      { label: 'New',      color: 'text-indigo',    bg: 'badge badge-blue' },
@@ -50,6 +50,7 @@ export default function Patients() {
           lastName: form.lastName.trim(),
           email: form.email.trim() || undefined,
           phone: form.phone.trim() || undefined,
+          dateOfBirth: form.dateOfBirth || undefined,
           lifecycleStage: form.lifecycleStage,
         }),
       });
@@ -116,6 +117,10 @@ export default function Patients() {
               <input value={form.lastName} onChange={e => setForm(f => ({ ...f, lastName: e.target.value }))} placeholder="Last name" className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
               <input value={form.email} onChange={e => setForm(f => ({ ...f, email: e.target.value }))} placeholder="Email" className="col-span-2 px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
               <input value={form.phone} onChange={e => setForm(f => ({ ...f, phone: e.target.value }))} placeholder="Phone" className="col-span-2 px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+              <label className="col-span-2 flex items-center gap-2 text-[11px] text-t3">
+                <span className="shrink-0">Date of birth</span>
+                <input type="date" aria-label="Date of birth" value={form.dateOfBirth} onChange={e => setForm(f => ({ ...f, dateOfBirth: e.target.value }))} className="flex-1 px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+              </label>
               <select aria-label="Branch" title="Branch" value={form.branchId} onChange={e => setForm(f => ({ ...f, branchId: e.target.value }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
                 <option value="">Select branch…</option>
                 {branchOptions.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}

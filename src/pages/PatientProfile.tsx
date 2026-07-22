@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Star, ShieldCheck, MessageSquare, CalendarDays, TrendingUp, AlertCircle, Sparkles, Zap, CheckCircle2, Mail, Phone, Clock } from 'lucide-react';
+import { ArrowLeft, Star, ShieldCheck, MessageSquare, CalendarDays, TrendingUp, AlertCircle, Sparkles, Zap, CheckCircle2, Mail, Phone, Clock, Pencil, ClipboardList } from 'lucide-react';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
 import { formatCurrency, formatDate } from '../utils/formatters';
 import { apiRequest } from '../lib/api';
 import { mapAppointment, mapPatient, mapProviderProfile, type ApiPatient, type ApiProviderProfile } from '../lib/apiAdapters';
+import { intakeApi } from '../lib/intake';
 import { checkEligibility, type EligibilityVerification } from '../lib/revenueProtection';
 import { useApiResource } from '../hooks/useApiResource';
 
@@ -56,6 +57,14 @@ export default function PatientProfile() {
   const [showPolicyForm, setShowPolicyForm] = useState(false);
   const [policySaving, setPolicySaving] = useState(false);
   const [policyForm, setPolicyForm] = useState({ payerId: '', planName: '', memberId: '', groupNumber: '' });
+  // Edit patient record (name / contact / DOB) — PATCH /v1/patients/:id.
+  const [showEdit, setShowEdit] = useState(false);
+  const [editSaving, setEditSaving] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [editForm, setEditForm] = useState({ firstName: '', lastName: '', email: '', phone: '', dateOfBirth: '' });
+  // Originate an intake link for this patient.
+  const [intakeState, setIntakeState] = useState<'idle' | 'saving' | 'saved'>('idle');
+  const [intakeNotice, setIntakeNotice] = useState<string | null>(null);
   const { data: branchOptions } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
   const { data: providerRecords } = useApiResource<ApiProviderProfile, ReturnType<typeof mapProviderProfile>>('/v1/providers/overview?limit=100', [], mapProviderProfile);
   const assignedDoctor = providerRecords.find(d => d.branchId === patient?.branchId);
@@ -68,6 +77,7 @@ export default function PatientProfile() {
       .then(row => {
         if (!active) return;
         setPatient(mapPatient(row));
+        setEditForm({ firstName: row.firstName, lastName: row.lastName, email: row.email ?? '', phone: row.phone ?? '', dateOfBirth: row.dateOfBirth ? row.dateOfBirth.slice(0, 10) : '' });
         setLiveVisitHistory(row.appointments?.map(mapAppointment) ?? []);
         setEligibilityHistory(row.eligibilityVerifications?.map(item => ({
           id: item.id,
@@ -153,6 +163,7 @@ export default function PatientProfile() {
     if (!id) return;
     const row = await apiRequest<ApiPatient>(`/v1/patients/${id}`);
     setPatient(mapPatient(row));
+    setEditForm({ firstName: row.firstName, lastName: row.lastName, email: row.email ?? '', phone: row.phone ?? '', dateOfBirth: row.dateOfBirth ? row.dateOfBirth.slice(0, 10) : '' });
     setLiveVisitHistory(row.appointments?.map(mapAppointment) ?? []);
     setEligibilityHistory(row.eligibilityVerifications?.map(item => ({
       id: item.id,
@@ -187,6 +198,50 @@ export default function PatientProfile() {
       verifiedAt: row.patientInsurancePolicies[0].verifiedAt ?? null,
       verificationStatus: row.patientInsurancePolicies[0].verificationStatus,
     } : null);
+  }
+
+  async function savePatient() {
+    if (!patient) return;
+    if (!editForm.firstName.trim() || !editForm.lastName.trim()) {
+      setEditError('First and last name are required.');
+      return;
+    }
+    setEditSaving(true);
+    setEditError(null);
+    try {
+      await apiRequest(`/v1/patients/${patient.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          firstName: editForm.firstName.trim(),
+          lastName: editForm.lastName.trim(),
+          email: editForm.email.trim() || undefined,
+          phone: editForm.phone.trim() || undefined,
+          dateOfBirth: editForm.dateOfBirth || undefined,
+        }),
+      });
+      setShowEdit(false);
+      await refreshPatient();
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : 'Failed to update record');
+    } finally {
+      setEditSaving(false);
+    }
+  }
+
+  async function sendIntake() {
+    if (!patient) return;
+    setIntakeState('saving');
+    setIntakeNotice(null);
+    try {
+      const packet = await intakeApi.createPacket({ patientId: patient.id, source: 'staff' });
+      const link = packet.publicUrl || (packet.publicToken ? `/intake/${packet.publicToken}` : null);
+      if (link) await navigator.clipboard.writeText(link).catch(() => undefined);
+      setIntakeState('saved');
+      setIntakeNotice(link ? 'Intake link created and copied to clipboard.' : 'Intake packet created.');
+    } catch (err) {
+      setIntakeState('idle');
+      setIntakeNotice(err instanceof Error ? err.message : 'Failed to create intake');
+    }
   }
 
   async function createFollowUpTask() {
@@ -280,7 +335,13 @@ export default function PatientProfile() {
             </div>
           </div>
         </div>
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex items-center gap-2 shrink-0 flex-wrap justify-end">
+          <button type="button" onClick={() => { setEditError(null); setShowEdit(true); }} className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition">
+            <Pencil className="w-3.5 h-3.5" /> Edit record
+          </button>
+          <button type="button" onClick={() => void sendIntake()} className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--violet-soft)] border border-[var(--b2)] px-3 py-2 text-xs font-semibold text-violet-v hover:bg-[var(--s3)] transition">
+            <ClipboardList className="w-3.5 h-3.5" /> {intakeState === 'saving' ? 'Sending…' : intakeState === 'saved' ? 'Intake sent' : 'Send intake'}
+          </button>
           <button type="button" onClick={() => void createFollowUpTask()} className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--indigo-soft)] border border-[var(--b2)] px-3 py-2 text-xs font-semibold text-indigo hover:bg-[var(--s3)] transition">
             <Zap className="w-3.5 h-3.5" /> {taskState === 'saving' ? 'Creating task…' : taskState === 'saved' ? 'Task created' : 'Create follow-up task'}
           </button>
@@ -289,6 +350,31 @@ export default function PatientProfile() {
           </button>
         </div>
       </div>
+
+      {intakeNotice && <p className="text-[11px] font-semibold text-emerald-v -mt-2">{intakeNotice}</p>}
+
+      {showEdit && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setShowEdit(false)}>
+          <div className="w-full max-w-md rounded-2xl bg-[var(--s1)] border border-[var(--b2)] p-5 shadow-xl" onClick={e => e.stopPropagation()}>
+            <p className="text-sm font-bold text-t1 mb-3">Edit Customer Record</p>
+            {editError && <p className="text-[11px] text-red-v mb-2">{editError}</p>}
+            <div className="grid grid-cols-2 gap-2.5">
+              <input value={editForm.firstName} onChange={e => setEditForm(f => ({ ...f, firstName: e.target.value }))} placeholder="First name" className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+              <input value={editForm.lastName} onChange={e => setEditForm(f => ({ ...f, lastName: e.target.value }))} placeholder="Last name" className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+              <input value={editForm.email} onChange={e => setEditForm(f => ({ ...f, email: e.target.value }))} placeholder="Email" className="col-span-2 px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+              <input value={editForm.phone} onChange={e => setEditForm(f => ({ ...f, phone: e.target.value }))} placeholder="Phone" className="col-span-2 px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+              <label className="col-span-2 flex items-center gap-2 text-[11px] text-t3">
+                <span className="shrink-0">Date of birth</span>
+                <input type="date" aria-label="Date of birth" value={editForm.dateOfBirth} onChange={e => setEditForm(f => ({ ...f, dateOfBirth: e.target.value }))} className="flex-1 px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+              </label>
+            </div>
+            <div className="flex gap-2 mt-4">
+              <button type="button" disabled={editSaving} onClick={() => void savePatient()} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition disabled:opacity-40">{editSaving ? 'Saving…' : 'Save changes'}</button>
+              <button type="button" onClick={() => setShowEdit(false)} className="px-4 py-2 rounded-lg border border-[var(--b1)] text-t2 text-xs font-semibold hover:bg-[var(--s3)] transition">Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* KPI strip */}
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">

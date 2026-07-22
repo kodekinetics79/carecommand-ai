@@ -7,6 +7,7 @@ export interface ApiPatient {
   lastName: string;
   email?: string | null;
   phone?: string | null;
+  dateOfBirth?: string | null;
   lifecycleStage: 'NEW' | 'ACTIVE' | 'AT_RISK' | 'INACTIVE' | 'LOST' | 'RETAINED';
   churnRisk: number;
   lifetimeValue: string;
