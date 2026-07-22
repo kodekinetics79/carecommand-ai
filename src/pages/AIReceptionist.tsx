@@ -149,9 +149,9 @@ export default function AIReceptionist() {
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
         <StatCard title="Missed Calls Today" value={String(callConversations.length)} subtitle="Calls needing recovery" icon={<Phone className="w-4 h-4" />} accent="red" />
-        <StatCard title="AI Recovered" value={`${recovered}/${callConversations.length || 1}`} subtitle="Missed-call follow-up" trend={48} icon={<Bot className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Avg Response Time" value={`${avgReplyMinutes ? `${avgReplyMinutes} min` : 'n/a'}`} subtitle="Time to first AI reply" trend={-22} icon={<Clock className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Open Conversations" value={String(unresolved)} subtitle="Needs review or action" trend={31} icon={<Calendar className="w-4 h-4" />} accent="violet" />
+        <StatCard title="AI Recovered" value={`${recovered}/${callConversations.length || 1}`} subtitle="Genuinely-sent recoveries" icon={<Bot className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Avg Response Time" value={`${avgReplyMinutes ? `${avgReplyMinutes} min` : 'n/a'}`} subtitle="Time to first AI reply" icon={<Clock className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Open Conversations" value={String(unresolved)} subtitle="Needs review or action" icon={<Calendar className="w-4 h-4" />} accent="violet" />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_380px]">
@@ -328,8 +328,8 @@ export default function AIReceptionist() {
             </button>
           </BentoCard>
 
-          <BentoCard title="After-Hours Bookings" subtitle="AI automation — this week">
-            <div className="grid grid-cols-7 gap-1 mb-2 items-end">
+          <BentoCard title="After-Hours Bookings" subtitle="Illustrative sample — not live data">
+            <div className="grid grid-cols-7 gap-1 mb-2 items-end opacity-70">
               {['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((day, index) => {
                 const heightClass = ['h-[60%]', 'h-[40%]', 'h-[75%]', 'h-[30%]', 'h-[90%]', 'h-[45%]', 'h-[20%]'][index];
                 const count = [3, 2, 4, 1, 5, 2, 1][index];
@@ -344,7 +344,7 @@ export default function AIReceptionist() {
                 );
               })}
             </div>
-            <p className="text-xs text-t2 text-center">Live AI recovery stream · automatically updates from the DB</p>
+            <p className="text-xs text-t3 text-center">Sample illustration only — an after-hours bookings feed is not wired yet.</p>
           </BentoCard>
         </div>
       </div>

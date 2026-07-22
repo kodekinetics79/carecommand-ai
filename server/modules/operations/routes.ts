@@ -7,6 +7,8 @@ import { assertBranchAccess, branchScope } from '../../lib/scope';
 import { requireRoles } from '../../plugins/roles';
 import { runWithTenantContext } from '../../lib/tenantContext';
 import { requireFeature } from '../../lib/entitlements';
+import { sendMessage, type SendResult } from '../../lib/commsProvider';
+import type { CommChannel } from '../../lib/campaigns';
 
 const channel = z.enum(['WHATSAPP', 'SMS', 'EMAIL', 'PUSH', 'CALL', 'VIDEO']);
 const uuid = z.string().uuid();
@@ -200,6 +202,40 @@ const integrationCatalog: IntegrationCatalogEntry[] = [
 
 function scopedBranch(request: FastifyRequest, branchId?: string) {
   return request.auth.branchId ?? branchId;
+}
+
+// Map a conversation channel + patient contact to a real outbound send target.
+// Returns null when no concrete sender/destination exists (PUSH/VIDEO, or a
+// missing phone/email) — the caller then records the reply truthfully as
+// undelivered instead of claiming an AI recovery.
+function resolveReplyTarget(
+  channel: string,
+  patient: { phone: string | null; email: string | null } | null,
+): { channel: CommChannel; destination: string } | null {
+  const phone = patient?.phone?.trim() || '';
+  const email = patient?.email?.trim() || '';
+  switch (channel) {
+    case 'SMS':
+    case 'CALL': // missed-call recovery is delivered as an SMS follow-up
+      return phone ? { channel: 'sms', destination: phone } : null;
+    case 'WHATSAPP':
+      return phone ? { channel: 'whatsapp', destination: phone } : null;
+    case 'EMAIL':
+      return email ? { channel: 'email', destination: email } : null;
+    default: // PUSH / VIDEO — no concrete outbound sender wired
+      return null;
+  }
+}
+
+function deliveryMessage(delivered: boolean, deliveryStatus: string): string {
+  if (delivered) return 'Reply delivered to the patient.';
+  switch (deliveryStatus) {
+    case 'suppressed': return 'Not sent: recipient has opted out / is suppressed. Nothing was delivered.';
+    case 'setup_required': return 'Not sent: this channel has no messaging provider configured yet.';
+    case 'no_contact': return 'Not sent: no reachable phone/email on file for this channel.';
+    case 'pending': return 'Queued: provider accepted but delivery is not yet confirmed.';
+    default: return 'Not sent: delivery failed. Nothing was delivered to the patient.';
+  }
 }
 
 function isEnvSet(name: string) {
@@ -717,31 +753,81 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     });
   });
 
+  // HONEST outbound reply. Previously this fabricated an "AI recovery": it wrote
+  // lastAgentMessage + aiHandled:true and set status 'ai-recovered' while sending
+  // NOTHING to the patient. Now the reply is actually delivered through the
+  // governed comms provider (consent/suppression gate + E.164/email validation),
+  // and ONLY a genuinely-sent message may mark the conversation aiHandled /
+  // recovered — the metric that keys off those fields therefore counts real sends.
+  const replyResponseInclude = {
+    branch: { select: { name: true } },
+    patient: { select: { firstName: true, lastName: true } },
+  } as const;
+
   app.post('/conversations/:id/reply', { preHandler: writeRoles }, async (request, reply) => {
     const params = z.object({ id: uuid }).parse(request.params);
     const body = z.object({
       message: z.string().min(1).max(2000),
       status: z.enum(['replied', 'ai-recovered', 'escalated', 'pending']).default('replied'),
     }).parse(request.body);
-    const row = await db.conversation.findFirst({ where: { id: params.id, tenantId: request.auth.tenantId } });
+    const row = await db.conversation.findFirst({
+      where: { id: params.id, tenantId: request.auth.tenantId },
+      include: { patient: { select: { id: true, phone: true, email: true } } },
+    });
     if (!row) throw request.server.httpErrors.notFound('Conversation not found');
     if (row.branchId) assertBranchAccess(request, row.branchId);
+
+    // Escalation is an internal hand-off to a human — never an outbound patient
+    // message, so it must not send and must not inflate AI-recovery metrics.
+    if (body.status === 'escalated') {
+      const escalated = await db.conversation.update({
+        where: { id: row.id },
+        data: { status: 'escalated' },
+        include: replyResponseInclude,
+      });
+      await audit(request, { action: 'conversation.escalated', resource: 'conversation', resourceId: row.id });
+      return reply.send({ conversation: escalated, delivered: false, deliveryStatus: 'escalated', providerMode: null, message: 'Escalated to a human. No patient message was sent.' });
+    }
+
+    const target = resolveReplyTarget(row.channel, row.patient);
+    let send: SendResult | null = null;
+    if (target) {
+      send = await sendMessage(
+        target.channel,
+        target.destination,
+        'Reply from your care team',
+        body.message,
+        `conv-reply-${row.id}-${Date.now()}`,
+        { tenantId: request.auth.tenantId, patientId: row.patientId ?? undefined },
+      );
+    }
+
+    const delivered = Boolean(send?.ok && send.status === 'sent');
+    const deliveryStatus = target ? (send?.status ?? 'failed') : 'no_contact';
+
+    // Only a real, delivered send records an AI reply / recovery. An undelivered
+    // draft (suppressed, unconfigured provider, no contact, or failure) records
+    // nothing that would imply outreach happened.
     const updated = await db.conversation.update({
       where: { id: row.id },
-      data: {
-        latestMessage: row.latestMessage,
-        lastAgentMessage: body.message,
-        lastAgentMessageAt: new Date(),
-        status: body.status,
-        aiHandled: true,
-      },
-      include: {
-        branch: { select: { name: true } },
-        patient: { select: { firstName: true, lastName: true } },
-      },
+      data: delivered
+        ? { lastAgentMessage: body.message, lastAgentMessageAt: new Date(), status: body.status, aiHandled: true }
+        : {},
+      include: replyResponseInclude,
     });
-    await audit(request, { action: 'conversation.replied', resource: 'conversation', resourceId: row.id });
-    return reply.send(updated);
+    await audit(request, {
+      action: delivered ? 'conversation.replied' : 'conversation.replyNotDelivered',
+      resource: 'conversation',
+      resourceId: row.id,
+      metadata: { delivered, deliveryStatus, channel: target?.channel ?? null, providerMode: send?.mode ?? null },
+    });
+    return reply.send({
+      conversation: updated,
+      delivered,
+      deliveryStatus,
+      providerMode: send?.mode ?? null,
+      message: deliveryMessage(delivered, deliveryStatus),
+    });
   });
 
   // ===== AI-ready operational briefing (RULE-BASED — no LLM) ===============
