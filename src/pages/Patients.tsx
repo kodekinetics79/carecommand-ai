@@ -7,10 +7,25 @@ import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
 import { formatCurrency } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
+import { useApiData } from '../hooks/useApiData';
 import { mapPatient, type ApiPatient } from '../lib/apiAdapters';
 import { apiRequest } from '../lib/api';
 
 interface ApiBranchOption { id: string; name: string }
+interface PatientSummary {
+  scope: 'tenant' | 'assigned_branch';
+  asOf: string;
+  patientCount: number;
+  activeRetainedCount: number;
+  highRiskCount: number;
+  highLifetimeValueCount: number;
+  averageLifetimeValue: number;
+  outstandingBalance: number;
+  lifecycleCounts: Record<string, number>;
+  branchCounts: Record<string, number>;
+  activeConsentCounts: Record<string, number>;
+  marketingConsentRate: number | null;
+}
 const emptyForm = { firstName: '', lastName: '', email: '', phone: '', dateOfBirth: '', branchId: '', lifecycleStage: 'NEW' };
 
 const lifecycleConfig: Record<string, { label: string; color: string; bg: string }> = {
@@ -25,7 +40,8 @@ export default function Patients() {
   const navigate = useNavigate();
   const [query, setQuery] = useState('');
   const [activeLifecycle, setActiveLifecycle] = useState<string>('all');
-  const { data: customerRecords, source, error, reload } = useApiResource<ApiPatient, ReturnType<typeof mapPatient>>('/v1/patients?limit=100', [], mapPatient);
+  const { data: customerRecords, error, reload } = useApiResource<ApiPatient, ReturnType<typeof mapPatient>>('/v1/patients?limit=100', [], mapPatient);
+  const { data: summary, error: summaryError, reload: reloadSummary } = useApiData<PatientSummary | null>('/v1/patients/summary', null);
   const { data: branchOptions } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], b => b);
   const [showAddForm, setShowAddForm] = useState(false);
   const [form, setForm] = useState(emptyForm);
@@ -57,6 +73,7 @@ export default function Patients() {
       setForm(emptyForm);
       setShowAddForm(false);
       reload();
+      void reloadSummary();
     } catch (err) {
       setFormError(err instanceof Error ? err.message : 'Failed to add customer');
     } finally {
@@ -64,24 +81,16 @@ export default function Patients() {
     }
   }
 
-  const familyCount = customerRecords.filter(p => p.familyAccountId).length;
-  const highRisk = customerRecords.filter(p => p.churnRisk >= 60).length;
-  const activeCount = customerRecords.filter(p => p.lifecycleStage === 'active' || p.lifecycleStage === 'retained').length;
-  const avgLTV = customerRecords.length > 0 ? Math.round(customerRecords.reduce((sum, patient) => sum + patient.lifetimeValue, 0) / customerRecords.length) : 0;
-  const marketingConsented = customerRecords.filter(patient => patient.consentStatus.marketing).length;
-  const marketingConsentRate = customerRecords.length > 0 ? Math.round((marketingConsented / customerRecords.length) * 100) : 0;
-  const preferredChannelCounts = customerRecords.reduce<Record<string, number>>((counts, patient) => {
-    const channel = patient.preferredChannel || 'unknown';
-    counts[channel] = (counts[channel] ?? 0) + 1;
-    return counts;
-  }, {});
-  const preferredChannel = Object.entries(preferredChannelCounts).sort((a, b) => b[1] - a[1])[0]?.[0] ?? 'No data';
+  const highRisk = summary?.highRiskCount;
+  const consentChannels = Object.entries(summary?.activeConsentCounts ?? {})
+    .filter(([channel]) => channel === 'WHATSAPP' || channel === 'SMS' || channel === 'EMAIL')
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const mostConsentedChannel = consentChannels[0]?.[1] ? consentChannels[0][0] : null;
   const segments = [
-    { label: 'High LTV (>$4,000)', count: customerRecords.filter(p => p.lifetimeValue > 4000).length, color: 'emerald' as const },
-    { label: 'At-risk churn', count: customerRecords.filter(p => p.churnRisk >= 60).length, color: 'red' as const },
-    { label: 'Inactive (90d+)', count: customerRecords.filter(p => p.lifecycleStage === 'inactive').length, color: 'amber' as const },
-    { label: 'Marketing consented', count: customerRecords.filter(p => p.consentStatus.marketing).length, color: 'blue' as const },
-    { label: 'Family accounts', count: familyCount, color: 'violet' as const },
+    { label: 'High LTV (>$4,000)', count: summary?.highLifetimeValueCount ?? null, color: 'emerald' as const },
+    { label: 'At-risk churn', count: summary?.highRiskCount ?? null, color: 'red' as const },
+    { label: 'Inactive lifecycle', count: summary?.lifecycleCounts.INACTIVE ?? null, color: 'amber' as const },
+    { label: 'Marketing consented', count: summary?.activeConsentCounts.MARKETING ?? null, color: 'blue' as const },
   ];
 
   const filtered = useMemo(() => {
@@ -100,7 +109,7 @@ export default function Patients() {
       <PageHeader
         title="Customer360"
         subtitle="Customer intelligence, lifecycle insights, consent-aware outreach, and LTV management."
-        badge={loadError ? 'Live Data Error' : `${highRisk} At Risk · ${source === 'live' ? 'Live DB' : 'Loading'}`}
+        badge={loadError || summaryError ? 'Live Data Error' : summary ? `${summary.highRiskCount} At Risk · Live DB` : 'Loading live facts'}
         badgeColor="red"
         actions={
           <button type="button" onClick={() => setShowAddForm(true)} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
@@ -109,9 +118,9 @@ export default function Patients() {
         }
       />
 
-      {loadError && (
+      {(loadError || summaryError) && (
         <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          Customer data could not be loaded from the live API: {loadError}
+          Customer data could not be loaded from the live API: {loadError || summaryError}
         </div>
       )}
 
@@ -146,17 +155,17 @@ export default function Patients() {
       )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Total Customers" value={customerRecords.length} subtitle="All branches" icon={<Users className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Active & Retained" value={activeCount} subtitle="Engaged lifecycle" trend={4} icon={<Heart className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="At-Risk Churn" value={highRisk} subtitle="Score ≥60%" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
-        <StatCard title="Avg Lifetime Value" value={formatCurrency(avgLTV)} subtitle="Per customer" trend={6} icon={<TrendingUp className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Total Customers" value={summary?.patientCount ?? '—'} subtitle={summary?.scope === 'assigned_branch' ? 'Assigned branch' : 'All accessible branches'} icon={<Users className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Active & Retained" value={summary?.activeRetainedCount ?? '—'} subtitle="Current lifecycle facts" icon={<Heart className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="At-Risk Churn" value={highRisk ?? '—'} subtitle="Stored score ≥60%" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
+        <StatCard title="Avg Lifetime Value" value={summary ? formatCurrency(summary.averageLifetimeValue) : '—'} subtitle="All scoped customers" icon={<TrendingUp className="w-4 h-4" />} accent="violet" />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_340px]">
         {/* Main customer list */}
         <div className="space-y-4">
           {/* Search & filter */}
-          <BentoCard title="Customer Records" subtitle="Search and filter all customers">
+          <BentoCard title="Customer Records" subtitle={`Loaded records: ${customerRecords.length}${summary && summary.patientCount > customerRecords.length ? ` of ${summary.patientCount} (first page)` : ''}`}>
             {/* Lifecycle filter */}
             <div className="flex items-center gap-2 flex-wrap mb-4">
               {['all', 'new', 'active', 'retained', 'at-risk', 'inactive'].map((lc) => (
@@ -216,7 +225,7 @@ export default function Patients() {
                         <p className="text-sm font-bold text-t1 truncate">{patient.name}</p>
                         {patient.familyAccountId && <span className="badge badge-violet shrink-0">Family</span>}
                       </div>
-                      <p className="text-[11px] text-t3 truncate">{patient.preferredChannel.toUpperCase()} · {patient.visitCount} visits · LTV {formatCurrency(patient.lifetimeValue)}</p>
+                      <p className="text-[11px] text-t3 truncate">{patient.visitCount} recorded visits · LTV {formatCurrency(patient.lifetimeValue)}</p>
                     </div>
                     <div className="flex flex-col items-end gap-1.5 shrink-0">
                       <span className={lc?.bg}>{lc?.label}</span>
@@ -237,13 +246,13 @@ export default function Patients() {
 
         <div className="space-y-4">
           {/* Quick metrics */}
-          <BentoCard title="Customer Intelligence" subtitle="Network-wide signals">
+          <BentoCard title="Customer Intelligence" subtitle={summary?.scope === 'assigned_branch' ? 'Assigned-branch aggregate facts' : 'Tenant aggregate facts'}>
             <div className="space-y-3">
               {[
-                { label: 'Preferred channel', value: preferredChannel === 'No data' ? preferredChannel : preferredChannel.toUpperCase(), icon: <ShieldCheck className="w-3.5 h-3.5 text-emerald-v" /> },
-                { label: 'Marketing consent rate', value: `${marketingConsentRate}%`, icon: <ShieldCheck className="w-3.5 h-3.5 text-emerald-v" /> },
-                { label: 'Follow-up opportunities', value: `${highRisk} customers`, icon: <Sparkles className="w-3.5 h-3.5 text-violet-v" /> },
-                { label: 'Outstanding balances', value: formatCurrency(customerRecords.reduce((s, p) => s + p.outstandingBalance, 0)), icon: <AlertCircle className="w-3.5 h-3.5 text-amber-v" /> },
+                { label: 'Most consented channel', value: mostConsentedChannel ?? 'None recorded', icon: <ShieldCheck className="w-3.5 h-3.5 text-emerald-v" /> },
+                { label: 'Marketing consent rate', value: summary?.marketingConsentRate === null || !summary ? 'No denominator' : `${summary.marketingConsentRate}%`, icon: <ShieldCheck className="w-3.5 h-3.5 text-emerald-v" /> },
+                { label: 'Risk review queue', value: summary ? `${summary.highRiskCount} customers` : 'Unavailable', icon: <Sparkles className="w-3.5 h-3.5 text-violet-v" /> },
+                { label: 'Outstanding balances', value: summary ? formatCurrency(summary.outstandingBalance) : 'Unavailable', icon: <AlertCircle className="w-3.5 h-3.5 text-amber-v" /> },
               ].map((item) => (
                 <div key={item.label} className="flex items-center justify-between gap-3 p-2.5 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors">
                   <div className="flex items-center gap-2">
@@ -263,9 +272,9 @@ export default function Patients() {
                 <div key={seg.label} className="flex items-center justify-between gap-3 p-3 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-all">
                   <div className="flex-1">
                     <p className="text-xs font-semibold text-t1 mb-1">{seg.label}</p>
-                    <ProgressBar value={seg.count} max={customerRecords.length} color={seg.color} size="xs" />
+                    <ProgressBar value={seg.count ?? 0} max={summary?.patientCount || 1} color={seg.color} size="xs" />
                   </div>
-                  <span className="text-xs font-bold text-t2 shrink-0">{seg.count}</span>
+                  <span className="text-xs font-bold text-t2 shrink-0">{seg.count ?? '—'}</span>
                 </div>
               ))}
             </div>
@@ -280,7 +289,7 @@ export default function Patients() {
                     <p className="text-xs font-bold text-t1">{branch.name}</p>
                   </div>
                   <span className="text-xs font-bold text-t2">
-                    {customerRecords.filter(patient => patient.branchId === branch.id).length}
+                    {summary ? (summary.branchCounts[branch.id] ?? 0) : '—'}
                   </span>
                 </div>
               ))}
@@ -293,8 +302,8 @@ export default function Patients() {
               <Sparkles className="w-4 h-4 text-violet-v" />
               <p className="text-[10px] font-bold uppercase tracking-widest text-violet-v">Outreach Recommendation</p>
             </div>
-            <p className="text-sm font-bold text-t1 mb-1">{highRisk} customers need follow-up review</p>
-            <p className="text-xs text-t2 mb-3">This queue is calculated from the current customer risk scores. Campaign consent is rechecked before any outreach.</p>
+            <p className="text-sm font-bold text-t1 mb-1">{summary ? `${summary.highRiskCount} customers need risk review` : 'Risk queue unavailable'}</p>
+            <p className="text-xs text-t2 mb-3">This count uses stored risk scores across the displayed tenant or branch scope. It is a review queue, not an automated outreach decision; consent must be rechecked before contact.</p>
             <button type="button" onClick={() => navigate('/campaigner')} className="w-full py-2 rounded-xl bg-[var(--violet-soft)] hover:bg-[var(--s3)] text-violet-v text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
               <ArrowRight className="w-3.5 h-3.5" /> Launch outreach campaign
             </button>

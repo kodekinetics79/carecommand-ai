@@ -17,6 +17,7 @@ export interface ApiPatient {
   nextVisitAt?: string | null;
   appointments?: ApiAppointment[];
   consentEvents?: Array<{ purpose: 'SMS' | 'WHATSAPP' | 'EMAIL' | 'MARKETING'; granted: boolean }>;
+  _count?: { appointments?: number };
   patientInsurancePolicies?: Array<{
     id: string;
     payerId?: string | null;
@@ -272,26 +273,26 @@ export function mapPatient(row: ApiPatient): Patient {
   return {
     id: row.id,
     name: `${row.firstName} ${row.lastName}`,
-    age: 0,
-    gender: 'female',
+    age: row.dateOfBirth ? Math.max(0, Math.floor((Date.now() - new Date(row.dateOfBirth).getTime()) / 31_556_952_000)) : null,
+    gender: null,
     branchId: row.branchId,
-    assignedDoctorId: '',
-    lastVisit: row.lastVisitAt ?? new Date().toISOString(),
+    assignedDoctorId: null,
+    lastVisit: row.lastVisitAt ?? null,
     nextVisit: row.nextVisitAt ?? undefined,
     lifecycleStage: lifecycleMap[row.lifecycleStage],
     churnRisk: row.churnRisk,
     lifetimeValue: Number(row.lifetimeValue),
-    preferredChannel: latestConsent.get('WHATSAPP') ? 'whatsapp' : latestConsent.get('SMS') ? 'sms' : 'email',
+    preferredChannel: latestConsent.get('WHATSAPP') ? 'whatsapp' : latestConsent.get('SMS') ? 'sms' : latestConsent.get('EMAIL') ? 'email' : null,
     consentStatus: {
       sms: latestConsent.get('SMS') ?? false,
       whatsapp: latestConsent.get('WHATSAPP') ?? false,
-      email: latestConsent.get('EMAIL') ?? Boolean(row.email),
+      email: latestConsent.get('EMAIL') ?? false,
       marketing: latestConsent.get('MARKETING') ?? false,
     },
     tags: row.tags,
     phone: row.phone ?? '',
     email: row.email ?? '',
-    visitCount: row.appointments?.length ?? 0,
+    visitCount: row._count?.appointments ?? row.appointments?.length ?? 0,
     outstandingBalance: Number(row.outstandingBalance),
   };
 }

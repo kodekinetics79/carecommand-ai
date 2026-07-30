@@ -40,16 +40,16 @@ export interface Doctor {
 export interface Patient {
   id: string;
   name: string;
-  age: number;
-  gender: 'male' | 'female';
+  age: number | null;
+  gender: 'male' | 'female' | null;
   branchId: string;
-  assignedDoctorId: string;
-  lastVisit: string; // ISO date
+  assignedDoctorId: string | null;
+  lastVisit: string | null; // ISO date when known
   nextVisit?: string;
   lifecycleStage: LifecycleStage;
   churnRisk: number; // 0-100
   lifetimeValue: number;
-  preferredChannel: Channel;
+  preferredChannel: Channel | null;
   consentStatus: {
     sms: boolean;
     whatsapp: boolean;

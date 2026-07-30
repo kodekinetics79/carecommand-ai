@@ -318,7 +318,7 @@ export default function PatientProfile() {
                 <span className={lc?.bg}>{lc?.label}</span>
                 {patient.familyAccountId && <span className="badge badge-violet">Family Account</span>}
               </div>
-              <p className="text-xs text-t3 mt-0.5">Age {patient.age} · {patient.gender} · {branch?.name ?? 'Live branch'}</p>
+              <p className="text-xs text-t3 mt-0.5">{patient.age === null ? 'Date of birth not recorded' : `Age ${patient.age}`} · {branch?.name ?? 'Assigned branch'}</p>
             </div>
           </div>
         </div>
@@ -384,7 +384,7 @@ export default function PatientProfile() {
         </div>
         <div className="p-4 rounded-2xl border border-[var(--b1)] bg-[var(--s2)]">
           <p className="text-[10px] font-bold uppercase tracking-widest text-t3 mb-1">Last Visit</p>
-          <p className="text-base font-bold text-t1">{formatDate(patient.lastVisit)}</p>
+          <p className="text-base font-bold text-t1">{patient.lastVisit ? formatDate(patient.lastVisit) : 'No completed visit recorded'}</p>
           {patient.nextVisit && <p className="text-[10px] text-emerald-v font-semibold">Next: {formatDate(patient.nextVisit)}</p>}
         </div>
       </div>
@@ -429,7 +429,7 @@ export default function PatientProfile() {
               {[
                 { label: 'Branch', value: branch?.name ?? '—' },
                 { label: 'Assigned Provider', value: assignedDoctor?.name ?? '—' },
-                { label: 'Preferred Channel', value: patient.preferredChannel.toUpperCase() },
+                { label: 'Consented Channel', value: patient.preferredChannel?.toUpperCase() ?? 'None recorded' },
                 { label: 'Total Visits', value: `${patient.visitCount} visits` },
               ].map((item) => (
                 <div key={item.label} className="flex items-center justify-between gap-3 py-2 border-b border-[var(--b1)] last:border-0">
