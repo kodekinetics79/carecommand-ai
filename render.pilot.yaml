@@ -58,8 +58,6 @@ services:
         sync: false
       - key: RETELL_API_KEY
         sync: false
-      - key: RETELL_AGENT_ID
-        sync: false
       - key: RETELL_FROM_NUMBER
         sync: false
       - key: CAMPAIGN_WEBHOOK_SECRET
@@ -121,8 +119,6 @@ services:
       - key: STEDI_API_KEY
         sync: false
       - key: RETELL_API_KEY
-        sync: false
-      - key: RETELL_AGENT_ID
         sync: false
       - key: RETELL_FROM_NUMBER
         sync: false

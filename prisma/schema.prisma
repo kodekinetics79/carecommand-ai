@@ -1360,6 +1360,18 @@ enum ReceptionistCampaignStatus {
   ARCHIVED
 }
 
+enum ReceptionistAgentProviderStatus {
+  UNVERIFIED
+  VERIFIED
+  INVALID
+}
+
+enum ReceptionistAgentProbeStatus {
+  NEVER
+  SUCCEEDED
+  FAILED
+}
+
 enum ReceptionistCallOutcome {
   IN_PROGRESS
   BOOKED
@@ -1469,24 +1481,52 @@ model ReceptionistLocation {
 }
 
 model ReceptionistAgent {
-  id                String                         @id @default(uuid()) @db.Uuid
-  tenantId          String                         @db.Uuid
-  clinicId          String                         @db.Uuid
-  name              String
-  voice             String                         @default("11labs-Adrian")
-  tone              String                         @default("Warm and professional")
-  language          String                         @default("en-US")
-  persona           String?
-  greetingOverride  String?
-  active            Boolean                        @default(true)
-  createdAt         DateTime                       @default(now())
-  updatedAt         DateTime                       @updatedAt
-  tenant            Tenant                         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  clinic            ReceptionistClinic             @relation(fields: [clinicId], references: [id], onDelete: Cascade)
-  campaigns         ReceptionistCampaign[]
-  outboundCampaigns ReceptionistOutboundCampaign[]
+  id                            String                          @id @default(uuid()) @db.Uuid
+  tenantId                      String                          @db.Uuid
+  clinicId                      String                          @db.Uuid
+  name                          String
+  // Local prompt-preview metadata. Production calls use the immutable,
+  // provider-verified snapshot below and never silently override it.
+  voice                         String                          @default("11labs-Adrian")
+  tone                          String                          @default("Warm and professional")
+  language                      String                          @default("en-US")
+  persona                       String?
+  greetingOverride              String?
+  active                        Boolean                         @default(true)
+  providerAgentId               String?
+  providerVersionTag            String                          @default("prod")
+  providerVersion               Int?
+  providerStatus                ReceptionistAgentProviderStatus @default(UNVERIFIED)
+  providerPublished             Boolean?
+  providerAssignedTags          String[]                    @default([])
+  providerVoiceId               String?
+  providerLanguage              String?
+  providerWebhookUrl            String?
+  providerWebhookEvents         String[]                    @default([])
+  providerDataStorageSetting    String?
+  providerSignedUrl             Boolean?
+  providerResponseEngineType    String?
+  providerResponseEngineId      String?
+  providerResponseEngineVersion Int?
+  providerLastModifiedAt        DateTime?
+  providerFingerprint           String?
+  providerConfigRevision        Int                             @default(1)
+  providerVerifiedRevision      Int?
+  providerVerifiedAt            DateTime?
+  providerVerificationExpiresAt DateTime?
+  providerLastAttemptAt         DateTime?
+  providerLastAttemptStatus     ReceptionistAgentProbeStatus    @default(NEVER)
+  providerLastErrorCode         String?
+  createdAt                     DateTime                         @default(now())
+  updatedAt                     DateTime                         @updatedAt
+  tenant                        Tenant                           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clinic                        ReceptionistClinic               @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  campaigns                     ReceptionistCampaign[]
+  outboundCampaigns             ReceptionistOutboundCampaign[]
 
   @@index([tenantId, clinicId, active])
+  @@index([providerAgentId, providerVersion], map: "ReceptionistAgent_provider_deployment_idx")
+  @@unique([tenantId, clinicId, id])
 }
 
 model ReceptionistCampaign {
@@ -1509,7 +1549,7 @@ model ReceptionistCampaign {
   updatedAt           DateTime                         @updatedAt
   tenant              Tenant                           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   clinic              ReceptionistClinic               @relation(fields: [clinicId], references: [id], onDelete: Cascade)
-  agent               ReceptionistAgent?               @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  agent               ReceptionistAgent?               @relation(fields: [tenantId, clinicId, agentId], references: [tenantId, clinicId, id], onDelete: Restrict, map: "ReceptionistCampaign_agent_scope_fkey")
   intakeFields        ReceptionistIntakeField[]
   appointmentRequests ReceptionistAppointmentRequest[]
   callLogs            ReceptionistCallLog[]
@@ -2235,7 +2275,7 @@ model ReceptionistOutboundCampaign {
   updatedAt               DateTime                 @updatedAt
   tenant                  Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   clinic                  ReceptionistClinic       @relation(fields: [clinicId], references: [id], onDelete: Cascade)
-  agent                   ReceptionistAgent?       @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  agent                   ReceptionistAgent?       @relation(fields: [tenantId, clinicId, agentId], references: [tenantId, clinicId, id], onDelete: Restrict, map: "ReceptionistOutboundCampaign_agent_scope_fkey")
   targets                 ReceptionistCallTarget[]
   callLogs                ReceptionistCallLog[]
 

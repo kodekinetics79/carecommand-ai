@@ -27,7 +27,15 @@ import { resolveIngressTenant } from '../../lib/tenantIngressResolvers';
 import { isFeatureEnabled } from '../../lib/entitlements';
 import { platformDb } from '../../lib/platformDb';
 import { MAX_TENANT_ACTIVE_CALLS, DEFAULT_VOICE_MINUTES_LIMIT } from './outbound';
-import { stopPhoneCall } from '../../lib/retell';
+import {
+  evaluateRetellAgentReadiness,
+  isValidRetellVersionTag,
+  probeRetellAgent,
+  RETELL_AGENT_VERIFICATION_TTL_MS,
+  stopPhoneCall,
+  type RetellAgentSnapshot,
+} from '../../lib/retell';
+import { agentReadinessReason } from '../../lib/receptionist/agentReadiness';
 import { validateIanaTimezone } from '../../lib/scheduling';
 import { Prisma } from '../../generated/prisma/client';
 import {
@@ -63,6 +71,73 @@ const workingHoursInput = z.object({
   wednesday: hoursWindow.optional(), thursday: hoursWindow.optional(), friday: hoursWindow.optional(),
   saturday: hoursWindow.optional(),
 }).strict();
+const providerAgentIdInput = z.string().trim().regex(/^[A-Za-z0-9_-]{1,128}$/).optional().nullable();
+const providerVersionTagInput = z.string().trim().refine(isValidRetellVersionTag, {
+  message: 'Deployment tag must start lowercase, use at most 20 lowercase letters, digits, hyphens or underscores, and cannot be latest or v<number>.',
+}).optional();
+
+function expectedRetellAgentWebhookUrl() {
+  return `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`;
+}
+
+function providerSnapshotData(snapshot: RetellAgentSnapshot) {
+  return {
+    providerVersion: snapshot.version,
+    providerPublished: snapshot.published,
+    providerAssignedTags: snapshot.assignedTags,
+    providerVoiceId: snapshot.voiceId,
+    providerLanguage: snapshot.language,
+    providerWebhookUrl: snapshot.webhookUrl,
+    providerWebhookEvents: snapshot.webhookEvents,
+    providerDataStorageSetting: snapshot.dataStorageSetting,
+    providerSignedUrl: snapshot.signedUrl,
+    providerResponseEngineType: snapshot.responseEngineType,
+    providerResponseEngineId: snapshot.responseEngineId,
+    providerResponseEngineVersion: snapshot.responseEngineVersion,
+    providerLastModifiedAt: snapshot.lastModifiedAt,
+    providerFingerprint: snapshot.fingerprint,
+  };
+}
+
+async function assertCampaignAgent(
+  tx: Prisma.TransactionClient,
+  input: { tenantId: string; clinicId: string; agentId: string | null | undefined; requireReady: boolean },
+) {
+  if (!input.agentId) {
+    if (input.requireReady) throw new Error('agent_unlinked');
+    return null;
+  }
+  const agent = await tx.receptionistAgent.findFirst({
+    where: { id: input.agentId, tenantId: input.tenantId, clinicId: input.clinicId },
+  });
+  if (!agent) throw new Error('agent_scope_mismatch');
+  if (!agent.active) throw new Error('agent_inactive');
+  if (input.requireReady) {
+    const reason = agentReadinessReason(agent);
+    if (reason) throw new Error(reason);
+  }
+  return agent;
+}
+
+async function assertCampaignLocations(
+  tx: Prisma.TransactionClient,
+  input: { tenantId: string; clinicId: string; locationIds: string[] },
+) {
+  const uniqueIds = [...new Set(input.locationIds)];
+  if (uniqueIds.length !== input.locationIds.length) throw new Error('location_scope_mismatch');
+  if (!uniqueIds.length) return;
+  const count = await tx.receptionistLocation.count({
+    where: { id: { in: uniqueIds }, tenantId: input.tenantId, clinicId: input.clinicId, active: true, branchId: { not: null } },
+  });
+  if (count !== uniqueIds.length) throw new Error('location_scope_mismatch');
+}
+
+function campaignAssignmentError(error: unknown) {
+  const code = error instanceof Error ? error.message : '';
+  return ['agent_unlinked', 'agent_scope_mismatch', 'agent_inactive', 'agent_unverified', 'agent_configuration_changed', 'agent_verification_stale', 'location_scope_mismatch'].includes(code)
+    ? code
+    : null;
+}
 
 function isReceptionistDestinationConflict(error: unknown) {
   return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
@@ -441,6 +516,8 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
     language: z.string().trim().max(20).optional(),
     persona: z.string().trim().max(600).optional().nullable(),
     greetingOverride: z.string().trim().max(600).optional().nullable(),
+    providerAgentId: providerAgentIdInput,
+    providerVersionTag: providerVersionTagInput,
     active: z.boolean().optional(),
   });
   const agentUpdate = agentCreate.partial().omit({ clinicId: true });
@@ -455,29 +532,183 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
 
   app.post('/agents', { preHandler: writeRoles }, async (request, reply) => {
     const input = agentCreate.parse(request.body);
-    const clinic = await db.receptionistClinic.findFirst({ where: { id: input.clinicId, tenantId: request.auth.tenantId } });
-    if (!clinic) throw app.httpErrors.notFound('Clinic not found');
-    const row = await db.receptionistAgent.create({ data: { tenantId: request.auth.tenantId, ...input } });
-    await audit(request, { action: 'receptionistAgent.created', resource: 'receptionistAgent', resourceId: row.id });
+    const row = await runWithTenantContext(request.auth.tenantId, async tx => {
+      await lockReceptionistConfiguration(tx, request.auth.tenantId);
+      const clinic = await tx.receptionistClinic.findFirst({ where: { id: input.clinicId, tenantId: request.auth.tenantId, active: true }, select: { id: true } });
+      if (!clinic) throw app.httpErrors.badRequest('An active tenant-owned clinic is required.');
+      const duplicate = await tx.receptionistAgent.findFirst({
+        where: { tenantId: request.auth.tenantId, clinicId: input.clinicId, name: { equals: input.name, mode: 'insensitive' } },
+        select: { id: true },
+      });
+      if (duplicate) throw app.httpErrors.conflict('An agent with this name already exists for the clinic.');
+      const created = await tx.receptionistAgent.create({ data: { tenantId: request.auth.tenantId, ...input } });
+      await auditReceptionistMutation(tx, request, {
+        action: 'receptionistAgent.created', resource: 'receptionistAgent', resourceId: created.id,
+        metadata: { clinicId: created.clinicId, providerLinked: Boolean(created.providerAgentId), providerStatus: created.providerStatus },
+      });
+      return created;
+    });
     return reply.code(201).send(row);
   });
 
   app.patch('/agents/:id', { preHandler: writeRoles }, async request => {
     const { id } = idParam.parse(request.params);
     const input = agentUpdate.parse(request.body);
-    const existing = await db.receptionistAgent.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Agent not found');
-    const row = await db.receptionistAgent.update({ where: { id }, data: input });
-    await audit(request, { action: 'receptionistAgent.updated', resource: 'receptionistAgent', resourceId: id });
-    return row;
+    try {
+      return await runWithTenantContext(request.auth.tenantId, async tx => {
+      await lockReceptionistConfiguration(tx, request.auth.tenantId);
+      const existing = await tx.receptionistAgent.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+      if (!existing) throw app.httpErrors.notFound('Agent not found');
+      const providerBindingChanged = (input.providerAgentId !== undefined && input.providerAgentId !== existing.providerAgentId)
+        || (input.providerVersionTag !== undefined && input.providerVersionTag !== existing.providerVersionTag);
+      const deactivating = input.active === false && existing.active;
+      if (providerBindingChanged || deactivating) {
+        const [studioReference, outboundReference] = await Promise.all([
+          tx.receptionistCampaign.findFirst({ where: { tenantId: request.auth.tenantId, agentId: id, status: 'ACTIVE' }, select: { id: true } }),
+          tx.receptionistOutboundCampaign.findFirst({ where: { tenantId: request.auth.tenantId, agentId: id, status: { in: ['SCHEDULED', 'RUNNING'] } }, select: { id: true } }),
+        ]);
+        if (studioReference || outboundReference) throw app.httpErrors.conflict('Pause active and runnable campaigns before changing or deactivating this provider binding.');
+      }
+      if (input.name !== undefined) {
+        const duplicate = await tx.receptionistAgent.findFirst({
+          where: { tenantId: request.auth.tenantId, clinicId: existing.clinicId, id: { not: id }, name: { equals: input.name, mode: 'insensitive' } },
+          select: { id: true },
+        });
+        if (duplicate) throw app.httpErrors.conflict('An agent with this name already exists for the clinic.');
+      }
+      const data: Prisma.ReceptionistAgentUpdateInput = { ...input };
+      if (providerBindingChanged) Object.assign(data, {
+        providerStatus: 'UNVERIFIED',
+        providerVersion: null,
+        providerPublished: null,
+        providerAssignedTags: { set: [] },
+        providerVoiceId: null,
+        providerLanguage: null,
+        providerWebhookUrl: null,
+        providerWebhookEvents: { set: [] },
+        providerDataStorageSetting: null,
+        providerSignedUrl: null,
+        providerResponseEngineType: null,
+        providerResponseEngineId: null,
+        providerResponseEngineVersion: null,
+        providerLastModifiedAt: null,
+        providerFingerprint: null,
+        providerConfigRevision: { increment: 1 },
+        providerVerifiedRevision: null,
+        providerVerifiedAt: null,
+        providerVerificationExpiresAt: null,
+        providerLastAttemptStatus: 'NEVER',
+        providerLastAttemptAt: null,
+        providerLastErrorCode: null,
+      });
+      const row = await tx.receptionistAgent.update({ where: { id }, data });
+      await auditReceptionistMutation(tx, request, {
+        action: 'receptionistAgent.updated', resource: 'receptionistAgent', resourceId: id,
+        metadata: { active: row.active, providerBindingChanged, providerStatus: row.providerStatus },
+      });
+        return row;
+      });
+    } catch (error) {
+      if (isReceptionistDestinationConflict(error)) throw app.httpErrors.conflict('This active provider deployment is already assigned to another agent.');
+      throw error;
+    }
+  });
+
+  app.post('/agents/:id/verify-provider', { preHandler: writeRoles }, async (request, reply) => {
+    const { id } = idParam.parse(request.params);
+    const before = await db.receptionistAgent.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    if (!before) throw app.httpErrors.notFound('Agent not found');
+    if (!before.providerAgentId) throw app.httpErrors.conflict('Link a Retell agent before verification.');
+
+    const attemptedAt = new Date();
+    const probe = await probeRetellAgent(before.providerAgentId, before.providerVersionTag);
+    const permanentProbeFailure = !probe.ok && ['not_found', 'invalid_request', 'invalid_response'].includes(probe.error);
+    const readinessFailure = probe.ok
+      ? evaluateRetellAgentReadiness(probe.snapshot, { versionTag: before.providerVersionTag, webhookUrl: expectedRetellAgentWebhookUrl() })
+      : null;
+    const safeError = probe.ok ? readinessFailure : probe.error;
+
+    try {
+      const updated = await runWithTenantContext(request.auth.tenantId, async tx => {
+        await lockReceptionistConfiguration(tx, request.auth.tenantId);
+        const current = await tx.receptionistAgent.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+        if (!current) throw app.httpErrors.notFound('Agent not found');
+        if (current.providerConfigRevision !== before.providerConfigRevision
+          || current.providerAgentId !== before.providerAgentId
+          || current.providerVersionTag !== before.providerVersionTag) {
+          throw app.httpErrors.conflict('Agent configuration changed while provider verification was in progress. Retry verification.');
+        }
+
+        const success = probe.ok && !readinessFailure;
+        const deploymentChanged = success && current.providerStatus === 'VERIFIED'
+          && (current.providerVersion !== probe.snapshot.version || current.providerFingerprint !== probe.snapshot.fingerprint);
+        if (deploymentChanged) {
+          const [studioReference, outboundReference] = await Promise.all([
+            tx.receptionistCampaign.findFirst({ where: { tenantId: request.auth.tenantId, agentId: id, status: 'ACTIVE' }, select: { id: true } }),
+            tx.receptionistOutboundCampaign.findFirst({ where: { tenantId: request.auth.tenantId, agentId: id, status: { in: ['SCHEDULED', 'RUNNING'] } }, select: { id: true } }),
+          ]);
+          if (studioReference || outboundReference) {
+            throw app.httpErrors.conflict('Provider deployment drift detected. Pause active and runnable campaigns before approving the new immutable version.');
+          }
+        }
+        const data: Prisma.ReceptionistAgentUpdateInput = {
+          providerLastAttemptAt: attemptedAt,
+          providerLastAttemptStatus: success ? 'SUCCEEDED' : 'FAILED',
+          providerLastErrorCode: safeError,
+          ...(probe.ok ? providerSnapshotData(probe.snapshot) : {}),
+          ...(success ? {
+            providerStatus: 'VERIFIED' as const,
+            providerVerifiedRevision: current.providerConfigRevision,
+            providerVerifiedAt: attemptedAt,
+            providerVerificationExpiresAt: new Date(attemptedAt.getTime() + RETELL_AGENT_VERIFICATION_TTL_MS),
+          } : (probe.ok || permanentProbeFailure) ? {
+            providerStatus: 'INVALID' as const,
+            providerVerifiedRevision: null,
+            providerVerifiedAt: null,
+            providerVerificationExpiresAt: null,
+          } : {}),
+        };
+        const row = await tx.receptionistAgent.update({ where: { id }, data });
+        await auditReceptionistMutation(tx, request, {
+          action: success
+            ? deploymentChanged ? 'receptionistAgent.providerDeploymentUpdated' : 'receptionistAgent.providerVerified'
+            : 'receptionistAgent.providerVerificationFailed',
+          resource: 'receptionistAgent', resourceId: id,
+          metadata: {
+            providerStatus: row.providerStatus,
+            providerVersion: row.providerVersion,
+            providerVersionTag: row.providerVersionTag,
+            deploymentChanged,
+            reason: safeError,
+          },
+        });
+        return row;
+      });
+      if (!probe.ok && !permanentProbeFailure) return reply.code(503).send(updated);
+      return reply.code(200).send(updated);
+    } catch (error) {
+      if (isReceptionistDestinationConflict(error)) throw app.httpErrors.conflict('This active provider deployment is already assigned to another agent.');
+      throw error;
+    }
   });
 
   app.delete('/agents/:id', { preHandler: writeRoles }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
-    const existing = await db.receptionistAgent.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Agent not found');
-    await db.receptionistAgent.delete({ where: { id } });
-    await audit(request, { action: 'receptionistAgent.deleted', resource: 'receptionistAgent', resourceId: id });
+    await runWithTenantContext(request.auth.tenantId, async tx => {
+      await lockReceptionistConfiguration(tx, request.auth.tenantId);
+      const existing = await tx.receptionistAgent.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+      if (!existing) throw app.httpErrors.notFound('Agent not found');
+      const [studioReference, outboundReference] = await Promise.all([
+        tx.receptionistCampaign.findFirst({ where: { tenantId: request.auth.tenantId, agentId: id }, select: { id: true } }),
+        tx.receptionistOutboundCampaign.findFirst({ where: { tenantId: request.auth.tenantId, agentId: id }, select: { id: true } }),
+      ]);
+      if (studioReference || outboundReference) throw app.httpErrors.conflict('Agent history is referenced by a campaign. Deactivate the agent instead of deleting it.');
+      await tx.receptionistAgent.delete({ where: { id } });
+      await auditReceptionistMutation(tx, request, {
+        action: 'receptionistAgent.deleted', resource: 'receptionistAgent', resourceId: id,
+        metadata: { clinicId: existing.clinicId, providerLinked: Boolean(existing.providerAgentId) },
+      });
+    });
     return reply.code(204).send();
   });
 
@@ -522,33 +753,71 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
 
   app.post('/campaigns', { preHandler: writeRoles }, async (request, reply) => {
     const input = campaignCreate.parse(request.body);
-    const clinic = await db.receptionistClinic.findFirst({ where: { id: input.clinicId, tenantId: request.auth.tenantId } });
-    if (!clinic) throw app.httpErrors.notFound('Clinic not found');
-    const { bookingRules, eligibleLocationIds, ...rest } = input;
-    const row = await db.receptionistCampaign.create({
-      data: {
-        tenantId: request.auth.tenantId,
-        ...rest,
-        eligibleLocationIds: eligibleLocationIds ?? [],
-        bookingRules: bookingRules ?? undefined,
-      },
-    });
-    await audit(request, { action: 'receptionistCampaign.created', resource: 'receptionistCampaign', resourceId: row.id });
-    return reply.code(201).send(row);
+    try {
+      const row = await runWithTenantContext(request.auth.tenantId, async tx => {
+        await lockReceptionistConfiguration(tx, request.auth.tenantId);
+        const clinic = await tx.receptionistClinic.findFirst({ where: { id: input.clinicId, tenantId: request.auth.tenantId, active: true }, select: { id: true } });
+        if (!clinic) throw app.httpErrors.badRequest('An active tenant-owned clinic is required.');
+        await assertCampaignAgent(tx, {
+          tenantId: request.auth.tenantId, clinicId: input.clinicId, agentId: input.agentId,
+          requireReady: input.status === 'ACTIVE',
+        });
+        await assertCampaignLocations(tx, { tenantId: request.auth.tenantId, clinicId: input.clinicId, locationIds: input.eligibleLocationIds ?? [] });
+        const { bookingRules, eligibleLocationIds, ...rest } = input;
+        const created = await tx.receptionistCampaign.create({
+          data: {
+            tenantId: request.auth.tenantId,
+            ...rest,
+            eligibleLocationIds: eligibleLocationIds ?? [],
+            bookingRules: bookingRules ?? undefined,
+          },
+        });
+        await auditReceptionistMutation(tx, request, {
+          action: 'receptionistCampaign.created', resource: 'receptionistCampaign', resourceId: created.id,
+          metadata: { clinicId: created.clinicId, agentId: created.agentId, status: created.status },
+        });
+        return created;
+      });
+      return reply.code(201).send(row);
+    } catch (error) {
+      const reason = campaignAssignmentError(error);
+      if (reason) throw app.httpErrors.conflict(`Campaign configuration is not deployable: ${reason}.`);
+      throw error;
+    }
   });
 
   app.patch('/campaigns/:id', { preHandler: writeRoles }, async request => {
     const { id } = idParam.parse(request.params);
     const input = campaignUpdate.parse(request.body);
-    const existing = await db.receptionistCampaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Campaign not found');
-    const { bookingRules, ...rest } = input;
-    const row = await db.receptionistCampaign.update({
-      where: { id },
-      data: { ...rest, ...(bookingRules !== undefined ? { bookingRules: bookingRules ?? undefined } : {}) },
-    });
-    await audit(request, { action: 'receptionistCampaign.updated', resource: 'receptionistCampaign', resourceId: id });
-    return row;
+    try {
+      return await runWithTenantContext(request.auth.tenantId, async tx => {
+        await lockReceptionistConfiguration(tx, request.auth.tenantId);
+        const existing = await tx.receptionistCampaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+        if (!existing) throw app.httpErrors.notFound('Campaign not found');
+        const nextAgentId = input.agentId === undefined ? existing.agentId : input.agentId;
+        const nextStatus = input.status ?? existing.status;
+        const nextLocations = input.eligibleLocationIds ?? existing.eligibleLocationIds;
+        await assertCampaignAgent(tx, {
+          tenantId: request.auth.tenantId, clinicId: existing.clinicId, agentId: nextAgentId,
+          requireReady: nextStatus === 'ACTIVE',
+        });
+        await assertCampaignLocations(tx, { tenantId: request.auth.tenantId, clinicId: existing.clinicId, locationIds: nextLocations });
+        const { bookingRules, ...rest } = input;
+        const row = await tx.receptionistCampaign.update({
+          where: { id },
+          data: { ...rest, ...(bookingRules !== undefined ? { bookingRules: bookingRules ?? undefined } : {}) },
+        });
+        await auditReceptionistMutation(tx, request, {
+          action: 'receptionistCampaign.updated', resource: 'receptionistCampaign', resourceId: id,
+          metadata: { agentId: row.agentId, status: row.status },
+        });
+        return row;
+      });
+    } catch (error) {
+      const reason = campaignAssignmentError(error);
+      if (reason) throw app.httpErrors.conflict(`Campaign configuration is not deployable: ${reason}.`);
+      throw error;
+    }
   });
 
   app.delete('/campaigns/:id', { preHandler: writeRoles }, async (request, reply) => {

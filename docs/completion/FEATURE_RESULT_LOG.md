@@ -32,6 +32,17 @@ records decision checkpoints produced during production completion.
 
 ## Rejected/open checkpoints
 
+### M09-F02 immutable receptionist agent deployment
+
+- Result: initial independent `REJECT`; remediated candidate awaiting re-review.
+- Initial findings: call-response deployment mismatch, V0 rejection, unsafe tag repin,
+  cross-tag deployment sharing, transient classification of 400/422, clinic-branch
+  mapping, strict tag/DB/UI/source-of-truth gaps.
+- Remediation evidence: fresh 71 migrations; focused 59/59; all receptionist
+  114/114; RLS 962/962; Prisma drift 121/143 only; typecheck, lint and build.
+- External/not claimed: live Retell account transaction and browser walkthrough;
+  originating-number ownership and tool-schema readiness remain later gates.
+
 ### Foundation, tenant, workforce and patient master data
 
 - Result: initial `REJECT`, superseded by independent `PASS` for the reviewed scope.

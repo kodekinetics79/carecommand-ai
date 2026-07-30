@@ -36,9 +36,9 @@ const PROVIDERS: Record<string, ProviderDef> = {
   insurance: { label: 'Insurance (Stedi)', required: ['apiKey'],
     fields: [{ k: 'apiKey', label: 'API Key', secret: true }],
     env: { apiKey: 'STEDI_API_KEY' } },
-  voice: { label: 'Voice (Retell)', required: ['apiKey', 'agentId', 'fromNumber'],
-    fields: [{ k: 'apiKey', label: 'API Key', secret: true }, { k: 'agentId', label: 'Agent ID', secret: false }, { k: 'fromNumber', label: 'From Number', secret: false }],
-    env: { apiKey: 'RETELL_API_KEY', agentId: 'RETELL_AGENT_ID', fromNumber: 'RETELL_FROM_NUMBER' } },
+  voice: { label: 'Voice (Retell)', required: ['apiKey', 'fromNumber'],
+    fields: [{ k: 'apiKey', label: 'API Key', secret: true }, { k: 'fromNumber', label: 'From Number', secret: false }],
+    env: { apiKey: 'RETELL_API_KEY', fromNumber: 'RETELL_FROM_NUMBER' } },
 };
 const PROVIDER_KEYS = Object.keys(PROVIDERS) as Array<keyof typeof PROVIDERS & string>;
 

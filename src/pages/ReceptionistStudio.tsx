@@ -148,7 +148,7 @@ export default function ReceptionistStudio() {
     <div className="space-y-6 pb-10">
       <PageHeader
         title="AI Receptionist Studio"
-        subtitle="Configure a RetellAI-ready voice agent for any clinic — profile, campaign, intake flow, prompt, and live test config."
+        subtitle="Draft and export receptionist prompts, then link and verify the separate immutable Retell deployment used for live calls."
         badge={`${clinics.length} clinic${clinics.length === 1 ? '' : 's'}`}
         badgeColor="violet"
         actions={
@@ -514,6 +514,7 @@ function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic; campai
   const [draft, setDraft] = useState<Campaign>(campaign);
   const [busy, setBusy] = useState(false);
   const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [newAgentName, setNewAgentName] = useState('');
   const dirty = JSON.stringify(draft) !== JSON.stringify(campaign);
   const locations = clinic.locations ?? [];
   const rules = draft.bookingRules ?? {};
@@ -528,14 +529,8 @@ function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic; campai
   async function ensureAgentAndSave() {
     setBusy(true);
     try {
-      let agentId = draft.agentId;
-      if (!agentId) {
-        const created = await api.createAgent({ clinicId: clinic.id, name: 'Riley' });
-        agentId = created.id;
-        setAgents(prev => [...prev, created]);
-      }
       await api.updateCampaign(campaign.id, {
-        name: draft.name, campaignType: draft.campaignType, status: draft.status, agentId,
+        name: draft.name, campaignType: draft.campaignType, status: draft.status, agentId: draft.agentId,
         offerTitle: draft.offerTitle, offerDescription: draft.offerDescription, offerScript: draft.offerScript,
         appointmentType: draft.appointmentType, bookingRules: draft.bookingRules, eligibleLocationIds: draft.eligibleLocationIds,
         smsConfirmation: draft.smsConfirmation, emailConfirmation: draft.emailConfirmation,
@@ -549,6 +544,30 @@ function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic; campai
     if (!activeAgent) return;
     const updated = await api.updateAgent(activeAgent.id, patch);
     setAgents(prev => prev.map(a => (a.id === updated.id ? updated : a)));
+  }
+
+  async function verifyAgent() {
+    if (!activeAgent) return;
+    try {
+      const updated = await api.verifyAgentProvider(activeAgent.id);
+      setAgents(prev => prev.map(a => (a.id === updated.id ? updated : a)));
+    } finally {
+      // A failed provider request still records a durable safe attempt state.
+      // Refresh so Studio shows that state even when the API returns 503/409.
+      setAgents(await api.listAgents(clinic.id));
+    }
+  }
+
+  async function createNamedAgent() {
+    const name = newAgentName.trim();
+    if (!name) return;
+    setBusy(true);
+    try {
+      const created = await api.createAgent({ clinicId: clinic.id, name });
+      setAgents(prev => [...prev, created]);
+      setDraft(prev => ({ ...prev, agentId: created.id }));
+      setNewAgentName('');
+    } finally { setBusy(false); }
   }
 
   async function deleteCampaign() {
@@ -568,10 +587,24 @@ function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic; campai
       {/* Agent */}
       <div className="cc-card p-5 space-y-4">
         <h3 className="text-sm font-bold text-t1 inline-flex items-center gap-2"><Bot className="w-4 h-4 text-violet-v" /> Agent</h3>
+        <Field label="Campaign agent" hint="Runnable campaigns require a fresh verified provider deployment.">
+          <Select value={draft.agentId ?? ''} onChange={e => set('agentId', e.target.value || null)}>
+            <option value="">No agent linked (draft only)</option>
+            {agents.map(row => <option key={row.id} value={row.id}>{row.name} · {row.providerStatus}</option>)}
+          </Select>
+        </Field>
         {activeAgent ? (
-          <AgentEditor key={activeAgent.id} agent={activeAgent} onSave={saveAgent} />
+          <AgentEditor
+            key={`${activeAgent.id}:${activeAgent.providerLastAttemptAt ?? 'never'}:${activeAgent.providerStatus}:${activeAgent.providerVersion ?? 'unbound'}`}
+            agent={activeAgent}
+            onSave={saveAgent}
+            onVerify={verifyAgent}
+          />
         ) : (
-          <p className="text-xs text-t3">No agent linked yet — one named “Riley” will be created automatically when you save this campaign.</p>
+          <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
+            <TextInput aria-label="New agent name" placeholder="Enter a receptionist name" value={newAgentName} onChange={e => setNewAgentName(e.target.value)} />
+            <button type="button" disabled={!newAgentName.trim() || busy} onClick={createNamedAgent} className="rounded-xl bg-indigo px-3 py-2 text-sm font-semibold text-white disabled:opacity-40">Create agent</button>
+          </div>
         )}
       </div>
 
@@ -644,43 +677,82 @@ function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic; campai
   );
 }
 
-function AgentEditor({ agent, onSave }: { agent: Agent; onSave: (patch: Partial<Agent>) => Promise<void> }) {
+function AgentEditor({ agent, onSave, onVerify }: { agent: Agent; onSave: (patch: Partial<Agent>) => Promise<void>; onVerify: () => Promise<void> }) {
   const [draft, setDraft] = useState<Agent>(agent);
   const [busy, setBusy] = useState(false);
   const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const dirty = JSON.stringify(draft) !== JSON.stringify(agent);
   const set = <K extends keyof Agent>(key: K, value: Agent[K]) => setDraft(prev => ({ ...prev, [key]: value }));
 
   async function save() {
     setBusy(true);
+    setError(null);
     try {
-      await onSave({ name: draft.name, voice: draft.voice, tone: draft.tone, language: draft.language, persona: draft.persona, greetingOverride: draft.greetingOverride });
+      await onSave({
+        name: draft.name, voice: draft.voice, tone: draft.tone, language: draft.language,
+        persona: draft.persona, greetingOverride: draft.greetingOverride, active: draft.active,
+        providerAgentId: draft.providerAgentId, providerVersionTag: draft.providerVersionTag,
+      });
       setSavedAt(Date.now());
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Unable to save the agent.');
     } finally { setBusy(false); }
+  }
+
+  async function verify() {
+    setBusy(true);
+    setError(null);
+    try { await onVerify(); }
+    catch (caught) { setError(caught instanceof Error ? caught.message : 'Provider verification failed.'); }
+    finally { setBusy(false); }
   }
 
   return (
     <div className="space-y-4">
       <div className="grid gap-4 md:grid-cols-2">
         <Field label="Agent name" required><TextInput value={draft.name} onChange={e => set('name', e.target.value)} /></Field>
-        <Field label="Voice">
+        <Field label="Prompt-preview voice" hint="Launch uses the provider-verified voice snapshot.">
           <Select value={draft.voice} onChange={e => set('voice', e.target.value)}>
             {VOICE_OPTIONS.map(v => <option key={v.id} value={v.id}>{v.label}</option>)}
           </Select>
         </Field>
-        <Field label="Tone">
+        <Field label="Prompt-preview tone" hint="Preview/export only; saving does not deploy this value to the linked Retell agent.">
           <Select value={draft.tone} onChange={e => set('tone', e.target.value)}>
             {[...new Set([draft.tone, ...TONE_OPTIONS])].map(t => <option key={t} value={t}>{t}</option>)}
           </Select>
         </Field>
-        <Field label="Language">
+        <Field label="Prompt-preview language" hint="Launch uses the provider-verified language snapshot.">
           <Select value={draft.language} onChange={e => set('language', e.target.value)}>
             {LANGUAGE_OPTIONS.map(l => <option key={l.id} value={l.id}>{l.label}</option>)}
           </Select>
         </Field>
       </div>
-      <Field label="Persona" hint="Extra personality guidance for the agent."><TextArea rows={2} value={draft.persona ?? ''} onChange={e => set('persona', e.target.value)} /></Field>
-      <Field label="Greeting override" hint="Optional first line. Falls back to the clinic disclosure if empty."><TextInput value={draft.greetingOverride ?? ''} onChange={e => set('greetingOverride', e.target.value)} /></Field>
+      <Field label="Prompt-preview persona" hint="Preview/export only; this is not synchronized to the linked Retell response engine."><TextArea rows={2} value={draft.persona ?? ''} onChange={e => set('persona', e.target.value)} /></Field>
+      <Field label="Prompt-preview greeting" hint="Preview/export only; live calls use the separately configured and verified provider deployment."><TextInput value={draft.greetingOverride ?? ''} onChange={e => set('greetingOverride', e.target.value)} /></Field>
+      <div className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] p-4 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <p className="text-xs font-bold text-t1">Retell deployment</p>
+            <p className="text-[11px] text-t3">Link an existing published agent. CareCommand only reads and verifies it.</p>
+          </div>
+          <span className={`badge ${agent.providerStatus === 'VERIFIED' ? 'badge-emerald' : agent.providerStatus === 'INVALID' ? 'badge-red' : 'badge-amber'}`}>{agent.providerStatus}</span>
+        </div>
+        <div className="grid gap-3 md:grid-cols-2">
+          <Field label="Retell agent ID"><TextInput value={draft.providerAgentId ?? ''} onChange={e => set('providerAgentId', e.target.value || null)} placeholder="agent_…" /></Field>
+          <Field label="Deployment tag" hint="The returned agent must explicitly contain this tag."><TextInput value={draft.providerVersionTag} onChange={e => set('providerVersionTag', e.target.value)} /></Field>
+        </div>
+        {agent.providerVersion !== null && <p className="text-[11px] text-t2">Pinned version {agent.providerVersion} · {agent.providerVoiceId ?? 'voice unavailable'} · {agent.providerLanguage ?? 'language unavailable'}</p>}
+        {agent.providerVerifiedAt && <p className="text-[11px] text-t3">Verified {new Date(agent.providerVerifiedAt).toLocaleString()} · expires {agent.providerVerificationExpiresAt ? new Date(agent.providerVerificationExpiresAt).toLocaleString() : 'unknown'}</p>}
+        {agent.providerLastErrorCode && <p role="alert" className="text-xs font-semibold text-red-v">Provider check: {agent.providerLastErrorCode.replaceAll('_', ' ')}</p>}
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <Toggle checked={draft.active} onChange={value => set('active', value)} label="Agent active" />
+          <button type="button" disabled={busy || dirty || !agent.providerAgentId} onClick={verify} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t1 disabled:opacity-40">
+            {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />} Verify provider deployment
+          </button>
+        </div>
+      </div>
+      {error && <p role="alert" className="text-xs font-semibold text-red-v">{error}</p>}
       <SaveBar dirty={dirty} busy={busy} onSave={save} savedAt={savedAt} />
     </div>
   );
@@ -911,15 +983,16 @@ function RetellPanel({ campaignId }: { campaignId: string }) {
   const fullJson = useMemo(() => (config ? JSON.stringify(config, null, 2) : ''), [config]);
 
   if (error) return <div className="cc-card p-6 text-sm text-red-v">{error}</div>;
-  if (!config) return <div className="cc-card p-10 text-center text-sm text-t3"><Loader2 className="w-4 h-4 animate-spin inline mr-2" /> Building RetellAI config…</div>;
+  if (!config) return <div className="cc-card p-10 text-center text-sm text-t3"><Loader2 className="w-4 h-4 animate-spin inline mr-2" /> Building preview/export config…</div>;
 
   return (
     <div className="space-y-4">
       <div className="cc-card p-5 space-y-3">
         <div className="flex items-center justify-between">
-          <h3 className="text-sm font-bold text-t1 inline-flex items-center gap-2"><Code2 className="w-4 h-4 text-indigo" /> Test-call configuration</h3>
+          <h3 className="text-sm font-bold text-t1 inline-flex items-center gap-2"><Code2 className="w-4 h-4 text-indigo" /> Preview/export configuration — not deployed</h3>
           <CopyButton value={fullJson} label="Copy full JSON" />
         </div>
+        <p role="note" className="text-xs text-t3">Copying this JSON does not change the live provider agent. Verify the linked deployment above before campaign activation.</p>
         <div className="grid gap-3 md:grid-cols-3">
           <KV label="Voice ID" value={config.voiceId} />
           <KV label="Language" value={config.language} />

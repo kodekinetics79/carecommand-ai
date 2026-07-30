@@ -89,6 +89,11 @@ function key(table: string, tenantId?: string): string {
   return `${table}:${tenantId ?? 'GLOBAL'}`;
 }
 
+function syntheticE164Phone(seed: string): string {
+  const digits = BigInt(`0x${createHash('sha256').update(seed).digest('hex').slice(0, 14)}`) % 10_000_000_000n;
+  return `+1${digits.toString().padStart(10, '0')}`;
+}
+
 function syntheticScalar(column: Column, suffix: string): unknown {
   const name = column.name.toLowerCase();
   if (column.enumValue !== null) return column.enumValue;
@@ -107,7 +112,7 @@ function syntheticScalar(column: Column, suffix: string): unknown {
   if (['smallint', 'integer', 'bigint', 'numeric', 'real', 'double precision', 'money'].includes(column.typeName)) return 1;
   if (column.typeName === 'inet') return '192.0.2.1';
   if (name.includes('email')) return `rls-${suffix}@example.test`;
-  if (name.includes('phone')) return `+1555${suffix.replaceAll('-', '').slice(0, 7).padEnd(7, '0')}`;
+  if (name.includes('phone')) return syntheticE164Phone(`${column.table}:${column.name}:${suffix}`);
   if (name.includes('timezone')) return 'UTC';
   if (name.includes('currency')) return 'USD';
   if (name.includes('locale') || name.includes('language')) return 'en';
@@ -617,6 +622,7 @@ export class RlsBehaviorHarness {
       if (column.typeName === 'uuid') clone[name] = randomUUID();
       else if (['smallint', 'integer', 'bigint', 'numeric'].includes(column.typeName)) clone[name] = Number(clone[name]) + 10_000;
       else if (column.typeName.includes('timestamp')) clone[name] = new Date(Date.now() + 86_400_000).toISOString();
+      else if (name.toLowerCase().includes('phone')) clone[name] = syntheticE164Phone(`${table}:${name}:${randomUUID()}`);
       else clone[name] = `${String(clone[name]).slice(0, 80)}-${randomUUID().slice(0, 8)}`;
     }
     return clone;

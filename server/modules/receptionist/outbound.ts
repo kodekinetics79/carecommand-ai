@@ -1,4 +1,4 @@
-import type { FastifyPluginAsync } from 'fastify';
+import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
@@ -11,6 +11,9 @@ import {
   RECEPTIONIST_PERMISSIONS,
   requireReceptionistPermission,
 } from '../../lib/receptionist/accessControl';
+import { agentReadinessReason } from '../../lib/receptionist/agentReadiness';
+import { runWithTenantContext } from '../../lib/tenantContext';
+import { Prisma } from '../../generated/prisma/client';
 
 const uuid = z.string().uuid();
 const idParam = z.object({ id: uuid });
@@ -48,6 +51,64 @@ export function targetStatusAfterOutcome(
 async function outboundStopped(tenantId: string): Promise<boolean> {
   const usage = await db.tenantAiUsage.findUnique({ where: { tenantId }, select: { killSwitch: true } });
   return usage?.killSwitch === true;
+}
+
+async function lockOutboundConfiguration(tx: Prisma.TransactionClient, tenantId: string) {
+  await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`receptionist-config:${tenantId}`}::text, 0))::text AS locked`;
+}
+
+async function auditOutboundMutation(
+  tx: Prisma.TransactionClient,
+  request: FastifyRequest,
+  event: { action: string; resource: string; resourceId: string; metadata?: Prisma.InputJsonObject },
+) {
+  await tx.auditEvent.create({ data: {
+    tenantId: request.auth.tenantId,
+    actorUserId: request.auth.userId,
+    action: event.action,
+    resource: event.resource,
+    resourceId: event.resourceId,
+    requestId: request.id,
+    ipAddress: request.ip,
+    userAgent: request.headers['user-agent'],
+    metadata: event.metadata,
+  } });
+}
+
+async function validateOutboundAssignments(
+  tx: Prisma.TransactionClient,
+  input: { tenantId: string; clinicId: string; agentId: string | null | undefined; branchId: string | null | undefined; requireReady: boolean },
+) {
+  const clinic = await tx.receptionistClinic.findFirst({ where: { id: input.clinicId, tenantId: input.tenantId, active: true }, select: { id: true } });
+  if (!clinic) throw new Error('clinic_inactive_or_foreign');
+  if (input.branchId) {
+    const branch = await tx.branch.findFirst({ where: { id: input.branchId, tenantId: input.tenantId, active: true }, select: { id: true } });
+    if (!branch) throw new Error('branch_inactive_or_foreign');
+    const mappedLocation = await tx.receptionistLocation.findFirst({
+      where: { tenantId: input.tenantId, clinicId: input.clinicId, branchId: input.branchId, active: true },
+      select: { id: true },
+    });
+    if (!mappedLocation) throw new Error('branch_not_mapped_to_clinic');
+  }
+  if (!input.agentId) {
+    if (input.requireReady) throw new Error('agent_unlinked');
+    return;
+  }
+  const agent = await tx.receptionistAgent.findFirst({ where: { id: input.agentId, tenantId: input.tenantId, clinicId: input.clinicId } });
+  if (!agent) throw new Error('agent_scope_mismatch');
+  if (!agent.active) throw new Error('agent_inactive');
+  if (input.requireReady) {
+    const reason = agentReadinessReason(agent);
+    if (reason) throw new Error(reason);
+  }
+}
+
+function outboundAssignmentReason(error: unknown) {
+  const reason = error instanceof Error ? error.message : '';
+  return [
+    'clinic_inactive_or_foreign', 'branch_inactive_or_foreign', 'branch_not_mapped_to_clinic', 'agent_unlinked', 'agent_scope_mismatch',
+    'agent_inactive', 'agent_unverified', 'agent_configuration_changed', 'agent_verification_stale',
+  ].includes(reason) ? reason : null;
 }
 
 // --- Quiet-hours enforcement (per outbound campaign, clinic timezone) --------
@@ -156,16 +217,26 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
   });
 
   // ----- Retell setup status (no secrets exposed) -------------------------
-  app.get('/retell-status', async () => {
+  app.get('/retell-status', async request => {
     const status = retellConfigStatus();
+    const linkedAgents = await db.receptionistAgent.findMany({
+      where: { tenantId: request.auth.tenantId, active: true },
+      select: {
+        active: true, providerAgentId: true, providerVersion: true, providerStatus: true,
+        providerConfigRevision: true, providerVerifiedRevision: true, providerVerifiedAt: true,
+        providerVerificationExpiresAt: true,
+      },
+    });
+    const readyAgents = linkedAgents.filter(agent => !agentReadinessReason(agent)).length;
     return {
-      configured: status.configured,
+      configured: status.configured && readyAgents > 0,
       mock: status.mock,
-      missing: status.missing,
+      missing: [...status.missing, ...(readyAgents ? [] : ['AGENT_DEPLOYMENT'])],
+      readyAgents,
       checklist: [
         { key: 'RETELL_API_KEY', label: 'Retell API key', set: !status.missing.includes('RETELL_API_KEY') },
-        { key: 'RETELL_AGENT_ID', label: 'Retell agent id', set: !status.missing.includes('RETELL_AGENT_ID') },
         { key: 'RETELL_FROM_NUMBER', label: 'Outbound caller number', set: !status.missing.includes('RETELL_FROM_NUMBER') },
+        { key: 'AGENT_DEPLOYMENT', label: 'Published agent deployment', set: readyAgents > 0 },
       ],
     };
   });
@@ -209,25 +280,60 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
 
   app.post('/outbound-campaigns', { preHandler: writeRoles }, async (request, reply) => {
     const input = campaignCreate.parse(request.body);
-    const clinic = await db.receptionistClinic.findFirst({ where: { id: input.clinicId, tenantId: request.auth.tenantId } });
-    if (!clinic) throw app.httpErrors.notFound('Clinic not found');
-    const { customQuestions, defaultBranchId, agentId, ...rest } = input;
-    const row = await db.receptionistOutboundCampaign.create({
-      data: { tenantId: request.auth.tenantId, ...rest, agentId: agentId ?? undefined, defaultBranchId: defaultBranchId ?? undefined, customQuestions: customQuestions ?? undefined },
-    });
-    await audit(request, { action: 'receptionist.campaign.created', resource: 'receptionistOutboundCampaign', resourceId: row.id, metadata: { name: row.name, bookingMode: row.bookingMode } });
-    return reply.code(201).send(row);
+    try {
+      const row = await runWithTenantContext(request.auth.tenantId, async tx => {
+        await lockOutboundConfiguration(tx, request.auth.tenantId);
+        await validateOutboundAssignments(tx, {
+          tenantId: request.auth.tenantId, clinicId: input.clinicId, agentId: input.agentId, branchId: input.defaultBranchId,
+          requireReady: false,
+        });
+        const { customQuestions, defaultBranchId, agentId, ...rest } = input;
+        const created = await tx.receptionistOutboundCampaign.create({
+          data: { tenantId: request.auth.tenantId, ...rest, agentId: agentId ?? undefined, defaultBranchId: defaultBranchId ?? undefined, customQuestions: customQuestions ?? undefined },
+        });
+        await auditOutboundMutation(tx, request, {
+          action: 'receptionist.campaign.created', resource: 'receptionistOutboundCampaign', resourceId: created.id,
+          metadata: { name: created.name, bookingMode: created.bookingMode, agentId: created.agentId, status: created.status },
+        });
+        return created;
+      });
+      return reply.code(201).send(row);
+    } catch (error) {
+      const reason = outboundAssignmentReason(error);
+      if (reason) throw app.httpErrors.conflict(`Outbound campaign configuration is not deployable: ${reason}.`);
+      throw error;
+    }
   });
 
   app.patch('/outbound-campaigns/:id', { preHandler: writeRoles }, async request => {
     const { id } = idParam.parse(request.params);
     const input = campaignUpdate.parse(request.body);
-    const existing = await db.receptionistOutboundCampaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Campaign not found');
-    const { customQuestions, ...rest } = input;
-    const row = await db.receptionistOutboundCampaign.update({ where: { id }, data: { ...rest, ...(customQuestions !== undefined ? { customQuestions: customQuestions ?? undefined } : {}) } });
-    await audit(request, { action: 'receptionist.campaign.updated', resource: 'receptionistOutboundCampaign', resourceId: id, metadata: { status: input.status } });
-    return row;
+    try {
+      return await runWithTenantContext(request.auth.tenantId, async tx => {
+        await lockOutboundConfiguration(tx, request.auth.tenantId);
+        const existing = await tx.receptionistOutboundCampaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+        if (!existing) throw app.httpErrors.notFound('Campaign not found');
+        const nextStatus = input.status ?? existing.status;
+        await validateOutboundAssignments(tx, {
+          tenantId: request.auth.tenantId,
+          clinicId: existing.clinicId,
+          agentId: input.agentId === undefined ? existing.agentId : input.agentId,
+          branchId: input.defaultBranchId === undefined ? existing.defaultBranchId : input.defaultBranchId,
+          requireReady: nextStatus === 'SCHEDULED' || nextStatus === 'RUNNING',
+        });
+        const { customQuestions, ...rest } = input;
+        const row = await tx.receptionistOutboundCampaign.update({ where: { id }, data: { ...rest, ...(customQuestions !== undefined ? { customQuestions: customQuestions ?? undefined } : {}) } });
+        await auditOutboundMutation(tx, request, {
+          action: 'receptionist.campaign.updated', resource: 'receptionistOutboundCampaign', resourceId: id,
+          metadata: { status: row.status, agentId: row.agentId },
+        });
+        return row;
+      });
+    } catch (error) {
+      const reason = outboundAssignmentReason(error);
+      if (reason) throw app.httpErrors.conflict(`Outbound campaign configuration is not deployable: ${reason}.`);
+      throw error;
+    }
   });
 
   // ----- Targets ----------------------------------------------------------
@@ -285,13 +391,19 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
 
     const campaign = await db.receptionistOutboundCampaign.findFirst({
       where: { id, tenantId: request.auth.tenantId },
-      include: { clinic: { select: { name: true, complianceDisclosure: true, timezone: true } }, agent: { select: { name: true, voice: true } } },
+      include: { clinic: { select: { name: true, complianceDisclosure: true, timezone: true } }, agent: true },
     });
     if (!campaign) throw app.httpErrors.notFound('Campaign not found');
 
     if (campaign.status !== RUNNABLE_CAMPAIGN_STATUS) {
       await audit(request, { action: 'receptionist.call.blocked', resource: 'receptionistOutboundCampaign', resourceId: campaign.id, metadata: { reason: 'campaign_not_running', status: campaign.status } });
       return reply.code(409).send({ status: 'blocked', reason: 'campaign_not_running' });
+    }
+
+    const initialAgentReadiness = campaign.agent ? agentReadinessReason(campaign.agent) : 'agent_unlinked';
+    if (initialAgentReadiness) {
+      await audit(request, { action: 'receptionist.call.blocked', resource: 'receptionistOutboundCampaign', resourceId: campaign.id, metadata: { reason: initialAgentReadiness } });
+      return reply.code(409).send({ status: 'blocked', reason: initialAgentReadiness });
     }
 
     if (await outboundStopped(request.auth.tenantId)) {
@@ -432,9 +544,13 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     // while preflight work is in progress.
     const [stoppedAtBoundary, currentCampaign] = await Promise.all([
       outboundStopped(request.auth.tenantId),
-      db.receptionistOutboundCampaign.findFirst({ where: { id: campaign.id, tenantId: request.auth.tenantId }, select: { status: true } }),
+      db.receptionistOutboundCampaign.findFirst({
+        where: { id: campaign.id, tenantId: request.auth.tenantId },
+        select: { status: true, agent: true },
+      }),
     ]);
-    if (stoppedAtBoundary || currentCampaign?.status !== RUNNABLE_CAMPAIGN_STATUS) {
+    const boundaryAgentReadiness = currentCampaign?.agent ? agentReadinessReason(currentCampaign.agent) : 'agent_unlinked';
+    if (stoppedAtBoundary || currentCampaign?.status !== RUNNABLE_CAMPAIGN_STATUS || boundaryAgentReadiness) {
       await db.$transaction(async tx => {
         await tx.receptionistCallLog.update({ where: { id: callLog.id }, data: { outcome: 'FAILED', endedAt: new Date() } });
         if (target) {
@@ -444,7 +560,9 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
           });
         }
       });
-      const reason = stoppedAtBoundary ? 'outbound_stopped' : 'campaign_not_running';
+      const reason = stoppedAtBoundary ? 'outbound_stopped'
+        : currentCampaign?.status !== RUNNABLE_CAMPAIGN_STATUS ? 'campaign_not_running'
+          : boundaryAgentReadiness!;
       await audit(request, { action: 'receptionist.call.blocked', resource: 'receptionistCallLog', resourceId: callLog.id, metadata: { campaignId: campaign.id, reason: `${reason}_pre_provider` } });
       if (stoppedAtBoundary) return reply.code(423).send({ status: 'blocked', reason, callLogId: callLog.id });
       return reply.code(409).send({ status: 'blocked', reason, callLogId: callLog.id });
@@ -452,7 +570,8 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
 
     const result = await createPhoneCall({
       toNumber: dialIdentity.phone,
-      agentId: undefined,
+      agentId: currentCampaign!.agent!.providerAgentId!,
+      agentVersion: currentCampaign!.agent!.providerVersion!,
       webhookUrl: `${env.PUBLIC_API_URL}/v1/receptionist/webhooks/retell?clinicId=${campaign.clinicId}`,
       dynamicVariables: {
         clinic_name: campaign.clinic.name,
@@ -472,14 +591,31 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     });
 
     if (!result.ok) {
-      await db.receptionistCallLog.update({ where: { id: callLog.id }, data: { outcome: 'FAILED', endedAt: new Date() } });
-      if (body.targetId) {
-        await db.receptionistCallTarget.updateMany({
-          where: { id: body.targetId, tenantId: request.auth.tenantId, campaignId: campaign.id, status: 'CALLING' },
-          data: { status: targetStatusAfterOutcome('FAILED', (target?.attempts ?? 0) + 1, campaign.maxRetryAttempts) ?? 'FAILED', lastOutcome: 'FAILED', lastCallLogId: callLog.id },
+      await runWithTenantContext(request.auth.tenantId, async tx => {
+        await tx.receptionistCallLog.update({
+          where: { id: callLog.id },
+          data: { outcome: 'FAILED', endedAt: new Date(), ...(result.callId ? { retellCallId: result.callId } : {}) },
         });
-      }
-      await audit(request, { action: 'receptionist.call.failed', resource: 'receptionistCallLog', resourceId: callLog.id, metadata: { error: result.error } });
+        if (body.targetId) {
+          await tx.receptionistCallTarget.updateMany({
+            where: { id: body.targetId, tenantId: request.auth.tenantId, campaignId: campaign.id, status: 'CALLING' },
+            data: { status: targetStatusAfterOutcome('FAILED', (target?.attempts ?? 0) + 1, campaign.maxRetryAttempts) ?? 'FAILED', lastOutcome: 'FAILED', lastCallLogId: callLog.id },
+          });
+        }
+        await auditOutboundMutation(tx, request, {
+          action: result.error === 'retell_deployment_mismatch'
+            ? 'receptionist.call.providerDeploymentMismatch'
+            : 'receptionist.call.failed',
+          resource: 'receptionistCallLog',
+          resourceId: callLog.id,
+          metadata: {
+            error: result.error,
+            operationalReviewRequired: result.error === 'retell_deployment_mismatch',
+            providerStopApplied: result.providerStopApplied ?? null,
+            providerStopError: result.providerStopError ?? null,
+          },
+        });
+      });
       return reply.code(502).send({ status: 'failed', error: result.error, callLogId: callLog.id });
     }
 

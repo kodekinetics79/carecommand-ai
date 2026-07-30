@@ -1,13 +1,13 @@
 # Realistic Scenario Matrix
 
-The 45 deterministic scenarios below define tenant, actors, preconditions, input, expected database/API/UI/audit behavior, authorization and reset strategy in the machine-readable catalog. 33 scenarios link to current executable evidence; the remainder are explicitly marked specification-only and are not release evidence.
+The 51 deterministic scenarios below define tenant, actors, preconditions, input, expected database/API/UI/audit behavior, authorization and reset strategy in the machine-readable catalog. 39 scenarios link to current executable evidence; the remainder are explicitly marked specification-only and are not release evidence.
 
 | Category | Scenarios |
 |---|---:|
 | AUTH | 3 |
 | PAT | 5 |
 | SCH | 7 |
-| REC | 11 |
+| REC | 17 |
 | FIN | 5 |
 | INT | 3 |
 | PLAT | 5 |
@@ -42,6 +42,12 @@ The 45 deterministic scenarios below define tenant, actors, preconditions, input
 | REC-009 | EDGE | EXECUTABLE | functional-family | Admit another call | Atomic capacity control enforced |
 | REC-010 | EDGE | EXECUTABLE | functional-family | Replay duplicate/out-of-order webhook | Signed webhook remains tenant-scoped |
 | REC-011 | EDGE | EXECUTABLE | functional-family | Start provider operation | No local bypass |
+| REC-012 | FUNCTIONAL | EXECUTABLE | functional-family | Verify production agent deployment | Receptionist managers may verify only agents in their clinic and tenant |
+| REC-013 | EDGE | EXECUTABLE | functional-family | Verify unsafe provider deployment | Provider response cannot bypass production readiness controls |
+| REC-014 | EDGE | EXECUTABLE | edge-multitenant | Bind foreign agent to campaign | Tenant and clinic ownership are enforced by API and composite database constraints |
+| REC-015 | EDGE | EXECUTABLE | functional-family | Retry provider verification then activate campaign | A transient provider failure never silently authorizes a stale deployment |
+| REC-016 | EDGE | EXECUTABLE | functional-family | Complete stale provider verification response | Optimistic revision prevents stale verification overwrite |
+| REC-017 | FUNCTIONAL | EXECUTABLE | functional-family | Activate and launch outbound campaign | Every activation and dial rechecks same-tenant, same-clinic, fresh verified readiness |
 | FIN-001 | FUNCTIONAL | EXECUTABLE | functional-family | Run eligibility simulator | Billing role within tenant only |
 | FIN-002 | EDGE | SPECIFICATION_ONLY | functional-family | Request eligibility | No payer call without policy |
 | FIN-003 | FUNCTIONAL | EXECUTABLE | functional-family | Complete simulator payment | Opaque public token is resource-bound |

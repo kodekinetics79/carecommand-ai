@@ -30,7 +30,17 @@ async function makeTenant() {
   await db.tenantFeatureEntitlement.create({ data: { tenantId: id, featureKey: 'ai_receptionist', enabled: true, source: 'test' } });
   const user = await db.user.create({ data: { tenantId: id, role: 'OWNER', active: true, email: `owner-${id.slice(0, 8)}@rcp.test`, displayName: 'Owner' } });
   const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Main clinic', phone: phoneFor(id) } });
-  return { id, userId: user.id, clinicId: clinic.id };
+  const now = new Date();
+  const agent = await db.receptionistAgent.create({ data: {
+    tenantId: id, clinicId: clinic.id, name: 'Outbound pilot agent', providerAgentId: `agent_${id.replaceAll('-', '')}`,
+    providerVersion: 1, providerVersionTag: 'prod', providerStatus: 'VERIFIED', providerPublished: true,
+    providerAssignedTags: ['prod'], providerFingerprint: 'c'.repeat(64), providerConfigRevision: 1, providerVerifiedRevision: 1,
+    providerWebhookUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`,
+    providerWebhookEvents: ['call_started', 'call_ended', 'call_analyzed'], providerDataStorageSetting: 'basic_attributes_only', providerSignedUrl: true,
+    providerResponseEngineType: 'retell-llm', providerResponseEngineId: `llm_${id.replaceAll('-', '')}`,
+    providerVerifiedAt: now, providerVerificationExpiresAt: new Date(now.getTime() + 60 * 60 * 1_000),
+  } });
+  return { id, userId: user.id, clinicId: clinic.id, agentId: agent.id };
 }
 
 function auth(t: { id: string }, userId: string) {
@@ -58,6 +68,7 @@ describe('AI receptionist outbound targets', () => {
       headers,
       payload: {
         clinicId: tenant.clinicId,
+        agentId: tenant.agentId,
         name: 'Pilot cleanup queue',
         script: 'Call the patient.',
         requiredFields: ['firstName', 'lastName', 'phone'],
@@ -93,7 +104,7 @@ describe('AI receptionist outbound targets', () => {
     const tenant = await makeTenant();
     const headers = auth(tenant, tenant.userId);
     const makeCampaign = async (name: string, status: 'DRAFT' | 'RUNNING') => db.receptionistOutboundCampaign.create({
-      data: { tenantId: tenant.id, clinicId: tenant.clinicId, name, script: 'Call the patient.', requiredFields: ['phone'], status },
+      data: { tenantId: tenant.id, clinicId: tenant.clinicId, agentId: tenant.agentId, name, script: 'Call the patient.', requiredFields: ['phone'], status },
     });
     const draft = await makeCampaign('Draft queue', 'DRAFT');
     const running = await makeCampaign('Running queue', 'RUNNING');
@@ -114,13 +125,11 @@ describe('AI receptionist outbound targets', () => {
     expect(wrongIdentity.json()).toMatchObject({ reason: 'target_identity_mismatch' });
 
     await db.receptionistCallLog.create({ data: { tenantId: tenant.id, clinicId: tenant.clinicId, outboundCampaignId: running.id, callerPhone: target.phone, retellCallId: 'mock-active-call', outcome: 'IN_PROGRESS' } });
-    const stopOriginal = { apiKey: env.RETELL_API_KEY, agentId: env.RETELL_AGENT_ID, from: env.RETELL_FROM_NUMBER };
+    const stopOriginal = { apiKey: env.RETELL_API_KEY, from: env.RETELL_FROM_NUMBER };
     env.RETELL_API_KEY = 'mock_stop_control';
-    env.RETELL_AGENT_ID = 'agent_stop';
     env.RETELL_FROM_NUMBER = '+15550000001';
     const stop = await app.inject({ method: 'POST', url: '/v1/receptionist/outbound-control', headers, payload: { stopped: true, reason: 'Pilot emergency stop test' } });
     env.RETELL_API_KEY = stopOriginal.apiKey;
-    env.RETELL_AGENT_ID = stopOriginal.agentId;
     env.RETELL_FROM_NUMBER = stopOriginal.from;
     expect(stop.statusCode).toBe(200);
     expect(stop.json()).toMatchObject({ stopped: true, activeCancellation: { requested: 1, confirmed: 0, failed: 0, unconfirmed: 1 } });
@@ -150,13 +159,12 @@ describe('AI receptionist outbound targets', () => {
   it('blocks atomically at tenant concurrency and voice-minute capacity', async () => {
     const tenant = await makeTenant();
     const headers = auth(tenant, tenant.userId);
-    const original = { apiKey: env.RETELL_API_KEY, agentId: env.RETELL_AGENT_ID, from: env.RETELL_FROM_NUMBER };
+    const original = { apiKey: env.RETELL_API_KEY, from: env.RETELL_FROM_NUMBER };
     env.RETELL_API_KEY = 'mock_capacity';
-    env.RETELL_AGENT_ID = 'agent_capacity';
     env.RETELL_FROM_NUMBER = '+15550000001';
     try {
     const campaign = await db.receptionistOutboundCampaign.create({
-      data: { tenantId: tenant.id, clinicId: tenant.clinicId, name: 'Capacity queue', script: 'Call the patient.', requiredFields: ['phone'], status: 'RUNNING' },
+      data: { tenantId: tenant.id, clinicId: tenant.clinicId, agentId: tenant.agentId, name: 'Capacity queue', script: 'Call the patient.', requiredFields: ['phone'], status: 'RUNNING' },
     });
     await db.receptionistCallLog.createMany({
       data: [1, 2, 3].map(n => ({ tenantId: tenant.id, clinicId: tenant.clinicId, outboundCampaignId: campaign.id, callerPhone: `+1555101040${n}`, outcome: 'IN_PROGRESS' })),
@@ -176,7 +184,6 @@ describe('AI receptionist outbound targets', () => {
     expect(spent.json()).toMatchObject({ status: 'blocked', reason: 'voice_minutes_limit_reached' });
     } finally {
       env.RETELL_API_KEY = original.apiKey;
-      env.RETELL_AGENT_ID = original.agentId;
       env.RETELL_FROM_NUMBER = original.from;
     }
   });
@@ -185,16 +192,15 @@ describe('AI receptionist outbound targets', () => {
     const tenant = await makeTenant();
     const headers = auth(tenant, tenant.userId);
     const campaign = await db.receptionistOutboundCampaign.create({
-      data: { tenantId: tenant.id, clinicId: tenant.clinicId, name: 'Atomic queue', script: 'Call the patient.', requiredFields: ['phone'], status: 'RUNNING', maxRetryAttempts: 0 },
+      data: { tenantId: tenant.id, clinicId: tenant.clinicId, agentId: tenant.agentId, name: 'Atomic queue', script: 'Call the patient.', requiredFields: ['phone'], status: 'RUNNING', maxRetryAttempts: 0 },
     });
     const target = await db.receptionistCallTarget.create({
       data: { tenantId: tenant.id, campaignId: campaign.id, phone: '+15551010202' },
     });
-    const original = { apiKey: env.RETELL_API_KEY, agentId: env.RETELL_AGENT_ID, from: env.RETELL_FROM_NUMBER, base: env.RETELL_BASE_URL };
+    const original = { apiKey: env.RETELL_API_KEY, from: env.RETELL_FROM_NUMBER, base: env.RETELL_BASE_URL };
 
     try {
       env.RETELL_API_KEY = 'mock_atomic_claim';
-      env.RETELL_AGENT_ID = 'agent_atomic';
       env.RETELL_FROM_NUMBER = '+15550000001';
       const payload = { phone: target.phone, targetId: target.id };
       const [first, second] = await Promise.all([
@@ -208,15 +214,41 @@ describe('AI receptionist outbound targets', () => {
       const failingTarget = await db.receptionistCallTarget.create({ data: { tenantId: tenant.id, campaignId: campaign.id, phone: '+15551010303' } });
       env.RETELL_API_KEY = 'real_provider_key';
       env.RETELL_BASE_URL = 'https://retell.invalid';
-      vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ message: 'provider unavailable' }), { status: 503, headers: { 'content-type': 'application/json' } })));
+      const providerFetch = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ message: 'provider unavailable' }), { status: 503, headers: { 'content-type': 'application/json' } }));
+      vi.stubGlobal('fetch', providerFetch);
       const failed = await app.inject({ method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaign.id}/call`, headers, payload: { phone: failingTarget.phone, targetId: failingTarget.id } });
       expect(failed.statusCode).toBe(502);
       expect(failed.json()).toMatchObject({ status: 'failed' });
+      const providerRequest = providerFetch.mock.calls[0]?.[1] as RequestInit;
+      expect(JSON.parse(String(providerRequest.body))).toMatchObject({
+        override_agent_id: `agent_${tenant.id.replaceAll('-', '')}`,
+        override_agent_version: 1,
+      });
       expect(await db.receptionistCallTarget.findUnique({ where: { id: failingTarget.id } })).toMatchObject({ status: 'FAILED', attempts: 1, lastOutcome: 'FAILED' });
       expect(await db.receptionistCallLog.count({ where: { tenantId: tenant.id, targetId: failingTarget.id, outcome: 'IN_PROGRESS' } })).toBe(0);
+
+      const mismatchTarget = await db.receptionistCallTarget.create({ data: { tenantId: tenant.id, campaignId: campaign.id, phone: '+15551010304' } });
+      providerFetch.mockImplementation(async (url) => String(url).includes('/v2/create-phone-call')
+        ? new Response(JSON.stringify({ call_id: 'call-provider-mismatch', agent_id: 'agent_wrong', agent_version: 1 }), { status: 201 })
+        : new Response(null, { status: 204 }));
+      const mismatch = await app.inject({
+        method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaign.id}/call`, headers,
+        payload: { phone: mismatchTarget.phone, targetId: mismatchTarget.id },
+      });
+      expect(mismatch.statusCode).toBe(502);
+      expect(mismatch.json()).toMatchObject({ status: 'failed', error: 'retell_deployment_mismatch' });
+      expect(await db.receptionistCallLog.findFirst({ where: { tenantId: tenant.id, targetId: mismatchTarget.id } })).toMatchObject({
+        retellCallId: 'call-provider-mismatch', outcome: 'FAILED',
+      });
+      expect(await db.auditEvent.findFirst({
+        where: { tenantId: tenant.id, action: 'receptionist.call.providerDeploymentMismatch' },
+      })).toMatchObject({ metadata: expect.objectContaining({ operationalReviewRequired: true, providerStopApplied: true }) });
+      expect(providerFetch).toHaveBeenLastCalledWith(
+        'https://retell.invalid/v2/stop-call/call-provider-mismatch',
+        expect.objectContaining({ method: 'POST' }),
+      );
     } finally {
       env.RETELL_API_KEY = original.apiKey;
-      env.RETELL_AGENT_ID = original.agentId;
       env.RETELL_FROM_NUMBER = original.from;
       env.RETELL_BASE_URL = original.base;
       vi.unstubAllGlobals();

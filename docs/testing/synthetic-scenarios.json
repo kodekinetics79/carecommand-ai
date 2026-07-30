@@ -689,6 +689,159 @@
       "resetStrategy": "DROP_DISPOSABLE_DATABASE"
     },
     {
+      "scenarioId": "REC-012",
+      "profile": "FUNCTIONAL",
+      "tenant": "functional-family",
+      "actors": [
+        "receptionist-manager"
+      ],
+      "preconditions": [
+        "published Retell agent",
+        "production tag assigned",
+        "approved webhook and privacy controls"
+      ],
+      "inputEvent": "Verify production agent deployment",
+      "expectedDatabaseState": "Immutable provider version and safe readiness snapshot persisted",
+      "expectedApiResult": "200 verified agent",
+      "expectedUiResult": "Verified badge and pinned version shown",
+      "expectedAuditEvents": [
+        "RECEPTIONIST_AGENT_PROVIDER_VERIFIED"
+      ],
+      "expectedAuthorization": "Receptionist managers may verify only agents in their clinic and tenant",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistAgentProvider.unit.test.ts",
+        "server/test/receptionistConfiguration.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-013",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "receptionist-manager"
+      ],
+      "preconditions": [
+        "Retell agent missing requested environment tag or required privacy control"
+      ],
+      "inputEvent": "Verify unsafe provider deployment",
+      "expectedDatabaseState": "Agent remains invalid or unverified; no runnable deployment created",
+      "expectedApiResult": "422 provider configuration rejected",
+      "expectedUiResult": "Safe corrective checklist shown without provider secret or prompt",
+      "expectedAuditEvents": [
+        "RECEPTIONIST_AGENT_PROVIDER_VERIFICATION_FAILED"
+      ],
+      "expectedAuthorization": "Provider response cannot bypass production readiness controls",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistAgentProvider.unit.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-014",
+      "profile": "EDGE",
+      "tenant": "edge-multitenant",
+      "actors": [
+        "tenant-a-manager"
+      ],
+      "preconditions": [
+        "Tenant B clinic and agent identifiers known"
+      ],
+      "inputEvent": "Bind foreign agent to campaign",
+      "expectedDatabaseState": "No cross-tenant or cross-clinic relationship stored",
+      "expectedApiResult": "404 or database foreign-key denial",
+      "expectedUiResult": "No foreign agent shown",
+      "expectedAuditEvents": [
+        "security.cross_tenant.denied"
+      ],
+      "expectedAuthorization": "Tenant and clinic ownership are enforced by API and composite database constraints",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistConfiguration.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-015",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "receptionist-manager"
+      ],
+      "preconditions": [
+        "previously verified agent",
+        "provider timeout",
+        "verification freshness expires"
+      ],
+      "inputEvent": "Retry provider verification then activate campaign",
+      "expectedDatabaseState": "Last safe snapshot retained with failed probe evidence; stale deployment remains non-runnable",
+      "expectedApiResult": "503 verify failure then 409 activation blocked",
+      "expectedUiResult": "Previous snapshot and safe failure state shown",
+      "expectedAuditEvents": [
+        "RECEPTIONIST_AGENT_PROVIDER_VERIFICATION_FAILED"
+      ],
+      "expectedAuthorization": "A transient provider failure never silently authorizes a stale deployment",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistConfiguration.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-016",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "receptionist-manager"
+      ],
+      "preconditions": [
+        "verification in flight",
+        "agent relinked concurrently"
+      ],
+      "inputEvent": "Complete stale provider verification response",
+      "expectedDatabaseState": "Relinked configuration remains unchanged",
+      "expectedApiResult": "409 configuration changed",
+      "expectedUiResult": "Operator is prompted to verify the current link",
+      "expectedAuditEvents": [
+        "RECEPTIONIST_AGENT_UPDATED"
+      ],
+      "expectedAuthorization": "Optimistic revision prevents stale verification overwrite",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistConfiguration.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-017",
+      "profile": "FUNCTIONAL",
+      "tenant": "functional-family",
+      "actors": [
+        "receptionist-manager"
+      ],
+      "preconditions": [
+        "fresh verified immutable agent",
+        "eligible outbound target"
+      ],
+      "inputEvent": "Activate and launch outbound campaign",
+      "expectedDatabaseState": "Campaign audit commits atomically and call binds the verified agent version",
+      "expectedApiResult": "201/200 with exact provider ID and numeric version override",
+      "expectedUiResult": "Runnable campaign and truthful call state shown",
+      "expectedAuditEvents": [
+        "RECEPTIONIST_CAMPAIGN_CREATED",
+        "RECEPTIONIST_OUTBOUND_CALL_STARTED"
+      ],
+      "expectedAuthorization": "Every activation and dial rechecks same-tenant, same-clinic, fresh verified readiness",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistConfiguration.integration.test.ts",
+        "server/test/receptionistOutboundTargets.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
       "scenarioId": "FIN-001",
       "profile": "FUNCTIONAL",
       "tenant": "functional-family",

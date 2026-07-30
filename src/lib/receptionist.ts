@@ -56,6 +56,18 @@ export interface Agent {
   persona: string | null;
   greetingOverride: string | null;
   active: boolean;
+  providerAgentId: string | null;
+  providerVersionTag: string;
+  providerVersion: number | null;
+  providerStatus: 'UNVERIFIED' | 'VERIFIED' | 'INVALID';
+  providerPublished: boolean | null;
+  providerVoiceId: string | null;
+  providerLanguage: string | null;
+  providerVerifiedAt: string | null;
+  providerVerificationExpiresAt: string | null;
+  providerLastAttemptAt: string | null;
+  providerLastAttemptStatus: 'NEVER' | 'SUCCEEDED' | 'FAILED';
+  providerLastErrorCode: string | null;
 }
 
 export interface Clinic {
@@ -210,6 +222,7 @@ export interface RetellStatus {
   configured: boolean;
   mock: boolean;
   missing: string[];
+  readyAgents: number;
   checklist: Array<{ key: string; label: string; set: boolean }>;
 }
 
@@ -370,6 +383,7 @@ export const receptionistApi = {
   listAgents: (clinicId: string) => apiRequest<Agent[]>(`${base}/agents?clinicId=${clinicId}`),
   createAgent: (body: Partial<Agent> & { clinicId: string }) => apiRequest<Agent>(`${base}/agents`, { method: 'POST', body: JSON.stringify(body) }),
   updateAgent: (id: string, body: Partial<Agent>) => apiRequest<Agent>(`${base}/agents/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  verifyAgentProvider: (id: string) => apiRequest<Agent>(`${base}/agents/${id}/verify-provider`, { method: 'POST' }),
   deleteAgent: (id: string) => apiRequest<void>(`${base}/agents/${id}`, { method: 'DELETE' }),
 
   listCampaigns: (clinicId: string) => apiRequest<Campaign[]>(`${base}/campaigns?clinicId=${clinicId}`),

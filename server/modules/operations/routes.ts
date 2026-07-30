@@ -197,7 +197,7 @@ const integrationCatalog: IntegrationCatalogEntry[] = [
     category: 'AI Voice',
     description: 'Outbound AI receptionist voice calls and webhook handoff.',
     supportedWorkflows: ['Outbound calling', 'Appointment request capture', 'Call webhook handoff'],
-    envVars: ['RETELL_API_KEY', 'RETELL_AGENT_ID', 'RETELL_FROM_NUMBER'],
+    envVars: ['RETELL_API_KEY', 'RETELL_FROM_NUMBER'],
     providerType: 'integration',
   },
 ] as const;
@@ -312,7 +312,7 @@ async function buildIntegrationStatuses(tenantId: string) {
       health = configured ? 'healthy' : 'not_configured';
       lastSyncAt = latestLog?.createdAt.toISOString() ?? null;
     } else if (entry.key === 'retell') {
-      configured = Boolean(env.RETELL_API_KEY && env.RETELL_AGENT_ID && env.RETELL_FROM_NUMBER);
+      configured = Boolean(env.RETELL_API_KEY && env.RETELL_FROM_NUMBER);
       mode = !configured ? 'mock' : env.RETELL_API_KEY!.startsWith('mock') ? 'sandbox' : 'live';
       health = configured ? 'healthy' : 'not_configured';
       lastSyncAt = latestLog?.createdAt.toISOString() ?? null;

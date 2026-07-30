@@ -41,8 +41,18 @@ async function makeTenant() {
   await db.providerAvailability.createMany({ data: Array.from({ length: 7 }, (_, dayOfWeek) => ({ tenantId: id, branchId: branch.id, providerProfileId: provider.id, dayOfWeek, startMinute: 540, endMinute: 1020, slotMinutes: 30 })) });
   const patient = await db.patient.create({ data: { tenantId: id, branchId: branch.id, firstName: 'Pat', lastName: 'Roe', lifecycleStage: 'ACTIVE' }, select: { id: true } });
   const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Clinic', phone: phoneFor(id) }, select: { id: true } });
-  await db.receptionistAgent.create({ data: { tenantId: id, clinicId: clinic.id, name: 'Avery', active: true } });
-  return { id, branchId: branch.id, adminId: admin.id, providerId: provider.id, patientId: patient.id, clinicId: clinic.id };
+  const now = new Date();
+  const agent = await db.receptionistAgent.create({ data: {
+    tenantId: id, clinicId: clinic.id, name: 'Avery', active: true,
+    providerAgentId: `agent_${id.replaceAll('-', '')}`, providerVersionTag: 'prod', providerVersion: 1,
+    providerStatus: 'VERIFIED', providerPublished: true, providerAssignedTags: ['prod'], providerFingerprint: 'b'.repeat(64),
+    providerWebhookUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`,
+    providerWebhookEvents: ['call_started', 'call_ended', 'call_analyzed'], providerDataStorageSetting: 'basic_attributes_only', providerSignedUrl: true,
+    providerResponseEngineType: 'retell-llm', providerResponseEngineId: `llm_${id.replaceAll('-', '')}`,
+    providerConfigRevision: 1, providerVerifiedRevision: 1, providerVerifiedAt: now,
+    providerVerificationExpiresAt: new Date(now.getTime() + 60 * 60 * 1_000),
+  }, select: { id: true } });
+  return { id, branchId: branch.id, adminId: admin.id, providerId: provider.id, patientId: patient.id, clinicId: clinic.id, agentId: agent.id };
 }
 type T = Awaited<ReturnType<typeof makeTenant>>;
 const adminAuth = (t: T) => ({ authorization: `Bearer ${app.jwt.sign({ userId: t.adminId, tenantId: t.id, role: 'ADMIN', type: 'access' })}` });
@@ -330,7 +340,7 @@ describe('receptionist outbound dial — opt-out gate (FIX 4)', () => {
     const t = await makeTenant();
     const optedPhone = '+15553330001';
     await db.receptionistOptOut.create({ data: { tenantId: t.id, contactPhone: optedPhone, channel: 'ALL', reason: 'AI call' } });
-    const campaign = await db.receptionistOutboundCampaign.create({ data: { tenantId: t.id, clinicId: t.clinicId, name: 'Cleanup', script: 'Call the patient.', requiredFields: ['firstName', 'lastName', 'phone'], status: 'RUNNING' }, select: { id: true } });
+    const campaign = await db.receptionistOutboundCampaign.create({ data: { tenantId: t.id, clinicId: t.clinicId, agentId: t.agentId, name: 'Cleanup', script: 'Call the patient.', requiredFields: ['firstName', 'lastName', 'phone'], status: 'RUNNING' }, select: { id: true } });
 
     const res = await app.inject({ method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaign.id}/call`, headers: adminAuth(t), payload: { phone: optedPhone, firstName: 'Opted', lastName: 'Out' } });
     expect(res.statusCode).toBe(200);
@@ -345,7 +355,7 @@ describe('receptionist outbound dial — opt-out gate (FIX 4)', () => {
 
   it('a non-opted-out number is NOT skipped by the gate (contrast: falls through to provider setup)', async () => {
     const t = await makeTenant();
-    const campaign = await db.receptionistOutboundCampaign.create({ data: { tenantId: t.id, clinicId: t.clinicId, name: 'Cleanup', script: 'Call the patient.', requiredFields: ['firstName', 'lastName', 'phone'], status: 'RUNNING' }, select: { id: true } });
+    const campaign = await db.receptionistOutboundCampaign.create({ data: { tenantId: t.id, clinicId: t.clinicId, agentId: t.agentId, name: 'Cleanup', script: 'Call the patient.', requiredFields: ['firstName', 'lastName', 'phone'], status: 'RUNNING' }, select: { id: true } });
     const res = await app.inject({ method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaign.id}/call`, headers: adminAuth(t), payload: { phone: '+15553330002', firstName: 'Fresh', lastName: 'Lead' } });
     expect(res.statusCode).toBe(200);
     // Retell is unconfigured in test → the gate passed and we reach setup_required

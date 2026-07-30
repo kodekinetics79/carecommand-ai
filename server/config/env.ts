@@ -202,7 +202,6 @@ const baseEnvSchema = z.object({
   DEV_USER_ID: z.string().uuid().optional(),
   PUBLIC_API_URL: z.string().url().default('http://localhost:3001'),
   RETELL_API_KEY: z.string().optional(),
-  RETELL_AGENT_ID: z.string().optional(),
   RETELL_FROM_NUMBER: z.string().optional(),
   RETELL_BASE_URL: z.string().url().default('https://api.retellai.com'),
   // Platform control plane legacy token (separate from tenant UserRole). In

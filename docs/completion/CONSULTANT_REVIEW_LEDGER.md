@@ -13,6 +13,7 @@ until a later independent entry explicitly supersedes it.
 | Foundation/master data | PASS | P0/P1/P2: 0; P3 retired compatibility removal, indexed canonical phone at scale, pg client warning | `524169f`, `70923c5`, `1bb1c1e`; 40/40; real route and cross-entry race proofs | ACCEPTED for reviewed F1–F7 scope |
 | Market/AI Receptionist pilot review | REJECT | P1 unsupported parity/advantage claims, unsegmented/narrow market set and non-quantitative acceptance; P2 provider coopetition, TCO, adversarial scenarios and unbuilt-roadmap ambiguity | claims demoted, ICP/market expanded, quantitative phased protocol and stop rules added, roadmap labeled NOT BUILT | Superseded by PASS |
 | Market/AI Receptionist pilot review | PASS | P0/P1/P2: 0; P3 named live approvers and pre-result threshold calibration | `8f9f0e5`; seven vendor primary-source families; 300-call simulation, 100 shadow and capped live protocol | ACCEPTED as review artifact; live evidence not implied |
+| M09-F02 immutable receptionist agent deployment | REJECT | P0: create-call response deployment mismatch not stopped; P1: V0, moving-tag repin, cross-tag deployment ownership, 400/422 permanence, clinic-branch mapping; P2: tag grammar, global agent fallback surfaces, unique conflict, DB shape and UI truthfulness/evidence | Remediated candidate passes fresh 71 migrations, focused 59/59, receptionist 114/114, RLS 962/962, drift/typecheck/lint/build; independent re-review pending | OPEN — cannot be marked complete until a later PASS |
 
 ## Review independence
 
