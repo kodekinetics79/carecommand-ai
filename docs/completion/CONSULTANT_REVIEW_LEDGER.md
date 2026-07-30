@@ -10,6 +10,8 @@ until a later independent entry explicitly supersedes it.
 | Pilot topology/release controls | REJECT | P1 invalid environment-group secret prompting; P1 cross-site cookie omission; P2 public-URL and migration-principal bypasses; accessibility false negatives | service-level external vars, SameSite=None, strict URL classes, isolated principal guard, strengthened browser contract | Superseded by PASS |
 | Pilot topology/release controls/accessibility | PASS | Residual repository P0/P1/P2: 0 | `3ac14ac`, `a07ba0f`, `5634aa5`; structural 28/28; desktop browser 5/5; gitleaks full history; CycloneDX SBOM | ACCEPTED; environment and formal WCAG gates external |
 | Foundation/master data | REJECT | P1 fabricated/bounded patient facts presented as network metrics; P1 front-desk task regression; P1 clinician-owner identity and provisioning integrity; P2 patient/clinic races and lifecycle collisions | implementation pod remediation in progress | OPEN — cannot be marked complete |
+| Market/AI Receptionist pilot review | REJECT | P1 unsupported parity/advantage claims, unsegmented/narrow market set and non-quantitative acceptance; P2 provider coopetition, TCO, adversarial scenarios and unbuilt-roadmap ambiguity | claims demoted, ICP/market expanded, quantitative phased protocol and stop rules added, roadmap labeled NOT BUILT | Superseded by PASS |
+| Market/AI Receptionist pilot review | PASS | P0/P1/P2: 0; P3 named live approvers and pre-result threshold calibration | `8f9f0e5`; seven vendor primary-source families; 300-call simulation, 100 shadow and capped live protocol | ACCEPTED as review artifact; live evidence not implied |
 
 ## Review independence
 
