@@ -1,7 +1,7 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { timingSafeEqual } from 'node:crypto';
 import { env } from '../config/env';
-import { db } from './db';
+import { platformDb } from './platformDb';
 import type { Prisma } from '../generated/prisma/client';
 
 // ===========================================================================
@@ -44,7 +44,7 @@ export async function requirePlatformOperator(request: FastifyRequest, reply: Fa
 
 // Platform actions have no tenant session, so audit directly (system actor).
 export async function platformAudit(tenantId: string, action: string, resourceId: string | null, metadata?: Prisma.InputJsonObject) {
-  await db.auditEvent.create({
-    data: { tenantId, actorUserId: null, action, resource: 'platform', resourceId: resourceId ?? undefined, userAgent: 'platform-operator', metadata },
+  await platformDb.platformAuditEvent.create({
+    data: { tenantId, action, targetType: 'platform', targetId: resourceId ?? undefined, metadata },
   });
 }

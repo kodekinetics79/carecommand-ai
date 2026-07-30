@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { createHash } from 'node:crypto';
-import { db } from './db';
+import { platformDb } from './platformDb';
+import { enterPlatformDatabaseContext } from './platformContextStore';
 import { env } from '../config/env';
 import { effectivePlatformToken } from './platform';
 import { safeEqual, generatePasswordHash } from './security';
@@ -45,6 +46,37 @@ export function hashV(value?: string | null): string | null {
   return createHash('sha256').update(value).digest('hex').slice(0, 32);
 }
 
+/** Bind a resolved database identity to request-level and database audit context. */
+export function attachPlatformActorContext(
+  request: FastifyRequest,
+  user: { id: string; role: string; email?: string },
+): PlatformActor {
+  const actor: PlatformActor = { id: user.id, role: user.role as PlatformRole, legacy: false, email: user.email };
+  request.platformUser = actor;
+  enterPlatformDatabaseContext({ actorId: actor.id, actorRole: actor.role });
+  return actor;
+}
+
+type PlatformAuditTarget = { type: string; id?: string | null; tenantId?: string | null };
+
+function platformAuditData(
+  request: FastifyRequest | null,
+  action: string,
+  target: PlatformAuditTarget,
+  metadata?: Prisma.InputJsonObject,
+): Prisma.PlatformAuditEventUncheckedCreateInput {
+  return {
+    platformUserId: request?.platformUser && !request.platformUser.legacy ? request.platformUser.id : undefined,
+    action,
+    targetType: target.type,
+    targetId: target.id ?? undefined,
+    tenantId: target.tenantId ?? undefined,
+    ipHash: hashV(request?.ip),
+    userAgentHash: hashV(typeof request?.headers['user-agent'] === 'string' ? request.headers['user-agent'] : null),
+    metadata,
+  };
+}
+
 // preHandler: requires a platform JWT, or a legacy static token only when
 // explicitly enabled by effectivePlatformToken(). Optional role gate.
 export function requirePlatformAccess(...allowedRoles: PlatformRole[]) {
@@ -55,7 +87,7 @@ export function requirePlatformAccess(...allowedRoles: PlatformRole[]) {
     try {
       const payload = await request.jwtVerify<PlatformJwt>();
       if (payload?.type === 'platform' && payload.platformUserId) {
-        const pu = await db.platformUser.findFirst({ where: { id: payload.platformUserId, status: 'active' }, select: { id: true, role: true, email: true } });
+        const pu = await platformDb.platformUser.findFirst({ where: { id: payload.platformUserId, status: 'active' }, select: { id: true, role: true, email: true } });
         if (pu) actor = { id: pu.id, role: pu.role as PlatformRole, legacy: false, email: pu.email };
       }
     } catch { /* not a platform JWT — try legacy token */ }
@@ -75,20 +107,53 @@ export function requirePlatformAccess(...allowedRoles: PlatformRole[]) {
     if (allowedRoles.length && !platformRoleAllowed(actor.role, allowedRoles)) {
       return reply.code(403).send({ error: 'platform_forbidden', message: 'Your platform role cannot perform this action.' });
     }
-    request.platformUser = actor;
+    if (actor.legacy) request.platformUser = actor;
+    else attachPlatformActorContext(request, actor);
   };
 }
 
 // --- Platform audit (no tenant scope required; no PHI/secrets) --------------
-export async function platformAuditEvent(request: FastifyRequest | null, action: string, target: { type: string; id?: string | null; tenantId?: string | null }, metadata?: Prisma.InputJsonObject) {
-  await db.platformAuditEvent.create({
-    data: {
-      platformUserId: request?.platformUser && !request.platformUser.legacy ? request.platformUser.id : undefined,
-      action, targetType: target.type, targetId: target.id ?? undefined, tenantId: target.tenantId ?? undefined,
-      ipHash: hashV(request?.ip), userAgentHash: hashV(typeof request?.headers['user-agent'] === 'string' ? request.headers['user-agent'] : null),
-      metadata,
-    },
-  }).catch(() => {});
+export async function createPlatformAuditEvent(
+  client: Prisma.TransactionClient,
+  request: FastifyRequest | null,
+  action: string,
+  target: PlatformAuditTarget,
+  metadata?: Prisma.InputJsonObject,
+) {
+  return client.platformAuditEvent.create({ data: platformAuditData(request, action, target, metadata) });
+}
+
+/**
+ * Persist a standalone platform security event. Audit failure is deliberately
+ * propagated: callers must never acknowledge a privileged action without its
+ * security evidence.
+ */
+export async function platformAuditEvent(request: FastifyRequest | null, action: string, target: PlatformAuditTarget, metadata?: Prisma.InputJsonObject) {
+  return platformDb.platformAuditEvent.create({ data: platformAuditData(request, action, target, metadata) });
+}
+
+/** Execute a platform-plane mutation and its audit evidence on one connection. */
+export function runPlatformAuditedMutation<T>(
+  request: FastifyRequest,
+  event: (result: T) => { action: string; target: PlatformAuditTarget; metadata?: Prisma.InputJsonObject },
+  mutate: (tx: Prisma.TransactionClient) => Promise<T>,
+): Promise<T>;
+export function runPlatformAuditedMutation<T>(
+  request: FastifyRequest,
+  event: { action: string; target: PlatformAuditTarget; metadata?: Prisma.InputJsonObject },
+  mutate: (tx: Prisma.TransactionClient) => Promise<T>,
+): Promise<T>;
+export async function runPlatformAuditedMutation<T>(
+  request: FastifyRequest,
+  event: { action: string; target: PlatformAuditTarget; metadata?: Prisma.InputJsonObject } | ((result: T) => { action: string; target: PlatformAuditTarget; metadata?: Prisma.InputJsonObject }),
+  mutate: (tx: Prisma.TransactionClient) => Promise<T>,
+): Promise<T> {
+  return platformDb.$transaction(async tx => {
+    const result = await mutate(tx);
+    const resolved = typeof event === 'function' ? event(result) : event;
+    await createPlatformAuditEvent(tx, request, resolved.action, resolved.target, resolved.metadata);
+    return result;
+  });
 }
 
 // --- First PLATFORM_OWNER seed (env-only; no weak default in production) ----
@@ -97,8 +162,22 @@ export async function ensurePlatformOwnerSeed(): Promise<{ seeded: boolean; reas
   const password = env.PLATFORM_OWNER_PASSWORD;
   const name = env.PLATFORM_OWNER_NAME ?? 'Platform Owner';
   if (!email || !password) return { seeded: false, reason: 'env_not_set' };
-  const existing = await db.platformUser.findUnique({ where: { email } });
-  if (existing) return { seeded: false, reason: 'already_exists' };
-  await db.platformUser.create({ data: { email, name, passwordHash: await generatePasswordHash(password), role: 'PLATFORM_OWNER', status: 'active' } });
-  return { seeded: true, reason: 'created' };
+  const passwordHash = await generatePasswordHash(password);
+  return platformDb.$transaction(async tx => {
+    const existing = await tx.platformUser.findUnique({ where: { email } });
+    if (existing) return { seeded: false, reason: 'already_exists' };
+    const owner = await tx.platformUser.create({
+      data: { email, name, passwordHash, role: 'PLATFORM_OWNER', status: 'active' },
+    });
+    await tx.platformAuditEvent.create({
+      data: {
+        platformUserId: owner.id,
+        action: 'platform.owner.seeded',
+        targetType: 'platformUser',
+        targetId: owner.id,
+        metadata: { source: 'environment' },
+      },
+    });
+    return { seeded: true, reason: 'created' };
+  });
 }
