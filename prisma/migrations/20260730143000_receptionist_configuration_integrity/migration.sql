@@ -39,7 +39,7 @@ BEGIN
     CROSS JOIN LATERAL (
       SELECT '+' || regexp_replace(c.phone, '[^0-9]', '', 'g') AS canonical_phone
     ) normalized
-    WHERE left(trim(c.phone), 1) <> '+'
+    WHERE trim(c.phone) !~ '^\+[0-9][0-9().[:space:]-]*$'
        OR normalized.canonical_phone !~ '^\+[1-9][0-9]{7,14}$'
   ) THEN
     RAISE EXCEPTION 'receptionist_destination_invalid_e164: reconcile ReceptionistClinic.phone before migration';

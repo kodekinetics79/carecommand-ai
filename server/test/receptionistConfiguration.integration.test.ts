@@ -2,6 +2,7 @@ import 'dotenv/config';
 
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import type { FastifyInstance } from 'fastify';
 
 vi.mock('../workers/queues', () => ({
@@ -21,6 +22,9 @@ type Role = 'OWNER' | 'MANAGER' | 'BILLING';
 type TenantFixture = { id: string; users: Record<Role, string>; branchId: string };
 const tenantIds: string[] = [];
 let app: FastifyInstance;
+const migrationSql = readFileSync(new URL('../../prisma/migrations/20260730143000_receptionist_configuration_integrity/migration.sql', import.meta.url), 'utf8');
+const migrationPreflight = migrationSql.match(/DO \$preflight\$[\s\S]*?\$preflight\$;/)?.[0];
+const migrationCanonicalization = migrationSql.match(/UPDATE "ReceptionistClinic" c[\s\S]*?;(?=\n\nALTER TABLE "ReceptionistClinic")/)?.[0];
 
 const phone = () => `+1${(BigInt(`0x${randomUUID().replace(/-/g, '').slice(0, 14)}`) % 10_000_000_000n).toString().padStart(10, '0')}`;
 
@@ -64,6 +68,30 @@ afterAll(async () => {
 });
 
 describe('AI receptionist trusted configuration', () => {
+  it('migration rejects alphabetic/extensions before canonicalization and safely normalizes formatting-only legacy values', async () => {
+    expect(migrationPreflight).toBeTruthy();
+    expect(migrationCanonicalization).toBeTruthy();
+    const t = await tenant();
+    for (const malformed of ['+1 (212) 555-0100 ext 4', '+1212ABC5550100']) {
+      await expect(db.$transaction(async tx => {
+        await tx.$executeRawUnsafe('ALTER TABLE "ReceptionistClinic" DROP CONSTRAINT "ReceptionistClinic_phone_e164_check"');
+        await tx.receptionistClinic.create({ data: { tenantId: t.id, name: `Malformed ${randomUUID()}`, phone: malformed } });
+        await tx.$executeRawUnsafe(migrationPreflight!);
+      })).rejects.toThrow(/receptionist_destination_invalid_e164/);
+    }
+
+    const canonical = phone();
+    const formatted = `+${canonical.slice(1, 2)} (${canonical.slice(2, 5)}) ${canonical.slice(5, 8)}-${canonical.slice(8)}`;
+    await expect(db.$transaction(async tx => {
+      await tx.$executeRawUnsafe('ALTER TABLE "ReceptionistClinic" DROP CONSTRAINT "ReceptionistClinic_phone_e164_check"');
+      const row = await tx.receptionistClinic.create({ data: { tenantId: t.id, name: `Formatted ${randomUUID()}`, phone: formatted } });
+      await tx.$executeRawUnsafe(migrationPreflight!);
+      await tx.$executeRawUnsafe(migrationCanonicalization!);
+      expect((await tx.receptionistClinic.findUniqueOrThrow({ where: { id: row.id } })).phone).toBe(canonical);
+      throw new Error('ROLLBACK_FORMATTED_MIGRATION_PROBE');
+    })).rejects.toThrow('ROLLBACK_FORMATTED_MIGRATION_PROBE');
+  });
+
   it('enforces management RBAC and validates canonical phones, IANA timezones, and structured hours', async () => {
     const t = await tenant();
     const denied = await app.inject({
