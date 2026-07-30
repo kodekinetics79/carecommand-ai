@@ -1,0 +1,16 @@
+# M10 Patient Portal — Feature Inventory
+
+Pod: Portal Pod. Embedded consultant: patient-experience/accessibility consultant. Independent reviewer: portal privacy/accessibility consultant. Data: PHI-H/PHI-M. Dependencies: M01, M04, M06, M07, M12, M13, M19, M22, M23.
+
+| ID | Feature/value | Roles/journeys | UI/API trace | Data/jobs/integrations | Controls/audit/isolation/flags/demo | Evidence/missing/acceptance | Status |
+|---|---|---|---|---|---|---|---|
+| M10-F01 | Portal access request/signup | Patient/adult; match, duplicate, minor/guardian, mismatch | `/client/login`; portal auth/admin APIs | `PortalAccessRequest`, `PatientPortalAccount` | fail-closed minor/guardian, tenant/patient match, review audit | Signup tests accepted guardian fail-closed; production delivery external | IN DISCOVERY |
+| M10-F02 | Magic-link/code verification and session | Patient; request/verify/replay/expire/logout | portal auth APIs/client memory token | `PatientPortalToken`, account session fields | hashed one-time code, short memory bearer, HMAC-JTI server session, revoke/audit | Portal session/logout/replay tests accepted | COMPLETE |
+| M10-F03 | Portal dashboard | Patient; data/empty/expired | `/client` → `/portal/dashboard` | patient appointments/requests/intake | self-only, minimized PHI, truthful unavailable | Golden journey covers dashboard; data completeness/accessibility evidence incomplete | IN DISCOVERY |
+| M10-F04 | Appointment list/request | Patient; own list/create request/foreign | portal appointments/requests | appointment/request models | self-only, policy, audit, no false booking | Portal tests pass; full browser alternate/negative matrix incomplete | IN DISCOVERY |
+| M10-F05 | Self-service booking/cancel/reschedule | Patient; slots/book/change/late/race | portal booking/change APIs | M07 models, M13 deposits | self-only, canonical transaction, scheduling policy, audit | Portal booking/self-service/cross-path tests pass | COMPLETE |
+| M10-F06 | Intake completion | Patient; open/save/submit/expired | `/client/intake`; portal intake APIs | M06 intake models | self-only packet, explicit acknowledgement, audit | Portal/intake tests exist; browser resume/error/accessibility incomplete | IN DISCOVERY |
+| M10-F07 | Insurance maintenance | Patient; view/add/edit, overlap/foreign policy | `/client/insurance`; portal insurance APIs | M12 policy models | self-only, payer/policy integrity, audit | Policy-integrity tests include portal paths; full browser evidence incomplete | IN DISCOVERY |
+| M10-F08 | Payments/estimates/acknowledgements | Patient; view, acknowledge, unavailable link | `/client/payments`; portal payment APIs | M13 estimates/requests | self-only opaque link, truthful unavailable, immutable ack/audit | Money/portal tests exist; live payment journey external | EXTERNAL BLOCKED |
+| M10-F09 | Profile/preferences/consents | Patient; view/update invalid/consents | profile/preferences/consents APIs | `Patient`, M22 preference, consent models | allow-listed self fields, audit, no staff field access | Portal tests cover selected paths; complete browser/accessibility/consent version evidence incomplete | IN DISCOVERY |
+

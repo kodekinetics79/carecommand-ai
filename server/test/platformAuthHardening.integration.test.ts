@@ -59,6 +59,19 @@ async function platformUser(input: { email: string; password: string; status?: s
 }
 
 describe('platform authentication enumeration resistance', () => {
+  it('revokes the invoking high-privilege JWT on logout and writes an audit receipt', async () => {
+    const suffix = randomUUID();
+    const user = await platformUser({ email: `logout-${suffix}@platform.test`, password: 'Correct-Logout-Password!' });
+    const login = await app.inject({ method: 'POST', url: '/v1/platform/auth/login', payload: { email: user.email, password: 'Correct-Logout-Password!' } });
+    expect(login.statusCode).toBe(200);
+    const token = login.json().token as string;
+    const headers = { authorization: `Bearer ${token}`, 'x-forwarded-for': '203.0.113.120' };
+    expect((await app.inject({ method: 'GET', url: '/v1/platform/auth/me', headers })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'POST', url: '/v1/platform/auth/logout', headers })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'GET', url: '/v1/platform/auth/me', headers })).statusCode).toBe(401);
+    expect(await platformDb.platformAuditEvent.count({ where: { platformUserId: user.id, action: 'platform.logout', targetId: user.id } })).toBe(1);
+  });
+
   it('always invokes one verifier with valid scrypt work, including the unknown-account path', async () => {
     const verifier = vi.fn(async () => false);
     await expect(verifyPlatformLoginPassword('submitted-password', undefined, verifier)).resolves.toBe(false);

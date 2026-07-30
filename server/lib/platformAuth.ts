@@ -25,14 +25,33 @@ declare module 'fastify' {
   interface FastifyRequest { platformUser?: PlatformActor }
 }
 
-interface PlatformJwt { platformUserId: string; role: PlatformRole; type: 'platform' }
+interface PlatformJwt {
+  platformUserId: string;
+  role: PlatformRole;
+  type: 'platform';
+  sessionIssuedAtMs: number;
+}
 
 export function signPlatformToken(app: FastifyInstance, user: { id: string; role: string }, expiresIn = '8h'): string {
-  return app.jwt.sign({ platformUserId: user.id, role: user.role, type: 'platform' } as PlatformJwt, { expiresIn });
+  return app.jwt.sign({ platformUserId: user.id, role: user.role, type: 'platform', sessionIssuedAtMs: Date.now() } as PlatformJwt, { expiresIn });
 }
 
 export function signPlatformMfaToken(app: FastifyInstance, userId: string): string {
   return app.jwt.sign({ platformUserId: userId, role: 'PLATFORM_MFA' as PlatformRole, type: 'platform-mfa' } as never, { expiresIn: '10m' });
+}
+
+export async function platformSessionWasLoggedOut(platformUserId: string, sessionIssuedAtMs: number): Promise<boolean> {
+  const receipt = await platformDb.platformAuditEvent.findFirst({
+    where: {
+      platformUserId,
+      action: 'platform.logout',
+      targetType: 'platformUser',
+      targetId: platformUserId,
+      metadata: { path: ['sessionIssuedAtMs'], equals: sessionIssuedAtMs },
+    },
+    select: { id: true },
+  });
+  return Boolean(receipt);
 }
 
 // PLATFORM_OWNER always passes; otherwise the role must be in the allowed list.
@@ -87,8 +106,18 @@ export function requirePlatformAccess(...allowedRoles: PlatformRole[]) {
     try {
       const payload = await request.jwtVerify<PlatformJwt>();
       if (payload?.type === 'platform' && payload.platformUserId) {
-        const pu = await platformDb.platformUser.findFirst({ where: { id: payload.platformUserId, status: 'active' }, select: { id: true, role: true, email: true } });
-        if (pu) actor = { id: pu.id, role: pu.role as PlatformRole, legacy: false, email: pu.email };
+        const [pu, loggedOut] = await Promise.all([
+          platformDb.platformUser.findFirst({
+            where: { id: payload.platformUserId, status: 'active' },
+            select: { id: true, role: true, email: true },
+          }),
+          Number.isFinite(payload.sessionIssuedAtMs)
+            ? platformSessionWasLoggedOut(payload.platformUserId, payload.sessionIssuedAtMs)
+            : Promise.resolve(true),
+        ]);
+        if (pu && !loggedOut) {
+          actor = { id: pu.id, role: pu.role as PlatformRole, legacy: false, email: pu.email };
+        }
       }
     } catch { /* not a platform JWT — try legacy token */ }
 
