@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
+import { env } from '../config/env';
 
 vi.mock('../workers/queues', () => ({
   redisConnection: {},
@@ -50,6 +51,13 @@ afterAll(async () => {
 });
 
 describe('foundation clinic and workforce master-data integrity', () => {
+  it('reports the configured refresh-cookie SameSite policy truthfully', async () => {
+    const t = await fixture();
+    const response = await app.inject({ method: 'GET', url: '/v1/security/posture', headers: bearer(t.tenantId, t.owner.id) });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().refreshCookie.sameSite).toBe(env.COOKIE_SAMESITE);
+  });
+
   it('serializes concurrent cross-deactivation so one active administrator always remains', async () => {
     const tenantId = randomUUID();
     tenantIds.push(tenantId);

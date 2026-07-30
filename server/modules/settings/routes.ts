@@ -919,7 +919,7 @@ export const securityRoutes: FastifyPluginAsync = async app => {
       refreshCookie: {
         httpOnly: true,
         secure: env.NODE_ENV === 'production',
-        sameSite: 'Lax',
+        sameSite: env.COOKIE_SAMESITE,
         path: '/v1/auth',
       },
       csrf: {
