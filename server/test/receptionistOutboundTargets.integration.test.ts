@@ -227,6 +227,31 @@ describe('AI receptionist outbound targets', () => {
       expect(await db.receptionistCallTarget.findUnique({ where: { id: failingTarget.id } })).toMatchObject({ status: 'FAILED', attempts: 1, lastOutcome: 'FAILED' });
       expect(await db.receptionistCallLog.count({ where: { tenantId: tenant.id, targetId: failingTarget.id, outcome: 'IN_PROGRESS' } })).toBe(0);
 
+      const relatedScheduled = await db.receptionistOutboundCampaign.create({
+        data: { tenantId: tenant.id, clinicId: tenant.clinicId, agentId: tenant.agentId, name: 'Related scheduled', script: 'Scheduled.', status: 'SCHEDULED' },
+      });
+      const relatedDraft = await db.receptionistOutboundCampaign.create({
+        data: { tenantId: tenant.id, clinicId: tenant.clinicId, agentId: tenant.agentId, name: 'Related draft', script: 'Draft.', status: 'DRAFT' },
+      });
+      const relatedStudioActive = await db.receptionistCampaign.create({
+        data: {
+          tenantId: tenant.id, clinicId: tenant.clinicId, agentId: tenant.agentId, name: 'Related active Studio', status: 'ACTIVE',
+          offerTitle: 'Appointment', offerDescription: 'Schedule care', offerScript: 'Schedule now', appointmentType: 'Consultation', eligibleLocationIds: [],
+        },
+      });
+      const relatedStudioPaused = await db.receptionistCampaign.create({
+        data: {
+          tenantId: tenant.id, clinicId: tenant.clinicId, agentId: tenant.agentId, name: 'Related paused Studio', status: 'PAUSED',
+          offerTitle: 'Appointment', offerDescription: 'Schedule care', offerScript: 'Schedule now', appointmentType: 'Consultation', eligibleLocationIds: [],
+        },
+      });
+      const unrelatedAgent = await db.receptionistAgent.create({
+        data: { tenantId: tenant.id, clinicId: tenant.clinicId, name: 'Unrelated agent' },
+      });
+      const unrelatedRunning = await db.receptionistOutboundCampaign.create({
+        data: { tenantId: tenant.id, clinicId: tenant.clinicId, agentId: unrelatedAgent.id, name: 'Unrelated running', script: 'Unrelated.', status: 'RUNNING' },
+      });
+
       const mismatchTarget = await db.receptionistCallTarget.create({ data: { tenantId: tenant.id, campaignId: campaign.id, phone: '+15551010304' } });
       providerFetch.mockImplementation(async (url) => String(url).includes('/v2/create-phone-call')
         ? new Response(JSON.stringify({ call_id: 'call-provider-mismatch', agent_id: 'agent_wrong', agent_version: 1 }), { status: 201 })
@@ -253,6 +278,11 @@ describe('AI receptionist outbound targets', () => {
         providerStatus: 'INVALID', providerLastErrorCode: 'provider_deployment_mismatch',
       });
       expect(await db.receptionistOutboundCampaign.findUniqueOrThrow({ where: { id: campaign.id } })).toMatchObject({ status: 'PAUSED' });
+      expect(await db.receptionistOutboundCampaign.findUniqueOrThrow({ where: { id: relatedScheduled.id } })).toMatchObject({ status: 'PAUSED' });
+      expect(await db.receptionistOutboundCampaign.findUniqueOrThrow({ where: { id: relatedDraft.id } })).toMatchObject({ status: 'DRAFT' });
+      expect(await db.receptionistCampaign.findUniqueOrThrow({ where: { id: relatedStudioActive.id } })).toMatchObject({ status: 'PAUSED' });
+      expect(await db.receptionistCampaign.findUniqueOrThrow({ where: { id: relatedStudioPaused.id } })).toMatchObject({ status: 'PAUSED' });
+      expect(await db.receptionistOutboundCampaign.findUniqueOrThrow({ where: { id: unrelatedRunning.id } })).toMatchObject({ status: 'RUNNING' });
       expect(await db.staffTask.findUnique({ where: { id: mismatch.json().reviewTaskId } })).toMatchObject({
         priority: 'CRITICAL', status: 'OPEN', metadata: expect.objectContaining({ requiresAcknowledgement: true, providerStopApplied: true }),
       });
@@ -360,6 +390,60 @@ describe('AI receptionist outbound targets', () => {
       expect(providerFetch.mock.calls.filter(([url]) => String(url).includes('/v2/create-phone-call'))).toHaveLength(providerCreateCount);
     } finally {
       await db.$executeRawUnsafe('DROP TRIGGER IF EXISTS receptionist_review_persistence_failure_trigger ON "StaffTask"; DROP TRIGGER IF EXISTS receptionist_signal_persistence_failure_trigger ON "OperationalSignal"; DROP FUNCTION IF EXISTS receptionist_review_persistence_failure();');
+      env.RETELL_API_KEY = original.apiKey;
+      env.RETELL_FROM_NUMBER = original.from;
+      env.RETELL_BASE_URL = original.base;
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each([
+    { failingTable: 'OperationalSignal', expectedSignalRecorded: false, expectedReviewDegraded: false, expectedSignalPending: true },
+    { failingTable: 'AuditEvent', expectedSignalRecorded: true, expectedReviewDegraded: true, expectedSignalPending: false },
+  ] as const)('keeps task evidence truthful during isolated $failingTable persistence failure', async scenario => {
+    const tenant = await makeTenant();
+    const headers = auth(tenant, tenant.userId);
+    const campaign = await db.receptionistOutboundCampaign.create({
+      data: { tenantId: tenant.id, clinicId: tenant.clinicId, agentId: tenant.agentId, name: `Isolated ${scenario.failingTable} outage`, script: 'Call the patient.', requiredFields: ['phone'], status: 'RUNNING' },
+    });
+    await db.$executeRawUnsafe(`
+      CREATE OR REPLACE FUNCTION receptionist_isolated_persistence_failure() RETURNS trigger AS $$
+      BEGIN
+        IF NEW."tenantId" = '${tenant.id}'::uuid THEN
+          RAISE EXCEPTION 'injected isolated persistence failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      CREATE TRIGGER receptionist_isolated_persistence_failure_trigger
+      BEFORE INSERT ON "${scenario.failingTable}"
+      FOR EACH ROW EXECUTE FUNCTION receptionist_isolated_persistence_failure();
+    `);
+    const original = { apiKey: env.RETELL_API_KEY, from: env.RETELL_FROM_NUMBER, base: env.RETELL_BASE_URL };
+    try {
+      env.RETELL_API_KEY = 'real_provider_key';
+      env.RETELL_FROM_NUMBER = '+15550000001';
+      env.RETELL_BASE_URL = 'https://retell.invalid';
+      vi.stubGlobal('fetch', vi.fn<typeof fetch>(async url => String(url).includes('/v2/create-phone-call')
+        ? new Response(JSON.stringify({ call_id: `call-${scenario.failingTable.toLowerCase()}-outage`, agent_id: 'agent_wrong', agent_version: 1 }), { status: 201 })
+        : new Response(null, { status: 204 })));
+
+      const mismatch = await app.inject({
+        method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaign.id}/call`, headers, payload: { phone: '+15551010901' },
+      });
+      expect(mismatch.statusCode).toBe(502);
+      expect(mismatch.json()).toMatchObject({
+        error: 'retell_deployment_mismatch', reviewRecorded: true, signalRecorded: scenario.expectedSignalRecorded,
+      });
+      const task = await db.staffTask.findUniqueOrThrow({ where: { id: mismatch.json().reviewTaskId } });
+      expect(task.metadata).toEqual(expect.objectContaining({
+        reviewPersistenceDegraded: scenario.expectedReviewDegraded,
+        signalPersistencePending: scenario.expectedSignalPending,
+      }));
+      expect(await db.receptionistAgent.findUniqueOrThrow({ where: { id: tenant.agentId } })).toMatchObject({ providerStatus: 'INVALID' });
+      expect(await db.receptionistOutboundCampaign.findUniqueOrThrow({ where: { id: campaign.id } })).toMatchObject({ status: 'PAUSED' });
+    } finally {
+      await db.$executeRawUnsafe(`DROP TRIGGER IF EXISTS receptionist_isolated_persistence_failure_trigger ON "${scenario.failingTable}"; DROP FUNCTION IF EXISTS receptionist_isolated_persistence_failure();`);
       env.RETELL_API_KEY = original.apiKey;
       env.RETELL_FROM_NUMBER = original.from;
       env.RETELL_BASE_URL = original.base;

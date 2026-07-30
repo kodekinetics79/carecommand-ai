@@ -660,7 +660,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         } catch {
           signalId = null;
         }
-        const taskData = (degraded: boolean) => ({
+        const taskData = (reviewPersistenceDegraded: boolean) => ({
           tenantId: request.auth.tenantId,
           branchId: campaign.defaultBranchId,
           title: 'Critical: review AI receptionist provider deployment mismatch',
@@ -673,8 +673,8 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
             callLogId: callLog.id,
             providerStopApplied: result.providerStopApplied ?? false,
             providerStopFailed: Boolean(result.providerStopError),
-            reviewPersistenceDegraded: degraded,
-            signalPersistencePending: degraded,
+            reviewPersistenceDegraded,
+            signalPersistencePending: signalId === null,
           },
         });
         try {
