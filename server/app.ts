@@ -176,8 +176,8 @@ export async function buildApp() {
   await app.register(intakePublicRoutes, { prefix: '/v1/intake' });
   // Customer-facing pilot share link (hashed token, no auth, no PHI).
   await app.register(pilotPublicRoutes, { prefix: '/v1/pilot' });
-  // Platform operator + onboarding APIs: gated by the platform token (NOT a
-  // tenant JWT), so they live outside the tenant-authenticated scope.
+  // Retired legacy onboarding route: valid legacy operators receive a truthful
+  // 410 directing them to PlatformUser-authenticated /v1/platform/tenants.
   await app.register(onboardingRoutes, { prefix: '/v1/onboarding' });
   // Platform Admin auth (PlatformUser identity) — separate from tenant auth.
   await app.register(platformAuthRoutes, { prefix: '/v1/platform/auth' });

@@ -1,4 +1,3 @@
-import { db } from './db';
 import { env } from '../config/env';
 import { generatePasswordHash, validatePassword } from './security';
 import { recomputeEntitlements } from './entitlements';
@@ -8,10 +7,10 @@ import { Prisma, type PrismaClient } from '../generated/prisma/client';
 import { lockTenantProvisioningIdentity } from './tenantProvisioningLocks';
 
 // ===========================================================================
-// Tenant provisioning — the full onboarding flow used by the operator-gated
-// onboarding endpoint. Creates a tenant, default branch, owner user, compliance
-// baseline (incl. default TenantSecurityPolicy), and a default TRIAL Starter
-// subscription, then recomputes entitlements. Audited. Never returns secrets.
+// Offline/test provisioning primitive. The legacy HTTP endpoint is retired and
+// runtime provisioning uses platformTenantProvisioning with the dedicated
+// least-privilege platform client. Requiring an explicit client prevents this
+// helper from silently falling back to the tenant-RLS runtime identity.
 // ===========================================================================
 
 export interface ProvisionInput {
@@ -34,7 +33,7 @@ export class ProvisionError extends Error {
   constructor(public code: string, message: string) { super(message); }
 }
 
-export async function provisionTenant(input: ProvisionInput, client: PrismaClient = db) {
+export async function provisionTenant(input: ProvisionInput, client: PrismaClient) {
   const slug = input.clinicSlug.trim().toLowerCase();
   if (!/^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])$/.test(slug)) {
     throw new ProvisionError('invalid_slug', 'Slug must be 3-40 chars: lowercase letters, numbers, and hyphens.');

@@ -17,6 +17,7 @@ vi.mock('../workers/queues', () => ({
 const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { generatePasswordHash } = await import('../lib/security');
+const { effectivePlatformToken } = await import('../lib/platform');
 const { provisionTenant, ProvisionError } = await import('../lib/tenantProvisioning');
 const { platformProvisionTenant } = await import('../lib/platformTenantProvisioning');
 
@@ -53,6 +54,25 @@ afterAll(async () => {
 });
 
 describe('foundation clinic and workforce master-data integrity', () => {
+  it('retires legacy tenant onboarding without touching tenant data', async () => {
+    const slug = `retired-onboarding-${randomUUID().slice(0, 8)}`;
+    const payload = {
+      clinicName: 'Retired Onboarding', clinicSlug: slug, ownerName: 'Legacy Operator',
+      ownerEmail: `${slug}@example.invalid`, ownerPassword: 'Legacy-Secure-9!', defaultBranchName: 'Main',
+    };
+    const unauthorized = await app.inject({ method: 'POST', url: '/v1/onboarding/tenant', payload });
+    expect(unauthorized.statusCode).toBe(401);
+    const token = effectivePlatformToken();
+    expect(token).toBeTruthy();
+    const retired = await app.inject({ method: 'POST', url: '/v1/onboarding/tenant', headers: { 'x-platform-token': token! }, payload });
+    expect(retired.statusCode).toBe(410);
+    expect(retired.json()).toMatchObject({
+      error: 'legacy_onboarding_retired',
+      successor: { method: 'POST', path: '/v1/platform/tenants', authentication: 'PlatformUser session' },
+    });
+    expect(await db.tenant.count({ where: { slug } })).toBe(0);
+  });
+
   it('reports the configured refresh-cookie SameSite policy truthfully', async () => {
     const t = await fixture();
     const response = await app.inject({ method: 'GET', url: '/v1/security/posture', headers: bearer(t.tenantId, t.owner.id) });
