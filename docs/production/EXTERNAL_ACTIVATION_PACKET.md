@@ -8,6 +8,14 @@ activate a PHI environment or unattended automation.
 - Restricted tenant, platform, and migration database principals
 - Managed Redis and always-on worker service
 - Retell/Twilio numbers, signing secrets, callback allowlists, and delivery logs
+  - 2026-07-30 read-only account probe authenticated and found three exact-version
+    agents (two Retell LLM, one Conversation Flow), but 0/3 exposed an assigned
+    environment tag, required call webhook events, metadata-only storage, signed
+    recording URLs, strict tool-call mode, or a published exact version. No
+    provider mutation or call was performed. Configure and independently validate
+    a dedicated pilot deployment before unattended use.
+  - Rotate the API credential supplied through the collaboration channel before
+    activation; do not reuse a chat-exposed credential in production.
 - Stripe restricted/test or live keys, webhook endpoint, refunds and disputes
 - Stedi/payer sandbox or production credentials and trading-partner approval
 - Approved email/SMS provider credentials, suppression and delivery callbacks
