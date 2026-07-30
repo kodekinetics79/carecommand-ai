@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { fixtureDb as db } from '../../server/test/helpers/fixtureDb';
 import { generatePasswordHash } from '../../server/lib/security';
 import { recomputeEntitlements } from '../../server/lib/entitlements';
+import { assertAccessibilityContract } from './accessibility';
 
 const API = 'http://127.0.0.1:43201';
 const OUTBOX = '.playwright/portal-outbox.jsonl';
@@ -134,6 +135,7 @@ async function latestPortalToken(tenantId: string) {
 
 async function loginPatient(page: Page, data: GoldenData) {
   await page.goto('/client/login');
+  await assertAccessibilityContract(page, 'patient portal login');
   await page.getByLabel('Clinic').fill(data.slug);
   await page.getByLabel('Email').fill(data.patientEmail);
   await page.getByRole('button', { name: 'Send sign-in link' }).click();
@@ -142,10 +144,12 @@ async function loginPatient(page: Page, data: GoldenData) {
   await page.getByLabel('Sign-in code').fill(outbox.token);
   await page.getByRole('button', { name: 'Continue' }).click();
   await expect(page.getByText(/Hi Avery/)).toBeVisible();
+  await assertAccessibilityContract(page, 'patient portal dashboard');
 }
 
 async function loginStaff(page: Page, data: GoldenData) {
   await page.goto('/login');
+  await assertAccessibilityContract(page, 'staff login');
   await page.getByLabel('Email').fill(data.staffEmail);
   await page.getByRole('textbox', { name: /Password/ }).fill(STAFF_PASSWORD);
   await page.getByRole('button', { name: /Sign in/i }).click();
@@ -163,6 +167,8 @@ test.describe('staff authentication and accessibility contract', () => {
   test('preserves a deep link across login and reload, supports keyboard login, then logs out', async ({ page }, testInfo) => {
     const data = await seedGoldenData(`auth-${testInfo.project.name}`);
     try {
+      await page.goto('/platform/login');
+      await assertAccessibilityContract(page, 'platform login');
       await page.goto('/patients');
       await expect(page).toHaveURL(/\/login$/);
 
@@ -251,6 +257,7 @@ test.describe.serial('production-style browser golden journey', () => {
 
     await page.getByRole('link', { name: /Insurance/i }).click();
     await page.getByRole('button', { name: /Add insurance|Add \/ update insurance/i }).click();
+    await assertAccessibilityContract(page, 'patient portal insurance form');
     await page.getByPlaceholder('Plan name (e.g. Aetna Core)').fill('Aetna Enterprise PPO');
     await page.getByPlaceholder('Member ID').fill('E2E-MEMBER-001');
     await page.getByPlaceholder('Group # (optional)').fill('GRP-E2E');

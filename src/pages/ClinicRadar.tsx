@@ -262,6 +262,7 @@ export default function ClinicRadar() {
       <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-3">
         <p className="text-xs font-semibold text-t2">Clinic</p>
         <select
+          aria-label="Clinic"
           value={selectedBranchId}
           onChange={e => setSelectedBranchId(e.target.value)}
           className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs text-t1 outline-none"

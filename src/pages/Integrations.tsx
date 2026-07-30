@@ -142,6 +142,7 @@ export default function Integrations() {
             <div className="relative flex-1">
               <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-t3" />
               <input
+                aria-label="Search integrations"
                 value={search}
                 onChange={event => setSearch(event.target.value)}
                 placeholder="Search integrations"

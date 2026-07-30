@@ -164,6 +164,7 @@ export default function AdvisoryRoom() {
             <div className="flex flex-wrap items-center gap-2 mb-3">
               <p className="text-xs font-semibold text-t2">Clinic scope</p>
               <select
+                aria-label="Clinic scope"
                 value={selectedClinicId}
                 onChange={e => setSelectedClinicId(e.target.value)}
                 className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs text-t1 outline-none"
@@ -177,6 +178,7 @@ export default function AdvisoryRoom() {
             </div>
 
             <textarea
+              aria-label="Question for the advisory room"
               value={question}
               onChange={e => setQuestion(e.target.value)}
               rows={4}

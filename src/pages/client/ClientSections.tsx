@@ -644,11 +644,11 @@ export function ClientInsurance() {
       {!adding && rows.length > 0 && <button type="button" onClick={() => setAdding(true)} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-3 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s2)]"><Plus className="w-4 h-4" /> Add / update insurance</button>}
       {adding && (
         <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4 space-y-2.5">
-          <input className={inp} value={form.planName} onChange={e => setForm(f => ({ ...f, planName: e.target.value }))} placeholder="Plan name (e.g. Aetna Core)" />
-          <input className={inp} value={form.memberId} onChange={e => setForm(f => ({ ...f, memberId: e.target.value }))} placeholder="Member ID" />
+          <input aria-label="Plan name" className={inp} value={form.planName} onChange={e => setForm(f => ({ ...f, planName: e.target.value }))} placeholder="Plan name (e.g. Aetna Core)" />
+          <input aria-label="Member ID" className={inp} value={form.memberId} onChange={e => setForm(f => ({ ...f, memberId: e.target.value }))} placeholder="Member ID" />
           <div className="grid grid-cols-2 gap-2.5">
-            <input className={inp} value={form.groupNumber} onChange={e => setForm(f => ({ ...f, groupNumber: e.target.value }))} placeholder="Group # (optional)" />
-            <input className={inp} value={form.subscriberName} onChange={e => setForm(f => ({ ...f, subscriberName: e.target.value }))} placeholder="Subscriber name (optional)" />
+            <input aria-label="Group number" className={inp} value={form.groupNumber} onChange={e => setForm(f => ({ ...f, groupNumber: e.target.value }))} placeholder="Group # (optional)" />
+            <input aria-label="Subscriber name" className={inp} value={form.subscriberName} onChange={e => setForm(f => ({ ...f, subscriberName: e.target.value }))} placeholder="Subscriber name (optional)" />
           </div>
           <div className="flex gap-2"><button type="button" disabled={busy || form.planName.trim().length < 1 || form.memberId.trim().length < 2} onClick={save} className="rounded-lg bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50">Save</button><button type="button" onClick={() => setAdding(false)} className="rounded-lg border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2">Cancel</button></div>
         </div>

@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { fixtureDb as db } from '../../server/test/helpers/fixtureDb';
 import { generatePasswordHash } from '../../server/lib/security';
 import { recomputeEntitlements } from '../../server/lib/entitlements';
+import { assertAccessibilityContract } from './accessibility';
 
 const PASSWORD = 'Route-Crawl-Pw-123!';
 const roles = ['OWNER', 'FRONT_DESK', 'AUDITOR'] as const;
@@ -59,6 +60,7 @@ test.describe('role-aware real-backend route and action crawl', () => {
       const nav = page.locator('#staff-navigation nav');
       await expect(nav.locator('a[href="#"]')).toHaveCount(0);
       await expect(page.locator('button a, a button')).toHaveCount(0);
+      await assertAccessibilityContract(page, `${role}:/`);
 
       const hrefs = await nav.locator('a').evaluateAll(anchors => [...new Set(anchors.map(anchor => anchor.getAttribute('href')).filter((href): href is string => Boolean(href)))]);
       expect(hrefs.length).toBeGreaterThan(20);
@@ -76,6 +78,7 @@ test.describe('role-aware real-backend route and action crawl', () => {
         await expect(page.getByRole('main', { name: 'Clinic workspace' })).toBeVisible();
         await expect(page.locator('a[href="#"]')).toHaveCount(0);
         await expect(page.locator('button a, a button')).toHaveCount(0);
+        await assertAccessibilityContract(page, `${role}:${href}`);
       }
 
       expect(pageErrors, `uncaught browser errors for ${role}`).toEqual([]);

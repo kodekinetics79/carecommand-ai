@@ -746,12 +746,12 @@ export default function RevenueProtection() {
           <BentoCard title="Deposit Rule Engine" subtitle="Define when deposits are required and how much to collect">
             <div className="grid gap-3">
               <div className="grid gap-2 sm:grid-cols-2">
-                <input value={ruleDraft.name} onChange={e => setRuleDraft(prev => ({ ...prev, name: e.target.value }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Rule name" />
-                <input value={ruleDraft.ruleType} onChange={e => setRuleDraft(prev => ({ ...prev, ruleType: e.target.value }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Rule type" />
+                <input aria-label="Deposit rule name" value={ruleDraft.name} onChange={e => setRuleDraft(prev => ({ ...prev, name: e.target.value }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Rule name" />
+                <input aria-label="Deposit rule type" value={ruleDraft.ruleType} onChange={e => setRuleDraft(prev => ({ ...prev, ruleType: e.target.value }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Rule type" />
               </div>
-              <input value={ruleDraft.description} onChange={e => setRuleDraft(prev => ({ ...prev, description: e.target.value }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Description" />
+              <input aria-label="Deposit rule description" value={ruleDraft.description} onChange={e => setRuleDraft(prev => ({ ...prev, description: e.target.value }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Description" />
               <div className="grid gap-2 sm:grid-cols-[1fr_140px]">
-                <input type="number" value={ruleDraft.amountValue} onChange={e => setRuleDraft(prev => ({ ...prev, amountValue: Number(e.target.value) }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Amount" />
+                <input aria-label="Deposit amount" type="number" min="0" value={ruleDraft.amountValue} onChange={e => setRuleDraft(prev => ({ ...prev, amountValue: Number(e.target.value) }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Amount" />
                 <button type="button" disabled={actionBusy === 'create-rule'} onClick={() => void handleCreateRule()} className="rounded-xl bg-[var(--indigo)] px-3 py-2 text-sm font-semibold text-white hover:opacity-90 transition disabled:opacity-50">
                   {actionBusy === 'create-rule' ? 'Saving…' : 'Create Rule'}
                 </button>
