@@ -40,8 +40,9 @@ records decision checkpoints produced during production completion.
   mapping, strict tag/DB/UI/source-of-truth gaps.
 - Remediation evidence: fresh 71 migrations; focused 60/60; all receptionist
   115/115; RLS 962/962; Prisma drift 121/143 only; typecheck, lint and build;
-  stop success/failure and injected review-task failure all preserve the
-  INVALID/PAUSED circuit, critical operational signal and no-second-dial rule.
+  stop success/failure and injected simultaneous signal/task failure all
+  preserve the INVALID/PAUSED/FAILED circuit and no-second-dial rule; missing
+  review records are reported truthfully and the agent error remains visible.
 - External/not claimed: live Retell account transaction and browser walkthrough;
   originating-number ownership and tool-schema readiness remain later gates.
 

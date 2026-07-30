@@ -630,29 +630,36 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
               data: { status: 'PAUSED' },
             }),
           ]);
-          // This is the durable, staff-consumed review primitive exposed by
-          // GET /v1/signals. It is part of the fail-closed safety transaction,
-          // so a later task/audit outage cannot erase the review requirement.
-          const signal = await tx.operationalSignal.create({
-            data: {
-              tenantId: request.auth.tenantId,
-              signalType: 'receptionist_provider_deployment_mismatch',
-              entityType: 'receptionistCallLog',
-              entityId: callLog.id,
-              severity: 'critical',
-              score: 100,
-              reason: 'Provider started a call with an agent deployment different from the verified immutable binding; campaigns were paused for staff review.',
-            },
-          });
-          return { agentId, signalId: signal.id, pausedOutboundCampaigns: pausedOutbound.count, pausedStudioCampaigns: pausedStudio.count };
+          return { agentId, pausedOutboundCampaigns: pausedOutbound.count, pausedStudioCampaigns: pausedStudio.count };
         }
-        return { agentId: null, signalId: null, pausedOutboundCampaigns: 0, pausedStudioCampaigns: 0 };
+        return { agentId: null, pausedOutboundCampaigns: 0, pausedStudioCampaigns: 0 };
       });
 
       let reviewTaskId: string | null = null;
       let reviewRecorded = false;
-      const signalRecorded = safetyState.signalId !== null;
+      let signalId: string | null = null;
       if (result.error === 'retell_deployment_mismatch' && safetyState.agentId) {
+        // Operational review records are deliberately outside the core safety
+        // transaction. Their failure is reported truthfully but can never
+        // restore the invalid deployment or paused campaigns.
+        try {
+          signalId = await runWithTenantContext(request.auth.tenantId, async tx => {
+            const signal = await tx.operationalSignal.create({
+              data: {
+                tenantId: request.auth.tenantId,
+                signalType: 'receptionist_provider_deployment_mismatch',
+                entityType: 'receptionistCallLog',
+                entityId: callLog.id,
+                severity: 'critical',
+                score: 100,
+                reason: 'Provider started a call with an agent deployment different from the verified immutable binding; campaigns were paused for staff review.',
+              },
+            });
+            return signal.id;
+          });
+        } catch {
+          signalId = null;
+        }
         const taskData = (degraded: boolean) => ({
           tenantId: request.auth.tenantId,
           branchId: campaign.defaultBranchId,
@@ -732,8 +739,8 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         callLogId: callLog.id,
         reviewTaskId,
         reviewRecorded,
-        signalRecorded,
-        signalId: safetyState.signalId,
+        signalRecorded: signalId !== null,
+        signalId,
       });
     }
 

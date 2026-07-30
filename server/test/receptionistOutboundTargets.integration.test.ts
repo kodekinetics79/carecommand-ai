@@ -318,6 +318,9 @@ describe('AI receptionist outbound targets', () => {
       CREATE TRIGGER receptionist_review_persistence_failure_trigger
       BEFORE INSERT ON "StaffTask"
       FOR EACH ROW EXECUTE FUNCTION receptionist_review_persistence_failure();
+      CREATE TRIGGER receptionist_signal_persistence_failure_trigger
+      BEFORE INSERT ON "OperationalSignal"
+      FOR EACH ROW EXECUTE FUNCTION receptionist_review_persistence_failure();
     `);
     const original = { apiKey: env.RETELL_API_KEY, from: env.RETELL_FROM_NUMBER, base: env.RETELL_BASE_URL };
     try {
@@ -334,19 +337,19 @@ describe('AI receptionist outbound targets', () => {
       });
       expect(mismatch.statusCode).toBe(502);
       expect(mismatch.json()).toMatchObject({
-        status: 'failed', error: 'retell_deployment_mismatch', reviewTaskId: null, reviewRecorded: false, signalRecorded: true,
+        status: 'failed', error: 'retell_deployment_mismatch', reviewTaskId: null, reviewRecorded: false, signalId: null, signalRecorded: false,
       });
-      expect(mismatch.json().signalId).toMatch(/^[0-9a-f-]{36}$/);
       expect(await db.receptionistAgent.findUniqueOrThrow({ where: { id: tenant.agentId } })).toMatchObject({
         providerStatus: 'INVALID', providerLastErrorCode: 'provider_deployment_mismatch',
       });
       expect(await db.receptionistOutboundCampaign.findUniqueOrThrow({ where: { id: campaign.id } })).toMatchObject({ status: 'PAUSED' });
       expect(await db.receptionistCallLog.findFirst({ where: { tenantId: tenant.id, retellCallId: 'call-review-outage' } })).toMatchObject({ outcome: 'FAILED' });
       expect(await db.staffTask.count({ where: { tenantId: tenant.id } })).toBe(0);
-      const visibleSignals = await app.inject({ method: 'GET', url: '/v1/signals?status=open', headers });
-      expect(visibleSignals.statusCode).toBe(200);
-      expect(visibleSignals.json()).toEqual(expect.arrayContaining([
-        expect.objectContaining({ id: mismatch.json().signalId, signalType: 'receptionist_provider_deployment_mismatch', severity: 'critical' }),
+      expect(await db.operationalSignal.count({ where: { tenantId: tenant.id, signalType: 'receptionist_provider_deployment_mismatch' } })).toBe(0);
+      const visibleAgentState = await app.inject({ method: 'GET', url: `/v1/receptionist/agents?clinicId=${tenant.clinicId}`, headers });
+      expect(visibleAgentState.statusCode).toBe(200);
+      expect(visibleAgentState.json()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: tenant.agentId, providerStatus: 'INVALID', providerLastErrorCode: 'provider_deployment_mismatch' }),
       ]));
 
       const providerCreateCount = providerFetch.mock.calls.filter(([url]) => String(url).includes('/v2/create-phone-call')).length;
@@ -356,7 +359,7 @@ describe('AI receptionist outbound targets', () => {
       expect(blocked.statusCode).toBe(409);
       expect(providerFetch.mock.calls.filter(([url]) => String(url).includes('/v2/create-phone-call'))).toHaveLength(providerCreateCount);
     } finally {
-      await db.$executeRawUnsafe('DROP TRIGGER IF EXISTS receptionist_review_persistence_failure_trigger ON "StaffTask"; DROP FUNCTION IF EXISTS receptionist_review_persistence_failure();');
+      await db.$executeRawUnsafe('DROP TRIGGER IF EXISTS receptionist_review_persistence_failure_trigger ON "StaffTask"; DROP TRIGGER IF EXISTS receptionist_signal_persistence_failure_trigger ON "OperationalSignal"; DROP FUNCTION IF EXISTS receptionist_review_persistence_failure();');
       env.RETELL_API_KEY = original.apiKey;
       env.RETELL_FROM_NUMBER = original.from;
       env.RETELL_BASE_URL = original.base;
