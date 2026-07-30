@@ -110,16 +110,25 @@ describe('providers — create + edit (onboarding blocker)', () => {
     expect(edited.statusCode).toBe(200);
     expect(edited.json().specialty).toBe('Neurology');
   });
+
+  it('allows one OWNER/ADMIN clinician identity to retain administration and receive a provider profile', async () => {
+    const t = await makeTenant();
+    await db.user.update({ where: { id: t.users.ADMIN }, data: { branchId: t.branchId } });
+    const created = await app.inject({ method: 'POST', url: '/v1/providers', headers: auth(tok(t.id, t.users.ADMIN)), payload: { userId: t.users.ADMIN, branchId: t.branchId, specialty: 'Medical Director' } });
+    expect(created.statusCode).toBe(201);
+    expect(created.json().userId).toBe(t.users.ADMIN);
+    expect((await db.user.findUniqueOrThrow({ where: { id: t.users.ADMIN } })).role).toBe('ADMIN');
+  });
 });
 
 describe('staff tasks — permission and lifecycle safety', () => {
-  it('denies a role without staff:write and keeps terminal tasks final with one transition audit', async () => {
+  it('allows FRONT_DESK the narrow task-status action, denies AUDITOR, and keeps terminal tasks final', async () => {
     const t = await makeTenant();
     const task = await db.staffTask.create({ data: { tenantId: t.id, branchId: t.branchId, title: 'Call patient', priority: 'HIGH' } });
     const denied = await app.inject({ method: 'PATCH', url: `/v1/staff/tasks/${task.id}/status`, headers: auth(tok(t.id, t.users.AUDITOR)), payload: { status: 'COMPLETED' } });
     expect(denied.statusCode).toBe(403);
 
-    const completed = await app.inject({ method: 'PATCH', url: `/v1/staff/tasks/${task.id}/status`, headers: auth(tok(t.id, t.users.ADMIN)), payload: { status: 'COMPLETED' } });
+    const completed = await app.inject({ method: 'PATCH', url: `/v1/staff/tasks/${task.id}/status`, headers: auth(tok(t.id, t.users.FRONT_DESK)), payload: { status: 'COMPLETED' } });
     const reopened = await app.inject({ method: 'PATCH', url: `/v1/staff/tasks/${task.id}/status`, headers: auth(tok(t.id, t.users.ADMIN)), payload: { status: 'OPEN' } });
     expect(completed.statusCode).toBe(200);
     expect(reopened.statusCode).toBe(409);

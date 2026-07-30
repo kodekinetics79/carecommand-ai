@@ -3,6 +3,7 @@ import { db } from './db';
 import { audit } from './audit';
 import { runWithTenantContext } from './tenantContext';
 import type { UserRole } from '../generated/prisma/enums';
+import { lockClinicAccessMutation } from './clinicAccessSafety';
 
 // ===========================================================================
 // Admin role safety guards. Prevent a tenant from locking itself out of
@@ -87,8 +88,20 @@ function auditData(request: FastifyRequest, action: string, targetId: string, me
 export async function setUserActiveSafely(request: FastifyRequest, targetId: string, active: boolean, action: string) {
   const result = await runWithTenantContext(request.auth.tenantId, async tx => {
     await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`tenant.admin.guard:${request.auth.tenantId}`}::text, 0))::text AS locked`;
+    await lockClinicAccessMutation(tx, request.auth.tenantId);
     const target = await tx.user.findFirst({ where: { id: targetId, tenantId: request.auth.tenantId } });
     if (!target) return { kind: 'not_found' as const };
+    if (active && !target.active) {
+      const access = await tx.userClinicAccess.findMany({ where: { tenantId: request.auth.tenantId, userId: target.id }, select: { branchId: true } });
+      const assignedIds = [...new Set([target.branchId, ...access.map(row => row.branchId)].filter((id): id is string => Boolean(id)))];
+      const activeBranches = assignedIds.length > 0
+        ? await tx.branch.count({ where: { tenantId: request.auth.tenantId, id: { in: assignedIds }, active: true } })
+        : 0;
+      if (activeBranches !== assignedIds.length) {
+        await tx.auditEvent.create({ data: auditData(request, 'admin.user.activationBlocked', target.id, { reason: 'inactive_clinic_assignment', branchIds: assignedIds }) });
+        return { kind: 'inactive_clinic' as const, message: 'Reassign this user to active clinics before activation.' };
+      }
+    }
     if (!active && target.active && isAdminRole(target.role)) {
       const remaining = await tx.user.count({ where: { tenantId: request.auth.tenantId, active: true, role: { in: ['OWNER', 'ADMIN'] }, id: { not: target.id } } });
       if (remaining < 1) {
@@ -105,6 +118,7 @@ export async function setUserActiveSafely(request: FastifyRequest, targetId: str
   });
   if (result.kind === 'not_found') throw request.server.httpErrors.notFound('User not found');
   if (result.kind === 'blocked') throw request.server.httpErrors.conflict(result.message);
+  if (result.kind === 'inactive_clinic') throw request.server.httpErrors.conflict(result.message);
   return result.updated;
 }
 

@@ -11,7 +11,7 @@ import { useApiData } from '../hooks/useApiData';
 import { mapPatient, type ApiPatient } from '../lib/apiAdapters';
 import { apiRequest } from '../lib/api';
 
-interface ApiBranchOption { id: string; name: string }
+interface ApiBranchOption { id: string; name: string; active: boolean }
 interface PatientSummary {
   scope: 'tenant' | 'assigned_branch';
   asOf: string;
@@ -48,9 +48,10 @@ export default function Patients() {
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const loadError = error;
+  const activeBranchOptions = branchOptions.filter(branch => branch.active);
 
   async function createPatient() {
-    const branchId = form.branchId || branchOptions[0]?.id;
+    const branchId = form.branchId;
     if (!form.firstName.trim() || !form.lastName.trim() || !branchId) {
       setFormError('First name, last name and branch are required.');
       return;
@@ -140,7 +141,7 @@ export default function Patients() {
               </label>
               <select aria-label="Branch" title="Branch" value={form.branchId} onChange={e => setForm(f => ({ ...f, branchId: e.target.value }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
                 <option value="">Select branch…</option>
-                {branchOptions.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+                {activeBranchOptions.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
               </select>
               <select aria-label="Lifecycle stage" title="Lifecycle stage" value={form.lifecycleStage} onChange={e => setForm(f => ({ ...f, lifecycleStage: e.target.value }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
                 {['NEW', 'ACTIVE', 'AT_RISK', 'INACTIVE', 'LOST', 'RETAINED'].map(s => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
@@ -286,7 +287,7 @@ export default function Patients() {
               {branchOptions.map((branch) => (
                 <div key={branch.id} className="flex items-center justify-between gap-3 p-2.5 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors">
                   <div>
-                    <p className="text-xs font-bold text-t1">{branch.name}</p>
+                    <p className="text-xs font-bold text-t1">{branch.name}{branch.active ? '' : ' (inactive)'}</p>
                   </div>
                   <span className="text-xs font-bold text-t2">
                     {summary ? (summary.branchCounts[branch.id] ?? 0) : '—'}

@@ -12,6 +12,7 @@ import { paymentProviderStatus } from '../../lib/deposits';
 import { eligibilityProviderStatus } from '../../lib/insuranceIntelligence';
 import { runWithTenantContext } from '../../lib/tenantContext';
 import type { Prisma } from '../../generated/prisma/client';
+import { lockClinicAccessMutation } from '../../lib/clinicAccessSafety';
 
 const ownerAdminRoles = requireRoles('OWNER', 'ADMIN');
 const uuid = z.string().uuid();
@@ -671,21 +672,19 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     if (body.primaryBranchId && !requestedBranchIds.includes(body.primaryBranchId)) {
       throw app.httpErrors.badRequest('Primary branch must be included in selected branch access');
     }
-    const validBranchRows = requestedBranchIds.length > 0
-      ? await db.branch.findMany({ where: { tenantId: request.auth.tenantId, active: true, id: { in: requestedBranchIds } }, select: { id: true } })
-      : [];
-    let validBranchIds = validBranchRows.map(branch => branch.id);
-    if (validBranchIds.length !== requestedBranchIds.length) {
-      throw app.httpErrors.badRequest('Every selected branch must be active and belong to this tenant');
-    }
-    if (validBranchIds.length === 0) {
-      const fallbackBranch = await db.branch.findFirst({ where: { tenantId: request.auth.tenantId, active: true }, orderBy: { name: 'asc' }, select: { id: true } });
-      if (fallbackBranch) validBranchIds = [fallbackBranch.id];
-    }
-    const primaryBranchId = body.primaryBranchId && validBranchIds.includes(body.primaryBranchId) ? body.primaryBranchId : validBranchIds[0] ?? null;
-
     const passwordHash = await generatePasswordHash(body.password);
-    const created = await runWithTenantContext(request.auth.tenantId, async tx => {
+    const result = await runWithTenantContext(request.auth.tenantId, async tx => {
+      await lockClinicAccessMutation(tx, request.auth.tenantId);
+      const validBranchRows = requestedBranchIds.length > 0
+        ? await tx.branch.findMany({ where: { tenantId: request.auth.tenantId, active: true, id: { in: requestedBranchIds } }, select: { id: true } })
+        : [];
+      let validBranchIds = validBranchRows.map(branch => branch.id);
+      if (validBranchIds.length !== requestedBranchIds.length) throw app.httpErrors.badRequest('Every selected branch must be active and belong to this tenant');
+      if (validBranchIds.length === 0) {
+        const fallbackBranch = await tx.branch.findFirst({ where: { tenantId: request.auth.tenantId, active: true }, orderBy: { name: 'asc' }, select: { id: true } });
+        if (fallbackBranch) validBranchIds = [fallbackBranch.id];
+      }
+      const primaryBranchId = body.primaryBranchId && validBranchIds.includes(body.primaryBranchId) ? body.primaryBranchId : validBranchIds[0] ?? null;
       const user = await tx.user.create({ data: {
         tenantId: request.auth.tenantId,
         email: body.email,
@@ -706,16 +705,16 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
         userAgent: request.headers['user-agent'],
         metadata: { email: user.email, role: user.role, branchIds: validBranchIds },
       } });
-      return user;
+      return { user, validBranchIds, primaryBranchId };
     });
     return reply.code(201).send({
-      id: created.id,
-      email: created.email,
-      name: created.displayName,
-      role: created.role,
-      status: created.active ? 'active' : 'inactive',
-      branchIds: validBranchIds,
-      primaryBranchId,
+      id: result.user.id,
+      email: result.user.email,
+      name: result.user.displayName,
+      role: result.user.role,
+      status: result.user.active ? 'active' : 'inactive',
+      branchIds: result.validBranchIds,
+      primaryBranchId: result.primaryBranchId,
     });
   });
 
@@ -736,19 +735,17 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
   app.patch('/users/:id/clinic-access', { preHandler: ownerAdminRoles }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const body = clinicAccessBody.parse(request.body);
-    const existing = await db.user.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('User not found');
     const requestedBranchIds = [...new Set(body.branchIds)];
     if (body.primaryBranchId && !requestedBranchIds.includes(body.primaryBranchId)) {
       throw app.httpErrors.badRequest('Primary branch must be included in selected branch access');
     }
-    const validBranches = await db.branch.findMany({ where: { tenantId: request.auth.tenantId, active: true, id: { in: requestedBranchIds } }, select: { id: true } });
-    if (validBranches.length !== requestedBranchIds.length) {
-      throw app.httpErrors.badRequest('Every selected branch must be active and belong to this tenant');
-    }
-    const validBranchIds = requestedBranchIds;
     await runWithTenantContext(request.auth.tenantId, async tx => {
-      await replaceClinicAccess(tx, request.auth.tenantId, id, validBranchIds, body.primaryBranchId);
+      await lockClinicAccessMutation(tx, request.auth.tenantId);
+      const existing = await tx.user.findFirst({ where: { id, tenantId: request.auth.tenantId }, select: { id: true } });
+      if (!existing) throw app.httpErrors.notFound('User not found');
+      const validBranches = await tx.branch.findMany({ where: { tenantId: request.auth.tenantId, active: true, id: { in: requestedBranchIds } }, select: { id: true } });
+      if (validBranches.length !== requestedBranchIds.length) throw app.httpErrors.badRequest('Every selected branch must be active and belong to this tenant');
+      await replaceClinicAccess(tx, request.auth.tenantId, id, requestedBranchIds, body.primaryBranchId);
       await tx.auditEvent.create({ data: {
         tenantId: request.auth.tenantId,
         actorUserId: request.auth.userId,
@@ -758,10 +755,10 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
         requestId: request.id,
         ipAddress: request.ip,
         userAgent: request.headers['user-agent'],
-        metadata: { branchIds: validBranchIds },
+        metadata: { branchIds: requestedBranchIds },
       } });
     });
-    return { id, branchIds: validBranchIds, primaryBranchId: body.primaryBranchId ?? validBranchIds[0] ?? null };
+    return { id, branchIds: requestedBranchIds, primaryBranchId: body.primaryBranchId ?? requestedBranchIds[0] ?? null };
   });
 
   app.get('/users/:id/audit-trail', { preHandler: ownerAdminRoles }, async request => {
@@ -866,22 +863,22 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
   app.patch('/clinics/:id/status', { preHandler: ownerAdminRoles }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const { active } = clinicStatusBody.parse(request.body);
-    const clinic = await db.branch.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!clinic) throw app.httpErrors.notFound('Clinic not found');
-    if (!active) {
-      const assignedActiveUsers = await db.user.count({
-        where: {
-          tenantId: request.auth.tenantId,
-          active: true,
-          OR: [{ branchId: id }, { clinicAccesses: { some: { branchId: id } } }],
-        },
-      });
-      if (assignedActiveUsers > 0) {
-        throw app.httpErrors.conflict('Reassign or deactivate active clinic users before deactivating this clinic');
+    const updated = await runWithTenantContext(request.auth.tenantId, async tx => {
+      await lockClinicAccessMutation(tx, request.auth.tenantId);
+      const clinic = await tx.branch.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+      if (!clinic) throw app.httpErrors.notFound('Clinic not found');
+      if (!active) {
+        const assignedActiveUsers = await tx.user.count({ where: { tenantId: request.auth.tenantId, active: true, OR: [{ branchId: id }, { clinicAccesses: { some: { branchId: id } } }] } });
+        if (assignedActiveUsers > 0) throw app.httpErrors.conflict('Reassign or deactivate active clinic users before deactivating this clinic');
       }
-    }
-    const updated = await db.branch.update({ where: { id }, data: { active } });
-    await audit(request, { action: 'controlPlane.clinic.statusUpdated', resource: 'branch', resourceId: id, metadata: { active } });
+      const branch = await tx.branch.update({ where: { id }, data: { active } });
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+        action: 'controlPlane.clinic.statusUpdated', resource: 'branch', resourceId: id,
+        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'], metadata: { active },
+      } });
+      return branch;
+    });
     return reply.send({ id: updated.id, active: updated.active });
   });
 

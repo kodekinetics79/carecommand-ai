@@ -7,6 +7,7 @@ import { requirePermission, PERMISSIONS, ROLE_PERMISSIONS, sanitizePermissions }
 import { runWithTenantContext } from '../../lib/tenantContext';
 import { checkRlsRuntimeRole } from '../../lib/rlsGuard';
 import { setUserActiveSafely, setUserRoleSafely } from '../../lib/adminSafety';
+import { lockClinicAccessMutation } from '../../lib/clinicAccessSafety';
 
 const uuid = z.string().uuid();
 // Permission-gated (defaults preserve the prior role membership):
@@ -345,7 +346,16 @@ async function replaceUserClinicAccess(request: FastifyRequest, userId: string, 
   const orderedBranchIds = primaryBranchId
     ? [primaryBranchId, ...branchIds.filter(id => id !== primaryBranchId)]
     : branchIds;
-  await runWithTenantContext(tenantId, async tx => {
+  return runWithTenantContext(tenantId, async tx => {
+    await lockClinicAccessMutation(tx, tenantId);
+    const existing = await tx.user.findFirst({ where: { id: userId, tenantId } });
+    if (!existing) throw request.server.httpErrors.notFound('User not found');
+    if (primaryBranchId && !branchIds.includes(primaryBranchId)) throw request.server.httpErrors.badRequest('Primary branch must be included in selected clinic access');
+    if (branchIds.length === 0 && existing.role !== 'OWNER' && existing.role !== 'ADMIN') throw request.server.httpErrors.badRequest('At least one clinic access entry is required');
+    const validBranches = branchIds.length > 0
+      ? await tx.branch.findMany({ where: { tenantId, active: true, id: { in: branchIds } }, select: { id: true } })
+      : [];
+    if (validBranches.length !== branchIds.length) throw request.server.httpErrors.badRequest('Every selected clinic must be active and belong to this tenant');
     await tx.userClinicAccess.deleteMany({ where: { tenantId, userId } });
     if (orderedBranchIds.length > 0) {
       await tx.userClinicAccess.createMany({
@@ -364,6 +374,13 @@ async function replaceUserClinicAccess(request: FastifyRequest, userId: string, 
       userAgent: request.headers['user-agent'],
       metadata: { branchIds: orderedBranchIds },
     } });
+    return tx.user.findFirst({
+      where: { id: userId, tenantId },
+      include: {
+        branch: { select: { id: true, name: true, location: true } },
+        clinicAccesses: { orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }], include: { branch: { select: { id: true, name: true, location: true } } } },
+      },
+    });
   });
 }
 
@@ -718,39 +735,9 @@ export const adminRoutes: FastifyPluginAsync = async app => {
   app.patch('/users/:id/branches', { preHandler: ownerAdminRoles }, async request => {
     const { id } = idParam.parse(request.params);
     const input = branchAccessBody.parse(request.body);
-    const existing = await db.user.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('User not found');
-
     const branchIds = [...new Set(input.branchIds)];
-    if (input.primaryBranchId && !branchIds.includes(input.primaryBranchId)) {
-      throw app.httpErrors.badRequest('Primary branch must be included in selected clinic access');
-    }
-    if (branchIds.length === 0 && existing.role !== 'OWNER' && existing.role !== 'ADMIN') {
-      throw app.httpErrors.badRequest('At least one clinic access entry is required');
-    }
-
-    const validBranches = branchIds.length > 0
-      ? await db.branch.findMany({
-          where: { tenantId: request.auth.tenantId, active: true, id: { in: branchIds } },
-          select: { id: true },
-        })
-      : [];
-    if (validBranches.length !== branchIds.length) {
-      throw app.httpErrors.badRequest('Every selected clinic must be active and belong to this tenant');
-    }
     const primaryBranchId = input.primaryBranchId ?? branchIds[0];
-    await replaceUserClinicAccess(request, id, branchIds, primaryBranchId);
-
-    const refreshed = await db.user.findFirst({
-      where: { id, tenantId: request.auth.tenantId },
-      include: {
-        branch: { select: { id: true, name: true, location: true } },
-        clinicAccesses: {
-          orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
-          include: { branch: { select: { id: true, name: true, location: true } } },
-        },
-      },
-    });
+    const refreshed = await replaceUserClinicAccess(request, id, branchIds, primaryBranchId);
     return {
       id: refreshed?.id ?? id,
       accessBranches: (refreshed?.clinicAccesses ?? []).map((access: { branch: { id: string; name: string; location: string }; isPrimary: boolean }) => ({

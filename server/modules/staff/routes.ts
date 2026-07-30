@@ -36,7 +36,7 @@ export const staffRoutes: FastifyPluginAsync = async app => {
     return cursorPage(rows, query.limit);
   });
 
-  app.patch('/tasks/:id/status', { preHandler: requirePermission('staff:write') }, async (request, reply) => {
+  app.patch('/tasks/:id/status', { preHandler: requirePermission('staff:task-status') }, async (request, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = taskStatusInput.parse(request.body);
     const result = await runWithTenantContext(request.auth.tenantId, async tx => {

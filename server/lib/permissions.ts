@@ -39,6 +39,9 @@ export const PERMISSIONS = [
   'billing:write',
   'staff:read',
   'staff:write',
+  // Narrow operational grant: update an existing task's lifecycle without
+  // gaining staff/profile administration.
+  'staff:task-status',
   'settings:read',
   'settings:write',
   'compliance:read',
@@ -75,14 +78,14 @@ export const ROLE_PERMISSIONS: Record<UserRole, Permission[]> = {
     'intake:read', 'intake:write',
     'appointment:read', 'appointment:write', 'schedule:manage',
     'billing:read',
-    'staff:read', 'staff:write',
+    'staff:read', 'staff:write', 'staff:task-status',
     'settings:read', 'settings:write',
     'receptionist:call-artifacts:read', 'receptionist:manage',
   ],
   BILLING: ['billing:read', 'billing:write', 'settings:read', 'patient:read', 'intake:read', 'intake:write'],
   PROVIDER: ['patient:read', 'intake:read', 'appointment:read', 'appointment:write', 'schedule:manage', 'staff:read', 'settings:read'],
   FRONT_DESK: [
-    'patient:read', 'patient:write', 'intake:read', 'intake:write', 'appointment:read', 'appointment:write', 'billing:read', 'staff:read',
+    'patient:read', 'patient:write', 'intake:read', 'intake:write', 'appointment:read', 'appointment:write', 'billing:read', 'staff:read', 'staff:task-status',
     'receptionist:call-artifacts:read',
   ],
   ANALYST: ['patient:read', 'appointment:read', 'billing:read', 'staff:read', 'settings:read', 'audit:read'],
