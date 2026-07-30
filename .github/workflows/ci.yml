@@ -101,5 +101,14 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      - name: Verify package registry signatures and attestations
+        run: npm audit signatures
+      - name: Generate CycloneDX software bill of materials
+        run: npm sbom --sbom-format cyclonedx > carecommand-sbom.cdx.json
+      - name: Upload software bill of materials
+        uses: actions/upload-artifact@v4
+        with:
+          name: carecommand-sbom
+          path: carecommand-sbom.cdx.json
       - name: Dependency audit (production deps, high+)
         run: npm audit --audit-level=high --omit=dev

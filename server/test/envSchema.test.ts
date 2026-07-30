@@ -14,6 +14,16 @@ const base = {
   JWT_REFRESH_SECRET: 'y'.repeat(32),
 };
 
+const productionProfile = {
+  ...base,
+  NODE_ENV: 'production' as const,
+  PLATFORM_DATABASE_URL: 'postgresql://app_platform:pass@db.carecommand.example.com:5432/db',
+  PUBLIC_API_URL: 'https://api.pilot.carecommand.example.com',
+  CORS_ORIGINS: 'https://pilot.carecommand.example.com',
+  COOKIE_SAMESITE: 'none' as const,
+  METRICS_TOKEN: 'metrics-test-token',
+};
+
 describe('env schema — PORTAL_TOKEN_OUTBOX_PATH production guard', () => {
   it('rejects production + outbox path without the E2E escape hatch (boot fails closed)', () => {
     const res = envSchema.safeParse({ ...base, NODE_ENV: 'production', PORTAL_TOKEN_OUTBOX_PATH: '.playwright/portal-outbox.jsonl' });
@@ -59,7 +69,7 @@ describe('env schema — DEPLOYMENT_PROFILE integration-mode gate', () => {
   });
 
   it('pilot + mock payments without acknowledgement → boot fails naming integration, profile, and fix', () => {
-    const res = envSchema.safeParse({ ...base, DEPLOYMENT_PROFILE: 'pilot' });
+    const res = envSchema.safeParse({ ...productionProfile, DEPLOYMENT_PROFILE: 'pilot' });
     expect(res.success).toBe(false);
     if (!res.success) {
       const issue = res.error.issues.find(i => i.path.includes('PAYMENT_PROVIDER'));
@@ -70,7 +80,7 @@ describe('env schema — DEPLOYMENT_PROFILE integration-mode gate', () => {
   });
 
   it('pilot flags EVERY unacknowledged mock (payments, insurance, ai each named)', () => {
-    const res = envSchema.safeParse({ ...base, DEPLOYMENT_PROFILE: 'pilot' });
+    const res = envSchema.safeParse({ ...productionProfile, DEPLOYMENT_PROFILE: 'pilot' });
     expect(res.success).toBe(false);
     if (!res.success) {
       const paths = res.error.issues.map(i => i.path[0]);
@@ -82,18 +92,18 @@ describe('env schema — DEPLOYMENT_PROFILE integration-mode gate', () => {
 
   it('pilot + mocks accepted when each is explicitly acknowledged (trim + case-insensitive tokens)', () => {
     expect(envSchema.safeParse({
-      ...base, DEPLOYMENT_PROFILE: 'pilot',
+      ...productionProfile, DEPLOYMENT_PROFILE: 'pilot',
       ALLOWED_MOCK_INTEGRATIONS: 'payments,insurance,ai',
     }).success).toBe(true);
     expect(envSchema.safeParse({
-      ...base, DEPLOYMENT_PROFILE: 'pilot',
+      ...productionProfile, DEPLOYMENT_PROFILE: 'pilot',
       ALLOWED_MOCK_INTEGRATIONS: ' Payments , INSURANCE , ai ',
     }).success).toBe(true);
   });
 
   it('pilot acknowledgement is per-integration — acking ai/insurance does not cover payments', () => {
     const res = envSchema.safeParse({
-      ...base, DEPLOYMENT_PROFILE: 'pilot',
+      ...productionProfile, DEPLOYMENT_PROFILE: 'pilot',
       ALLOWED_MOCK_INTEGRATIONS: 'ai,insurance',
     });
     expect(res.success).toBe(false);
@@ -106,14 +116,18 @@ describe('env schema — DEPLOYMENT_PROFILE integration-mode gate', () => {
 
   it('pilot with real providers boots without any acknowledgement', () => {
     expect(envSchema.safeParse({
-      ...base, DEPLOYMENT_PROFILE: 'pilot',
+      ...productionProfile, DEPLOYMENT_PROFILE: 'pilot',
       PAYMENT_PROVIDER: 'stripe', INSURANCE_PROVIDER: 'stedi', AI_PROVIDER: 'claude',
+      STRIPE_SECRET_KEY: 'sk_test_profile', STRIPE_WEBHOOK_SECRET: 'whsec_profile',
+      STRIPE_SUCCESS_URL: 'https://pilot.carecommand.example.com/revenue-protection?payment=success',
+      STRIPE_CANCEL_URL: 'https://pilot.carecommand.example.com/revenue-protection?payment=cancel',
+      CLAUDE_API_KEY: 'claude-test-key',
     }).success).toBe(true);
   });
 
   it('enterprise + mock payments is rejected EVEN WITH acknowledgement (money path)', () => {
     const res = envSchema.safeParse({
-      ...base, DEPLOYMENT_PROFILE: 'enterprise',
+      ...productionProfile, DEPLOYMENT_PROFILE: 'enterprise',
       ALLOWED_MOCK_INTEGRATIONS: 'payments,insurance,ai',
     });
     expect(res.success).toBe(false);
@@ -126,8 +140,11 @@ describe('env schema — DEPLOYMENT_PROFILE integration-mode gate', () => {
 
   it('enterprise boots with real payments + acknowledged mock ai/insurance', () => {
     expect(envSchema.safeParse({
-      ...base, DEPLOYMENT_PROFILE: 'enterprise',
+      ...productionProfile, DEPLOYMENT_PROFILE: 'enterprise',
       PAYMENT_PROVIDER: 'stripe',
+      STRIPE_SECRET_KEY: 'sk_test_profile', STRIPE_WEBHOOK_SECRET: 'whsec_profile',
+      STRIPE_SUCCESS_URL: 'https://pilot.carecommand.example.com/revenue-protection?payment=success',
+      STRIPE_CANCEL_URL: 'https://pilot.carecommand.example.com/revenue-protection?payment=cancel',
       ALLOWED_MOCK_INTEGRATIONS: 'insurance,ai',
     }).success).toBe(true);
   });
@@ -139,5 +156,102 @@ describe('env schema — DEPLOYMENT_PROFILE integration-mode gate', () => {
       const issue = res.error.issues.find(i => i.path.includes('ALLOWED_MOCK_INTEGRATIONS'));
       expect(issue?.message).toContain('unknown integration "payment"');
     }
+  });
+
+  it('pilot fails closed when its operational posture is development, loopback, unmonitored, or missing the platform plane', () => {
+    const res = envSchema.safeParse({
+      ...base,
+      DEPLOYMENT_PROFILE: 'pilot',
+      ALLOWED_MOCK_INTEGRATIONS: 'payments,insurance,ai',
+    });
+    expect(res.success).toBe(false);
+    if (!res.success) {
+      const paths = res.error.issues.map(issue => issue.path[0]);
+      expect(paths).toContain('NODE_ENV');
+      expect(paths).toContain('PLATFORM_DATABASE_URL');
+      expect(paths).toContain('PUBLIC_API_URL');
+      expect(paths).toContain('CORS_ORIGINS');
+      expect(paths).toContain('METRICS_TOKEN');
+      expect(paths).toContain('COOKIE_SAMESITE');
+    }
+  });
+
+  it('pilot accepts an explicitly acknowledged synthetic provider posture only when operational controls are present', () => {
+    expect(envSchema.safeParse({
+      ...productionProfile,
+      DEPLOYMENT_PROFILE: 'pilot',
+      ALLOWED_MOCK_INTEGRATIONS: 'payments,insurance,ai',
+    }).success).toBe(true);
+  });
+
+  it('selected live providers fail boot when their required credentials or public redirect URLs are absent', () => {
+    const res = envSchema.safeParse({
+      ...productionProfile,
+      DEPLOYMENT_PROFILE: 'pilot',
+      PAYMENT_PROVIDER: 'stripe',
+      INSURANCE_PROVIDER: 'stedi',
+      AI_PROVIDER: 'openai',
+    });
+    expect(res.success).toBe(false);
+    if (!res.success) {
+      const paths = res.error.issues.map(issue => issue.path[0]);
+      expect(paths).toContain('STRIPE_SECRET_KEY');
+      expect(paths).toContain('STRIPE_WEBHOOK_SECRET');
+      expect(paths).toContain('STRIPE_SUCCESS_URL');
+      expect(paths).toContain('STRIPE_CANCEL_URL');
+      expect(paths).toContain('OPENAI_API_KEY');
+    }
+  });
+
+  it('rejects disguised loopback, private IP, credentials, paths, queries, and reserved development domains', () => {
+    const invalidPairs = [
+      { PUBLIC_API_URL: 'https://localhost.' },
+      { PUBLIC_API_URL: 'https://service.localhost' },
+      { PUBLIC_API_URL: 'https://10.0.0.1' },
+      { PUBLIC_API_URL: 'https://user:pass@api.carecommand.example.com' },
+      { CORS_ORIGINS: 'https://10.0.0.1/path' },
+      { CORS_ORIGINS: 'https://pilot.carecommand.example.com/path' },
+      { CORS_ORIGINS: 'https://pilot.example.test' },
+      { CORS_ORIGINS: 'https://pilot.carecommand.example.com?tenant=x' },
+    ];
+    for (const invalid of invalidPairs) {
+      const res = envSchema.safeParse({
+        ...productionProfile,
+        DEPLOYMENT_PROFILE: 'pilot',
+        ALLOWED_MOCK_INTEGRATIONS: 'payments,insurance,ai',
+        ...invalid,
+      });
+      expect(res.success, JSON.stringify(invalid)).toBe(false);
+    }
+  });
+
+  it('allows public HTTPS Stripe redirect paths and query state but rejects private redirect hosts', () => {
+    const valid = envSchema.safeParse({
+      ...productionProfile,
+      DEPLOYMENT_PROFILE: 'pilot',
+      PAYMENT_PROVIDER: 'stripe',
+      INSURANCE_PROVIDER: 'mock',
+      AI_PROVIDER: 'mock',
+      ALLOWED_MOCK_INTEGRATIONS: 'insurance,ai',
+      STRIPE_SECRET_KEY: 'sk_test_profile',
+      STRIPE_WEBHOOK_SECRET: 'whsec_profile',
+      STRIPE_SUCCESS_URL: 'https://pilot.carecommand.example.com/revenue-protection?payment=success',
+      STRIPE_CANCEL_URL: 'https://pilot.carecommand.example.com/revenue-protection?payment=cancel',
+    });
+    expect(valid.success).toBe(true);
+
+    const invalid = envSchema.safeParse({
+      ...productionProfile,
+      DEPLOYMENT_PROFILE: 'pilot',
+      PAYMENT_PROVIDER: 'stripe',
+      INSURANCE_PROVIDER: 'mock',
+      AI_PROVIDER: 'mock',
+      ALLOWED_MOCK_INTEGRATIONS: 'insurance,ai',
+      STRIPE_SECRET_KEY: 'sk_test_profile',
+      STRIPE_WEBHOOK_SECRET: 'whsec_profile',
+      STRIPE_SUCCESS_URL: 'https://127.0.0.1/revenue-protection?payment=success',
+      STRIPE_CANCEL_URL: 'https://pilot.carecommand.example.com/revenue-protection?payment=cancel',
+    });
+    expect(invalid.success).toBe(false);
   });
 });

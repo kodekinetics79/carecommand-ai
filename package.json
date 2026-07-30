@@ -27,6 +27,9 @@
     "verify:no-production-demo-artifacts": "tsx server/scripts/verifyNoProductionDemoArtifacts.ts",
     "verify:prisma-drift": "tsx server/scripts/verifyPrismaDrift.ts",
     "verify:db-lifecycle": "tsx server/scripts/verifyReleaseDatabaseLifecycle.ts",
+    "verify:clean-clone": "bash scripts/verify-clean-clone.sh",
+    "verify:production-engineering": "vitest run server/test/productionEngineering.test.ts server/test/envSchema.test.ts",
+    "release:migrate": "bash scripts/deploy-migrations.sh",
     "build": "NODE_ENV=production tsc -b && NODE_ENV=production vite build",
     "lint": "eslint .",
     "test": "vitest run",
@@ -94,6 +97,7 @@
     "typescript": "~6.0.2",
     "typescript-eslint": "^8.59.2",
     "vite": "^8.0.12",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.10",
+    "yaml": "^2.9.0"
   }
 }

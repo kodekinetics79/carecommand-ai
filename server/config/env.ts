@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { z } from 'zod';
+import { isIP } from 'node:net';
 import { booleanString } from '../lib/booleanString';
 
 // Integrations that have a mock mode and therefore need explicit
@@ -17,6 +18,30 @@ export function parseAllowedMockIntegrations(raw: string): string[] {
     .split(',')
     .map(token => token.trim().toLowerCase())
     .filter(token => token.length > 0);
+}
+
+function publicHttpsUrl(raw: string): URL | null {
+  try {
+    const url = new URL(raw);
+    const hostname = url.hostname.toLowerCase().replace(/\.$/, '');
+    const blockedSuffixes = ['.localhost', '.local', '.internal', '.test', '.example', '.invalid'];
+    const valid = url.protocol === 'https:'
+      && !url.username
+      && !url.password
+      && !url.hash
+      && hostname !== 'localhost'
+      && !blockedSuffixes.some(suffix => hostname.endsWith(suffix))
+      && isIP(hostname) === 0
+      && hostname.includes('.');
+    return valid ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+function isPublicHttpsOrigin(raw: string): boolean {
+  const url = publicHttpsUrl(raw);
+  return Boolean(url && (url.pathname === '' || url.pathname === '/') && !url.search);
 }
 
 const baseEnvSchema = z.object({
@@ -244,6 +269,57 @@ export const envSchema = baseEnvSchema.superRefine((cfg, ctx) => {
   }
 
   if (cfg.DEPLOYMENT_PROFILE === 'pilot' || cfg.DEPLOYMENT_PROFILE === 'enterprise') {
+    const addProfileIssue = (path: string, message: string) => {
+      ctx.addIssue({ code: 'custom', path: [path], message });
+    };
+
+    if (cfg.NODE_ENV !== 'production') {
+      addProfileIssue('NODE_ENV', `${cfg.DEPLOYMENT_PROFILE} deployments require NODE_ENV=production.`);
+    }
+    if (!cfg.PLATFORM_DATABASE_URL) {
+      addProfileIssue(
+        'PLATFORM_DATABASE_URL',
+        `${cfg.DEPLOYMENT_PROFILE} deployments require the dedicated app_platform database principal.`,
+      );
+    }
+    if (!cfg.QUEUES_ENABLED) {
+      addProfileIssue(
+        'QUEUES_ENABLED',
+        `${cfg.DEPLOYMENT_PROFILE} deployments require queues and an always-on worker for scheduled and retryable workflows.`,
+      );
+    }
+    if (!isPublicHttpsOrigin(cfg.PUBLIC_API_URL)) {
+      addProfileIssue(
+        'PUBLIC_API_URL',
+        `${cfg.DEPLOYMENT_PROFILE} deployments require a non-loopback HTTPS PUBLIC_API_URL for signed callbacks.`,
+      );
+    }
+    const origins = cfg.CORS_ORIGINS.split(',').map(origin => origin.trim()).filter(Boolean);
+    if (origins.length === 0 || origins.some(origin => !isPublicHttpsOrigin(origin))) {
+      addProfileIssue(
+        'CORS_ORIGINS',
+        `${cfg.DEPLOYMENT_PROFILE} deployments require explicit non-loopback HTTPS browser origins.`,
+      );
+    }
+    if (!cfg.METRICS_ENABLED || !cfg.METRICS_TOKEN) {
+      addProfileIssue(
+        'METRICS_TOKEN',
+        `${cfg.DEPLOYMENT_PROFILE} deployments require enabled, bearer-protected operational metrics.`,
+      );
+    }
+    if (cfg.PLATFORM_LEGACY_TOKEN_ENABLED) {
+      addProfileIssue(
+        'PLATFORM_LEGACY_TOKEN_ENABLED',
+        `${cfg.DEPLOYMENT_PROFILE} deployments must keep the legacy platform token disabled.`,
+      );
+    }
+    if (cfg.COOKIE_SAMESITE !== 'none') {
+      addProfileIssue(
+        'COOKIE_SAMESITE',
+        `${cfg.DEPLOYMENT_PROFILE} deployments require COOKIE_SAMESITE=none so split-site HTTPS refresh, CSRF, and logout cookies remain operational.`,
+      );
+    }
+
     const mockModes: Array<{ integration: MockableIntegration; envKey: string }> = [];
     if (cfg.PAYMENT_PROVIDER === 'mock') mockModes.push({ integration: 'payments', envKey: 'PAYMENT_PROVIDER' });
     if (cfg.INSURANCE_PROVIDER === 'mock') mockModes.push({ integration: 'insurance', envKey: 'INSURANCE_PROVIDER' });
@@ -276,6 +352,33 @@ export const envSchema = baseEnvSchema.superRefine((cfg, ctx) => {
             'to ALLOWED_MOCK_INTEGRATIONS (comma-separated).',
         });
       }
+    }
+
+    if (cfg.PAYMENT_PROVIDER === 'stripe') {
+      if (!cfg.STRIPE_SECRET_KEY) {
+        addProfileIssue('STRIPE_SECRET_KEY', 'Stripe mode requires STRIPE_SECRET_KEY.');
+      }
+      if (!cfg.STRIPE_WEBHOOK_SECRET) {
+        addProfileIssue('STRIPE_WEBHOOK_SECRET', 'Stripe mode requires STRIPE_WEBHOOK_SECRET.');
+      }
+      if (!publicHttpsUrl(cfg.STRIPE_SUCCESS_URL)) {
+        addProfileIssue('STRIPE_SUCCESS_URL', 'Stripe mode requires a non-loopback HTTPS success URL.');
+      }
+      if (!publicHttpsUrl(cfg.STRIPE_CANCEL_URL)) {
+        addProfileIssue('STRIPE_CANCEL_URL', 'Stripe mode requires a non-loopback HTTPS cancellation URL.');
+      }
+    }
+    if (cfg.INSURANCE_PROVIDER === 'stedi' && !cfg.STEDI_TEST_MODE && !cfg.STEDI_API_KEY) {
+      addProfileIssue('STEDI_API_KEY', 'Live Stedi mode requires STEDI_API_KEY; use STEDI_TEST_MODE=true for sandbox validation.');
+    }
+    if (cfg.AI_PROVIDER === 'openai' && !cfg.OPENAI_API_KEY) {
+      addProfileIssue('OPENAI_API_KEY', 'OpenAI mode requires OPENAI_API_KEY.');
+    }
+    if (cfg.AI_PROVIDER === 'claude' && !cfg.CLAUDE_API_KEY) {
+      addProfileIssue('CLAUDE_API_KEY', 'Claude mode requires CLAUDE_API_KEY.');
+    }
+    if (cfg.AI_PROVIDER === 'ollama' && cfg.OLLAMA_MODE === 'cloud' && !cfg.OLLAMA_API_KEY) {
+      addProfileIssue('OLLAMA_API_KEY', 'Ollama cloud mode requires OLLAMA_API_KEY.');
     }
   }
 });
