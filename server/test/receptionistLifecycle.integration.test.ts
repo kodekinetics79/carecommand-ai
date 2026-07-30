@@ -1,8 +1,9 @@
 import 'dotenv/config';
 
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
-import { createHmac, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
+import { signRetell } from './helpers/retellSignature';
 
 // Inbound-call lifecycle over the PUBLIC Retell event webhook: a call_started
 // creates a log, a later call_analyzed UPDATES the same log (duration, summary,
@@ -52,7 +53,7 @@ function webhook(clinicId: string, payload: unknown) {
   const raw = JSON.stringify(payload);
   return app.inject({
     method: 'POST', url: `/v1/receptionist/webhooks/retell?clinicId=${clinicId}`,
-    headers: { 'content-type': 'application/json', 'x-retell-signature': createHmac('sha256', RETELL_KEY).update(raw).digest('hex') },
+    headers: { 'content-type': 'application/json', 'x-retell-signature': signRetell(raw, RETELL_KEY) },
     payload: raw,
   });
 }
@@ -61,7 +62,7 @@ function webhookTool(clinicId: string, payload: unknown) {
   const raw = JSON.stringify(payload);
   return app.inject({
     method: 'POST', url: `/v1/receptionist/webhooks/retell/fn?clinicId=${clinicId}`,
-    headers: { 'content-type': 'application/json', 'x-retell-signature': createHmac('sha256', RETELL_KEY).update(raw).digest('hex') },
+    headers: { 'content-type': 'application/json', 'x-retell-signature': signRetell(raw, RETELL_KEY) },
     payload: raw,
   });
 }

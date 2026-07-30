@@ -1,8 +1,9 @@
 import 'dotenv/config';
 
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
-import { createHmac, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
+import { signRetell } from './helpers/retellSignature';
 
 // Real booking behavior through the live-agent tools (/webhooks/retell/fn), plus
 // the concurrency + cross-path double-booking guard, graceful bad-data handling,
@@ -64,7 +65,7 @@ async function fn(t: Pick<T, 'id' | 'clinicId'>, name: string, args: Record<stri
     const consent = await app.inject({
       method: 'POST',
       url: `/v1/receptionist/webhooks/retell/fn?clinicId=${t.clinicId}`,
-      headers: { 'content-type': 'application/json', 'x-retell-signature': createHmac('sha256', RETELL_KEY).update(consentRaw).digest('hex') },
+      headers: { 'content-type': 'application/json', 'x-retell-signature': signRetell(consentRaw, RETELL_KEY) },
       payload: consentRaw,
     });
     expect(consent.statusCode).toBe(200);
@@ -74,7 +75,7 @@ async function fn(t: Pick<T, 'id' | 'clinicId'>, name: string, args: Record<stri
   const res = await app.inject({
     method: 'POST',
     url: `/v1/receptionist/webhooks/retell/fn?clinicId=${t.clinicId}`,
-    headers: { 'content-type': 'application/json', 'x-retell-signature': createHmac('sha256', RETELL_KEY).update(raw).digest('hex') },
+    headers: { 'content-type': 'application/json', 'x-retell-signature': signRetell(raw, RETELL_KEY) },
     payload: raw,
   });
   return res;

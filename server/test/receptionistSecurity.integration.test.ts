@@ -1,8 +1,9 @@
 import 'dotenv/config';
 
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
-import { randomUUID, createHmac } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
+import { signRetell } from './helpers/retellSignature';
 
 // FIX 1 proof: the live-agent tool webhook (/webhooks/retell/fn) is a booking +
 // SMS primitive. It must reject unsigned/invalid calls in production EXACTLY like
@@ -21,6 +22,7 @@ vi.mock('../workers/queues', () => ({
 const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
+const { verifyRetellSignature } = await import('../modules/receptionist/routes');
 
 let app: FastifyInstance;
 const tenantIds: string[] = [];
@@ -44,7 +46,7 @@ function setEnv(patch: { NODE_ENV?: string; RETELL_API_KEY?: string }) {
 
 const fnUrl = (clinicId: string) => `/v1/receptionist/webhooks/retell/fn?clinicId=${clinicId}`;
 const body = (name: string, args: Record<string, unknown> = {}) => JSON.stringify({ name, args, call: { call_id: `sec-${randomUUID()}` } });
-const sign = (raw: string, key: string) => createHmac('sha256', key).update(raw).digest('hex');
+const sign = signRetell;
 
 beforeAll(async () => { app = await buildApp(); }, 60_000);
 afterAll(async () => {
@@ -52,6 +54,29 @@ afterAll(async () => {
   for (const id of tenantIds) await db.tenant.delete({ where: { id } }).catch(() => {});
   await app?.close();
   await db.$disconnect();
+});
+
+describe('Retell current secure-webhook signature contract', () => {
+  const key = 'retell-current-contract-key';
+  const now = 1_800_000_000_000;
+  const raw = Buffer.from('{"event":"call_started","call":{"call_id":"contract"}}');
+
+  it('accepts the exact official format and inclusive five-minute freshness boundary', () => {
+    expect(verifyRetellSignature(raw, sign(raw, key, now), key, now)).toBe(true);
+    expect(verifyRetellSignature(raw, sign(raw, key, now - 300_000), key, now)).toBe(true);
+    expect(verifyRetellSignature(raw, sign(raw, key, now + 300_000), key, now)).toBe(true);
+  });
+
+  it('rejects stale/future, wrong-body/key, legacy, malformed, extra, and duplicated fields', () => {
+    expect(verifyRetellSignature(raw, sign(raw, key, now - 300_001), key, now)).toBe(false);
+    expect(verifyRetellSignature(raw, sign(raw, key, now + 300_001), key, now)).toBe(false);
+    expect(verifyRetellSignature(Buffer.from(`${raw.toString()} `), sign(raw, key, now), key, now)).toBe(false);
+    expect(verifyRetellSignature(raw, sign(raw, 'wrong-key', now), key, now)).toBe(false);
+    expect(verifyRetellSignature(raw, sign(raw, key, now).split('d=')[1], key, now)).toBe(false);
+    expect(verifyRetellSignature(raw, `d=${'a'.repeat(64)},v=${now}`, key, now)).toBe(false);
+    expect(verifyRetellSignature(raw, `${sign(raw, key, now)},d=${'a'.repeat(64)}`, key, now)).toBe(false);
+    expect(verifyRetellSignature(raw, [sign(raw, key, now), sign(raw, key, now)], key, now)).toBe(false);
+  });
 });
 
 describe('receptionist /fn — signature enforcement (FIX 1)', () => {
@@ -79,7 +104,7 @@ describe('receptionist /fn — signature enforcement (FIX 1)', () => {
     }
   });
 
-  it('a correctly-signed call is accepted (200)', async () => {
+  it('a current-format correctly-signed call passes authentication', async () => {
     const t = await makeTenant();
     setEnv({ RETELL_API_KEY: 'retell_real_secret' });
     try {
@@ -97,6 +122,19 @@ describe('receptionist /fn — signature enforcement (FIX 1)', () => {
     try {
       const raw = body('check_availability');
       const res = await app.inject({ method: 'POST', url: fnUrl(t.clinicId), headers: { 'content-type': 'application/json', 'x-retell-signature': sign(raw, 'a_different_key') }, payload: raw });
+      expect(res.statusCode).toBe(401);
+    } finally {
+      setEnv(original);
+    }
+  });
+
+  it('rejects body mutation after signing', async () => {
+    const t = await makeTenant();
+    setEnv({ RETELL_API_KEY: 'retell_real_secret' });
+    try {
+      const originalRaw = body('check_availability', { appointment_date: '2030-01-01' });
+      const mutatedRaw = originalRaw.replace('2030-01-01', '2030-01-02');
+      const res = await app.inject({ method: 'POST', url: fnUrl(t.clinicId), headers: { 'content-type': 'application/json', 'x-retell-signature': sign(originalRaw, 'retell_real_secret') }, payload: mutatedRaw });
       expect(res.statusCode).toBe(401);
     } finally {
       setEnv(original);
@@ -138,13 +176,31 @@ describe('receptionist event webhook — production fail-closed posture', () => 
     }
   });
 
-  it('a correctly-signed event is accepted (200)', async () => {
+  it('a current-format correctly-signed event passes authentication', async () => {
     const t = await makeTenant();
     setEnv({ RETELL_API_KEY: 'retell_real_secret' });
     try {
       const raw = eventBody();
       const res = await app.inject({ method: 'POST', url: eventUrl(t.clinicId), headers: { 'content-type': 'application/json', 'x-retell-signature': sign(raw, 'retell_real_secret') }, payload: raw });
       expect(res.statusCode).toBe(202); // verified but unresolved first-call mapping
+    } finally {
+      setEnv(original);
+    }
+  });
+
+  it('rejects stale official-format event and tool callbacks', async () => {
+    const t = await makeTenant();
+    setEnv({ RETELL_API_KEY: 'retell_real_secret' });
+    try {
+      const timestamp = Date.now() - 300_001;
+      const rawEvent = eventBody();
+      const rawTool = body('check_availability');
+      const [eventResponse, toolResponse] = await Promise.all([
+        app.inject({ method: 'POST', url: eventUrl(t.clinicId), headers: { 'content-type': 'application/json', 'x-retell-signature': sign(rawEvent, 'retell_real_secret', timestamp) }, payload: rawEvent }),
+        app.inject({ method: 'POST', url: fnUrl(t.clinicId), headers: { 'content-type': 'application/json', 'x-retell-signature': sign(rawTool, 'retell_real_secret', timestamp) }, payload: rawTool }),
+      ]);
+      expect(eventResponse.statusCode).toBe(401);
+      expect(toolResponse.statusCode).toBe(401);
     } finally {
       setEnv(original);
     }

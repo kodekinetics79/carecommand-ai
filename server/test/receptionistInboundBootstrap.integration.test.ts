@@ -1,8 +1,9 @@
 import 'dotenv/config';
 
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { createHmac, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
+import { signRetell } from './helpers/retellSignature';
 
 vi.mock('../workers/queues', () => ({
   redisConnection: {},
@@ -44,7 +45,7 @@ function signedInject(url: string, payload: unknown, key = KEY) {
   return app.inject({
     method: 'POST',
     url,
-    headers: { 'content-type': 'application/json', 'x-retell-signature': createHmac('sha256', key).update(raw).digest('hex') },
+    headers: { 'content-type': 'application/json', 'x-retell-signature': signRetell(raw, key) },
     payload: raw,
   });
 }

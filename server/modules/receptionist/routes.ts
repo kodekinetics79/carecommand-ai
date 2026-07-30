@@ -816,12 +816,26 @@ async function claimWebhookIdempotency(scope: string, key: string, tenantId?: st
   }
 }
 
-// Retell signs the raw request body with the workspace API key (HMAC-SHA256).
-function verifyRetellSignature(rawBody: Buffer | undefined, signature: string | undefined, apiKey: string): boolean {
-  if (!rawBody || !signature) return false;
-  const expected = createHmac('sha256', apiKey).update(rawBody).digest('hex');
-  const expectedBuffer = Buffer.from(expected);
-  const signatureBuffer = Buffer.from(signature);
+const RETELL_SIGNATURE_TOLERANCE_MS = 5 * 60 * 1_000;
+
+// Current Retell contract: `v=<unix-ms>,d=<hex>` where the digest covers the
+// exact raw body bytes followed by the timestamp text. Strict parsing rejects
+// duplicate/extra fields and the freshness window prevents captured replay.
+export function verifyRetellSignature(
+  rawBody: Buffer | undefined,
+  signature: string | string[] | undefined,
+  apiKey: string,
+  nowMs = Date.now(),
+): boolean {
+  if (!rawBody || typeof signature !== 'string' || !apiKey) return false;
+  const match = /^v=(\d{13}),d=([a-fA-F0-9]{64})$/.exec(signature);
+  if (!match) return false;
+  const timestampText = match[1];
+  const timestamp = Number(timestampText);
+  if (!Number.isSafeInteger(timestamp) || Math.abs(nowMs - timestamp) > RETELL_SIGNATURE_TOLERANCE_MS) return false;
+  const expected = createHmac('sha256', apiKey).update(rawBody).update(timestampText).digest('hex');
+  const expectedBuffer = Buffer.from(expected, 'hex');
+  const signatureBuffer = Buffer.from(match[2], 'hex');
   if (expectedBuffer.length !== signatureBuffer.length) return false;
   return timingSafeEqual(expectedBuffer, signatureBuffer);
 }
@@ -964,9 +978,8 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     // Signature verification — unverifiable webhooks never establish tenant
     // authority in any environment.
     const signatureRaw = request.headers['x-retell-signature'];
-    const signatureHeader = Array.isArray(signatureRaw) ? signatureRaw[0] : signatureRaw;
     if (env.RETELL_API_KEY) {
-      if (!verifyRetellSignature(request.rawBody, signatureHeader, env.RETELL_API_KEY)) {
+      if (!verifyRetellSignature(request.rawBody, signatureRaw, env.RETELL_API_KEY)) {
         request.log.warn({ ip: request.ip }, 'Retell webhook signature verification failed');
         return reply.code(401).send({ error: 'INVALID_SIGNATURE' });
       }
@@ -1256,9 +1269,8 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     // Signature verification — MIRRORS /webhooks/retell. Reject when the
     // signature is absent/invalid and fail closed when the key is missing.
     const sig = request.headers['x-retell-signature'];
-    const sigHeader = Array.isArray(sig) ? sig[0] : sig;
     if (env.RETELL_API_KEY) {
-      if (!verifyRetellSignature(request.rawBody, sigHeader, env.RETELL_API_KEY)) {
+      if (!verifyRetellSignature(request.rawBody, sig, env.RETELL_API_KEY)) {
         request.log.warn({ ip: request.ip }, 'Retell fn webhook signature verification failed');
         return reply.code(401).send({ error: 'INVALID_SIGNATURE' });
       }

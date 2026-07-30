@@ -1,8 +1,9 @@
 import 'dotenv/config';
 
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
-import { createHmac, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
+import { signRetell } from './helpers/retellSignature';
 
 vi.mock('../workers/queues', () => ({
   redisConnection: {},
@@ -232,7 +233,7 @@ describe('AI receptionist outbound targets', () => {
     env.RETELL_API_KEY = 'retell_usage_secret';
     try {
       const raw = JSON.stringify({ event: 'call_ended', call: { call_id: callId, from_number: '+15550000001', duration_ms: 61_000, call_analysis: { custom_analysis_data: { outcome: 'OPTED_OUT' } } } });
-      const signature = createHmac('sha256', env.RETELL_API_KEY).update(raw).digest('hex');
+      const signature = signRetell(raw, env.RETELL_API_KEY);
       const send = () => app.inject({
         method: 'POST',
         url: `/v1/receptionist/webhooks/retell?clinicId=${tenant.clinicId}`,
