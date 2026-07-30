@@ -20,6 +20,17 @@ vi.mock('../workers/queues', () => ({
   registerCampaignSchedules: async () => undefined,
 }));
 
+vi.mock('../lib/receptionist/retellRateStore', () => ({
+  retellRateStore: {
+    async eval(script: string, numberOfKeys: number, ...args: Array<string | number>) {
+      const client = await Promise.resolve(rateStoreState.client) as { eval(script: string, numberOfKeys: number, ...args: Array<string | number>): Promise<unknown> } | undefined;
+      if (!client) throw new Error('rate store unavailable');
+      return client.eval(script, numberOfKeys, ...args);
+    },
+  },
+  closeRetellRateStore: () => undefined,
+}));
+
 const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');

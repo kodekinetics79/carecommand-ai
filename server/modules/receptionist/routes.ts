@@ -30,13 +30,11 @@ import { MAX_TENANT_ACTIVE_CALLS, DEFAULT_VOICE_MINUTES_LIMIT } from './outbound
 import { stopPhoneCall } from '../../lib/retell';
 import { validateIanaTimezone } from '../../lib/scheduling';
 import { Prisma } from '../../generated/prisma/client';
-import { autopilotQueue } from '../../workers/queues';
 import {
   enforceInvalidRetellSignatureRateLimit,
   enforceVerifiedRetellRateLimit,
-  withRetellRateStoreDeadline,
-  type RetellRateRedis,
 } from '../../lib/receptionist/providerRateLimit';
+import { retellRateStore } from '../../lib/receptionist/retellRateStore';
 
 const uuid = z.string().uuid();
 const RECEPTIONIST_CALL_LEASE_MS = 4 * 60 * 60 * 1_000;
@@ -847,22 +845,12 @@ export function verifyRetellSignature(
   return timingSafeEqual(expectedBuffer, signatureBuffer);
 }
 
-async function retellRateRedis(): Promise<RetellRateRedis | undefined> {
-  let redis: RetellRateRedis | undefined;
-  try {
-    redis = await withRetellRateStoreDeadline(autopilotQueue.client as unknown as Promise<RetellRateRedis>);
-  } catch {
-    redis = undefined;
-  }
-  return redis;
-}
-
 async function enforceTrustedRetellCallbackRate(tenantId: string, providerCallId: string, kind: 'event' | 'tool') {
   return enforceVerifiedRetellRateLimit({
     tenantId,
     providerCallId,
     kind,
-    redis: await retellRateRedis(),
+    redis: retellRateStore,
     production: env.NODE_ENV === 'production',
   });
 }
@@ -870,7 +858,7 @@ async function enforceTrustedRetellCallbackRate(tenantId: string, providerCallId
 async function enforceInvalidRetellCallbackRate(source: string) {
   return enforceInvalidRetellSignatureRateLimit({
     source,
-    redis: await retellRateRedis(),
+    redis: retellRateStore,
     production: env.NODE_ENV === 'production',
   });
 }

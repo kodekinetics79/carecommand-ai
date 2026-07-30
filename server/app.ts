@@ -49,6 +49,7 @@ import { portalRoutes } from './modules/portal/routes';
 import { portalAdminRoutes } from './modules/portal/admin';
 import { autopilotQueue } from './workers/queues';
 import { assertProductionRateLimitStore, skipRateLimitStoreErrors } from './lib/rateLimitPolicy';
+import { closeRetellRateStore } from './lib/receptionist/retellRateStore';
 
 // Webhook signature verification (Stripe/Retell) needs the exact bytes that were
 // signed, so we capture the raw JSON body while still parsing it normally.
@@ -71,6 +72,7 @@ export async function buildApp() {
     // under it. Make it intentional rather than relying on the framework default.
     bodyLimit: 1_048_576,
   });
+  app.addHook('onClose', async () => { closeRetellRateStore(); });
 
   // Preserve the raw body so webhook handlers can verify HMAC signatures,
   // while still delivering parsed JSON to every other route.

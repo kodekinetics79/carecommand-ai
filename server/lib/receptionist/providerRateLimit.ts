@@ -29,13 +29,13 @@ if source_count == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
 return source_count
 `;
 
-export async function withRetellRateStoreDeadline<T>(operation: Promise<T>): Promise<T> {
+export async function withRetellRateStoreDeadline<T>(operation: Promise<T>, timeoutMs = RETELL_RATE_STORE_TIMEOUT_MS): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       operation,
       new Promise<T>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error('Retell rate store deadline exceeded')), RETELL_RATE_STORE_TIMEOUT_MS);
+        timer = setTimeout(() => reject(new Error('Retell rate store deadline exceeded')), timeoutMs);
       }),
     ]);
   } finally {

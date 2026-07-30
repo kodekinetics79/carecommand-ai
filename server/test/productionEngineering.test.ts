@@ -72,6 +72,14 @@ describe('production engineering repository gates', () => {
     expect(keyed(service('web').envVars).get('TRUSTED_PROXY_CIDRS')?.sync).toBe(false);
   });
 
+  it('uses a dedicated fail-fast Redis client for Retell callback limits', () => {
+    const source = read('server/lib/receptionist/retellRateStore.ts');
+    expect(source).toContain('enableOfflineQueue: false');
+    expect(source).toContain('maxRetriesPerRequest: 0');
+    expect(source).toContain('retryStrategy: () => null');
+    expect(source).toContain('disconnect(false)');
+  });
+
   it('uses sync:false only on services, never in an environment group', () => {
     for (const group of blueprint.envVarGroups) {
       expect(group.envVars.filter(entry => entry.sync !== undefined), `${group.name} contains unsupported sync`).toEqual([]);
