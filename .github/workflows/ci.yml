@@ -32,8 +32,9 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
-      DATABASE_URL: postgresql://carecommand:carecommand@localhost:5432/carecommand?schema=public
+      DATABASE_URL: postgresql://app_rls:ci-app-rls-only@localhost:5432/carecommand?schema=public
       DATABASE_MIGRATION_URL: postgresql://carecommand:carecommand@localhost:5432/carecommand?schema=public
+      PLATFORM_DATABASE_URL: postgresql://app_platform:ci-app-platform-only@localhost:5432/carecommand?schema=public
       REDIS_URL: redis://localhost:6379
       JWT_SECRET: ci-only-secret-with-more-than-32-characters
       JWT_REFRESH_SECRET: ci-only-refresh-secret-more-than-32-characters
@@ -47,10 +48,43 @@ jobs:
       - run: npm ci
       - run: npm run db:generate
       - run: npm run db:deploy
+      - name: Reject unexpected Prisma drift
+        run: npm run verify:prisma-drift
+      - name: Configure restricted RLS runtime role for verification
+        env:
+          PGPASSWORD: carecommand
+        run: psql -h localhost -U carecommand -d carecommand -v ON_ERROR_STOP=1 -c "ALTER ROLE app_rls PASSWORD 'ci-app-rls-only'; ALTER ROLE app_platform PASSWORD 'ci-app-platform-only'"
+      - name: Verify complete RLS catalog as restricted runtime role
+        env:
+          DATABASE_URL: postgresql://app_rls:ci-app-rls-only@localhost:5432/carecommand?schema=public
+        run: npm run rls:verify
+      - name: Verify every protected table behaviorally in a disposable database
+        env:
+          NODE_ENV: test
+          RLS_DISPOSABLE_DB_ACK: CREATE_AND_DROP_LOCAL_RLS_TEST_DATABASE
+        run: npm run test:rls:behavior
+      - name: Verify clean migrate, deterministic seed, backup, and restore
+        env:
+          NODE_ENV: test
+          RELEASE_DB_LIFECYCLE_ACK: CREATE_DROP_LOCAL_RELEASE_TEST_DATABASES
+        run: npm run verify:db-lifecycle
       - run: npm run api:typecheck
       - run: npm run lint
       - run: npm test
       - run: npm run build
+      - name: Reject production demo, fixture, credential, and dead-action artifacts
+        run: npm run verify:no-production-demo-artifacts
+      - name: Install Chromium for real-backend route/action tests
+        run: npx playwright install --with-deps chromium
+      - name: Real-backend desktop and mobile route/action certification
+        run: npm run test:e2e
+      - name: Upload browser evidence on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-evidence
+          path: .playwright/
+          if-no-files-found: ignore
 
   security:
     runs-on: ubuntu-latest

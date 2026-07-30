@@ -1,5 +1,11 @@
 # CareCommand AI — Pilot Readiness & Superiority Backlog
 
+> **Superseded planning snapshot.** The current release decision is maintained
+> in [`docs/testing/RELEASE_READINESS_REPORT.md`](testing/RELEASE_READINESS_REPORT.md)
+> and is **NO-GO for real PHI, production launch, or unattended autonomous
+> receptionist operation**. The conditional language below is retained only as
+> historical planning context for an attended synthetic-data pilot.
+
 _Prepared by CTO + Sales Director (Kode Kinetics) after a full autonomous engineering + independent-expert review pass. Branch: `feat/security-observability-hardening` (uncommitted). Verification at time of writing: server + frontend typecheck clean, lint clean, **251/251 tests passing (43 files)**, 56 migrations applied and coherent._
 
 ---

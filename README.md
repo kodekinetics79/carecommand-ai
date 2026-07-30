@@ -104,13 +104,13 @@ cp .env.example .env
 docker compose up -d postgres redis
 npm run db:generate
 npm run db:deploy
-npm run db:seed
+NODE_ENV=test SYNTHETIC_PROFILE=FUNCTIONAL SYNTHETIC_DATABASE_URL="$DATABASE_MIGRATION_URL" CONFIRM_SYNTHETIC_DATABASE=<disposable_database_name> npm run db:seed
 npm run dev:all
 ```
 
 - Frontend: `http://localhost:12000`
 - API: `http://localhost:3001`
-- API docs: `http://localhost:3001/docs`
+- OpenAPI document (development only): `http://localhost:3001/docs/json`
 - Readiness probe: `http://localhost:3001/health/ready`
 - Local development login:
   - Email: `admin@carecommand.ai`
@@ -140,13 +140,13 @@ CareCommand AI now includes a premium advisory layer that turns the product into
 CareCommand AI also includes a revenue-protection workflow for insurance readiness, patient responsibility capture, prior authorisation tracking, and payment follow-up.
 
 - Provider strategy: `INSURANCE_PROVIDER=mock|stedi|availity|pverify|optum` and `PAYMENT_PROVIDER=mock|stripe|square|authorize_net|clover|paypal`
-- Stedi and Stripe are server-side only; if credentials are missing or invalid, the backend falls back to mock mode instead of crashing the app
+- Stedi and Stripe are server-side only; missing/invalid live credentials return an explicit setup/unavailable state and never silently fabricate a successful provider result
 - `STEDI_TEST_MODE=true` keeps Stedi in sandbox mode when credentials exist; `STRIPE_SECRET_KEY` controls Stripe test/live behavior
 - Refresh/status labels in the UI intentionally show `Mock Mode`, `Sandbox Active`, or `Live Active`
-- The Stripe webhook route is currently a placeholder; it records a safe integration log and does not fake completed payments
+- The Stripe webhook verifies signatures, reconciles payment state atomically and idempotently, and never treats an unverified callback as a completed payment
 - No card numbers, CVV, or raw payment payloads are stored; provider references and payment URLs only
 - Insurance responses are normalized into internal eligibility and responsibility models before they reach the UI
-- If the API becomes cross-site later, add a dedicated CSRF strategy before enabling cookie-authenticated writes across origins
+- Separate-origin SPAs receive a rotating CSRF value for module-memory use and can bootstrap it from `/v1/auth/csrf`; refresh remains an HttpOnly cookie and the CSRF value is never stored locally
 
 ## Enterprise Admin, Security, and Integrations
 
@@ -175,16 +175,15 @@ The platform now exposes working enterprise control surfaces for access control,
 
 The UI now authenticates against the local API and hydrates operational records from PostgreSQL for the executive dashboard, Customer360, customer profiles, scheduling, CRM leads, campaigns, reviews, competitor radar, reputation defense, provider productivity, staff workflow, inventory, partner reports and review actions, integrations, staff tasks, revenue snapshots, AI front-desk conversations and replies, and Autopilot approvals.
 
-- Development blends live records with demo rows so product walkthroughs remain visually rich.
-- Production disables demo fallback unless `VITE_DEMO_FALLBACK=true` is explicitly configured.
+- Application screens use persisted API data and truthful empty/setup states; deterministic synthetic data is available only through the guarded test seeder.
 - The topbar reports `API Live` when the readiness endpoint responds successfully.
 - Required secrets: `JWT_SECRET` and `JWT_REFRESH_SECRET`.
 - Refresh cookies are `HttpOnly`, `SameSite=Lax`, scoped to `/v1/auth`, and `Secure` in production; serve the app over HTTPS in production.
 - Access tokens stay in memory only; refresh is restored via the cookie on page reload.
 - Access tokens expire in 15 minutes; already-issued access tokens remain valid until they naturally expire.
-- Auth endpoints are lightly rate-limited and refresh/logout require a matching `X-CSRF-Token` header plus the `cc_csrf` cookie.
+- Auth endpoints are rate-limited; refresh/logout require a matching `X-CSRF-Token` plus CSRF cookie, with the response/bootstrap value held only in module memory for separate-origin SPAs.
 - Passwords are stored as salted hashes; never commit plaintext credentials.
-- If the API ever moves cross-site, add a CSRF token strategy before exposing cookie-authenticated writes.
+- Cross-site HTTPS requires `COOKIE_SAMESITE=none`, exact CORS origins and the implemented response/bootstrap CSRF flow.
 - Future work: replace local email/password login with OIDC or SSO for production.
 
 ### Auth production checklist

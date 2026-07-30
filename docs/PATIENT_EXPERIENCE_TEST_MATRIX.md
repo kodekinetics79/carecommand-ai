@@ -11,6 +11,7 @@ non-production patient records.
 | Persona | Scenario focus |
 | --- | --- |
 | New adult patient | portal signup, booking, intake, consent, insurance, payment |
+| Minor or proxy request | staff review remains pending; no patient-self credential is created until a scoped proxy-authority model exists |
 | Returning patient | sign-in, reschedule, cancel, payment receipt, follow-up |
 | Caregiver/guardian | dependent workflow where enabled; explicit limitation where not enabled |
 | Billing-question patient | failed payment, receipt, refund status, insurance transparency |

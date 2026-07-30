@@ -49,7 +49,7 @@ Browser ──► Vercel (static SPA, VITE_API_URL) ──► Railway API ──
 6. **Seed once** (data + sandbox demo). Railway CLI:
    ```bash
    railway link            # pick the project
-   railway run npm run db:seed
+   Do not run a data seed in production. Provision tenant data through the audited platform workflow.
    railway run npm run demo:sandbox   # optional: populates connected-care demo
    ```
    (or run them as one-off commands from the service shell).

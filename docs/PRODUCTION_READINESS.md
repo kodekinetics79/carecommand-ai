@@ -1,25 +1,20 @@
 # Production Readiness — CareCommand AI
 
-Tracking the move from demo posture → production-grade. Status as of the
-"build the foundation" track (no specific first client yet).
+Tracking the move from local engineering release-candidate posture to a
+production-operated service. Status as of the 2026-07-30 convergence run.
 
 Legend: ✅ done · 🟡 in progress · ⬜ todo
 
 ## Phase 1 — Trust & isolation (the non-negotiables)
 - ✅ CI runs typecheck + lint + **tests** + build on every push/PR (Postgres + Redis services).
 - ✅ CI **secret scanning** (gitleaks, blocking) + **dependency audit** (`npm audit --audit-level=high --omit=dev`, **blocking** — production tree at 0 high+ after pinning the dev-only `hono`/`@hono/node-server` transitive via `overrides`).
-- ✅ Production **seed guard** — refuses to load demo data into prod unless `ALLOW_PROD_SEED=true`.
+- ✅ Legacy production/demo seed removed. `npm run db:seed` now accepts only an explicitly confirmed disposable test database and a deterministic synthetic profile.
 - ✅ Production legacy platform token is disabled by default. `PLATFORM_API_TOKEN`
   is accepted in production only when the explicit break-glass flag
   `PLATFORM_LEGACY_TOKEN_ENABLED=true` is set; prefer PlatformUser login +
   platform JWT. Proof: `server/test/platformLegacyToken.test.ts`.
-- 🟡 **RLS / DB-level tenant isolation** — mechanism live, enforced on 6 tables, now **CI-proven**, expansion in progress (wave rollout).
-  - **How it works:** the runtime connects as the non-bypass role `app_rls`; `server/lib/tenantContext.ts` exposes `runWithTenantContext/JobTenantContext/WebhookTenantContext`, which open a Prisma interactive transaction and `set_config('app.current_tenant_id', …, is_local=true)` on the pinned connection. Policies filter `tenantId = current_setting('app.current_tenant_id')` and **fail closed** when unset.
-  - **Enforced today (RLS + FORCE):** `NotificationTemplate`, `AiGuardrail`, `CustomerPreference`, `DepositRule`, `RevenueLeak`, `RevenueProtectionAlert` — every access path adopts `runWithTenantContext` (7 modules).
-  - **Proof (CI-gated):** `server/test/rls.test.ts` — drops to `app_rls`, proves cross-tenant read/update/delete denied, `WITH CHECK` blocks cross-tenant writes, and unset GUC yields zero rows. Portable across the `app_rls` runtime role and the CI superuser base (via `SET LOCAL ROLE app_rls`).
-  - **Intentional exclusions (do NOT enrol):** `User`, `PasswordResetToken` (login needs cross-tenant lookup), `TenantSubscription`/`TenantFeatureEntitlement`/`SubscriptionPlan*` (entitlement checks), `PaymentRequest`/`DepositRequirement` (webhook-global by design). `Tenant` + platform/global tables are correctly non-tenant.
-  - **Remaining (wave work):** ~99 tenant tables not yet enrolled. Each wave: route all access through `runWithTenantContext` → enable RLS in a reversible migration → extend `rls.test.ts`. Until enrolled, the app-level `where: { tenantId }` on every query is the primary control; RLS is defense-in-depth.
-  - **⚠️ Production cutover check:** the prod `DATABASE_URL` runtime role MUST be `rolbypassrls=false` (i.e., `app_rls`, not a Neon owner/superuser) or RLS is silently ineffective. Verify before relying on it in prod.
+- ✅ **RLS / DB-level tenant isolation (local engineering):** 119/119 protected tenant/PHI tables have ENABLE + FORCE RLS; the current catalog has 522 policies and eight documented global/shared exemptions. `app_rls` is non-superuser, has no `BYPASSRLS`, owns no protected tables, and has no platform-table privileges. The table-driven restricted-role harness proves 962 same/cross/no-context CRUD and relationship behaviors across all 119 tables, including connection-pool cleanup. Platform control data uses the separate least-privilege `app_platform` client/role. Evidence: `docs/security/RLS_COVERAGE_MATRIX.md`, `RLS_BEHAVIORAL_EVIDENCE.md`, and `PLATFORM_DATABASE_PLANE.md`.
+  - **Production cutover check:** the deployed `DATABASE_URL` must authenticate as `app_rls`, `PLATFORM_DATABASE_URL` as `app_platform`, and migrations as the distinct schema owner. Re-run catalog/behavior probes against the deployed topology before handling PHI; local proof is not deployed evidence.
 - 🟡 **Observability**: backend foundation shipped — **PHI-safe structured logging** (`server/config/logger.ts`: pino `redact` for auth/cookie/token/webhook-signature paths, used app-wide) and a **vendor-neutral error-capture seam** (`server/lib/observability.ts`): the HTTP error handler captures every **5xx with id-only context** (requestId/route/method/tenantId/userId/statusCode — never bodies/PHI) as a structured `event:'exception'` log and forwards to a registered reporter. **Sentry is a ~6-line boot wiring** (`setErrorReporter` + `@sentry/node`, gated by `SENTRY_DSN`) documented in the module — no premature dependency. Proven by `server/test/observability.test.ts` (redaction, capture, reporter forwarding/throw-safety, 5xx-vs-4xx routing). *Remaining:* install + wire Sentry for real, frontend error reporting, uptime + error-rate alerting.
 - ⬜ **Secrets**: rotate the values shared in chat (Neon/Redis/Retell + JWT/encryption); confirm all are Vercel-encrypted env, none in git.
 
@@ -68,7 +63,7 @@ Legend: ✅ done · 🟡 in progress · ⬜ todo
   - **Migration:** `20260629000000_role_definition_permissions` adds nullable `RoleDefinition.permissions` (JSONB). Additive/backward-compatible. Rollback: `ALTER TABLE "RoleDefinition" DROP COLUMN "permissions";`.
   - 🟡 Money paths: ✅ `server/test/payments.integration.test.ts` — **Stripe webhook signature verification** (invalid sig → 400, nothing collected), **idempotency** on the Stripe event id (redelivery → `duplicate:true`, no second `paymentTransaction`), verified success → `collected` + transaction + `payment.succeeded` audit, unmatched event acknowledged (200), **tokenized public checkout** is patient-safe (no tenant/PHI ids leaked; 404 on unknown token), and authed payment routes require auth (401). Eligibility has authed coverage in `connectedCare.integration.test.ts`. ⬜ still: booking/no-show money flows, mobile/loading/error UI states, large-dataset pagination.
 - ⬜ Expand test coverage on the money paths (payments, eligibility, booking, RLS).
-- ✅ **Module demo-data coverage** — `npm run verify:modules` reports, per the demo tenant, which module tables are empty (a "dead module" renders empty in the UI); it bypasses RLS (owner role) for accurate counts and exits non-zero if any non-ephemeral module is empty. `npm run db:seed:coverage` (idempotent) backfills the modules that had no demo data: compliance policy/risk/task/evidence/exception, security incidents + scans + vendor risk, platform integration, support-access session, the billing/usage/add-on/request commercial layer, outbound-calling targets, consent/intake detail records, and pilot import/share records. Demo tenant now at **107/107 non-ephemeral modules covered**.
+- ✅ **Synthetic module coverage** — deterministic FUNCTIONAL, PILOT, and EDGE profiles replace the retired shared demo tenant. The guarded seeder refuses production, unsafe names, non-empty targets, and missing exact confirmation.
 - 🟡 Performance/abuse-hardening: ✅ explicit request **`bodyLimit` (1 MiB)** caps oversized payloads (memory-exhaustion defense), and list pagination is **bounded** (cursor + `limit` max 100). Proven by `server/test/hardening.test.ts` — oversized body → 413; `limit=99999` → 400; a 30-row dataset walks in stable, non-overlapping pages covering every row exactly once. ⬜ still: serverless cold-start budget; bundle size (index chunk ~533 KB); key DB index review.
 - 🟡 Runbooks: incident, rollback, on-call, data-subject requests.
   Added operational runbooks for enterprise validation:
