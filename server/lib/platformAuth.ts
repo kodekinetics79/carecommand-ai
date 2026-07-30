@@ -1,5 +1,5 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { platformDb } from './platformDb';
 import { enterPlatformDatabaseContext } from './platformContextStore';
 import { env } from '../config/env';
@@ -29,25 +29,29 @@ interface PlatformJwt {
   platformUserId: string;
   role: PlatformRole;
   type: 'platform';
-  sessionIssuedAtMs: number;
+  sessionId: string;
 }
 
 export function signPlatformToken(app: FastifyInstance, user: { id: string; role: string }, expiresIn = '8h'): string {
-  return app.jwt.sign({ platformUserId: user.id, role: user.role, type: 'platform', sessionIssuedAtMs: Date.now() } as PlatformJwt, { expiresIn });
+  return app.jwt.sign({ platformUserId: user.id, role: user.role, type: 'platform', sessionId: randomUUID() } as PlatformJwt, { expiresIn });
 }
 
 export function signPlatformMfaToken(app: FastifyInstance, userId: string): string {
   return app.jwt.sign({ platformUserId: userId, role: 'PLATFORM_MFA' as PlatformRole, type: 'platform-mfa' } as never, { expiresIn: '10m' });
 }
 
-export async function platformSessionWasLoggedOut(platformUserId: string, sessionIssuedAtMs: number): Promise<boolean> {
+export function platformSessionIdHash(sessionId: string): string {
+  return createHash('sha256').update(sessionId).digest('hex');
+}
+
+export async function platformSessionWasLoggedOut(platformUserId: string, sessionId: string): Promise<boolean> {
   const receipt = await platformDb.platformAuditEvent.findFirst({
     where: {
       platformUserId,
       action: 'platform.logout',
       targetType: 'platformUser',
       targetId: platformUserId,
-      metadata: { path: ['sessionIssuedAtMs'], equals: sessionIssuedAtMs },
+      metadata: { path: ['sessionIdHash'], equals: platformSessionIdHash(sessionId) },
     },
     select: { id: true },
   });
@@ -111,8 +115,8 @@ export function requirePlatformAccess(...allowedRoles: PlatformRole[]) {
             where: { id: payload.platformUserId, status: 'active' },
             select: { id: true, role: true, email: true },
           }),
-          Number.isFinite(payload.sessionIssuedAtMs)
-            ? platformSessionWasLoggedOut(payload.platformUserId, payload.sessionIssuedAtMs)
+          typeof payload.sessionId === 'string' && payload.sessionId.length > 0
+            ? platformSessionWasLoggedOut(payload.platformUserId, payload.sessionId)
             : Promise.resolve(true),
         ]);
         if (pu && !loggedOut) {

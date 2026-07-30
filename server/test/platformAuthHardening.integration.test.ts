@@ -19,7 +19,7 @@ const { buildApp } = await import('../app');
 const { platformDb } = await import('../lib/platformDb');
 const { encryptSecret, generatePasswordHash } = await import('../lib/security');
 const { generateTotp, generateTotpSecret } = await import('../lib/totp');
-const { hashV } = await import('../lib/platformAuth');
+const { hashV, signPlatformToken, platformSessionIdHash } = await import('../lib/platformAuth');
 const {
   PLATFORM_AUTH_RATE_LIMIT,
   PLATFORM_LOGIN_DUMMY_HASH,
@@ -59,17 +59,28 @@ async function platformUser(input: { email: string; password: string; status?: s
 }
 
 describe('platform authentication enumeration resistance', () => {
-  it('revokes the invoking high-privilege JWT on logout and writes an audit receipt', async () => {
+  it('revokes only the invoking high-privilege JWT even when two sessions are issued in the same millisecond', async () => {
     const suffix = randomUUID();
     const user = await platformUser({ email: `logout-${suffix}@platform.test`, password: 'Correct-Logout-Password!' });
-    const login = await app.inject({ method: 'POST', url: '/v1/platform/auth/login', payload: { email: user.email, password: 'Correct-Logout-Password!' } });
-    expect(login.statusCode).toBe(200);
-    const token = login.json().token as string;
-    const headers = { authorization: `Bearer ${token}`, 'x-forwarded-for': '203.0.113.120' };
-    expect((await app.inject({ method: 'GET', url: '/v1/platform/auth/me', headers })).statusCode).toBe(200);
-    expect((await app.inject({ method: 'POST', url: '/v1/platform/auth/logout', headers })).statusCode).toBe(200);
-    expect((await app.inject({ method: 'GET', url: '/v1/platform/auth/me', headers })).statusCode).toBe(401);
+    const frozenNow = Date.now();
+    const now = vi.spyOn(Date, 'now').mockReturnValue(frozenNow);
+    const tokenA = signPlatformToken(app, user);
+    const tokenB = signPlatformToken(app, user);
+    now.mockRestore();
+    expect(tokenA).not.toBe(tokenB);
+    const headersA = { authorization: `Bearer ${tokenA}`, 'x-forwarded-for': '203.0.113.120' };
+    const headersB = { authorization: `Bearer ${tokenB}`, 'x-forwarded-for': '203.0.113.121' };
+    expect((await app.inject({ method: 'GET', url: '/v1/platform/auth/me', headers: headersA })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'GET', url: '/v1/platform/auth/me', headers: headersB })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'POST', url: '/v1/platform/auth/logout', headers: headersA })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'GET', url: '/v1/platform/auth/me', headers: headersA })).statusCode).toBe(401);
+    expect((await app.inject({ method: 'GET', url: '/v1/platform/auth/me', headers: headersB })).statusCode).toBe(200);
     expect(await platformDb.platformAuditEvent.count({ where: { platformUserId: user.id, action: 'platform.logout', targetId: user.id } })).toBe(1);
+    const receipt = await platformDb.platformAuditEvent.findFirstOrThrow({ where: { platformUserId: user.id, action: 'platform.logout', targetId: user.id } });
+    const payloadA = app.jwt.decode<{ sessionId: string }>(tokenA);
+    if (!payloadA) throw new Error('synthetic platform token did not decode');
+    expect(receipt.metadata).toEqual({ sessionIdHash: platformSessionIdHash(payloadA.sessionId) });
+    expect(JSON.stringify(receipt.metadata)).not.toContain(payloadA.sessionId);
   });
 
   it('always invokes one verifier with valid scrypt work, including the unknown-account path', async () => {

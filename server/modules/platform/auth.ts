@@ -4,7 +4,7 @@ import { platformDb } from '../../lib/platformDb';
 import { env } from '../../config/env';
 import { verifyPassword, encryptSecret, decryptSecret } from '../../lib/security';
 import { generateTotpSecret, verifyTotp, totpAuthUri } from '../../lib/totp';
-import { signPlatformToken, signPlatformMfaToken, requirePlatformAccess, platformAuditEvent, runPlatformAuditedMutation, attachPlatformActorContext, platformSessionWasLoggedOut } from '../../lib/platformAuth';
+import { signPlatformToken, signPlatformMfaToken, requirePlatformAccess, platformAuditEvent, runPlatformAuditedMutation, attachPlatformActorContext, platformSessionWasLoggedOut, platformSessionIdHash } from '../../lib/platformAuth';
 import { runWithPlatformDatabaseRequest } from '../../lib/platformContextStore';
 
 // ===========================================================================
@@ -83,8 +83,8 @@ export const platformAuthRoutes: FastifyPluginAsync = async app => {
   });
 
   // Resolves either a full platform session or a platform-mfa login token.
-  async function resolvePlatformActor(request: FastifyRequest): Promise<{ platformUserId: string; type: string; sessionIssuedAtMs?: number }> {
-    const payload = await request.jwtVerify<{ platformUserId: string; type: string; sessionIssuedAtMs?: number }>();
+  async function resolvePlatformActor(request: FastifyRequest): Promise<{ platformUserId: string; type: string; sessionId?: string }> {
+    const payload = await request.jwtVerify<{ platformUserId: string; type: string; sessionId?: string }>();
     if (!payload?.platformUserId || !['platform', 'platform-mfa'].includes(payload.type)) throw app.httpErrors.unauthorized('A valid platform token is required.');
     return payload;
   }
@@ -94,7 +94,7 @@ export const platformAuthRoutes: FastifyPluginAsync = async app => {
     const actor = await resolvePlatformActor(request);
     const user = await platformDb.platformUser.findFirst({ where: { id: actor.platformUserId, status: 'active' } });
     if (!user || !user.mfaSecretEnc) throw app.httpErrors.unauthorized('MFA is not set up.');
-    if (actor.type === 'platform' && (!Number.isFinite(actor.sessionIssuedAtMs) || await platformSessionWasLoggedOut(user.id, actor.sessionIssuedAtMs!))) {
+    if (actor.type === 'platform' && (typeof actor.sessionId !== 'string' || await platformSessionWasLoggedOut(user.id, actor.sessionId))) {
       throw app.httpErrors.unauthorized('Platform session expired. Please sign in again.');
     }
     attachPlatformActorContext(request, user);
@@ -136,9 +136,10 @@ export const platformAuthRoutes: FastifyPluginAsync = async app => {
 
   app.post('/logout', { preHandler: requirePlatformAccess() }, async request => {
     if (!request.platformUser!.legacy) {
-      const token = await request.jwtVerify<{ sessionIssuedAtMs?: number }>();
+      const token = await request.jwtVerify<{ sessionId?: string }>();
+      if (!token.sessionId) throw app.httpErrors.unauthorized('Platform session expired. Please sign in again.');
       await runPlatformAuditedMutation(request, {
-        action: 'platform.logout', target: { type: 'platformUser', id: request.platformUser!.id }, metadata: { sessionIssuedAtMs: token.sessionIssuedAtMs ?? null },
+        action: 'platform.logout', target: { type: 'platformUser', id: request.platformUser!.id }, metadata: { sessionIdHash: platformSessionIdHash(token.sessionId) },
       }, tx => tx.platformUser.findUniqueOrThrow({ where: { id: request.platformUser!.id } }));
     }
     // The client also discards its token; the server-side session epoch makes
