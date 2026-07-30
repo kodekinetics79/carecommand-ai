@@ -17,11 +17,10 @@ Independent consultant: required before any feature status is changed to COMPLET
 - `npm run api:typecheck` — PASS.
 - Targeted ESLint — PASS.
 - `npx vitest run server/test/platformAuthHardening.integration.test.ts` — PASS, 6/6.
-- `npx vitest run server/test/authSession.integration.test.ts server/test/rbac.permissions.integration.test.ts` — PASS in the combined pod run.
+- `npx vitest run server/test/authSession.integration.test.ts server/test/rbac.permissions.test.ts` — PASS in focused/combined pod runs.
 
 ## Open acceptance items
 
 - SSO is not represented as an implemented customer feature in the current repository. Production OIDC/SAML support needs an explicit identity-provider selection, metadata/credentials, account-linking policy, SCIM decision, and browser acceptance plan; it must not be marketed as available before those external and product decisions are completed.
 - Live cross-site cookie behavior, production Redis fail-closed behavior, MFA recovery, and full browser enrollment/logout/session-administration journeys remain release evidence, not implied by these API tests.
 - No compliance certification is asserted. These controls support HIPAA/SOC 2/GDPR readiness and still require policy, deployment, vendor, and independent assessment evidence.
-
