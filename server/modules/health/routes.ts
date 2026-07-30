@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { env, parseAllowedMockIntegrations } from '../../config/env';
+import { env, isIngressProxyConfigurationReady, parseAllowedMockIntegrations } from '../../config/env';
 import { SLOS, errorBudgetMinutes } from '../../lib/slo';
 import { refreshDependencyGauges } from './checks';
 
@@ -16,12 +16,14 @@ export const healthRoutes: FastifyPluginAsync = async app => {
     // Redis backs rate limiting and the job queue, so it is required in
     // production. In other environments we report its state without failing.
     const redisRequired = env.NODE_ENV === 'production';
-    const ready = databaseOk && (!redisRequired || redisOk);
+    const proxyTrustOk = isIngressProxyConfigurationReady(env);
+    const ready = databaseOk && (!redisRequired || redisOk) && proxyTrustOk;
     const body = {
       status: ready ? 'ready' : 'not-ready',
       checks: {
         database: databaseOk ? 'ok' : 'down',
         redis: redisOk ? 'ok' : redisRequired ? 'down' : 'degraded',
+        ingressProxy: proxyTrustOk ? 'ok' : 'trusted_proxy_cidrs_required',
       },
     };
     return ready ? body : reply.code(503).send(body);

@@ -36,6 +36,8 @@ services:
         sync: false
       - key: PUBLIC_API_URL
         sync: false
+      - key: TRUSTED_PROXY_CIDRS
+        sync: false
       - key: PAYMENT_PROVIDER
         sync: false
       - key: INSURANCE_PROVIDER
@@ -146,6 +148,8 @@ envVarGroups:
         value: production
       - key: DEPLOYMENT_PROFILE
         value: pilot
+      - key: INGRESS_MODE
+        value: trusted_proxy
       - key: QUEUES_ENABLED
         value: "true"
       - key: RLS_ENFORCE_RUNTIME_ROLE

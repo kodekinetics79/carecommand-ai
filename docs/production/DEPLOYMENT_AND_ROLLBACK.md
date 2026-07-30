@@ -13,6 +13,10 @@ developer profiles and must not be presented as full pilot production stacks.
 - Runtime tenant and platform clients require separate `app_rls` and
   `app_platform` principals.
 - Readiness checks include Postgres and Redis.
+- Proxied deployments declare `INGRESS_MODE=trusted_proxy`; readiness fails
+  until the operator supplies verified ingress CIDRs. The origin must also be
+  network-isolated behind those proxies. Direct mode deliberately ignores all
+  forwarded client-IP headers.
 - The application fails boot when a pilot/enterprise profile uses development
   mode, loopback callbacks/origins, unprotected metrics, disabled queues, or a
   missing platform database plane.

@@ -59,9 +59,12 @@ declare module 'fastify' {
 }
 
 export async function buildApp() {
+  const trustedProxyCidrs = env.INGRESS_MODE === 'trusted_proxy'
+    ? env.TRUSTED_PROXY_CIDRS.split(',').map(value => value.trim()).filter(Boolean)
+    : [];
   const app = Fastify({
     logger: loggerOptions,
-    trustProxy: true,
+    trustProxy: trustedProxyCidrs.length ? trustedProxyCidrs : false,
     requestIdHeader: 'x-request-id',
     // Explicit request-body cap (defends against oversized-payload memory
     // exhaustion). 1 MiB is ample for this JSON API; webhooks/intake stay well

@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { describe, it, expect } from 'vitest';
-import { envSchema } from '../config/env';
+import { envSchema, isIngressProxyConfigurationReady } from '../config/env';
 
 // PORTAL_TOKEN_OUTBOX_PATH writes RAW patient magic-login tokens to disk (E2E
 // delivery sink). In production that is a PHI/credential leak, so env parsing
@@ -23,6 +23,17 @@ const productionProfile = {
   COOKIE_SAMESITE: 'none' as const,
   METRICS_TOKEN: 'metrics-test-token',
 };
+
+describe('env schema — ingress proxy posture', () => {
+  it('keeps direct-origin mode safe by default and marks unconfigured trusted-proxy mode not ready', () => {
+    const direct = envSchema.parse(base);
+    expect(direct.INGRESS_MODE).toBe('direct');
+    expect(isIngressProxyConfigurationReady(direct)).toBe(true);
+    const proxied = envSchema.parse({ ...base, INGRESS_MODE: 'trusted_proxy' });
+    expect(isIngressProxyConfigurationReady(proxied)).toBe(false);
+    expect(isIngressProxyConfigurationReady({ INGRESS_MODE: 'trusted_proxy', TRUSTED_PROXY_CIDRS: '10.0.0.0/8, 192.0.2.4' })).toBe(true);
+  });
+});
 
 describe('env schema — PORTAL_TOKEN_OUTBOX_PATH production guard', () => {
   it('rejects production + outbox path without the E2E escape hatch (boot fails closed)', () => {

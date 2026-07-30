@@ -20,7 +20,7 @@ import {
 } from './promptService';
 import { outboundRoutes, targetStatusAfterOutcome } from './outbound';
 import { runBookingHandoff } from './handoff';
-import { handleAgentTool } from '../../lib/receptionist/liveTools';
+import { handleAgentTool, requestHumanHandoff } from '../../lib/receptionist/liveTools';
 import { ingestCallArtifacts } from '../../lib/receptionist/privacyLifecycle';
 import { enterTenantContext, runWithTenantContext } from '../../lib/tenantContext';
 import { resolveIngressTenant } from '../../lib/tenantIngressResolvers';
@@ -30,6 +30,12 @@ import { MAX_TENANT_ACTIVE_CALLS, DEFAULT_VOICE_MINUTES_LIMIT } from './outbound
 import { stopPhoneCall } from '../../lib/retell';
 import { validateIanaTimezone } from '../../lib/scheduling';
 import { Prisma } from '../../generated/prisma/client';
+import { autopilotQueue } from '../../workers/queues';
+import {
+  enforceInvalidRetellSignatureRateLimit,
+  enforceVerifiedRetellRateLimit,
+  type RetellRateRedis,
+} from '../../lib/receptionist/providerRateLimit';
 
 const uuid = z.string().uuid();
 const RECEPTIONIST_CALL_LEASE_MS = 4 * 60 * 60 * 1_000;
@@ -840,6 +846,34 @@ export function verifyRetellSignature(
   return timingSafeEqual(expectedBuffer, signatureBuffer);
 }
 
+async function retellRateRedis(): Promise<RetellRateRedis | undefined> {
+  let redis: RetellRateRedis | undefined;
+  try {
+    redis = (await autopilotQueue.client) as unknown as RetellRateRedis | undefined;
+  } catch {
+    redis = undefined;
+  }
+  return redis;
+}
+
+async function enforceTrustedRetellCallbackRate(tenantId: string, providerCallId: string, kind: 'event' | 'tool') {
+  return enforceVerifiedRetellRateLimit({
+    tenantId,
+    providerCallId,
+    kind,
+    redis: await retellRateRedis(),
+    production: env.NODE_ENV === 'production',
+  });
+}
+
+async function enforceInvalidRetellCallbackRate(source: string) {
+  return enforceInvalidRetellSignatureRateLimit({
+    source,
+    redis: await retellRateRedis(),
+    production: env.NODE_ENV === 'production',
+  });
+}
+
 function canonicalRetellDestination(value: string | undefined): string | null {
   if (!value) return null;
   const normalized = value.trim().replace(/[().\s-]/g, '');
@@ -954,7 +988,12 @@ async function flagInboundAdmissionDenied(tenantId: string, providerCallId: stri
 
 // ===== Public webhook (no JWT — Retell posts events here) =================
 export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
-  app.post('/webhooks/retell', async (request, reply) => {
+  app.post('/webhooks/retell', {
+    // Retell publishes a shared callback IP, so the app's global IP bucket can
+    // drop valid callbacks across unrelated tenants. Authentication happens
+    // first; trusted tenant/call Redis limits are applied below.
+    config: { rateLimit: false },
+  }, async (request, reply) => {
     const query = z.object({ clinicId: uuid.optional(), campaignId: uuid.optional() }).parse(request.query);
     const body = z.object({
       event: z.string().optional(),
@@ -980,11 +1019,23 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     const signatureRaw = request.headers['x-retell-signature'];
     if (env.RETELL_API_KEY) {
       if (!verifyRetellSignature(request.rawBody, signatureRaw, env.RETELL_API_KEY)) {
-        request.log.warn({ ip: request.ip }, 'Retell webhook signature verification failed');
+        const invalidRate = await enforceInvalidRetellCallbackRate(request.ip);
+        const sourceRef = opaqueIngressReference(request.ip).slice(0, 16);
+        if (!invalidRate.allowed && invalidRate.reason === 'source_limit') {
+          request.log.warn({ sourceRef, decision: invalidRate.reason }, 'Retell invalid-signature source rate limited');
+          return reply.code(429).send({ error: 'INVALID_SIGNATURE_RATE_LIMITED' });
+        }
+        request.log.warn({ sourceRef, decision: invalidRate.allowed ? 'rejected' : invalidRate.reason }, 'Retell webhook signature verification failed');
         return reply.code(401).send({ error: 'INVALID_SIGNATURE' });
       }
     } else {
-      request.log.error('Retell webhook rejected: RETELL_API_KEY not configured');
+      const invalidRate = await enforceInvalidRetellCallbackRate(request.ip);
+      const sourceRef = opaqueIngressReference(request.ip).slice(0, 16);
+      if (!invalidRate.allowed && invalidRate.reason === 'source_limit') {
+        request.log.warn({ sourceRef, decision: invalidRate.reason }, 'Unconfigured Retell webhook source rate limited');
+        return reply.code(429).send({ error: 'WEBHOOK_NOT_CONFIGURED_RATE_LIMITED' });
+      }
+      request.log.error({ sourceRef, decision: invalidRate.allowed ? 'rejected' : invalidRate.reason }, 'Retell webhook rejected: RETELL_API_KEY not configured');
       return reply.code(503).send({ error: 'WEBHOOK_NOT_CONFIGURED' });
     }
 
@@ -1036,6 +1087,27 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     }
 
     const endedEvent = body.event === 'call_ended' || body.event === 'call_analyzed';
+    // Query selectors are not covered by Retell's body signature, so validate
+    // them before counting. Never discard terminal lifecycle/usage
+    // reconciliation: it is signed, mapped, serialized, and delta-idempotent.
+    if (!endedEvent) {
+      const rate = await enforceTrustedRetellCallbackRate(tenantId, providerCallId, 'event');
+      if (!rate.allowed) {
+        const decision = rate.reason;
+        const refs = {
+          tenantRef: opaqueIngressReference(tenantId).slice(0, 16),
+          callRef: opaqueIngressReference(providerCallId).slice(0, 16),
+          decision,
+        };
+        if (decision === 'store_unavailable') {
+          request.log.error(refs, 'Retell verified callback rate store unavailable');
+          return reply.code(503).send({ error: 'CALLBACK_RATE_LIMIT_UNAVAILABLE' });
+        }
+        request.log.warn(refs, 'Retell verified callback rate limited');
+        return reply.code(429).send({ error: 'CALLBACK_RATE_LIMITED', reason: decision });
+      }
+    }
+
     if (call.direction === 'inbound' || resolvedByDestination) {
       const admission = await admitInboundReceptionist(tenantId, providerCallId, {
         clinicId: trustedClinicId,
@@ -1230,10 +1302,14 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
   // ── Live agent tools (Retell custom functions invoked DURING a call) ──────
   // check_availability / book_appointment. This is a live booking + SMS
   // primitive, so it is signature-verified EXACTLY like the sibling event
-  // webhook (never accept an unsigned/invalid call in production) and carries a
-  // tight per-route rate limit (the global ceiling is far too loose for a
-  // booking primitive). Tenant is resolved from the clinic/campaign on the URL.
-  app.post('/webhooks/retell/fn', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async (request, reply) => {
+  // webhook (never accept an unsigned/invalid call in production). Invalid
+  // signatures use a separate source bucket; valid callbacks never share an IP
+  // bucket and are limited only after persisted tenant/call authority resolves.
+  // Tenant is resolved from persisted call/destination authority; URL selectors
+  // cannot establish it.
+  app.post('/webhooks/retell/fn', {
+    config: { rateLimit: false },
+  }, async (request, reply) => {
     const query = z.object({ clinicId: uuid.optional(), campaignId: uuid.optional() }).parse(request.query);
     // Bounded, typed args replace the loose z.record so a caller cannot smuggle
     // oversized or wrong-typed fields into the booking/SMS primitives. Unknown
@@ -1271,11 +1347,23 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     const sig = request.headers['x-retell-signature'];
     if (env.RETELL_API_KEY) {
       if (!verifyRetellSignature(request.rawBody, sig, env.RETELL_API_KEY)) {
-        request.log.warn({ ip: request.ip }, 'Retell fn webhook signature verification failed');
+        const invalidRate = await enforceInvalidRetellCallbackRate(request.ip);
+        const sourceRef = opaqueIngressReference(request.ip).slice(0, 16);
+        if (!invalidRate.allowed && invalidRate.reason === 'source_limit') {
+          request.log.warn({ sourceRef, decision: invalidRate.reason }, 'Retell invalid-signature tool source rate limited');
+          return reply.code(429).send({ error: 'INVALID_SIGNATURE_RATE_LIMITED' });
+        }
+        request.log.warn({ sourceRef, decision: invalidRate.allowed ? 'rejected' : invalidRate.reason }, 'Retell fn webhook signature verification failed');
         return reply.code(401).send({ error: 'INVALID_SIGNATURE' });
       }
     } else {
-      request.log.error('Retell fn webhook rejected: RETELL_API_KEY not configured');
+      const invalidRate = await enforceInvalidRetellCallbackRate(request.ip);
+      const sourceRef = opaqueIngressReference(request.ip).slice(0, 16);
+      if (!invalidRate.allowed && invalidRate.reason === 'source_limit') {
+        request.log.warn({ sourceRef, decision: invalidRate.reason }, 'Unconfigured Retell tool source rate limited');
+        return reply.code(429).send({ error: 'WEBHOOK_NOT_CONFIGURED_RATE_LIMITED' });
+      }
+      request.log.error({ sourceRef, decision: invalidRate.allowed ? 'rejected' : invalidRate.reason }, 'Retell fn webhook rejected: RETELL_API_KEY not configured');
       return reply.code(503).send({ error: 'WEBHOOK_NOT_CONFIGURED' });
     }
 
@@ -1354,6 +1442,50 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     if (activeCall.endedAt || activeCall.outcome !== 'IN_PROGRESS' || activeSince.getTime() < Date.now() - RECEPTIONIST_CALL_LEASE_MS) {
       await flagRetellIngressReview(tenantId, providerCallId, 'Signed Retell tool rejected because the call is ended, terminal, or outside its active lease');
       return reply.code(200).send({ allowed: false, needs_human: true, message: 'This call is no longer active. I cannot access or change patient information.' });
+    }
+
+    // Count only a fully authorized, active call context. Query selectors are
+    // not signed, and an ended/expired call must never be able to consume a
+    // valid call's quota or create a staff task through the overload path. The
+    // count intentionally precedes the recording-consent response so repeated
+    // denied mutation attempts are bounded too.
+    const rate = await enforceTrustedRetellCallbackRate(tenantId, providerCallId, 'tool');
+    if (!rate.allowed) {
+      const refs = {
+        tenantRef: opaqueIngressReference(tenantId).slice(0, 16),
+        callRef: opaqueIngressReference(providerCallId).slice(0, 16),
+        decision: rate.reason,
+      };
+      if (rate.reason === 'store_unavailable') request.log.error(refs, 'Retell verified tool rate store unavailable; creating staff handoff');
+      else request.log.warn(refs, 'Retell verified tool rate limited; creating staff handoff');
+      try {
+        const handoff = await requestHumanHandoff({
+          tenantId,
+          callId: providerCallId,
+          callerPhone: (body.call?.direction === 'outbound' ? body.call.to_number : body.call?.from_number) ?? null,
+        }, {
+          reason_category: 'automated_tool_safety_limit',
+          message: 'AI receptionist tool safety limit reached; staff review is required.',
+        });
+        return reply.code(200).send({
+          allowed: false,
+          needs_human: true,
+          reason: rate.reason,
+          ...handoff,
+          ...(rate.reason === 'store_unavailable' ? {
+            message: 'I cannot safely continue this automated request. I recorded a front desk review request; staff have not acknowledged it yet.',
+          } : {}),
+        });
+      } catch (error) {
+        request.log.error({ ...refs, err: error }, 'Retell tool-limit staff handoff could not be persisted');
+        await flagRetellIngressReview(tenantId, providerCallId, 'Verified Retell tool limit reached but staff handoff persistence failed').catch(() => {});
+        return reply.code(200).send({
+          allowed: false,
+          needs_human: true,
+          handoff_recorded: false,
+          message: "I'm sorry, I can't safely continue this automated request. Please contact the front desk directly.",
+        });
+      }
     }
 
     const SAFE_WITHOUT_RECORDING_GRANT = new Set(['record_recording_preference', 'record_do_not_call', 'request_human_handoff', 'take_message', 'report_emergency', 'check_availability']);

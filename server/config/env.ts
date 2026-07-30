@@ -20,6 +20,11 @@ export function parseAllowedMockIntegrations(raw: string): string[] {
     .filter(token => token.length > 0);
 }
 
+export function isIngressProxyConfigurationReady(config: { INGRESS_MODE: 'direct' | 'trusted_proxy'; TRUSTED_PROXY_CIDRS: string }): boolean {
+  return config.INGRESS_MODE === 'direct'
+    || config.TRUSTED_PROXY_CIDRS.split(',').some(value => value.trim().length > 0);
+}
+
 function publicHttpsUrl(raw: string): URL | null {
   try {
     const url = new URL(raw);
@@ -60,6 +65,14 @@ const baseEnvSchema = z.object({
   ALLOWED_MOCK_INTEGRATIONS: z.string().default(''),
   API_HOST: z.string().default('0.0.0.0'),
   API_PORT: z.coerce.number().int().positive().default(3001),
+  // Declare whether the API is directly reachable or exclusively fronted by a
+  // trusted reverse proxy. Proxied mode remains not-ready until the operator
+  // supplies the actual private proxy CIDRs.
+  INGRESS_MODE: z.enum(['direct', 'trusted_proxy']).default('direct'),
+  // Comma-separated proxy IP/CIDR allowlist. Empty means do not trust forwarded
+  // headers. Production ingress must list only its private/load-balancer hops;
+  // never use blanket `trustProxy: true` on a directly reachable origin.
+  TRUSTED_PROXY_CIDRS: z.string().default(''),
   DATABASE_URL: z.string().min(1),
   // Dedicated least-privilege control-plane role. Production requires this
   // unless the local E2E harness is explicitly enabled; it must not reuse the

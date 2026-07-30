@@ -62,12 +62,14 @@ describe('production engineering repository gates', () => {
     const shared = keyed(group?.envVars);
     expect(shared.get('NODE_ENV')?.value).toBe('production');
     expect(shared.get('DEPLOYMENT_PROFILE')?.value).toBe('pilot');
+    expect(shared.get('INGRESS_MODE')?.value).toBe('trusted_proxy');
     expect(shared.get('QUEUES_ENABLED')?.value).toBe('true');
     expect(shared.get('RLS_ENFORCE_RUNTIME_ROLE')?.value).toBe('true');
     expect(shared.get('PLATFORM_LEGACY_TOKEN_ENABLED')?.value).toBe('false');
     expect(shared.get('COOKIE_SAMESITE')?.value).toBe('none');
     expect(shared.get('METRICS_ENABLED')?.value).toBe('true');
     expect(shared.get('METRICS_TOKEN')?.generateValue).toBe(true);
+    expect(keyed(service('web').envVars).get('TRUSTED_PROXY_CIDRS')?.sync).toBe(false);
   });
 
   it('uses sync:false only on services, never in an environment group', () => {
