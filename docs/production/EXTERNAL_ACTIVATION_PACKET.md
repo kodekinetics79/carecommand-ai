@@ -14,6 +14,10 @@ activate a PHI environment or unattended automation.
     recording URLs, strict tool-call mode, or a published exact version. No
     provider mutation or call was performed. Configure and independently validate
     a dedicated pilot deployment before unattended use.
+  - Exact response-engine inspection found one `book_appointment` custom function
+    across the three engines; two engines have none. The one discovered tool has
+    an HTTPS URL and object-shaped parameter schema, but it is not accepted until
+    its full executable contract matches a published CareCommand intake revision.
   - Rotate the API credential supplied through the collaboration channel before
     activation; do not reuse a chat-exposed credential in production.
 - Stripe restricted/test or live keys, webhook endpoint, refunds and disputes
