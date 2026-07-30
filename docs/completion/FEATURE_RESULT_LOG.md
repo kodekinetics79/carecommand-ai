@@ -30,19 +30,20 @@ records decision checkpoints produced during production completion.
   crawl 5/5 after correcting nine unnamed controls.
 - External: full WCAG/contrast/assistive-technology audit.
 
-## Rejected/open checkpoints
+## Feature checkpoints
 
 ### M09-F02 immutable receptionist agent deployment
 
-- Result: initial independent `REJECT`; remediated candidate awaiting re-review.
+- Result: initial independent `REJECT`, superseded by independent `PASS` at exact
+  `499809aa3fbf0b55a7e51e73d70648be89550726`.
 - Initial findings: call-response deployment mismatch, V0 rejection, unsafe tag repin,
   cross-tag deployment sharing, transient classification of 400/422, clinic-branch
   mapping, strict tag/DB/UI/source-of-truth gaps.
-- Remediation evidence: fresh 71 migrations; focused 60/60; all receptionist
-  115/115; RLS 962/962; Prisma drift 121/143 only; typecheck, lint and build;
-  stop success/failure and injected simultaneous signal/task failure all
-  preserve the INVALID/PAUSED/FAILED circuit and no-second-dial rule; missing
-  review records are reported truthfully and the agent error remains visible.
+- Acceptance evidence: independent detached fresh database with 71/71 migrations
+  and 47/47 focused tests; pod evidence 117/117 receptionist and 962/962 RLS;
+  typecheck, targeted lint, production build and diff checks pass. Stop
+  success/failure, isolated and simultaneous review-system outages, all-campaign
+  pause coverage, durable drift evidence and the no-second-dial rule pass.
 - External/not claimed: live Retell account transaction and browser walkthrough;
   originating-number ownership and tool-schema readiness remain later gates.
 
