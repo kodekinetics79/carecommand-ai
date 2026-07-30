@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Star, ShieldCheck, MessageSquare, CalendarDays, TrendingUp, AlertCircle, Sparkles, Zap, CheckCircle2, Mail, Phone, Clock, Pencil, ClipboardList } from 'lucide-react';
+import { useNavigate, useParams } from 'react-router';
+import { ArrowLeft, Star, ShieldCheck, CalendarDays, TrendingUp, AlertCircle, Sparkles, Zap, CheckCircle2, Clock, Pencil, ClipboardList } from 'lucide-react';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
 import { formatCurrency, formatDate } from '../utils/formatters';
@@ -19,19 +19,6 @@ const lifecycleConfig: Record<string, { label: string; color: string; bg: string
   'at-risk':{ label: 'At Risk',  color: 'text-amber-v',   bg: 'badge badge-amber' },
   inactive: { label: 'Inactive', color: 'text-red-v',     bg: 'badge badge-red' },
 };
-
-const channelIcon: Record<string, React.ReactNode> = {
-  whatsapp: <MessageSquare className="w-3.5 h-3.5 text-emerald-v" />,
-  email:    <Mail className="w-3.5 h-3.5 text-indigo" />,
-  sms:      <Phone className="w-3.5 h-3.5 text-violet-v" />,
-  call:     <Phone className="w-3.5 h-3.5 text-amber-v" />,
-};
-
-const commsTimeline = [
-  { date: '05 May 2026', message: 'SMS reminder sent for follow-up appointment.', type: 'sms' },
-  { date: '15 Apr 2026', message: 'WhatsApp check-in for treatment progress.', type: 'whatsapp' },
-  { date: '22 Mar 2026', message: 'Email education series started.', type: 'email' },
-];
 
 export default function PatientProfile() {
   const { id } = useParams();
@@ -430,19 +417,7 @@ export default function PatientProfile() {
 
           {/* Communication timeline */}
           <BentoCard title="Communication Timeline" subtitle="Recent outreach history">
-            <div className="space-y-2.5">
-              {commsTimeline.map((item) => (
-                <div key={item.date} className="flex items-start gap-3 p-3 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors">
-                  <div className="w-6 h-6 rounded-full bg-[var(--s3)] flex items-center justify-center shrink-0">
-                    {channelIcon[item.type] ?? <MessageSquare className="w-3 h-3 text-t3" />}
-                  </div>
-                  <div>
-                    <p className="text-xs font-bold text-t2">{item.date}</p>
-                    <p className="text-[11px] text-t3">{item.message}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
+            <p className="text-sm text-t3 py-4">No live patient communication history is available from the current API.</p>
           </BentoCard>
         </div>
 

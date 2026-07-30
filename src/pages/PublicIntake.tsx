@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useParams } from 'react-router-dom';
+import { useParams } from 'react-router';
 import { ShieldCheck, Loader2, CheckCircle2, AlertCircle } from 'lucide-react';
 import { intakeApi, SECTION_LABEL, type PublicIntakeView } from '../lib/intake';
 
@@ -77,7 +77,7 @@ function CenterCard({ children }: { children: React.ReactNode }) {
   return <div className="min-h-screen grid place-items-center bg-[var(--s1)] p-4"><div className="cc-card p-8">{children}</div></div>;
 }
 
-function SectionCard({ section, storage, onSave }: { section: { sectionType: string; status: string; prompt: string }; storage: boolean; onSave: (t: string, d: Record<string, unknown>) => Promise<void> }) {
+function SectionCard({ section, storage, onSave }: { section: PublicIntakeView['sections'][number]; storage: boolean; onSave: (t: string, d: Record<string, unknown>) => Promise<void> }) {
   const [form, setForm] = useState<Record<string, unknown>>({});
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -86,7 +86,8 @@ function SectionCard({ section, storage, onSave }: { section: { sectionType: str
 
   async function save() {
     setBusy(true); setErr(null);
-    try { await onSave(section.sectionType, form); } catch (e) { setErr(e instanceof Error ? e.message : 'Could not save'); } finally { setBusy(false); }
+    const data = section.acknowledgement ? { ...form, acknowledgementId: section.acknowledgement.id } : form;
+    try { await onSave(section.sectionType, data); } catch (e) { setErr(e instanceof Error ? e.message : 'Could not save'); } finally { setBusy(false); }
   }
 
   const input = 'w-full rounded-lg border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-sm text-t1 outline-none focus:border-indigo';
@@ -96,7 +97,7 @@ function SectionCard({ section, storage, onSave }: { section: { sectionType: str
         <h3 className="text-sm font-bold text-t1">{SECTION_LABEL[section.sectionType] ?? section.sectionType}</h3>
         {done && <span className="badge badge-emerald inline-flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> Done</span>}
       </div>
-      <p className="text-xs text-t3">{section.prompt}</p>
+      <p className="text-xs text-t3">{section.acknowledgement?.text ?? section.prompt}</p>
       {!done && (
         <>
           {section.sectionType === 'demographics' && (
@@ -138,7 +139,7 @@ function SectionCard({ section, storage, onSave }: { section: { sectionType: str
             <label className="flex items-start gap-2 text-sm text-t2"><input type="checkbox" className="mt-1" onChange={e => set('accepted', e.target.checked)} /> I confirm this section.</label>
           )}
           {err && <p className="text-[11px] text-red-v">{err}</p>}
-          <button type="button" disabled={busy} onClick={save} className="rounded-lg bg-indigo px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-50">{busy ? 'Saving…' : 'Save'}</button>
+          <button type="button" disabled={busy || Boolean(section.acknowledgement && form.accepted !== true)} onClick={save} className="rounded-lg bg-indigo px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-50">{busy ? 'Saving…' : 'Save'}</button>
         </>
       )}
     </div>

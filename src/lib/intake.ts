@@ -36,7 +36,12 @@ export interface PublicIntakeView {
   readinessScore: number;
   appointment: { service: string; startsAt: string } | null;
   objectStorageEnabled: boolean;
-  sections: Array<{ sectionType: string; status: string; prompt: string }>;
+  sections: Array<{
+    sectionType: string;
+    status: string;
+    prompt: string;
+    acknowledgement: { id: string; version: string; text: string } | null;
+  }>;
 }
 
 export const INTAKE_STATUS_META: Record<string, { label: string; badge: string }> = {

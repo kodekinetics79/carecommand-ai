@@ -1,5 +1,5 @@
 import { useState, type FormEvent, type ReactNode } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router';
 import { Lock, Mail, KeyRound, Smartphone, Eye, EyeOff, ShieldCheck, Users, Bot, TrendingUp, CalendarDays, BadgeCheck, CreditCard } from 'lucide-react';
 import { useSession } from '../hooks/useSession';
 import Logo from '../components/ui/Logo';
@@ -24,6 +24,8 @@ export default function Login() {
   const [mode, setMode] = useState<Mode>('login');
   const [email, setEmail] = useState(rememberedEmail ?? '');
   const [password, setPassword] = useState('');
+  const [tenantSlug, setTenantSlug] = useState('');
+  const [tenantRequired, setTenantRequired] = useState(false);
   const [rememberMe, setRememberMe] = useState(rememberedEmail !== null);
   const [code, setCode] = useState('');
   const [resetToken, setResetToken] = useState('');
@@ -50,8 +52,13 @@ export default function Login() {
   const onLogin = (e: FormEvent) => { e.preventDefault(); void run(async () => {
     const cleanEmail = email.trim().toLowerCase();
     if (rememberMe) localStorage.setItem(REMEMBER_KEY, cleanEmail); else localStorage.removeItem(REMEMBER_KEY);
-    const result = await signIn(cleanEmail, password);
+    const result = await signIn(cleanEmail, password, tenantRequired ? tenantSlug.trim().toLowerCase() : undefined);
     if (result.kind === 'session') return goHome();
+    if (result.kind === 'tenant_required') {
+      setTenantRequired(true);
+      setInfo(result.message);
+      return;
+    }
     if (result.kind === 'mfa_required') { setMfaToken(result.mfaToken); setMode('mfa'); return; }
     if (result.kind === 'mfa_setup_required') {
       setMfaToken(result.mfaToken);
@@ -161,12 +168,17 @@ export default function Login() {
           {mode === 'login' && (
             <form onSubmit={onLogin} className="space-y-4">
               <Labeled label="Email" icon={<Mail className="w-4 h-4 text-t3 shrink-0" />}>
-                <input type="email" value={email} onChange={e => setEmail(e.target.value)} className={fieldInput} placeholder="you@clinic.com" autoComplete="email" autoFocus />
+                <input type="email" value={email} onChange={e => { setEmail(e.target.value); setTenantRequired(false); setTenantSlug(''); }} className={fieldInput} placeholder="you@clinic.com" autoComplete="email" autoFocus />
               </Labeled>
               <Labeled label="Password" icon={<Lock className="w-4 h-4 text-t3 shrink-0" />}>
                 <input type={showPw ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} className={fieldInput} placeholder="••••••••" autoComplete="current-password" />
                 <PwReveal shown={showPw} onToggle={() => setShowPw(v => !v)} />
               </Labeled>
+              {tenantRequired && (
+                <Labeled label="Clinic workspace" icon={<Users className="w-4 h-4 text-t3 shrink-0" />}>
+                  <input value={tenantSlug} onChange={e => setTenantSlug(e.target.value)} className={fieldInput} placeholder="your-clinic" autoComplete="organization" required autoFocus />
+                </Labeled>
+              )}
 
               <div className="flex items-center justify-between">
                 <label className="inline-flex items-center gap-2 cursor-pointer select-none">
@@ -238,13 +250,9 @@ export default function Login() {
 
           {/* Footer */}
           <div className="mt-9 pt-5 border-t border-[var(--b1)] flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5 text-[11px] text-t3">
-            <a href="#" className="hover:text-t1 transition">Privacy</a>
-            <span className="text-[var(--b2)]" aria-hidden="true">·</span>
-            <a href="#" className="hover:text-t1 transition">Terms</a>
-            <span className="text-[var(--b2)]" aria-hidden="true">·</span>
-            <a href="#" className="hover:text-t1 transition">Security</a>
-            <span className="text-[var(--b2)]" aria-hidden="true">·</span>
             <a href="mailto:support@carecommand.ai" className="hover:text-t1 transition">Support</a>
+            <span className="text-[var(--b2)]" aria-hidden="true">·</span>
+            <a href="mailto:security@carecommand.ai?subject=CareCommand%20security%20report" className="hover:text-t1 transition">Report a security issue</a>
           </div>
           <p className="mt-3 text-center text-[11px] text-t3">
             Powered by{' '}
@@ -285,5 +293,5 @@ function Labeled({ label, icon, children }: { label: string; icon: ReactNode; ch
 
 function Banner({ tone, children }: { tone: 'red' | 'blue'; children: ReactNode }) {
   const cls = tone === 'red' ? 'border-[var(--red-soft)] bg-[var(--red-soft)] text-red-v' : 'border-[var(--b1)] bg-[var(--blue-soft)] text-blue-v';
-  return <div className={`mb-4 rounded-xl border px-4 py-3 text-sm ${cls}`}>{children}</div>;
+  return <div role={tone === 'red' ? 'alert' : 'status'} aria-live="polite" className={`mb-4 rounded-xl border px-4 py-3 text-sm ${cls}`}>{children}</div>;
 }

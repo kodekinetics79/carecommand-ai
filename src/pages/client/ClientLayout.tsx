@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { NavLink, Outlet, useNavigate } from 'react-router-dom';
+import { NavLink, Outlet, useNavigate } from 'react-router';
 import { HeartPulse, Home, CalendarDays, ClipboardList, FileText, ShieldCheck, CreditCard, User, Bell, LogOut, Loader2 } from 'lucide-react';
 import { portalClient, getPortalToken, setPortalToken } from '../../lib/portalClient';
 import BackButton from '../../components/layout/BackButton';

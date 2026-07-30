@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { TrendingUp, DollarSign, ShieldCheck, Megaphone, AlertCircle, ArrowRight, Zap, BarChart3 } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
@@ -12,16 +12,6 @@ import { formatCurrency } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
 import { apiRequest } from '../lib/api';
 import { mapAppointment, mapProviderProfile, mapRevenueSnapshot, type ApiAppointment, type ApiProviderProfile, type ApiRevenueSnapshot } from '../lib/apiAdapters';
-
-// Illustrative only — NOT live money. These fixed categories are shown as a sample
-// of the kinds of recoverable leakage the product surfaces; they are clearly labelled
-// "Sample" in the UI and are never presented as computed live figures.
-const sampleLostOpportunities = [
-  { label: 'Missed calls — unrecovered', value: 3450, action: 'Launch follow-up' },
-  { label: 'Empty slots — unfilled this week', value: 6200, action: 'Fill with slot campaign' },
-  { label: 'Inactive customers — no outreach', value: 18700, action: 'Run winback campaign' },
-  { label: 'Unpaid invoices >30 days', value: 1150, action: 'Send payment reminder' },
-];
 
 // Genuine revenue-protection aggregates from the DB (server computes these from real
 // transactions/deposits/alerts). Used to drive the money tiles honestly.
@@ -90,6 +80,11 @@ export default function Revenue() {
   const serviceRows = Array.from(serviceRevenue.entries())
     .map(([service, revenue]) => ({ service, revenue }))
     .sort((a, b) => b.revenue - a.revenue);
+  const liveLostOpportunities = [
+    { label: 'Open unpaid balances', value: rpSummary?.unpaidBalances ?? 0, action: 'Review payment requests', route: '/revenue-protection' },
+    { label: 'Revenue in open protection alerts', value: rpSummary?.revenueAtRisk ?? 0, action: 'Review alerts', route: '/revenue-protection' },
+    { label: 'Lost opportunities in latest snapshot', value: latest?.lost ?? 0, action: 'Open opportunity center', route: '/opportunities' },
+  ].filter(opportunity => opportunity.value > 0);
   const waterfall: { label: string; value: number; color: BarColor; positive: boolean }[] = [
     { label: 'Gross Revenue', value: latest?.revenue ?? 0, color: 'blue', positive: true },
     { label: '+ Campaign Revenue', value: latest?.campaigns ?? 0, color: 'violet', positive: true },
@@ -218,18 +213,18 @@ export default function Revenue() {
             </div>
           </BentoCard>
 
-          {/* Lost opportunity tracker — illustrative sample, NOT live money. */}
-          <BentoCard title="Lost Opportunity Tracker" subtitle="Illustrative sample — not live figures" headerRight={
-            <span className="badge badge-amber">Sample</span>
+          <BentoCard title="Lost Opportunity Tracker" subtitle="Live protection and snapshot figures" headerRight={
+            <span className="badge badge-emerald">Live DB</span>
           }>
             <div className="space-y-2.5">
-              {sampleLostOpportunities.map((opp) => (
+              {liveLostOpportunities.length === 0 && <p className="text-xs text-t3 py-2">No live lost-revenue opportunities are currently reported.</p>}
+              {liveLostOpportunities.map((opp) => (
                 <div key={opp.label} className="flex items-center justify-between gap-3 p-3 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all">
                   <div className="flex-1 min-w-0">
                     <p className="text-xs font-semibold text-t1">{opp.label}</p>
                     <p className="text-xs font-bold text-red-v">{formatCurrency(opp.value)}</p>
                   </div>
-                  <button type="button" onClick={() => navigate('/opportunities')} className="shrink-0 inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1.5 rounded-lg hover:opacity-80 transition-colors">
+                  <button type="button" onClick={() => navigate(opp.route)} className="shrink-0 inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1.5 rounded-lg hover:opacity-80 transition-colors">
                     <Zap className="w-3 h-3" />
                     {opp.action}
                   </button>

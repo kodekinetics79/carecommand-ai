@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { Search, Megaphone, Users, Phone, TrendingUp, Star, BarChart2, UserPlus, Zap, X, ArrowRight, Orbit } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 
 interface Command {
   id: string;

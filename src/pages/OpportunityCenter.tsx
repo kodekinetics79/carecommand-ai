@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { CircleDollarSign, AlertTriangle, Target, Gauge, TrendingUp, Sparkles } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import BentoCard from '../components/ui/BentoCard';

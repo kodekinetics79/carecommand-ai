@@ -1,18 +1,11 @@
-import { Video, CheckCircle2, Clock, ArrowRight, Sparkles, Phone, CalendarDays, Zap, Users } from 'lucide-react';
+import { Video, CheckCircle2, Clock, CalendarDays, Users } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
-import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapTelehealthSession, type ApiTelehealthSession, type TelehealthSession } from '../lib/apiAdapters';
 import { formatCurrency } from '../utils/formatters';
-
-const conversionOpportunities = [
-  { patient: 'Rowan Brooks', suggestion: 'Book in-person Botox consultation following virtual review', value: 480 },
-  { patient: 'Nora Steele', suggestion: 'Schedule 12-week nutrition programme after follow-up', value: 960 },
-  { patient: 'Oliver Chen', suggestion: 'Follow-up blood test at Downtown branch', value: 220 },
-];
 
 const statusColors: Record<string, { dot: string; text: string; bg: string }> = {
   Confirmed: { dot: 'bg-emerald-500', text: 'text-emerald-v', bg: 'badge badge-emerald' },
@@ -21,8 +14,6 @@ const statusColors: Record<string, { dot: string; text: string; bg: string }> = 
 
 export default function Telehealth() {
   const navigate = useNavigate();
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [sentIntakeIds, setSentIntakeIds] = useState<string[]>([]);
   const { data: sessions, error: loadError } = useApiResource<ApiTelehealthSession, TelehealthSession>(
     '/v1/telehealth/sessions?limit=100',
     [],
@@ -43,7 +34,7 @@ export default function Telehealth() {
         badgeColor="blue"
         actions={
           <button type="button" onClick={() => navigate('/scheduling')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition">
-            <Video className="w-4 h-4" /> Launch Video Room
+            <Video className="w-4 h-4" /> Schedule virtual visit
           </button>
         }
       />
@@ -105,16 +96,7 @@ export default function Telehealth() {
                         : <span className="flex items-center gap-1 text-[10px] font-semibold text-amber-v"><Clock className="w-3 h-3" /> Intake pending</span>
                       }
                     </div>
-                    <div className="flex items-center gap-2">
-                      {!session.intakeComplete && (
-                        <button type="button" disabled={sentIntakeIds.includes(session.id)} onClick={() => setSentIntakeIds(current => current.includes(session.id) ? current : [...current, session.id])} className="inline-flex items-center gap-1 text-[10px] font-semibold text-amber-v bg-[var(--amber-soft)] px-2 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors disabled:opacity-40">
-                          <Zap className="w-3 h-3" /> {sentIntakeIds.includes(session.id) ? 'Sent' : 'Send intake'}
-                        </button>
-                      )}
-                      <button type="button" onClick={() => setActiveSessionId(session.id)} className="inline-flex items-center gap-1.5 text-[10px] font-semibold text-white bg-[var(--indigo)] px-2.5 py-1 rounded-lg hover:bg-[var(--indigo-mid)] transition-colors">
-                        <Video className="w-3 h-3" /> {activeSessionId === session.id ? 'Starting…' : 'Start'}
-                      </button>
-                    </div>
+                    <span className="text-[10px] text-t3">Video-room and intake-delivery actions require a configured provider.</span>
                   </div>
                 </div>
               );
@@ -123,24 +105,6 @@ export default function Telehealth() {
           </BentoCard>
 
         <div className="space-y-4">
-          {/* Conversion opportunities */}
-          <BentoCard title="Convert to In-Person" subtitle="Upsell & booking opportunities" headerRight={<Sparkles className="w-4 h-4 text-violet-500" />}>
-            <div className="space-y-3">
-              {conversionOpportunities.map((opp) => (
-                <div key={opp.patient} className="p-3.5 rounded-xl border border-[var(--b1)] bg-[var(--violet-soft)] hover:border-[var(--b2)] transition-all">
-                  <div className="flex items-start justify-between gap-2 mb-1.5">
-                    <p className="text-xs font-bold text-t1">{opp.patient}</p>
-                    <span className="text-xs font-bold text-violet-v shrink-0">+{formatCurrency(opp.value)}</span>
-                  </div>
-                  <p className="text-[11px] text-t3 mb-2">{opp.suggestion}</p>
-                  <button type="button" onClick={() => navigate('/scheduling')} className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo hover:text-blue-v">
-                    <CalendarDays className="w-3 h-3" /> Book in-person slot
-                  </button>
-                </div>
-              ))}
-            </div>
-          </BentoCard>
-
           {/* Workflow */}
           <BentoCard title="Virtual Visit Workflow" subtitle="3-step patient journey">
             <div className="space-y-2.5">
@@ -160,18 +124,6 @@ export default function Telehealth() {
             </div>
           </BentoCard>
 
-          {/* Post-visit follow-ups */}
-          <div className="rounded-2xl bg-[var(--s2)] border border-[var(--b1)] p-4">
-            <div className="flex items-center gap-2 mb-2">
-              <Phone className="w-4 h-4 text-t3" />
-              <p className="text-[10px] font-bold uppercase tracking-widest text-t3">Post-Visit Automation</p>
-            </div>
-            <p className="text-2xl font-bold text-t1 mb-1">6 follow-ups</p>
-            <p className="text-xs text-t3 mb-3">Triggered automatically after virtual sessions this month.</p>
-            <button type="button" onClick={() => navigate('/crm')} className="w-full py-2 rounded-xl bg-[var(--s3)] hover:bg-[var(--indigo-soft)] text-t2 hover:text-indigo text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
-              <ArrowRight className="w-3.5 h-3.5" /> View follow-up queue
-            </button>
-          </div>
         </div>
       </div>
     </div>

@@ -2,15 +2,8 @@ import { apiRequest } from './api';
 
 // ============================================================================
 // Dashboard data service. All page data flows through here (no hardcoded sample
-// data in components). [LIVE] = backed by a real endpoint; [TODO] = typed
-// contract for a not-yet-built route (throws NotImplemented so the UI surfaces
-// an honest state instead of silently no-op'ing).
+// data in components). Every callable action is backed by a real endpoint.
 // ============================================================================
-
-export class NotImplemented extends Error {
-  contract: string;
-  constructor(contract: string) { super(`Backend pending: ${contract}`); this.name = 'NotImplemented'; this.contract = contract; }
-}
 
 // ---- Summary ----------------------------------------------------------------
 export interface DashboardSummary {
@@ -19,8 +12,7 @@ export interface DashboardSummary {
   activeCustomers: number; todaysAppointments: number;
   noShowRisk: number; callsRecovered: number; missedCalls: number;
   activeOpportunities: number; pendingApprovals: number;
-  // [TODO] period-over-period deltas — populated once /v1/dashboard/summary
-  // returns prior-period comparisons. Optional so the UI hides them until real.
+  // Optional real period-over-period deltas; the UI hides absent values.
   networkRevenueTrend?: number; revenueRecoveredTrend?: number; activeOpportunitiesTrend?: number;
 }
 
@@ -113,8 +105,8 @@ export const dashboardService = {
       return {
         id: String(c.id), name: String(c.name ?? 'Campaign'), status,
         audienceSize, booked, revenue, conversionRate,
-        estimatedAudience: launched ? null : (num(c.estimatedAudience) || 150),
-        estimatedRecoverable: launched ? null : (num(c.estimatedRecoverable) || 8500),
+        estimatedAudience: launched ? null : (num(c.estimatedAudience) || null),
+        estimatedRecoverable: launched ? null : (num(c.estimatedRecoverable) || null),
         nextAction: launched ? 'Review performance' : status === 'draft' ? 'Generate & approve' : 'Approve to launch',
       };
     });
@@ -165,12 +157,4 @@ export const dashboardService = {
     }
     return actions.sort((a, b) => (b.revenueImpact ?? 0) - (a.revenueImpact ?? 0)).slice(0, 8);
   },
-
-  // ---- Action verbs ---------------------------------------------------------
-  // [TODO] Persisted snooze/dismiss/assign for priority actions — needs a
-  // PriorityActionState model + routes. Until then these throw NotImplemented
-  // and the UI shows a "backend pending" notice (no silent no-op, no fake state).
-  snoozeAction: (id: string, hours: number): Promise<void> => { void id; void hours; throw new NotImplemented('POST /v1/dashboard/actions/:id/snooze'); },
-  dismissAction: (id: string, reason: string): Promise<void> => { void id; void reason; throw new NotImplemented('POST /v1/dashboard/actions/:id/dismiss'); },
-  assignAction: (id: string, assigneeId: string): Promise<void> => { void id; void assigneeId; throw new NotImplemented('POST /v1/dashboard/actions/:id/assign'); },
 };

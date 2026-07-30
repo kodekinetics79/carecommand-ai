@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { Phone, MessageSquare, Mail, Sparkles, Clock, CheckCircle2, AlertCircle, ArrowRight, Bot, Zap, User, Calendar } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
@@ -89,9 +89,21 @@ export default function AIReceptionist() {
   }, [conversationRecords]);
 
   const filtered = activeChannel === 'all' ? conversationRecords : conversationRecords.filter(item => item.channel === activeChannel);
+  const todayKey = new Date().toDateString();
   const callConversations = conversationRecords
     .filter(item => item.channel === 'call')
     .sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime());
+  const callsToday = callConversations.filter(item => new Date(item.createdAt).toDateString() === todayKey);
+  const afterHoursByDay = useMemo(() => {
+    const counts = Array.from({ length: 7 }, () => 0);
+    for (const conversation of conversationRecords) {
+      const created = new Date(conversation.createdAt);
+      if (Number.isNaN(created.getTime())) continue;
+      const hour = created.getHours();
+      if (hour < 8 || hour >= 17) counts[(created.getDay() + 6) % 7] += 1;
+    }
+    return counts;
+  }, [conversationRecords]);
   const recovered = callConversations.filter(item => item.aiHandled || item.status === 'ai-recovered' || Boolean(item.lastAgentMessage)).length;
   const unresolved = conversationRecords.filter(item => !['replied', 'ai-recovered'].includes(item.status)).length;
   const avgReplyMinutes = useMemo(() => {
@@ -148,8 +160,8 @@ export default function AIReceptionist() {
       )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Missed Calls Today" value={String(callConversations.length)} subtitle="Calls needing recovery" icon={<Phone className="w-4 h-4" />} accent="red" />
-        <StatCard title="AI Recovered" value={`${recovered}/${callConversations.length || 1}`} subtitle="Genuinely-sent recoveries" icon={<Bot className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Missed Calls Today" value={String(callsToday.length)} subtitle="Calls needing recovery" icon={<Phone className="w-4 h-4" />} accent="red" />
+        <StatCard title="AI Recovered" value={`${recovered}/${callConversations.length}`} subtitle="Genuinely-sent recoveries" icon={<Bot className="w-4 h-4" />} accent="emerald" />
         <StatCard title="Avg Response Time" value={`${avgReplyMinutes ? `${avgReplyMinutes} min` : 'n/a'}`} subtitle="Time to first AI reply" icon={<Clock className="w-4 h-4" />} accent="blue" />
         <StatCard title="Open Conversations" value={String(unresolved)} subtitle="Needs review or action" icon={<Calendar className="w-4 h-4" />} accent="violet" />
       </div>
@@ -164,7 +176,7 @@ export default function AIReceptionist() {
                   <h3 className="text-sm font-bold text-t1">All incoming enquiries</h3>
                 </div>
                 <span className="flex items-center gap-1.5 text-xs font-semibold text-emerald-v bg-[var(--emerald-soft)] px-2.5 py-1 rounded-full border border-[var(--b1)]">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" /> AI Active
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> {source === 'live' ? 'Live inbox' : 'Loading'}
                 </span>
               </div>
               <ModuleTabs tabs={channelTabs} activeTab={activeChannel} onChange={setActiveChannel} variant="pills" />
@@ -289,7 +301,7 @@ export default function AIReceptionist() {
           </BentoCard>
 
           <BentoCard title="Missed-Call Recovery" subtitle="Live call log" headerRight={
-            <span className="text-xs font-bold text-emerald-v bg-[var(--emerald-soft)] px-2 py-1 rounded-full border border-[var(--b1)]">{recovered}/{callConversations.length || 1} recovered</span>
+            <span className="text-xs font-bold text-emerald-v bg-[var(--emerald-soft)] px-2 py-1 rounded-full border border-[var(--b1)]">{recovered}/{callConversations.length} recovered</span>
           }>
             <div className="space-y-3">
               {(callConversations.length ? callConversations : conversationRecords.slice(0, 5)).length === 0 ? (
@@ -328,23 +340,23 @@ export default function AIReceptionist() {
             </button>
           </BentoCard>
 
-          <BentoCard title="After-Hours Bookings" subtitle="Illustrative sample — not live data">
+          <BentoCard title="After-Hours Activity" subtitle="Live conversations received outside 08:00–17:00 local time">
             <div className="grid grid-cols-7 gap-1 mb-2 items-end opacity-70">
               {['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((day, index) => {
-                const heightClass = ['h-[60%]', 'h-[40%]', 'h-[75%]', 'h-[30%]', 'h-[90%]', 'h-[45%]', 'h-[20%]'][index];
-                const count = [3, 2, 4, 1, 5, 2, 1][index];
+                const count = afterHoursByDay[index];
+                const max = Math.max(...afterHoursByDay, 1);
                 return (
                   <div key={`${day}-${index}`} className="text-center">
                     <p className="text-[9px] text-t3 mb-1">{day}</p>
                     <div className="h-12 bg-[var(--s3)] rounded-md overflow-hidden flex items-end">
-                      <div className={`w-full bg-indigo rounded-sm ${heightClass}`} />
+                      <div className="w-full bg-indigo rounded-sm min-h-px" style={{ height: `${Math.round((count / max) * 100)}%` }} />
                     </div>
                     <p className="text-[9px] text-t2 mt-1">{count}</p>
                   </div>
                 );
               })}
             </div>
-            <p className="text-xs text-t3 text-center">Sample illustration only — an after-hours bookings feed is not wired yet.</p>
+            <p className="text-xs text-t3 text-center">Counts come from the live conversation inbox; no activity is synthesized.</p>
           </BentoCard>
         </div>
       </div>

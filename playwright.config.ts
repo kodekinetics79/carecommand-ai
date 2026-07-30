@@ -9,7 +9,7 @@ export default defineConfig({
   workers: 1,
   reporter: [['list'], ['html', { outputFolder: '.playwright/report', open: 'never' }]],
   use: {
-    baseURL: 'http://127.0.0.1:4173',
+    baseURL: 'http://127.0.0.1:44173',
     trace: 'on',
     screenshot: 'on',
     video: 'on',
@@ -20,7 +20,7 @@ export default defineConfig({
   ],
   webServer: {
     command: 'npm run e2e:serve',
-    url: 'http://127.0.0.1:4173/client/login',
+    url: 'http://127.0.0.1:44173/client/login',
     timeout: 120_000,
     reuseExistingServer: false,
   },

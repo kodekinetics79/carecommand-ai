@@ -3,13 +3,9 @@ import { apiRequest } from './api';
 // ============================================================================
 // GrowthPulse CRM service — AI patient growth, retention & revenue recovery.
 // All page data flows through here (no hardcoded sample data in components).
-// [LIVE] = real endpoint; [TODO] = typed contract for a not-yet-built route.
+// Every callable method below is backed by a real endpoint or real-data derivation.
 // ============================================================================
 
-export class NotImplemented extends Error {
-  contract: string;
-  constructor(contract: string) { super(`Backend pending: ${contract}`); this.name = 'NotImplemented'; this.contract = contract; }
-}
 const num = (v: unknown): number => typeof v === 'string' ? Number(v) || 0 : typeof v === 'number' ? v : 0;
 
 export type Stage = 'new-inquiry' | 'contacted' | 'booked' | 'visited' | 'follow-up' | 'retained' | 'lost';
@@ -195,11 +191,6 @@ export const crmService = {
     return res;
   },
 
-  // ---- [TODO] backend routes not yet present (typed contracts) ----------------
-  // Lost-reason analytics → needs a Lead.lostReason field + aggregation route.
-  getLostReasons: (): Promise<Array<{ reason: string; count: number; lostValue: number; fix: string }>> => { throw new NotImplemented('GET /v1/crm/lost-reasons'); },
-  // Source/attribution analytics → needs lead source + appointment/revenue join.
-  getSourceAttribution: (): Promise<Array<{ source: string; leads: number; booked: number; revenue: number; cpb: number; roi: number }>> => { throw new NotImplemented('GET /v1/crm/sources'); },
   // [LIVE] Automation rules engine.
   getAutomationRules: () => apiRequest<AutomationRule[]>('/v1/crm/automation-rules'),
   getAutomationCatalog: () => apiRequest<RuleTemplate[]>('/v1/crm/automation-rules/catalog'),
@@ -207,6 +198,4 @@ export const crmService = {
   toggleAutomationRule: (id: string, enabled: boolean) => apiRequest<AutomationRule>(`/v1/crm/automation-rules/${id}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
   deleteAutomationRule: (id: string) => apiRequest<void>(`/v1/crm/automation-rules/${id}`, { method: 'DELETE' }),
   runAutomationRule: (id: string) => apiRequest<{ matched: number; actionType: string; created: number; preview: boolean; route: string | null; note: string }>(`/v1/crm/automation-rules/${id}/run`, { method: 'POST' }),
-  // Missed-call recovery queue → derive from Conversation(channel=CALL) + SLA.
-  getMissedCallQueue: (): Promise<unknown[]> => { throw new NotImplemented('GET /v1/crm/missed-call-queue'); },
 };

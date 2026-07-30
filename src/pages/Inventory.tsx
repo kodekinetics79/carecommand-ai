@@ -1,4 +1,4 @@
-import { Package, AlertCircle, Clock, Zap, Sparkles, ArrowRight, TrendingUp } from 'lucide-react';
+import { Package, AlertCircle, Clock, Zap, Sparkles, TrendingUp } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
@@ -17,12 +17,6 @@ const statusConfig: Record<string, { label: string; badge: string; border: strin
   critical: { label: 'Critical',  badge: 'badge badge-red',     border: 'border-[var(--b1)]',        bg: 'bg-[var(--red-soft)]' },
   expiring: { label: 'Expiring',  badge: 'badge badge-amber',   border: 'border-[var(--b1)]',        bg: 'bg-[var(--amber-soft)]' },
 };
-
-const aiRecommendations = [
-  { title: 'Reorder Botox immediately', desc: 'Downtown: 3 vials left, 8 appointments next week. 2-day lead time.', urgency: 'Critical', action: 'Place reorder with Allergan UK' },
-  { title: 'Use expiring composite resin first', desc: 'Northgate: expires 15 Jun. Prioritise dental fillings to avoid waste.', urgency: 'Expiring', action: 'Schedule usage priority' },
-  { title: 'Transfer blood test strips from Downtown', desc: 'Southbank is critically low. Downtown has surplus.', urgency: 'Critical', action: 'Arrange branch transfer' },
-];
 
 export default function Inventory() {
   const { data: stockItems, source, error, reload } = useApiResource<ApiInventoryItem, ReturnType<typeof mapInventoryItem>>('/v1/inventory?limit=100', [], mapInventoryItem);
@@ -59,6 +53,11 @@ export default function Inventory() {
   const criticalCount = stockItems.filter(i => i.status === 'critical' || i.status === 'low').length;
   const expiringCount = stockItems.filter(i => i.status === 'expiring').length;
   const totalValue = stockItems.reduce((sum, item) => sum + item.currentStock * item.unitCost, 0);
+  const supplyRecommendations = stockItems
+    .filter(item => item.status !== 'ok')
+    .sort((left, right) => (left.status === 'critical' ? -1 : 0) - (right.status === 'critical' ? -1 : 0))
+    .slice(0, 5);
+  const inventoryCategories = [...new Set(stockItems.map(item => item.category))].sort();
 
   return (
     <div className="space-y-6 pb-8">
@@ -119,7 +118,7 @@ export default function Inventory() {
                   <div className="flex items-center justify-between gap-3">
                     <div className="flex items-center gap-3 text-[11px] text-t3">
                       <span>~{weeksLeft}w left</span>
-                      {item.expiryDate && <span className={`font-semibold ${new Date(item.expiryDate) < new Date('2025-07-01') ? 'text-amber-v' : 'text-t3'}`}>Exp: {item.expiryDate}</span>}
+                      {item.expiryDate && <span className={`font-semibold ${item.status === 'expiring' ? 'text-amber-v' : 'text-t3'}`}>Exp: {item.expiryDate}</span>}
                       <span>{formatCurrency(item.unitCost)}/unit</span>
                     </div>
                     {(item.status === 'critical' || item.status === 'low') && (
@@ -138,16 +137,17 @@ export default function Inventory() {
         <div className="space-y-4">
           <BentoCard title="AI Supply Recommendations" subtitle="Automated intelligence" headerRight={<Sparkles className="w-4 h-4 text-violet-500" />}>
             <div className="space-y-3">
-              {aiRecommendations.map((rec) => (
-                <div key={rec.title} className="p-3.5 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all">
+              {supplyRecommendations.length === 0 && <p className="text-xs text-t3">No live inventory issues require action.</p>}
+              {supplyRecommendations.map((rec) => (
+                <div key={rec.id} className="p-3.5 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all">
                   <div className="flex items-start justify-between gap-2 mb-1.5">
-                    <p className="text-xs font-bold text-t1 leading-tight">{rec.title}</p>
-                    <span className={`badge shrink-0 ${rec.urgency === 'Critical' ? 'badge-red' : 'badge-amber'}`}>{rec.urgency}</span>
+                    <p className="text-xs font-bold text-t1 leading-tight">{rec.name} needs attention</p>
+                    <span className={`badge shrink-0 ${rec.status === 'critical' ? 'badge-red' : 'badge-amber'}`}>{statusConfig[rec.status]?.label ?? rec.status}</span>
                   </div>
-                  <p className="text-[11px] text-t3 mb-2">{rec.desc}</p>
-                  <button type="button" onClick={() => void reorderAll()} className="inline-flex items-center gap-1 text-xs font-semibold text-indigo hover:opacity-80">
-                    <ArrowRight className="w-3 h-3" /> {rec.action}
-                  </button>
+                  <p className="text-[11px] text-t3 mb-2">{rec.currentStock} {rec.unit} available; reorder level is {rec.reorderLevel}.</p>
+                  {(rec.status === 'critical' || rec.status === 'low') && <button type="button" disabled={reorderingId === rec.id} onClick={() => void reorder(rec.id, rec.reorderLevel)} className="inline-flex items-center gap-1 text-xs font-semibold text-indigo hover:opacity-80 disabled:opacity-40">
+                    <Zap className="w-3 h-3" /> {reorderingId === rec.id ? 'Ordering…' : 'Reorder from live record'}
+                  </button>}
                 </div>
               ))}
             </div>
@@ -155,7 +155,7 @@ export default function Inventory() {
 
           <BentoCard title="Category Breakdown" subtitle="Stock by category">
             <div className="space-y-2.5">
-              {['Aesthetics', 'Dental', 'Diagnostics', 'Dermatology', 'Physiotherapy', 'General'].map(cat => {
+              {inventoryCategories.map(cat => {
                 const catItems = stockItems.filter(i => i.category === cat);
                 const catValue = catItems.reduce((s, i) => s + i.currentStock * i.unitCost, 0);
                 const hasIssue = catItems.some(i => i.status !== 'ok');

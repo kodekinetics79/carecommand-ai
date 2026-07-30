@@ -11,7 +11,7 @@ import {
   ShieldCheck,
   Sparkles,
 } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
@@ -232,7 +232,7 @@ export default function Integrations() {
                     type="button"
                     onClick={() => void testConnection(row.key)}
                     disabled={!canTest || testingKey === row.key}
-                    title={!canTest ? 'Backend action not implemented yet for this role' : ''}
+                    title={!canTest ? 'Your role does not have permission to test provider connections' : ''}
                     className="mt-3 inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition disabled:opacity-40"
                   >
                     <RefreshCw className="w-3.5 h-3.5" />
@@ -251,7 +251,7 @@ export default function Integrations() {
                 { title: 'Mock Mode', text: 'Safe fallback when a provider is not configured.' },
                 { title: 'Sandbox Ready', text: 'Credentials are present but not actively connected.' },
                 { title: 'Sandbox Active', text: 'Configured and ready for test transactions or sandbox calls.' },
-                { title: 'Live Not Configured', text: 'Production provider not wired yet.' },
+                { title: 'Live Not Configured', text: 'Production credentials or activation are not configured.' },
                 { title: 'Live Active', text: 'Provider is live and health checks are passing.' },
               ].map(item => (
                 <div key={item.title} className="rounded-xl border border-[var(--b1)] p-3">

@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import {
-  LayoutDashboard, Kanban, Users, Layers3, Megaphone, ListTodo, Radio, XCircle, Workflow,
-  Search, Sparkles, Zap, Flame, ArrowRight, Crown, ChevronUp, ChevronDown,
+  LayoutDashboard, Kanban, Users, Layers3, Workflow,
+  Search, Sparkles, Zap, Flame, ChevronUp, ChevronDown,
 } from 'lucide-react';
 import BentoCard from '../components/ui/BentoCard';
 import EmptyStatePremium from '../components/ui/EmptyStatePremium';
@@ -17,17 +17,13 @@ import AutomationRulesPanel from '../components/crm/AutomationRulesPanel';
 import { formatCurrency } from '../utils/formatters';
 import { crmService, type CrmLead, type CrmPatient, type CtaId, type CommandMetrics, type SmartSegment } from '../lib/crmService';
 
-type TabKey = 'command' | 'pipeline' | 'intelligence' | 'segments' | 'campaigns' | 'tasks' | 'sources' | 'lost' | 'automation';
+type TabKey = 'command' | 'pipeline' | 'intelligence' | 'segments' | 'automation';
 type PatientSortKey = 'name' | 'value' | 'churn';
 const TABS: Array<{ key: TabKey; label: string; icon: React.ElementType }> = [
   { key: 'command', label: 'Command View', icon: LayoutDashboard },
   { key: 'pipeline', label: 'Pipeline', icon: Kanban },
   { key: 'intelligence', label: 'Patient Intelligence', icon: Users },
   { key: 'segments', label: 'Smart Segments', icon: Layers3 },
-  { key: 'campaigns', label: 'Campaign ROI', icon: Megaphone },
-  { key: 'tasks', label: 'Tasks & Follow-ups', icon: ListTodo },
-  { key: 'sources', label: 'Sources & Attribution', icon: Radio },
-  { key: 'lost', label: 'Lost Reasons', icon: XCircle },
   { key: 'automation', label: 'Automation Rules', icon: Workflow },
 ];
 
@@ -67,7 +63,7 @@ export default function CRM() {
     if (cta === 'mark_retained') { await crmService.setStage(lead.id, 'retained'); await reload(); return; }
     if (cta === 'mark_lost') { setReasonModal(lead); return; }
     if (cta === 'launch_winback' || cta === 'recover_lost') { navigate('/campaigner'); return; }
-    // comms CTAs → confirm (consent-checked send is a typed TODO)
+    // Communication CTAs use the live consent/suppression-checked send route.
     setCommsModal({ lead, cta });
   }
 
@@ -187,10 +183,6 @@ export default function CRM() {
           </div>
         )}
 
-        {tab === 'campaigns' && <ContractTab title="Campaign ROI funnel" contract="GET /v1/crm/campaigns/:id/roi" note="The full funnel (sent → delivered → opened → clicked → booked → visited → paid → revenue/cost/ROI) and the unconverted follow-up list need a campaign delivery-metrics route. Launch and approve flows already work in the Reactivation engine." onGo={() => navigate('/reactivation')} goLabel="Open Reactivation engine" />}
-        {tab === 'tasks' && <ContractTab title="Tasks & Follow-ups" contract="GET /v1/tasks (CRM-scoped view)" note="Staff tasks exist (Staff Workflow). A CRM-scoped follow-up queue with SLA + owner + auto-assignment rules is pending." onGo={() => navigate('/staff')} goLabel="Open Staff Workflow" />}
-        {tab === 'sources' && <ContractTab title="Sources & Attribution" contract="GET /v1/crm/sources" note="Per-source performance (leads, booked, visited, revenue, LTV, cost-per-booking, no-show rate, ROI) needs a lead-source → appointment/revenue attribution route." />}
-        {tab === 'lost' && <ContractTab title="Lost Reason Intelligence" contract="GET /v1/crm/lost-reasons" note="Lost-reason tracking (price, no response, competitor, insurance, no slot, missed call, deposit unpaid, not eligible) needs a Lead.lostReason field + aggregation route. The pipeline already captures a reason when a lead is marked lost." />}
         {tab === 'automation' && (
           <BentoCard title="Automation Rules" subtitle="Trigger → action engine for patient growth" headerRight={<span className="inline-flex items-center gap-1 text-[11px] font-bold text-violet-v"><Workflow className="w-3.5 h-3.5" /> Live engine</span>}>
             <AutomationRulesPanel onNavigate={navigate} />
@@ -230,20 +222,5 @@ function SortableTh({ label, active, dir, onClick, align = 'left' }: { label: st
           : <ChevronDown className="w-3 h-3 opacity-30" />}
       </button>
     </th>
-  );
-}
-
-function ContractTab({ title, contract, note, onGo, goLabel }: { title: string; contract: string; note: string; onGo?: () => void; goLabel?: string }) {
-  return (
-    <BentoCard title={title} subtitle="Backend contract pending — no dead controls until the route exists">
-      <div className="rounded-xl border border-dashed border-[var(--b2)] bg-[var(--s2)] p-5">
-        <div className="flex items-center gap-2 mb-2"><Crown className="w-4 h-4 text-[var(--gold-ink)]" /><p className="text-sm font-bold text-t1">{title}</p></div>
-        <p className="text-[13px] text-t2 leading-relaxed max-w-2xl">{note}</p>
-        <div className="mt-3 flex items-center gap-3 flex-wrap">
-          <code className="rounded-md bg-[var(--s3)] px-2 py-1 text-[11px] font-mono text-t2">{contract}</code>
-          {onGo && <button type="button" onClick={onGo} className="inline-flex items-center gap-1 text-[12px] font-semibold text-indigo hover:opacity-80">{goLabel} <ArrowRight className="w-3.5 h-3.5" /></button>}
-        </div>
-      </div>
-    </BentoCard>
   );
 }

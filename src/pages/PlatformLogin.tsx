@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { ShieldCheck, Loader2, Lock, Mail, KeyRound, Building2, Activity, Layers, Eye, EyeOff } from 'lucide-react';
 import { platformAdmin, setPlatformToken } from '../lib/platformAdmin';
 

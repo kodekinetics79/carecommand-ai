@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useLocation, Link, useNavigate } from 'react-router-dom';
+import { useLocation, Link, useNavigate } from 'react-router';
 import {
   LayoutDashboard, Radar, Users2, Megaphone, TrendingUp,
   CalendarDays, ClipboardList, Puzzle, Settings,
@@ -131,7 +131,7 @@ function isPathActive(pathname: string, path: string): boolean {
   return pathname === path || pathname.startsWith(path + '/');
 }
 
-export default function Sidebar() {
+export default function Sidebar({ mobileOpen = false, onNavigate }: { mobileOpen?: boolean; onNavigate?: () => void }) {
   const { pathname } = useLocation();
   const navigate = useNavigate();
   const { user } = useSession();
@@ -157,7 +157,7 @@ export default function Sidebar() {
   const roleLabel = user?.role ? user.role.toLowerCase().replace(/_/g, ' ') : '';
 
   return (
-    <aside className={`sidebar ${collapsed ? 'sidebar--collapsed' : ''}`}>
+    <aside id="staff-navigation" className={`sidebar ${collapsed ? 'sidebar--collapsed' : ''} ${mobileOpen ? 'sidebar--mobile-open' : ''}`}>
       {/* Brand */}
       <div className="px-4 pt-4 pb-3 border-b-b1">
         <div className="brand-row flex items-center justify-between gap-2">
@@ -192,7 +192,9 @@ export default function Sidebar() {
       )}
 
       {/* Navigation */}
-      <nav className="flex-1 overflow-y-auto px-3 py-2">
+      <nav className="flex-1 overflow-y-auto px-3 py-2" onClick={event => {
+        if ((event.target as Element).closest('a')) onNavigate?.();
+      }}>
         {visibleNav.length === 0 && (
           <p className="px-2 py-6 text-center text-[12px] text-t3">No modules match “{filter}”.</p>
         )}
@@ -254,7 +256,7 @@ export default function Sidebar() {
 
       {/* User profile — the real signed-in user */}
       <div className="px-3 py-3 border-t-b1">
-        <button type="button" onClick={() => navigate('/settings')} title="Account & settings"
+        <button type="button" onClick={() => { onNavigate?.(); navigate('/settings'); }} title="Account & settings"
           className="w-full flex items-center gap-2.5 px-2 py-2 rounded-lg transition-colors hover:bg-[rgba(255,255,255,0.04)]">
           <div className="logo-user w-6 h-6 rounded-full flex items-center justify-center text-[9px] font-bold text-white shrink-0">{initials(user?.displayName)}</div>
           <div className="flex-1 text-left min-w-0 collapse-hide">

@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import {
   CalendarDays, Users, AlertCircle, Phone, Coins, Globe, Gauge, LineChart, BarChart3,
 } from 'lucide-react';

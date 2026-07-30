@@ -54,7 +54,9 @@ async function rawApiRequest<T>(path: string, init?: RequestInit, retryOnRefresh
       await refreshSession();
       return rawApiRequest<T>(path, init, false);
     } catch {
-      clearSession(false);
+      // refreshSession is client-wide single-flight and clears the token once
+      // when that shared refresh fails. Do not let each waiting caller race to
+      // repeat session cleanup independently.
       throw new Error('Session expired. Please sign in again.');
     }
   }

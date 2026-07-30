@@ -17,12 +17,6 @@ const statusConfig: Record<string, { label: string; color: string; bg: string; i
   'doctor-reviewed': { label: 'Reviewed',       color: 'text-t2',        bg: 'badge badge-blue',    icon: <Archive className="w-3 h-3" /> },
 };
 
-const aiNotes = [
-  { title: '2 urgent reports need review today', desc: 'Grace Adeyemi and Amelia Foster have sample-collected reports flagged urgent. Assign for operational review.', urgency: 'high' },
-  { title: 'Mohammed Al-Farsi result arrived', desc: 'Fasting Glucose + Kidney Function report received from TDL London. Ready for provider review and follow-up booking.', urgency: 'medium' },
-  { title: 'Sarah Kimani OPG result pending action', desc: 'Dental X-Ray result received from in-house lab. No follow-up appointment booked yet.', urgency: 'medium' },
-];
-
 export default function Labs() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const { data: reportRecords, source, error, reload } = useApiResource<ApiPartnerReport, ReturnType<typeof mapPartnerReport>>('/v1/partner-reports?limit=100', [], mapPartnerReport);
@@ -32,6 +26,11 @@ export default function Labs() {
   const urgentCount = reportRecords.filter(order => order.urgency === 'urgent').length;
   const receivedCount = reportRecords.filter(order => order.status === 'result-received').length;
   const reviewedCount = reportRecords.filter(order => order.status === 'doctor-reviewed').length;
+  const actionNotes = [
+    urgentCount > 0 ? { title: `${urgentCount} urgent report${urgentCount === 1 ? '' : 's'} need review`, desc: 'Assign these live priority reports for operational review.', urgency: 'high' } : null,
+    receivedCount > 0 ? { title: `${receivedCount} result${receivedCount === 1 ? '' : 's'} ready for provider review`, desc: 'These live reports have results and are not yet marked reviewed.', urgency: 'medium' } : null,
+    openCount > 0 ? { title: `${openCount} open report${openCount === 1 ? '' : 's'} in the workflow`, desc: 'Monitor pending documents and follow up with the responsible provider.', urgency: 'medium' } : null,
+  ].filter((note): note is { title: string; desc: string; urgency: string } => note !== null);
 
   async function markReviewed(orderId: string, summary?: string) {
     setBusyId(orderId);
@@ -136,7 +135,8 @@ export default function Labs() {
           {/* AI Notes */}
           <BentoCard title="AI Action Notes" subtitle="Automated workflow intelligence" headerRight={<Sparkles className="w-4 h-4 text-violet-500" />}>
             <div className="space-y-3">
-              {aiNotes.map((note) => (
+              {actionNotes.length === 0 && <p className="text-xs text-t3">No live report actions require attention.</p>}
+              {actionNotes.map((note) => (
                 <div key={note.title} className={`p-3.5 rounded-xl border transition-all ${note.urgency === 'high' ? 'border-[var(--b2)] bg-[var(--red-soft)]' : 'border-[var(--b1)] bg-[var(--amber-soft)]'}`}>
                   <p className="text-xs font-bold text-t1 mb-1 leading-tight">{note.title}</p>
                   <p className="text-[11px] text-t3 mb-2">{note.desc}</p>

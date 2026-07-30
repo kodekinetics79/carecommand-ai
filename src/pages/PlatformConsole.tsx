@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import {
   ShieldCheck, Loader2, LogOut, Building2, FileCheck2, Users2, ScrollText, Ban, Play,
   Search, CircleCheck, CircleSlash, Clock3, UserCog, Activity, ChevronRight, ChevronDown,
@@ -99,7 +99,6 @@ export default function PlatformConsole() {
                     <span className="flex-1 text-left truncate">{s.label}</span>
                     {s.premium && <Crown className="w-3 h-3 text-[var(--gold-ink)] shrink-0" />}
                     {badge > 0 && <span className="min-w-4 h-4 px-1 grid place-items-center rounded-full bg-[var(--red)] text-[9px] font-bold text-white">{badge}</span>}
-                    {!s.live && !s.premium && <span className="w-1.5 h-1.5 rounded-full bg-[var(--b2)] shrink-0" title="Backend pending" />}
                   </button>
                 );
               })}
@@ -123,7 +122,6 @@ export default function PlatformConsole() {
             <active.icon className="w-4 h-4 text-indigo shrink-0" />
             <h1 className="text-sm font-bold text-t1 truncate">{active.label}</h1>
             {active.premium && <span className="badge badge-gold">Premium</span>}
-            {!active.live && <span className="badge badge-amber">Backend pending</span>}
           </div>
           {/* mobile section select */}
           <select aria-label="Section" value={section} onChange={e => setSection(e.target.value as SectionId)} className="lg:hidden rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-2 py-1 text-xs">

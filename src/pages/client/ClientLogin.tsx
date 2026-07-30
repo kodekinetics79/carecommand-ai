@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { Loader2, Mail, Building2, KeyRound } from 'lucide-react';
 import Logo from '../../components/ui/Logo';
 import { portalClient, setPortalToken } from '../../lib/portalClient';

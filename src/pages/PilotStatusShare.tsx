@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { CheckCircle2, Clock3, Loader2, ShieldCheck } from 'lucide-react';
-import { useParams } from 'react-router-dom';
+import { useParams } from 'react-router';
 import { platformAdmin, type PilotChecklistView } from '../lib/platformAdmin';
 
 type ShareView = {

@@ -2,12 +2,11 @@ import 'dotenv/config';
 import { test, expect, type Page } from '@playwright/test';
 import { randomUUID, createHmac } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { db } from '../../server/lib/db';
-import { runWithTenantContext } from '../../server/lib/tenantContext';
+import { fixtureDb as db } from '../../server/test/helpers/fixtureDb';
 import { generatePasswordHash } from '../../server/lib/security';
 import { recomputeEntitlements } from '../../server/lib/entitlements';
 
-const API = 'http://127.0.0.1:3201';
+const API = 'http://127.0.0.1:43201';
 const OUTBOX = '.playwright/portal-outbox.jsonl';
 const STAFF_PASSWORD = 'E2E-Staff-Pw-123!';
 const STRIPE_SECRET = 'whsec_pw_e2e';
@@ -44,7 +43,7 @@ async function seedGoldenData(projectName: string): Promise<GoldenData> {
   await db.tenant.create({ data: { id: tenantId, name: `E2E Clinic ${tag}`, slug } });
   const plan = await db.subscriptionPlan.findUnique({ where: { key: 'enterprise' } });
   if (plan) await db.tenantSubscription.create({ data: { tenantId, planId: plan.id, status: 'ACTIVE', startedAt: new Date() } });
-  await recomputeEntitlements(tenantId);
+  await recomputeEntitlements(tenantId, db);
 
   const branch = await db.branch.create({ data: { tenantId, name: 'Main Clinic', location: 'Validation Suite' } });
   const staff = await db.user.create({
@@ -78,17 +77,17 @@ async function seedGoldenData(projectName: string): Promise<GoldenData> {
   // Real deposit rule so staff can drive the actual payment-link flow in the UI
   // (check deposit rules → generate link). The test never writes PaymentRequest
   // rows itself — the staff UI + API create them, exactly as in production.
-  await runWithTenantContext(tenantId, tx => tx.depositRule.create({
+  await db.depositRule.create({
     data: {
       tenantId, name: 'Appointment deposit', ruleType: 'standard',
       description: 'E2E golden journey: fixed deposit for every appointment',
       active: true, depositRequired: true, amountType: 'fixed', amountValue: 75, dueTiming: 'at_booking',
     },
-  }));
+  });
 
   // Patient (like DepositRule above) is FORCE-RLS: the app_rls runtime role can
   // only touch it inside a tenant-scoped transaction — same as the app itself.
-  const patient = await runWithTenantContext(tenantId, tx => tx.patient.create({
+  const patient = await db.patient.create({
     data: {
       tenantId,
       branchId: branch.id,
@@ -98,7 +97,7 @@ async function seedGoldenData(projectName: string): Promise<GoldenData> {
       phone: '+15555550123',
       lifecycleStage: 'ACTIVE',
     },
-  }));
+  });
   await db.patientPortalAccount.create({ data: { tenantId, patientId: patient.id, email: patient.email, phone: patient.phone, status: 'invited' } });
   const packet = await db.patientIntakePacket.create({ data: { tenantId, patientId: patient.id, source: 'e2e', status: 'in_progress', readinessScore: 0 } });
   await db.patientIntakeSection.createMany({
@@ -120,15 +119,17 @@ async function seedGoldenData(projectName: string): Promise<GoldenData> {
   };
 }
 
-async function latestPortalToken() {
+async function latestPortalToken(tenantId: string) {
+  const matchingTokens = async () => {
+    const raw = await readFile(OUTBOX, 'utf8').catch(() => '');
+    return raw.trim().split('\n').filter(Boolean)
+      .map(line => JSON.parse(line) as { tenantId: string; token: string })
+      .filter(event => event.tenantId === tenantId);
+  };
   await expect
-    .poll(async () => {
-      const raw = await readFile(OUTBOX, 'utf8').catch(() => '');
-      return raw.trim().split('\n').filter(Boolean).length;
-    })
+    .poll(async () => (await matchingTokens()).length)
     .toBeGreaterThan(0);
-  const raw = await readFile(OUTBOX, 'utf8');
-  return JSON.parse(raw.trim().split('\n').at(-1)!) as { token: string };
+  return (await matchingTokens()).at(-1)!;
 }
 
 async function loginPatient(page: Page, data: GoldenData) {
@@ -137,7 +138,7 @@ async function loginPatient(page: Page, data: GoldenData) {
   await page.getByLabel('Email').fill(data.patientEmail);
   await page.getByRole('button', { name: 'Send sign-in link' }).click();
   await expect(page.getByText('Enter your link code')).toBeVisible();
-  const outbox = await latestPortalToken();
+  const outbox = await latestPortalToken(data.tenantId);
   await page.getByLabel('Sign-in code').fill(outbox.token);
   await page.getByRole('button', { name: 'Continue' }).click();
   await expect(page.getByText(/Hi Avery/)).toBeVisible();
@@ -151,6 +152,56 @@ async function loginStaff(page: Page, data: GoldenData) {
   await expect(page).toHaveURL(/\/$/);
   await expect(page.getByText('CareCommand AI').first()).toBeVisible();
 }
+
+async function openStaffSection(page: Page, name: string) {
+  const mobileNavigation = page.getByRole('button', { name: 'Open navigation' });
+  if (await mobileNavigation.isVisible()) await mobileNavigation.click();
+  await page.getByRole('link', { name, exact: true }).click();
+}
+
+test.describe('staff authentication and accessibility contract', () => {
+  test('preserves a deep link across login and reload, supports keyboard login, then logs out', async ({ page }, testInfo) => {
+    const data = await seedGoldenData(`auth-${testInfo.project.name}`);
+    try {
+      await page.goto('/patients');
+      await expect(page).toHaveURL(/\/login$/);
+
+      const email = page.getByLabel('Email');
+      const password = page.getByRole('textbox', { name: /Password/ });
+      await expect(email).toBeVisible();
+      await expect(password).toBeVisible();
+
+      // Keyboard-only form completion and submission.
+      await email.focus();
+      await page.keyboard.type(data.staffEmail);
+      await password.focus();
+      await page.keyboard.type(STAFF_PASSWORD);
+      const submit = page.getByRole('button', { name: /^Sign in$/i });
+      await submit.focus();
+      await page.keyboard.press('Enter');
+
+      await expect(page).toHaveURL(/\/patients$/);
+      await expect(page.getByRole('main', { name: 'Clinic workspace' })).toBeVisible();
+      await expect(page.getByRole('navigation').first()).toBeVisible();
+      await expect(page.locator('img:not([alt])')).toHaveCount(0);
+      await expect(page.locator('button a, a button')).toHaveCount(0);
+
+      await page.reload();
+      await expect(page).toHaveURL(/\/patients$/);
+      await expect(page.getByRole('main', { name: 'Clinic workspace' })).toBeVisible();
+
+      const accountMenu = page.getByRole('banner').getByRole('button', { name: /Account menu for E2E Admin/i });
+      await accountMenu.click();
+      await page.getByRole('button', { name: 'Sign out' }).click();
+      await expect(page).toHaveURL(/\/login$/);
+
+      await page.goto('/patients');
+      await expect(page).toHaveURL(/\/login$/);
+    } finally {
+      await db.tenant.delete({ where: { id: data.tenantId } }).catch(() => {});
+    }
+  });
+});
 
 test.describe.serial('production-style browser golden journey', () => {
   let data: GoldenData;
@@ -169,6 +220,10 @@ test.describe.serial('production-style browser golden journey', () => {
   });
 
   test('patient books a real slot, updates insurance, and staff sees the result', async ({ page, context, request }, testInfo) => {
+    // This deliberately spans patient booking, staff payment, webhook payment,
+    // and clinical monitoring in two browser tabs. Keep the stricter global
+    // timeout for focused tests while allowing this comprehensive gate 3x.
+    test.slow();
     const consoleErrors: string[] = [];
     const failedRequests: string[] = [];
     const watch = (p: Page) => {
@@ -190,8 +245,7 @@ test.describe.serial('production-style browser golden journey', () => {
     await expect(page.getByText(/Booked Annual physical/)).toBeVisible();
     await testInfo.attach('portal-booking', { body: await page.screenshot({ fullPage: true }), contentType: 'image/png' });
 
-    const appointment = await runWithTenantContext(data.tenantId, tx =>
-      tx.appointment.findFirstOrThrow({ where: { tenantId: data.tenantId, patientId: data.patientId, service: 'Annual physical' } }));
+    const appointment = await db.appointment.findFirstOrThrow({ where: { tenantId: data.tenantId, patientId: data.patientId, service: 'Annual physical' } });
     expect(appointment.providerProfileId).toBe(data.providerId);
     expect(appointment.status).toBe('CONFIRMED');
 
@@ -209,7 +263,7 @@ test.describe.serial('production-style browser golden journey', () => {
     const staffPage = await context.newPage();
     watch(staffPage);
     await loginStaff(staffPage, data);
-    await staffPage.getByRole('link', { name: 'Scheduling' }).click();
+    await openStaffSection(staffPage, 'Scheduling');
     await staffPage.getByRole('button', { name: 'Tomorrow', exact: true }).click();
     const apptRow = staffPage.locator(`[data-appointment-id="${appointment.id}"]`);
     await expect(apptRow).toBeVisible();
@@ -220,13 +274,13 @@ test.describe.serial('production-style browser golden journey', () => {
     await testInfo.attach('staff-payment-link', { body: await staffPage.screenshot({ fullPage: true }), contentType: 'image/png' });
 
     // The PaymentRequest row must exist only because the staff UI created it.
-    const paymentRequest = await runWithTenantContext(data.tenantId, tx =>
-      tx.paymentRequest.findFirstOrThrow({ where: { tenantId: data.tenantId, appointmentId: appointment.id } }));
+    const paymentRequest = await db.paymentRequest.findFirstOrThrow({ where: { tenantId: data.tenantId, appointmentId: appointment.id } });
     expect(paymentRequest.status).toBe('link_sent');
+    expect(paymentRequest.mode).toBe('mock');
+    expect(paymentRequest.paymentUrl).toMatch(/^http:\/\/localhost:/);
     expect(paymentRequest.providerReference).toBeTruthy();
     expect(paymentRequest.publicToken).toBeTruthy();
-    const requirement = await runWithTenantContext(data.tenantId, tx =>
-      tx.depositRequirement.findFirstOrThrow({ where: { tenantId: data.tenantId, appointmentId: appointment.id } }));
+    const requirement = await db.depositRequirement.findFirstOrThrow({ where: { tenantId: data.tenantId, appointmentId: appointment.id } });
     expect(requirement.status).toBe('link_sent');
 
     // Patient sees the staff-created deposit and acknowledges the billing policy.
@@ -234,7 +288,10 @@ test.describe.serial('production-style browser golden journey', () => {
     await page.getByRole('button', { name: /Acknowledge/i }).click();
     await expect(page.getByText('Appointment deposit · link_sent')).toBeVisible();
     await expect(page.getByText('$75 USD')).toBeVisible();
-    await expect(page.getByRole('link', { name: 'Pay', exact: true })).toBeVisible();
+    // The explicit synthetic adapter returns an HTTP localhost URL. The portal
+    // must not expose that unsafe/dead URL as if it were a real hosted checkout.
+    await expect(page.getByText('Secure payment link not ready — please contact the clinic.')).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Pay', exact: true })).toHaveCount(0);
 
     const eventId = `evt_${randomUUID()}`;
     const body = JSON.stringify({ id: eventId, type: 'checkout.session.completed', data: { object: { id: paymentRequest.providerReference } } });
@@ -249,17 +306,16 @@ test.describe.serial('production-style browser golden journey', () => {
     });
     expect(await replay.json()).toMatchObject({ duplicate: true });
 
-    await staffPage.getByRole('link', { name: 'Patients' }).click();
-    await expect(staffPage.getByText('Avery Pilot')).toBeVisible();
-    await staffPage.getByRole('link', { name: 'Remote Monitoring' }).click();
+    await openStaffSection(staffPage, 'Patients');
+    await expect(staffPage.getByText('Avery Pilot').first()).toBeVisible();
+    await openStaffSection(staffPage, 'Remote Monitoring');
 
     const ingest = await request.post(`${API}/v1/monitoring/readings/ingest`, {
       headers: { authorization: `Bearer ${await staffToken(data)}`, 'content-type': 'application/json' },
       data: { patientId: data.patientId, readingType: 'glucose', value: '325', numericValue: 325, unit: 'mg/dL', capturedAt: new Date().toISOString() },
     });
     expect(ingest.status()).toBe(201);
-    const alert = await runWithTenantContext(data.tenantId, tx =>
-      tx.readingAlert.findFirstOrThrow({ where: { tenantId: data.tenantId, patientId: data.patientId, severity: 'critical' }, orderBy: { createdAt: 'desc' } }));
+    const alert = await db.readingAlert.findFirstOrThrow({ where: { tenantId: data.tenantId, patientId: data.patientId, severity: 'critical' }, orderBy: { createdAt: 'desc' } });
     await staffPage.getByRole('button', { name: /Refresh/i }).click();
     await expect(staffPage.getByText('Avery Pilot').first()).toBeVisible();
     await expect(staffPage.getByText(/Glucose:.*325 mg\/dL/)).toBeVisible();
@@ -271,11 +327,10 @@ test.describe.serial('production-style browser golden journey', () => {
     await expect(alertCard.getByRole('button', { name: /Acknowledge/i })).toHaveCount(0);
     await testInfo.attach('monitoring-acknowledged', { body: await staffPage.screenshot({ fullPage: true }), contentType: 'image/png' });
     await expect.poll(async () =>
-      (await runWithTenantContext(data.tenantId, tx => tx.readingAlert.findUnique({ where: { id: alert.id }, select: { status: true } })))?.status
+      (await db.readingAlert.findUnique({ where: { id: alert.id }, select: { status: true } }))?.status
     ).toBe('acknowledged');
 
-    const auditActions = await runWithTenantContext(data.tenantId, tx =>
-      tx.auditEvent.findMany({ where: { tenantId: data.tenantId }, select: { action: true } }));
+    const auditActions = await db.auditEvent.findMany({ where: { tenantId: data.tenantId }, select: { action: true } });
     expect(auditActions.map(a => a.action)).toEqual(expect.arrayContaining([
       'portal.login.requested',
       'portal.login.success',

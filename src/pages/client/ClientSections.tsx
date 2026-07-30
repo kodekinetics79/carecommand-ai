@@ -1,19 +1,19 @@
 import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link } from 'react-router';
 import {
   CalendarDays, ClipboardList, FileText, ShieldCheck, CreditCard, User, Bell, Loader2,
-  ChevronRight, Plus, ExternalLink, Info, ShieldAlert,
+  ChevronRight, Plus, ExternalLink, Info, ShieldAlert, X, CheckCircle2,
 } from 'lucide-react';
 import EmptyStatePremium from '../../components/ui/EmptyStatePremium';
 import { formatCurrency } from '../../utils/formatters';
 import {
   portalClient, STATE_META,
   type PortalDashboard, type PortalAppt, type PortalRequest, type PortalIntake,
+  type PortalIntakePacket, type PortalIntakeSection,
   type PortalInsurance, type PortalPayment, type PortalEstimate, type PortalPreferences,
   type PortalBookingProvider, type PortalBookingSlot,
 } from '../../lib/portalClient';
 
-const API = (import.meta.env.VITE_API_URL as string | undefined) ?? (import.meta.env.PROD ? '' : 'http://localhost:3001');
 function Skel({ n = 3 }: { n?: number }) { return <div className="space-y-2">{Array.from({ length: n }).map((_, i) => <div key={i} className="skeleton-line h-16 rounded-xl" />)}</div>; }
 function H({ icon: Icon, title, sub }: { icon: React.ElementType; title: string; sub?: string }) {
   return <div className="mb-4"><h1 className="text-lg font-bold text-t1 flex items-center gap-2"><Icon className="w-5 h-5 text-indigo" /> {title}</h1>{sub && <p className="text-[13px] text-t3 mt-0.5">{sub}</p>}</div>;
@@ -142,9 +142,100 @@ export function ClientDashboard() {
 }
 
 /* -------------------------------------------------------------- Appointments */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// A single upcoming appointment card with self-service cancel + reschedule.
+// The provider slot picker is reused when the appointment carries a real
+// provider id; otherwise the patient enters a preferred date/time directly.
+function UpcomingApptRow({ appt, onChanged }: { appt: PortalAppt; onChanged: () => Promise<void> | void }) {
+  const [mode, setMode] = useState<'idle' | 'cancel' | 'reschedule'>('idle');
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const providerId = appt.provider && UUID_RE.test(appt.provider) ? appt.provider : null;
+  const durationMin = Math.max(5, Math.round((new Date(appt.endsAt).getTime() - new Date(appt.startsAt).getTime()) / 60000));
+  const [date, setDate] = useState(() => new Date(appt.startsAt).toISOString().slice(0, 10));
+  const [slots, setSlots] = useState<PortalBookingSlot[]>([]);
+  const [selectedSlot, setSelectedSlot] = useState('');
+  const [dt, setDt] = useState(''); // free datetime-local fallback
+
+  useEffect(() => {
+    if (mode !== 'reschedule' || !providerId) return;
+    let a = true;
+    void (async () => {
+      try {
+        const data = await portalClient.bookingSlots(providerId, date);
+        if (a) { setSlots(data.slots); setSelectedSlot(data.slots[0]?.startsAt ?? ''); }
+      } catch { if (a) { setSlots([]); setSelectedSlot(''); } }
+    })();
+    return () => { a = false; };
+  }, [mode, providerId, date]);
+
+  async function doCancel() {
+    setBusy(true); setErr(null); setMsg(null);
+    try { await portalClient.cancelAppointment(appt.id); await onChanged(); }
+    catch (e) { setErr(e instanceof Error ? e.message : 'Could not cancel'); setBusy(false); }
+  }
+  async function doReschedule() {
+    const startsAt = providerId ? selectedSlot : (dt ? new Date(dt).toISOString() : '');
+    if (!startsAt) { setErr('Please choose a new time.'); return; }
+    setBusy(true); setErr(null); setMsg(null);
+    try { await portalClient.rescheduleAppointment(appt.id, { startsAt, durationMin }); setMsg('Appointment updated.'); await onChanged(); }
+    catch (e) { setErr(e instanceof Error ? e.message : 'Could not reschedule'); setBusy(false); }
+  }
+
+  const inp = 'w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--indigo)]';
+  return (
+    <div className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3.5">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0"><p className="text-[13px] font-bold text-t1">{appt.service}</p><p className="text-[12px] text-t3">{new Date(appt.startsAt).toLocaleString()}{appt.provider && !UUID_RE.test(appt.provider) ? ` · ${appt.provider}` : ''}</p></div>
+        <span className="badge badge-blue capitalize shrink-0">{appt.status.toLowerCase().replace('_', ' ')}</span>
+      </div>
+      {mode === 'idle' && (
+        <div className="mt-2.5 flex flex-wrap gap-2">
+          <button type="button" onClick={() => { setMode('reschedule'); setErr(null); setMsg(null); }} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[12px] font-semibold text-t2 hover:bg-[var(--s2)]"><CalendarDays className="w-3.5 h-3.5" /> Reschedule</button>
+          <button type="button" onClick={() => { setMode('cancel'); setErr(null); setMsg(null); }} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[12px] font-semibold text-red-v hover:bg-red-soft"><X className="w-3.5 h-3.5" /> Cancel</button>
+        </div>
+      )}
+      {mode === 'cancel' && (
+        <div className="mt-3 rounded-lg border border-[rgba(220,38,38,0.18)] bg-red-soft px-3 py-2.5">
+          <p className="text-[12px] text-t2">Cancel this appointment? You can request or book a new time afterward.</p>
+          <div className="mt-2 flex gap-2">
+            <button type="button" disabled={busy} onClick={doCancel} className="rounded-lg bg-red-v px-3 py-1.5 text-[12px] font-semibold text-white hover:opacity-90 disabled:opacity-50">{busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : 'Yes, cancel'}</button>
+            <button type="button" disabled={busy} onClick={() => setMode('idle')} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[12px] font-semibold text-t2">Keep it</button>
+          </div>
+        </div>
+      )}
+      {mode === 'reschedule' && (
+        <div className="mt-3 rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2.5 space-y-2">
+          {providerId ? (
+            <>
+              <label className="block space-y-1"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">New date</span><input className={inp} type="date" value={date} onChange={e => setDate(e.target.value)} /></label>
+              <label className="block space-y-1"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">Open slots</span>
+                <select className={inp} value={selectedSlot} onChange={e => setSelectedSlot(e.target.value)} aria-label="Open slots">
+                  {slots.length === 0 ? <option value="">No open slots on this date</option> : slots.map(s => <option key={s.startsAt} value={s.startsAt}>{new Date(s.startsAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</option>)}
+                </select>
+              </label>
+            </>
+          ) : (
+            <label className="block space-y-1"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">New date & time</span><input className={inp} type="datetime-local" value={dt} onChange={e => setDt(e.target.value)} aria-label="New date and time" /></label>
+          )}
+          <div className="flex gap-2">
+            <button type="button" disabled={busy || (providerId ? !selectedSlot : !dt)} onClick={doReschedule} className="rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[12px] font-semibold text-white hover:opacity-90 disabled:opacity-50">{busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : 'Confirm new time'}</button>
+            <button type="button" disabled={busy} onClick={() => setMode('idle')} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[12px] font-semibold text-t2">Back</button>
+          </div>
+        </div>
+      )}
+      {err && <p className="text-[12px] text-red-v mt-2">{err}</p>}
+      {msg && <p className="text-[12px] text-emerald-v mt-2">{msg}</p>}
+    </div>
+  );
+}
+
 export function ClientAppointments() {
   const [data, setData] = useState<{ upcoming: PortalAppt[]; past: PortalAppt[] } | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  async function load() { setData(await portalClient.appointments()); }
   useEffect(() => {
     let a = true;
     void (async () => {
@@ -160,9 +251,9 @@ export function ClientAppointments() {
   }, []);
   if (loadError) return <LoadError title="Appointments unavailable" message={loadError} />;
   if (!data) return <Skel />;
-  const Row = (a: PortalAppt) => (
+  const PastRow = (a: PortalAppt) => (
     <div key={a.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3.5 flex items-center justify-between gap-3">
-      <div><p className="text-[13px] font-bold text-t1">{a.service}</p><p className="text-[12px] text-t3">{new Date(a.startsAt).toLocaleString()}{a.provider ? ` · ${a.provider}` : ''}</p></div>
+      <div><p className="text-[13px] font-bold text-t1">{a.service}</p><p className="text-[12px] text-t3">{new Date(a.startsAt).toLocaleString()}{a.provider && !UUID_RE.test(a.provider) ? ` · ${a.provider}` : ''}</p></div>
       <span className="badge badge-blue capitalize">{a.status.toLowerCase().replace('_', ' ')}</span>
     </div>
   );
@@ -170,8 +261,8 @@ export function ClientAppointments() {
     <div>
       <H icon={CalendarDays} title="Appointments" sub="Your upcoming and past visits" />
       <p className="text-[11px] font-bold uppercase tracking-wide text-t3 mb-2">Upcoming</p>
-      {data.upcoming.length ? <div className="space-y-2">{data.upcoming.map(Row)}</div> : <EmptyStatePremium icon={<CalendarDays className="w-5 h-5" />} title="No upcoming appointments" description="Request one and the clinic will confirm a time." cta={{ label: 'Request appointment', onClick: () => { window.location.assign('/client/requests'); } }} />}
-      {data.past.length > 0 && <><p className="text-[11px] font-bold uppercase tracking-wide text-t3 mt-5 mb-2">Past</p><div className="space-y-2">{data.past.map(Row)}</div></>}
+      {data.upcoming.length ? <div className="space-y-2">{data.upcoming.map(a => <UpcomingApptRow key={a.id} appt={a} onChanged={load} />)}</div> : <EmptyStatePremium icon={<CalendarDays className="w-5 h-5" />} title="No upcoming appointments" description="Request one and the clinic will confirm a time." cta={{ label: 'Request appointment', onClick: () => { window.location.assign('/client/requests'); } }} />}
+      {data.past.length > 0 && <><p className="text-[11px] font-bold uppercase tracking-wide text-t3 mt-5 mb-2">Past</p><div className="space-y-2">{data.past.map(PastRow)}</div></>}
     </div>
   );
 }
@@ -331,9 +422,147 @@ export function ClientRequests() {
 }
 
 /* -------------------------------------------------------------------- Intake */
+// Fillable in-portal intake. Documents remain metadata-only (no image upload):
+// insurance_card / photo_id capture confirmation + a reference note, never a file.
+type IntakeField = { key: string; label: string; type: 'text' | 'email' | 'tel' | 'checkbox' };
+const INTAKE_FIELDS: Record<string, IntakeField[]> = {
+  demographics: [
+    { key: 'firstName', label: 'First name', type: 'text' },
+    { key: 'lastName', label: 'Last name', type: 'text' },
+    { key: 'email', label: 'Email', type: 'email' },
+    { key: 'phone', label: 'Phone', type: 'tel' },
+  ],
+  insurance: [
+    { key: 'planName', label: 'Plan name', type: 'text' },
+    { key: 'memberId', label: 'Member ID', type: 'text' },
+    { key: 'groupNumber', label: 'Group number (optional)', type: 'text' },
+    { key: 'payerName', label: 'Insurer / payer (optional)', type: 'text' },
+  ],
+  communication_consent: [
+    { key: 'sms', label: 'Allow SMS reminders', type: 'checkbox' },
+    { key: 'email', label: 'Allow email updates', type: 'checkbox' },
+    { key: 'voice', label: 'Allow voice calls', type: 'checkbox' },
+  ],
+  insurance_card: [
+    { key: 'hasFront', label: 'I have my insurance card details ready', type: 'checkbox' },
+    { key: 'fileName', label: 'Reference / note (optional)', type: 'text' },
+  ],
+  photo_id: [
+    { key: 'hasFront', label: 'I have a valid photo ID', type: 'checkbox' },
+    { key: 'fileName', label: 'ID type (e.g. Driver license)', type: 'text' },
+  ],
+};
+// Sections without structured fields are a single acknowledgement.
+const ACK_SECTIONS = new Set(['payment_policy', 'estimate_acknowledgement', 'pre_visit_checklist', 'consent_forms', 'custom']);
+
+// Renders one packet's sections as fillable forms and a final submit.
+function IntakePacketDetail({ packetId, onClose }: { packetId: string; onClose: () => void }) {
+  const [packet, setPacket] = useState<PortalIntakePacket | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  async function load() {
+    try { setPacket(await portalClient.intakePacket(packetId)); }
+    catch (e) { setErr(e instanceof Error ? e.message : 'Could not load this form'); }
+  }
+  useEffect(() => {
+    let active = true;
+    void portalClient.intakePacket(packetId)
+      .then(next => { if (active) setPacket(next); })
+      .catch(e => { if (active) setErr(e instanceof Error ? e.message : 'Could not load this form'); });
+    return () => { active = false; };
+  }, [packetId]);
+  if (err) return <LoadError title="Form unavailable" message={err} />;
+  if (!packet) return <Skel n={3} />;
+  const submitted = ['submitted', 'needs_review', 'approved', 'reviewed'].includes(packet.status);
+  async function submitPacket() {
+    setSubmitting(true); setMsg(null);
+    try { await portalClient.submitIntakePacket(packetId); await load(); setMsg('Submitted — your clinic will review it.'); }
+    catch (e) { setMsg(e instanceof Error ? e.message : 'Could not submit'); } finally { setSubmitting(false); }
+  }
+  return (
+    <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
+      <div className="flex items-center justify-between gap-2 mb-3">
+        <div><p className="text-[13px] font-bold text-t1">{packet.clinicName} intake</p><p className="text-[11px] text-t3">{packet.readinessScore}% complete{packet.appointment ? ` · for ${packet.appointment.service}` : ''}</p></div>
+        <button type="button" onClick={onClose} className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[12px] font-semibold text-t2 hover:bg-[var(--s1)]"><X className="w-3.5 h-3.5" /> Close</button>
+      </div>
+      <div className="space-y-2.5">
+        {packet.sections.map(s => <IntakeSection key={s.sectionType} packetId={packetId} section={s} disabled={submitted} onSaved={load} />)}
+      </div>
+      {!submitted ? (
+        <div className="mt-4 flex items-center gap-3">
+          <button type="button" disabled={submitting} onClick={submitPacket} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50">{submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />} Submit for review</button>
+          {msg && <span className="text-[12px] text-emerald-v">{msg}</span>}
+        </div>
+      ) : <p className="mt-4 text-[12px] text-emerald-v flex items-center gap-1.5"><CheckCircle2 className="w-4 h-4" /> {msg ?? 'This form has been submitted for review.'}</p>}
+    </div>
+  );
+}
+
+function IntakeSection({ packetId, section, disabled, onSaved }: { packetId: string; section: PortalIntakeSection; disabled: boolean; onSaved: () => Promise<void> | void }) {
+  const fields = INTAKE_FIELDS[section.sectionType];
+  const isAck = !fields && ACK_SECTIONS.has(section.sectionType);
+  const isDoc = section.sectionType === 'insurance_card' || section.sectionType === 'photo_id';
+  const [values, setValues] = useState<Record<string, string | boolean>>({});
+  const [ack, setAck] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const done = section.status === 'completed';
+  const label = section.sectionType.replace(/_/g, ' ');
+  const inp = 'w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--indigo)]';
+
+  async function save() {
+    setBusy(true); setErr(null);
+    const data: Record<string, unknown> = fields
+      ? { ...values }
+      : { accepted: ack, ...(section.acknowledgement ? { acknowledgementId: section.acknowledgement.id } : {}) };
+    try { await portalClient.submitIntakeSection(packetId, section.sectionType, data); await onSaved(); }
+    catch (e) { setErr(e instanceof Error ? e.message : 'Could not save'); setBusy(false); }
+  }
+
+  return (
+    <div className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3.5">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-[13px] font-bold text-t1 capitalize">{label}</p>
+        {done ? <span className="badge badge-emerald">Completed</span> : <span className="badge badge-amber">Action required</span>}
+      </div>
+      <p className="text-[12px] text-t3 mt-0.5">{section.acknowledgement?.text ?? section.prompt}</p>
+      {isDoc && <p className="text-[11px] text-t3 mt-1 italic">Details only — no image is uploaded or stored.</p>}
+      {!done && !disabled && (
+        <div className="mt-2.5 space-y-2">
+          {fields ? fields.map(f => (
+            f.type === 'checkbox' ? (
+              <label key={f.key} className="flex items-center gap-2 text-[13px] text-t2">
+                <input type="checkbox" checked={Boolean(values[f.key])} onChange={e => setValues(v => ({ ...v, [f.key]: e.target.checked }))} /> {f.label}
+              </label>
+            ) : (
+              <label key={f.key} className="block space-y-1">
+                <span className="text-[11px] font-bold uppercase tracking-wide text-t3">{f.label}</span>
+                <input className={inp} type={f.type} value={String(values[f.key] ?? '')} onChange={e => setValues(v => ({ ...v, [f.key]: e.target.value }))} />
+              </label>
+            )
+          )) : isAck ? (
+            <label className="flex items-center gap-2 text-[13px] text-t2">
+              <input type="checkbox" checked={ack} onChange={e => setAck(e.target.checked)} /> I confirm / acknowledge the above.
+            </label>
+          ) : (
+            <label className="flex items-center gap-2 text-[13px] text-t2">
+              <input type="checkbox" checked={ack} onChange={e => setAck(e.target.checked)} /> I confirm this section.
+            </label>
+          )}
+          <button type="button" disabled={busy || (isAck && !ack)} onClick={save} className="rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[12px] font-semibold text-white hover:opacity-90 disabled:opacity-50">{busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : 'Save section'}</button>
+          {err && <p className="text-[12px] text-red-v">{err}</p>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function ClientIntake() {
   const [rows, setRows] = useState<PortalIntake[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [openId, setOpenId] = useState<string | null>(null);
+  async function load() { setRows(await portalClient.intake()); }
   useEffect(() => {
     let a = true;
     void (async () => {
@@ -354,16 +583,23 @@ export function ClientIntake() {
       <H icon={FileText} title="Intake forms" sub="Complete your pre-visit information" />
       {rows.length === 0 ? <EmptyStatePremium icon={<FileText className="w-5 h-5" />} title="No intake forms" description="When your clinic sends an intake form, it will appear here." /> :
         <div className="space-y-2">{rows.map(p => (
-          <div key={p.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3.5">
-            <div className="flex items-center justify-between gap-2">
-              <p className="text-[13px] font-bold text-t1">Intake packet</p>
-              <StateBadge state={p.label} />
+          openId === p.id ? (
+            <IntakePacketDetail key={p.id} packetId={p.id} onClose={() => { setOpenId(null); void load(); }} />
+          ) : (
+            <div key={p.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3.5">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-[13px] font-bold text-t1">Intake packet</p>
+                <StateBadge state={p.label} />
+              </div>
+              <div className="prog-track md mt-2"><div className={`prog-fill ${p.readinessScore >= 80 ? 'pf-emerald' : 'pf-amber'}`} style={{ width: `${p.readinessScore}%` }} /></div>
+              <p className="text-[11px] text-t3 mt-1.5">{p.readinessScore}% complete · started {new Date(p.createdAt).toLocaleDateString()}</p>
+              <button type="button" onClick={() => setOpenId(p.id)} className="mt-2.5 inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[12px] font-semibold text-white hover:opacity-90">
+                <FileText className="w-3.5 h-3.5" /> {p.label === 'completed' ? 'View form' : 'Complete form'}
+              </button>
             </div>
-            <div className="prog-track md mt-2"><div className={`prog-fill ${p.readinessScore >= 80 ? 'pf-emerald' : 'pf-amber'}`} style={{ width: `${p.readinessScore}%` }} /></div>
-            <p className="text-[11px] text-t3 mt-1.5">{p.readinessScore}% complete · started {new Date(p.createdAt).toLocaleDateString()}</p>
-          </div>
+          )
         ))}</div>}
-      <p className="text-[11px] text-t3 mt-4">To complete a form, use the secure link your clinic sent. Submitted forms are reviewed by staff.</p>
+      <p className="text-[11px] text-t3 mt-4">Fill in the sections above and submit for review. You can also use the secure link your clinic sent. Submitted forms are reviewed by staff.</p>
     </div>
   );
 }
@@ -466,7 +702,13 @@ export function ClientPayments() {
         <div className="space-y-2">{payments.map(p => (
           <div key={p.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3.5 flex items-center justify-between gap-3">
             <div><p className="text-[13px] font-bold text-t1">{formatCurrency(p.amount)} <span className="text-[11px] font-normal text-t3">{p.currency}</span></p><p className="text-[12px] text-t3">{p.reason} · {p.status}</p></div>
-            {p.payLink ? <a href={`${API}${p.payLink}`} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[12px] font-semibold text-white hover:opacity-90">Pay <ExternalLink className="w-3.5 h-3.5" /></a> : <span className="badge badge-blue">{p.status}</span>}
+            {p.payLink
+              // payLink is the provider-hosted checkout page (absolute URL) — open it directly.
+              ? <a href={p.payLink} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[12px] font-semibold text-white hover:opacity-90">Pay <ExternalLink className="w-3.5 h-3.5" /></a>
+              : p.payLinkUnavailable
+                // Honest state — a balance is owed but no secure link is ready yet.
+                ? <span className="text-[11px] text-t3 text-right max-w-[10rem]">Secure payment link not ready — please contact the clinic.</span>
+                : <span className="badge badge-blue">{p.status}</span>}
           </div>
         ))}</div>}
       <p className="text-[11px] font-bold uppercase tracking-wide text-t3 mt-5 mb-2">Cost estimates</p>

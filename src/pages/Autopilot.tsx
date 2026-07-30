@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import {
   Activity, AlertTriangle, ArrowRight, Bot, CheckCircle2, Clock3,
   DollarSign, FileCheck2, Loader2, Pause, Play, ShieldCheck, Sparkles, Users,

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { X, User, Mail, Phone, CalendarDays, ShieldCheck, CreditCard, Cpu, Sparkles, Tag } from 'lucide-react';
+import { X, User, Mail, Phone, CalendarDays, ShieldCheck, CreditCard, Sparkles, Tag } from 'lucide-react';
 import { formatCurrency } from '../../utils/formatters';
 import ConsentBadgeGroup from './ConsentBadgeGroup';
 import { apiRequest } from '../../lib/api';
@@ -100,10 +100,6 @@ export default function PatientGrowthDrawer({ lead, patient, onClose, onNavigate
             </Block>
           )}
 
-          {/* Honest placeholders for sections without a backend feed */}
-          <Block icon={<Cpu className="w-3.5 h-3.5" />} title="Device / RPM signals & timeline">
-            <p className="text-[11px] text-t3">Device readings, full communication timeline, notes, and per-record audit trail are pending backend feeds (RPM model + comms log + <code className="font-mono">GET /v1/patients/:id/audit</code>).</p>
-          </Block>
         </div>
 
         <footer className="p-5 border-t border-[var(--b1)] bg-[var(--s1)] grid grid-cols-2 gap-2">

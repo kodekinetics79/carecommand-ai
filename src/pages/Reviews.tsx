@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { Star, CheckCircle2, AlertCircle, Sparkles, ArrowRight, TrendingUp, MessageSquare, ShieldCheck, BellRing } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';

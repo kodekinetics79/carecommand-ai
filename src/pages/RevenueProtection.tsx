@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import {
   AlertTriangle,
   ArrowRight,
@@ -730,7 +730,9 @@ export default function RevenueProtection() {
                     </button>
                     <button
                       type="button"
-                      onClick={() => window.open(row.paymentUrl ?? '#', '_blank', 'noopener,noreferrer')}
+                      disabled={!row.paymentUrl}
+                      title={row.paymentUrl ? 'Open secure payment page' : 'No payment page is available for this request'}
+                      onClick={() => { if (row.paymentUrl) window.open(row.paymentUrl, '_blank', 'noopener,noreferrer'); }}
                       className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition"
                     >
                       Open Link

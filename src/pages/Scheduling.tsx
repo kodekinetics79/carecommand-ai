@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { CalendarDays, Sparkles, Zap, AlertCircle, CheckCircle2, Clock, Users, DollarSign, ArrowRight, RefreshCw, CreditCard, LogIn, UserX, CheckCheck, XCircle, CalendarClock } from 'lucide-react';
+import { useNavigate } from 'react-router';
+import { CalendarDays, Zap, AlertCircle, CheckCircle2, Clock, Users, DollarSign, RefreshCw, CreditCard, LogIn, UserX, CheckCheck, XCircle, CalendarClock } from 'lucide-react';
 import AppointmentPaymentCard from '../components/payments/AppointmentPaymentCard';
 import PaymentRequestsPanel from '../components/payments/PaymentRequestsPanel';
 import InsuranceIntakeCard from '../components/insurance/InsuranceIntakeCard';
@@ -54,21 +54,6 @@ const statusConfig: Record<string, { label: string; dot: string; bg: string; tex
 
 interface ApiBranchOption { id: string; name: string }
 
-// NOTE: waitlistSlots + aiRecommendations are illustrative sample data (no live
-// source yet). The panels rendering them are labelled "Illustrative sample — not
-// live data" so nothing fabricated is presented to staff as real.
-const waitlistSlots = [
-  { name: 'Isabelle Dubois', service: 'Nutrition Consultation', preferred: 'Mon–Wed afternoon', value: formatCurrency(180) },
-  { name: 'Jack Harrison', service: 'Annual Wellness Review', preferred: 'Any weekday AM', value: formatCurrency(200) },
-  { name: 'Sara Montero', service: 'Skin Consultation', preferred: 'Thu or Fri', value: formatCurrency(320) },
-];
-
-const aiRecommendations = [
-  { title: 'Fill 6 empty Downtown slots', desc: 'Target 90-day inactive dermatology customers. Est. ' + formatCurrency(1680) + '.', impact: formatCurrency(1680), action: 'Create offer campaign' },
-  { title: 'Westside: 31 slots at risk this week', desc: 'Utilisation at 61%. Activate a slot-filling offer immediately.', impact: formatCurrency(6200), action: 'Launch fill campaign' },
-  { title: '3 high no-show risk appointments today', desc: 'Marcus Thompson (74%), Mohammed Al-Farsi (61%), Yuki Tanaka (78%). AI reminders sent.', impact: formatCurrency(660), action: 'Review risk queue' },
-];
-
 export default function Scheduling() {
   const navigate = useNavigate();
   const { user } = useSession();
@@ -86,7 +71,7 @@ export default function Scheduling() {
     const from = `${selectedDate}T00:00:00.000Z`;
     const to = `${selectedDate}T23:59:59.999Z`;
     const branchParam = selectedBranch === 'all' ? '' : `&branchId=${selectedBranch}`;
-    return `/v1/appointments?limit=200&from=${from}&to=${to}${branchParam}`;
+    return `/v1/appointments?limit=100&from=${from}&to=${to}${branchParam}`;
   }, [selectedDate, selectedBranch]);
   const { data: appointmentRecords, source, error: appointmentError, reload } = useApiResource<ApiAppointment, ReturnType<typeof mapAppointment>>(appointmentsPath, [], mapAppointment);
   const { data: providerRecords, error: providerError } = useApiResource<ApiProviderProfile, ReturnType<typeof mapProviderProfile>>('/v1/providers/overview?limit=100', [], mapProviderProfile);
@@ -120,13 +105,12 @@ export default function Scheduling() {
   // Load real open slots whenever a provider + date are chosen.
   useEffect(() => {
     if (!showBooking || !booking.providerId || !booking.date) {
-      setSlots([]);
       return;
     }
     let active = true;
-    setSlotsLoading(true);
-    setSlotsError(null);
     void (async () => {
+      setSlotsLoading(true);
+      setSlotsError(null);
       try {
         const res = await schedulingApi.slots(booking.providerId, booking.date);
         if (!active) return;
@@ -591,45 +575,6 @@ export default function Scheduling() {
           {/* Deposit payment requests queue */}
           <PaymentRequestsPanel />
 
-          {/* AI Slot-Filling Panel */}
-          <BentoCard title="AI Slot-Filling Engine" subtitle="Illustrative sample — not live data" headerRight={<Sparkles className="w-4 h-4 text-violet-v" />}>
-            <div className="space-y-3">
-              {aiRecommendations.map((rec) => (
-                <div key={rec.title} className="p-3.5 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all">
-                  <div className="flex items-start justify-between gap-2 mb-1.5">
-                    <p className="text-xs font-bold text-t1 leading-tight">{rec.title}</p>
-                    <span className="badge badge-emerald shrink-0">{rec.impact}</span>
-                  </div>
-                  <p className="text-[11px] text-t3 mb-2 leading-relaxed">{rec.desc}</p>
-                  <button type="button" onClick={() => navigate('/campaigner')} className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo hover:opacity-80">
-                    <Zap className="w-3 h-3" /> {rec.action} <ArrowRight className="w-3 h-3" />
-                  </button>
-                </div>
-              ))}
-            </div>
-          </BentoCard>
-
-          {/* Waitlist */}
-          <BentoCard title="Waitlist Queue" subtitle="Illustrative sample — not live data" headerRight={
-            <span className="badge badge-amber">Sample</span>
-          }>
-            <div className="space-y-2.5">
-              {waitlistSlots.map((w) => (
-                <div key={w.name} className="p-3 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all">
-                  <div className="flex items-center justify-between gap-2 mb-0.5">
-                    <p className="text-xs font-bold text-t1">{w.name}</p>
-                    <span className="text-[10px] font-bold text-emerald-v">{w.value}</span>
-                  </div>
-                  <p className="text-[11px] text-t3">{w.service}</p>
-                  <p className="text-[10px] text-t3 mt-0.5">Pref: {w.preferred}</p>
-                  <button type="button" onClick={() => setShowBooking(true)} className="mt-2 inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2 py-1 rounded-lg hover:opacity-80 transition-colors">
-                    <CalendarDays className="w-3 h-3" /> Match & Book
-                  </button>
-                </div>
-              ))}
-            </div>
-          </BentoCard>
-
           {/* Provider utilisation */}
           <BentoCard title="Provider Utilisation" subtitle="Today's capacity">
             <div className="space-y-3">
@@ -660,15 +605,6 @@ export default function Scheduling() {
             </div>
           </BentoCard>
 
-          {/* Empty slot value — illustrative sample, not wired to live utilisation */}
-          <div className="rounded-2xl bg-[var(--s2)] border border-[var(--b1)] p-4">
-            <p className="text-[10px] font-bold uppercase tracking-widest text-blue-v mb-1">Empty Slot Value · Sample</p>
-            <p className="text-2xl font-bold text-t1 mb-0.5">{formatCurrency(6200)}</p>
-            <p className="text-xs text-t2 mb-3">Illustrative sample — not live data.</p>
-            <button type="button" onClick={() => navigate('/campaigner')} className="w-full py-2 rounded-xl bg-[var(--s3)] hover:bg-[var(--b1)] text-t1 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
-              <Zap className="w-3.5 h-3.5" /> Activate slot-fill campaign
-            </button>
-          </div>
         </div>
       </div>
     </div>

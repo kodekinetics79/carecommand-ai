@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router';
 import {
   ShieldCheck, ListChecks, FileText, AlertTriangle, Building2, Siren,
   ScrollText, SlidersHorizontal, BarChart3, RefreshCw, Plus, Trash2, History,
@@ -671,9 +671,9 @@ function SecurityPolicySection({ canWrite }: { canWrite: boolean }) {
       <StateBlock loading={loading} error={error}>
         {current && (
           <div className="cc-card p-5 space-y-4">
-            {current.requireMfa && <Note tone="warn">The “Require MFA” setting is tracked here, but MFA is not implemented yet — enabling it does not enforce MFA.</Note>}
+            {current.requireMfa && <Note tone="info">MFA is enforced. Users without verified TOTP enrollment must complete setup on their next sign-in; enrolled users must pass the MFA challenge.</Note>}
             <div className="grid gap-4 md:grid-cols-2">
-              <Toggle checked={current.requireMfa} onChange={v => canWrite && set('requireMfa', v)} label="Require MFA (tracked; not enforced yet)" />
+              <Toggle checked={current.requireMfa} onChange={v => canWrite && set('requireMfa', v)} label="Require MFA" />
               <Toggle checked={current.failedLoginLockout} onChange={v => canWrite && set('failedLoginLockout', v)} label="Failed-login lockout" />
               <Field label="Password expiry (days, blank = none)"><TextInput type="number" disabled={!canWrite} value={current.passwordExpiryDays ?? ''} onChange={e => set('passwordExpiryDays', e.target.value ? Number(e.target.value) : null)} /></Field>
               <Field label="Session timeout (minutes)"><TextInput type="number" disabled={!canWrite} value={current.sessionTimeoutMinutes} onChange={e => set('sessionTimeoutMinutes', Number(e.target.value))} /></Field>

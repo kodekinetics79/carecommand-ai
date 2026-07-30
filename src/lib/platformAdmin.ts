@@ -52,7 +52,8 @@ export interface PilotStatusShare {
   createdAt: string;
   updatedAt: string;
   active: boolean;
-  url: string;
+  publicUrlAvailable: false;
+  url: null;
 }
 
 export interface PilotStatusShareCreated {
@@ -205,10 +206,10 @@ export const platformAdmin = {
   getPilotChecklist: (tenantId: string) => pf<PilotChecklistView>(`/v1/platform/tenants/${tenantId}/pilot-checklist`),
   getPilotImportPresets: (tenantId: string, entityType?: PilotEntityType) =>
     pf<PilotImportPreset[]>(`/v1/platform/tenants/${tenantId}/pilot-import/presets${entityType ? `?entityType=${encodeURIComponent(entityType)}` : ''}`),
-  savePilotImportPreset: (tenantId: string, body: { entityType: PilotEntityType; name: string; mapping: Record<string, string>; isDefault?: boolean }) =>
-    pf<PilotImportPreset>(`/v1/platform/tenants/${tenantId}/pilot-import/presets`, { method: 'POST', body: JSON.stringify(body) }),
-  deletePilotImportPreset: (tenantId: string, presetId: string) =>
-    pf<void>(`/v1/platform/tenants/${tenantId}/pilot-import/presets/${presetId}`, { method: 'DELETE' }),
+  savePilotImportPreset: (tenantId: string, body: { entityType: PilotEntityType; name: string; mapping: Record<string, string>; isDefault?: boolean }, operationKey = crypto.randomUUID()) =>
+    pf<PilotImportPreset>(`/v1/platform/tenants/${tenantId}/pilot-import/presets`, { method: 'POST', headers: { 'Idempotency-Key': operationKey }, body: JSON.stringify(body) }),
+  deletePilotImportPreset: (tenantId: string, presetId: string, operationKey = crypto.randomUUID()) =>
+    pf<void>(`/v1/platform/tenants/${tenantId}/pilot-import/presets/${presetId}`, { method: 'DELETE', headers: { 'Idempotency-Key': operationKey } }),
   downloadPilotTemplate: async (tenantId: string, entityType: PilotEntityType) => {
     const token = getPlatformToken();
     const res = await fetch(`${API}/v1/platform/tenants/${tenantId}/pilot-import/${entityType}/template.csv`, {
@@ -225,11 +226,11 @@ export const platformAdmin = {
   },
   previewPilotImport: (tenantId: string, entityType: PilotEntityType, body: { csvText: string; mapping: Record<string, string> }) =>
     pf<PilotImportPreview>(`/v1/platform/tenants/${tenantId}/pilot-import/${entityType}/preview`, { method: 'POST', body: JSON.stringify(body) }),
-  commitPilotImport: (tenantId: string, entityType: PilotEntityType, body: { csvText: string; mapping: Record<string, string> }) =>
-    pf<PilotImportCommit>(`/v1/platform/tenants/${tenantId}/pilot-import/${entityType}/commit`, { method: 'POST', body: JSON.stringify(body) }),
+  commitPilotImport: (tenantId: string, entityType: PilotEntityType, body: { csvText: string; mapping: Record<string, string> }, operationKey = crypto.randomUUID()) =>
+    pf<PilotImportCommit>(`/v1/platform/tenants/${tenantId}/pilot-import/${entityType}/commit`, { method: 'POST', headers: { 'Idempotency-Key': operationKey }, body: JSON.stringify(body) }),
   getPilotStatusShare: (token: string) => pf<{ link: { label: string | null; expiresAt: string; active: boolean }; clinic: { id: string; name: string; slug: string }; checklist: PilotChecklistView }>(`/v1/pilot/share/${token}`, { auth: false }),
-  createPilotStatusShare: (tenantId: string, body: { label?: string; expiresInDays?: number }) =>
-    pf<PilotStatusShareCreated>(`/v1/platform/tenants/${tenantId}/pilot-status-links`, { method: 'POST', body: JSON.stringify(body) }),
+  createPilotStatusShare: (tenantId: string, body: { label?: string; expiresInDays?: number }, operationKey = crypto.randomUUID()) =>
+    pf<PilotStatusShareCreated>(`/v1/platform/tenants/${tenantId}/pilot-status-links`, { method: 'POST', headers: { 'Idempotency-Key': operationKey }, body: JSON.stringify(body) }),
   listPilotStatusShares: (tenantId: string) => pf<PilotStatusShare[]>(`/v1/platform/tenants/${tenantId}/pilot-status-links`),
 
   integrations: () => pf<IntegrationView[]>(`/v1/platform/integrations`),

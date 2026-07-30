@@ -39,8 +39,8 @@ export function useSession(options: { hydrate?: boolean } = {}) {
     };
   }, [hydrate, shouldHydrate]);
 
-  const signIn = async (email: string, password: string) => {
-    const result = await login(email, password);
+  const signIn = async (email: string, password: string, tenantSlug?: string) => {
+    const result = await login(email, password, tenantSlug);
     if (result.kind === 'session') {
       setUser(result.user);
       setLoading(false);

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { RefreshCw, Loader2, Check, X, Clock, MessageSquare, PenLine, DollarSign } from 'lucide-react';
+import { RefreshCw, Loader2, Check, X, PenLine, DollarSign } from 'lucide-react';
 import BentoCard from '../components/ui/BentoCard';
 import EmptyStatePremium from '../components/ui/EmptyStatePremium';
 import { apiRequest } from '../lib/api';
@@ -27,11 +27,11 @@ export default function RpmBillingReadiness() {
   // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { void load(); }, [load]);
 
-  async function act(patientId: string, kind: 'minutes' | 'comm' | 'signoff') {
+  async function signoff(patientId: string) {
+    const kind = 'signoff';
     setBusy(`${patientId}-${kind}`);
     try {
-      if (kind === 'signoff') await apiRequest(`/v1/connected-care/rpm-readiness/${patientId}/signoff`, { method: 'POST' });
-      else await apiRequest(`/v1/connected-care/rpm-readiness/${patientId}/review`, { method: 'PATCH', body: JSON.stringify(kind === 'minutes' ? { addReviewMinutes: 10 } : { communicationFlag: true }) });
+      await apiRequest(`/v1/connected-care/rpm-readiness/${patientId}/signoff`, { method: 'POST' });
       await load();
     } catch (e) { setError(e instanceof Error ? e.message : 'Action failed'); }
     finally { setBusy(null); }
@@ -72,9 +72,8 @@ export default function RpmBillingReadiness() {
                     ))}
                   </div>
                   <div className="flex items-center gap-1.5 flex-wrap">
-                    <button type="button" disabled={busy === `${r.patientId}-minutes`} onClick={() => act(r.patientId, 'minutes')} className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-t2 hover:bg-[var(--s3)] disabled:opacity-50">{busy === `${r.patientId}-minutes` ? <Loader2 className="w-3 h-3 animate-spin" /> : <Clock className="w-3 h-3" />} +10 review min</button>
-                    <button type="button" disabled={busy === `${r.patientId}-comm` || r.communicationFlag} onClick={() => act(r.patientId, 'comm')} className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-t2 hover:bg-[var(--s3)] disabled:opacity-50"><MessageSquare className="w-3 h-3" /> Mark communicated</button>
-                    <button type="button" disabled={busy === `${r.patientId}-signoff` || !!r.providerSignoffAt} onClick={() => act(r.patientId, 'signoff')} className="inline-flex items-center gap-1 rounded-lg bg-[var(--indigo)] px-2.5 py-1 text-[11px] font-semibold text-white hover:opacity-90 disabled:opacity-50">{busy === `${r.patientId}-signoff` ? <Loader2 className="w-3 h-3 animate-spin" /> : <PenLine className="w-3 h-3" />} Provider signoff</button>
+                    <span className="text-[11px] text-t3">Review minutes and communications are accepted only from source-attributed clinical sessions.</span>
+                    <button type="button" disabled={busy === `${r.patientId}-signoff` || !!r.providerSignoffAt} onClick={() => signoff(r.patientId)} className="inline-flex items-center gap-1 rounded-lg bg-[var(--indigo)] px-2.5 py-1 text-[11px] font-semibold text-white hover:opacity-90 disabled:opacity-50">{busy === `${r.patientId}-signoff` ? <Loader2 className="w-3 h-3 animate-spin" /> : <PenLine className="w-3 h-3" />} Provider signoff</button>
                   </div>
                 </div>
               ))}
