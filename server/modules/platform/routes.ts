@@ -10,6 +10,11 @@ import { autopilotQueue } from '../../workers/queues';
 import { env } from '../../config/env';
 import { encryptSecret, decryptSecret } from '../../lib/security';
 import { runWithPlatformDatabaseRequest } from '../../lib/platformContextStore';
+import { validateIanaTimezone } from '../../lib/scheduling';
+
+const timezoneInput = z.string().trim().min(1).max(80).refine(value => {
+  try { validateIanaTimezone(value); return true; } catch { return false; }
+}, { message: 'timezone must be a valid IANA timezone identifier' });
 
 // Integration provider catalog. `env` is the fallback config source; UI-saved
 // credentials live encrypted in PlatformIntegration and take precedence.
@@ -216,7 +221,7 @@ export const platformRoutes: FastifyPluginAsync = async app => {
       ownerEmail: z.string().email().trim().toLowerCase(),
       ownerPassword: z.string().min(1).max(200),
       defaultBranchName: z.string().trim().min(2).max(160).optional(),
-      timezone: z.string().trim().max(80).optional(),
+      timezone: timezoneInput.optional(),
     }).parse(request.body);
     if (await db.tenant.findUnique({ where: { slug: body.slug } })) throw app.httpErrors.conflict('Slug already in use');
     // Apply global platform defaults (default plan + trial length) from settings.

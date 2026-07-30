@@ -5,11 +5,13 @@ import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { generatePasswordHash, validatePassword } from '../../lib/security';
 import { requireRoles } from '../../plugins/roles';
-import { assertRoleChangeSafe, assertDeactivateSafe } from '../../lib/adminSafety';
+import { setUserActiveSafely, setUserRoleSafely } from '../../lib/adminSafety';
 import { autopilotQueue } from '../../workers/queues';
 import { createPaymentProvider, createInsuranceProvider, type PaymentRequestContext } from '../revenue-protection';
 import { paymentProviderStatus } from '../../lib/deposits';
 import { eligibilityProviderStatus } from '../../lib/insuranceIntelligence';
+import { runWithTenantContext } from '../../lib/tenantContext';
+import type { Prisma } from '../../generated/prisma/client';
 
 const ownerAdminRoles = requireRoles('OWNER', 'ADMIN');
 const uuid = z.string().uuid();
@@ -164,21 +166,21 @@ async function loadUsers(tenantId: string) {
   }));
 }
 
-async function replaceClinicAccess(tenantId: string, userId: string, branchIds: string[], primaryBranchId?: string) {
-  const uniqueBranchIds = [...new Set([primaryBranchId, ...branchIds].filter(Boolean) as string[])];
-  await db.userClinicAccess.deleteMany({ where: { tenantId, userId } });
-  if (uniqueBranchIds.length === 0) return;
-
-  await db.userClinicAccess.createMany({
-    data: uniqueBranchIds.map((branchId, index) => ({
-      tenantId,
-      userId,
-      branchId,
-      isPrimary: index === 0 || branchId === primaryBranchId,
-    })),
-  });
-
-  await db.user.update({ where: { id: userId }, data: { branchId: uniqueBranchIds[0] ?? null } });
+async function replaceClinicAccess(tx: Prisma.TransactionClient, tenantId: string, userId: string, branchIds: string[], primaryBranchId?: string) {
+  const uniqueBranchIds = [...new Set(branchIds)];
+  if (primaryBranchId && !uniqueBranchIds.includes(primaryBranchId)) {
+    throw new Error('primary_branch_must_be_selected');
+  }
+  const orderedBranchIds = primaryBranchId
+    ? [primaryBranchId, ...uniqueBranchIds.filter(id => id !== primaryBranchId)]
+    : uniqueBranchIds;
+  await tx.userClinicAccess.deleteMany({ where: { tenantId, userId } });
+  if (orderedBranchIds.length > 0) {
+    await tx.userClinicAccess.createMany({
+      data: orderedBranchIds.map((branchId, index) => ({ tenantId, userId, branchId, isPrimary: index === 0 })),
+    });
+  }
+  await tx.user.update({ where: { id: userId }, data: { branchId: orderedBranchIds[0] ?? null } });
 }
 
 async function buildIntegrationRows(tenantId: string) {
@@ -665,32 +667,46 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     const policy = validatePassword(body.password);
     if (!policy.ok) throw app.httpErrors.badRequest(policy.message ?? 'Weak password');
 
-    const validBranchRows = body.branchIds.length > 0
-      ? await db.branch.findMany({ where: { tenantId: request.auth.tenantId, id: { in: body.branchIds } }, select: { id: true } })
+    const requestedBranchIds = [...new Set(body.branchIds)];
+    if (body.primaryBranchId && !requestedBranchIds.includes(body.primaryBranchId)) {
+      throw app.httpErrors.badRequest('Primary branch must be included in selected branch access');
+    }
+    const validBranchRows = requestedBranchIds.length > 0
+      ? await db.branch.findMany({ where: { tenantId: request.auth.tenantId, active: true, id: { in: requestedBranchIds } }, select: { id: true } })
       : [];
     let validBranchIds = validBranchRows.map(branch => branch.id);
+    if (validBranchIds.length !== requestedBranchIds.length) {
+      throw app.httpErrors.badRequest('Every selected branch must be active and belong to this tenant');
+    }
     if (validBranchIds.length === 0) {
       const fallbackBranch = await db.branch.findFirst({ where: { tenantId: request.auth.tenantId, active: true }, orderBy: { name: 'asc' }, select: { id: true } });
       if (fallbackBranch) validBranchIds = [fallbackBranch.id];
     }
     const primaryBranchId = body.primaryBranchId && validBranchIds.includes(body.primaryBranchId) ? body.primaryBranchId : validBranchIds[0] ?? null;
 
-    const created = await db.user.create({
-      data: {
+    const passwordHash = await generatePasswordHash(body.password);
+    const created = await runWithTenantContext(request.auth.tenantId, async tx => {
+      const user = await tx.user.create({ data: {
         tenantId: request.auth.tenantId,
         email: body.email,
         displayName: body.name,
         role: body.role,
-        passwordHash: await generatePasswordHash(body.password),
+        passwordHash,
         branchId: primaryBranchId,
-      },
-    });
-    if (validBranchIds.length > 0) await replaceClinicAccess(request.auth.tenantId, created.id, validBranchIds, primaryBranchId ?? undefined);
-    await audit(request, {
-      action: 'controlPlane.user.created',
-      resource: 'user',
-      resourceId: created.id,
-      metadata: { email: created.email, role: created.role, branchIds: validBranchIds },
+      } });
+      if (validBranchIds.length > 0) await replaceClinicAccess(tx, request.auth.tenantId, user.id, validBranchIds, primaryBranchId ?? undefined);
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId,
+        actorUserId: request.auth.userId,
+        action: 'controlPlane.user.created',
+        resource: 'user',
+        resourceId: user.id,
+        requestId: request.id,
+        ipAddress: request.ip,
+        userAgent: request.headers['user-agent'],
+        metadata: { email: user.email, role: user.role, branchIds: validBranchIds },
+      } });
+      return user;
     });
     return reply.code(201).send({
       id: created.id,
@@ -706,29 +722,15 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
   app.patch('/users/:id/status', { preHandler: ownerAdminRoles }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const { active } = userStatusBody.parse(request.body);
-    const existing = await db.user.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('User not found');
-    if (!active) await assertDeactivateSafe(request, existing);
-    const updated = await db.user.update({
-      where: { id },
-      data: {
-        active,
-        ...(active ? {} : { refreshTokenHash: null, refreshTokenExpiresAt: null }),
-      },
-    });
-    await audit(request, { action: active ? 'controlPlane.user.activated' : 'controlPlane.user.deactivated', resource: 'user', resourceId: id, metadata: { active } });
+    const updated = await setUserActiveSafely(request, id, active, active ? 'controlPlane.user.activated' : 'controlPlane.user.deactivated');
     return reply.send({ id: updated.id, active: updated.active });
   });
 
   app.patch('/users/:id/role', { preHandler: ownerAdminRoles }, async (request) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const { role } = userRoleBody.parse(request.body);
-    const existing = await db.user.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('User not found');
-    await assertRoleChangeSafe(request, existing, role);
-    await db.user.update({ where: { id }, data: { role } });
-    await audit(request, { action: 'controlPlane.user.roleChanged', resource: 'user', resourceId: id, metadata: { fromRole: existing.role, toRole: role } });
-    return { id, role };
+    const updated = await setUserRoleSafely(request, id, role, 'controlPlane.user.roleChanged');
+    return { id: updated.id, role: updated.role };
   });
 
   app.patch('/users/:id/clinic-access', { preHandler: ownerAdminRoles }, async request => {
@@ -736,10 +738,29 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     const body = clinicAccessBody.parse(request.body);
     const existing = await db.user.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!existing) throw app.httpErrors.notFound('User not found');
-    const validBranches = await db.branch.findMany({ where: { tenantId: request.auth.tenantId, id: { in: body.branchIds } }, select: { id: true } });
-    const validBranchIds = body.branchIds.filter(branchId => validBranches.some(branch => branch.id === branchId));
-    await replaceClinicAccess(request.auth.tenantId, id, validBranchIds, body.primaryBranchId);
-    await audit(request, { action: 'controlPlane.user.clinicAccessUpdated', resource: 'user', resourceId: id, metadata: { branchIds: validBranchIds } });
+    const requestedBranchIds = [...new Set(body.branchIds)];
+    if (body.primaryBranchId && !requestedBranchIds.includes(body.primaryBranchId)) {
+      throw app.httpErrors.badRequest('Primary branch must be included in selected branch access');
+    }
+    const validBranches = await db.branch.findMany({ where: { tenantId: request.auth.tenantId, active: true, id: { in: requestedBranchIds } }, select: { id: true } });
+    if (validBranches.length !== requestedBranchIds.length) {
+      throw app.httpErrors.badRequest('Every selected branch must be active and belong to this tenant');
+    }
+    const validBranchIds = requestedBranchIds;
+    await runWithTenantContext(request.auth.tenantId, async tx => {
+      await replaceClinicAccess(tx, request.auth.tenantId, id, validBranchIds, body.primaryBranchId);
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId,
+        actorUserId: request.auth.userId,
+        action: 'controlPlane.user.clinicAccessUpdated',
+        resource: 'user',
+        resourceId: id,
+        requestId: request.id,
+        ipAddress: request.ip,
+        userAgent: request.headers['user-agent'],
+        metadata: { branchIds: validBranchIds },
+      } });
+    });
     return { id, branchIds: validBranchIds, primaryBranchId: body.primaryBranchId ?? validBranchIds[0] ?? null };
   });
 
@@ -847,6 +868,18 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     const { active } = clinicStatusBody.parse(request.body);
     const clinic = await db.branch.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!clinic) throw app.httpErrors.notFound('Clinic not found');
+    if (!active) {
+      const assignedActiveUsers = await db.user.count({
+        where: {
+          tenantId: request.auth.tenantId,
+          active: true,
+          OR: [{ branchId: id }, { clinicAccesses: { some: { branchId: id } } }],
+        },
+      });
+      if (assignedActiveUsers > 0) {
+        throw app.httpErrors.conflict('Reassign or deactivate active clinic users before deactivating this clinic');
+      }
+    }
     const updated = await db.branch.update({ where: { id }, data: { active } });
     await audit(request, { action: 'controlPlane.clinic.statusUpdated', resource: 'branch', resourceId: id, metadata: { active } });
     return reply.send({ id: updated.id, active: updated.active });
@@ -1028,8 +1061,20 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const existing = await db.user.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!existing) throw app.httpErrors.notFound('Session not found');
-    await db.user.update({ where: { id }, data: { refreshTokenHash: null, refreshTokenExpiresAt: null } });
-    await audit(request, { action: 'controlPlane.session.revoked', resource: 'session', resourceId: id, metadata: { reason: 'owner-admin-revoked' } });
+    await runWithTenantContext(request.auth.tenantId, async tx => {
+      await tx.user.update({ where: { id }, data: { refreshTokenHash: null, refreshTokenExpiresAt: null } });
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId,
+        actorUserId: request.auth.userId,
+        action: 'controlPlane.session.revoked',
+        resource: 'session',
+        resourceId: id,
+        requestId: request.id,
+        ipAddress: request.ip,
+        userAgent: request.headers['user-agent'],
+        metadata: { reason: 'owner-admin-revoked' },
+      } });
+    });
     return reply.code(204).send();
   });
 

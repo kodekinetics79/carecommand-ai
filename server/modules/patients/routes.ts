@@ -27,12 +27,12 @@ const patientQuery = paginationSchema.extend({
 
 const patientInput = z.object({
   branchId: z.string().uuid(),
-  externalRef: z.string().trim().max(120).optional(),
+  externalRef: z.string().trim().min(1).max(120).optional(),
   firstName: z.string().trim().min(1).max(80),
   lastName: z.string().trim().min(1).max(80),
   // Front-desk demographic capture / identity verification. Optional, date-only.
   dateOfBirth: z.coerce.date().refine(v => v <= new Date(), { message: 'dateOfBirth cannot be in the future' }).optional(),
-  email: z.string().email().optional(),
+  email: z.string().email().trim().toLowerCase().optional(),
   phone: z.string().trim().max(40).optional(),
   lifecycleStage: z.enum(['NEW', 'ACTIVE', 'AT_RISK', 'INACTIVE', 'LOST', 'RETAINED']).default('NEW'),
   tags: z.array(z.string().trim().min(1).max(40)).max(30).default([]),
@@ -42,11 +42,11 @@ const patientInput = z.object({
 // so an empty PATCH is a 400 rather than a silent no-op. branchId is intentionally
 // not editable here (moving a patient across branches is a separate operation).
 const patientUpdateInput = z.object({
-  externalRef: z.string().trim().max(120).optional(),
+  externalRef: z.string().trim().min(1).max(120).optional(),
   firstName: z.string().trim().min(1).max(80).optional(),
   lastName: z.string().trim().min(1).max(80).optional(),
   dateOfBirth: z.coerce.date().refine(v => v <= new Date(), { message: 'dateOfBirth cannot be in the future' }).optional(),
-  email: z.string().email().optional(),
+  email: z.string().email().trim().toLowerCase().optional(),
   phone: z.string().trim().max(40).optional(),
   lifecycleStage: z.enum(['NEW', 'ACTIVE', 'AT_RISK', 'INACTIVE', 'LOST', 'RETAINED']).optional(),
   tags: z.array(z.string().trim().min(1).max(40)).max(30).optional(),
@@ -68,6 +68,8 @@ export const patientRoutes: FastifyPluginAsync = async app => {
           { firstName: { contains: query.search, mode: 'insensitive' } },
           { lastName: { contains: query.search, mode: 'insensitive' } },
           { email: { contains: query.search, mode: 'insensitive' } },
+          { phone: { contains: query.search, mode: 'insensitive' } },
+          { externalRef: { contains: query.search, mode: 'insensitive' } },
         ] : undefined,
       },
       orderBy: { id: 'asc' },
@@ -120,10 +122,44 @@ export const patientRoutes: FastifyPluginAsync = async app => {
     const branch = await runWithTenantContext(request.auth.tenantId, tx => tx.branch.findFirst({ where: { id: input.branchId, tenantId: request.auth.tenantId } }));
     if (!branch) throw app.httpErrors.badRequest('Branch does not belong to this tenant');
 
-    const patient = await runWithTenantContext(request.auth.tenantId, tx => tx.patient.create({
-      data: { tenantId: request.auth.tenantId, ...input },
-    }));
-    await audit(request, { action: 'patient.created', resource: 'patient', resourceId: patient.id });
+    const identityClauses = [
+      ...(input.externalRef ? [{ externalRef: input.externalRef }] : []),
+      ...(input.email ? [{
+        email: { equals: input.email, mode: 'insensitive' as const },
+        firstName: { equals: input.firstName, mode: 'insensitive' as const },
+        lastName: { equals: input.lastName, mode: 'insensitive' as const },
+        ...(input.dateOfBirth ? { dateOfBirth: input.dateOfBirth } : {}),
+      }] : []),
+      ...(input.phone ? [{
+        phone: input.phone,
+        firstName: { equals: input.firstName, mode: 'insensitive' as const },
+        lastName: { equals: input.lastName, mode: 'insensitive' as const },
+        ...(input.dateOfBirth ? { dateOfBirth: input.dateOfBirth } : {}),
+      }] : []),
+    ];
+    const identityKey = [request.auth.tenantId, input.externalRef ?? '', input.email ?? '', input.phone ?? '', input.firstName.toLowerCase(), input.lastName.toLowerCase(), input.dateOfBirth?.toISOString() ?? ''].join('|');
+    const patient = await runWithTenantContext(request.auth.tenantId, async tx => {
+      if (identityClauses.length > 0) {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`patient.identity:${identityKey}`}::text, 0))::text AS locked`;
+        const duplicate = await tx.patient.findFirst({
+          where: { tenantId: request.auth.tenantId, deletedAt: null, OR: identityClauses },
+          select: { id: true },
+        });
+        if (duplicate) throw app.httpErrors.conflict('A possible duplicate patient already exists. Review the existing record before creating another.');
+      }
+      const created = await tx.patient.create({ data: { tenantId: request.auth.tenantId, ...input } });
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId,
+        actorUserId: request.auth.userId,
+        action: 'patient.created',
+        resource: 'patient',
+        resourceId: created.id,
+        requestId: request.id,
+        ipAddress: request.ip,
+        userAgent: request.headers['user-agent'],
+      } });
+      return created;
+    });
     return reply.code(201).send(patient);
   });
 

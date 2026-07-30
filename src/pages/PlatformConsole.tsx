@@ -1011,9 +1011,10 @@ function CreateCompanyForm({ plans, onCancel, onCreated }: { plans: Array<{ key:
   const [ownerEmail, setOwnerEmail] = useState('');
   const [ownerPassword, setOwnerPassword] = useState('');
   const [branch, setBranch] = useState('Main Branch');
+  const [timezone, setTimezone] = useState(() => Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/New_York');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [done, setDone] = useState<{ email: string; password: string } | null>(null);
+  const [done, setDone] = useState<{ email: string } | null>(null);
 
   const autoSlug = (v: string) => v.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
   const inputCls = 'w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--indigo)]';
@@ -1021,8 +1022,9 @@ function CreateCompanyForm({ plans, onCancel, onCreated }: { plans: Array<{ key:
   async function submit() {
     setBusy(true); setError(null);
     try {
-      await platformAdmin.createTenant({ name: name.trim(), slug: slug.trim(), planKey, ownerName: ownerName.trim(), ownerEmail: ownerEmail.trim(), ownerPassword, defaultBranchName: branch.trim() || 'Main Branch' });
-      setDone({ email: ownerEmail.trim(), password: ownerPassword });
+      await platformAdmin.createTenant({ name: name.trim(), slug: slug.trim(), planKey, ownerName: ownerName.trim(), ownerEmail: ownerEmail.trim(), ownerPassword, defaultBranchName: branch.trim() || 'Main Branch', timezone });
+      setOwnerPassword('');
+      setDone({ email: ownerEmail.trim() });
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to create company');
     } finally { setBusy(false); }
@@ -1032,12 +1034,10 @@ function CreateCompanyForm({ plans, onCancel, onCreated }: { plans: Array<{ key:
     return (
       <div className="mb-4 rounded-xl border border-[rgba(5,150,105,0.25)] bg-emerald-soft p-4">
         <p className="text-sm font-bold text-emerald-v flex items-center gap-2"><CircleCheck className="w-4 h-4" /> Company created</p>
-        <p className="text-[12px] text-t2 mt-1.5">The client can now sign in at the clinic login with <span className="font-semibold">{done.email}</span> and the temporary password below.</p>
+        <p className="text-[12px] text-t2 mt-1.5">The client can now sign in at the clinic login with <span className="font-semibold">{done.email}</span>. Deliver the initial password through your approved secure channel; it is not displayed or retained here.</p>
         <div className="mt-3 rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-[12px] text-t2">
           <p><span className="font-semibold text-t1">Email:</span> {done.email}</p>
-          <p className="mt-1"><span className="font-semibold text-t1">Password:</span> {done.password}</p>
         </div>
-        <p className="mt-2 text-[11px] text-t3">Have the client change this password after first sign-in.</p>
         <button type="button" onClick={onCreated} className="mt-3 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90">Done</button>
       </div>
     );
@@ -1057,6 +1057,8 @@ function CreateCompanyForm({ plans, onCancel, onCreated }: { plans: Array<{ key:
           <select aria-label="Plan" className={inputCls} value={planKey} onChange={e => setPlanKey(e.target.value)}>{(plans.length ? plans : [{ key: 'starter', name: 'Starter' }]).map(p => <option key={p.key} value={p.key}>{p.name}</option>)}</select></label>
         <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Default branch</span>
           <input className={inputCls} value={branch} onChange={e => setBranch(e.target.value)} placeholder="Main Branch" /></label>
+        <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Clinic timezone</span>
+          <input className={inputCls} value={timezone} onChange={e => setTimezone(e.target.value)} placeholder="America/New_York" /></label>
       </div>
       <div className="border-t border-[var(--b1)] pt-3">
         <p className="text-[10px] font-semibold text-t3 mb-2">OWNER LOGIN (the client signs in with these)</p>
@@ -1065,8 +1067,8 @@ function CreateCompanyForm({ plans, onCancel, onCreated }: { plans: Array<{ key:
             <input className={inputCls} value={ownerName} onChange={e => setOwnerName(e.target.value)} placeholder="Dr. Jane Doe" /></label>
           <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Owner email</span>
             <input className={inputCls} type="email" value={ownerEmail} onChange={e => setOwnerEmail(e.target.value)} placeholder="owner@clinic.com" /></label>
-          <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Temp password (min 8)</span>
-            <input className={inputCls} type="text" value={ownerPassword} onChange={e => setOwnerPassword(e.target.value)} placeholder="Set a starter password" /></label>
+          <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Initial password (min 8)</span>
+            <input className={inputCls} type="password" autoComplete="new-password" value={ownerPassword} onChange={e => setOwnerPassword(e.target.value)} placeholder="Set an initial password" /></label>
         </div>
       </div>
       <div className="flex gap-2">

@@ -151,7 +151,7 @@ export const platformAdmin = {
   health: () => pf<SystemHealth>(`/v1/platform/health`),
   tenants: () => pf<TenantSummary[]>(`/v1/platform/tenants`),
   tenant: (id: string) => pf<TenantSummary>(`/v1/platform/tenants/${id}`),
-  createTenant: (body: { name: string; slug: string; planKey?: string; ownerName: string; ownerEmail: string; ownerPassword: string; defaultBranchName?: string }) =>
+  createTenant: (body: { name: string; slug: string; planKey?: string; ownerName: string; ownerEmail: string; ownerPassword: string; defaultBranchName?: string; timezone?: string }) =>
     pf<TenantSummary>(`/v1/platform/tenants`, { method: 'POST', body: JSON.stringify(body) }),
   suspend: (id: string) => pf<{ status: string }>(`/v1/platform/tenants/${id}/suspend`, { method: 'POST' }),
   reactivate: (id: string) => pf<{ status: string }>(`/v1/platform/tenants/${id}/reactivate`, { method: 'POST' }),

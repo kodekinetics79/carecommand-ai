@@ -68,6 +68,14 @@ export default function Patients() {
   const highRisk = customerRecords.filter(p => p.churnRisk >= 60).length;
   const activeCount = customerRecords.filter(p => p.lifecycleStage === 'active' || p.lifecycleStage === 'retained').length;
   const avgLTV = customerRecords.length > 0 ? Math.round(customerRecords.reduce((sum, patient) => sum + patient.lifetimeValue, 0) / customerRecords.length) : 0;
+  const marketingConsented = customerRecords.filter(patient => patient.consentStatus.marketing).length;
+  const marketingConsentRate = customerRecords.length > 0 ? Math.round((marketingConsented / customerRecords.length) * 100) : 0;
+  const preferredChannelCounts = customerRecords.reduce<Record<string, number>>((counts, patient) => {
+    const channel = patient.preferredChannel || 'unknown';
+    counts[channel] = (counts[channel] ?? 0) + 1;
+    return counts;
+  }, {});
+  const preferredChannel = Object.entries(preferredChannelCounts).sort((a, b) => b[1] - a[1])[0]?.[0] ?? 'No data';
   const segments = [
     { label: 'High LTV (>$4,000)', count: customerRecords.filter(p => p.lifetimeValue > 4000).length, color: 'emerald' as const },
     { label: 'At-risk churn', count: customerRecords.filter(p => p.churnRisk >= 60).length, color: 'red' as const },
@@ -232,9 +240,9 @@ export default function Patients() {
           <BentoCard title="Customer Intelligence" subtitle="Network-wide signals">
             <div className="space-y-3">
               {[
-                { label: 'Preferred channel', value: 'WhatsApp', icon: <ShieldCheck className="w-3.5 h-3.5 text-emerald-v" /> },
-                { label: 'Marketing consent rate', value: '87%', icon: <ShieldCheck className="w-3.5 h-3.5 text-emerald-v" /> },
-                { label: 'Follow-up opportunities', value: '18 customers', icon: <Sparkles className="w-3.5 h-3.5 text-violet-v" /> },
+                { label: 'Preferred channel', value: preferredChannel === 'No data' ? preferredChannel : preferredChannel.toUpperCase(), icon: <ShieldCheck className="w-3.5 h-3.5 text-emerald-v" /> },
+                { label: 'Marketing consent rate', value: `${marketingConsentRate}%`, icon: <ShieldCheck className="w-3.5 h-3.5 text-emerald-v" /> },
+                { label: 'Follow-up opportunities', value: `${highRisk} customers`, icon: <Sparkles className="w-3.5 h-3.5 text-violet-v" /> },
                 { label: 'Outstanding balances', value: formatCurrency(customerRecords.reduce((s, p) => s + p.outstandingBalance, 0)), icon: <AlertCircle className="w-3.5 h-3.5 text-amber-v" /> },
               ].map((item) => (
                 <div key={item.label} className="flex items-center justify-between gap-3 p-2.5 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors">
@@ -285,8 +293,8 @@ export default function Patients() {
               <Sparkles className="w-4 h-4 text-violet-v" />
               <p className="text-[10px] font-bold uppercase tracking-widest text-violet-v">Outreach Recommendation</p>
             </div>
-            <p className="text-sm font-bold text-t1 mb-1">18 customers ready for outreach</p>
-            <p className="text-xs text-t2 mb-3">High-LTV customers with marketing consent who haven't been contacted in 60+ days.</p>
+            <p className="text-sm font-bold text-t1 mb-1">{highRisk} customers need follow-up review</p>
+            <p className="text-xs text-t2 mb-3">This queue is calculated from the current customer risk scores. Campaign consent is rechecked before any outreach.</p>
             <button type="button" onClick={() => navigate('/campaigner')} className="w-full py-2 rounded-xl bg-[var(--violet-soft)] hover:bg-[var(--s3)] text-violet-v text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
               <ArrowRight className="w-3.5 h-3.5" /> Launch outreach campaign
             </button>

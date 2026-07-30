@@ -3,6 +3,7 @@ import { env } from '../config/env';
 import { generatePasswordHash, validatePassword } from './security';
 import { recomputeEntitlements } from './entitlements';
 import { seedComplianceBaseline } from '../modules/compliance/baseline';
+import { validateIanaTimezone } from './scheduling';
 
 // ===========================================================================
 // Tenant provisioning — the full onboarding flow used by the operator-gated
@@ -37,6 +38,7 @@ export async function provisionTenant(input: ProvisionInput) {
     throw new ProvisionError('invalid_slug', 'Slug must be 3-40 chars: lowercase letters, numbers, and hyphens.');
   }
   const email = input.ownerEmail.trim().toLowerCase();
+  const timezone = validateIanaTimezone(input.timezone ?? 'America/New_York');
   const pw = validatePassword(input.ownerPassword);
   if (!pw.ok) throw new ProvisionError('weak_password', pw.message ?? 'Password does not meet policy.');
 
@@ -50,7 +52,7 @@ export async function provisionTenant(input: ProvisionInput) {
 
   const tenant = await db.tenant.create({ data: { name: input.clinicName.trim(), slug } });
   const branch = await db.branch.create({
-    data: { tenantId: tenant.id, name: input.defaultBranchName.trim(), location: (input.address ?? input.clinicName).trim(), ...(input.timezone ? { timezone: input.timezone } : {}) },
+    data: { tenantId: tenant.id, name: input.defaultBranchName.trim(), location: (input.address ?? input.clinicName).trim(), timezone },
   });
   const owner = await db.user.create({
     data: {

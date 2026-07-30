@@ -118,14 +118,23 @@ function accessTtlSeconds(sessionTimeoutMinutes?: number | null) {
   return minutes * 60;
 }
 
-function buildSession(app: FastifyInstance, user: SessionUserShape, ttlSeconds: number) {
+function buildSession(app: FastifyInstance, user: SessionUserShape, ttlSeconds: number, revokedAt?: Date | null) {
+  const sessionIssuedAtMs = Math.max(Date.now(), (revokedAt?.getTime() ?? 0) + 1);
   return app.jwt.sign(
-    { userId: user.id, tenantId: user.tenantId, role: user.role, branchId: user.branchId ?? undefined, type: 'access' },
+    { userId: user.id, tenantId: user.tenantId, role: user.role, branchId: user.branchId ?? undefined, type: 'access', sessionIssuedAtMs },
     { expiresIn: ttlSeconds },
   );
 }
 
-async function issueSession(app: FastifyInstance, user: SessionUserShape, ttlSeconds: number) {
+async function issueSession(app: FastifyInstance, user: SessionUserShape, ttlSeconds: number, revokedAt?: Date | null) {
+  const userRevocation = await db.auditEvent.findFirst({
+    where: { tenantId: user.tenantId, action: 'controlPlane.session.revoked', resource: 'session', resourceId: user.id },
+    orderBy: { occurredAt: 'desc' },
+    select: { occurredAt: true },
+  });
+  const effectiveRevocation = userRevocation && (!revokedAt || userRevocation.occurredAt > revokedAt)
+    ? userRevocation.occurredAt
+    : revokedAt;
   const refreshToken = createRefreshToken();
   const csrfToken = createCsrfToken();
   const refreshTokenHash = hashRefreshToken(refreshToken);
@@ -134,7 +143,7 @@ async function issueSession(app: FastifyInstance, user: SessionUserShape, ttlSec
     where: { id: user.id },
     data: { refreshTokenHash, refreshTokenExpiresAt, lastLoginAt: new Date(), failedLoginCount: 0, lockedUntil: null },
   });
-  return { accessToken: buildSession(app, user, ttlSeconds), refreshToken, csrfToken };
+  return { accessToken: buildSession(app, user, ttlSeconds, effectiveRevocation), refreshToken, csrfToken };
 }
 
 async function resolveSessionUser(userId: string) {
@@ -287,7 +296,7 @@ export const authRoutes: FastifyPluginAsync = async app => {
       return reply.send({ status: 'mfa_setup_required', mfaToken });
     }
 
-    const session = await issueSession(app, user, accessTtlSeconds(policy?.sessionTimeoutMinutes));
+    const session = await issueSession(app, user, accessTtlSeconds(policy?.sessionTimeoutMinutes), policy?.sessionsRevokedAt);
     setAuthCookies(reply, session.refreshToken, session.csrfToken);
     await auditAuth(request, user.tenantId, user.id, 'auth.login.success', { email: user.email });
     return { accessToken: session.accessToken, csrfToken: session.csrfToken, user: serializeUser(user) };
@@ -327,7 +336,7 @@ export const authRoutes: FastifyPluginAsync = async app => {
       return reply.code(403).send({ status: 'suspended_tenant', message: 'This account is suspended. Please contact support.' });
     }
     const policy = await tenantPolicy(user.tenantId);
-    const session = await issueSession(app, user, accessTtlSeconds(policy?.sessionTimeoutMinutes));
+    const session = await issueSession(app, user, accessTtlSeconds(policy?.sessionTimeoutMinutes), policy?.sessionsRevokedAt);
     setAuthCookies(reply, session.refreshToken, session.csrfToken);
     return { accessToken: session.accessToken, csrfToken: session.csrfToken, user: serializeUser(user) };
   });
@@ -506,7 +515,7 @@ export const authRoutes: FastifyPluginAsync = async app => {
     // Login-flow tokens complete the sign-in by issuing a real session.
     if (actor.type === 'mfa-challenge' || actor.type === 'mfa-setup') {
       const policy = await tenantPolicy(user.tenantId);
-      const session = await issueSession(app, user, accessTtlSeconds(policy?.sessionTimeoutMinutes));
+      const session = await issueSession(app, user, accessTtlSeconds(policy?.sessionTimeoutMinutes), policy?.sessionsRevokedAt);
       setAuthCookies(reply, session.refreshToken, session.csrfToken);
       await auditAuth(request, user.tenantId, user.id, 'auth.login.success', { email: user.email, mfa: true });
       return { status: 'ok', accessToken: session.accessToken, csrfToken: session.csrfToken, user: serializeUser(user) };

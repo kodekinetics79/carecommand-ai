@@ -33,6 +33,10 @@ function csvSnippet(text: string) {
   return lines.slice(0, 6).join('\n');
 }
 
+function localTimezone() {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/New_York';
+}
+
 export default function PlatformPilot() {
   const [tenants, setTenants] = useState<TenantSummary[]>([]);
   const [selectedTenantId, setSelectedTenantId] = useState('');
@@ -49,6 +53,7 @@ export default function PlatformPilot() {
   const [ownerEmail, setOwnerEmail] = useState('');
   const [ownerPassword, setOwnerPassword] = useState('');
   const [branchName, setBranchName] = useState('Main Branch');
+  const [timezone, setTimezone] = useState(localTimezone);
 
   const [entityType, setEntityType] = useState<PilotEntityType>('patients');
   const [csvText, setCsvText] = useState('');
@@ -154,6 +159,7 @@ export default function PlatformPilot() {
         ownerEmail: ownerEmail.trim(),
         ownerPassword,
         defaultBranchName: branchName.trim() || 'Main Branch',
+        timezone,
       });
       await reloadTenants(created.tenant?.id);
       setCompanyName('');
@@ -163,6 +169,7 @@ export default function PlatformPilot() {
       setOwnerEmail('');
       setOwnerPassword('');
       setBranchName('Main Branch');
+      setTimezone(localTimezone());
       setCompanyOpen(false);
       setImportResult(`Created ${created.tenant?.name ?? 'tenant'} and owner ${ownerEmail.trim()}.`);
     } catch (e) {
@@ -400,6 +407,10 @@ export default function PlatformPilot() {
                     <span className="text-[11px] font-semibold text-t3">Default branch</span>
                     <input value={branchName} onChange={e => setBranchName(e.target.value)} className="w-full rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Main Branch" />
                   </label>
+                  <label className="block space-y-1">
+                    <span className="text-[11px] font-semibold text-t3">Clinic timezone</span>
+                    <input value={timezone} onChange={e => setTimezone(e.target.value)} className="w-full rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="America/New_York" />
+                  </label>
                 </div>
                 <div className="grid gap-3 md:grid-cols-3">
                   <label className="block space-y-1">
@@ -411,8 +422,8 @@ export default function PlatformPilot() {
                     <input value={ownerEmail} onChange={e => setOwnerEmail(e.target.value)} className="w-full rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="owner@clinic.com" />
                   </label>
                   <label className="block space-y-1">
-                    <span className="text-[11px] font-semibold text-t3">Temp password</span>
-                    <input value={ownerPassword} onChange={e => setOwnerPassword(e.target.value)} className="w-full rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Set a starter password" />
+                    <span className="text-[11px] font-semibold text-t3">Initial password</span>
+                    <input type="password" autoComplete="new-password" value={ownerPassword} onChange={e => setOwnerPassword(e.target.value)} className="w-full rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Set an initial password" />
                   </label>
                 </div>
                 <button type="button" disabled={busy === 'create' || companyName.trim().length < 2 || companySlug.trim().length < 2 || ownerName.trim().length < 2 || ownerEmail.trim().length < 5 || ownerPassword.length < 8} onClick={() => void createTenant()} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2.5 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-40">

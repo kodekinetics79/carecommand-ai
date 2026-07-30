@@ -1,4 +1,4 @@
-import type { FastifyPluginAsync } from 'fastify';
+import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { env } from '../../config/env';
 import { db } from '../../lib/db';
@@ -6,7 +6,7 @@ import { audit } from '../../lib/audit';
 import { requirePermission, PERMISSIONS, ROLE_PERMISSIONS, sanitizePermissions } from '../../lib/permissions';
 import { runWithTenantContext } from '../../lib/tenantContext';
 import { checkRlsRuntimeRole } from '../../lib/rlsGuard';
-import { assertRoleChangeSafe, assertDeactivateSafe } from '../../lib/adminSafety';
+import { setUserActiveSafely, setUserRoleSafely } from '../../lib/adminSafety';
 
 const uuid = z.string().uuid();
 // Permission-gated (defaults preserve the prior role membership):
@@ -340,28 +340,30 @@ async function loadAdminData(tenantId: string): Promise<AdminData> {
   };
 }
 
-function uniqueBranchIds(branchIds: string[], primaryBranchId?: string) {
-  const ordered = primaryBranchId ? [primaryBranchId, ...branchIds] : branchIds;
-  return [...new Set(ordered.filter(Boolean))];
-}
-
-async function replaceUserClinicAccess(tenantId: string, userId: string, branchIds: string[], primaryBranchId?: string) {
-  const orderedBranchIds = uniqueBranchIds(branchIds, primaryBranchId);
-  await db.userClinicAccess.deleteMany({ where: { tenantId, userId } });
-  if (orderedBranchIds.length === 0) return;
-
-  await db.userClinicAccess.createMany({
-    data: orderedBranchIds.map((branchId, index) => ({
+async function replaceUserClinicAccess(request: FastifyRequest, userId: string, branchIds: string[], primaryBranchId?: string) {
+  const tenantId = request.auth.tenantId;
+  const orderedBranchIds = primaryBranchId
+    ? [primaryBranchId, ...branchIds.filter(id => id !== primaryBranchId)]
+    : branchIds;
+  await runWithTenantContext(tenantId, async tx => {
+    await tx.userClinicAccess.deleteMany({ where: { tenantId, userId } });
+    if (orderedBranchIds.length > 0) {
+      await tx.userClinicAccess.createMany({
+        data: orderedBranchIds.map((branchId, index) => ({ tenantId, userId, branchId, isPrimary: index === 0 })),
+      });
+    }
+    await tx.user.update({ where: { id: userId }, data: { branchId: orderedBranchIds[0] ?? null } });
+    await tx.auditEvent.create({ data: {
       tenantId,
-      userId,
-      branchId,
-      isPrimary: index === 0 || branchId === primaryBranchId,
-    })),
-  });
-
-  await db.user.update({
-    where: { id: userId },
-    data: { branchId: orderedBranchIds[0] ?? null },
+      actorUserId: request.auth.userId,
+      action: 'admin.user.branchAccessUpdated',
+      resource: 'user',
+      resourceId: userId,
+      requestId: request.id,
+      ipAddress: request.ip,
+      userAgent: request.headers['user-agent'],
+      metadata: { branchIds: orderedBranchIds },
+    } });
   });
 }
 
@@ -699,22 +701,7 @@ export const adminRoutes: FastifyPluginAsync = async app => {
   app.patch('/users/:id/status', { preHandler: ownerAdminRoles }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
     const input = statusBody.parse(request.body);
-    const existing = await db.user.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('User not found');
-    if (!input.active) await assertDeactivateSafe(request, existing);
-    const updated = await db.user.update({
-      where: { id },
-      data: {
-        active: input.active,
-        ...(input.active ? {} : { refreshTokenHash: null, refreshTokenExpiresAt: null }),
-      },
-    });
-    await audit(request, {
-      action: input.active ? 'admin.user.activated' : 'admin.user.deactivated',
-      resource: 'user',
-      resourceId: id,
-      metadata: { active: input.active },
-    });
+    const updated = await setUserActiveSafely(request, id, input.active, input.active ? 'admin.user.activated' : 'admin.user.deactivated');
     return reply.send({
       id: updated.id,
       active: updated.active,
@@ -724,16 +711,7 @@ export const adminRoutes: FastifyPluginAsync = async app => {
   app.patch('/users/:id/role', { preHandler: ownerAdminRoles }, async request => {
     const { id } = idParam.parse(request.params);
     const input = roleBody.parse(request.body);
-    const existing = await db.user.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('User not found');
-    await assertRoleChangeSafe(request, existing, input.role);
-    const updated = await db.user.update({ where: { id }, data: { role: input.role } });
-    await audit(request, {
-      action: 'admin.user.roleChanged',
-      resource: 'user',
-      resourceId: id,
-      metadata: { fromRole: existing.role, toRole: input.role },
-    });
+    const updated = await setUserRoleSafely(request, id, input.role, 'admin.user.roleChanged');
     return { id: updated.id, role: updated.role };
   });
 
@@ -743,30 +721,25 @@ export const adminRoutes: FastifyPluginAsync = async app => {
     const existing = await db.user.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!existing) throw app.httpErrors.notFound('User not found');
 
-    const branchIds = uniqueBranchIds(input.branchIds, input.primaryBranchId ?? existing.branchId ?? undefined);
+    const branchIds = [...new Set(input.branchIds)];
+    if (input.primaryBranchId && !branchIds.includes(input.primaryBranchId)) {
+      throw app.httpErrors.badRequest('Primary branch must be included in selected clinic access');
+    }
     if (branchIds.length === 0 && existing.role !== 'OWNER' && existing.role !== 'ADMIN') {
       throw app.httpErrors.badRequest('At least one clinic access entry is required');
     }
 
     const validBranches = branchIds.length > 0
       ? await db.branch.findMany({
-          where: { tenantId: request.auth.tenantId, id: { in: branchIds } },
+          where: { tenantId: request.auth.tenantId, active: true, id: { in: branchIds } },
           select: { id: true },
         })
       : [];
-    const validBranchIds = new Set(validBranches.map(branch => branch.id));
-    const filteredBranchIds = branchIds.filter(branchId => validBranchIds.has(branchId));
-    if (branchIds.length > 0 && filteredBranchIds.length === 0) {
-      throw app.httpErrors.badRequest('No valid clinic branches provided');
+    if (validBranches.length !== branchIds.length) {
+      throw app.httpErrors.badRequest('Every selected clinic must be active and belong to this tenant');
     }
-
-    await replaceUserClinicAccess(request.auth.tenantId, id, filteredBranchIds, input.primaryBranchId ?? filteredBranchIds[0]);
-    await audit(request, {
-      action: 'admin.user.branchAccessUpdated',
-      resource: 'user',
-      resourceId: id,
-      metadata: { branchIds: filteredBranchIds },
-    });
+    const primaryBranchId = input.primaryBranchId ?? branchIds[0];
+    await replaceUserClinicAccess(request, id, branchIds, primaryBranchId);
 
     const refreshed = await db.user.findFirst({
       where: { id, tenantId: request.auth.tenantId },

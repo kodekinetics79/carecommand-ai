@@ -727,7 +727,7 @@ export default function ControlPlane() {
                 <button type="button" onClick={() => setEditingAccessUserId(null)} className="text-xs font-semibold text-t3 hover:text-t1">Close</button>
               </div>
               <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-                {(usersPayload?.branches ?? []).map(branch => (
+                {(usersPayload?.branches ?? []).filter(branch => branch.active).map(branch => (
                   <label key={branch.id} className="flex items-center justify-between gap-3 rounded-xl border border-[var(--b1)] px-3 py-2 text-sm text-t2">
                     <span className="min-w-0">
                       <span className="block truncate font-semibold text-t1">{branch.name}</span>
@@ -737,10 +737,17 @@ export default function ControlPlane() {
                       type="checkbox"
                       checked={accessDraft.branchIds.includes(branch.id)}
                       onChange={event => {
-                        setAccessDraft(current => ({
-                          ...current,
-                          branchIds: event.target.checked ? [...current.branchIds, branch.id] : current.branchIds.filter(branchId => branchId !== branch.id),
-                        }));
+                        setAccessDraft(current => {
+                          const branchIds = event.target.checked
+                            ? [...current.branchIds, branch.id]
+                            : current.branchIds.filter(branchId => branchId !== branch.id);
+                          return {
+                            branchIds,
+                            primaryBranchId: current.primaryBranchId && branchIds.includes(current.primaryBranchId)
+                              ? current.primaryBranchId
+                              : branchIds[0],
+                          };
+                        });
                       }}
                     />
                   </label>

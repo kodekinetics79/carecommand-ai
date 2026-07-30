@@ -66,6 +66,23 @@ afterAll(async () => {
 });
 
 describe('tenant authentication session lifecycle', () => {
+  it('invalidates a selected access token immediately and permits a fresh login after revocation', async () => {
+    const account = await makeLoginUser();
+    const login = await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { email: account.email, password: account.password } });
+    expect(login.statusCode).toBe(200);
+    const token = login.json().accessToken as string;
+    const headers = { authorization: `Bearer ${token}`, 'x-forwarded-for': '198.51.100.210' };
+    expect((await app.inject({ method: 'GET', url: '/v1/auth/me', headers })).statusCode).toBe(200);
+    const revoked = await app.inject({ method: 'PATCH', url: `/v1/control-plane/sessions/${account.userId}/revoke`, headers });
+    expect(revoked.statusCode).toBe(204);
+    expect((await app.inject({ method: 'GET', url: '/v1/auth/me', headers })).statusCode).toBe(401);
+
+    const fresh = await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { email: account.email, password: account.password } });
+    expect(fresh.statusCode).toBe(200);
+    expect((await app.inject({ method: 'GET', url: '/v1/auth/me', headers: { authorization: `Bearer ${fresh.json().accessToken as string}` } })).statusCode).toBe(200);
+    expect(await db.auditEvent.count({ where: { tenantId: account.tenantId, action: 'controlPlane.session.revoked', resourceId: account.userId } })).toBe(1);
+  });
+
   it('sets correctly scoped cookies, rotates refresh+CSRF tokens, and revokes them on logout', async () => {
     const account = await makeLoginUser();
     const login = await app.inject({

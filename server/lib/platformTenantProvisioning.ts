@@ -3,6 +3,7 @@ import { platformDb } from './platformDb';
 import { seedComplianceBaseline } from '../modules/compliance/baseline';
 import { recomputeEntitlements } from './entitlements';
 import type { Prisma, PrismaClient } from '../generated/prisma/client';
+import { validateIanaTimezone } from './scheduling';
 
 export interface PlatformProvisionInput {
   clinicName: string;
@@ -43,6 +44,7 @@ export async function platformProvisionTenant(
   const policy = validatePassword(input.ownerPassword);
   if (!policy.ok) throw new PlatformProvisionError('weak_password', policy.message ?? 'Password does not meet policy.');
   const ownerEmail = input.ownerEmail.trim().toLowerCase();
+  const timezone = validateIanaTimezone(input.timezone ?? 'America/New_York');
   const passwordHash = await generatePasswordHash(input.ownerPassword);
   let rows: ProvisionRow[];
   try {
@@ -54,7 +56,7 @@ export async function platformProvisionTenant(
         ${ownerEmail}::text,
         ${passwordHash}::text,
         ${input.defaultBranchName.trim()}::text,
-        ${input.timezone ?? 'America/New_York'}::text,
+        ${timezone}::text,
         ${input.planKey}::text,
         ${input.trialDays}::integer
       )

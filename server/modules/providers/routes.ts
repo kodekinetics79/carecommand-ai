@@ -1,17 +1,17 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { db } from '../../lib/db';
-import { audit } from '../../lib/audit';
 import { cursorPage, paginationSchema } from '../../lib/pagination';
 import { requirePermission } from '../../lib/permissions';
 import { assertBranchAccess, branchScope } from '../../lib/scope';
+import { runWithTenantContext } from '../../lib/tenantContext';
 
-// Provider (clinician) management. Reads are open to any authenticated user;
-// create/edit are gated on `schedule:manage` — the same permission the scheduling
-// module uses for all provider-scoped management (availability, time-off), so a
-// tenant that can manage a provider's schedule can also onboard/edit the provider
-// itself. Tenant isolation is application-level (findFirst by {id, tenantId}).
-const canManageProviders = requirePermission('schedule:manage');
+// Provider identities are workforce master data, distinct from maintaining a
+// clinician's calendar. Reading requires staff-directory access; onboarding and
+// reassignment require tenant administration so a clinician cannot create or
+// rewrite provider identities merely because they can maintain a schedule.
+const canReadProviders = requirePermission('staff:read');
+const canManageProviders = requirePermission('admin:manage');
 
 const providerQuery = paginationSchema.extend({
   branchId: z.string().uuid().optional(),
@@ -31,7 +31,7 @@ const providerUpdateInput = z.object({
 });
 
 export const providerRoutes: FastifyPluginAsync = async app => {
-  app.get('/overview', async request => {
+  app.get('/overview', { preHandler: canReadProviders }, async request => {
     const query = providerQuery.parse(request.query);
     const rows = await db.providerProfile.findMany({
       where: {
@@ -57,27 +57,38 @@ export const providerRoutes: FastifyPluginAsync = async app => {
     const input = providerCreateInput.parse(request.body);
     assertBranchAccess(request, input.branchId);
 
-    // Branch and user must both belong to this tenant (no cross-tenant FK / IDOR).
-    const branch = await db.branch.findFirst({ where: { id: input.branchId, tenantId: request.auth.tenantId }, select: { id: true } });
-    if (!branch) throw app.httpErrors.badRequest('Branch does not belong to this tenant');
-    const user = await db.user.findFirst({ where: { id: input.userId, tenantId: request.auth.tenantId }, select: { id: true } });
-    if (!user) throw app.httpErrors.badRequest('User does not belong to this tenant');
-
-    // A user has at most one provider profile (userId is unique); reject a dup up
-    // front rather than surfacing a raw unique-constraint error.
-    const existing = await db.providerProfile.findUnique({ where: { userId: input.userId }, select: { id: true } });
-    if (existing) throw app.httpErrors.conflict('This user already has a provider profile');
-
-    const provider = await db.providerProfile.create({
-      data: {
-        tenantId: request.auth.tenantId,
-        branchId: input.branchId,
-        userId: input.userId,
-        specialty: input.specialty,
-      },
+    const result = await runWithTenantContext(request.auth.tenantId, async tx => {
+      // Serialize by tenant/user so concurrent onboarding cannot leak a raw
+      // uniqueness error or create an unaudited provider identity.
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider:${request.auth.tenantId}:${input.userId}`}::text, 0))::text AS locked`;
+      const branch = await tx.branch.findFirst({ where: { id: input.branchId, tenantId: request.auth.tenantId, active: true }, select: { id: true } });
+      if (!branch) return { kind: 'invalid_branch' as const };
+      const user = await tx.user.findFirst({
+        where: { id: input.userId, tenantId: request.auth.tenantId, active: true },
+        select: { id: true, role: true, branchId: true, clinicAccesses: { where: { branchId: input.branchId }, select: { id: true } } },
+      });
+      if (!user) return { kind: 'invalid_user' as const };
+      if (user.role !== 'PROVIDER') return { kind: 'invalid_role' as const };
+      if (user.branchId !== input.branchId && user.clinicAccesses.length === 0) return { kind: 'invalid_access' as const };
+      const existing = await tx.providerProfile.findUnique({ where: { userId: input.userId }, select: { id: true } });
+      if (existing) return { kind: 'duplicate' as const };
+      const provider = await tx.providerProfile.create({
+        data: { tenantId: request.auth.tenantId, branchId: input.branchId, userId: input.userId, specialty: input.specialty },
+      });
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+        action: 'provider.created', resource: 'providerProfile', resourceId: provider.id,
+        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
+        metadata: { branchId: provider.branchId, userId: provider.userId },
+      } });
+      return { kind: 'created' as const, provider };
     });
-    await audit(request, { action: 'provider.created', resource: 'providerProfile', resourceId: provider.id, metadata: { branchId: provider.branchId, userId: provider.userId } });
-    return reply.code(201).send(provider);
+    if (result.kind === 'invalid_branch') throw app.httpErrors.badRequest('Branch does not belong to this tenant');
+    if (result.kind === 'invalid_user') throw app.httpErrors.badRequest('Active user does not belong to this tenant');
+    if (result.kind === 'invalid_role') throw app.httpErrors.badRequest('Only a user with the PROVIDER role can have a provider profile');
+    if (result.kind === 'invalid_access') throw app.httpErrors.badRequest('Provider user does not have access to the selected branch');
+    if (result.kind === 'duplicate') throw app.httpErrors.conflict('This user already has a provider profile');
+    return reply.code(201).send(result.provider);
   });
 
   // ----- Edit a clinician's profile (specialty / branch) ----------------------
@@ -92,18 +103,30 @@ export const providerRoutes: FastifyPluginAsync = async app => {
 
     if (input.branchId && input.branchId !== provider.branchId) {
       assertBranchAccess(request, input.branchId);
-      const branch = await db.branch.findFirst({ where: { id: input.branchId, tenantId: request.auth.tenantId }, select: { id: true } });
+      const branch = await db.branch.findFirst({ where: { id: input.branchId, tenantId: request.auth.tenantId, active: true }, select: { id: true } });
       if (!branch) throw app.httpErrors.badRequest('Branch does not belong to this tenant');
+      const userAccess = await db.user.findFirst({
+        where: { id: provider.userId, tenantId: request.auth.tenantId, active: true, role: 'PROVIDER' },
+        select: { branchId: true, clinicAccesses: { where: { branchId: input.branchId }, select: { id: true } } },
+      });
+      if (!userAccess || (userAccess.branchId !== input.branchId && userAccess.clinicAccesses.length === 0)) {
+        throw app.httpErrors.badRequest('Provider user does not have access to the selected branch');
+      }
     }
 
-    const updated = await db.providerProfile.update({
-      where: { id: provider.id },
-      data: {
-        branchId: input.branchId ?? undefined,
-        specialty: input.specialty ?? undefined,
-      },
+    const updated = await runWithTenantContext(request.auth.tenantId, async tx => {
+      const row = await tx.providerProfile.update({
+        where: { id: provider.id },
+        data: { branchId: input.branchId ?? undefined, specialty: input.specialty ?? undefined },
+      });
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+        action: 'provider.updated', resource: 'providerProfile', resourceId: provider.id,
+        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
+        metadata: { fromBranchId: provider.branchId, toBranchId: row.branchId, specialtyChanged: input.specialty !== undefined },
+      } });
+      return row;
     });
-    await audit(request, { action: 'provider.updated', resource: 'providerProfile', resourceId: provider.id });
     return updated;
   });
 };

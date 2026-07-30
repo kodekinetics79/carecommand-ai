@@ -37,7 +37,7 @@ async function makeTenant() {
     users[role] = u.id;
   }
   // A tenant user with no provider profile yet — the target for provider onboarding.
-  const clinician = await db.user.create({ data: { tenantId: id, role: 'PROVIDER', active: true, email: `clin-${id.slice(0, 8)}@onb.test`, displayName: 'Dr New' } });
+  const clinician = await db.user.create({ data: { tenantId: id, branchId: branch.id, role: 'PROVIDER', active: true, email: `clin-${id.slice(0, 8)}@onb.test`, displayName: 'Dr New' } });
   const patient = await db.patient.create({ data: { tenantId: id, branchId: branch.id, firstName: 'Seed', lastName: 'Patient', lifecycleStage: 'NEW' } });
   return { id, branchId: branch.id, users, clinicianUserId: clinician.id, patientId: patient.id };
 }
@@ -71,7 +71,7 @@ describe('providers — create + edit (onboarding blocker)', () => {
 
     const denied = await app.inject({ method: 'POST', url: '/v1/providers', headers: auth(tok(t.id, t.users.FRONT_DESK)), payload });
     expect(denied.statusCode).toBe(403);
-    expect(denied.json().permission).toBe('schedule:manage');
+    expect(denied.json().permission).toBe('admin:manage');
 
     const created = await app.inject({ method: 'POST', url: '/v1/providers', headers: auth(tok(t.id, t.users.ADMIN)), payload });
     expect(created.statusCode).toBe(201);
@@ -79,15 +79,27 @@ describe('providers — create + edit (onboarding blocker)', () => {
     expect(created.json().userId).toBe(t.clinicianUserId);
   });
 
-  it('rejects a duplicate profile for the same user (409) and a cross-tenant user (400)', async () => {
+  it('serializes duplicate onboarding (201/409 with one audit) and rejects a cross-tenant user (400)', async () => {
     const t = await makeTenant();
     const other = await makeTenant();
-    const first = await app.inject({ method: 'POST', url: '/v1/providers', headers: auth(tok(t.id, t.users.ADMIN)), payload: { userId: t.clinicianUserId, branchId: t.branchId, specialty: 'Derm' } });
-    expect(first.statusCode).toBe(201);
-    const dup = await app.inject({ method: 'POST', url: '/v1/providers', headers: auth(tok(t.id, t.users.ADMIN)), payload: { userId: t.clinicianUserId, branchId: t.branchId, specialty: 'Derm' } });
-    expect(dup.statusCode).toBe(409);
+    const responses = await Promise.all([1, 2].map(() => app.inject({ method: 'POST', url: '/v1/providers', headers: auth(tok(t.id, t.users.ADMIN)), payload: { userId: t.clinicianUserId, branchId: t.branchId, specialty: 'Derm' } })));
+    expect(responses.map(response => response.statusCode).sort()).toEqual([201, 409]);
+    expect(await db.providerProfile.count({ where: { tenantId: t.id, userId: t.clinicianUserId } })).toBe(1);
+    expect(await db.auditEvent.count({ where: { tenantId: t.id, action: 'provider.created' } })).toBe(1);
     const crossTenant = await app.inject({ method: 'POST', url: '/v1/providers', headers: auth(tok(t.id, t.users.ADMIN)), payload: { userId: other.clinicianUserId, branchId: t.branchId, specialty: 'Derm' } });
     expect(crossTenant.statusCode).toBe(400);
+  });
+
+  it('rejects a non-provider identity, inactive clinician, or clinician without selected-branch access', async () => {
+    const t = await makeTenant();
+    const secondBranch = await db.branch.create({ data: { tenantId: t.id, name: 'Second', location: 'Remote' } });
+    const nonProvider = await app.inject({ method: 'POST', url: '/v1/providers', headers: auth(tok(t.id, t.users.ADMIN)), payload: { userId: t.users.FRONT_DESK, branchId: t.branchId, specialty: 'Unsafe' } });
+    const wrongBranch = await app.inject({ method: 'POST', url: '/v1/providers', headers: auth(tok(t.id, t.users.ADMIN)), payload: { userId: t.clinicianUserId, branchId: secondBranch.id, specialty: 'Unsafe' } });
+    await db.user.update({ where: { id: t.clinicianUserId }, data: { active: false } });
+    const inactive = await app.inject({ method: 'POST', url: '/v1/providers', headers: auth(tok(t.id, t.users.ADMIN)), payload: { userId: t.clinicianUserId, branchId: t.branchId, specialty: 'Unsafe' } });
+    expect(nonProvider.statusCode).toBe(400);
+    expect(wrongBranch.statusCode).toBe(400);
+    expect(inactive.statusCode).toBe(400);
   });
 
   it('ADMIN edits a provider specialty (200)', async () => {
@@ -97,6 +109,22 @@ describe('providers — create + edit (onboarding blocker)', () => {
     const edited = await app.inject({ method: 'PATCH', url: `/v1/providers/${providerId}`, headers: auth(tok(t.id, t.users.ADMIN)), payload: { specialty: 'Neurology' } });
     expect(edited.statusCode).toBe(200);
     expect(edited.json().specialty).toBe('Neurology');
+  });
+});
+
+describe('staff tasks — permission and lifecycle safety', () => {
+  it('denies a role without staff:write and keeps terminal tasks final with one transition audit', async () => {
+    const t = await makeTenant();
+    const task = await db.staffTask.create({ data: { tenantId: t.id, branchId: t.branchId, title: 'Call patient', priority: 'HIGH' } });
+    const denied = await app.inject({ method: 'PATCH', url: `/v1/staff/tasks/${task.id}/status`, headers: auth(tok(t.id, t.users.AUDITOR)), payload: { status: 'COMPLETED' } });
+    expect(denied.statusCode).toBe(403);
+
+    const completed = await app.inject({ method: 'PATCH', url: `/v1/staff/tasks/${task.id}/status`, headers: auth(tok(t.id, t.users.ADMIN)), payload: { status: 'COMPLETED' } });
+    const reopened = await app.inject({ method: 'PATCH', url: `/v1/staff/tasks/${task.id}/status`, headers: auth(tok(t.id, t.users.ADMIN)), payload: { status: 'OPEN' } });
+    expect(completed.statusCode).toBe(200);
+    expect(reopened.statusCode).toBe(409);
+    expect((await db.staffTask.findUniqueOrThrow({ where: { id: task.id } })).status).toBe('COMPLETED');
+    expect(await db.auditEvent.count({ where: { tenantId: t.id, action: 'task.status.updated', resourceId: task.id } })).toBe(1);
   });
 });
 

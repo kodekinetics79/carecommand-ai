@@ -30,7 +30,7 @@ export const authPlugin = fp(async app => {
   app.decorateRequest('auth');
 
   app.decorate('authenticate', async (request: FastifyRequest) => {
-    const payload = await request.jwtVerify<FastifyRequest['auth'] & { type?: 'access' }>();
+    const payload = await request.jwtVerify<FastifyRequest['auth'] & { type?: 'access'; iat?: number; sessionIssuedAtMs?: number }>();
     if (payload.type && payload.type !== 'access') {
       throw app.httpErrors.unauthorized(authErrorMessage);
     }
@@ -58,14 +58,17 @@ export const authPlugin = fp(async app => {
       source: 'request' as const,
       requestId: request.id,
     };
-    // Platform "revoke all sessions": reject access tokens issued before the
-    // revocation instant (JWT iat is in seconds).
-    // JWT iat has second granularity, so compare at the same precision: reject
-    // only tokens issued strictly before the revocation second (a token minted
-    // in the same second as the revoke — e.g. an immediate re-login — survives).
+    // Platform "revoke all sessions": use the millisecond claim for newly
+    // issued sessions and retain second-precision compatibility for old tokens.
     const revokedAt = user.sessions_revoked_at;
-    const iat = (payload as { iat?: number }).iat;
-    if (revokedAt && iat && iat < Math.floor(revokedAt.getTime() / 1000)) {
+    const issuedAtMs = Number.isFinite(payload.sessionIssuedAtMs)
+      ? payload.sessionIssuedAtMs!
+      : Number.isFinite(payload.iat) ? payload.iat! * 1000 : 0;
+    if (revokedAt && (
+      payload.sessionIssuedAtMs
+        ? issuedAtMs <= revokedAt.getTime()
+        : payload.iat && payload.iat < Math.floor(revokedAt.getTime() / 1000)
+    )) {
       throw app.httpErrors.unauthorized('session_revoked');
     }
     request.auth = {
@@ -75,6 +78,28 @@ export const authPlugin = fp(async app => {
       branchId: user.branch_id ?? undefined,
     };
     enterTenantContext(context);
+    // A user-specific control-plane revocation must invalidate the short-lived
+    // access token too, not merely its refresh token. The append-only audit
+    // receipt is the durable revocation epoch and carries no PHI.
+    const [latestUserRevocation, activeBranch] = await Promise.all([
+      db.auditEvent.findFirst({
+        where: {
+          tenantId: user.tenant_id,
+          action: 'controlPlane.session.revoked',
+          resource: 'session',
+          resourceId: user.user_id,
+        },
+        orderBy: { occurredAt: 'desc' },
+        select: { occurredAt: true },
+      }),
+      user.branch_id
+        ? db.branch.findFirst({ where: { id: user.branch_id, tenantId: user.tenant_id, active: true }, select: { id: true } })
+        : Promise.resolve({ id: 'tenant-wide' }),
+    ]);
+    if (!activeBranch) throw app.httpErrors.forbidden('clinic_inactive');
+    if (latestUserRevocation && latestUserRevocation.occurredAt.getTime() >= issuedAtMs) {
+      throw app.httpErrors.unauthorized('session_revoked');
+    }
   });
 });
 
