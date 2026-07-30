@@ -19,6 +19,7 @@ const { fixtureDb: db } = await import('./helpers/fixtureDb');
 
 let app: FastifyInstance;
 const tenantIds: string[] = [];
+const phoneFor = (id: string) => `+1${(BigInt(`0x${id.replace(/-/g, '').slice(0, 14)}`) % 10_000_000_000n).toString().padStart(10, '0')}`;
 
 type Role = 'ADMIN' | 'MANAGER' | 'BILLING' | 'FRONT_DESK';
 
@@ -37,7 +38,7 @@ async function makeTenant() {
     users[role] = user.id;
   }
   const clinic = await db.receptionistClinic.create({
-    data: { tenantId: id, name: 'Least Privilege Clinic', phone: '+15550000001' },
+    data: { tenantId: id, name: 'Least Privilege Clinic', phone: phoneFor(id) },
   });
   const call = await db.receptionistCallLog.create({
     data: {

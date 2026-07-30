@@ -25,13 +25,14 @@ const { env } = await import('../config/env');
 let app: FastifyInstance;
 const tenantIds: string[] = [];
 const original = { NODE_ENV: env.NODE_ENV, RETELL_API_KEY: env.RETELL_API_KEY };
+const phoneFor = (id: string) => `+1${(BigInt(`0x${id.replace(/-/g, '').slice(0, 14)}`) % 10_000_000_000n).toString().padStart(10, '0')}`;
 
 async function makeTenant() {
   const id = randomUUID();
   tenantIds.push(id);
   await db.tenant.create({ data: { id, name: `sec-${id.slice(0, 6)}`, slug: `sec-${id.slice(0, 8)}` } });
   await db.branch.create({ data: { tenantId: id, name: 'Main', location: 'X' } });
-  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Clinic', phone: '+15550000000' }, select: { id: true } });
+  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Clinic', phone: phoneFor(id) }, select: { id: true } });
   return { id, clinicId: clinic.id };
 }
 

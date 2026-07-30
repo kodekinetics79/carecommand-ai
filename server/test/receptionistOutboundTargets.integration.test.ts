@@ -17,20 +17,18 @@ vi.mock('../workers/queues', () => ({
 const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
-const { recomputeEntitlements } = await import('../lib/entitlements');
 
 let app: FastifyInstance;
 const tenantIds: string[] = [];
+const phoneFor = (id: string) => `+1${(BigInt(`0x${id.replace(/-/g, '').slice(0, 14)}`) % 10_000_000_000n).toString().padStart(10, '0')}`;
 
 async function makeTenant() {
   const id = randomUUID();
   tenantIds.push(id);
   await db.tenant.create({ data: { id, name: `rcp-${id.slice(0, 6)}`, slug: `rcp-${id.slice(0, 8)}` } });
-  const plan = await db.subscriptionPlan.findUnique({ where: { key: 'enterprise' } });
-  await db.tenantSubscription.create({ data: { tenantId: id, planId: plan!.id, status: 'ACTIVE', startedAt: new Date() } });
-  await recomputeEntitlements(id, db);
+  await db.tenantFeatureEntitlement.create({ data: { tenantId: id, featureKey: 'ai_receptionist', enabled: true, source: 'test' } });
   const user = await db.user.create({ data: { tenantId: id, role: 'OWNER', active: true, email: `owner-${id.slice(0, 8)}@rcp.test`, displayName: 'Owner' } });
-  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Main clinic', phone: '+1 555 000 0000' } });
+  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Main clinic', phone: phoneFor(id) } });
   return { id, userId: user.id, clinicId: clinic.id };
 }
 

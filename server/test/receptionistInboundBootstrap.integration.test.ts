@@ -103,21 +103,13 @@ describe('Retell first-ever inbound trusted destination bootstrap', () => {
     expect(await db.operationalSignal.count({ where: { tenantId: attacker.id } })).toBe(0);
   });
 
-  it('fails closed for unknown or ambiguous active destinations', async () => {
-    const sharedPhone = randomE164();
-    await tenant(sharedPhone);
-    await tenant(sharedPhone);
+  it('fails closed for an unknown active destination', async () => {
     const unknownCall = `unknown-${randomUUID()}`;
-    const ambiguousCall = `ambiguous-${randomUUID()}`;
     const unknown = await signedInject('/v1/receptionist/webhooks/retell', {
       event: 'call_started', call: { call_id: unknownCall, direction: 'inbound', to_number: randomE164() },
     });
-    const ambiguous = await signedInject('/v1/receptionist/webhooks/retell', {
-      event: 'call_started', call: { call_id: ambiguousCall, direction: 'inbound', to_number: sharedPhone },
-    });
     expect(unknown.statusCode).toBe(202);
-    expect(ambiguous.statusCode).toBe(202);
-    expect(await db.receptionistCallLog.count({ where: { retellCallId: { in: [unknownCall, ambiguousCall] } } })).toBe(0);
+    expect(await db.receptionistCallLog.count({ where: { retellCallId: unknownCall } })).toBe(0);
   });
 
   it('bootstraps a tool-first inbound call once before invoking the live tool', async () => {

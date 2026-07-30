@@ -294,6 +294,7 @@ model Branch {
   userClinicAccesses             UserClinicAccess[]
   appointmentRequests            AppointmentRequest[]
   devices                        Device[]
+  receptionistLocations          ReceptionistLocation[]
 
   @@unique([tenantId, name])
   @@index([tenantId, active])
@@ -1416,6 +1417,9 @@ model ReceptionistClinic {
   tenantId             String                           @db.Uuid
   name                 String
   logoUrl              String?
+  // Stored in canonical E.164. A partial global unique index permits only one
+  // active trusted inbound destination (migration-managed; Prisma cannot
+  // represent partial unique indexes in this schema).
   phone                String
   website              String?
   addressLine          String?
@@ -1445,6 +1449,9 @@ model ReceptionistLocation {
   id           String             @id @default(uuid()) @db.Uuid
   tenantId     String             @db.Uuid
   clinicId     String             @db.Uuid
+  // Explicit core scheduling location. Legacy null mappings fail closed;
+  // new configuration requires an active tenant-owned Branch.
+  branchId     String?            @db.Uuid
   name         String
   address      String
   phone        String?
@@ -1455,8 +1462,10 @@ model ReceptionistLocation {
   updatedAt    DateTime           @updatedAt
   tenant       Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   clinic       ReceptionistClinic @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  branch       Branch?            @relation(fields: [branchId], references: [id], onDelete: Restrict)
 
   @@index([tenantId, clinicId, active])
+  @@index([tenantId, branchId, active])
 }
 
 model ReceptionistAgent {

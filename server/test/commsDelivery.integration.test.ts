@@ -25,6 +25,7 @@ const isDestinationOptedOut = (tenantId: string, ...args: Parameters<typeof isDe
   runWithJobTenantContext(tenantId, () => isDestinationOptedOutUnscoped(tenantId, ...args), 'worker:test-comms');
 
 const tenantIds: string[] = [];
+const phoneFor = (id: string) => `+1${(BigInt(`0x${id.replace(/-/g, '').slice(0, 14)}`) % 10_000_000_000n).toString().padStart(10, '0')}`;
 
 // ---- Local Twilio stub (real HTTP on an ephemeral port) --------------------
 let twilioStub: http.Server;
@@ -256,7 +257,7 @@ describe('cross-module: AI receptionist opt-out (ReceptionistOptOut, channel ALL
     const t = await makeTenant();
     const phone = '+15552220004';
     await db.receptionistOptOut.create({ data: { tenantId: t.id, contactPhone: phone, channel: 'ALL', reason: 'AI call' } });
-    const clinic = await db.receptionistClinic.create({ data: { tenantId: t.id, name: 'Main clinic', phone: '+15550000000' }, select: { id: true } });
+    const clinic = await db.receptionistClinic.create({ data: { tenantId: t.id, name: 'Main clinic', phone: phoneFor(t.id) }, select: { id: true } });
     const campaign = await db.receptionistOutboundCampaign.create({ data: { tenantId: t.id, clinicId: clinic.id, name: 'Outbound', script: 'Call the patient.', requiredFields: ['firstName', 'lastName', 'phone'] }, select: { id: true } });
     // outbound.ts adds targets with no suppression filter — the opted-out contact
     // lands in the call queue. This documents the gap (fix belongs in the

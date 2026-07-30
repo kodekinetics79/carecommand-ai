@@ -40,6 +40,10 @@ for (const statement of statements) {
     continue;
   }
 
+  // Prisma cannot represent a partial unique index. This migration-owned
+  // destination authority constraint is expected to appear as a drop in diff.
+  if (statement === 'DROP INDEX "ReceptionistClinic_active_phone_unique"') continue;
+
   unexpected.push(statement);
 }
 

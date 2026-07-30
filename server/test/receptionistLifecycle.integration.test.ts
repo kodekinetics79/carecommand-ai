@@ -22,23 +22,21 @@ vi.mock('../workers/queues', () => ({
 
 const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
-const { recomputeEntitlements } = await import('../lib/entitlements');
 const { env } = await import('../config/env');
 
 let app: FastifyInstance;
 const tenantIds: string[] = [];
 const RETELL_KEY = 'test-retell-lifecycle-signature-key';
 const originalRetellKey = env.RETELL_API_KEY;
+const phoneFor = (id: string) => `+1${(BigInt(`0x${id.replace(/-/g, '').slice(0, 14)}`) % 10_000_000_000n).toString().padStart(10, '0')}`;
 
 async function makeTenant() {
   const id = randomUUID();
   tenantIds.push(id);
   await db.tenant.create({ data: { id, name: `life-${id.slice(0, 6)}`, slug: `life-${id.slice(0, 8)}` } });
-  const plan = await db.subscriptionPlan.findUnique({ where: { key: 'enterprise' } });
-  await db.tenantSubscription.create({ data: { tenantId: id, planId: plan!.id, status: 'ACTIVE', startedAt: new Date() } });
-  await recomputeEntitlements(id, db);
+  await db.tenantFeatureEntitlement.create({ data: { tenantId: id, featureKey: 'ai_receptionist', enabled: true, source: 'test' } });
   const user = await db.user.create({ data: { tenantId: id, role: 'OWNER', active: true, email: `owner-${id.slice(0, 8)}@life.test`, displayName: 'Owner' } });
-  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Main clinic', phone: '+15550000000' }, select: { id: true } });
+  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Main clinic', phone: phoneFor(id) }, select: { id: true } });
   await db.receptionistAgent.create({ data: { tenantId: id, clinicId: clinic.id, name: 'Avery', active: true } });
   return { id, userId: user.id, clinicId: clinic.id };
 }

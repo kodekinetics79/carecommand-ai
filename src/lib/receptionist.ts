@@ -26,10 +26,23 @@ export interface BookingRules {
 export interface Location {
   id: string;
   clinicId: string;
+  branchId: string | null;
   name: string;
   address: string;
   phone: string | null;
   timezone: string | null;
+  workingHours: WeeklyHours | null;
+  active: boolean;
+}
+
+export type HoursWindow = { open: boolean; start?: string; end?: string };
+export type WeeklyHours = Partial<Record<'sunday' | 'monday' | 'tuesday' | 'wednesday' | 'thursday' | 'friday' | 'saturday', HoursWindow>>;
+
+export interface SchedulingBranch {
+  id: string;
+  name: string;
+  location: string;
+  timezone: string;
   active: boolean;
 }
 
@@ -57,7 +70,7 @@ export interface Clinic {
   complianceDisclosure: string;
   humanFallbackNumber: string | null;
   doNotContactPolicy: string;
-  workingHours: Record<string, string> | null;
+  workingHours: WeeklyHours | null;
   active: boolean;
   locations?: Location[];
   agents?: Agent[];
@@ -348,7 +361,9 @@ export const receptionistApi = {
   updateClinic: (id: string, body: Partial<Clinic>) => apiRequest<Clinic>(`${base}/clinics/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deleteClinic: (id: string) => apiRequest<void>(`${base}/clinics/${id}`, { method: 'DELETE' }),
 
-  createLocation: (body: Partial<Location> & { clinicId: string }) => apiRequest<Location>(`${base}/locations`, { method: 'POST', body: JSON.stringify(body) }),
+  listSchedulingBranches: () => apiRequest<SchedulingBranch[]>(`${base}/scheduling-branches`),
+
+  createLocation: (body: Partial<Location> & { clinicId: string; branchId: string }) => apiRequest<Location>(`${base}/locations`, { method: 'POST', body: JSON.stringify(body) }),
   updateLocation: (id: string, body: Partial<Location>) => apiRequest<Location>(`${base}/locations/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deleteLocation: (id: string) => apiRequest<void>(`${base}/locations/${id}`, { method: 'DELETE' }),
 
