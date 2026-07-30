@@ -11,7 +11,7 @@ import { createPaymentProvider, createInsuranceProvider, type PaymentRequestCont
 import { paymentProviderStatus } from '../../lib/deposits';
 import { eligibilityProviderStatus } from '../../lib/insuranceIntelligence';
 import { runWithTenantContext } from '../../lib/tenantContext';
-import type { Prisma } from '../../generated/prisma/client';
+import { Prisma } from '../../generated/prisma/client';
 import { lockClinicAccessMutation } from '../../lib/clinicAccessSafety';
 
 const ownerAdminRoles = requireRoles('OWNER', 'ADMIN');
@@ -663,8 +663,6 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
 
   app.post('/users', { preHandler: ownerAdminRoles }, async (request, reply) => {
     const body = userCreateBody.parse(request.body);
-    const existing = await db.user.findFirst({ where: { tenantId: request.auth.tenantId, email: body.email } });
-    if (existing) throw app.httpErrors.conflict('User email already exists');
     const policy = validatePassword(body.password);
     if (!policy.ok) throw app.httpErrors.badRequest(policy.message ?? 'Weak password');
 
@@ -673,49 +671,63 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
       throw app.httpErrors.badRequest('Primary branch must be included in selected branch access');
     }
     const passwordHash = await generatePasswordHash(body.password);
-    const result = await runWithTenantContext(request.auth.tenantId, async tx => {
-      await lockClinicAccessMutation(tx, request.auth.tenantId);
-      const validBranchRows = requestedBranchIds.length > 0
-        ? await tx.branch.findMany({ where: { tenantId: request.auth.tenantId, active: true, id: { in: requestedBranchIds } }, select: { id: true } })
-        : [];
-      let validBranchIds = validBranchRows.map(branch => branch.id);
-      if (validBranchIds.length !== requestedBranchIds.length) throw app.httpErrors.badRequest('Every selected branch must be active and belong to this tenant');
-      if (validBranchIds.length === 0) {
-        const fallbackBranch = await tx.branch.findFirst({ where: { tenantId: request.auth.tenantId, active: true }, orderBy: { name: 'asc' }, select: { id: true } });
-        if (fallbackBranch) validBranchIds = [fallbackBranch.id];
+    try {
+      const result = await runWithTenantContext(request.auth.tenantId, async tx => {
+        await lockClinicAccessMutation(tx, request.auth.tenantId);
+        const emailLockKey = `control-plane-user-email:${request.auth.tenantId}:${body.email}`;
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${emailLockKey}::text, 0))::text AS locked`;
+        const existing = await tx.user.findFirst({
+          where: { tenantId: request.auth.tenantId, email: { equals: body.email, mode: 'insensitive' } },
+          select: { id: true },
+        });
+        if (existing) throw app.httpErrors.conflict('User email already exists');
+        const validBranchRows = requestedBranchIds.length > 0
+          ? await tx.branch.findMany({ where: { tenantId: request.auth.tenantId, active: true, id: { in: requestedBranchIds } }, select: { id: true } })
+          : [];
+        let validBranchIds = validBranchRows.map(branch => branch.id);
+        if (validBranchIds.length !== requestedBranchIds.length) throw app.httpErrors.badRequest('Every selected branch must be active and belong to this tenant');
+        if (validBranchIds.length === 0) {
+          const fallbackBranch = await tx.branch.findFirst({ where: { tenantId: request.auth.tenantId, active: true }, orderBy: { name: 'asc' }, select: { id: true } });
+          if (fallbackBranch) validBranchIds = [fallbackBranch.id];
+        }
+        const primaryBranchId = body.primaryBranchId && validBranchIds.includes(body.primaryBranchId) ? body.primaryBranchId : validBranchIds[0] ?? null;
+        const user = await tx.user.create({ data: {
+          tenantId: request.auth.tenantId,
+          email: body.email,
+          displayName: body.name,
+          role: body.role,
+          passwordHash,
+          branchId: primaryBranchId,
+        } });
+        if (validBranchIds.length > 0) await replaceClinicAccess(tx, request.auth.tenantId, user.id, validBranchIds, primaryBranchId ?? undefined);
+        await tx.auditEvent.create({ data: {
+          tenantId: request.auth.tenantId,
+          actorUserId: request.auth.userId,
+          action: 'controlPlane.user.created',
+          resource: 'user',
+          resourceId: user.id,
+          requestId: request.id,
+          ipAddress: request.ip,
+          userAgent: request.headers['user-agent'],
+          metadata: { email: user.email, role: user.role, branchIds: validBranchIds },
+        } });
+        return { user, validBranchIds, primaryBranchId };
+      });
+      return reply.code(201).send({
+        id: result.user.id,
+        email: result.user.email,
+        name: result.user.displayName,
+        role: result.user.role,
+        status: result.user.active ? 'active' : 'inactive',
+        branchIds: result.validBranchIds,
+        primaryBranchId: result.primaryBranchId,
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw app.httpErrors.conflict('User email already exists');
       }
-      const primaryBranchId = body.primaryBranchId && validBranchIds.includes(body.primaryBranchId) ? body.primaryBranchId : validBranchIds[0] ?? null;
-      const user = await tx.user.create({ data: {
-        tenantId: request.auth.tenantId,
-        email: body.email,
-        displayName: body.name,
-        role: body.role,
-        passwordHash,
-        branchId: primaryBranchId,
-      } });
-      if (validBranchIds.length > 0) await replaceClinicAccess(tx, request.auth.tenantId, user.id, validBranchIds, primaryBranchId ?? undefined);
-      await tx.auditEvent.create({ data: {
-        tenantId: request.auth.tenantId,
-        actorUserId: request.auth.userId,
-        action: 'controlPlane.user.created',
-        resource: 'user',
-        resourceId: user.id,
-        requestId: request.id,
-        ipAddress: request.ip,
-        userAgent: request.headers['user-agent'],
-        metadata: { email: user.email, role: user.role, branchIds: validBranchIds },
-      } });
-      return { user, validBranchIds, primaryBranchId };
-    });
-    return reply.code(201).send({
-      id: result.user.id,
-      email: result.user.email,
-      name: result.user.displayName,
-      role: result.user.role,
-      status: result.user.active ? 'active' : 'inactive',
-      branchIds: result.validBranchIds,
-      primaryBranchId: result.primaryBranchId,
-    });
+      throw error;
+    }
   });
 
   app.patch('/users/:id/status', { preHandler: ownerAdminRoles }, async (request, reply) => {

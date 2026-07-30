@@ -4,6 +4,7 @@ import { seedComplianceBaseline } from '../modules/compliance/baseline';
 import { recomputeEntitlements } from './entitlements';
 import type { Prisma, PrismaClient } from '../generated/prisma/client';
 import { validateIanaTimezone } from './scheduling';
+import { lockTenantProvisioningIdentity } from './tenantProvisioningLocks';
 
 export interface PlatformProvisionInput {
   clinicName: string;
@@ -47,11 +48,9 @@ export async function platformProvisionTenant(
   const timezone = validateIanaTimezone(input.timezone ?? 'America/New_York');
   const passwordHash = await generatePasswordHash(input.ownerPassword);
   const provision = async (tx: PrismaClient | Prisma.TransactionClient) => {
-    // User email is not globally unique in the physical schema, while login
-    // resolution and onboarding require it to be. Serialize both provisioning
-    // entry points on the same canonical email key before the SQL function's
-    // global existence check.
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`tenant-owner-email:${ownerEmail}`}::text, 0))::text AS locked`;
+    // Both entry points use the same sorted canonical email + slug locks before
+    // their existence checks, so cross-path races have deterministic semantics.
+    await lockTenantProvisioningIdentity(tx, slug, ownerEmail);
     let rows: ProvisionRow[];
     try {
       rows = await tx.$queryRaw<ProvisionRow[]>`

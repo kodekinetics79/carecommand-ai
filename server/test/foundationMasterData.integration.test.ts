@@ -60,6 +60,27 @@ describe('foundation clinic and workforce master-data integrity', () => {
     expect(response.json().refreshCookie.sameSite).toBe(env.COOKIE_SAMESITE);
   });
 
+  it('serializes concurrent control-plane user creation by canonical tenant email', async () => {
+    const t = await fixture();
+    const email = `Race.User-${randomUUID().slice(0, 8)}@Example.Invalid`;
+    const payload = {
+      email,
+      name: 'Race User',
+      password: 'Race-User-Secure-9!',
+      role: 'FRONT_DESK',
+      branchIds: [t.branchA.id],
+      primaryBranchId: t.branchA.id,
+    };
+    const responses = await Promise.all([
+      app.inject({ method: 'POST', url: '/v1/control-plane/users', headers: bearer(t.tenantId, t.owner.id), payload }),
+      app.inject({ method: 'POST', url: '/v1/control-plane/users', headers: bearer(t.tenantId, t.owner.id), payload: { ...payload, email: email.toLowerCase() } }),
+    ]);
+    expect(responses.map(response => response.statusCode).sort()).toEqual([201, 409]);
+    const users = await db.user.findMany({ where: { tenantId: t.tenantId, email: email.toLowerCase() }, select: { id: true } });
+    expect(users).toHaveLength(1);
+    expect(await db.auditEvent.count({ where: { tenantId: t.tenantId, action: 'controlPlane.user.created', resourceId: users[0].id } })).toBe(1);
+  });
+
   it('serializes concurrent cross-deactivation so one active administrator always remains', async () => {
     const tenantId = randomUUID();
     tenantIds.push(tenantId);
@@ -269,6 +290,27 @@ describe('tenant provisioning atomicity', () => {
     expect(await db.tenant.findUnique({ where: { slug: mixedSlug } })).toBeNull();
   });
 
+  it('serializes concurrent same-slug provisioning and returns one typed slug conflict without a partial graph', async () => {
+    const plan = await db.subscriptionPlan.findFirstOrThrow({ where: { active: true }, select: { key: true } });
+    const seed = randomUUID().slice(0, 8);
+    const slug = `slug-race-${seed}`;
+    const outcomes = await Promise.allSettled([
+      provisionTenant(provisionInput(slug.toUpperCase(), `slug-a-${seed}@example.invalid`, plan.key), db),
+      provisionTenant(provisionInput(slug, `slug-b-${seed}@example.invalid`, plan.key), db),
+    ]);
+    const winner = outcomes.find(outcome => outcome.status === 'fulfilled');
+    expect(outcomes.filter(outcome => outcome.status === 'fulfilled')).toHaveLength(1);
+    expect(outcomes.filter(outcome => outcome.status === 'rejected')).toHaveLength(1);
+    expect(outcomes.some(outcome => outcome.status === 'rejected' && outcome.reason instanceof ProvisionError && outcome.reason.code === 'slug_taken')).toBe(true);
+    if (winner?.status !== 'fulfilled') throw new Error('Expected one successful provisioning result');
+    tenantIds.push(winner.value.tenant.id);
+    expect(await db.tenant.count({ where: { slug } })).toBe(1);
+    expect(await db.branch.count({ where: { tenantId: winner.value.tenant.id } })).toBe(1);
+    expect(await db.user.count({ where: { tenantId: winner.value.tenant.id, role: 'OWNER' } })).toBe(1);
+    expect(await db.tenantSubscription.count({ where: { tenantId: winner.value.tenant.id } })).toBe(1);
+    expect(await db.auditEvent.count({ where: { tenantId: winner.value.tenant.id, action: { in: ['tenant.created', 'tenant.owner.created'] } } })).toBe(2);
+  });
+
   it('rolls back a mid-provision failure completely and permits a clean retry', async () => {
     const plan = await db.subscriptionPlan.findFirstOrThrow({ where: { active: true }, select: { key: true } });
     const seed = randomUUID().slice(0, 8);
@@ -311,7 +353,7 @@ describe('tenant provisioning atomicity', () => {
         let draftTenants = committedTenants;
         const tx = {
           $queryRaw: async (_strings: TemplateStringsArray, ...values: unknown[]) => {
-            if (typeof values[0] === 'string' && values[0].startsWith('tenant-owner-email:')) {
+            if (typeof values[0] === 'string' && values[0].startsWith('tenant-')) {
               lockKeys.push(values[0]);
               return [];
             }
@@ -344,6 +386,9 @@ describe('tenant provisioning atomicity', () => {
     const retry = await platformProvisionTenant(input, fakeRoot);
     expect(retry.tenant.slug).toBe('platform-atomic');
     expect(committedTenants).toBe(1);
-    expect(lockKeys).toEqual(['tenant-owner-email:atomic@example.invalid', 'tenant-owner-email:atomic@example.invalid']);
+    expect(lockKeys).toEqual([
+      'tenant-owner-email:atomic@example.invalid', 'tenant-slug:platform-atomic',
+      'tenant-owner-email:atomic@example.invalid', 'tenant-slug:platform-atomic',
+    ]);
   });
 });
