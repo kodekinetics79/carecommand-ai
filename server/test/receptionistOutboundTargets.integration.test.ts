@@ -236,7 +236,9 @@ describe('AI receptionist outbound targets', () => {
         payload: { phone: mismatchTarget.phone, targetId: mismatchTarget.id },
       });
       expect(mismatch.statusCode).toBe(502);
-      expect(mismatch.json()).toMatchObject({ status: 'failed', error: 'retell_deployment_mismatch' });
+      expect(mismatch.json()).toMatchObject({ status: 'failed', error: 'retell_deployment_mismatch', reviewRecorded: true, signalRecorded: true });
+      expect(mismatch.json().reviewTaskId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(mismatch.json().signalId).toMatch(/^[0-9a-f-]{36}$/);
       expect(await db.receptionistCallLog.findFirst({ where: { tenantId: tenant.id, targetId: mismatchTarget.id } })).toMatchObject({
         retellCallId: 'call-provider-mismatch', outcome: 'FAILED',
       });
@@ -247,7 +249,114 @@ describe('AI receptionist outbound targets', () => {
         'https://retell.invalid/v2/stop-call/call-provider-mismatch',
         expect.objectContaining({ method: 'POST' }),
       );
+      expect(await db.receptionistAgent.findUniqueOrThrow({ where: { id: tenant.agentId } })).toMatchObject({
+        providerStatus: 'INVALID', providerLastErrorCode: 'provider_deployment_mismatch',
+      });
+      expect(await db.receptionistOutboundCampaign.findUniqueOrThrow({ where: { id: campaign.id } })).toMatchObject({ status: 'PAUSED' });
+      expect(await db.staffTask.findUnique({ where: { id: mismatch.json().reviewTaskId } })).toMatchObject({
+        priority: 'CRITICAL', status: 'OPEN', metadata: expect.objectContaining({ requiresAcknowledgement: true, providerStopApplied: true }),
+      });
+      expect(await db.operationalSignal.findUnique({ where: { id: mismatch.json().signalId } })).toMatchObject({
+        signalType: 'receptionist_provider_deployment_mismatch', severity: 'critical', status: 'open',
+      });
+      const createCallsAfterStopSuccess = providerFetch.mock.calls.filter(([url]) => String(url).includes('/v2/create-phone-call')).length;
+      const blockedAfterStopSuccess = await app.inject({
+        method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaign.id}/call`, headers, payload: { phone: '+15551010305' },
+      });
+      expect(blockedAfterStopSuccess.statusCode).toBe(409);
+      expect(providerFetch.mock.calls.filter(([url]) => String(url).includes('/v2/create-phone-call'))).toHaveLength(createCallsAfterStopSuccess);
+
+      const reverifiedAt = new Date();
+      await db.receptionistAgent.update({ where: { id: tenant.agentId }, data: {
+        providerStatus: 'VERIFIED', providerVerifiedRevision: 1, providerVerifiedAt: reverifiedAt,
+        providerVerificationExpiresAt: new Date(reverifiedAt.getTime() + 60 * 60 * 1_000),
+        providerLastAttemptAt: reverifiedAt, providerLastAttemptStatus: 'SUCCEEDED', providerLastErrorCode: null,
+      } });
+      await db.receptionistOutboundCampaign.update({ where: { id: campaign.id }, data: { status: 'RUNNING' } });
+      const stopFailureTarget = await db.receptionistCallTarget.create({ data: { tenantId: tenant.id, campaignId: campaign.id, phone: '+15551010306' } });
+      providerFetch.mockImplementation(async (url) => String(url).includes('/v2/create-phone-call')
+        ? new Response(JSON.stringify({ call_id: 'call-provider-mismatch-stop-failed', agent_id: 'agent_wrong', agent_version: 1 }), { status: 201 })
+        : new Response(null, { status: 503 }));
+      const stopFailure = await app.inject({
+        method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaign.id}/call`, headers,
+        payload: { phone: stopFailureTarget.phone, targetId: stopFailureTarget.id },
+      });
+      expect(stopFailure.statusCode).toBe(502);
+      expect(stopFailure.json()).toMatchObject({ status: 'failed', error: 'retell_deployment_mismatch' });
+      expect(await db.staffTask.findUnique({ where: { id: stopFailure.json().reviewTaskId } })).toMatchObject({
+        priority: 'CRITICAL', metadata: expect.objectContaining({ providerStopApplied: false, providerStopFailed: true }),
+      });
+      const createCallsAfterStopFailure = providerFetch.mock.calls.filter(([url]) => String(url).includes('/v2/create-phone-call')).length;
+      const blockedAfterStopFailure = await app.inject({
+        method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaign.id}/call`, headers, payload: { phone: '+15551010307' },
+      });
+      expect(blockedAfterStopFailure.statusCode).toBe(409);
+      expect(providerFetch.mock.calls.filter(([url]) => String(url).includes('/v2/create-phone-call'))).toHaveLength(createCallsAfterStopFailure);
     } finally {
+      env.RETELL_API_KEY = original.apiKey;
+      env.RETELL_FROM_NUMBER = original.from;
+      env.RETELL_BASE_URL = original.base;
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('keeps the deployment circuit fail-closed when review persistence is unavailable', async () => {
+    const tenant = await makeTenant();
+    const headers = auth(tenant, tenant.userId);
+    const campaign = await db.receptionistOutboundCampaign.create({
+      data: { tenantId: tenant.id, clinicId: tenant.clinicId, agentId: tenant.agentId, name: 'Review outage circuit', script: 'Call the patient.', requiredFields: ['phone'], status: 'RUNNING' },
+    });
+    await db.$executeRawUnsafe(`
+      CREATE OR REPLACE FUNCTION receptionist_review_persistence_failure() RETURNS trigger AS $$
+      BEGIN
+        IF NEW."tenantId" = '${tenant.id}'::uuid THEN
+          RAISE EXCEPTION 'injected review persistence failure';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      CREATE TRIGGER receptionist_review_persistence_failure_trigger
+      BEFORE INSERT ON "StaffTask"
+      FOR EACH ROW EXECUTE FUNCTION receptionist_review_persistence_failure();
+    `);
+    const original = { apiKey: env.RETELL_API_KEY, from: env.RETELL_FROM_NUMBER, base: env.RETELL_BASE_URL };
+    try {
+      env.RETELL_API_KEY = 'real_provider_key';
+      env.RETELL_FROM_NUMBER = '+15550000001';
+      env.RETELL_BASE_URL = 'https://retell.invalid';
+      const providerFetch = vi.fn<typeof fetch>(async url => String(url).includes('/v2/create-phone-call')
+        ? new Response(JSON.stringify({ call_id: 'call-review-outage', agent_id: 'agent_wrong', agent_version: 1 }), { status: 201 })
+        : new Response(null, { status: 204 }));
+      vi.stubGlobal('fetch', providerFetch);
+
+      const mismatch = await app.inject({
+        method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaign.id}/call`, headers, payload: { phone: '+15551010801' },
+      });
+      expect(mismatch.statusCode).toBe(502);
+      expect(mismatch.json()).toMatchObject({
+        status: 'failed', error: 'retell_deployment_mismatch', reviewTaskId: null, reviewRecorded: false, signalRecorded: true,
+      });
+      expect(mismatch.json().signalId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(await db.receptionistAgent.findUniqueOrThrow({ where: { id: tenant.agentId } })).toMatchObject({
+        providerStatus: 'INVALID', providerLastErrorCode: 'provider_deployment_mismatch',
+      });
+      expect(await db.receptionistOutboundCampaign.findUniqueOrThrow({ where: { id: campaign.id } })).toMatchObject({ status: 'PAUSED' });
+      expect(await db.receptionistCallLog.findFirst({ where: { tenantId: tenant.id, retellCallId: 'call-review-outage' } })).toMatchObject({ outcome: 'FAILED' });
+      expect(await db.staffTask.count({ where: { tenantId: tenant.id } })).toBe(0);
+      const visibleSignals = await app.inject({ method: 'GET', url: '/v1/signals?status=open', headers });
+      expect(visibleSignals.statusCode).toBe(200);
+      expect(visibleSignals.json()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: mismatch.json().signalId, signalType: 'receptionist_provider_deployment_mismatch', severity: 'critical' }),
+      ]));
+
+      const providerCreateCount = providerFetch.mock.calls.filter(([url]) => String(url).includes('/v2/create-phone-call')).length;
+      const blocked = await app.inject({
+        method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaign.id}/call`, headers, payload: { phone: '+15551010802' },
+      });
+      expect(blocked.statusCode).toBe(409);
+      expect(providerFetch.mock.calls.filter(([url]) => String(url).includes('/v2/create-phone-call'))).toHaveLength(providerCreateCount);
+    } finally {
+      await db.$executeRawUnsafe('DROP TRIGGER IF EXISTS receptionist_review_persistence_failure_trigger ON "StaffTask"; DROP FUNCTION IF EXISTS receptionist_review_persistence_failure();');
       env.RETELL_API_KEY = original.apiKey;
       env.RETELL_FROM_NUMBER = original.from;
       env.RETELL_BASE_URL = original.base;

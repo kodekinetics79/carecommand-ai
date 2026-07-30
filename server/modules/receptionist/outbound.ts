@@ -591,7 +591,10 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     });
 
     if (!result.ok) {
-      await runWithTenantContext(request.auth.tenantId, async tx => {
+      // Safety state is committed independently from review/audit plumbing.
+      // A broken task/signal/audit dependency must never roll a mismatched
+      // deployment back to VERIFIED or make its campaigns runnable again.
+      const safetyState = await runWithTenantContext(request.auth.tenantId, async tx => {
         await tx.receptionistCallLog.update({
           where: { id: callLog.id },
           data: { outcome: 'FAILED', endedAt: new Date(), ...(result.callId ? { retellCallId: result.callId } : {}) },
@@ -602,21 +605,136 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
             data: { status: targetStatusAfterOutcome('FAILED', (target?.attempts ?? 0) + 1, campaign.maxRetryAttempts) ?? 'FAILED', lastOutcome: 'FAILED', lastCallLogId: callLog.id },
           });
         }
-        await auditOutboundMutation(tx, request, {
-          action: result.error === 'retell_deployment_mismatch'
-            ? 'receptionist.call.providerDeploymentMismatch'
-            : 'receptionist.call.failed',
-          resource: 'receptionistCallLog',
-          resourceId: callLog.id,
+        if (result.error === 'retell_deployment_mismatch') {
+          const trippedAt = new Date();
+          const agentId = currentCampaign!.agent!.id;
+          await tx.receptionistAgent.updateMany({
+            where: { id: agentId, tenantId: request.auth.tenantId },
+            data: {
+              providerStatus: 'INVALID',
+              providerVerifiedRevision: null,
+              providerVerifiedAt: null,
+              providerVerificationExpiresAt: null,
+              providerLastAttemptAt: trippedAt,
+              providerLastAttemptStatus: 'FAILED',
+              providerLastErrorCode: 'provider_deployment_mismatch',
+            },
+          });
+          const [pausedOutbound, pausedStudio] = await Promise.all([
+            tx.receptionistOutboundCampaign.updateMany({
+              where: { tenantId: request.auth.tenantId, agentId, status: { in: ['SCHEDULED', 'RUNNING'] } },
+              data: { status: 'PAUSED' },
+            }),
+            tx.receptionistCampaign.updateMany({
+              where: { tenantId: request.auth.tenantId, agentId, status: 'ACTIVE' },
+              data: { status: 'PAUSED' },
+            }),
+          ]);
+          // This is the durable, staff-consumed review primitive exposed by
+          // GET /v1/signals. It is part of the fail-closed safety transaction,
+          // so a later task/audit outage cannot erase the review requirement.
+          const signal = await tx.operationalSignal.create({
+            data: {
+              tenantId: request.auth.tenantId,
+              signalType: 'receptionist_provider_deployment_mismatch',
+              entityType: 'receptionistCallLog',
+              entityId: callLog.id,
+              severity: 'critical',
+              score: 100,
+              reason: 'Provider started a call with an agent deployment different from the verified immutable binding; campaigns were paused for staff review.',
+            },
+          });
+          return { agentId, signalId: signal.id, pausedOutboundCampaigns: pausedOutbound.count, pausedStudioCampaigns: pausedStudio.count };
+        }
+        return { agentId: null, signalId: null, pausedOutboundCampaigns: 0, pausedStudioCampaigns: 0 };
+      });
+
+      let reviewTaskId: string | null = null;
+      let reviewRecorded = false;
+      const signalRecorded = safetyState.signalId !== null;
+      if (result.error === 'retell_deployment_mismatch' && safetyState.agentId) {
+        const taskData = (degraded: boolean) => ({
+          tenantId: request.auth.tenantId,
+          branchId: campaign.defaultBranchId,
+          title: 'Critical: review AI receptionist provider deployment mismatch',
+          priority: 'CRITICAL',
           metadata: {
-            error: result.error,
-            operationalReviewRequired: result.error === 'retell_deployment_mismatch',
-            providerStopApplied: result.providerStopApplied ?? null,
-            providerStopError: result.providerStopError ?? null,
+            workflow: 'receptionist_provider_deployment_review',
+            requiresAcknowledgement: true,
+            agentId: safetyState.agentId,
+            campaignId: campaign.id,
+            callLogId: callLog.id,
+            providerStopApplied: result.providerStopApplied ?? false,
+            providerStopFailed: Boolean(result.providerStopError),
+            reviewPersistenceDegraded: degraded,
+            signalPersistencePending: degraded,
           },
         });
+        try {
+          reviewTaskId = await runWithTenantContext(request.auth.tenantId, async tx => {
+            const task = await tx.staffTask.create({ data: taskData(false) });
+            await auditOutboundMutation(tx, request, {
+              action: 'receptionist.agentDeploymentSafetyCircuitTripped',
+              resource: 'staffTask',
+              resourceId: task.id,
+              metadata: {
+                agentId: safetyState.agentId,
+                callLogId: callLog.id,
+                pausedOutboundCampaigns: safetyState.pausedOutboundCampaigns,
+                pausedStudioCampaigns: safetyState.pausedStudioCampaigns,
+                providerStopApplied: result.providerStopApplied ?? false,
+                providerStopError: result.providerStopError ?? null,
+              },
+            });
+            await auditOutboundMutation(tx, request, {
+              action: 'receptionist.call.providerDeploymentMismatch',
+              resource: 'receptionistCallLog',
+              resourceId: callLog.id,
+              metadata: {
+                error: result.error,
+                operationalReviewRequired: true,
+                providerStopApplied: result.providerStopApplied ?? false,
+                providerStopError: result.providerStopError ?? null,
+              },
+            });
+            return task.id;
+          });
+          reviewRecorded = true;
+        } catch {
+          // Best-effort degraded task: if signal/audit persistence is the
+          // failing dependency, staff still receives a truthful review item.
+          // If task persistence itself is down, durable INVALID/PAUSED state
+          // and providerLastErrorCode remain the fail-closed retry evidence.
+          try {
+            const fallback = await runWithTenantContext(request.auth.tenantId, tx => tx.staffTask.create({ data: taskData(true) }));
+            reviewTaskId = fallback.id;
+            reviewRecorded = true;
+          } catch {
+            reviewTaskId = null;
+          }
+        }
+      } else {
+        try {
+          await runWithTenantContext(request.auth.tenantId, tx => auditOutboundMutation(tx, request, {
+            action: 'receptionist.call.failed',
+            resource: 'receptionistCallLog',
+            resourceId: callLog.id,
+            metadata: { error: result.error },
+          }));
+        } catch {
+          // The FAILED call state is already durable and must not be rolled back
+          // because the secondary audit dependency is unavailable.
+        }
+      }
+      return reply.code(502).send({
+        status: 'failed',
+        error: result.error,
+        callLogId: callLog.id,
+        reviewTaskId,
+        reviewRecorded,
+        signalRecorded,
+        signalId: safetyState.signalId,
       });
-      return reply.code(502).send({ status: 'failed', error: result.error, callLogId: callLog.id });
     }
 
     await db.receptionistCallLog.update({ where: { id: callLog.id }, data: { retellCallId: result.callId } });

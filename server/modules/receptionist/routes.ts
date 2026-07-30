@@ -648,7 +648,26 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
             tx.receptionistOutboundCampaign.findFirst({ where: { tenantId: request.auth.tenantId, agentId: id, status: { in: ['SCHEDULED', 'RUNNING'] } }, select: { id: true } }),
           ]);
           if (studioReference || outboundReference) {
-            throw app.httpErrors.conflict('Provider deployment drift detected. Pause active and runnable campaigns before approving the new immutable version.');
+            const row = await tx.receptionistAgent.update({
+              where: { id },
+              data: {
+                providerLastAttemptAt: attemptedAt,
+                providerLastAttemptStatus: 'FAILED',
+                providerLastErrorCode: 'provider_deployment_drift',
+              },
+            });
+            await auditReceptionistMutation(tx, request, {
+              action: 'receptionistAgent.providerDeploymentDriftDetected',
+              resource: 'receptionistAgent',
+              resourceId: id,
+              metadata: {
+                pinnedVersion: current.providerVersion,
+                detectedVersion: probe.snapshot.version,
+                studioCampaignActive: Boolean(studioReference),
+                outboundCampaignRunnable: Boolean(outboundReference),
+              },
+            });
+            return { row, driftBlocked: true };
           }
         }
         const data: Prisma.ReceptionistAgentUpdateInput = {
@@ -682,10 +701,17 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
             reason: safeError,
           },
         });
-        return row;
+        return { row, driftBlocked: false };
       });
-      if (!probe.ok && !permanentProbeFailure) return reply.code(503).send(updated);
-      return reply.code(200).send(updated);
+      if (updated.driftBlocked) {
+        return reply.code(409).send({
+          ...updated.row,
+          code: 'provider_deployment_drift',
+          message: 'Provider deployment drift detected. Pause active and runnable campaigns before approving the new immutable version.',
+        });
+      }
+      if (!probe.ok && !permanentProbeFailure) return reply.code(503).send(updated.row);
+      return reply.code(200).send(updated.row);
     } catch (error) {
       if (isReceptionistDestinationConflict(error)) throw app.httpErrors.conflict('This active provider deployment is already assigned to another agent.');
       throw error;

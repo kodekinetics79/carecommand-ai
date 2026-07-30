@@ -337,7 +337,15 @@ describe('AI receptionist trusted configuration', () => {
       const driftBlocked = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agentId}/verify-provider`, headers: auth(owner, 'OWNER') });
       expect(driftBlocked.statusCode).toBe(409);
       expect(driftBlocked.json().message).toContain('drift');
-      expect((await db.receptionistAgent.findUniqueOrThrow({ where: { id: agentId } })).providerVersion).toBe(17);
+      expect(await db.receptionistAgent.findUniqueOrThrow({ where: { id: agentId } })).toMatchObject({
+        providerVersion: 17,
+        providerStatus: 'VERIFIED',
+        providerLastAttemptStatus: 'FAILED',
+        providerLastErrorCode: 'provider_deployment_drift',
+      });
+      expect(await db.auditEvent.count({
+        where: { tenantId: owner.id, resourceId: agentId, action: 'receptionistAgent.providerDeploymentDriftDetected' },
+      })).toBe(1);
 
       const paused = await app.inject({
         method: 'PATCH', url: `/v1/receptionist/campaigns/${activeCampaign.json().id}`, headers: auth(owner, 'OWNER'), payload: { status: 'PAUSED' },
