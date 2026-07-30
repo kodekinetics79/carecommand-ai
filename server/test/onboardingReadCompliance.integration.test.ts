@@ -19,7 +19,7 @@ vi.mock('../workers/queues', () => ({
 }));
 
 const { buildApp } = await import('../app');
-const { db } = await import('../lib/db');
+const { fixtureDb: db } = await import('./helpers/fixtureDb');
 
 let app: FastifyInstance;
 const createdTenantIds: string[] = [];
@@ -54,7 +54,7 @@ async function makeAppointment(t: { id: string; branchId: string; patientId: str
   return appt.id;
 }
 
-const tok = (tenantId: string, userId: string) => app.jwt.sign({ userId, tenantId, type: 'access' });
+const tok = (tenantId: string, userId: string) => app.jwt.sign({ userId, tenantId, role: 'OWNER', type: 'access' });
 const auth = (t: string) => ({ authorization: `Bearer ${t}`, 'x-forwarded-for': '203.0.113.11' });
 
 beforeAll(async () => { app = await buildApp(); }, 60_000);

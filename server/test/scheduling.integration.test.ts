@@ -18,7 +18,7 @@ vi.mock('../workers/queues', () => ({
 }));
 
 const { buildApp } = await import('../app');
-const { db } = await import('../lib/db');
+const { fixtureDb: db } = await import('./helpers/fixtureDb');
 
 let app: FastifyInstance;
 const createdTenantIds: string[] = [];
@@ -37,7 +37,7 @@ async function makeTenant() {
   const id = randomUUID();
   await db.tenant.create({ data: { id, name: `sch-${id.slice(0, 6)}`, slug: `sch-${id.slice(0, 8)}` } });
   createdTenantIds.push(id);
-  const branch = await db.branch.create({ data: { tenantId: id, name: 'b', location: 'x' } });
+  const branch = await db.branch.create({ data: { tenantId: id, name: 'b', location: 'x', timezone: 'UTC' } });
   const provUser = await db.user.create({ data: { tenantId: id, role: 'PROVIDER', active: true, email: `pv-${id.slice(0, 8)}@sch.test`, displayName: 'Dr' } });
   const provider = await db.providerProfile.create({ data: { tenantId: id, branchId: branch.id, userId: provUser.id, specialty: 'Primary Care' } });
   const patient = await db.patient.create({ data: { tenantId: id, branchId: branch.id, firstName: 'Pat', lastName: 'Roe', lifecycleStage: 'ACTIVE' } });
@@ -46,7 +46,7 @@ async function makeTenant() {
   return { id, branchId: branch.id, providerId: provider.id, patientId: patient.id, adminId: admin.id, analystId: analyst.id };
 }
 
-const tok = (tenantId: string, userId: string) => app.jwt.sign({ userId, tenantId, type: 'access' });
+const tok = (tenantId: string, userId: string) => app.jwt.sign({ userId, tenantId, role: 'OWNER', type: 'access' });
 const hdr = (t: { id: string }, userId: string) => ({ authorization: `Bearer ${tok(t.id, userId)}` });
 
 // Mon 09:00–12:00, 30-min slots

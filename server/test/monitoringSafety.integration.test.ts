@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { describe, it, expect, afterAll } from 'vitest';
 import { randomUUID } from 'node:crypto';
-import { db } from '../lib/db';
+import { fixtureDb as db } from './helpers/fixtureDb';
 import { detectMissedReadings, detectOfflineDevices } from '../lib/connectedCare/safetyDetection';
 
 // Proves the proactive RPM safety net actually DETECTS at runtime (missed
@@ -59,6 +59,20 @@ describe('missed-reading detection (P0 safety)', () => {
     expect(r.created).toBe(0);
     expect(await db.readingAlert.count({ where: { tenantId: t.id, alertType: 'missed_reading' } })).toBe(0);
   });
+
+  it('collapses concurrent detector runs and queues an accountable notification', async () => {
+    const now = new Date('2026-07-21T12:00:00.000Z');
+    const t = await makeTenant();
+    const owner = await db.user.create({ data: { tenantId: t.id, branchId: t.branchId, email: `owner-${t.id}@test.invalid`, passwordHash: 'test', displayName: 'Safety Owner', role: 'OWNER' } });
+    await db.monitoringRule.create({ data: { tenantId: t.id, scope: 'organization', readingType: 'glucose', missedAfterHours: 24, active: true } });
+    await db.patientDeviceEnrollment.create({ data: { tenantId: t.id, patientId: t.patientId, branchId: t.branchId, providerKey: 'manual', status: 'active', enrolledAt: new Date(now.getTime() - 48 * HOURS) } });
+
+    await Promise.all([detectMissedReadings(t.id, now), detectMissedReadings(t.id, now)]);
+    const alerts = await db.readingAlert.findMany({ where: { tenantId: t.id, patientId: t.patientId, alertType: 'missed_reading', status: { in: ['open', 'acknowledged', 'assigned'] } } });
+    expect(alerts).toHaveLength(1);
+    const notification = await db.notificationEvent.findFirstOrThrow({ where: { tenantId: t.id, alertId: alerts[0].id } });
+    expect(notification).toMatchObject({ recipientUserId: owner.id, status: 'queued', attempts: 0, sentAt: null });
+  });
 });
 
 describe('device-offline detection (P0 safety)', () => {
@@ -80,5 +94,22 @@ describe('device-offline detection (P0 safety)', () => {
     expect(second.flipped).toBe(0);
     expect(second.created).toBe(0);
     expect(await db.readingAlert.count({ where: { tenantId: t.id, deviceId: stale.id, alertType: 'device_offline' } })).toBe(1);
+  });
+
+  it('rolls back the status flip when a required alert write fails', async () => {
+    const now = new Date('2026-07-21T12:00:00.000Z');
+    const t = await makeTenant();
+    const stale = await db.device.create({ data: { tenantId: t.id, branchId: t.branchId, name: 'Atomic Monitor', deviceType: 'vitals_monitor', status: 'online', active: true, lastSeenAt: new Date(now.getTime() - 48 * HOURS) } });
+    const functionName = `reject_alert_${t.id.replaceAll('-', '_')}`;
+    await db.$executeRawUnsafe(`CREATE FUNCTION ${functionName}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW."tenantId" = '${t.id}'::uuid THEN RAISE EXCEPTION 'forced alert failure'; END IF; RETURN NEW; END $$`);
+    await db.$executeRawUnsafe(`CREATE TRIGGER ${functionName} BEFORE INSERT ON "ReadingAlert" FOR EACH ROW EXECUTE FUNCTION ${functionName}()`);
+    try {
+      await expect(detectOfflineDevices(t.id, 24, now)).rejects.toThrow('forced alert failure');
+      expect((await db.device.findUniqueOrThrow({ where: { id: stale.id } })).status).toBe('online');
+      expect(await db.deviceEvent.count({ where: { tenantId: t.id, deviceId: stale.id } })).toBe(0);
+    } finally {
+      await db.$executeRawUnsafe(`DROP TRIGGER IF EXISTS ${functionName} ON "ReadingAlert"`);
+      await db.$executeRawUnsafe(`DROP FUNCTION IF EXISTS ${functionName}()`);
+    }
   });
 });

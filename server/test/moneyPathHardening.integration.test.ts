@@ -28,7 +28,7 @@ vi.mock('../workers/queues', () => ({
 }));
 
 const { buildApp } = await import('../app');
-const { db } = await import('../lib/db');
+const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { recomputeEntitlements } = await import('../lib/entitlements');
 const { runWithTenantContext } = await import('../lib/tenantContext');
 const { roundMoney, toMinorUnits, StediEligibilityProvider } = await import('../modules/revenue-protection');
@@ -49,14 +49,14 @@ async function makeTenant() {
   createdTenantIds.push(id);
   const plan = await db.subscriptionPlan.findUnique({ where: { key: 'enterprise' } });
   await db.tenantSubscription.create({ data: { tenantId: id, planId: plan!.id, status: 'ACTIVE', startedAt: new Date() } });
-  await recomputeEntitlements(id);
+  await recomputeEntitlements(id, db);
   const branch = await db.branch.create({ data: { tenantId: id, name: 'b', location: 'x' } });
   const owner = await db.user.create({ data: { tenantId: id, role: 'OWNER', active: true, email: `own-${id.slice(0, 8)}@mph.test`, displayName: 'Owner' } });
   const frontDesk = await db.user.create({ data: { tenantId: id, role: 'FRONT_DESK', active: true, email: `fd-${id.slice(0, 8)}@mph.test`, displayName: 'Front Desk' } });
   return { id, branchId: branch.id, ownerId: owner.id, frontDeskId: frontDesk.id };
 }
 
-const auth = (t: { id: string }, userId: string) => ({ authorization: `Bearer ${app.jwt.sign({ userId, tenantId: t.id, type: 'access' })}` });
+const auth = (t: { id: string }, userId: string) => ({ authorization: `Bearer ${app.jwt.sign({ userId, tenantId: t.id, role: 'OWNER', type: 'access' })}` });
 const jsonAuth = (t: { id: string }, userId: string) => ({ ...auth(t, userId), 'content-type': 'application/json' });
 const webhook = (body: string) =>
   app.inject({ method: 'POST', url: '/v1/revenue-protection/webhooks/stripe', headers: { 'content-type': 'application/json', 'stripe-signature': stripeSignature(body) }, payload: body });
@@ -242,7 +242,11 @@ describe('#5 refund and dispute webhooks reconcile correctly', () => {
     const disputeBody = JSON.stringify({ id: `evt_${randomUUID()}`, type: 'charge.dispute.created', data: { object: { id: pr.providerReference, amount: 8000 } } });
     expect((await webhook(disputeBody)).statusCode).toBe(200);
 
-    const alert = await runWithTenantContext(t.id, tx => tx.revenueProtectionAlert.findFirst({ where: { tenantId: t.id, sourceType: 'payment_dispute' } }));
+    const alert = await runWithTenantContext(
+      t.id,
+      tx => tx.revenueProtectionAlert.findFirst({ where: { tenantId: t.id, sourceType: 'payment_dispute' } }),
+      { id: t.ownerId, role: 'OWNER' },
+    );
     expect(alert).not.toBeNull();
     expect(alert?.severity).toBe('high');
     const audit = await db.auditEvent.findFirst({ where: { tenantId: t.id, action: 'payment.dispute.created', resourceId: pr.id } });

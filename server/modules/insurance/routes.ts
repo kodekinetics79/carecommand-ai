@@ -1,17 +1,19 @@
 import type { FastifyPluginAsync } from 'fastify';
+import { Prisma } from '../../generated/prisma/client';
 import { z } from 'zod';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { requireRoles } from '../../plugins/roles';
 import { requireFeature } from '../../lib/entitlements';
 import { assertBranchAccess, branchScope } from '../../lib/scope';
-import { eligibilityProviderStatus, computeDenialRisk, runDenialPreventionForAppointment } from '../../lib/insuranceIntelligence';
+import { computeDenialRisk, runDenialPreventionForAppointment } from '../../lib/insuranceIntelligence';
 import { emitBusinessEvent } from '../../lib/intelligence';
 import { encryptSecret } from '../../lib/security';
 import { INSURANCE_PROVIDERS, maskMemberId } from '../../lib/connectedCare/catalog';
 import { runStediEligibility, type NormalizedEligibility } from '../../lib/connectedCare/eligibilityService';
 import { env } from '../../config/env';
 import { createInsuranceProvider } from '../revenue-protection';
+import { requirePermission } from '../../lib/permissions';
 
 function insStatus(def: { supportsSandbox: boolean }, mode: string, hasRequired: boolean): string {
   if (mode === 'sandbox' && def.supportsSandbox) return 'SANDBOX';
@@ -19,27 +21,54 @@ function insStatus(def: { supportsSandbox: boolean }, mode: string, hasRequired:
   return 'NOT_CONFIGURED';
 }
 
+function providerRuntimeCapability(providerKey: string, mode: string) {
+  if (providerKey !== 'stedi') return { enabled: false, simulated: false, reason: 'Adapter is not implemented' };
+  if (mode === 'sandbox') return { enabled: true, simulated: true, reason: null };
+  const enabled = env.INSURANCE_PROVIDER === 'stedi' && Boolean(env.STEDI_API_KEY) && !env.STEDI_TEST_MODE;
+  return { enabled, simulated: false, reason: enabled ? null : 'Live Stedi adapter credentials and live mode are not enabled on this deployment' };
+}
+
+function isPolicyRangeConflict(error: unknown): boolean {
+  if (error instanceof Prisma.PrismaClientKnownRequestError && (error.code === 'P2004' || error.code === 'P2034')) return true;
+  return error instanceof Error && error.message.includes('PatientInsurancePolicy_active_order_range_excl');
+}
+
 const uuid = z.string().uuid();
 const adminRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
 const deskRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'FRONT_DESK');
+const insuranceRead = requirePermission('billing:read');
 
 export const insuranceRoutes: FastifyPluginAsync = async app => {
   // Entire insurance surface requires the insurance_eligibility entitlement.
   app.addHook('preHandler', requireFeature('insurance_eligibility'));
 
   // Eligibility provider configuration status (no secrets exposed).
-  app.get('/provider-status', async () => {
-    const s = eligibilityProviderStatus();
-    return { provider: s.provider, configured: s.configured, mock: s.mock, setupRequired: s.setupRequired, missing: s.missing };
+  app.get('/provider-status', async request => {
+    const selected = await db.insuranceProvider.findFirst({
+      where: { tenantId: request.auth.tenantId, active: true, status: { in: ['SANDBOX', 'ACTIVE'] } },
+      orderBy: { updatedAt: 'desc' },
+    });
+    if (!selected) return { provider: null, configured: false, mock: false, setupRequired: true, missing: ['tenant_provider_configuration'], mode: 'unconfigured' };
+    const capability = providerRuntimeCapability(selected.providerKey, selected.mode);
+    return {
+      provider: selected.providerKey,
+      configured: capability.enabled,
+      mock: capability.simulated,
+      setupRequired: !capability.enabled,
+      missing: capability.enabled ? [] : ['runtime_adapter_capability'],
+      mode: capability.simulated ? 'sandbox' : capability.enabled ? 'live' : 'unconfigured',
+    };
   });
 
   // Appointment intake insurance summary + rule-based denial risk (view-only;
   // PROVIDER may read). Mobile-ready fields.
-  app.get('/intake/:appointmentId', async request => {
+  app.get('/intake/:appointmentId', { preHandler: insuranceRead }, async request => {
     const { appointmentId } = z.object({ appointmentId: uuid }).parse(request.params);
     const appointment = await db.appointment.findFirst({ where: { id: appointmentId, tenantId: request.auth.tenantId, deletedAt: null }, select: { id: true, patientId: true, branchId: true } });
     if (!appointment) throw app.httpErrors.notFound('Appointment not found');
+    assertBranchAccess(request, appointment.branchId);
     const assessment = await computeDenialRisk({ tenantId: request.auth.tenantId, appointmentId });
+    await audit(request, { action: 'insurance.intake.read', resource: 'appointment', resourceId: appointmentId });
     return assessment;
   });
 
@@ -49,21 +78,22 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
     const { appointmentId } = z.object({ appointmentId: uuid }).parse(request.params);
     const appointment = await db.appointment.findFirst({ where: { id: appointmentId, tenantId: request.auth.tenantId, deletedAt: null }, select: { id: true, branchId: true } });
     if (!appointment) throw app.httpErrors.notFound('Appointment not found');
+    assertBranchAccess(request, appointment.branchId);
     const assessment = await runDenialPreventionForAppointment(request.auth.tenantId, appointmentId, { actorUserId: request.auth.userId, branchId: appointment.branchId });
     return reply.send({ ...assessment, requiresHumanReview: true });
   });
 
   // Snapshot of accepted insurances + policy coverage for the practice.
-  app.get('/overview', async request => {
+  app.get('/overview', { preHandler: insuranceRead }, async request => {
     const tenantId = request.auth.tenantId;
     const [payers, totalPolicies, verifiedPolicies] = await Promise.all([
       db.insurancePayer.findMany({
         where: { tenantId },
         orderBy: [{ active: 'desc' }, { sortOrder: 'asc' }, { name: 'asc' }],
-        include: { _count: { select: { policies: true } } },
+        include: { _count: { select: { policies: { where: branchScope(request) } } } },
       }),
-      db.patientInsurancePolicy.count({ where: { tenantId, active: true } }),
-      db.patientInsurancePolicy.count({ where: { tenantId, active: true, verificationStatus: 'verified' } }),
+      db.patientInsurancePolicy.count({ where: { tenantId, ...branchScope(request), active: true } }),
+      db.patientInsurancePolicy.count({ where: { tenantId, ...branchScope(request), active: true, verificationStatus: 'verified' } }),
     ]);
 
     return {
@@ -133,9 +163,9 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
   });
 
   // Patient insurance policies (capture at front desk / patient profile).
-  app.get('/policies', async request => {
+  app.get('/policies', { preHandler: insuranceRead }, async request => {
     const query = z.object({ patientId: uuid.optional() }).parse(request.query);
-    return db.patientInsurancePolicy.findMany({
+    const rows = await db.patientInsurancePolicy.findMany({
       where: { tenantId: request.auth.tenantId, ...branchScope(request), patientId: query.patientId },
       orderBy: { updatedAt: 'desc' },
       include: {
@@ -144,6 +174,8 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
         verifications: { orderBy: { checkedAt: 'desc' }, take: 1 },
       },
     });
+    await audit(request, { action: 'insurance.policy.list', resource: 'patientInsurancePolicy', metadata: { count: rows.length, patientScoped: Boolean(query.patientId) } });
+    return rows;
   });
 
   app.post('/policies', { preHandler: deskRoles }, async (request, reply) => {
@@ -155,45 +187,85 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
       groupNumber: z.string().trim().max(80).optional(),
       relationship: z.string().trim().max(40).optional(),
       subscriberName: z.string().trim().max(160).optional(),
+      branchId: uuid.optional(),
+      coverageOrder: z.number().int().min(1).max(9).default(1),
+      effectiveFrom: z.coerce.date().default(() => new Date()),
+      effectiveTo: z.coerce.date().optional(),
     }).parse(request.body);
+
+    if (input.effectiveTo && input.effectiveTo <= input.effectiveFrom) {
+      throw app.httpErrors.badRequest('effectiveTo must be later than effectiveFrom');
+    }
 
     const patient = await db.patient.findFirst({
       where: { id: input.patientId, tenantId: request.auth.tenantId, deletedAt: null, ...branchScope(request) },
     });
     if (!patient) throw app.httpErrors.notFound('Patient not found');
     assertBranchAccess(request, patient.branchId);
+    if (input.branchId && input.branchId !== patient.branchId) throw app.httpErrors.badRequest('Policy branch must match the patient branch');
 
-    if (input.payerId) {
-      const payer = await db.insurancePayer.findFirst({ where: { id: input.payerId, tenantId: request.auth.tenantId } });
-      if (!payer) throw app.httpErrors.badRequest('Payer does not belong to this practice');
+    let row;
+    try {
+      row = await db.$transaction(async tx => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${request.auth.tenantId}), hashtext(${input.patientId}))`;
+        if (input.payerId) {
+          const payer = await tx.insurancePayer.findFirst({ where: { id: input.payerId, tenantId: request.auth.tenantId, active: true } });
+          if (!payer) throw app.httpErrors.badRequest('Payer is not active for this practice');
+        }
+        return tx.patientInsurancePolicy.create({
+          data: {
+            tenantId: request.auth.tenantId, branchId: patient.branchId, patientId: input.patientId,
+            payerId: input.payerId, planName: input.planName, memberId: input.memberId,
+            groupNumber: input.groupNumber, relationship: input.relationship,
+            subscriberName: input.subscriberName, payerReference: input.memberId,
+            coverageOrder: input.coverageOrder, effectiveFrom: input.effectiveFrom,
+            effectiveTo: input.effectiveTo, verificationStatus: 'pending', active: true,
+          },
+          include: { payer: { select: { name: true } } },
+        });
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    } catch (error) {
+      if (isPolicyRangeConflict(error)) {
+        throw app.httpErrors.conflict('Coverage at this order overlaps an existing active policy; refresh and retry');
+      }
+      throw error;
     }
-
-    // A patient's existing active policies are superseded by the newly captured one.
-    await db.patientInsurancePolicy.updateMany({
-      where: { tenantId: request.auth.tenantId, patientId: input.patientId, active: true },
-      data: { active: false },
-    });
-
-    const row = await db.patientInsurancePolicy.create({
-      data: {
-        tenantId: request.auth.tenantId,
-        branchId: patient.branchId,
-        patientId: input.patientId,
-        payerId: input.payerId,
-        planName: input.planName,
-        memberId: input.memberId,
-        groupNumber: input.groupNumber,
-        relationship: input.relationship,
-        subscriberName: input.subscriberName,
-        payerReference: input.memberId,
-        verificationStatus: 'pending',
-        active: true,
-      },
-      include: { payer: { select: { name: true } } },
-    });
-    await audit(request, { action: 'insurance.profile.created', resource: 'patientInsurancePolicy', resourceId: row.id, metadata: { patientId: input.patientId } });
-    await emitBusinessEvent(request.auth.tenantId, { eventType: 'insurance.profile.created', entityType: 'patientInsurancePolicy', entityId: row.id, sourceModule: 'insurance', payload: { patientId: input.patientId } }).catch(() => {});
+    await audit(request, { action: 'insurance.profile.created', resource: 'patientInsurancePolicy', resourceId: row.id, metadata: { coverageOrder: row.coverageOrder } });
+    await emitBusinessEvent(request.auth.tenantId, { eventType: 'insurance.profile.created', entityType: 'patientInsurancePolicy', entityId: row.id, sourceModule: 'insurance', payload: { coverageOrder: row.coverageOrder } }).catch(() => {});
     return reply.code(201).send(row);
+  });
+
+  app.patch('/policies/:id', { preHandler: deskRoles }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const input = z.object({
+      payerId: uuid.nullable().optional(), planName: z.string().trim().min(2).max(160).optional(),
+      memberId: z.string().trim().min(2).max(80).optional(), groupNumber: z.string().trim().max(80).nullable().optional(),
+      relationship: z.string().trim().max(40).nullable().optional(), subscriberName: z.string().trim().max(160).nullable().optional(),
+      coverageOrder: z.number().int().min(1).max(9).optional(), effectiveFrom: z.coerce.date().optional(),
+      effectiveTo: z.coerce.date().nullable().optional(), active: z.boolean().optional(),
+    }).parse(request.body);
+    const existing = await db.patientInsurancePolicy.findFirst({ where: { id, tenantId: request.auth.tenantId, ...branchScope(request) } });
+    if (!existing) throw app.httpErrors.notFound('Policy not found');
+    assertBranchAccess(request, existing.branchId);
+    const effectiveFrom = input.effectiveFrom ?? existing.effectiveFrom;
+    const effectiveTo = input.effectiveTo === undefined ? existing.effectiveTo : input.effectiveTo;
+    if (effectiveTo && effectiveTo <= effectiveFrom) throw app.httpErrors.badRequest('effectiveTo must be later than effectiveFrom');
+    let row;
+    try {
+      row = await db.$transaction(async tx => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${request.auth.tenantId}), hashtext(${existing.patientId}))`;
+        if (input.payerId) {
+          const payer = await tx.insurancePayer.findFirst({ where: { id: input.payerId, tenantId: request.auth.tenantId, active: true } });
+          if (!payer) throw app.httpErrors.badRequest('Payer is not active for this practice');
+        }
+        return tx.patientInsurancePolicy.update({ where: { id }, data: { ...input, effectiveFrom, effectiveTo, ...(input.memberId ? { payerReference: input.memberId, verificationStatus: 'pending', verifiedAt: null } : {}) }, include: { payer: { select: { name: true } } } });
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    } catch (error) {
+      if (isPolicyRangeConflict(error)) throw app.httpErrors.conflict('Coverage at this order overlaps an existing active policy; refresh and retry');
+      throw error;
+    }
+    await audit(request, { action: 'insurance.profile.updated', resource: 'patientInsurancePolicy', resourceId: row.id, metadata: { coverageOrder: row.coverageOrder, active: row.active } });
+    return row;
   });
 
   // ════════════════════════════════════════════════════════════════════════
@@ -211,7 +283,10 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
         key: def.key, displayName: def.displayName, category: def.category, supportsSandbox: def.supportsSandbox, note: def.note,
         configFields: def.configFields.map(f => ({ key: f.key, label: f.label, secret: f.secret, required: f.required })),
         status: row?.status ?? 'NOT_CONFIGURED', mode: row?.mode ?? 'sandbox',
-        configured: !!row && row.status !== 'NOT_CONFIGURED',
+        configured: !!row && (row.status === 'SANDBOX' || row.status === 'ACTIVE') && providerRuntimeCapability(def.key, row.mode).enabled,
+        simulated: row?.mode === 'sandbox',
+        runtimeAvailable: !!row && providerRuntimeCapability(def.key, row.mode).enabled,
+        runtimeReason: row ? providerRuntimeCapability(def.key, row.mode).reason : 'Tenant has not authorized this provider',
         lastHealthCheckAt: row?.lastHealthCheckAt ?? null, lastHealthStatus: row?.lastHealthStatus ?? null, healthMessage: row?.healthMessage ?? null,
       };
     });
@@ -244,11 +319,14 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
     const row = await db.insuranceProvider.findFirst({ where: { tenantId: request.auth.tenantId, providerKey: key } });
     let healthStatus = 'error';
     let message = 'Provider is not configured.';
-    if (row && (row.status === 'SANDBOX' || row.status === 'ACTIVE')) {
+    const capability = row ? providerRuntimeCapability(key, row.mode) : null;
+    if (row && (row.status === 'SANDBOX' || row.status === 'ACTIVE') && capability?.enabled) {
       healthStatus = 'healthy';
       message = key === 'stedi'
         ? (row.mode === 'sandbox' ? 'Sandbox reachable — simulated 271 response OK.' : 'Production credentials present.')
-        : 'Credentials present.';
+        : 'Adapter ready.';
+    } else if (capability?.reason) {
+      message = capability.reason;
     }
     const updated = await db.insuranceProvider.upsert({
       where: { tenantId_providerKey: { tenantId: request.auth.tenantId, providerKey: key } },
@@ -271,15 +349,33 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
       planName: z.string().trim().max(120).optional(),
       serviceType: z.string().trim().max(40).optional(),
       providerKey: z.enum(['stedi']).default('stedi'),
+      policyId: uuid.optional(),
     }).parse(request.body);
     const tenantId = request.auth.tenantId;
     const provider = await db.insuranceProvider.findFirst({ where: { tenantId, providerKey: input.providerKey } });
     if (!provider || (provider.status !== 'SANDBOX' && provider.status !== 'ACTIVE')) {
       throw app.httpErrors.badRequest('Eligibility provider is not configured. Configure Stedi (sandbox is available) first.');
     }
+    const capability = providerRuntimeCapability(input.providerKey, provider.mode);
+    if (!capability.enabled) throw app.httpErrors.serviceUnavailable(capability.reason ?? 'Eligibility adapter is unavailable');
     const patient = await db.patient.findFirst({ where: { id: input.patientId, tenantId, deletedAt: null }, select: { id: true, branchId: true } });
     if (!patient) throw app.httpErrors.notFound('Patient not found');
     assertBranchAccess(request, patient.branchId);
+
+    const now = new Date();
+    const policies = await db.patientInsurancePolicy.findMany({
+      where: {
+        tenantId, patientId: patient.id, branchId: patient.branchId, active: true,
+        effectiveFrom: { lte: now }, OR: [{ effectiveTo: null }, { effectiveTo: { gt: now } }],
+        ...(input.policyId ? { id: input.policyId } : { memberId: input.memberId, payer: { name: input.payerName } }),
+      },
+      include: { payer: { select: { id: true, name: true, tradingPartnerServiceId: true, sourceProvider: true } } },
+      take: 2,
+    });
+    if (policies.length !== 1 || !policies[0].payer) throw app.httpErrors.badRequest('Select one active tenant policy with a configured payer');
+    const policy = policies[0];
+    const policyPayer = policy.payer;
+    if (!policyPayer || policy.memberId !== input.memberId || policyPayer.name !== input.payerName) throw app.httpErrors.badRequest('Policy, payer, and member details do not match');
 
     // Split-brain honesty: /v1/revenue-protection/eligibility/check makes a REAL
     // Stedi call when a live key is configured, while this route historically ran a
@@ -289,7 +385,7 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
     // configured; otherwise return an explicitly SIMULATED sandbox result so invented
     // copay/deductible is never presented as a real payer (271) response. connectedCare/*
     // is owned elsewhere and is NOT modified — we reuse revenue-protection's provider.
-    const liveConfigured = env.INSURANCE_PROVIDER === 'stedi' && Boolean(env.STEDI_API_KEY);
+    const liveConfigured = providerRuntimeCapability('stedi', 'production').enabled;
     let n: NormalizedEligibility;
     let providerMode: string;
     let raw: unknown;
@@ -297,13 +393,10 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
 
     if (input.providerKey === 'stedi' && provider.mode === 'production' && liveConfigured) {
       // REAL path — identical adapter to revenue-protection's eligibility check.
-      const payerRow = await db.insurancePayer.findFirst({ where: { tenantId, name: input.payerName } });
       const outcome = await createInsuranceProvider().runEligibilityCheck({
         tenantId, branchId: patient.branchId,
-        payer: payerRow
-          ? { id: payerRow.id, name: payerRow.name, tradingPartnerServiceId: payerRow.tradingPartnerServiceId, sourceProvider: payerRow.sourceProvider }
-          : { id: '', name: input.payerName, sourceProvider: 'stedi' },
-        policy: { id: '', planName: input.planName ?? 'Health Plan', memberId: input.memberId },
+        payer: policyPayer,
+        policy: { id: policy.id, planName: policy.planName, memberId: policy.memberId },
         serviceType: input.serviceType,
       });
       providerMode = outcome.providerMode;
@@ -329,15 +422,20 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
       raw = result.raw;
     }
 
-    const verification = await db.eligibilityVerification.create({
-      data: {
+    const verification = await db.$transaction(async tx => {
+      const created = await tx.eligibilityVerification.create({ data: {
         tenantId, branchId: patient.branchId, patientId: patient.id, providerMode,
+        payerId: policy.payerId, policyId: policy.id,
         coverageStatus: n.status, coverageActive: n.coverageActive, planName: n.planName, payerName: n.payerName,
         copay: n.copay, deductibleRemaining: n.deductibleRemaining, coinsurance: n.coinsurance,
         eligibilityMessage: n.message, payerReference: n.payerReference,
         normalizedResponse: { ...n, simulated } as unknown as object, rawResponse: raw as object,
-      },
-      select: { id: true, checkedAt: true },
+      }, select: { id: true, checkedAt: true } });
+      await tx.patientInsurancePolicy.update({ where: { id: policy.id }, data: { verificationStatus: n.coverageActive ? 'verified' : 'inactive', verifiedAt: new Date() } });
+      if (policy.coverageOrder === 1) {
+        await tx.patient.update({ where: { id: patient.id }, data: { eligibilityStatus: n.coverageActive ? 'ACTIVE' : 'INACTIVE', eligibilityLastVerifiedAt: new Date() } });
+      }
+      return created;
     });
     // Audit WITHOUT PHI — never log the member ID.
     await audit(request, { action: 'insurance.eligibility.checked', resource: 'eligibilityVerification', resourceId: verification.id, metadata: { providerKey: input.providerKey, status: n.status, mode: providerMode, simulated } });
@@ -353,7 +451,7 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
   });
 
   // Eligibility history (no member IDs are persisted; PHI-minimal).
-  app.get('/eligibility/history', async request => {
+  app.get('/eligibility/history', { preHandler: insuranceRead }, async request => {
     const q = z.object({ patientId: uuid.optional(), limit: z.coerce.number().min(1).max(100).default(25) }).parse(request.query);
     const rows = await db.eligibilityVerification.findMany({
       where: { tenantId: request.auth.tenantId, ...branchScope(request), ...(q.patientId ? { patientId: q.patientId } : {}) },
@@ -363,6 +461,7 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
     const pIds = [...new Set(rows.map(r => r.patientId))];
     const patients = pIds.length ? await db.patient.findMany({ where: { id: { in: pIds }, tenantId: request.auth.tenantId }, select: { id: true, firstName: true, lastName: true } }) : [];
     const pmap = new Map(patients.map(p => [p.id, `${p.firstName} ${p.lastName}`]));
+    await audit(request, { action: 'insurance.eligibility.history.read', resource: 'eligibilityVerification', metadata: { count: rows.length, patientScoped: Boolean(q.patientId) } });
     return rows.map(r => ({ ...r, copay: Number(r.copay), deductibleRemaining: Number(r.deductibleRemaining), coinsurance: Number(r.coinsurance), patientName: pmap.get(r.patientId) ?? 'Unknown' }));
   });
 };

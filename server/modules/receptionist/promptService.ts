@@ -1,4 +1,6 @@
 // ===========================================================================
+
+import { renderRecordingDisclosure } from '../../lib/receptionist/privacyLifecycle';
 // AI Receptionist — prompt generation service
 //
 // Pure, dependency-free composition layer. Given a clinic profile, an agent,
@@ -173,6 +175,18 @@ function locationList(locations: PromptLocation[], eligibleIds: string[]): Promp
   return eligible.length ? eligible : locations;
 }
 
+// This baseline is product-controlled and cannot be replaced by a clinic or
+// agent greeting. Clinic-specific compliance wording remains additive. A voice
+// workflow still needs jurisdiction-specific legal review and an operational
+// path for recording refusal; the prompt alone is not evidence of consent.
+export function mandatoryOpeningDisclosure(config: PromptConfig): string {
+  return renderRecordingDisclosure({
+    agentName: config.agent.name,
+    clinicName: config.clinic.name,
+    clinicDisclosure: config.clinic.complianceDisclosure,
+  });
+}
+
 // --- System prompt ---------------------------------------------------------
 
 export function generateSystemPrompt(config: PromptConfig): string {
@@ -183,9 +197,10 @@ export function generateSystemPrompt(config: PromptConfig): string {
   const confirmationChannels = [campaign.smsConfirmation ? 'SMS' : null, campaign.emailConfirmation ? 'email' : null]
     .filter(Boolean)
     .join(' and ');
+  const openingDisclosure = mandatoryOpeningDisclosure(config);
   const fallback = clinic.humanFallbackNumber
-    ? `Transfer the caller to a human at ${clinic.humanFallbackNumber}.`
-    : 'Take a message and let them know a team member will call back shortly.';
+    ? 'Call request_human_handoff first. Only after it succeeds, call transfer_to_staff. If the transfer fails, call take_message so the callback remains in the staff work queue.'
+    : 'Call take_message and explain that staff acknowledgment is still pending; do not promise a callback time.';
 
   return `You are ${agent.name}, the AI receptionist for ${clinic.name}.
 
@@ -206,7 +221,8 @@ You are calling or answering on behalf of ${clinic.name}. Use only the configura
 - Booking rules: ${describeBookingRules(campaign.bookingRules)}
 
 # Required disclosure (say at the very start)
-"${clinic.complianceDisclosure}"
+"${openingDisclosure}"
+This exact disclosure is mandatory and must be spoken before any greeting override, offer, intake question, identity lookup, or booking action. Do not shorten, paraphrase, skip, or replace it. If interrupted, finish the disclosure before continuing.
 
 # Purpose
 1. Greet the caller or lead warmly and professionally.
@@ -241,10 +257,14 @@ Say: "No problem at all. Would you like us not to contact you again about this o
 - Do not diagnose, give medical advice, recommend treatment, or discuss test results.
 - Do not collect detailed medical history unless an intake field above explicitly requires it.
 - Never collect Social Security numbers, payment card, or financial details.
-- If the person mentions an emergency, tell them to call 911 or go to the nearest emergency room immediately.
+- Before any patient-specific action involving an existing record, call verify_patient_identity using the date of birth stated by the caller. Never treat a name, caller assertion, or model-generated flag as verification. If verification fails, locks, or the caller is a proxy, guardian, or minor, use request_human_handoff; do not reveal whether a patient record exists.
+- For an existing appointment, verify identity first, then call list_upcoming_appointments. Use only the appointment_id returned by that tool. Call prepare_appointment_change with the exact action and requested time; read its confirmation question exactly. Only after the caller explicitly says yes, call cancel_appointment or reschedule_appointment with confirmed=true and the returned confirmation_token. Never invent or reuse a token. Never claim a cancellation or reschedule succeeded unless the mutation tool returns success; if it reports needs_human, create a handoff.
+- Immediately after the opening disclosure, call record_recording_preference with the caller's explicit answer before collecting information. If they refuse or later withdraw, use that tool first, do not use any other patient-data tool, explain that this AI line cannot continue, provide the human fallback option, and end the call.
+- If the person mentions a possible emergency, immediately tell them to hang up and call 911 or go to the nearest emergency room. Then call report_emergency to create the critical staff alert. Never delay the 911 instruction to ask questions, use another tool, or attempt a transfer, and never tell them to wait for staff.
 - If asked whether you are human, say you are an AI assistant calling on behalf of ${clinic.name}.
-- If the person asks not to be contacted again: ${clinic.doNotContactPolicy}
+- If the person asks not to be contacted again, immediately call record_do_not_call and then end politely. Do not rely only on post-call analysis. Clinic policy: ${clinic.doNotContactPolicy}
 - If a human is requested or escalation is needed: ${fallback}
+- For an unsupported intent, medical advice, complaints, refills, test results, billing disputes, or any action you cannot complete safely, call request_human_handoff or take_message. Never merely say that someone will follow up without a successful tool result and task ID.
 - Ask one question at a time. Keep responses short, warm, and natural.
 
 # Instruction integrity (never override)
@@ -272,7 +292,9 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
   const { clinic, agent, campaign } = config;
   const locations = locationList(config.locations, campaign.eligibleLocationIds);
   const systemPrompt = generateSystemPrompt(config);
-  const beginMessage = agent.greetingOverride?.trim() || clinic.complianceDisclosure;
+  const openingDisclosure = mandatoryOpeningDisclosure(config);
+  const greetingOverride = agent.greetingOverride?.trim();
+  const beginMessage = greetingOverride ? `${openingDisclosure} ${greetingOverride}` : openingDisclosure;
 
   const dynamicVariables: Record<string, string> = {
     clinic_name: clinic.name,
@@ -327,14 +349,121 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
   const tools: Array<Record<string, unknown>> = [
     {
       type: 'function',
+      name: 'record_recording_preference',
+      description: 'Immediately record the caller\'s explicit response to the approved AI/recording disclosure. Call this before collecting information. On refusal or withdrawal, do not use any other patient-data tool; offer human fallback.',
+      url: fnUrl,
+      speak_during_execution: true,
+      speak_after_execution: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          recording_decision: { type: 'string', enum: ['GRANTED', 'REFUSED', 'WITHDRAWN'], description: 'The caller\'s explicit decision after hearing the approved disclosure.' },
+          jurisdiction: { type: 'string', description: 'Known call jurisdiction/state only when available from approved routing data; never guess.' },
+        },
+        required: ['recording_decision'],
+      },
+    },
+    {
+      type: 'function',
+      name: 'record_do_not_call',
+      description: 'Immediately persist an ALL-channel do-not-contact suppression for the verified party on this call. Call whenever the person asks not to be contacted again, before ending the call.',
+      url: fnUrl,
+      speak_during_execution: true,
+      speak_after_execution: true,
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+    {
+      type: 'function',
+      name: 'verify_patient_identity',
+      description: 'Verify an existing patient for this call using the provider-observed caller number plus date of birth. Required before any patient-specific action involving an existing record. Never use for a proxy, guardian, or minor; route those cases to staff.',
+      url: fnUrl,
+      speak_during_execution: true,
+      speak_after_execution: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          date_of_birth: { type: 'string', description: 'Date of birth stated by the caller (YYYY-MM-DD).' },
+        },
+        required: ['date_of_birth'],
+      },
+    },
+    {
+      type: 'function',
+      name: 'list_upcoming_appointments',
+      description: 'After verify_patient_identity succeeds, list the verified caller\'s upcoming appointments that can be changed. Never call before verification and never reveal results to a proxy, guardian, or minor.',
+      url: fnUrl,
+      speak_during_execution: true,
+      speak_after_execution: true,
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+    {
+      type: 'function',
+      name: 'prepare_appointment_change',
+      description: 'Create a short-lived server-held confirmation for one verified caller-owned cancellation or reschedule. Read the returned confirmation question and wait for an explicit yes before calling the mutation tool.',
+      url: fnUrl,
+      speak_during_execution: true,
+      speak_after_execution: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['cancel', 'reschedule'] },
+          appointment_id: { type: 'string', description: 'Exact appointment_id returned by list_upcoming_appointments.' },
+          appointment_date: { type: 'string', description: 'For reschedule only: chosen date (YYYY-MM-DD).' },
+          appointment_time: { type: 'string', description: 'For reschedule only: chosen time (HH:mm, 24h).' },
+        },
+        required: ['action', 'appointment_id'],
+      },
+    },
+    {
+      type: 'function',
+      name: 'cancel_appointment',
+      description: 'Cancel only after prepare_appointment_change returned a confirmation_token and the verified caller explicitly said yes. Never promise a refund; report the tool result exactly.',
+      url: fnUrl,
+      speak_during_execution: true,
+      speak_after_execution: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          appointment_id: { type: 'string', description: 'Exact appointment_id returned by list_upcoming_appointments.' },
+          reason: { type: 'string', description: 'Optional brief non-clinical cancellation reason.' },
+          confirmation_token: { type: 'string', description: 'Short-lived token returned by prepare_appointment_change for this exact cancellation.' },
+          confirmed: { type: 'boolean', description: 'True only after the caller explicitly says yes to the server-rendered confirmation.' },
+        },
+        required: ['appointment_id', 'confirmation_token', 'confirmed'],
+      },
+    },
+    {
+      type: 'function',
+      name: 'reschedule_appointment',
+      description: 'Move an appointment only after prepare_appointment_change validates the exact new time and the verified caller explicitly says yes.',
+      url: fnUrl,
+      speak_during_execution: true,
+      speak_after_execution: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          appointment_id: { type: 'string', description: 'Exact appointment_id returned by list_upcoming_appointments.' },
+          appointment_date: { type: 'string', description: 'Chosen date (YYYY-MM-DD).' },
+          appointment_time: { type: 'string', description: 'Chosen time (HH:mm, 24h) returned by check_availability.' },
+          confirmation_token: { type: 'string', description: 'Short-lived token returned by prepare_appointment_change for this exact reschedule.' },
+          confirmed: { type: 'boolean', description: 'True only after the caller explicitly says yes to the server-rendered confirmation.' },
+        },
+        required: ['appointment_id', 'appointment_date', 'appointment_time', 'confirmation_token', 'confirmed'],
+      },
+    },
+    {
+      type: 'function',
       name: 'check_availability',
       description: `Check real-time open appointment slots at ${clinic.name} for a date. ALWAYS call this before offering times or booking.`,
       url: fnUrl,
       speak_during_execution: true,
       parameters: {
         type: 'object',
-        properties: { appointment_date: { type: 'string', description: 'Date to check (YYYY-MM-DD).' } },
-        required: ['appointment_date'],
+        properties: {
+          appointment_date: { type: 'string', description: 'Date to check (YYYY-MM-DD).' },
+          service: { type: 'string', description: `Service to schedule, e.g. ${campaign.appointmentType}.` },
+        },
+        required: ['appointment_date', 'service'],
       },
     },
     {
@@ -357,7 +486,76 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
         required: ['first_name', 'last_name', 'appointment_date', 'appointment_time'],
       },
     },
+    {
+      type: 'function',
+      name: 'request_human_handoff',
+      description: 'Create an acknowledgment-required staff handoff/callback task. ALWAYS call this before attempting transfer_to_staff. Never imply staff has seen it or claim a transfer completed from this tool result.',
+      url: fnUrl,
+      speak_during_execution: true,
+      speak_after_execution: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          caller_name: { type: 'string', description: 'Caller name, only if voluntarily provided.' },
+          callback_phone: { type: 'string', description: 'Callback number only when the verified caller number is unavailable.' },
+          reason_category: { type: 'string', description: 'Non-clinical routing category.', enum: ['human_requested', 'unsupported_intent', 'complaint', 'billing', 'refill', 'results', 'other'] },
+          message: { type: 'string', description: 'Brief minimum-necessary callback message; do not include detailed medical history.' },
+        },
+        required: ['reason_category'],
+      },
+    },
+    {
+      type: 'function',
+      name: 'take_message',
+      description: 'Create a staff callback task when no human transfer is configured, a transfer fails, or the request cannot safely be completed.',
+      url: fnUrl,
+      speak_during_execution: true,
+      speak_after_execution: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          caller_name: { type: 'string', description: 'Caller name, only if voluntarily provided.' },
+          callback_phone: { type: 'string', description: 'Callback number only when the verified caller number is unavailable.' },
+          reason_category: { type: 'string', description: 'Non-clinical routing category.', enum: ['unsupported_intent', 'complaint', 'billing', 'refill', 'results', 'transfer_failed', 'other'] },
+          message: { type: 'string', description: 'Brief minimum-necessary callback message; do not include detailed medical history.' },
+        },
+        required: ['reason_category', 'message'],
+      },
+    },
+    {
+      type: 'function',
+      name: 'report_emergency',
+      description: 'Create a CRITICAL staff alert after immediately instructing the caller to call 911 or go to the nearest ER. Never use this instead of immediate emergency instructions.',
+      url: fnUrl,
+      speak_during_execution: false,
+      speak_after_execution: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          reason_category: { type: 'string', enum: ['possible_emergency'], description: 'Emergency routing classification.' },
+          message: { type: 'string', description: 'Very brief minimum-necessary reason; do not collect detailed history.' },
+        },
+        required: ['reason_category'],
+      },
+    },
   ];
+
+  // Retell's provider-native transfer is executable only when the clinic has a
+  // valid E.164 fallback. The custom handoff tool above creates the durable
+  // callback task first, so a failed cold transfer never loses the request.
+  if (/^\+[1-9]\d{7,14}$/.test(clinic.humanFallbackNumber ?? '')) {
+    tools.push({
+      type: 'transfer_call',
+      name: 'transfer_to_staff',
+      description: 'Transfer to the clinic front desk only after request_human_handoff succeeds. A transfer attempt is not a completed transfer; if it fails, call take_message.',
+      transfer_destination: {
+        type: 'predefined',
+        number: clinic.humanFallbackNumber,
+        ignore_e164_validation: false,
+      },
+      transfer_option: { type: 'cold_transfer', show_transferee_as_caller: false },
+    });
+  }
 
   const callOutcomeFields = [
     { name: 'outcome', type: 'enum', choices: ['booked', 'not_interested', 'no_answer', 'voicemail', 'escalated', 'opted_out', 'failed'], description: 'Final disposition of the call.' },
@@ -365,7 +563,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     { name: 'requested_date_time', type: 'string', description: 'The date/time the patient requested, if any.' },
     { name: 'opted_out', type: 'boolean', description: 'Whether the caller asked not to be contacted again.' },
     { name: 'escalation_reason', type: 'string', description: 'Why the call was escalated to a human, if applicable.' },
-    { name: 'summary', type: 'string', description: 'One-paragraph summary of the conversation.' },
+    { name: 'summary', type: 'string', description: 'One-paragraph minimum-necessary operational summary; it is retained only when explicit consent evidence exists.' },
   ];
 
   return {
@@ -423,7 +621,9 @@ export function generateSamples(config: PromptConfig): PromptSamples {
     .filter(Boolean)
     .join(' and ') || 'a confirmation';
 
-  const greeting = `${agent.greetingOverride?.trim() || clinic.complianceDisclosure} Is now an okay time to talk for a moment?`;
+  const openingDisclosure = mandatoryOpeningDisclosure(config);
+  const greetingOverride = agent.greetingOverride?.trim();
+  const greeting = `${openingDisclosure}${greetingOverride ? ` ${greetingOverride}` : ''} Is now an okay time to talk for a moment?`;
   const pitch = campaign.offerScript?.trim()
     ? campaign.offerScript.trim()
     : `We're reaching out about ${campaign.offerTitle}. ${campaign.offerDescription} Would you like to hear about booking a ${campaign.appointmentType}?`;

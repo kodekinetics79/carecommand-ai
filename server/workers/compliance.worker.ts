@@ -1,7 +1,14 @@
 import { Worker } from 'bullmq';
 import { captureException } from '../lib/observability';
 import { observed } from './observedJob';
-import { redisConnection } from './queues';
+import {
+  enqueueComplianceTenantJob,
+  redisConnection,
+  type ComplianceJobName,
+  type ScheduledQueueData,
+} from './queues';
+import { assertSchedulerTick, validateTenantJobEnvelope } from '../lib/jobEnvelope';
+import { resolveActiveJobTenantIds } from '../lib/jobTenantResolver';
 import {
   runReadinessRecalc,
   runEvidenceExpiry,
@@ -14,21 +21,49 @@ import {
 // all tenants (the job functions iterate tenants and scope every write by
 // tenantId). Retries/backoff come from the queue's defaultJobOptions. Exported as
 // a factory; schedule registration + shutdown are owned by the worker runtime.
-export function createComplianceWorker(): Worker<Record<string, never>, void, string> {
-  const worker = new Worker<Record<string, never>, void, string>(
+const COMPLIANCE_SCHEDULERS: Record<ComplianceJobName, string> = {
+  'readiness-recalc': 'compliance-readiness-recalc',
+  'evidence-expiry': 'compliance-evidence-expiry',
+  'backup-placeholder': 'compliance-backup-placeholder',
+  'access-review-reminder': 'compliance-access-review',
+  'vendor-review-reminder': 'compliance-vendor-review',
+  'security-scan-placeholder': 'compliance-security-scan',
+};
+
+function isComplianceJobName(name: string): name is ComplianceJobName {
+  return Object.hasOwn(COMPLIANCE_SCHEDULERS, name);
+}
+
+async function runTenantComplianceJob(operation: ComplianceJobName, tenantId: string): Promise<void> {
+  switch (operation) {
+    case 'readiness-recalc': await runReadinessRecalc(tenantId); break;
+    case 'evidence-expiry': await runEvidenceExpiry(tenantId); break;
+    case 'backup-placeholder': await runBackupPlaceholder(tenantId); break;
+    case 'access-review-reminder': await runAccessReviewReminder(tenantId); break;
+    case 'vendor-review-reminder': await runVendorReviewReminder(tenantId); break;
+    case 'security-scan-placeholder':
+      console.info('[compliance-job] security scanner not integrated; awaiting supplied scan data');
+      break;
+  }
+}
+
+export function createComplianceWorker(): Worker<ScheduledQueueData, void, string> {
+  const worker = new Worker<ScheduledQueueData, void, string>(
     'compliance-maintenance',
     observed('compliance-maintenance', async job => {
-      switch (job.name) {
-        case 'readiness-recalc': await runReadinessRecalc(); break;
-        case 'evidence-expiry': await runEvidenceExpiry(); break;
-        case 'backup-placeholder': await runBackupPlaceholder(); break;
-        case 'access-review-reminder': await runAccessReviewReminder(); break;
-        case 'vendor-review-reminder': await runVendorReviewReminder(); break;
-        // No-op until a real scanner is integrated — never fabricates results.
-        case 'security-scan-placeholder':
-          console.info('[compliance-job] security scanner not integrated; awaiting supplied scan data');
-          break;
+      if (isComplianceJobName(job.name)) {
+        assertSchedulerTick(job, { name: job.name, schedulerId: COMPLIANCE_SCHEDULERS[job.name] });
+        for (const tenantId of await resolveActiveJobTenantIds()) await enqueueComplianceTenantJob(job.name, tenantId);
+        return;
       }
+      const suffix = '-tenant';
+      const operation = job.name.endsWith(suffix) ? job.name.slice(0, -suffix.length) : '';
+      if (!isComplianceJobName(operation)) throw new Error(`Unknown compliance job: ${job.name}`);
+      if (!job.id) throw new Error('Signed tenant job is missing its BullMQ job ID');
+      const envelope = validateTenantJobEnvelope(job.data, {
+        queue: 'compliance-maintenance', operation, jobId: job.id,
+      });
+      await runTenantComplianceJob(operation, envelope.tenantId);
     }),
     { connection: redisConnection, concurrency: 3 },
   );

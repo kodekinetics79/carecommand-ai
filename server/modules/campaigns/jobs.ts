@@ -1,6 +1,7 @@
 import { db } from '../../lib/db';
 import { channelStatus, type CommChannel } from '../../lib/campaigns';
 import { dispatchCampaign } from '../../lib/campaignDispatch';
+import { forEachActiveJobTenant } from '../../lib/jobTenantResolver';
 
 // ===========================================================================
 // Scheduled campaign dispatch. Processes ONLY approved SCHEDULED campaigns whose
@@ -21,21 +22,23 @@ export function isWithinQuietHours(quietHours: unknown, now: Date): boolean {
   return start <= end ? cur >= start && cur < end : cur >= start || cur < end;
 }
 
-export async function runScheduledCampaigns(now: Date = new Date()): Promise<{ dispatched: number; skipped: number }> {
-  const due = await db.campaign.findMany({
-    where: { status: 'SCHEDULED', requiresApproval: true, approvedByUserId: { not: null }, campaignType: { not: null }, scheduledAt: { not: null, lte: now } },
-    take: 200,
-  });
+export async function runScheduledCampaigns(now: Date = new Date(), only?: string): Promise<{ dispatched: number; skipped: number }> {
   let dispatched = 0, skipped = 0;
-  for (const c of due) {
-    if (!c.audienceType) { skipped++; continue; }
-    if (isWithinQuietHours(c.quietHours, now)) { skipped++; continue; }
-    const channel = (c.campaignChannel ?? 'sms') as CommChannel;
-    // Do not send if the provider is missing — leave it SCHEDULED for later.
-    if (channelStatus(channel).setupRequired) { skipped++; continue; }
-    const summary = await dispatchCampaign(c.tenantId, c.id, {});
-    await db.auditEvent.create({ data: { tenantId: c.tenantId, action: 'campaign.scheduled_run', resource: 'campaign', resourceId: c.id, metadata: { sent: summary.sent, suppressed: summary.suppressed, failed: summary.failed } } }).catch(() => {});
-    dispatched++;
-  }
+  await forEachActiveJobTenant(only, 'worker:campaign-scheduler', async tenantId => {
+    const due = await db.campaign.findMany({
+      where: { tenantId, status: 'SCHEDULED', requiresApproval: true, approvedByUserId: { not: null }, campaignType: { not: null }, scheduledAt: { not: null, lte: now } },
+      take: 200,
+    });
+    for (const c of due) {
+      if (!c.audienceType) { skipped++; continue; }
+      if (isWithinQuietHours(c.quietHours, now)) { skipped++; continue; }
+      const channel = (c.campaignChannel ?? 'sms') as CommChannel;
+      // Do not send if the provider is missing — leave it SCHEDULED for later.
+      if (channelStatus(channel).setupRequired) { skipped++; continue; }
+      const summary = await dispatchCampaign(tenantId, c.id, {});
+      await db.auditEvent.create({ data: { tenantId, action: 'campaign.scheduled_run', resource: 'campaign', resourceId: c.id, metadata: { sent: summary.sent, suppressed: summary.suppressed, failed: summary.failed } } }).catch(() => {});
+      dispatched++;
+    }
+  });
   return { dispatched, skipped };
 }

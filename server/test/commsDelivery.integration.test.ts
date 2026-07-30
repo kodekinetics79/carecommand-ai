@@ -10,12 +10,19 @@ import type { AddressInfo } from 'node:net';
 // cross-cutting audit()/AuditEvent RLS wiring owned by other modules, and it
 // runs correctly whether or not the shared dev DB currently enforces RLS
 // (tenant context is set either way).
-const { db } = await import('../lib/db');
+const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
-const { sendMessage } = await import('../lib/commsProvider');
-const { dispatchCampaign } = await import('../lib/campaignDispatch');
-const { isDestinationOptedOut, generateDraft } = await import('../lib/campaigns');
-const { runWithTenantContext } = await import('../lib/tenantContext');
+const { sendMessage: sendMessageUnscoped } = await import('../lib/commsProvider');
+const { dispatchCampaign: dispatchCampaignUnscoped } = await import('../lib/campaignDispatch');
+const { isDestinationOptedOut: isDestinationOptedOutUnscoped, generateDraft } = await import('../lib/campaigns');
+const { runWithJobTenantContext } = await import('../lib/tenantContext');
+
+const sendMessage = (...args: Parameters<typeof sendMessageUnscoped>) =>
+  runWithJobTenantContext(args[5].tenantId, () => sendMessageUnscoped(...args), 'worker:test-comms');
+const dispatchCampaign = (tenantId: string, ...args: Parameters<typeof dispatchCampaignUnscoped> extends [string, ...infer Rest] ? Rest : never) =>
+  runWithJobTenantContext(tenantId, () => dispatchCampaignUnscoped(tenantId, ...args), 'worker:test-comms');
+const isDestinationOptedOut = (tenantId: string, ...args: Parameters<typeof isDestinationOptedOutUnscoped> extends [string, ...infer Rest] ? Rest : never) =>
+  runWithJobTenantContext(tenantId, () => isDestinationOptedOutUnscoped(tenantId, ...args), 'worker:test-comms');
 
 const tenantIds: string[] = [];
 
@@ -64,14 +71,14 @@ async function makeTenant() {
 // Patient is RLS-enrolled (app_rls); insert inside a tenant transaction so the
 // GUC is set on the same connection — otherwise the write is rejected.
 async function makeInactivePatient(tenantId: string, branchId: string, opts: { phone?: string | null; email?: string | null } = {}) {
-  return runWithTenantContext(tenantId, tx => tx.patient.create({
+  return runWithJobTenantContext(tenantId, tx => tx.patient.create({
     data: {
       tenantId, branchId, firstName: 'Inactive', lastName: 'Patient',
       phone: opts.phone ?? '+1 555 010 2030', email: opts.email ?? null,
       lifecycleStage: 'ACTIVE', lastVisitAt: new Date('2020-01-01T00:00:00Z'),
     },
     select: { id: true, phone: true, email: true },
-  }));
+  }), 'worker:test-comms');
 }
 
 async function makeInactiveCampaign(tenantId: string) {

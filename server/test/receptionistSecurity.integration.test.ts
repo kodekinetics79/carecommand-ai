@@ -19,7 +19,7 @@ vi.mock('../workers/queues', () => ({
 }));
 
 const { buildApp } = await import('../app');
-const { db } = await import('../lib/db');
+const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
 
 let app: FastifyInstance;
@@ -84,7 +84,7 @@ describe('receptionist /fn — signature enforcement (FIX 1)', () => {
     try {
       const raw = body('check_availability', { appointment_date: '2030-01-01' });
       const res = await app.inject({ method: 'POST', url: fnUrl(t.clinicId), headers: { 'content-type': 'application/json', 'x-retell-signature': sign(raw, 'retell_real_secret') }, payload: raw });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(202); // verified but no persisted call mapping: fail closed
     } finally {
       setEnv(original);
     }
@@ -102,11 +102,11 @@ describe('receptionist /fn — signature enforcement (FIX 1)', () => {
     }
   });
 
-  it('the dev bypass still works: non-production + no key + unsigned → 200', async () => {
+  it('does not permit an unsigned development bypass when no verifier is configured', async () => {
     const t = await makeTenant();
     setEnv({ NODE_ENV: 'development', RETELL_API_KEY: '' });
     const res = await app.inject({ method: 'POST', url: fnUrl(t.clinicId), headers: { 'content-type': 'application/json' }, payload: body('check_availability', { appointment_date: '2030-01-01' }) });
-    expect(res.statusCode).toBe(200);
+    expect(res.statusCode).toBe(503);
   });
 });
 
@@ -143,7 +143,7 @@ describe('receptionist event webhook — production fail-closed posture', () => 
     try {
       const raw = eventBody();
       const res = await app.inject({ method: 'POST', url: eventUrl(t.clinicId), headers: { 'content-type': 'application/json', 'x-retell-signature': sign(raw, 'retell_real_secret') }, payload: raw });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(202); // verified but unresolved first-call mapping
     } finally {
       setEnv(original);
     }
@@ -160,8 +160,8 @@ describe('receptionist /fn — per-route rate limit engages', () => {
       const res = await app.inject({ method: 'POST', url: fnUrl(t.clinicId), headers: { 'content-type': 'application/json', 'x-forwarded-for': ip }, payload: body('check_availability', { appointment_date: '2030-01-01' }) });
       codes.push(res.statusCode);
     }
-    expect(codes[0]).toBe(200);
-    expect(codes.filter(c => c === 200).length).toBeLessThanOrEqual(30);
+    expect(codes[0]).toBe(503);
+    expect(codes.filter(c => c === 503).length).toBeLessThanOrEqual(30);
     expect(codes[codes.length - 1]).toBe(429); // the 31st is blocked
   });
 });

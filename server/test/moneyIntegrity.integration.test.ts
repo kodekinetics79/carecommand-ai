@@ -23,7 +23,7 @@ vi.mock('../workers/queues', () => ({
 }));
 
 const { buildApp } = await import('../app');
-const { db } = await import('../lib/db');
+const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { recomputeEntitlements } = await import('../lib/entitlements');
 const { runWithTenantContext } = await import('../lib/tenantContext');
 
@@ -36,13 +36,13 @@ async function makeTenant() {
   createdTenantIds.push(id);
   const plan = await db.subscriptionPlan.findUnique({ where: { key: 'enterprise' } });
   await db.tenantSubscription.create({ data: { tenantId: id, planId: plan!.id, status: 'ACTIVE', startedAt: new Date() } });
-  await recomputeEntitlements(id);
+  await recomputeEntitlements(id, db);
   const branch = await db.branch.create({ data: { tenantId: id, name: 'b', location: 'x' } });
   const owner = await db.user.create({ data: { tenantId: id, role: 'OWNER', active: true, email: `own-${id.slice(0, 8)}@mi.test`, displayName: 'Owner' } });
   return { id, branchId: branch.id, ownerId: owner.id };
 }
 
-const auth = (t: { id: string }, userId: string) => ({ authorization: `Bearer ${app.jwt.sign({ userId, tenantId: t.id, type: 'access' })}` });
+const auth = (t: { id: string }, userId: string) => ({ authorization: `Bearer ${app.jwt.sign({ userId, tenantId: t.id, role: 'OWNER', type: 'access' })}` });
 
 beforeAll(async () => { app = await buildApp(); }, 60_000);
 afterAll(async () => {
@@ -70,7 +70,7 @@ describe('#1 revenue overview totals are DB aggregates (correct past the 50-row 
     // an RLS-protected table, so it must be written under tenant context.
     await runWithTenantContext(t.id, tx => tx.revenueProtectionAlert.createMany({
       data: Array.from({ length: 55 }, () => ({ tenantId: t.id, branchId: t.branchId, sourceType: 'test', severity: 'low', title: 't', description: 'd', estimatedValue: 5, status: 'open', recommendedAction: 'r' })),
-    }));
+    }), { id: t.ownerId, role: 'OWNER' });
 
     const res = await app.inject({ method: 'GET', url: '/v1/revenue-protection/overview', headers: auth(t, t.ownerId) });
     expect(res.statusCode).toBe(200);
@@ -121,7 +121,7 @@ describe('#3 control-plane test buttons are honest (no fabricated success)', () 
 });
 
 describe('#5 insurance eligibility never presents a simulator result as a real payer response', () => {
-  it('a provider row in production mode WITHOUT a live key is reported as sandbox/simulated, never production', async () => {
+  it('a provider row in production mode WITHOUT a live key fails closed', async () => {
     const t = await makeTenant();
     const patient = await db.patient.create({ data: { tenantId: t.id, branchId: t.branchId, firstName: 'Pat', lastName: 'Roe' } });
     // Configure Stedi in PRODUCTION mode in the DB — but there is no live STEDI key
@@ -132,13 +132,9 @@ describe('#5 insurance eligibility never presents a simulator result as a real p
       method: 'POST', url: '/v1/insurance/eligibility/check', headers: { ...auth(t, t.ownerId), 'content-type': 'application/json' },
       payload: JSON.stringify({ patientId: patient.id, payerName: 'Acme Health', memberId: 'MEM12345' }),
     });
-    expect(res.statusCode).toBe(201);
-    const json = res.json();
-    expect(json.simulated).toBe(true);
-    expect(json.mode).toBe('sandbox');
-    expect(json.providerMode).toBe('sandbox');
-    // Persisted verification is also labelled sandbox — no 'production' fabrication.
+    expect(res.statusCode).toBe(503);
+    expect(res.json().message).toBe('An unexpected error occurred');
     const v = await db.eligibilityVerification.findFirst({ where: { tenantId: t.id, patientId: patient.id } });
-    expect(v?.providerMode).toBe('sandbox');
+    expect(v).toBeNull();
   });
 });

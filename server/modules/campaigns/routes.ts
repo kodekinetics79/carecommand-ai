@@ -19,6 +19,8 @@ import { dispatchCampaign } from '../../lib/campaignDispatch';
 import { sendMessage } from '../../lib/commsProvider';
 import { aiProviderConfigured, draftWithAI } from '../../lib/campaignAI';
 import { RULE_CATALOG, evaluateRule, executeRule } from '../../lib/automationRules';
+import { enterTenantContext } from '../../lib/tenantContext';
+import { resolveIngressTenant } from '../../lib/tenantIngressResolvers';
 
 // ===========================================================================
 // CRM Campaign / Reactivation engine routes (mounted at /v1/crm — distinct from
@@ -449,11 +451,15 @@ export const crmWebhookRoutes: FastifyPluginAsync = async app => {
     const event = z.object({ eventId: z.string().min(1), providerMessageId: z.string().min(1), status: z.string().min(1) }).safeParse(request.body ?? {});
     if (!event.success) return reply.code(400).send({ error: 'INVALID_EVENT' });
 
+    const resolved = await resolveIngressTenant('campaign_provider_message', event.data.providerMessageId);
+    if (!resolved) return reply.code(200).send({ received: true, matched: false });
+    enterTenantContext({ tenantId: resolved.tenantId, actorId: `webhook:campaign:${resolved.resourceId}`, actorRole: 'WEBHOOK', source: 'webhook', requestId: request.id });
+
     // Idempotent on the provider event id — duplicate callbacks are acknowledged.
-    const claim = await claimIdempotency('campaign.delivery.webhook', event.data.eventId);
+    const claim = await claimIdempotency('campaign.delivery.webhook', event.data.eventId, resolved.tenantId);
     if (!claim.claimed) return reply.code(200).send({ received: true, duplicate: true });
 
-    const delivery = await db.campaignDelivery.findFirst({ where: { providerMessageId: event.data.providerMessageId } });
+    const delivery = await db.campaignDelivery.findFirst({ where: { id: resolved.resourceId, providerMessageId: event.data.providerMessageId } });
     if (!delivery) return reply.code(200).send({ received: true, matched: false });
 
     const s = event.data.status.toLowerCase();

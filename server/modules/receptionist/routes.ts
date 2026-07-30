@@ -1,11 +1,15 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { env } from '../../config/env';
-import { requireRoles } from '../../plugins/roles';
 import { requireFeature } from '../../lib/entitlements';
+import {
+  hasReceptionistPermission,
+  RECEPTIONIST_PERMISSIONS,
+  requireReceptionistPermission,
+} from '../../lib/receptionist/accessControl';
 import {
   generateSystemPrompt,
   generateSamples,
@@ -14,13 +18,25 @@ import {
   type PromptIntakeField,
   type PromptBookingRules,
 } from './promptService';
-import { outboundRoutes } from './outbound';
+import { outboundRoutes, targetStatusAfterOutcome } from './outbound';
 import { runBookingHandoff } from './handoff';
 import { handleAgentTool } from '../../lib/receptionist/liveTools';
+import { ingestCallArtifacts } from '../../lib/receptionist/privacyLifecycle';
+import { enterTenantContext } from '../../lib/tenantContext';
+import { resolveIngressTenant } from '../../lib/tenantIngressResolvers';
+import { isFeatureEnabled } from '../../lib/entitlements';
+import { platformDb } from '../../lib/platformDb';
+import { MAX_TENANT_ACTIVE_CALLS, DEFAULT_VOICE_MINUTES_LIMIT } from './outbound';
+import { stopPhoneCall } from '../../lib/retell';
 
 const uuid = z.string().uuid();
+const RECEPTIONIST_CALL_LEASE_MS = 4 * 60 * 60 * 1_000;
 const idParam = z.object({ id: uuid });
-const writeRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
+const writeRoles = requireReceptionistPermission(RECEPTIONIST_PERMISSIONS.MANAGE);
+const callArtifactRead = requireReceptionistPermission(RECEPTIONIST_PERMISSIONS.CALL_ARTIFACTS_READ);
+const e164Phone = z.string().trim().max(40)
+  .transform(value => value.replace(/[().\s-]/g, ''))
+  .refine(value => /^\+[1-9]\d{7,14}$/.test(value), 'Phone must include country code in E.164 format');
 
 const FIELD_TYPES = [
   'FIRST_NAME', 'LAST_NAME', 'PHONE', 'EMAIL', 'PREFERRED_DATE', 'PREFERRED_TIME',
@@ -133,7 +149,7 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
   // ===== Clinics ==========================================================
   const clinicCreate = z.object({
     name: z.string().trim().min(2).max(160),
-    phone: z.string().trim().min(3).max(40),
+    phone: e164Phone,
     logoUrl: z.string().trim().max(500).optional().nullable(),
     website: z.string().trim().max(300).optional().nullable(),
     addressLine: z.string().trim().max(300).optional().nullable(),
@@ -462,7 +478,7 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
   });
 
   // ===== Appointment requests (read) ======================================
-  app.get('/appointment-requests', async request => {
+  app.get('/appointment-requests', { preHandler: callArtifactRead }, async request => {
     const query = z.object({
       clinicId: uuid.optional(),
       campaignId: uuid.optional(),
@@ -495,13 +511,13 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
   });
 
   // ===== Call logs (read) =================================================
-  app.get('/call-logs', async request => {
+  app.get('/call-logs', { preHandler: callArtifactRead }, async request => {
     const query = z.object({
       clinicId: uuid.optional(),
       campaignId: uuid.optional(),
       limit: z.coerce.number().int().min(1).max(200).default(100),
     }).parse(request.query);
-    return db.receptionistCallLog.findMany({
+    const rows = await db.receptionistCallLog.findMany({
       where: {
         tenantId: request.auth.tenantId,
         ...(query.clinicId ? { clinicId: query.clinicId } : {}),
@@ -511,6 +527,38 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
       take: query.limit,
       include: { campaign: { select: { id: true, name: true } } },
     });
+    const canReadRecordings = await hasReceptionistPermission(request, RECEPTIONIST_PERMISSIONS.RECORDINGS_READ);
+    await audit(request, {
+      action: 'receptionistCallLog.listRead',
+      resource: 'receptionistCallLog',
+      metadata: { count: rows.length, recordingsDisclosed: canReadRecordings },
+    });
+    return rows.map(row => ({
+      ...row,
+      recordingAvailable: Boolean(row.recordingUrl),
+      recordingUrl: canReadRecordings ? row.recordingUrl : null,
+    }));
+  });
+
+  app.get('/call-logs/:id', { preHandler: callArtifactRead }, async request => {
+    const { id } = idParam.parse(request.params);
+    const row = await db.receptionistCallLog.findFirst({
+      where: { id, tenantId: request.auth.tenantId },
+      include: { campaign: { select: { id: true, name: true } } },
+    });
+    if (!row) throw app.httpErrors.notFound('Call log not found');
+    const canReadRecording = await hasReceptionistPermission(request, RECEPTIONIST_PERMISSIONS.RECORDINGS_READ);
+    await audit(request, {
+      action: 'receptionistCallLog.read',
+      resource: 'receptionistCallLog',
+      resourceId: row.id,
+      metadata: { recordingDisclosed: canReadRecording && Boolean(row.recordingUrl) },
+    });
+    return {
+      ...row,
+      recordingAvailable: Boolean(row.recordingUrl),
+      recordingUrl: canReadRecording ? row.recordingUrl : null,
+    };
   });
 
   // ===== Opt-outs =========================================================
@@ -524,7 +572,7 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
     message: 'A phone number or email is required',
   });
 
-  app.get('/opt-outs', async request => {
+  app.get('/opt-outs', { preHandler: callArtifactRead }, async request => {
     return db.receptionistOptOut.findMany({
       where: { tenantId: request.auth.tenantId },
       orderBy: { createdAt: 'desc' },
@@ -602,6 +650,118 @@ function verifyRetellSignature(rawBody: Buffer | undefined, signature: string | 
   return timingSafeEqual(expectedBuffer, signatureBuffer);
 }
 
+function canonicalRetellDestination(value: string | undefined): string | null {
+  if (!value) return null;
+  const normalized = value.trim().replace(/[().\s-]/g, '');
+  return /^\+[1-9]\d{7,14}$/.test(normalized) ? normalized : null;
+}
+
+function opaqueIngressReference(value: string | undefined): string {
+  return createHash('sha256').update(value ?? 'missing').digest('hex');
+}
+
+async function flagRetellIngressReview(tenantId: string, callId: string, reason: string) {
+  const entityId = opaqueIngressReference(callId);
+  await db.operationalSignal.upsert({
+    where: { tenantId_signalType_entityType_entityId: { tenantId, signalType: 'RECEPTIONIST_INGRESS_REVIEW', entityType: 'retell_call', entityId } },
+    update: { severity: 'high', score: 100, reason, status: 'open' },
+    create: { tenantId, signalType: 'RECEPTIONIST_INGRESS_REVIEW', entityType: 'retell_call', entityId, severity: 'high', score: 100, reason, status: 'open' },
+  });
+}
+
+async function flagUnresolvedRetellIngress(callId: string | undefined, destination: string | null, direction: string | undefined) {
+  await platformDb.platformAuditEvent.create({
+    data: {
+      action: 'receptionist.ingress.unresolved',
+      targetType: 'retell_ingress',
+      targetId: opaqueIngressReference(callId).slice(0, 32),
+      metadata: {
+        callRef: opaqueIngressReference(callId).slice(0, 32),
+        destinationRef: opaqueIngressReference(destination ?? undefined).slice(0, 32),
+        direction: direction ?? 'unknown',
+        disposition: 'manual_configuration_review',
+      },
+    },
+  });
+}
+
+async function admitInboundReceptionist(tenantId: string, providerCallId: string, reservation: {
+  clinicId?: string; campaignId?: string; callerPhone?: string; direction?: string; enforceAdmission?: boolean;
+} = {}) {
+  return db.$transaction(async tx => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-capacity:${tenantId}`})::bigint)`;
+    const existing = await tx.receptionistCallLog.findFirst({ where: { tenantId, retellCallId: providerCallId }, select: { id: true } });
+    if (reservation.enforceAdmission !== false && !(await isFeatureEnabled(tenantId, 'ai_receptionist', tx))) return { allowed: false as const, reason: 'feature_locked' };
+    if (reservation.enforceAdmission === false) {
+      // Terminal delivery may bypass a newly enabled kill switch only to
+      // reconcile a call that was already admitted. It must not bootstrap an
+      // unknown/unadmitted provider call.
+      if (!existing) return { allowed: false as const, reason: 'terminal_without_active_call' };
+      return { allowed: true as const, reserved: false };
+    }
+    // A dropped terminal webhook must not consume tenant capacity forever.
+    // Expire only clearly stale in-progress rows under the same capacity lock;
+    // a late terminal event can still reconcile the provider's final outcome.
+    const leaseCutoff = new Date(Date.now() - RECEPTIONIST_CALL_LEASE_MS);
+    const staleCalls = await tx.receptionistCallLog.findMany({
+      where: {
+        tenantId,
+        outcome: 'IN_PROGRESS',
+        endedAt: null,
+        OR: [
+          { startedAt: { lt: leaseCutoff } },
+          { startedAt: null, createdAt: { lt: leaseCutoff } },
+        ],
+      },
+      select: { id: true },
+    });
+    if (staleCalls.length) {
+      const endedAt = new Date();
+      await tx.receptionistCallLog.updateMany({
+        where: { id: { in: staleCalls.map(call => call.id) }, tenantId, outcome: 'IN_PROGRESS', endedAt: null },
+        data: { outcome: 'FAILED', endedAt },
+      });
+      await tx.auditEvent.create({
+        data: {
+          tenantId,
+          action: 'receptionist.call_lease.expired',
+          resource: 'receptionistCapacity',
+          resourceId: tenantId,
+          userAgent: 'receptionist-admission',
+          metadata: { closedCount: staleCalls.length, leaseHours: RECEPTIONIST_CALL_LEASE_MS / 3_600_000, durationUnverified: true },
+        },
+      });
+    }
+    const aiUsage = await tx.tenantAiUsage.upsert({
+      where: { tenantId },
+      update: {},
+      create: { tenantId },
+      select: { receptionistMinutes: true, overageAllowed: true, killSwitch: true },
+    });
+    if (aiUsage.killSwitch) return { allowed: false as const, reason: 'kill_switch' };
+    const voiceUsage = await tx.tenantUsageLimit.upsert({
+      where: { tenantId_key: { tenantId, key: 'voice_minutes' } },
+      update: {},
+      create: { tenantId, key: 'voice_minutes', limitValue: DEFAULT_VOICE_MINUTES_LIMIT, used: aiUsage.receptionistMinutes },
+      select: { used: true, limitValue: true },
+    });
+    const activeCalls = await tx.receptionistCallLog.count({
+      where: { tenantId, outcome: 'IN_PROGRESS', endedAt: null, retellCallId: { not: providerCallId } },
+    });
+    if (activeCalls >= MAX_TENANT_ACTIVE_CALLS) return { allowed: false as const, reason: 'concurrency_limit_reached' };
+    const usedMinutes = Math.max(voiceUsage.used, aiUsage.receptionistMinutes);
+    if (!aiUsage.overageAllowed && voiceUsage.limitValue !== null && usedMinutes + activeCalls >= voiceUsage.limitValue) {
+      return { allowed: false as const, reason: 'voice_minutes_limit_reached' };
+    }
+    if (!existing) await tx.receptionistCallLog.create({ data: { tenantId, clinicId: reservation.clinicId, campaignId: reservation.campaignId, retellCallId: providerCallId, callerPhone: reservation.callerPhone, direction: reservation.direction ?? 'inbound', startedAt: new Date() } });
+    return { allowed: true as const, reserved: !existing };
+  });
+}
+
+async function flagInboundAdmissionDenied(tenantId: string, providerCallId: string, reason: string) {
+  await flagRetellIngressReview(tenantId, providerCallId, `Inbound receptionist admission denied: ${reason}`);
+}
+
 // ===== Public webhook (no JWT — Retell posts events here) =================
 export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
   app.post('/webhooks/retell', async (request, reply) => {
@@ -624,43 +784,85 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     }).partial().parse(request.body ?? {});
 
     const call = body.call ?? {};
-    let tenantId: string | undefined;
-    if (query.campaignId) {
-      const campaign = await db.receptionistCampaign.findUnique({ where: { id: query.campaignId }, select: { tenantId: true, clinicId: true } });
-      tenantId = campaign?.tenantId;
-    } else if (query.clinicId) {
-      const clinic = await db.receptionistClinic.findUnique({ where: { id: query.clinicId }, select: { tenantId: true } });
-      tenantId = clinic?.tenantId;
-    }
 
-    // Signature verification — never accept unsigned production webhooks.
+    // Signature verification — unverifiable webhooks never establish tenant
+    // authority in any environment.
     const signatureRaw = request.headers['x-retell-signature'];
     const signatureHeader = Array.isArray(signatureRaw) ? signatureRaw[0] : signatureRaw;
     if (env.RETELL_API_KEY) {
       if (!verifyRetellSignature(request.rawBody, signatureHeader, env.RETELL_API_KEY)) {
-        request.log.warn({ ip: request.ip, clinicId: query.clinicId, campaignId: query.campaignId }, 'Retell webhook signature verification failed');
-        if (tenantId) {
-          await db.auditEvent.create({
-            data: {
-              tenantId,
-              action: 'receptionist.webhook.verification_failed',
-              resource: 'receptionistWebhook',
-              ipAddress: request.ip,
-              userAgent: typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : undefined,
-              metadata: { clinicId: query.clinicId ?? null, campaignId: query.campaignId ?? null },
-            },
-          });
-        }
+        request.log.warn({ ip: request.ip }, 'Retell webhook signature verification failed');
         return reply.code(401).send({ error: 'INVALID_SIGNATURE' });
       }
-    } else if (env.NODE_ENV === 'production') {
-      request.log.error('Retell webhook rejected: RETELL_API_KEY not configured in production');
-      return reply.code(503).send({ error: 'WEBHOOK_NOT_CONFIGURED' });
     } else {
-      request.log.warn('Retell webhook accepted WITHOUT verification (non-production; set RETELL_API_KEY to enforce)');
+      request.log.error('Retell webhook rejected: RETELL_API_KEY not configured');
+      return reply.code(503).send({ error: 'WEBHOOK_NOT_CONFIGURED' });
     }
 
-    if (!tenantId) return reply.code(202).send({ ok: true, ignored: true });
+    // Retell's signature authenticates the exact provider body globally. A
+    // persisted opaque call id remains the primary mapping. For the first event
+    // of an inbound call only, the signed destination number may bootstrap a
+    // tenant when it maps to exactly one active clinic. Outbound `to_number` is
+    // the patient destination and is therefore never tenant authority.
+    const providerCallId = call.call_id?.trim();
+    const callResolution = providerCallId
+      ? await resolveIngressTenant('retell_call_id', providerCallId)
+      : null;
+    const signedDestination = call.direction === 'inbound'
+      ? canonicalRetellDestination(call.to_number)
+      : null;
+    const destinationResolution = !callResolution && providerCallId && signedDestination
+      ? await resolveIngressTenant('retell_destination_phone', signedDestination)
+      : null;
+    const resolved = callResolution ?? destinationResolution;
+    const resolvedByDestination = Boolean(destinationResolution);
+    if (!resolved || !providerCallId) {
+      request.log.warn({
+        callRef: opaqueIngressReference(providerCallId).slice(0, 16),
+        destinationRef: opaqueIngressReference(signedDestination ?? undefined).slice(0, 16),
+        direction: call.direction ?? 'unknown',
+      }, 'Signed Retell webhook requires manual ingress mapping review');
+      await flagUnresolvedRetellIngress(providerCallId, signedDestination, call.direction);
+      return reply.code(202).send({ ok: true, ignored: true, reason: 'unresolved_call' });
+    }
+    const tenantId = resolved.tenantId;
+    enterTenantContext({ tenantId, actorId: `webhook:retell:${resolved.resourceId}`, actorRole: 'WEBHOOK', source: 'webhook', requestId: request.id });
+    let trustedClinicId: string | undefined = resolvedByDestination ? resolved.resourceId : undefined;
+    let trustedCampaignId: string | undefined;
+    if (query.campaignId) {
+      const campaign = await db.receptionistCampaign.findFirst({ where: { id: query.campaignId, tenantId }, select: { clinicId: true } });
+      if (!campaign || (trustedClinicId && campaign.clinicId !== trustedClinicId) || (query.clinicId && campaign.clinicId !== query.clinicId)) {
+        await flagRetellIngressReview(tenantId, providerCallId, 'Signed Retell webhook selectors did not match the trusted clinic mapping');
+        return reply.code(202).send({ ok: true, ignored: true });
+      }
+      trustedCampaignId = query.campaignId;
+      trustedClinicId = campaign.clinicId;
+    } else if (query.clinicId) {
+      const clinic = await db.receptionistClinic.findFirst({ where: { id: query.clinicId, tenantId }, select: { id: true } });
+      if (!clinic || (trustedClinicId && clinic.id !== trustedClinicId)) {
+        await flagRetellIngressReview(tenantId, providerCallId, 'Signed Retell webhook clinic selector did not match the trusted clinic mapping');
+        return reply.code(202).send({ ok: true, ignored: true });
+      }
+      trustedClinicId = clinic.id;
+    }
+
+    const endedEvent = body.event === 'call_ended' || body.event === 'call_analyzed';
+    if (call.direction === 'inbound' || resolvedByDestination) {
+      const admission = await admitInboundReceptionist(tenantId, providerCallId, {
+        clinicId: trustedClinicId,
+        campaignId: trustedCampaignId,
+        callerPhone: call.from_number,
+        direction: 'inbound',
+        // A terminal lifecycle event must always reconcile an already-started
+        // provider call, even when a kill switch was enabled in the meantime.
+        enforceAdmission: !endedEvent,
+      });
+      if (!admission.allowed) {
+        const stopped = await stopPhoneCall(providerCallId);
+        await flagInboundAdmissionDenied(tenantId, providerCallId, `${admission.reason}; provider_stop_applied=${stopped.applied}`);
+        return reply.code(202).send({ ok: true, ignored: true, reason: 'admission_denied', providerStopApplied: stopped.applied });
+      }
+    }
 
     // Audit receipt of the (verified) webhook. No PHI — call id + event only.
     await db.auditEvent.create({
@@ -668,7 +870,7 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         tenantId,
         action: 'receptionist.webhook.received',
         resource: 'receptionistWebhook',
-        resourceId: call.call_id,
+        resourceId: providerCallId,
         ipAddress: request.ip,
         userAgent: typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : undefined,
         metadata: { event: body.event ?? null },
@@ -678,74 +880,140 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     const analysis = call.call_analysis ?? {};
     const custom = (analysis.custom_analysis_data ?? {}) as Record<string, unknown>;
     const outcomeRaw = String(custom.outcome ?? '').toUpperCase();
-    const validOutcomes = ['BOOKED', 'NOT_INTERESTED', 'NO_ANSWER', 'VOICEMAIL', 'ESCALATED', 'OPTED_OUT', 'FAILED'];
-    const outcome = validOutcomes.includes(outcomeRaw) ? (outcomeRaw as never) : ('IN_PROGRESS' as never);
-
+    type CallOutcome = 'IN_PROGRESS' | 'BOOKED' | 'NOT_INTERESTED' | 'NO_ANSWER' | 'VOICEMAIL' | 'ESCALATED' | 'OPTED_OUT' | 'FAILED';
+    const validOutcomes: ReadonlyArray<Exclude<CallOutcome, 'IN_PROGRESS'>> = ['BOOKED', 'NOT_INTERESTED', 'NO_ANSWER', 'VOICEMAIL', 'ESCALATED', 'OPTED_OUT', 'FAILED'];
     const durationSeconds = call.duration_ms ? Math.round(call.duration_ms / 1000) : 0;
-    const ended = body.event === 'call_ended' || body.event === 'call_analyzed';
-    const existingCall = call.call_id
-      ? await db.receptionistCallLog.findFirst({ where: { retellCallId: call.call_id, tenantId } })
+    const ended = endedEvent;
+    const existingCall = await db.receptionistCallLog.findFirst({ where: { retellCallId: providerCallId, tenantId } });
+    trustedClinicId ??= existingCall?.clinicId ?? undefined;
+    const isOutbound = Boolean(existingCall?.outboundCampaignId);
+    const bookingClaim = outcomeRaw === 'BOOKED' && !isOutbound
+      ? await db.idempotencyKey.findFirst({
+        where: { tenantId, scope: 'receptionist.live-booking', key: { startsWith: `${providerCallId}:` }, resultId: { not: null } },
+        select: { resultId: true },
+      })
       : null;
+    const canonicalBooking = bookingClaim?.resultId
+      ? await db.appointment.findFirst({ where: { id: bookingClaim.resultId, tenantId, deletedAt: null }, select: { id: true } })
+      : null;
+    // Provider/LLM analysis alone is not proof of a booking. Without the
+    // canonical Appointment created by the signed live tool, route to review.
+    const normalizedOutcomeRaw = outcomeRaw === 'BOOKED' && !isOutbound && !canonicalBooking ? 'ESCALATED' : outcomeRaw;
+    const outcome: CallOutcome = validOutcomes.includes(normalizedOutcomeRaw as Exclude<CallOutcome, 'IN_PROGRESS'>)
+      ? normalizedOutcomeRaw as Exclude<CallOutcome, 'IN_PROGRESS'>
+      : 'IN_PROGRESS';
 
-    if (existingCall) {
-      await db.receptionistCallLog.update({
-        where: { id: existingCall.id },
-        data: {
-          outcome,
-          recordingUrl: call.recording_url,
-          transcriptSummary: analysis.call_summary,
-          sentiment: analysis.user_sentiment,
-          durationSeconds,
-          endedAt: ended ? new Date() : undefined,
-        },
+    // Serialize lifecycle and usage accounting for this provider call. Retell
+    // commonly sends call_ended and call_analyzed with the same duration; only
+    // the positive billable-minute delta is charged, so replay cannot inflate
+    // tenant usage or bypass the outbound spend gate.
+    const persistedCall = await db.$transaction(async tx => {
+      const lifecycleKey = `receptionist-call-lifecycle:${tenantId}:${providerCallId}`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lifecycleKey})::bigint)`;
+      const current = await tx.receptionistCallLog.findFirst({ where: { retellCallId: providerCallId, tenantId } });
+      const persistedOutcome: CallOutcome = current && outcome === 'IN_PROGRESS' && current.outcome !== 'IN_PROGRESS'
+        ? current.outcome
+        : outcome;
+      const row = current
+        ? await tx.receptionistCallLog.update({
+          where: { id: current.id },
+          data: {
+            outcome: persistedOutcome,
+            sentiment: analysis.user_sentiment,
+            durationSeconds: Math.max(current.durationSeconds, durationSeconds),
+            endedAt: ended ? (current.endedAt ?? new Date()) : undefined,
+          },
+        })
+        : await tx.receptionistCallLog.create({
+          data: {
+            tenantId,
+            clinicId: trustedClinicId,
+            campaignId: trustedCampaignId,
+            retellCallId: providerCallId,
+            callerPhone: call.from_number,
+            direction: call.direction ?? 'outbound',
+            outcome: persistedOutcome,
+            sentiment: analysis.user_sentiment,
+            durationSeconds,
+            startedAt: new Date(),
+            endedAt: ended ? new Date() : undefined,
+          },
+        });
+      if (ended) {
+        const priorMinutes = current ? Math.ceil(current.durationSeconds / 60) : 0;
+        const finalMinutes = Math.ceil(row.durationSeconds / 60);
+        const delta = Math.max(0, finalMinutes - priorMinutes);
+        if (delta > 0) {
+          await tx.tenantAiUsage.upsert({
+            where: { tenantId },
+            update: { receptionistMinutes: { increment: delta } },
+            create: { tenantId, receptionistMinutes: delta },
+          });
+          await tx.tenantUsageLimit.upsert({
+            where: { tenantId_key: { tenantId, key: 'voice_minutes' } },
+            update: { used: { increment: delta } },
+            create: { tenantId, key: 'voice_minutes', limitValue: 500, used: delta },
+          });
+        }
+      }
+      return row;
+    });
+
+    // Provider/LLM analysis is never accepted as legal consent evidence. Only
+    // the signed, idempotent in-call recording-preference tool may create it.
+    await ingestCallArtifacts({
+      tenantId,
+      callLogId: persistedCall.id,
+      recordingUrl: call.recording_url,
+      transcriptSummary: analysis.call_summary,
+      retentionFrom: ended ? new Date() : undefined,
+    });
+
+    // Move an owned outbound target out of CALLING exactly once. Retryable
+    // outcomes return to PENDING only while the configured retry allowance
+    // remains; terminal states cannot be reopened by webhook redelivery.
+    if (existingCall?.targetId && existingCall.outboundCampaignId && ended) {
+      const target = await db.receptionistCallTarget.findFirst({
+        where: { id: existingCall.targetId, tenantId, campaignId: existingCall.outboundCampaignId },
+        include: { campaign: { select: { maxRetryAttempts: true } } },
       });
-    } else {
-      await db.receptionistCallLog.create({
-        data: {
-          tenantId,
-          clinicId: query.clinicId,
-          campaignId: query.campaignId,
-          retellCallId: call.call_id,
-          callerPhone: call.from_number,
-          direction: call.direction ?? 'outbound',
-          outcome,
-          recordingUrl: call.recording_url,
-          transcriptSummary: analysis.call_summary,
-          sentiment: analysis.user_sentiment,
-          durationSeconds,
-          startedAt: new Date(),
-          endedAt: ended ? new Date() : undefined,
-        },
-      });
-    }
-
-    // Opt-out and booking writes are guarded by the call id so webhook
-    // redelivery cannot create duplicate records.
-    const idempotencyAnchor = call.call_id ?? `${call.from_number ?? 'unknown'}:${body.event ?? 'event'}`;
-    // Outbound campaign calls are owned by the booking handoff below (new
-    // AppointmentRequest workflow); only studio calls use the legacy request.
-    const isOutbound = !!existingCall?.outboundCampaignId;
-
-    if (outcome === 'OPTED_OUT' && (call.from_number || custom.email)) {
-      if (await claimWebhookIdempotency('retell.optout', `${tenantId}:${idempotencyAnchor}`, tenantId)) {
-        await db.receptionistOptOut.create({
-          data: { tenantId, clinicId: query.clinicId, contactPhone: call.from_number, contactEmail: typeof custom.email === 'string' ? custom.email : undefined, channel: 'ALL', reason: 'Requested during AI call' },
+      const nextStatus = target ? targetStatusAfterOutcome(outcomeRaw, target.attempts, target.campaign.maxRetryAttempts) : null;
+      if (target && nextStatus) {
+        await db.receptionistCallTarget.updateMany({
+          where: { id: target.id, tenantId, campaignId: existingCall.outboundCampaignId, status: 'CALLING' },
+          data: { status: nextStatus, lastOutcome: outcomeRaw, lastCallLogId: existingCall.id },
         });
       }
     }
 
-    if (outcome === 'BOOKED' && !isOutbound) {
+    // Opt-out and booking writes are guarded by the call id so webhook
+    // redelivery cannot create duplicate records.
+    const idempotencyAnchor = providerCallId;
+    // Outbound campaign calls are owned by the booking handoff below (new
+    // AppointmentRequest workflow); only studio calls use the legacy request.
+    const optOutPhone = existingCall?.direction === 'outbound'
+      ? existingCall.callerPhone
+      : call.from_number;
+    if (outcome === 'OPTED_OUT' && (optOutPhone || custom.email)) {
+      if (await claimWebhookIdempotency('retell.optout', `${tenantId}:${idempotencyAnchor}`, tenantId)) {
+        await db.receptionistOptOut.create({
+          data: { tenantId, clinicId: trustedClinicId, contactPhone: optOutPhone, contactEmail: typeof custom.email === 'string' ? custom.email : undefined, channel: 'ALL', reason: 'Requested during AI call' },
+        });
+      }
+    }
+
+    if (outcomeRaw === 'BOOKED' && !isOutbound && !canonicalBooking) {
       if (await claimWebhookIdempotency('retell.booking', `${tenantId}:${idempotencyAnchor}`, tenantId)) {
         await db.receptionistAppointmentRequest.create({
           data: {
             tenantId,
-            clinicId: query.clinicId,
-            campaignId: query.campaignId,
+            clinicId: trustedClinicId,
+            campaignId: trustedCampaignId,
             contactPhone: call.from_number,
             contactName: typeof custom.first_name === 'string' ? custom.first_name : undefined,
             requestedDate: typeof custom.appointment_date === 'string' ? custom.appointment_date : undefined,
             requestedTime: typeof custom.appointment_time === 'string' ? custom.appointment_time : undefined,
-            status: 'CONFIRMED',
+            status: 'PENDING',
             collectedData: custom as never,
             source: 'retell',
           },
@@ -756,9 +1024,9 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     // Outbound campaign calls run the booking handoff: link/create patient or
     // lead, create an AppointmentRequest, and book only when safe. The handoff
     // is a no-op for studio (non-outbound) calls and is idempotent on call id.
-    if (call.call_id && ended) {
+    if (ended) {
       try {
-        const result = await runBookingHandoff(call.call_id, custom);
+        const result = await runBookingHandoff(providerCallId, custom);
         if (result.handled && result.reason !== 'duplicate_webhook') {
           request.log.info({ status: result.status }, 'Receptionist booking handoff completed');
         }
@@ -790,54 +1058,130 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       phone: z.string().max(40).optional(),
       email: z.string().max(160).optional(),
       service: z.string().max(120).optional(),
+      caller_name: z.string().max(80).optional(),
+      callback_phone: z.string().max(40).optional(),
+      reason_category: z.string().max(40).optional(),
+      message: z.string().max(500).optional(),
+      date_of_birth: z.string().max(10).optional(),
+      recording_decision: z.enum(['GRANTED', 'REFUSED', 'WITHDRAWN']).optional(),
+      jurisdiction: z.string().max(80).optional(),
     }).passthrough();
     const body = z.object({
       name: z.string().max(64),
       args: fnArgs.default({}),
-      call: z.object({ call_id: z.string().max(128).optional(), from_number: z.string().max(40).optional() }).optional(),
+      call: z.object({
+        call_id: z.string().max(128).optional(),
+        from_number: z.string().max(40).optional(),
+        to_number: z.string().max(40).optional(),
+        direction: z.enum(['inbound', 'outbound']).optional(),
+      }).optional(),
     }).parse(request.body);
 
-    let tenantId: string | null = null;
-    if (query.campaignId) {
-      const c = await db.receptionistCampaign.findUnique({ where: { id: query.campaignId }, select: { tenantId: true } });
-      tenantId = c?.tenantId ?? null;
-    } else if (query.clinicId) {
-      const c = await db.receptionistClinic.findUnique({ where: { id: query.clinicId }, select: { tenantId: true } });
-      tenantId = c?.tenantId ?? null;
-    }
-    if (!tenantId) return reply.code(202).send({ message: "I'm sorry, I can't access this clinic right now." });
-
-    // Signature verification — MIRRORS /webhooks/retell. In production with a
-    // real key, REJECT (401) when the signature is absent OR invalid; 503 when
-    // the key is missing. The unsigned dev bypass applies ONLY when NODE_ENV is
-    // not production. An absent header is NO LONGER a free pass (the prior
-    // `if (sigHeader && …)` gate let anyone with a clinic id book/send SMS).
+    // Signature verification — MIRRORS /webhooks/retell. Reject when the
+    // signature is absent/invalid and fail closed when the key is missing.
     const sig = request.headers['x-retell-signature'];
     const sigHeader = Array.isArray(sig) ? sig[0] : sig;
     if (env.RETELL_API_KEY) {
       if (!verifyRetellSignature(request.rawBody, sigHeader, env.RETELL_API_KEY)) {
-        request.log.warn({ ip: request.ip, clinicId: query.clinicId, campaignId: query.campaignId }, 'Retell fn webhook signature verification failed');
-        await db.auditEvent.create({
-          data: {
-            tenantId,
-            action: 'receptionist.webhook.fn.verification_failed',
-            resource: 'receptionistWebhook',
-            ipAddress: request.ip,
-            userAgent: typeof request.headers['user-agent'] === 'string' ? request.headers['user-agent'] : undefined,
-            metadata: { clinicId: query.clinicId ?? null, campaignId: query.campaignId ?? null, fn: body.name },
-          },
-        }).catch(() => {});
+        request.log.warn({ ip: request.ip }, 'Retell fn webhook signature verification failed');
         return reply.code(401).send({ error: 'INVALID_SIGNATURE' });
       }
-    } else if (env.NODE_ENV === 'production') {
-      request.log.error('Retell fn webhook rejected: RETELL_API_KEY not configured in production');
-      return reply.code(503).send({ error: 'WEBHOOK_NOT_CONFIGURED' });
     } else {
-      request.log.warn('Retell fn webhook accepted WITHOUT verification (non-production; set RETELL_API_KEY to enforce)');
+      request.log.error('Retell fn webhook rejected: RETELL_API_KEY not configured');
+      return reply.code(503).send({ error: 'WEBHOOK_NOT_CONFIGURED' });
+    }
+
+    const providerCallId = body.call?.call_id?.trim();
+    const callResolution = providerCallId
+      ? await resolveIngressTenant('retell_call_id', providerCallId)
+      : null;
+    const signedDestination = body.call?.direction === 'inbound'
+      ? canonicalRetellDestination(body.call.to_number)
+      : null;
+    const destinationResolution = !callResolution && providerCallId && signedDestination
+      ? await resolveIngressTenant('retell_destination_phone', signedDestination)
+      : null;
+    const resolved = callResolution ?? destinationResolution;
+    const resolvedByDestination = Boolean(destinationResolution);
+    if (!resolved || !providerCallId) {
+      request.log.warn({
+        callRef: opaqueIngressReference(providerCallId).slice(0, 16),
+        destinationRef: opaqueIngressReference(signedDestination ?? undefined).slice(0, 16),
+        direction: body.call?.direction ?? 'unknown',
+      }, 'Signed Retell tool call requires manual ingress mapping review');
+      await flagUnresolvedRetellIngress(providerCallId, signedDestination, body.call?.direction);
+      return reply.code(202).send({ message: "I'm sorry, I can't access this clinic right now." });
+    }
+    const tenantId = resolved.tenantId;
+    enterTenantContext({ tenantId, actorId: `webhook:retell-tool:${resolved.resourceId}`, actorRole: 'WEBHOOK', source: 'webhook', requestId: request.id });
+    let trustedClinicId: string | undefined = resolvedByDestination ? resolved.resourceId : undefined;
+    if (query.campaignId) {
+      const campaign = await db.receptionistCampaign.findFirst({ where: { id: query.campaignId, tenantId }, select: { clinicId: true } });
+      if (!campaign || (trustedClinicId && campaign.clinicId !== trustedClinicId) || (query.clinicId && campaign.clinicId !== query.clinicId)) {
+        await flagRetellIngressReview(tenantId, providerCallId, 'Signed Retell tool selectors did not match the trusted clinic mapping');
+        return reply.code(202).send({ message: "I'm sorry, I can't access this clinic right now." });
+      }
+      trustedClinicId = campaign.clinicId;
+    } else if (query.clinicId) {
+      const clinic = await db.receptionistClinic.findFirst({ where: { id: query.clinicId, tenantId }, select: { id: true } });
+      if (!clinic || (trustedClinicId && clinic.id !== trustedClinicId)) {
+        await flagRetellIngressReview(tenantId, providerCallId, 'Signed Retell tool clinic selector did not match the trusted clinic mapping');
+        return reply.code(202).send({ message: "I'm sorry, I can't access this clinic right now." });
+      }
+      trustedClinicId = clinic.id;
+    }
+
+    if (body.call?.direction === 'inbound' || resolvedByDestination) {
+      const admission = await admitInboundReceptionist(tenantId, providerCallId, { clinicId: trustedClinicId, callerPhone: body.call?.from_number, direction: 'inbound' });
+      if (!admission.allowed) {
+        const stopped = await stopPhoneCall(providerCallId);
+        await flagInboundAdmissionDenied(tenantId, providerCallId, `${admission.reason}; provider_stop_applied=${stopped.applied}`);
+        return reply.code(202).send({ message: "I'm sorry, this clinic's AI receptionist is unavailable right now. I can only direct you to staff.", providerStopApplied: stopped.applied });
+      }
+    }
+
+    // The tool webhook may arrive before the lifecycle event. Serialize the
+    // bootstrap so event/tool races create one persisted opaque call mapping.
+    const activeCall = await db.$transaction(async tx => {
+      const lifecycleKey = `receptionist-call-lifecycle:${tenantId}:${providerCallId}`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lifecycleKey})::bigint)`;
+      const existing = await tx.receptionistCallLog.findFirst({ where: { tenantId, retellCallId: providerCallId } });
+      trustedClinicId ??= existing?.clinicId ?? undefined;
+      if (!existing) {
+        return tx.receptionistCallLog.create({
+          data: {
+            tenantId,
+            clinicId: trustedClinicId,
+            retellCallId: providerCallId,
+            callerPhone: body.call?.from_number,
+            direction: body.call?.direction ?? 'inbound',
+            startedAt: new Date(),
+          },
+        });
+      }
+      return existing;
+    });
+
+    const activeSince = activeCall.startedAt ?? activeCall.createdAt;
+    if (activeCall.endedAt || activeCall.outcome !== 'IN_PROGRESS' || activeSince.getTime() < Date.now() - RECEPTIONIST_CALL_LEASE_MS) {
+      await flagRetellIngressReview(tenantId, providerCallId, 'Signed Retell tool rejected because the call is ended, terminal, or outside its active lease');
+      return reply.code(200).send({ allowed: false, needs_human: true, message: 'This call is no longer active. I cannot access or change patient information.' });
+    }
+
+    const SAFE_WITHOUT_RECORDING_GRANT = new Set(['record_recording_preference', 'record_do_not_call', 'request_human_handoff', 'take_message', 'report_emergency', 'check_availability']);
+    if (!SAFE_WITHOUT_RECORDING_GRANT.has(body.name)) {
+      const callState = await db.receptionistCallLog.findFirst({ where: { tenantId, retellCallId: providerCallId }, select: { recordingConsentStatus: true } });
+      if (callState?.recordingConsentStatus !== 'GRANTED') {
+        return reply.code(200).send({ allowed: false, needs_human: true, message: 'I need your explicit agreement to the opening disclosure before I can access or change patient information. I can connect you with staff instead.' });
+      }
     }
 
     const result = await handleAgentTool(
-      { tenantId, callId: body.call?.call_id ?? null, callerPhone: body.call?.from_number ?? null },
+      {
+        tenantId,
+        callId: providerCallId,
+        callerPhone: (body.call?.direction === 'outbound' ? body.call.to_number : body.call?.from_number) ?? null,
+      },
       body.name,
       body.args,
     );

@@ -17,7 +17,7 @@ vi.mock('../workers/queues', () => ({
 }));
 
 const { buildApp } = await import('../app');
-const { db } = await import('../lib/db');
+const { fixtureDb: db } = await import('./helpers/fixtureDb');
 
 let app: FastifyInstance;
 const createdTenantIds: string[] = [];
@@ -55,7 +55,7 @@ describe('hardening — large-dataset pagination is bounded and stable', () => {
     await db.patient.createMany({
       data: Array.from({ length: TOTAL }, (_, i) => ({ tenantId, branchId: branch.id, firstName: `P${i}`, lastName: 'Test', lifecycleStage: 'NEW' as const })),
     });
-    const token = app.jwt.sign({ userId: admin.id, tenantId, type: 'access' });
+    const token = app.jwt.sign({ userId: admin.id, tenantId, role: 'OWNER', type: 'access' });
     const auth = { authorization: `Bearer ${token}` };
 
     // Out-of-range limit is rejected (schema max is 100) — no unbounded scan.

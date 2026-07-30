@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import type { Worker } from 'bullmq';
-import { db } from '../lib/db';
+import { fixtureDb as db } from './helpers/fixtureDb';
 import { createAutopilotWorker } from '../workers/autopilot.worker';
 import { enqueueAutopilotExecution } from '../workers/queues';
 

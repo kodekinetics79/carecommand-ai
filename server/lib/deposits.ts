@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { db } from './db';
 import { env } from '../config/env';
 import { runWithTenantContext } from './tenantContext';
 import { isFeatureEnabled } from './entitlements';
@@ -26,7 +25,7 @@ export function toAmount(value: unknown): number {
 }
 
 async function writeAudit(tenantId: string, actorUserId: string | null, action: string, resource: string, resourceId: string, metadata: Prisma.InputJsonObject) {
-  await db.auditEvent.create({ data: { tenantId, actorUserId: actorUserId ?? undefined, action, resource, resourceId, metadata } }).catch(() => {});
+  await runWithTenantContext(tenantId, tx => tx.auditEvent.create({ data: { tenantId, actorUserId: actorUserId ?? undefined, action, resource, resourceId, metadata } })).catch(() => {});
 }
 
 // --- Provider configuration status (truthful; never fakes success) ---------
@@ -101,17 +100,17 @@ export async function evaluateDepositForAppointment(
   if (!(await isFeatureEnabled(tenantId, PAYMENTS_FEATURE))) {
     return { applied: false, created: false, reason: 'feature_not_enabled' };
   }
-  const appointment = await db.appointment.findFirst({
+  const appointment = await runWithTenantContext(tenantId, tx => tx.appointment.findFirst({
     where: { id: appointmentId, tenantId, deletedAt: null },
     include: { patient: { select: { id: true, lifecycleStage: true } } },
-  });
+  }));
   if (!appointment) return { applied: false, created: false, reason: 'appointment_not_found' };
 
   // Idempotency: an active (non-cancelled, non-waived) requirement already exists.
-  const existing = await db.depositRequirement.findFirst({
+  const existing = await runWithTenantContext(tenantId, tx => tx.depositRequirement.findFirst({
     where: { tenantId, appointmentId, status: { notIn: ['cancelled', 'waived'] } },
     select: { id: true, depositRuleId: true, requiredAmount: true, dueAt: true },
-  });
+  }));
   if (existing) {
     return { applied: true, created: false, requirementId: existing.id, ruleId: existing.depositRuleId ?? undefined, requiredAmount: toAmount(existing.requiredAmount), dueAt: existing.dueAt?.toISOString() ?? null, reason: 'already_linked' };
   }
@@ -133,13 +132,13 @@ export async function evaluateDepositForAppointment(
   if (requiredAmount <= 0) return { applied: false, created: false, reason: 'zero_amount' };
 
   const dueAt = depositDueAt(rule, appointment.startsAt);
-  const requirement = await db.depositRequirement.create({
+  const requirement = await runWithTenantContext(tenantId, tx => tx.depositRequirement.create({
     data: {
       tenantId, branchId: appointment.branchId, patientId: appointment.patientId, appointmentId,
       depositRuleId: rule.id, status: 'required', requiredAmount, collectedAmount: 0,
       reason: rule.name, mode: paymentProviderStatus().mode, dueAt,
     },
-  });
+  }));
   await writeAudit(tenantId, opts.actorUserId ?? null, 'deposit.required', 'depositRequirement', requirement.id, { appointmentId, ruleId: rule.id, requiredAmount });
   await recordWorkflowEvent(tenantId, { eventType: 'deposit.required', entityType: 'depositRequirement', entityId: requirement.id, sourceModule: 'deposits', payload: { appointmentId, requiredAmount } });
   return { applied: true, created: true, requirementId: requirement.id, ruleId: rule.id, requiredAmount, dueAt: dueAt?.toISOString() ?? null, reason: 'created' };
@@ -148,12 +147,12 @@ export async function evaluateDepositForAppointment(
 // On cancellation: void an unpaid requirement. Never fakes a refund — a paid
 // deposit is left intact and flagged for manual review.
 export async function handleAppointmentCancellationDeposit(tenantId: string, appointmentId: string, actorUserId?: string | null): Promise<{ updated: number; needsManualRefund: boolean }> {
-  const requirements = await db.depositRequirement.findMany({ where: { tenantId, appointmentId, status: { notIn: ['cancelled', 'waived'] } }, select: { id: true, status: true } });
+  const requirements = await runWithTenantContext(tenantId, tx => tx.depositRequirement.findMany({ where: { tenantId, appointmentId, status: { notIn: ['cancelled', 'waived'] } }, select: { id: true, status: true } }));
   let updated = 0;
   let needsManualRefund = false;
   for (const req of requirements) {
     if (req.status === 'collected') { needsManualRefund = true; continue; }
-    await db.depositRequirement.update({ where: { id: req.id }, data: { status: 'cancelled' } });
+    await runWithTenantContext(tenantId, tx => tx.depositRequirement.update({ where: { id: req.id }, data: { status: 'cancelled' } }));
     await writeAudit(tenantId, actorUserId ?? null, 'deposit.cancelled', 'depositRequirement', req.id, { appointmentId });
     updated += 1;
   }
@@ -212,11 +211,15 @@ export interface AppointmentPaymentSummary {
 export async function getAppointmentPaymentSummaries(tenantId: string, appointmentIds: string[]): Promise<Map<string, AppointmentPaymentSummary>> {
   const map = new Map<string, AppointmentPaymentSummary>();
   if (appointmentIds.length === 0) return map;
-  const [requirements, paymentRequests, succeededTxns] = await Promise.all([
-    db.depositRequirement.findMany({ where: { tenantId, appointmentId: { in: appointmentIds }, status: { not: 'cancelled' } }, orderBy: { createdAt: 'desc' } }),
-    db.paymentRequest.findMany({ where: { tenantId, appointmentId: { in: appointmentIds } }, orderBy: { createdAt: 'desc' } }),
-    db.paymentTransaction.findMany({ where: { tenantId, appointmentId: { in: appointmentIds }, status: 'succeeded' }, select: { appointmentId: true } }),
-  ]);
+  const [requirements, paymentRequests, succeededTxns] = await runWithTenantContext(tenantId, async tx => {
+    // A Prisma interactive transaction pins one pg client. Keep these queries
+    // sequential: concurrent client.query calls are deprecated in pg and would
+    // make transaction behavior adapter-version-dependent.
+    const requirements = await tx.depositRequirement.findMany({ where: { tenantId, appointmentId: { in: appointmentIds }, status: { not: 'cancelled' } }, orderBy: { createdAt: 'desc' } });
+    const paymentRequests = await tx.paymentRequest.findMany({ where: { tenantId, appointmentId: { in: appointmentIds } }, orderBy: { createdAt: 'desc' } });
+    const succeededTxns = await tx.paymentTransaction.findMany({ where: { tenantId, appointmentId: { in: appointmentIds }, status: 'succeeded' }, select: { appointmentId: true } });
+    return [requirements, paymentRequests, succeededTxns] as const;
+  });
   const reqByAppt = new Map<string, (typeof requirements)[number]>();
   for (const r of requirements) if (r.appointmentId && !reqByAppt.has(r.appointmentId)) reqByAppt.set(r.appointmentId, r);
   const prByAppt = new Map<string, (typeof paymentRequests)[number]>();

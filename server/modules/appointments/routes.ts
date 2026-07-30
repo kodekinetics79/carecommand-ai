@@ -3,12 +3,12 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { cursorPage, paginationSchema } from '../../lib/pagination';
-import { requireRoles } from '../../plugins/roles';
 import { requirePermission } from '../../lib/permissions';
 import { assertBranchAccess, branchScope } from '../../lib/scope';
 import { evaluateDepositForAppointment, getAppointmentPaymentSummaries, handleAppointmentCancellationDeposit } from '../../lib/deposits';
 import { recordWorkflowEvent } from '../../lib/intelligence';
-import { findSlotConflict, isDoubleBookConflictError } from '../../lib/scheduling';
+import { findSlotConflict, isDoubleBookConflictError, resolveSchedulingService } from '../../lib/scheduling';
+import { runWithTenantContext } from '../../lib/tenantContext';
 
 const uuid = z.string().uuid();
 
@@ -26,6 +26,8 @@ const STATUS_TRANSITIONS: Record<'ARRIVED' | 'NO_SHOW' | 'COMPLETED', ReadonlyAr
   NO_SHOW: ['CONFIRMED', 'RISKY', 'WAITLIST'],
   COMPLETED: ['ARRIVED', 'CONFIRMED', 'RISKY'],
 };
+const STAFF_CANCELLABLE_STATUSES = ['CONFIRMED', 'RISKY', 'WAITLIST', 'ARRIVED'] as const;
+const STAFF_RESCHEDULABLE_STATUSES = ['CONFIRMED', 'RISKY', 'WAITLIST', 'NO_SHOW'] as const;
 
 const appointmentQuery = paginationSchema.extend({
   branchId: z.string().uuid().optional(),
@@ -42,10 +44,13 @@ const appointmentInput = z.object({
   // cross-path conflict detection (portal self-book, scheduling module).
   providerProfileId: z.string().uuid().optional(),
   providerRef: z.string().trim().max(120).optional(),
+  serviceCatalogItemId: z.string().uuid().optional(),
   service: z.string().trim().min(2).max(160),
   startsAt: z.coerce.date(),
   endsAt: z.coerce.date(),
-  status: z.enum(['CONFIRMED', 'RISKY', 'ARRIVED', 'NO_SHOW', 'CANCELED', 'COMPLETED', 'WAITLIST']).default('CONFIRMED'),
+  // Historical/terminal states must be reached through explicit lifecycle
+  // transitions, never injected while creating a new appointment.
+  status: z.enum(['CONFIRMED', 'WAITLIST']).default('CONFIRMED'),
   channel: z.enum(['WHATSAPP', 'SMS', 'EMAIL', 'PUSH', 'CALL', 'VIDEO']),
   value: z.coerce.number().min(0).max(1_000_000).default(0),
   notes: z.string().trim().max(2000).optional(),
@@ -57,7 +62,7 @@ const appointmentInput = z.object({
 export const appointmentRoutes: FastifyPluginAsync = async app => {
   app.get('/', { preHandler: canReadAppointments }, async request => {
     const query = appointmentQuery.parse(request.query);
-    const rows = await db.appointment.findMany({
+    const rows = await runWithTenantContext(request.auth.tenantId, tx => tx.appointment.findMany({
       where: {
         tenantId: request.auth.tenantId,
         deletedAt: null,
@@ -74,7 +79,7 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
       cursor: query.cursor ? { id: query.cursor } : undefined,
       skip: query.cursor ? 1 : 0,
       take: query.limit + 1,
-    });
+    }));
     const page = cursorPage(rows, query.limit);
     // Attach appointment-checkout payment/deposit status (batched, no N+1).
     const summaries = await getAppointmentPaymentSummaries(request.auth.tenantId, page.data.map(a => a.id));
@@ -86,10 +91,10 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
   // ----- Single-appointment detail read (PHI: patient identity) --------------
   app.get('/:id', { preHandler: canReadAppointments }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
-    const appointment = await db.appointment.findFirst({
+    const appointment = await runWithTenantContext(request.auth.tenantId, tx => tx.appointment.findFirst({
       where: { id, tenantId: request.auth.tenantId, deletedAt: null, ...branchScope(request) },
       include: { patient: { select: { id: true, firstName: true, lastName: true } } },
-    });
+    }));
     if (!appointment) throw app.httpErrors.notFound('Appointment not found');
     const summaries = await getAppointmentPaymentSummaries(request.auth.tenantId, [appointment.id]);
     // Audit only an actual disclosure (a 404 above discloses nothing). Id-only.
@@ -98,18 +103,26 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
     return { ...appointment, patientName, payment: summaries.get(appointment.id) ?? null };
   });
 
-  app.post('/', { preHandler: requireRoles('OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK') }, async (request, reply) => {
+  app.post('/', { preHandler: canWriteAppointments }, async (request, reply) => {
     const input = appointmentInput.parse(request.body);
     assertBranchAccess(request, input.branchId);
-    const patient = await db.patient.findFirst({
+    const patient = await runWithTenantContext(request.auth.tenantId, tx => tx.patient.findFirst({
       where: { id: input.patientId, branchId: input.branchId, tenantId: request.auth.tenantId, deletedAt: null },
-    });
+    }));
     if (!patient) throw app.httpErrors.badRequest('Patient and branch must belong to this tenant');
+
+    const service = await resolveSchedulingService({
+      tenantId: request.auth.tenantId,
+      serviceCatalogItemId: input.serviceCatalogItemId,
+      service: input.service,
+      fallbackDurationMin: Math.round((input.endsAt.getTime() - input.startsAt.getTime()) / 60_000),
+    });
+    if (!service) throw app.httpErrors.badRequest('Select an active service before booking');
 
     // Guard the provider FK against cross-tenant references (IDOR).
     if (input.providerProfileId) {
-      const provider = await db.providerProfile.findFirst({ where: { id: input.providerProfileId, tenantId: request.auth.tenantId }, select: { id: true } });
-      if (!provider) throw app.httpErrors.badRequest('Provider does not belong to this tenant');
+      const provider = await runWithTenantContext(request.auth.tenantId, tx => tx.providerProfile.findFirst({ where: { id: input.providerProfileId, tenantId: request.auth.tenantId, branchId: input.branchId }, select: { id: true } }));
+      if (!provider) throw app.httpErrors.badRequest('Provider does not belong to this tenant and branch');
     }
 
     // When a provider is linked, this create participates in cross-path conflict
@@ -117,14 +130,13 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
     // guard against a race, and a pre-check gives a clean 409 in the common case.
     let appointment: Awaited<ReturnType<typeof db.appointment.create>>;
     try {
-      if (input.providerProfileId && input.status !== 'CANCELED' && input.status !== 'NO_SHOW') {
-        const durationMin = Math.round((input.endsAt.getTime() - input.startsAt.getTime()) / 60_000);
-        const conflict = await findSlotConflict({ tenantId: request.auth.tenantId, providerProfileId: input.providerProfileId, startsAt: input.startsAt, durationMin, now: input.startsAt });
-        if (conflict === 'already_booked') throw app.httpErrors.conflict('Provider is already booked for this time');
+      if (input.providerProfileId) {
+        const conflict = await runWithTenantContext(request.auth.tenantId, tx => findSlotConflict({ tenantId: request.auth.tenantId, providerProfileId: input.providerProfileId!, startsAt: input.startsAt, durationMin: service.durationMin }, tx));
+        if (conflict) return reply.code(409).send({ error: conflict, message: `Slot unavailable: ${conflict}` });
       }
-      appointment = await db.appointment.create({
-        data: { tenantId: request.auth.tenantId, ...input },
-      });
+      appointment = await runWithTenantContext(request.auth.tenantId, tx => tx.appointment.create({
+        data: { tenantId: request.auth.tenantId, ...input, service: service.name, serviceCatalogItemId: service.id, endsAt: new Date(input.startsAt.getTime() + service.durationMin * 60_000) },
+      }));
     } catch (error) {
       // Lost the race to a concurrent booking → the exclusion constraint fires.
       if (isDoubleBookConflictError(error)) return reply.code(409).send({ error: 'already_booked', message: 'Provider is already booked for this time' });
@@ -146,15 +158,22 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
   });
 
   // ----- Cancel: void unpaid deposits (never fake a refund) ----------------
-  app.patch('/:id/cancel', { preHandler: requireRoles('OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK') }, async request => {
+  app.patch('/:id/cancel', { preHandler: canWriteAppointments }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const reason = z.object({ reason: z.string().trim().max(240).optional() }).parse(request.body ?? {});
-    const appointment = await db.appointment.findFirst({ where: { id, tenantId: request.auth.tenantId, deletedAt: null } });
+    const appointment = await runWithTenantContext(request.auth.tenantId, tx => tx.appointment.findFirst({ where: { id, tenantId: request.auth.tenantId, deletedAt: null } }));
     if (!appointment) throw app.httpErrors.notFound('Appointment not found');
     assertBranchAccess(request, appointment.branchId);
     if (appointment.status === 'CANCELED') throw app.httpErrors.conflict('Appointment is already cancelled');
+    if (!STAFF_CANCELLABLE_STATUSES.includes(appointment.status as (typeof STAFF_CANCELLABLE_STATUSES)[number])) {
+      throw app.httpErrors.conflict(`An appointment in ${appointment.status} status cannot be cancelled`);
+    }
 
-    await db.appointment.update({ where: { id }, data: { status: 'CANCELED' } });
+    const changed = await runWithTenantContext(request.auth.tenantId, tx => tx.appointment.updateMany({
+      where: { id, tenantId: request.auth.tenantId, status: appointment.status, deletedAt: null },
+      data: { status: 'CANCELED' },
+    }));
+    if (changed.count !== 1) throw app.httpErrors.conflict('Appointment changed concurrently; refresh and retry');
     // Void unpaid deposit requirements; paid ones are flagged for MANUAL refund.
     const depositOutcome = await handleAppointmentCancellationDeposit(request.auth.tenantId, id, request.auth.userId);
     await audit(request, { action: 'appointment.cancelled', resource: 'appointment', resourceId: id, metadata: { reason: reason.reason ?? null, needsManualRefund: depositOutcome.needsManualRefund } });
@@ -165,13 +184,15 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
   });
 
   // ----- Reschedule: preserve / idempotently re-evaluate the deposit -------
-  app.patch('/:id/reschedule', { preHandler: requireRoles('OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK') }, async request => {
+  app.patch('/:id/reschedule', { preHandler: canWriteAppointments }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const body = z.object({ startsAt: z.coerce.date(), endsAt: z.coerce.date() }).refine(b => b.endsAt > b.startsAt, { message: 'endsAt must be after startsAt', path: ['endsAt'] }).parse(request.body);
-    const appointment = await db.appointment.findFirst({ where: { id, tenantId: request.auth.tenantId, deletedAt: null } });
+    const appointment = await runWithTenantContext(request.auth.tenantId, tx => tx.appointment.findFirst({ where: { id, tenantId: request.auth.tenantId, deletedAt: null } }));
     if (!appointment) throw app.httpErrors.notFound('Appointment not found');
     assertBranchAccess(request, appointment.branchId);
-    if (appointment.status === 'CANCELED') throw app.httpErrors.conflict('A cancelled appointment cannot be rescheduled');
+    if (!STAFF_RESCHEDULABLE_STATUSES.includes(appointment.status as (typeof STAFF_RESCHEDULABLE_STATUSES)[number])) {
+      throw app.httpErrors.conflict(`An appointment in ${appointment.status} status cannot be rescheduled`);
+    }
 
     // Don't drop this appointment onto another for the same provider. Pre-check
     // (excluding self) for a clean 409; the DB exclusion constraint is the final
@@ -179,14 +200,23 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
     // unconstrained behavior.
     const nextStatus = appointment.status === 'NO_SHOW' ? 'CONFIRMED' : appointment.status;
     if (appointment.providerProfileId) {
-      const durationMin = Math.round((body.endsAt.getTime() - body.startsAt.getTime()) / 60_000);
-      const conflict = await findSlotConflict({ tenantId: request.auth.tenantId, providerProfileId: appointment.providerProfileId, startsAt: body.startsAt, durationMin, now: body.startsAt, excludeAppointmentId: appointment.id });
-      if (conflict === 'already_booked') throw app.httpErrors.conflict('Provider is already booked for this time');
+      const service = await resolveSchedulingService({ tenantId: request.auth.tenantId, serviceCatalogItemId: appointment.serviceCatalogItemId, service: appointment.service, fallbackDurationMin: Math.round((body.endsAt.getTime() - body.startsAt.getTime()) / 60_000) });
+      if (!service) throw app.httpErrors.conflict('Appointment service requires staff review');
+      const conflict = await runWithTenantContext(request.auth.tenantId, tx => findSlotConflict({ tenantId: request.auth.tenantId, providerProfileId: appointment.providerProfileId!, startsAt: body.startsAt, durationMin: service.durationMin, excludeAppointmentId: appointment.id }, tx));
+      if (conflict) return reply.code(409).send({ error: conflict, message: `Slot unavailable: ${conflict}` });
+      body.endsAt = new Date(body.startsAt.getTime() + service.durationMin * 60_000);
     }
 
     let updated: Awaited<ReturnType<typeof db.appointment.update>>;
     try {
-      updated = await db.appointment.update({ where: { id }, data: { startsAt: body.startsAt, endsAt: body.endsAt, status: nextStatus } });
+      updated = await runWithTenantContext(request.auth.tenantId, async tx => {
+        const changed = await tx.appointment.updateMany({
+          where: { id, tenantId: request.auth.tenantId, status: appointment.status, deletedAt: null },
+          data: { startsAt: body.startsAt, endsAt: body.endsAt, status: nextStatus },
+        });
+        if (changed.count !== 1) throw app.httpErrors.conflict('Appointment changed concurrently; refresh and retry');
+        return tx.appointment.findUniqueOrThrow({ where: { id } });
+      });
     } catch (error) {
       if (isDoubleBookConflictError(error)) throw app.httpErrors.conflict('Provider is already booked for this time');
       throw error;
@@ -211,7 +241,7 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
   app.patch('/:id/status', { preHandler: canWriteAppointments }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const { status } = z.object({ status: z.enum(['ARRIVED', 'NO_SHOW', 'COMPLETED']) }).parse(request.body);
-    const appointment = await db.appointment.findFirst({ where: { id, tenantId: request.auth.tenantId, deletedAt: null } });
+    const appointment = await runWithTenantContext(request.auth.tenantId, tx => tx.appointment.findFirst({ where: { id, tenantId: request.auth.tenantId, deletedAt: null } }));
     if (!appointment) throw app.httpErrors.notFound('Appointment not found');
     assertBranchAccess(request, appointment.branchId);
 
@@ -220,7 +250,14 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
       throw app.httpErrors.conflict(`Cannot transition appointment from ${appointment.status} to ${status}`);
     }
 
-    const updated = await db.appointment.update({ where: { id }, data: { status } });
+    const updated = await runWithTenantContext(request.auth.tenantId, async tx => {
+      const changed = await tx.appointment.updateMany({
+        where: { id, tenantId: request.auth.tenantId, status: appointment.status, deletedAt: null },
+        data: { status },
+      });
+      if (changed.count !== 1) throw app.httpErrors.conflict('Appointment changed concurrently; refresh and retry');
+      return tx.appointment.findUniqueOrThrow({ where: { id } });
+    });
     await audit(request, { action: 'appointment.status_changed', resource: 'appointment', resourceId: id, metadata: { from: appointment.status, to: status } });
     // Feed the intelligence loop the one transition it already models (no-show).
     if (status === 'NO_SHOW') {

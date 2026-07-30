@@ -1,6 +1,6 @@
 import { Worker } from 'bullmq';
-import { db } from '../lib/db';
 import { captureException } from '../lib/observability';
+import { runWithJobTenantContext } from '../lib/tenantContext';
 import { observed } from './observedJob';
 import { redisConnection, type AutopilotExecutionJob } from './queues';
 
@@ -12,17 +12,17 @@ export function createAutopilotWorker(): Worker<AutopilotExecutionJob> {
   const worker = new Worker<AutopilotExecutionJob>(
     'autopilot-execution',
     observed('autopilot-execution', async job => {
-      const approval = await db.autopilotApproval.findFirst({
-        where: { id: job.data.approvalId, tenantId: job.data.tenantId, status: 'APPROVED' },
-      });
-      if (!approval) return;
+      await runWithJobTenantContext(job.data.tenantId, async tx => {
+        const approval = await tx.autopilotApproval.findFirst({
+          where: { id: job.data.approvalId, tenantId: job.data.tenantId, status: 'APPROVED' },
+        });
+        if (!approval) return;
 
-      await db.$transaction([
-        db.autopilotApproval.update({
+        await tx.autopilotApproval.update({
           where: { id: approval.id },
           data: { status: 'EXECUTED' },
-        }),
-        db.auditEvent.create({
+        });
+        await tx.auditEvent.create({
           data: {
             tenantId: approval.tenantId,
             action: 'autopilot.approval.executed',
@@ -30,8 +30,8 @@ export function createAutopilotWorker(): Worker<AutopilotExecutionJob> {
             resourceId: approval.id,
             metadata: { jobId: job.id },
           },
-        }),
-      ]);
+        });
+      });
     }),
     { connection: redisConnection, concurrency: 5 },
   );

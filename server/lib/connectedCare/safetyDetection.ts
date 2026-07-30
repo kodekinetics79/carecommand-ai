@@ -1,5 +1,11 @@
 import { db } from '../db';
 import type { Prisma } from '../../generated/prisma/client';
+import { forEachActiveJobTenant } from '../jobTenantResolver';
+import {
+  invalidateRpmProviderSignoff,
+  lockRpmEvidenceForDevice,
+  rpmPeriodBounds,
+} from './rpmEvidence';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // RPM PROACTIVE SAFETY NET — runtime detectors (P0)
@@ -26,17 +32,42 @@ export const DEVICE_OFFLINE_AFTER_HOURS = 24;
 
 const OPEN_STATUSES = ['open', 'acknowledged', 'assigned'];
 
-async function tenantIds(only?: string): Promise<string[]> {
-  if (only) return [only];
-  return (await db.tenant.findMany({ select: { id: true } })).map(t => t.id);
+type SafetyTx = Prisma.TransactionClient;
+
+async function accountableStaff(tx: SafetyTx, tenantId: string, branchId: string | null) {
+  return tx.user.findFirst({
+    where: {
+      tenantId,
+      active: true,
+      role: { in: ['PROVIDER', 'MANAGER', 'ADMIN', 'OWNER'] },
+      ...(branchId ? { OR: [{ branchId }, { role: { in: ['ADMIN', 'OWNER'] } }] } : {}),
+    },
+    orderBy: [{ role: 'asc' }, { createdAt: 'asc' }],
+    select: { id: true, displayName: true, role: true },
+  });
 }
 
-// Jobs have no request context, so they write AuditEvent directly (actorUserId
-// null = system actor) — mirroring the compliance/autopilot worker audit pattern.
-async function auditJob(tenantId: string, action: string, resourceId: string | null, metadata?: Prisma.InputJsonObject) {
-  await db.auditEvent.create({
-    data: { tenantId, actorUserId: null, action, resource: 'readingAlert', resourceId: resourceId ?? undefined, userAgent: 'monitoring-safety-job', metadata },
-  }).catch(() => {});
+async function queueStaffNotification(
+  tx: SafetyTx,
+  input: { tenantId: string; alertId: string; patientId?: string | null; branchId: string | null },
+) {
+  const recipient = await accountableStaff(tx, input.tenantId, input.branchId);
+  await tx.notificationEvent.create({
+    data: {
+      tenantId: input.tenantId,
+      alertId: input.alertId,
+      patientId: input.patientId ?? null,
+      recipientType: recipient?.role.toLowerCase() ?? 'unassigned_staff',
+      recipientUserId: recipient?.id ?? null,
+      recipientLabel: recipient?.displayName ?? 'unassigned clinical safety queue',
+      channel: 'in_app',
+      status: 'queued',
+      attempts: 0,
+      consentChecked: true,
+      consentResult: 'not_required',
+    },
+  });
+  return recipient?.id ?? null;
 }
 
 /**
@@ -68,7 +99,7 @@ export interface MissedReadingResult { checked: number; created: number; alerts:
  */
 export async function detectMissedReadings(only?: string, now = new Date()): Promise<MissedReadingResult> {
   const result: MissedReadingResult = { checked: 0, created: 0, alerts: [] };
-  for (const tenantId of await tenantIds(only)) {
+  await forEachActiveJobTenant(only, 'worker:monitoring:missed-readings', async tenantId => {
     const enrollments = await db.patientDeviceEnrollment.findMany({
       where: { tenantId, status: 'active' },
       select: { patientId: true, branchId: true, enrolledAt: true },
@@ -82,38 +113,46 @@ export async function detectMissedReadings(only?: string, now = new Date()): Pro
       if (!missedAfterHours || missedAfterHours <= 0) continue; // no cadence configured
       result.checked++;
 
-      const last = await db.deviceReading.findFirst({
-        where: { tenantId, patientId: enr.patientId, validationStatus: 'valid' },
-        orderBy: { capturedAt: 'desc' },
-        select: { capturedAt: true },
+      const created = await db.$transaction(async tx => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${tenantId}), hashtext(${'missed:' + enr.patientId}))`;
+        const currentEnrollment = await tx.patientDeviceEnrollment.findFirst({
+          where: { tenantId, patientId: enr.patientId, status: 'active' },
+          orderBy: { enrolledAt: 'asc' },
+          select: { enrolledAt: true, branchId: true },
+        });
+        if (!currentEnrollment) return null;
+        const last = await tx.deviceReading.findFirst({
+          where: { tenantId, patientId: enr.patientId, validationStatus: 'valid' },
+          orderBy: { capturedAt: 'desc' },
+          select: { capturedAt: true },
+        });
+        const lastActivity = last?.capturedAt ?? currentEnrollment.enrolledAt;
+        const hoursSince = (now.getTime() - lastActivity.getTime()) / 36e5;
+        if (hoursSince < missedAfterHours) return null;
+        const openExisting = await tx.readingAlert.findFirst({
+          where: { tenantId, patientId: enr.patientId, alertType: 'missed_reading', status: { in: OPEN_STATUSES } },
+          select: { id: true },
+        });
+        if (openExisting) return null;
+        const reason = last
+          ? `No valid reading in ${Math.floor(hoursSince)}h (expected at least every ${missedAfterHours}h). Outreach to capture the missed reading.`
+          : `No reading since enrollment ${Math.floor(hoursSince)}h ago (expected at least every ${missedAfterHours}h). Outreach to capture the first reading.`;
+        const alert = await tx.readingAlert.create({
+          data: { tenantId, patientId: enr.patientId, branchId: currentEnrollment.branchId, severity: 'high', alertType: 'missed_reading', status: 'open', generatedReason: reason },
+          select: { id: true },
+        });
+        const recipientUserId = await queueStaffNotification(tx, { tenantId, alertId: alert.id, patientId: enr.patientId, branchId: currentEnrollment.branchId });
+        await tx.auditEvent.create({
+          data: { tenantId, actorUserId: null, action: 'monitoring.missed_reading.detected', resource: 'readingAlert', resourceId: alert.id, userAgent: 'monitoring-safety-job', metadata: { patientId: enr.patientId, missedAfterHours, hoursSince: Math.floor(hoursSince), recipientUserId } },
+        });
+        return alert.id;
       });
-      const lastActivity = last?.capturedAt ?? enr.enrolledAt;
-      const hoursSince = (now.getTime() - lastActivity.getTime()) / 36e5;
-      if (hoursSince < missedAfterHours) continue;
-
-      // Idempotent — never stack a second open missed_reading alert.
-      const openExisting = await db.readingAlert.findFirst({
-        where: { tenantId, patientId: enr.patientId, alertType: 'missed_reading', status: { in: OPEN_STATUSES } },
-        select: { id: true },
-      });
-      if (openExisting) continue;
-
-      const reason = last
-        ? `No valid reading in ${Math.floor(hoursSince)}h (expected at least every ${missedAfterHours}h). Outreach to capture the missed reading.`
-        : `No reading since enrollment ${Math.floor(hoursSince)}h ago (expected at least every ${missedAfterHours}h). Outreach to capture the first reading.`;
-      const alert = await db.readingAlert.create({
-        data: { tenantId, patientId: enr.patientId, branchId: enr.branchId, severity: 'high', alertType: 'missed_reading', status: 'open', generatedReason: reason },
-        select: { id: true },
-      });
-      // Route to the nurse queue (staff notification — consent not required).
-      await db.notificationEvent.create({
-        data: { tenantId, alertId: alert.id, patientId: enr.patientId, recipientType: 'nurse', recipientLabel: 'nurse queue', channel: 'in_app', status: 'sent', attempts: 1, consentChecked: true, consentResult: 'not_required', sentAt: new Date() },
-      }).catch(() => {});
-      await auditJob(tenantId, 'monitoring.missed_reading.detected', alert.id, { patientId: enr.patientId, missedAfterHours, hoursSince: Math.floor(hoursSince) });
-      result.created++;
-      result.alerts.push(alert.id);
+      if (created) {
+        result.created++;
+        result.alerts.push(created);
+      }
     }
-  }
+  });
   return result;
 }
 
@@ -128,7 +167,8 @@ export interface OfflineDeviceResult { checked: number; flipped: number; created
 export async function detectOfflineDevices(only?: string, offlineAfterHours = DEVICE_OFFLINE_AFTER_HOURS, now = new Date()): Promise<OfflineDeviceResult> {
   const result: OfflineDeviceResult = { checked: 0, flipped: 0, created: 0, alerts: [] };
   const cutoff = new Date(now.getTime() - offlineAfterHours * 36e5);
-  for (const tenantId of await tenantIds(only)) {
+  const rpmPeriod = rpmPeriodBounds(now);
+  await forEachActiveJobTenant(only, 'worker:monitoring:offline-devices', async tenantId => {
     // Only devices currently believed healthy can transition to offline.
     const devices = await db.device.findMany({
       where: { tenantId, active: true, status: { in: ['online', 'pending'] } },
@@ -136,41 +176,56 @@ export async function detectOfflineDevices(only?: string, offlineAfterHours = DE
     });
     for (const device of devices) {
       result.checked++;
-      // Last activity = the newer of lastSeenAt and the device's latest reading.
-      const lastReading = await db.deviceReading.findFirst({
-        where: { tenantId, deviceId: device.id },
-        orderBy: { capturedAt: 'desc' },
-        select: { capturedAt: true },
+      const outcome = await db.$transaction(async tx => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${tenantId}), hashtext(${'offline:' + device.id}))`;
+        const current = await tx.device.findFirst({
+          where: { id: device.id, tenantId, active: true, status: { in: ['online', 'pending'] } },
+          select: { id: true, name: true, branchId: true, status: true, lastSeenAt: true },
+        });
+        if (!current) return null;
+        const lastReading = await tx.deviceReading.findFirst({ where: { tenantId, deviceId: current.id }, orderBy: { capturedAt: 'desc' }, select: { capturedAt: true } });
+        const stamps = [current.lastSeenAt, lastReading?.capturedAt].filter((d): d is Date => !!d);
+        const lastActivity = stamps.length ? new Date(Math.max(...stamps.map(d => d.getTime()))) : null;
+        if (!lastActivity || lastActivity > cutoff) return null;
+        const hoursSince = Math.floor((now.getTime() - lastActivity.getTime()) / 36e5);
+        // Acquire every enrolled patient's RPM evidence lock before changing
+        // Device.status. Provider signoff uses the same locks, so it must see
+        // either the complete pre-mutation or complete post-mutation snapshot.
+        const rpmPatientIds = await lockRpmEvidenceForDevice(tx, tenantId, current.id, rpmPeriod.start);
+        const changed = await tx.device.updateMany({ where: { id: current.id, tenantId, status: current.status }, data: { status: 'offline' } });
+        if (changed.count !== 1) return null;
+        for (const patientId of rpmPatientIds) {
+          await invalidateRpmProviderSignoff(tx, {
+            tenantId, patientId, periodStart: rpmPeriod.start,
+            reason: 'offline_detector_device_status_mutated', actorUserId: null,
+            userAgent: 'monitoring-safety-job', mutationResourceId: current.id,
+          });
+        }
+        await tx.deviceEvent.create({
+          data: { tenantId, deviceId: current.id, type: 'status_changed', fromStatus: current.status, toStatus: 'offline', message: `Auto-marked offline — no activity in ${hoursSince}h (threshold ${offlineAfterHours}h).` },
+        });
+        const openExisting = await tx.readingAlert.findFirst({
+          where: { tenantId, deviceId: current.id, alertType: 'device_offline', status: { in: OPEN_STATUSES } },
+          select: { id: true },
+        });
+        if (openExisting) {
+          await tx.auditEvent.create({ data: { tenantId, actorUserId: null, action: 'monitoring.device_offline.detected', resource: 'readingAlert', resourceId: openExisting.id, userAgent: 'monitoring-safety-job', metadata: { deviceId: current.id, hoursSince, offlineAfterHours, existingAlert: true } } });
+          return { alertId: null, flipped: true };
+        }
+        const alert = await tx.readingAlert.create({
+          data: { tenantId, deviceId: current.id, branchId: current.branchId, severity: 'high', alertType: 'device_offline', status: 'open', generatedReason: `${current.name} offline — no activity in ${hoursSince}h (threshold ${offlineAfterHours}h). Check the device/connection.` },
+          select: { id: true },
+        });
+        const recipientUserId = await queueStaffNotification(tx, { tenantId, alertId: alert.id, branchId: current.branchId });
+        await tx.auditEvent.create({ data: { tenantId, actorUserId: null, action: 'monitoring.device_offline.detected', resource: 'readingAlert', resourceId: alert.id, userAgent: 'monitoring-safety-job', metadata: { deviceId: current.id, hoursSince, offlineAfterHours, recipientUserId } } });
+        return { alertId: alert.id, flipped: true };
       });
-      const stamps = [device.lastSeenAt, lastReading?.capturedAt].filter((d): d is Date => !!d);
-      const lastActivity = stamps.length ? new Date(Math.max(...stamps.map(d => d.getTime()))) : null;
-      // A device that has NEVER reported (no lastSeenAt, no reading) is not
-      // "offline" — it never came online. Skip until it produces a first signal.
-      if (!lastActivity) continue;
-      if (lastActivity > cutoff) continue; // still fresh
-
-      const hoursSince = Math.floor((now.getTime() - lastActivity.getTime()) / 36e5);
-      // Flip status (idempotent: only from online/pending).
-      await db.device.update({ where: { id: device.id }, data: { status: 'offline' } });
-      await db.deviceEvent.create({
-        data: { tenantId, deviceId: device.id, type: 'status_changed', fromStatus: device.status, toStatus: 'offline', message: `Auto-marked offline — no activity in ${hoursSince}h (threshold ${offlineAfterHours}h).` },
-      }).catch(() => {});
-      result.flipped++;
-
-      // Idempotent alert — never stack a second open device_offline alert.
-      const openExisting = await db.readingAlert.findFirst({
-        where: { tenantId, deviceId: device.id, alertType: 'device_offline', status: { in: OPEN_STATUSES } },
-        select: { id: true },
-      });
-      if (openExisting) continue;
-      const alert = await db.readingAlert.create({
-        data: { tenantId, deviceId: device.id, branchId: device.branchId, severity: 'high', alertType: 'device_offline', status: 'open', generatedReason: `${device.name} offline — no activity in ${hoursSince}h (threshold ${offlineAfterHours}h). Check the device/connection.` },
-        select: { id: true },
-      });
-      await auditJob(tenantId, 'monitoring.device_offline.detected', alert.id, { deviceId: device.id, hoursSince, offlineAfterHours });
-      result.created++;
-      result.alerts.push(alert.id);
+      if (outcome?.flipped) result.flipped++;
+      if (outcome?.alertId) {
+        result.created++;
+        result.alerts.push(outcome.alertId);
+      }
     }
-  }
+  });
   return result;
 }

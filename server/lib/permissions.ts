@@ -27,6 +27,10 @@ export const PERMISSIONS = [
   // — more sensitive than read, so least-privilege by default (owner/admin/
   // compliance only).
   'patient:export',
+  // Intake PHI and consent records have a dedicated grant so users do not gain
+  // access merely because they can view a patient directory or billing totals.
+  'intake:read',
+  'intake:write',
   'appointment:read',
   'appointment:write',
   // Manage a provider's recurring availability + time-off (distinct from booking).
@@ -40,6 +44,13 @@ export const PERMISSIONS = [
   'compliance:read',
   'compliance:manage',
   'audit:read',
+  // AI receptionist call metadata, summaries, and appointment-request artifacts.
+  'receptionist:call-artifacts:read',
+  // Provider-hosted call recordings may contain substantially more PHI than a
+  // scheduling record and therefore require a separate, narrower grant.
+  'receptionist:recordings:read',
+  // Configure receptionist clinics/agents/campaigns and mutate their workflow.
+  'receptionist:manage',
   // Tenant administration: manage users, roles, sessions, security posture.
   'admin:manage',
 ] as const;
@@ -61,17 +72,28 @@ export const ROLE_PERMISSIONS: Record<UserRole, Permission[]> = {
   ADMIN: ALL,
   MANAGER: [
     'patient:read', 'patient:write',
+    'intake:read', 'intake:write',
     'appointment:read', 'appointment:write', 'schedule:manage',
     'billing:read',
     'staff:read', 'staff:write',
     'settings:read', 'settings:write',
+    'receptionist:call-artifacts:read', 'receptionist:manage',
   ],
-  BILLING: ['billing:read', 'billing:write', 'settings:read', 'patient:read'],
-  PROVIDER: ['patient:read', 'appointment:read', 'appointment:write', 'schedule:manage', 'staff:read', 'settings:read'],
-  FRONT_DESK: ['patient:read', 'patient:write', 'appointment:read', 'appointment:write', 'staff:read'],
+  BILLING: ['billing:read', 'billing:write', 'settings:read', 'patient:read', 'intake:read', 'intake:write'],
+  PROVIDER: ['patient:read', 'intake:read', 'appointment:read', 'appointment:write', 'schedule:manage', 'staff:read', 'settings:read'],
+  FRONT_DESK: [
+    'patient:read', 'patient:write', 'intake:read', 'intake:write', 'appointment:read', 'appointment:write', 'billing:read', 'staff:read',
+    'receptionist:call-artifacts:read',
+  ],
   ANALYST: ['patient:read', 'appointment:read', 'billing:read', 'staff:read', 'settings:read', 'audit:read'],
-  COMPLIANCE_OFFICER: ['compliance:read', 'compliance:manage', 'audit:read', 'patient:export'],
-  AUDITOR: ['compliance:read', 'audit:read'],
+  COMPLIANCE_OFFICER: [
+    'compliance:read', 'compliance:manage', 'audit:read', 'patient:export',
+    'receptionist:call-artifacts:read', 'receptionist:recordings:read',
+  ],
+  AUDITOR: [
+    'compliance:read', 'audit:read',
+    'receptionist:call-artifacts:read', 'receptionist:recordings:read',
+  ],
 };
 
 // RoleDefinition rows are keyed by a human name; map enum <-> catalogue name so a

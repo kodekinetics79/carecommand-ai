@@ -9,12 +9,14 @@ import { runWithTenantContext } from '../../lib/tenantContext';
 import { requireFeature } from '../../lib/entitlements';
 import { sendMessage, type SendResult } from '../../lib/commsProvider';
 import type { CommChannel } from '../../lib/campaigns';
+import { getRequestPermissions, requirePermission } from '../../lib/permissions';
 
 const channel = z.enum(['WHATSAPP', 'SMS', 'EMAIL', 'PUSH', 'CALL', 'VIDEO']);
 const uuid = z.string().uuid();
 const listLimit = z.object({ limit: z.coerce.number().int().min(1).max(100).default(50) });
 const writeRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK');
 const adminRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
+const staffTaskRead = requirePermission('staff:read');
 
 type IntegrationCatalogEntry = {
   key: string;
@@ -711,10 +713,10 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     });
   });
 
-  app.get('/tasks', async request => {
+  app.get('/tasks', { preHandler: staffTaskRead }, async request => {
     const query = listLimit.extend({ branchId: uuid.optional() }).parse(request.query);
     const branchId = scopedBranch(request, query.branchId);
-    return db.staffTask.findMany({
+    const rows = await db.staffTask.findMany({
       where: { tenantId: request.auth.tenantId, branchId },
       take: query.limit,
       orderBy: { createdAt: 'desc' },
@@ -722,6 +724,24 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
         branch: { select: { name: true } },
         assignedTo: { select: { displayName: true } },
       },
+    });
+    const permissions = await getRequestPermissions(request);
+    const canReadReceptionistArtifacts = permissions.has('receptionist:call-artifacts:read');
+    await audit(request, { action: 'task.list', resource: 'staffTask', metadata: { count: rows.length, branchScoped: Boolean(branchId) } });
+    return rows.map(row => {
+      const metadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+        ? row.metadata as Record<string, unknown>
+        : null;
+      if (canReadReceptionistArtifacts || metadata?.workflow !== 'receptionist_safety') return row;
+      return {
+        ...row,
+        metadata: {
+          workflow: 'receptionist_safety',
+          kind: metadata.kind ?? 'restricted',
+          requiresAcknowledgement: metadata.requiresAcknowledgement === true,
+          restricted: true,
+        },
+      };
     });
   });
   app.post('/tasks', { preHandler: adminRoles }, async (request, reply) => {

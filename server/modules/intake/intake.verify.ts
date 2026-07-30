@@ -10,6 +10,7 @@ const { PrismaPg } = await import('@prisma/adapter-pg');
 const { PrismaClient } = await import('../../generated/prisma/client');
 const { buildApp } = await import('../../app');
 const { recomputeEntitlements } = await import('../../lib/entitlements');
+const { INTAKE_ACKNOWLEDGEMENTS } = await import('../../lib/intake');
 
 const ownerDb = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_MIGRATION_URL ?? process.env.DATABASE_URL }) });
 let fail = 0;
@@ -103,13 +104,13 @@ async function main() {
   check('12. insurance card document is metadata_only (no fake upload)', doc?.status === 'metadata_only');
 
   // 13) Estimate acknowledgement records consent + audit.
-  await pub('POST', `/v1/intake/public/${token}/sections`, { sectionType: 'estimate_acknowledgement', data: { accepted: true } });
+  await pub('POST', `/v1/intake/public/${token}/sections`, { sectionType: 'estimate_acknowledgement', data: { accepted: true, acknowledgementId: INTAKE_ACKNOWLEDGEMENTS.estimate_acknowledgement.id } });
   const estConsent = await ownerDb.patientConsentRecord.findFirst({ where: { tenantId: tA.id, packetId: packet.intakePacketId, consentType: 'estimate_acknowledgement' } });
   const estAudit = await ownerDb.auditEvent.findFirst({ where: { tenantId: tA.id, action: 'intake.consent.accepted' } });
   check('13. estimate acknowledgement records consent + audit', estConsent?.status === 'accepted' && !!estAudit);
 
   // 14) Payment policy section does not fake payment.
-  await pub('POST', `/v1/intake/public/${token}/sections`, { sectionType: 'payment_policy', data: { accepted: true } });
+  await pub('POST', `/v1/intake/public/${token}/sections`, { sectionType: 'payment_policy', data: { accepted: true, acknowledgementId: INTAKE_ACKNOWLEDGEMENTS.payment_policy.id } });
   const dep = await ownerDb.depositRequirement.findFirst({ where: { tenantId: tA.id, appointmentId: appt.id } });
   check('14. payment policy ack does NOT mark deposit paid', dep?.status === 'required');
 

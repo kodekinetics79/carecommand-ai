@@ -17,6 +17,31 @@ export interface NormalizedReading {
   capturedAt: Date;
 }
 
+const CANONICAL_UNITS: Partial<Record<string, ReadonlyArray<string>>> = {
+  glucose: ['mg/dL'], blood_pressure: ['mmHg'], oxygen: ['%'], weight: ['kg', 'lb'],
+  temperature: ['°C'], heart_rate: ['bpm'],
+};
+
+/** Fail closed on impossible or non-canonical provider measurements. */
+export function isPlausibleNormalizedReading(reading: NormalizedReading, now = new Date()): boolean {
+  if (!Number.isFinite(reading.capturedAt.getTime()) || reading.capturedAt.getTime() > now.getTime() + 5 * 60_000) return false;
+  if (reading.readingType === 'ecg') return reading.value.trim().length > 0;
+  const allowedUnits = CANONICAL_UNITS[reading.readingType];
+  if (!allowedUnits || !reading.unit || !allowedUnits.includes(reading.unit)) return false;
+  const numeric = reading.numericValue;
+  if (numeric == null || !Number.isFinite(numeric)) return false;
+  if (reading.readingType === 'blood_pressure') {
+    const diastolic = reading.valueSecondary;
+    return diastolic != null && Number.isFinite(diastolic) && numeric >= 40 && numeric <= 300 && diastolic >= 20 && diastolic <= 200 && numeric > diastolic;
+  }
+  if (reading.readingType === 'glucose') return numeric >= 10 && numeric <= 1000;
+  if (reading.readingType === 'oxygen') return numeric >= 50 && numeric <= 100;
+  if (reading.readingType === 'weight') return reading.unit === 'lb' ? numeric >= 2 && numeric <= 1100 : numeric >= 1 && numeric <= 500;
+  if (reading.readingType === 'temperature') return numeric >= 25 && numeric <= 45;
+  if (reading.readingType === 'heart_rate') return numeric >= 20 && numeric <= 300;
+  return false;
+}
+
 export interface WebhookParseResult {
   readings: NormalizedReading[];
   meta: Record<string, unknown>;

@@ -4,7 +4,6 @@ import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import sensible from '@fastify/sensible';
 import swagger from '@fastify/swagger';
-import swaggerUi from '@fastify/swagger-ui';
 import { env } from './config/env';
 import { loggerOptions } from './config/logger';
 import { authPlugin } from './plugins/auth';
@@ -49,6 +48,7 @@ import { portalAuthRoutes } from './modules/portal/auth';
 import { portalRoutes } from './modules/portal/routes';
 import { portalAdminRoutes } from './modules/portal/admin';
 import { autopilotQueue } from './workers/queues';
+import { assertProductionRateLimitStore, skipRateLimitStoreErrors } from './lib/rateLimitPolicy';
 
 // Webhook signature verification (Stripe/Retell) needs the exact bytes that were
 // signed, so we capture the raw JSON body while still parsing it normally.
@@ -87,13 +87,18 @@ export async function buildApp() {
   await app.register(cors, {
     origin: env.CORS_ORIGINS.split(',').map(origin => origin.trim()),
     credentials: true,
+    // @fastify/cors defaults to GET, HEAD and POST only. The application uses
+    // browser-originated PUT/PATCH/DELETE mutations throughout, so enumerate
+    // the complete API method set; otherwise the browser accepts the 204
+    // preflight but refuses to send the actual mutation.
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   });
   await app.register(helmet);
 
   // Redis-backed rate limiting so limits (and brute-force protection) hold
   // across multiple API instances behind a load balancer. Reuses the BullMQ
-  // Redis connection; falls back to the in-memory store if Redis is
-  // unreachable (e.g. local dev without Redis) so development is never blocked.
+  // Redis connection. Local development may use the in-memory store, but a
+  // production process must never silently downgrade this shared control.
   let rateLimitRedis: unknown;
   try {
     rateLimitRedis = await Promise.race([
@@ -103,25 +108,29 @@ export async function buildApp() {
   } catch {
     rateLimitRedis = undefined;
   }
-  if (!rateLimitRedis && env.NODE_ENV === 'production') {
-    app.log.error('Rate limiter falling back to in-memory store in production: Redis unreachable');
-  }
   const isProd = env.NODE_ENV === 'production';
+  assertProductionRateLimitStore(env.NODE_ENV, rateLimitRedis);
   await app.register(rateLimit, {
     // The app shell (sidebar badges, topbar, dashboard widgets) fans out many
     // parallel calls per navigation, so a low global ceiling trips 429s during
     // normal/demo use. Keep production strict; give dev plenty of headroom.
-    max: isProd ? 200 : 2000,
+    // The production-style browser harness intentionally exercises two full
+    // user journeys from one loopback IP. Do not let that synthetic fan-out
+    // consume the real production ceiling and turn later assertions into 429s.
+    max: env.E2E_TEST_MODE ? 5000 : isProd ? 200 : 2000,
     timeWindow: '1 minute',
     ...(rateLimitRedis ? { redis: rateLimitRedis } : {}),
     // In non-production, never rate-limit loopback (local demos/tests).
     ...(isProd ? {} : { allowList: ['127.0.0.1', '::1'] }),
-    // Never fail a request because the rate-limit store hiccups; fail open.
-    skipOnError: true,
+    // Production authentication and abuse controls fail closed when the shared
+    // store errors. Development remains available when a local Redis is absent.
+    skipOnError: skipRateLimitStoreErrors(env.NODE_ENV),
     nameSpace: 'cc-ratelimit:',
   });
 
-  // API docs must not be exposed unauthenticated in production.
+  // API docs must not be exposed unauthenticated in production. Serve the raw
+  // OpenAPI document in development instead of bundling Swagger UI's static-file
+  // server into the production dependency tree.
   if (env.NODE_ENV !== 'production') {
     await app.register(swagger, {
       openapi: {
@@ -141,7 +150,7 @@ export async function buildApp() {
         ],
       },
     });
-    await app.register(swaggerUi, { routePrefix: '/docs' });
+    app.get('/docs/json', async (_request, reply) => reply.send(app.swagger()));
   }
   await app.register(errorPlugin);
   // Metrics before auth so its onRequest/onResponse hooks time EVERY route

@@ -36,6 +36,10 @@ const baseEnvSchema = z.object({
   API_HOST: z.string().default('0.0.0.0'),
   API_PORT: z.coerce.number().int().positive().default(3001),
   DATABASE_URL: z.string().min(1),
+  // Dedicated least-privilege control-plane role. Production requires this
+  // unless the local E2E harness is explicitly enabled; it must not reuse the
+  // tenant runtime principal.
+  PLATFORM_DATABASE_URL: z.string().url().optional(),
   // Optional owner/superuser connection for migrations + seed. When set, the
   // runtime DATABASE_URL can be the restricted `app_rls` role while schema
   // changes and seeding keep running as the owner. Falls back to DATABASE_URL.
@@ -52,6 +56,10 @@ const baseEnvSchema = z.object({
   RLS_ENFORCE_RUNTIME_ROLE: booleanString(false),
   JWT_SECRET: z.string().min(32),
   JWT_REFRESH_SECRET: z.string().min(32),
+  // Dedicated HMAC key for tenant-scoped BullMQ envelopes. Optional for a
+  // staged rollout; JWT_REFRESH_SECRET is used with domain separation if unset.
+  // The secret never appears in queue payloads.
+  JOB_ENVELOPE_SECRET: z.string().min(32).optional(),
   // Auth hardening (Phase A). Optional dedicated key for encrypting MFA secrets
   // at rest; if unset, a key is derived from JWT_SECRET.
   AUTH_ENCRYPTION_KEY: z.string().optional(),
@@ -152,8 +160,8 @@ const baseEnvSchema = z.object({
   GOOGLE_CLIENT_SECRET: z.string().optional(),
   META_APP_ID: z.string().optional(),
   META_APP_SECRET: z.string().optional(),
-  DEV_TENANT_ID: z.string().uuid().default('11111111-1111-4111-8111-111111111111'),
-  DEV_USER_ID: z.string().uuid().default('22222222-2222-4222-8222-222222222222'),
+  DEV_TENANT_ID: z.string().uuid().optional(),
+  DEV_USER_ID: z.string().uuid().optional(),
   PUBLIC_API_URL: z.string().url().default('http://localhost:3001'),
   RETELL_API_KEY: z.string().optional(),
   RETELL_AGENT_ID: z.string().optional(),
@@ -185,6 +193,23 @@ const baseEnvSchema = z.object({
 // Cross-field production hardening. Exported so tests can exercise the schema
 // in isolation (see server/test/envSchema.test.ts).
 export const envSchema = baseEnvSchema.superRefine((cfg, ctx) => {
+  // Missing production configuration is rejected when platformDb is
+  // constructed. Keeping that boot-time check outside this reusable schema
+  // preserves isolated env-schema tests and tooling that never load platform.
+  if (cfg.PLATFORM_DATABASE_URL) {
+    try {
+      const platformUser = new URL(cfg.PLATFORM_DATABASE_URL).username;
+      const tenantUser = new URL(cfg.DATABASE_URL).username;
+      if (!platformUser || platformUser !== 'app_platform') {
+        ctx.addIssue({ code: 'custom', path: ['PLATFORM_DATABASE_URL'], message: 'PLATFORM_DATABASE_URL must authenticate as app_platform.' });
+      }
+      if (platformUser === tenantUser) {
+        ctx.addIssue({ code: 'custom', path: ['PLATFORM_DATABASE_URL'], message: 'PLATFORM_DATABASE_URL must use a principal distinct from DATABASE_URL.' });
+      }
+    } catch {
+      ctx.addIssue({ code: 'custom', path: ['PLATFORM_DATABASE_URL'], message: 'PLATFORM_DATABASE_URL must be a valid PostgreSQL URL.' });
+    }
+  }
   // PORTAL_TOKEN_OUTBOX_PATH writes RAW patient magic-login tokens to disk —
   // a PHI/credential leak on any real production host. Fail the boot closed
   // unless the E2E harness explicitly opted in.

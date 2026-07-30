@@ -1,6 +1,7 @@
 import { Queue, type ConnectionOptions } from 'bullmq';
 import { env } from '../config/env';
 import { currentTraceCarrier, type TraceCarrier } from '../lib/traceContext';
+import { createTenantJobEnvelope, tenantJobId, type TenantJobEnvelope } from '../lib/jobEnvelope';
 
 export interface AutopilotExecutionJob {
   approvalId: string;
@@ -67,9 +68,12 @@ export type ComplianceJobName =
   | 'vendor-review-reminder'
   | 'security-scan-placeholder';
 
+export type ScheduledTickData = { _otel?: TraceCarrier };
+export type ScheduledQueueData = ScheduledTickData | TenantJobEnvelope;
+
 // NameType is `string` so scheduler ids and job names can differ freely;
 // ComplianceJobName still types the schedule config and worker dispatch.
-export const complianceQueue: Queue<Record<string, never>, void, string> = QUEUES_ENABLED
+export const complianceQueue: Queue<ScheduledQueueData, void, string> = QUEUES_ENABLED
   ? new Queue('compliance-maintenance', {
       connection: redisConnection,
       defaultJobOptions: {
@@ -98,11 +102,16 @@ export async function registerComplianceSchedules() {
   }
 }
 
+export async function enqueueComplianceTenantJob(operation: ComplianceJobName, tenantId: string) {
+  const data = createTenantJobEnvelope({ queue: 'compliance-maintenance', operation, tenantId, _otel: currentTraceCarrier() });
+  await complianceQueue.add(`${operation}-tenant`, data, { jobId: tenantJobId(data) });
+}
+
 // ---- CRM campaign scheduler queue -----------------------------------------
 // Dispatches approved SCHEDULED campaigns whose scheduledAt has passed, honoring
 // quiet hours. The job iterates tenants and is idempotent (delivery uniqueness +
 // status transition to ACTIVE prevents re-dispatch).
-export const campaignQueue: Queue<Record<string, never>, void, string> = QUEUES_ENABLED
+export const campaignQueue: Queue<ScheduledQueueData, void, string> = QUEUES_ENABLED
   ? new Queue('campaign-scheduler', {
       connection: redisConnection,
       defaultJobOptions: { attempts: 3, backoff: { type: 'exponential', delay: 2000 }, removeOnComplete: 500, removeOnFail: 1000 },
@@ -114,13 +123,19 @@ export async function registerCampaignSchedules() {
   await campaignQueue.upsertJobScheduler('campaign-dispatch', { pattern: '*/5 * * * *' }, { name: 'dispatch-scheduled', data: {} });
 }
 
+
+export async function enqueueCampaignTenantJob(tenantId: string) {
+  const data = createTenantJobEnvelope({ queue: 'campaign-scheduler', operation: 'dispatch-scheduled', tenantId, _otel: currentTraceCarrier() });
+  await campaignQueue.add('dispatch-scheduled-tenant', data, { jobId: tenantJobId(data) });
+}
+
 // ---- Monitoring safety-net queue ------------------------------------------
 // Proactive RPM safety detectors: missed-reading + device-offline. The job
 // functions iterate tenants and scope every write by tenantId, and are
 // idempotent (never duplicate an already-open alert), so re-runs are safe.
 export type MonitoringJobName = 'missed-reading-scan' | 'device-offline-scan';
 
-export const monitoringQueue: Queue<Record<string, never>, void, string> = QUEUES_ENABLED
+export const monitoringQueue: Queue<ScheduledQueueData, void, string> = QUEUES_ENABLED
   ? new Queue('monitoring-safety', {
       connection: redisConnection,
       defaultJobOptions: { attempts: 3, backoff: { type: 'exponential', delay: 2000 }, removeOnComplete: 500, removeOnFail: 1000 },
@@ -136,4 +151,10 @@ export async function registerMonitoringSchedules() {
   for (const schedule of MONITORING_SCHEDULES) {
     await monitoringQueue.upsertJobScheduler(schedule.id, { pattern: schedule.pattern }, { name: schedule.name, data: {} });
   }
+}
+
+
+export async function enqueueMonitoringTenantJob(operation: MonitoringJobName, tenantId: string) {
+  const data = createTenantJobEnvelope({ queue: 'monitoring-safety', operation, tenantId, _otel: currentTraceCarrier() });
+  await monitoringQueue.add(`${operation}-tenant`, data, { jobId: tenantJobId(data) });
 }

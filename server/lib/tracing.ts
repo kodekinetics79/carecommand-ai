@@ -2,7 +2,7 @@
 // OpenTelemetry tracing bootstrap.
 //
 // This MUST be imported before Fastify, pg, ioredis/bullmq, or any other
-// instrumented library so the auto-instrumentation can patch them. Import it at
+// instrumented library so the selected instrumentations can patch them. Import it at
 // the very top of the process entrypoint (server/index.ts, server/workers/index.ts)
 // BEFORE anything else, e.g.:
 //
@@ -71,7 +71,10 @@ export function startTracing(serviceName = env.OTEL_SERVICE_NAME): void {
   // Deferred requires — keep them out of the module's static import graph so a
   // disabled deploy pays nothing.
   const { NodeSDK } = require('@opentelemetry/sdk-node');
-  const { getNodeAutoInstrumentations } = require('@opentelemetry/auto-instrumentations-node');
+  const { HttpInstrumentation } = require('@opentelemetry/instrumentation-http');
+  const { FastifyInstrumentation } = require('@opentelemetry/instrumentation-fastify');
+  const { PgInstrumentation } = require('@opentelemetry/instrumentation-pg');
+  const { IORedisInstrumentation } = require('@opentelemetry/instrumentation-ioredis');
   const { resourceFromAttributes } = require('@opentelemetry/resources');
   const {
     ATTR_SERVICE_NAME,
@@ -107,14 +110,13 @@ export function startTracing(serviceName = env.OTEL_SERVICE_NAME): void {
       root: new TraceIdRatioBasedSampler(env.OTEL_TRACES_SAMPLER_RATIO),
     }),
     instrumentations: [
-      getNodeAutoInstrumentations({
-        // fs spans are noisy and rarely actionable for a web service.
-        '@opentelemetry/instrumentation-fs': { enabled: false },
-        '@opentelemetry/instrumentation-http': {
-          ignoreIncomingRequestHook: (req: { url?: string }) =>
-            req.url === '/health/live' || req.url === '/metrics',
-        },
+      new HttpInstrumentation({
+        ignoreIncomingRequestHook: (req: { url?: string }) =>
+          req.url === '/health/live' || req.url === '/metrics',
       }),
+      new FastifyInstrumentation(),
+      new PgInstrumentation(),
+      new IORedisInstrumentation(),
     ],
   });
 

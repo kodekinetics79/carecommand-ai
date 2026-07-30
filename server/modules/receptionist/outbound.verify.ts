@@ -64,6 +64,7 @@ async function main() {
   });
   check('2. entitled tenant creates campaign (201)', reqCampaignRes.statusCode === 201);
   const reqCampaign = JSON.parse(reqCampaignRes.body);
+  await call('PATCH', `/v1/receptionist/outbound-campaigns/${reqCampaign.id}`, entTok, { status: 'RUNNING' });
 
   // 3) setup_required is honest: with Retell unconfigured, no fake success.
   const savedKey = env.RETELL_API_KEY;

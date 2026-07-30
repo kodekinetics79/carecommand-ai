@@ -3,6 +3,13 @@ import { timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { env } from '../../config/env';
 import { db } from '../../lib/db';
+import { enterTenantContext } from '../../lib/tenantContext';
+import {
+  resolveAuthLoginCandidates,
+  resolveIngressTenant,
+  revokeInactiveRefreshToken,
+  type AuthLoginCandidate,
+} from '../../lib/tenantIngressResolvers';
 import {
   createCsrfToken, createRefreshToken, hashRefreshToken, verifyPassword,
   validatePassword, createResetToken, hashResetToken, generatePasswordHash,
@@ -13,11 +20,13 @@ import { generateTotpSecret, verifyTotp, totpAuthUri } from '../../lib/totp';
 const loginSchema = z.object({
   email: z.string().email().trim().toLowerCase(),
   password: z.string().min(1).max(200),
+  tenantSlug: z.string().trim().toLowerCase().min(2).max(80).optional(),
 });
 
 const refreshCookieName = 'cc_refresh';
 const csrfCookieName = 'cc_csrf';
 const refreshCookiePath = '/v1/auth';
+const csrfCookiePath = '/';
 const refreshTokenTtlSeconds = 60 * 60 * 24 * 30;
 const accessTokenTtl = '15m';
 const accessTokenTtlMinutes = 15;
@@ -36,12 +45,12 @@ function isProduction() {
 const sameSiteAttr = `SameSite=${env.COOKIE_SAMESITE.charAt(0).toUpperCase()}${env.COOKIE_SAMESITE.slice(1)}`;
 function cookieSecure() { return isProduction() || env.COOKIE_SAMESITE === 'none'; }
 
-function cookieFlags(httpOnly: boolean, maxAgeSeconds: number, value: string) {
+function cookieFlags(name: string, path: string, httpOnly: boolean, maxAgeSeconds: number, value: string) {
   const attributes = [
-    `${httpOnly ? refreshCookieName : csrfCookieName}=${encodeURIComponent(value)}`,
+    `${name}=${encodeURIComponent(value)}`,
     `Max-Age=${maxAgeSeconds}`,
     httpOnly ? 'HttpOnly' : undefined,
-    `Path=${refreshCookiePath}`,
+    `Path=${path}`,
     sameSiteAttr,
     cookieSecure() ? 'Secure' : undefined,
   ].filter(Boolean);
@@ -50,15 +59,20 @@ function cookieFlags(httpOnly: boolean, maxAgeSeconds: number, value: string) {
 
 function setAuthCookies(reply: FastifyReply, refreshToken: string, csrfToken: string) {
   reply.raw.setHeader('Set-Cookie', [
-    cookieFlags(true, refreshTokenTtlSeconds, refreshToken),
-    cookieFlags(false, refreshTokenTtlSeconds, csrfToken),
+    cookieFlags(refreshCookieName, refreshCookiePath, true, refreshTokenTtlSeconds, refreshToken),
+    cookieFlags(csrfCookieName, csrfCookiePath, false, refreshTokenTtlSeconds, csrfToken),
   ]);
+}
+
+function setCsrfCookie(reply: FastifyReply, csrfToken: string) {
+  reply.header('Cache-Control', 'no-store');
+  reply.raw.setHeader('Set-Cookie', cookieFlags(csrfCookieName, csrfCookiePath, false, refreshTokenTtlSeconds, csrfToken));
 }
 
 function clearAuthCookies(reply: FastifyReply) {
   reply.raw.setHeader('Set-Cookie', [
     `${refreshCookieName}=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Path=${refreshCookiePath}; ${sameSiteAttr}${cookieSecure() ? '; Secure' : ''}`,
-    `${csrfCookieName}=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=${refreshCookiePath}; ${sameSiteAttr}${cookieSecure() ? '; Secure' : ''}`,
+    `${csrfCookieName}=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=${csrfCookiePath}; ${sameSiteAttr}${cookieSecure() ? '; Secure' : ''}`,
   ]);
 }
 
@@ -86,6 +100,12 @@ function verifyCsrf(request: FastifyRequest) {
 }
 
 type SessionUserShape = { id: string; tenantId: string; role: string; branchId: string | null };
+type SessionResolvedUser = NonNullable<Awaited<ReturnType<typeof resolveSessionUser>>>;
+type LoginUser = AuthLoginCandidate;
+
+function tenantBlocksSessions(status: string) {
+  return status !== 'active';
+}
 
 async function tenantPolicy(tenantId: string) {
   return db.tenantSecurityPolicy.findUnique({ where: { tenantId } });
@@ -120,16 +140,22 @@ async function issueSession(app: FastifyInstance, user: SessionUserShape, ttlSec
 async function resolveSessionUser(userId: string) {
   return db.user.findFirst({
     where: { id: userId, active: true },
-    include: { tenant: { select: { id: true, name: true, slug: true } }, branch: { select: { id: true, name: true, location: true } } },
+    include: { tenant: { select: { id: true, name: true, slug: true, status: true } }, branch: { select: { id: true, name: true, location: true } } },
   });
 }
 
-function serializeUser(user: NonNullable<Awaited<ReturnType<typeof resolveSessionUser>>>) {
+function serializeUser(user: SessionResolvedUser | LoginUser) {
   return {
     id: user.id, email: user.email, displayName: user.displayName, role: user.role,
-    branchId: user.branchId, branch: user.branch, tenant: user.tenant, active: user.active,
+    branchId: user.branchId, branch: user.branch,
+    tenant: { id: user.tenant.id, name: user.tenant.name, slug: user.tenant.slug },
+    active: user.active,
     mfaEnabled: user.mfaEnabled,
   };
+}
+
+async function loginCandidates(email: string, tenantSlug?: string): Promise<LoginUser[]> {
+  return resolveAuthLoginCandidates(email, tenantSlug);
 }
 
 async function auditAuth(request: FastifyRequest, tenantId: string, userId: string | null, action: string, metadata?: Record<string, unknown>) {
@@ -143,24 +169,74 @@ async function auditAuth(request: FastifyRequest, tenantId: string, userId: stri
 }
 
 export const authRoutes: FastifyPluginAsync = async app => {
-  const rateLogin = { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } };
+  // The real-backend browser certification intentionally performs more than
+  // ten sequential synthetic role logins from one loopback IP. Production
+  // retains the strict limit; only the explicit E2E harness receives headroom.
+  const rateLogin = { config: { rateLimit: { max: env.E2E_TEST_MODE ? 100 : 10, timeWindow: '1 minute' } } };
   const rateSensitive = { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } };
 
   app.post('/dev-token', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } }, async (_request, reply) => {
-    if (env.NODE_ENV === 'production') return reply.code(404).send({ message: 'Not found' });
+    if (env.NODE_ENV === 'production' || !env.DEV_USER_ID || !env.DEV_TENANT_ID) {
+      return reply.code(404).send({ message: 'Not found' });
+    }
     return {
       token: app.jwt.sign({ userId: env.DEV_USER_ID, tenantId: env.DEV_TENANT_ID, role: 'OWNER', type: 'access' }, { expiresIn: accessTokenTtl }),
     };
+  });
+
+  // The SPA may be hosted on a different origin from the API. JavaScript on
+  // that origin cannot read an API-domain CSRF cookie, so expose the matching
+  // double-submit value through an allowlisted CORS response and keep it out of
+  // persistent browser storage. This endpoint never exposes session state.
+  app.get('/csrf', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async (_request, reply) => {
+    const csrfToken = createCsrfToken();
+    setCsrfCookie(reply, csrfToken);
+    return { csrfToken };
   });
 
   // ===== Login (lockout + expiry + MFA gating) =============================
   app.post('/login', rateLogin, async (request, reply) => {
     const input = loginSchema.parse(request.body);
     const now = new Date();
-    const user = await db.user.findFirst({
-      where: { email: input.email, active: true },
-      include: { tenant: { select: { id: true, name: true, slug: true } }, branch: { select: { id: true, name: true, location: true } } },
-    });
+    const candidates = await loginCandidates(input.email, input.tenantSlug);
+
+    // Do not reveal duplicate workspace membership to an unauthenticated email
+    // probe. Only a caller who has supplied a valid password for at least one of
+    // the duplicate accounts receives the neutral tenant-selector challenge;
+    // tenant names and slugs are never enumerated by this response.
+    if (!input.tenantSlug && candidates.length > 1) {
+      const passwordMatches = await Promise.all(candidates.map(candidate =>
+        candidate.passwordHash ? verifyPassword(input.password, candidate.passwordHash) : Promise.resolve(false),
+      ));
+      if (!passwordMatches.some(Boolean)) throw app.httpErrors.unauthorized(genericAuthError);
+      return reply.code(409).send({
+        status: 'tenant_required',
+        message: 'This email is linked to more than one workspace. Enter your clinic workspace identifier.',
+      });
+    }
+
+    const user = candidates[0] ?? null;
+    const passwordOk = Boolean(user && user.passwordHash && await verifyPassword(input.password, user.passwordHash));
+
+    // A tenant context can be activated only after the bounded credential
+    // resolver identifies a candidate. Inactive tenants fail before scoped DB
+    // work because the RLS context validator intentionally accepts only active
+    // tenants.
+    if (user && tenantBlocksSessions(user.tenant.status)) {
+      if (passwordOk) {
+        return reply.code(403).send({ status: 'suspended_tenant', message: 'This account is suspended. Please contact support.' });
+      }
+      throw app.httpErrors.unauthorized(genericAuthError);
+    }
+    if (user) {
+      enterTenantContext({
+        tenantId: user.tenantId,
+        actorId: user.id,
+        actorRole: user.role,
+        source: 'request',
+        requestId: request.id,
+      });
+    }
     const policy = user ? await tenantPolicy(user.tenantId) : null;
 
     // Locked account → generic error (no existence/lock leak), still audited.
@@ -169,7 +245,6 @@ export const authRoutes: FastifyPluginAsync = async app => {
       throw app.httpErrors.unauthorized(genericAuthError);
     }
 
-    const passwordOk = Boolean(user && user.passwordHash && await verifyPassword(input.password, user.passwordHash));
     if (!user || !passwordOk) {
       if (user) {
         const lockoutEnabled = policy?.failedLoginLockout ?? false;
@@ -189,13 +264,6 @@ export const authRoutes: FastifyPluginAsync = async app => {
 
     // Password verified — clear failed counters.
     await db.user.update({ where: { id: user.id }, data: { failedLoginCount: 0, lockedUntil: null } });
-
-    // Platform-controlled suspension blocks tenant login (reactivate via Platform Admin).
-    const tenantStatus = await db.tenant.findUnique({ where: { id: user.tenantId }, select: { status: true } });
-    if (tenantStatus?.status === 'suspended') {
-      await auditAuth(request, user.tenantId, user.id, 'auth.login.failed', { reason: 'suspended_tenant' });
-      return reply.code(403).send({ status: 'suspended_tenant', message: 'This account is suspended. Please contact support.' });
-    }
 
     // Password expiry → require reset (no session issued).
     if (policy?.passwordExpiryDays && policy.passwordExpiryDays > 0 && user.passwordChangedAt) {
@@ -222,7 +290,7 @@ export const authRoutes: FastifyPluginAsync = async app => {
     const session = await issueSession(app, user, accessTtlSeconds(policy?.sessionTimeoutMinutes));
     setAuthCookies(reply, session.refreshToken, session.csrfToken);
     await auditAuth(request, user.tenantId, user.id, 'auth.login.success', { email: user.email });
-    return { accessToken: session.accessToken, user: serializeUser(user) };
+    return { accessToken: session.accessToken, csrfToken: session.csrfToken, user: serializeUser(user) };
   });
 
   // ===== Refresh / logout / me / session-info =============================
@@ -231,25 +299,57 @@ export const authRoutes: FastifyPluginAsync = async app => {
     const refreshToken = readCookieValue(request, refreshCookieName);
     if (!refreshToken) throw app.httpErrors.unauthorized(authErrorMessage);
     const refreshTokenHash = hashRefreshToken(refreshToken);
+    const resolved = await resolveIngressTenant('refresh_token_hash', refreshTokenHash);
+    if (!resolved) {
+      const revoked = await revokeInactiveRefreshToken(refreshTokenHash);
+      clearAuthCookies(reply);
+      if (revoked) {
+        return reply.code(403).send({ status: 'suspended_tenant', message: 'This account is suspended. Please contact support.' });
+      }
+      return reply.code(401).send({ statusCode: 401, error: 'Unauthorized', message: authErrorMessage });
+    }
+    enterTenantContext({
+      tenantId: resolved.tenantId,
+      actorId: resolved.resourceId,
+      actorRole: 'SESSION_REFRESH',
+      source: 'request',
+      requestId: request.id,
+    });
     const user = await db.user.findFirst({
-      where: { refreshTokenHash, refreshTokenExpiresAt: { gt: new Date() }, active: true },
-      include: { tenant: { select: { id: true, name: true, slug: true } }, branch: { select: { id: true, name: true, location: true } } },
+      where: { id: resolved.resourceId, refreshTokenHash, refreshTokenExpiresAt: { gt: new Date() }, active: true },
+      include: { tenant: { select: { id: true, name: true, slug: true, status: true } }, branch: { select: { id: true, name: true, location: true } } },
     });
     if (!user) throw app.httpErrors.unauthorized(authErrorMessage);
+    if (tenantBlocksSessions(user.tenant.status)) {
+      await db.user.update({ where: { id: user.id }, data: { refreshTokenHash: null, refreshTokenExpiresAt: null } });
+      await auditAuth(request, user.tenantId, user.id, 'auth.refresh.denied', { reason: `${user.tenant.status}_tenant` });
+      clearAuthCookies(reply);
+      return reply.code(403).send({ status: 'suspended_tenant', message: 'This account is suspended. Please contact support.' });
+    }
     const policy = await tenantPolicy(user.tenantId);
     const session = await issueSession(app, user, accessTtlSeconds(policy?.sessionTimeoutMinutes));
     setAuthCookies(reply, session.refreshToken, session.csrfToken);
-    return { accessToken: session.accessToken, user: serializeUser(user) };
+    return { accessToken: session.accessToken, csrfToken: session.csrfToken, user: serializeUser(user) };
   });
 
   app.post('/logout', { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async (request, reply) => {
     if (!verifyCsrf(request)) { clearAuthCookies(reply); return reply.code(204).send(); }
     const refreshToken = readCookieValue(request, refreshCookieName);
     if (refreshToken) {
-      await db.user.updateMany({ where: { refreshTokenHash: hashRefreshToken(refreshToken) }, data: { refreshTokenHash: null, refreshTokenExpiresAt: null } });
-    }
-    if (request.auth?.userId) {
-      await auditAuth(request, request.auth.tenantId, request.auth.userId, 'auth.logout', { reason: 'user-initiated' });
+      const refreshTokenHash = hashRefreshToken(refreshToken);
+      const resolved = await resolveIngressTenant('refresh_token_hash', refreshTokenHash);
+      if (resolved) {
+        enterTenantContext({
+          tenantId: resolved.tenantId,
+          actorId: resolved.resourceId,
+          actorRole: 'SESSION_LOGOUT',
+          source: 'request',
+          requestId: request.id,
+        });
+        const user = await db.user.findFirst({ where: { id: resolved.resourceId, refreshTokenHash }, select: { id: true, tenantId: true } });
+        await db.user.updateMany({ where: { id: resolved.resourceId, refreshTokenHash }, data: { refreshTokenHash: null, refreshTokenExpiresAt: null } });
+        if (user) await auditAuth(request, user.tenantId, user.id, 'auth.logout', { reason: 'user-initiated' });
+      }
     }
     clearAuthCookies(reply);
     return reply.code(204).send();
@@ -266,7 +366,7 @@ export const authRoutes: FastifyPluginAsync = async app => {
     return {
       accessTokenTtlMinutes: Math.round(accessTtlSeconds(policy?.sessionTimeoutMinutes) / 60),
       refreshTokenTtlDays: Math.round(refreshTokenTtlSeconds / 86400),
-      csrfEnabled: true, cookiePath: refreshCookiePath, sameSite: 'Lax', secure: isProduction(),
+      csrfEnabled: true, cookiePath: refreshCookiePath, csrfCookiePath, sameSite: env.COOKIE_SAMESITE, secure: cookieSecure(),
       httpOnlyRefreshCookie: true, devTokenEnabled: env.NODE_ENV !== 'production', productionHttpsRequired: isProduction(),
       rbacEnabled: true, auditLoggingEnabled: true,
       accountLockoutEnabled: policy?.failedLoginLockout ?? false,
@@ -277,9 +377,22 @@ export const authRoutes: FastifyPluginAsync = async app => {
   // ===== Password reset ===================================================
   app.post('/password-reset/request', rateSensitive, async request => {
     const { email } = z.object({ email: z.string().email().trim().toLowerCase() }).parse(request.body);
-    const user = await db.user.findFirst({ where: { email, active: true } });
     // Always return a generic response (no account-existence leak).
     const generic = { status: 'ok', message: 'If an account exists for that email, a password reset has been initiated.' } as Record<string, unknown>;
+    const candidates = await resolveAuthLoginCandidates(email);
+    // Password-reset URLs do not currently carry a workspace selector. Fail
+    // closed for an ambiguous multi-workspace email instead of resetting an
+    // arbitrary account.
+    if (candidates.length !== 1 || tenantBlocksSessions(candidates[0].tenant.status)) return generic;
+    const candidate = candidates[0];
+    enterTenantContext({
+      tenantId: candidate.tenantId,
+      actorId: candidate.id,
+      actorRole: 'PASSWORD_RESET',
+      source: 'request',
+      requestId: request.id,
+    });
+    const user = await db.user.findFirst({ where: { id: candidate.id, email, active: true } });
     if (!user) return generic;
 
     const rawToken = createResetToken();
@@ -304,14 +417,24 @@ export const authRoutes: FastifyPluginAsync = async app => {
     const policyCheck = validatePassword(newPassword);
     if (!policyCheck.ok) throw app.httpErrors.badRequest(policyCheck.message ?? 'Password does not meet policy.');
 
-    const record = await db.passwordResetToken.findFirst({ where: { tokenHash: hashResetToken(token), usedAt: null, expiresAt: { gt: new Date() } } });
+    const tokenHash = hashResetToken(token);
+    const resolved = await resolveIngressTenant('password_reset_hash', tokenHash);
+    if (!resolved) throw app.httpErrors.badRequest('This reset link is invalid or has expired.');
+    enterTenantContext({
+      tenantId: resolved.tenantId,
+      actorId: resolved.resourceId,
+      actorRole: 'PASSWORD_RESET',
+      source: 'request',
+      requestId: request.id,
+    });
+    const record = await db.passwordResetToken.findFirst({ where: { id: resolved.resourceId, tokenHash, usedAt: null, expiresAt: { gt: new Date() } } });
     if (!record) throw app.httpErrors.badRequest('This reset link is invalid or has expired.');
 
     const passwordHash = await generatePasswordHash(newPassword);
-    await db.$transaction([
-      db.user.update({ where: { id: record.userId }, data: { passwordHash, passwordChangedAt: new Date(), failedLoginCount: 0, lockedUntil: null, refreshTokenHash: null, refreshTokenExpiresAt: null } }),
-      db.passwordResetToken.update({ where: { id: record.id }, data: { usedAt: new Date() } }),
-    ]);
+    await db.$transaction(async tx => {
+      await tx.user.update({ where: { id: record.userId }, data: { passwordHash, passwordChangedAt: new Date(), failedLoginCount: 0, lockedUntil: null, refreshTokenHash: null, refreshTokenExpiresAt: null } });
+      await tx.passwordResetToken.update({ where: { id: record.id }, data: { usedAt: new Date() } });
+    });
     await auditAuth(request, record.tenantId, record.userId, 'auth.password.reset.completed');
     return reply.send({ status: 'ok', message: 'Your password has been reset. Please sign in.' });
   });
@@ -321,7 +444,15 @@ export const authRoutes: FastifyPluginAsync = async app => {
   // short-lived login-flow mfa token (setup/challenge).
   async function resolveMfaActor(request: FastifyRequest): Promise<{ userId: string; tenantId: string; type: string }> {
     const payload = await request.jwtVerify<{ userId: string; tenantId: string; type?: string }>();
-    return { userId: payload.userId, tenantId: payload.tenantId, type: payload.type ?? 'access' };
+    const actor = { userId: payload.userId, tenantId: payload.tenantId, type: payload.type ?? 'access' };
+    enterTenantContext({
+      tenantId: actor.tenantId,
+      actorId: actor.userId,
+      actorRole: actor.type === 'access' ? 'AUTHENTICATED_USER' : 'MFA_CHALLENGE',
+      source: 'request',
+      requestId: request.id,
+    });
+    return actor;
   }
 
   app.get('/mfa/status', async request => {
@@ -353,9 +484,10 @@ export const authRoutes: FastifyPluginAsync = async app => {
     const actor = await resolveMfaActor(request);
     const user = await db.user.findFirst({
       where: { id: actor.userId, active: true },
-      include: { tenant: { select: { id: true, name: true, slug: true } }, branch: { select: { id: true, name: true, location: true } } },
+      include: { tenant: { select: { id: true, name: true, slug: true, status: true } }, branch: { select: { id: true, name: true, location: true } } },
     });
     if (!user || !user.mfaSecretEnc) throw app.httpErrors.badRequest('MFA is not set up for this account.');
+    if (tenantBlocksSessions(user.tenant.status)) throw app.httpErrors.forbidden('suspended_tenant');
     const secret = decryptSecret(user.mfaSecretEnc);
     if (!secret || !verifyTotp(secret, code)) {
       await auditAuth(request, actor.tenantId, user.id, 'auth.mfa.verify.failed');
@@ -377,7 +509,7 @@ export const authRoutes: FastifyPluginAsync = async app => {
       const session = await issueSession(app, user, accessTtlSeconds(policy?.sessionTimeoutMinutes));
       setAuthCookies(reply, session.refreshToken, session.csrfToken);
       await auditAuth(request, user.tenantId, user.id, 'auth.login.success', { email: user.email, mfa: true });
-      return { status: 'ok', accessToken: session.accessToken, user: serializeUser(user) };
+      return { status: 'ok', accessToken: session.accessToken, csrfToken: session.csrfToken, user: serializeUser(user) };
     }
     return { status: 'ok', enabled: true };
   });

@@ -20,7 +20,7 @@ vi.mock('../workers/queues', () => ({
 }));
 
 const { buildApp } = await import('../app');
-const { db } = await import('../lib/db');
+const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { recomputeEntitlements } = await import('../lib/entitlements');
 
 let app: FastifyInstance;
@@ -42,8 +42,8 @@ async function makeTenant() {
   createdTenantIds.push(id);
   const plan = await db.subscriptionPlan.findUnique({ where: { key: 'enterprise' } });
   await db.tenantSubscription.create({ data: { tenantId: id, planId: plan!.id, status: 'ACTIVE', startedAt: new Date() } });
-  await recomputeEntitlements(id);
-  const branch = await db.branch.create({ data: { tenantId: id, name: 'b', location: 'x' } });
+  await recomputeEntitlements(id, db);
+  const branch = await db.branch.create({ data: { tenantId: id, name: 'b', location: 'x', timezone: 'UTC' } });
   const provUser = await db.user.create({ data: { tenantId: id, role: 'PROVIDER', active: true, email: `pv-${id.slice(0, 8)}@ac.test`, displayName: 'Dr' } });
   const provider = await db.providerProfile.create({ data: { tenantId: id, branchId: branch.id, userId: provUser.id, specialty: 'Primary Care' } });
   await db.providerAvailability.create({ data: { tenantId: id, branchId: branch.id, providerProfileId: provider.id, dayOfWeek: 1, startMinute: 540, endMinute: 720, slotMinutes: 30 } });
@@ -53,7 +53,7 @@ async function makeTenant() {
 }
 
 type T = Awaited<ReturnType<typeof makeTenant>>;
-const staff = (t: T) => ({ authorization: `Bearer ${app.jwt.sign({ userId: t.adminId, tenantId: t.id, type: 'access' })}` });
+const staff = (t: T) => ({ authorization: `Bearer ${app.jwt.sign({ userId: t.adminId, tenantId: t.id, role: 'OWNER', type: 'access' })}` });
 
 const staffBook = (t: T, providerProfileId: string | undefined, start = '09:00', end = '09:30') =>
   app.inject({ method: 'POST', url: '/v1/appointments', headers: staff(t), payload: { branchId: t.branchId, patientId: t.patientId, providerProfileId, service: 'Checkup', startsAt: at(start), endsAt: at(end), channel: 'EMAIL' } });

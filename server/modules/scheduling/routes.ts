@@ -5,7 +5,7 @@ import { audit } from '../../lib/audit';
 import { requirePermission } from '../../lib/permissions';
 import { assertBranchAccess } from '../../lib/scope';
 import { recordWorkflowEvent } from '../../lib/intelligence';
-import { computeProviderSlots, findSlotConflict, getSchedulingPolicy, isDoubleBookConflictError } from '../../lib/scheduling';
+import { computeProviderSlots, findSlotConflict, getSchedulingPolicy, isDoubleBookConflictError, resolveSchedulingService } from '../../lib/scheduling';
 
 // ===========================================================================
 // Provider scheduling — recurring availability, one-off time-off, open-slot
@@ -66,13 +66,13 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
     const { windows } = z.object({ windows: z.array(windowSchema).max(50) }).parse(request.body);
     const provider = await loadProvider(request, providerId);
 
-    await db.$transaction([
-      db.providerAvailability.deleteMany({ where: { tenantId: request.auth.tenantId, providerProfileId: providerId } }),
-      db.providerAvailability.createMany({
+    await db.$transaction(async tx => {
+      await tx.providerAvailability.deleteMany({ where: { tenantId: request.auth.tenantId, providerProfileId: providerId } });
+      await tx.providerAvailability.createMany({
         data: windows.map(w => ({ tenantId: request.auth.tenantId, branchId: provider.branchId, providerProfileId: providerId, dayOfWeek: w.dayOfWeek, startMinute: w.startMinute, endMinute: w.endMinute, slotMinutes: w.slotMinutes })),
         skipDuplicates: true,
-      }),
-    ]);
+      });
+    });
     await audit(request, { action: 'schedule.availability.updated', resource: 'providerProfile', resourceId: providerId, metadata: { windows: windows.length } });
     const saved = await db.providerAvailability.findMany({ where: { tenantId: request.auth.tenantId, providerProfileId: providerId }, orderBy: [{ dayOfWeek: 'asc' }, { startMinute: 'asc' }] });
     return { providerId, windows: saved };
@@ -100,9 +100,11 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
   // ----- Open slots (read) --------------------------------------------------
   app.get('/providers/:providerId/slots', async request => {
     const { providerId } = providerParam.parse(request.params);
-    const query = z.object({ date: dateISO, durationMin: z.coerce.number().int().min(5).max(240).optional() }).parse(request.query);
+    const query = z.object({ date: dateISO, serviceCatalogItemId: uuid.optional(), service: z.string().trim().min(1).max(160).optional(), durationMin: z.coerce.number().int().min(5).max(240).optional() }).parse(request.query);
     await loadProvider(request, providerId);
-    const slots = await computeProviderSlots({ tenantId: request.auth.tenantId, providerProfileId: providerId, dateISO: query.date, durationMin: query.durationMin });
+    const service = await resolveSchedulingService({ tenantId: request.auth.tenantId, serviceCatalogItemId: query.serviceCatalogItemId, service: query.service, fallbackDurationMin: query.durationMin });
+    if (!service) throw app.httpErrors.badRequest('Select an active service before checking availability');
+    const slots = await computeProviderSlots({ tenantId: request.auth.tenantId, providerProfileId: providerId, dateISO: query.date, durationMin: service.durationMin });
     return { providerId, date: query.date, slots: slots.map(s => ({ startsAt: s.startsAt.toISOString(), endsAt: s.endsAt.toISOString() })) };
   });
 
@@ -112,16 +114,19 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
     const body = z.object({
       patientId: uuid,
       startsAt: z.coerce.date(),
-      durationMin: z.number().int().min(5).max(240).default(30),
+      durationMin: z.number().int().min(5).max(240).optional(),
+      serviceCatalogItemId: uuid.optional(),
       service: z.string().trim().min(1).max(160),
       channel: z.enum(['WHATSAPP', 'SMS', 'EMAIL', 'PUSH', 'CALL', 'VIDEO']).default('EMAIL'),
     }).parse(request.body);
     const provider = await loadProvider(request, providerId);
+    const service = await resolveSchedulingService({ tenantId: request.auth.tenantId, serviceCatalogItemId: body.serviceCatalogItemId, service: body.service, fallbackDurationMin: body.durationMin });
+    if (!service) throw app.httpErrors.badRequest('Select an active service before booking');
 
     const patient = await db.patient.findFirst({ where: { id: body.patientId, tenantId: request.auth.tenantId, branchId: provider.branchId, deletedAt: null }, select: { id: true } });
     if (!patient) throw app.httpErrors.badRequest('Patient not found in this provider\'s clinic');
 
-    const endsAt = new Date(body.startsAt.getTime() + body.durationMin * 60_000);
+    const endsAt = new Date(body.startsAt.getTime() + service.durationMin * 60_000);
 
     // Conflict check + create in one transaction so the slot can't be double-booked
     // between check and insert. The DB exclusion constraint is the final guard if a
@@ -129,12 +134,12 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
     let result: { conflict: Awaited<ReturnType<typeof findSlotConflict>> } | { appointment: Awaited<ReturnType<typeof db.appointment.create>> };
     try {
       result = await db.$transaction(async tx => {
-        const conflict = await findSlotConflict({ tenantId: request.auth.tenantId, providerProfileId: providerId, startsAt: body.startsAt, durationMin: body.durationMin }, tx);
+        const conflict = await findSlotConflict({ tenantId: request.auth.tenantId, providerProfileId: providerId, startsAt: body.startsAt, durationMin: service.durationMin }, tx);
         if (conflict) return { conflict } as const;
         const appointment = await tx.appointment.create({
           data: {
             tenantId: request.auth.tenantId, branchId: provider.branchId, patientId: body.patientId,
-            providerProfileId: providerId, providerRef: providerId, service: body.service, startsAt: body.startsAt, endsAt,
+            providerProfileId: providerId, providerRef: providerId, service: service.name, serviceCatalogItemId: service.id, startsAt: body.startsAt, endsAt,
             status: 'CONFIRMED', channel: body.channel,
           },
         });
