@@ -34,8 +34,9 @@ records decision checkpoints produced during production completion.
 
 ### Foundation, tenant, workforce and patient master data
 
-- Result: `REJECT — REMEDIATION ACTIVE`
-- Open severities: P1/P2.
-- Gate: no module completion until patient truthfulness, identity concurrency,
-  clinic/access serialization, clinician-owner identity, provisioning recovery and
-  narrow front-desk task permissions pass independent retest.
+- Result: initial `REJECT`, superseded by independent `PASS` for the reviewed scope.
+- Commits: `524169f`, `70923c5`, `1bb1c1e`.
+- Evidence: 40/40; typed user/tenant race outcomes; real retired-route 401/410
+  with zero write; cross-entry slug race; typecheck, lint and production build.
+- P3: remove retired compatibility after telemetry, index canonical phone for scale,
+  and resolve the PostgreSQL client deprecation warning during upgrade readiness.

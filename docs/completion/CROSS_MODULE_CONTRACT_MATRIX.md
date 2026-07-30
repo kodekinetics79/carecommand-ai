@@ -10,9 +10,9 @@ certify an organization.
 | Tenant context and RLS | M23 database/RLS | M01–M22 | authenticated tenant bound to transaction; runtime principals fail closed; platform plane separate | PASS at 69 migrations / 119 protected tables; managed database activation external |
 | Staff authentication/session | M02 identity | all staff modules | strong password/session validation, revocation, CSRF, no tenant selection by caller | PASS for reviewed core; SSO/MFA provider activation remains feature-specific |
 | Platform authentication/session | M03 platform | M03, M19, M24 | unique session ID, per-session revocation, separate audit plane | PASS at `75c22db` |
-| Authorization vocabulary | M05 workforce | M01–M22 | server-enforced least privilege; route/action scopes; no UI-only authorization | IN CONSULTANT REVIEW for foundation/workforce remediation |
-| Tenant/clinic master data | M04 organization | M05–M18 | active-clinic enforcement; serialized lifecycle and access changes; atomic audit | IN CONSULTANT REVIEW |
-| Patient identity | M06 patient data | M07–M17 | canonical identity, deterministic duplicate handling, soft-delete policy, no fabricated demographics/consent | IN CONSULTANT REVIEW |
+| Authorization vocabulary | M05 workforce | M01–M22 | server-enforced least privilege; route/action scopes; no UI-only authorization | PASS for reviewed foundation/workforce scope; catalog reconciliation continues |
+| Tenant/clinic master data | M04 organization | M05–M18 | active-clinic enforcement; serialized lifecycle and access changes; atomic audit | PASS for reviewed lifecycle/access scope |
+| Patient identity | M06 patient data | M07–M17 | canonical identity, deterministic duplicate handling, soft-delete policy, no fabricated demographics/consent | PASS for reviewed identity/search/lifecycle scope; indexed canonical phone is P3 scale work |
 | Consent and suppression | M06/M11 | M09–M14, M17 | purpose/channel/version/source/time provenance; revocation authoritative; minimum necessary | Accepted where cited; catalog reconciliation remains |
 | Scheduling/appointment mutation | M07 scheduling | M09, M10, M13, M16 | canonical availability and collision transaction; explicit ownership/policy; commit before success claim | PASS for reviewed collision/book/change paths |
 | Receptionist call identity | M09 receptionist | M06, M07, M11 | call-scoped proof, attempt limits, no hints, tenant destination fail closed | PASS for reviewed protected core |
