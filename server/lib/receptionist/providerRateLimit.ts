@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 export const RETELL_RATE_WINDOW_MS = 60_000;
+export const RETELL_RATE_STORE_TIMEOUT_MS = 500;
 export const RETELL_EVENT_PER_CALL_LIMIT = 20;
 export const RETELL_TOOL_PER_CALL_LIMIT = 120;
 export const RETELL_TENANT_CALLBACK_LIMIT = 12_000;
@@ -27,6 +28,20 @@ local source_count = redis.call('INCR', KEYS[1])
 if source_count == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
 return source_count
 `;
+
+export async function withRetellRateStoreDeadline<T>(operation: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('Retell rate store deadline exceeded')), RETELL_RATE_STORE_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 function opaqueKey(value: string) {
   return createHash('sha256').update(value).digest('hex').slice(0, 32);
@@ -75,7 +90,7 @@ export async function enforceVerifiedRetellRateLimit(input: {
   let counts: [number, number];
   if (input.redis) {
     try {
-      const raw = await input.redis.eval(RATE_SCRIPT, 2, tenantKey, callKey, RETELL_RATE_WINDOW_MS);
+      const raw = await withRetellRateStoreDeadline(input.redis.eval(RATE_SCRIPT, 2, tenantKey, callKey, RETELL_RATE_WINDOW_MS));
       if (!Array.isArray(raw) || raw.length !== 2) throw new Error('Unexpected Retell rate-store response');
       counts = [Number(raw[0]), Number(raw[1])];
       if (!counts.every(Number.isFinite)) throw new Error('Invalid Retell rate-store counters');
@@ -113,7 +128,7 @@ export async function enforceInvalidRetellSignatureRateLimit(input: {
   let count: number;
   if (input.redis) {
     try {
-      const raw = await input.redis.eval(INVALID_SIGNATURE_RATE_SCRIPT, 1, sourceKey, RETELL_RATE_WINDOW_MS);
+      const raw = await withRetellRateStoreDeadline(input.redis.eval(INVALID_SIGNATURE_RATE_SCRIPT, 1, sourceKey, RETELL_RATE_WINDOW_MS));
       count = Number(raw);
       if (!Number.isFinite(count)) throw new Error('Invalid Retell invalid-signature counter');
     } catch {

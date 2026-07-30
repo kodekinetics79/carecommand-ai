@@ -34,6 +34,7 @@ import { autopilotQueue } from '../../workers/queues';
 import {
   enforceInvalidRetellSignatureRateLimit,
   enforceVerifiedRetellRateLimit,
+  withRetellRateStoreDeadline,
   type RetellRateRedis,
 } from '../../lib/receptionist/providerRateLimit';
 
@@ -849,7 +850,7 @@ export function verifyRetellSignature(
 async function retellRateRedis(): Promise<RetellRateRedis | undefined> {
   let redis: RetellRateRedis | undefined;
   try {
-    redis = (await autopilotQueue.client) as unknown as RetellRateRedis | undefined;
+    redis = await withRetellRateStoreDeadline(autopilotQueue.client as unknown as Promise<RetellRateRedis>);
   } catch {
     redis = undefined;
   }

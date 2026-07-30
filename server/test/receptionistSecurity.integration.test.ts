@@ -352,4 +352,21 @@ describe('Retell authorization ordering and fail-closed store', () => {
     expect(response.json().message).toContain('staff have not acknowledged');
     expect(await db.staffTask.count({ where: { tenantId: tenant.id } })).toBe(1);
   });
+
+  it('bounds a never-settling Redis client for both tool and nonterminal event paths', async () => {
+    const tenant = await makeTenant();
+    const callId = await makeMappedCall(tenant);
+    const key = 'retell-store-timeout-key';
+    setEnv({ NODE_ENV: 'production', RETELL_API_KEY: key });
+    rateStoreState.client = new Promise<never>(() => {});
+    const startedAt = Date.now();
+    const toolResponse = await signedPost(fnUrl(tenant.clinicId), toolBody(callId), key);
+    expect(toolResponse.statusCode).toBe(200);
+    expect(toolResponse.json()).toMatchObject({ reason: 'store_unavailable', handoff_recorded: true });
+    const eventResponse = await signedPost(eventUrl(tenant.clinicId), eventBody(callId), key);
+    expect(eventResponse.statusCode).toBe(503);
+    expect(eventResponse.json().error).toBe('CALLBACK_RATE_LIMIT_UNAVAILABLE');
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    expect(await db.staffTask.count({ where: { tenantId: tenant.id } })).toBe(1);
+  });
 });

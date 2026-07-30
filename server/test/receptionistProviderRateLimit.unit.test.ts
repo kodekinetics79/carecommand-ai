@@ -66,6 +66,13 @@ describe('verified Retell callback rate policy', () => {
     failing.fail = true;
     expect(await enforceVerifiedRetellRateLimit({ tenantId: 'tenant', providerCallId: 'call', kind: 'tool', redis: failing, production: true })).toEqual({ allowed: false, reason: 'store_unavailable' });
   });
+
+  it('bounds a never-settling Redis EVAL with the production store-unavailable result', async () => {
+    const hanging: RetellRateRedis = { eval: async () => new Promise<never>(() => {}) };
+    const startedAt = Date.now();
+    expect(await enforceVerifiedRetellRateLimit({ tenantId: 'tenant', providerCallId: 'call', kind: 'tool', redis: hanging, production: true })).toEqual({ allowed: false, reason: 'store_unavailable' });
+    expect(Date.now() - startedAt).toBeLessThan(1_500);
+  });
 });
 
 describe('invalid Retell signature source policy', () => {
