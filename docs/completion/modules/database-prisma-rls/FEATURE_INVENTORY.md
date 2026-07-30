@@ -12,4 +12,3 @@ Pod: Database Council Pod. Embedded consultant: PostgreSQL/RLS/data-integrity co
 | M23-F06 | Tenant relationship integrity | Domain writers; foreign parent/reassignment/race | Prisma/SQL mutations | 120 composite tenant FKs | database-level tenant key, not app-only | Behavioral/FK evidence passes | COMPLETE |
 | M23-F07 | Prisma drift guard | DB council/release; schema diff, missing protected object | drift script | migration-owned FKs/indexes | fail on destructive/unexpected drift; no silent removal | Drift verification passes | COMPLETE |
 | M23-F08 | Database backup/restore integrity | DBA/release; backup/encrypt/restore/check/login/RLS/RPO/RTO | operational scripts/runbook | PostgreSQL | isolated target, integrity/RLS/login proof, no shared destructive action | Prior isolated local drill reported; managed production-like restore evidence external | EXTERNAL BLOCKED |
-

@@ -16,6 +16,16 @@ This ledger is generated from the authoritative 24 module feature inventories. I
 
 The feature inventories are the detailed acceptance contracts. “Existing evidence” below is not automatically sufficient for every Definition-of-Done clause; the gap text is authoritative.
 
+## Decision checkpoint
+
+- The ledger has 202 unique feature IDs and exactly 202 detailed inventory rows; no feature ID is duplicated.
+- The current application cannot be called Development COMPLETE: 135 features remain `IN DISCOVERY` and need dedicated feature-level completion or an explicit product-scope decision.
+- The 42 `COMPLETE` rows are limited to previously challenged controls and workflows: staff/session core, intake authorization/acknowledgement, slot/canonical booking, protected receptionist core, portal session/self-service booking, suppression, policy integrity, payment concurrency/reconciliation, device ingest/alerts/RPM evidence, mandatory audit durability, integration posture/job envelopes, database/RLS, and baseline build/test/browser gates.
+- The 25 external-only rows are: `M09-F04`, `M09-F12`–`F14`, `M10-F08`, `M11-F05`, `M12-F04`–`F05`, `M13-F03`, `M13-F05`, `M14-F01`, `M14-F08`, `M15-F03`, `M19-F12`–`F13`, `M21-F01`, `M21-F04`–`F07`, `M21-F09`, `M22-F05`, `M23-F08`, and `M24-F07`–`F08`.
+- External-only means credentials/provider or customer environment, legal/organizational approval, managed operational evidence, or independent external assessment. It does not include repository-fixable gaps.
+
+The highest-consequence internal discovery gaps are the unsupported clinical data model/API surfaces (`M08-F02`, `M08-F04`, `M08-F05`), absent refund/dispute workflow (`M13-F12`), intake document storage/malware/OCR proof (`M06-F06`), incomplete role-to-every-endpoint evidence (`M02-F07`/`M05-F02`), incomplete clean-clone/SBOM/history-secret evidence (`M24-F05`–`F06`), and broad feature-level browser/accessibility/negative/concurrency evidence gaps across the analytics, reputation, inventory, CRM, portal and administration modules.
+
 ## Module roll-up
 
 | Module | Features | Complete | External blocked | In discovery | Pod | Embedded consultant | Independent reviewer | Module verdict |
@@ -257,4 +267,3 @@ The feature inventories are the detailed acceptance contracts. “Existing evide
 Within each module, work proceeds in ascending feature ID unless dependency or severity evidence justifies a recorded reorder. A pod must update its feature inventory and this ledger only after implementation, focused/negative/security/privacy/tenant tests, realistic synthetic scenarios, adjacent and cross-module regression, embedded consultant review, independent challenge, and a focused commit. Shared schema, migration, auth, environment, router, CI and shared route files remain centrally serialized.
 
 No `IN DISCOVERY` row may be moved directly to `COMPLETE`; it must pass through implementation/testing/consultant review evidence even if those intermediate states are short-lived.
-

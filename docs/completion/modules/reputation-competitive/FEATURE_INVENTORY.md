@@ -9,4 +9,3 @@ Pod: Reputation Pod. Embedded consultant: healthcare reputation/competitive-inte
 | M17-F03 | Review request workflow | Staff/system; create/send/status/opt-out | growth/reputation consumers | `ReviewRequest` | communication consent, tenant/patient scope, truthful send state | Model exists; complete API/UI/provider evidence not identified | IN DISCOVERY |
 | M17-F04 | Reputation cases | Managers; open/assign/resolve/escalate | reputation endpoint | `ReputationCase` | tenant scope, sensitive content, audit | Aggregate endpoint exists; lifecycle UI/API/test evidence incomplete | IN DISCOVERY |
 | M17-F05 | Competitor radar/insights | Owner/analyst; list/compare/empty/source failure | Clinic Radar; competitor APIs | `Competitor`, `CompetitorReviewInsight` | provenance, no fabricated market data, tenant scope | Production hardcoding cleaned; statistical/source ingestion tests missing | IN DISCOVERY |
-

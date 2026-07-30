@@ -9,4 +9,3 @@ Pod: Experience Pod. Embedded consultant: WCAG/assistive-technology/localization
 | M22-F03 | UI shell preferences | Staff; sidebar collapse/sections, reload/malformed local state | Sidebar/uiPrefs | browser-local non-PHI | no security decision from local state, keyboard/ARIA | E2E mobile route crawl selected; focused accessibility/storage tests missing | IN DISCOVERY |
 | M22-F04 | Responsive/mobile behavior | Staff/patient/platform; nav/open/close/forms/tables | all React surfaces | none | no hidden authorization; accessible touch targets | Pixel 7 E2E `10/10` baseline; module/feature-specific mobile coverage incomplete | IN DISCOVERY |
 | M22-F05 | WCAG/assistive technology | All users; keyboard, focus, name/role/value, contrast, errors | design system/all pages | none | WCAG 2.2 target, semantic status/errors, no color-only meaning | Route crawl catches selected structural defects; formal WCAG/AT audit external | EXTERNAL BLOCKED |
-

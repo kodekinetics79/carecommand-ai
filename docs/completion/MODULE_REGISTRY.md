@@ -192,3 +192,23 @@ Data classes used in feature inventories:
 3. M05/M15/M22 share exports in `settings/routes.ts`; endpoint-level ownership is defined above, but file edits need a single integrator.
 4. Several production-dependent features have truthful adapters but lack live/sandbox evidence: telephony, payer, payments, communications, devices, managed alerts, backup/restore and deployed accessibility/performance.
 5. Existing broad evidence is strong for isolation, receptionist safety, money concurrency, RPM evidence, authentication and audit durability; it is not feature-level evidence for every analytics, reputation, inventory, portal, CRM, clinical or administrative action.
+
+## Registry validation checkpoint
+
+Validation was repeated after all inventories and the master ledger were written:
+
+| Invariant | Result |
+|---|---:|
+| Real modules with dedicated pod + embedded consultant + separate independent reviewer | 24/24 |
+| Prisma models in `schema.prisma` | 127 |
+| Models assigned in the exclusive ownership table | 127 total / 127 unique / no missing / no duplicate |
+| React route declarations inspected | 54, including the patient portal index |
+| Fastify module source files containing route handlers | 39/39 assigned |
+| Feature flags assigned | 15/15 |
+| BullMQ queues assigned | 4/4 |
+| Repeatable schedules assigned | 9/9 (six compliance, one campaign, two monitoring) |
+| Module feature inventories | 24/24 |
+| Unique feature IDs | 202/202 |
+| Master-ledger feature rows matching inventories | 202/202 |
+
+The 461 lexical `app.get/post/put/patch/delete` occurrences found under `server/modules` include all handlers in the 39 route-bearing source files; ownership is by registered namespace and the explicitly split endpoint groups in `operations/routes.ts` and `settings/routes.ts`. The registry does not claim that each handler has endpoint-specific Definition-of-Done evidence.

@@ -15,4 +15,3 @@ Pod: Connected Care Pod. Embedded consultant: RPM clinical/device-integration co
 | M14-F09 | Morning briefing/signals | Care team; overview/create/update/delete/foreign | morning briefing APIs | `MorningBriefingSignal` | branch/tenant scope, role controls, evidence timestamps, audit | Briefing tests exist; full browser correctness incomplete | IN DISCOVERY |
 | M14-F10 | RPM billing readiness/review minutes | Clinical/billing; monthly view/review/backdated data | `/rpm-readiness`; readiness APIs | `RPMBillingReadiness`, immutable `AuditEvent` evidence | UTC calendar month, derived minutes, v2 hash, locks/invalidation | Independent clinical review accepted `82/82` | COMPLETE |
 | M14-F11 | Provider signoff | Provider; sign, stale/offline/backdated/repeat | RPM signoff API | readiness + evidence/audit | provider-only, immutable evidence-bound hash, current recompute, fail closed | Independent RPM review accepted zero P0/P1 | COMPLETE |
-

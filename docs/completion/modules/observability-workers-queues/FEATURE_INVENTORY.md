@@ -13,4 +13,3 @@ Pod: Reliability Pod. Embedded consultant: SRE/incident-response/observability c
 | M21-F07 | Queue runtime/retry/backoff/shutdown | Worker/SRE; start/retry/fail/disabled/graceful stop | worker runtime | Redis/BullMQ four queues | deterministic jobs, bounded attempts/backoff, close cleanly, truthful disabled | Worker tests exist; production Redis/soak/DLQ alert evidence external | EXTERNAL BLOCKED |
 | M21-F08 | Signed tenant job envelopes | Domain workers; scheduler tick, tenant fanout, tamper/replay | queue helpers/workers | no model | HMAC domain separation, active tenant resolver, no untrusted tenant ID | Envelope/resolver/worker tests pass | COMPLETE |
 | M21-F09 | Queue depth/failure alerting | SRE; backlog/failure/recovery | sampling metrics | Redis/Prometheus/alert manager | no payload/PHI, per-queue bounded labels, actionable thresholds | Sampling code/tests exist; actual alert delivery/on-call acknowledgement external | EXTERNAL BLOCKED |
-
