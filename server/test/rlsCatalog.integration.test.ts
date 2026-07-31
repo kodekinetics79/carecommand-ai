@@ -18,7 +18,10 @@ type PolicyRow = {
 // PlatformAuditEvent has an optional tenantId that identifies a target rather
 // than row ownership. It is the only explicit tenant-column RLS exemption.
 const TENANT_COLUMN_EXEMPTIONS = new Set(['PlatformAuditEvent']);
-const APPEND_ONLY_TABLES = new Set(['AuditEvent', 'NotificationDeliveryAttempt']);
+const APPEND_ONLY_TABLES = new Set([
+  'AuditEvent', 'NotificationDeliveryAttempt',
+  'ReceptionistVoiceConsentEvent', 'ReceptionistOutboundProviderIntent',
+]);
 
 function schemaTenantTables(): string[] {
   // Prisma 7's generated namespace no longer exposes DMMF at runtime. Read the

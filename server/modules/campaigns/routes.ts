@@ -34,6 +34,16 @@ const campaignFeature = requireFeature('campaign_automation');
 const writeRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'FRONT_DESK');
 const launchRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'BILLING');
 const channelEnum = z.enum(['sms', 'email', 'voice', 'whatsapp']);
+const voicePurpose = z.enum(['CARE_COORDINATION', 'APPOINTMENT_REMINDER', 'PATIENT_REACTIVATION']);
+const voiceCaptureMethod = z.enum(['verbal_recorded', 'written', 'staff_attestation', 'import_verified']);
+const voiceEvidenceSource = z.enum(['patient_verbal', 'patient_written', 'staff_attested', 'verified_import']);
+
+const VOICE_SOURCE_BY_METHOD: Record<z.infer<typeof voiceCaptureMethod>, z.infer<typeof voiceEvidenceSource>> = {
+  verbal_recorded: 'patient_verbal',
+  written: 'patient_written',
+  staff_attestation: 'staff_attested',
+  import_verified: 'verified_import',
+};
 
 // Which entitlement each audience source requires (beyond campaign_automation).
 const AUDIENCE_FEATURE: Record<AudienceType, string> = {
@@ -400,14 +410,73 @@ export const crmRoutes: FastifyPluginAsync = async app => {
   });
 
   app.post('/consent', { preHandler: writeRoles }, async (request, reply) => {
-    const input = z.object({ patientId: uuid.optional(), leadId: uuid.optional(), channel: channelEnum, status: z.enum(['opted_in', 'opted_out', 'unknown']), source: z.string().max(80).default('staff') }).parse(request.body);
-    if (!input.patientId && !input.leadId) throw app.httpErrors.badRequest('patientId or leadId required');
-    const existing = await db.communicationConsent.findFirst({ where: { tenantId: request.auth.tenantId, patientId: input.patientId ?? null, leadId: input.leadId ?? null, channel: input.channel } });
-    const row = existing
-      ? await db.communicationConsent.update({ where: { id: existing.id }, data: { status: input.status, source: input.source, capturedAt: new Date(), revokedAt: input.status === 'opted_out' ? new Date() : null } })
-      : await db.communicationConsent.create({ data: { tenantId: request.auth.tenantId, patientId: input.patientId, leadId: input.leadId, channel: input.channel, status: input.status, source: input.source, revokedAt: input.status === 'opted_out' ? new Date() : null } });
-    await audit(request, { action: 'consent.updated', resource: 'communicationConsent', resourceId: row.id, metadata: { channel: input.channel, status: input.status } });
-    return reply.code(201).send(row);
+    const input = z.object({
+      patientId: uuid.optional(), leadId: uuid.optional(), channel: channelEnum,
+      status: z.enum(['opted_in', 'opted_out', 'unknown']), source: z.string().trim().max(80).default('staff'),
+      purpose: voicePurpose.optional(), policyVersion: z.string().trim().min(1).max(100).optional(),
+      disclosureTextHash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+      evidenceReference: z.string().trim().min(3).max(200).optional(),
+      captureMethod: voiceCaptureMethod.optional(), evidenceSource: voiceEvidenceSource.optional(),
+      jurisdiction: z.string().trim().min(2).max(100).optional(),
+      occurredAt: z.coerce.date().optional(), expiresAt: z.coerce.date().optional(),
+    }).parse(request.body);
+    if (Boolean(input.patientId) === Boolean(input.leadId)) throw app.httpErrors.badRequest('Exactly one patientId or leadId is required');
+
+    if (input.channel !== 'voice') {
+      const existing = await db.communicationConsent.findFirst({ where: { tenantId: request.auth.tenantId, patientId: input.patientId ?? null, leadId: input.leadId ?? null, channel: input.channel } });
+      const row = existing
+        ? await db.communicationConsent.update({ where: { id: existing.id }, data: { status: input.status, source: input.source, capturedAt: new Date(), revokedAt: input.status === 'opted_out' ? new Date() : null } })
+        : await db.communicationConsent.create({ data: { tenantId: request.auth.tenantId, patientId: input.patientId, leadId: input.leadId, channel: input.channel, status: input.status, source: input.source, revokedAt: input.status === 'opted_out' ? new Date() : null } });
+      await audit(request, { action: 'consent.updated', resource: 'communicationConsent', resourceId: row.id, metadata: { channel: input.channel, status: input.status } });
+      return reply.code(201).send(row);
+    }
+
+    if (input.status === 'unknown') throw app.httpErrors.badRequest('Voice evidence must be an explicit grant or revocation');
+    if (!input.purpose || !input.policyVersion || !input.disclosureTextHash || !input.evidenceReference || !input.captureMethod || !input.evidenceSource || !input.jurisdiction) {
+      throw app.httpErrors.badRequest('Voice evidence requires purpose, policyVersion, disclosureTextHash, evidenceReference, captureMethod, evidenceSource, and jurisdiction');
+    }
+    if (VOICE_SOURCE_BY_METHOD[input.captureMethod] !== input.evidenceSource) {
+      throw app.httpErrors.badRequest('Voice evidence source is incompatible with captureMethod');
+    }
+    if (!['OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK'].includes(request.auth.role)) {
+      throw app.httpErrors.forbidden('This role cannot attest outbound voice-consent evidence');
+    }
+    if (input.captureMethod === 'import_verified' && !['OWNER', 'ADMIN'].includes(request.auth.role)) {
+      throw app.httpErrors.forbidden('Verified consent imports require OWNER or ADMIN review');
+    }
+    const occurredAt = input.occurredAt ?? new Date();
+    if (occurredAt > new Date(Date.now() + 5 * 60_000) || (input.expiresAt && input.expiresAt <= occurredAt)) {
+      throw app.httpErrors.badRequest('Voice evidence timestamps are invalid');
+    }
+    const identityExists = input.patientId
+      ? await db.patient.count({ where: { id: input.patientId, tenantId: request.auth.tenantId, deletedAt: null } })
+      : await db.lead.count({ where: { id: input.leadId!, tenantId: request.auth.tenantId } });
+    if (identityExists !== 1) throw app.httpErrors.notFound('Consent identity not found in this tenant');
+
+    const result = await db.$transaction(async tx => {
+      const voiceEvent = await tx.receptionistVoiceConsentEvent.create({ data: {
+        tenantId: request.auth.tenantId, patientId: input.patientId, leadId: input.leadId,
+        purpose: input.purpose!, granted: input.status === 'opted_in', policyVersion: input.policyVersion!,
+        disclosureTextHash: input.disclosureTextHash!, evidenceReference: input.evidenceReference!,
+        captureMethod: input.captureMethod!, source: input.evidenceSource!, actorUserId: request.auth.userId,
+        jurisdiction: input.jurisdiction!, occurredAt, expiresAt: input.expiresAt,
+      } });
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+        action: input.status === 'opted_in' ? 'receptionist.voiceConsent.granted' : 'receptionist.voiceConsent.revoked',
+        resource: 'receptionistVoiceConsentEvent', resourceId: voiceEvent.id, requestId: request.id,
+        ipAddress: request.ip, userAgent: request.headers['user-agent'],
+        metadata: { purpose: input.purpose, policyVersion: input.policyVersion, captureMethod: input.captureMethod },
+      } });
+      await tx.businessEvent.create({ data: {
+        tenantId: request.auth.tenantId,
+        eventType: input.status === 'opted_in' ? 'receptionist.voice_consent.granted' : 'receptionist.voice_consent.revoked',
+        entityType: 'receptionistVoiceConsentEvent', entityId: voiceEvent.id, sourceModule: 'crm',
+        payload: { purpose: input.purpose, policyVersion: input.policyVersion, granted: input.status === 'opted_in' },
+      } });
+      return { voiceEvent };
+    });
+    return reply.code(201).send(result);
   });
 
   app.get('/suppressions', async request => {

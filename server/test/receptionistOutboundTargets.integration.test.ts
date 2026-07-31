@@ -19,7 +19,7 @@ const { buildApp } = await import('../app');
 const { env } = await import('../config/env');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { fingerprintJson } = await import('../modules/receptionist/intakeContract');
-const { setProviderBoundaryTestHookForTests } = await import('../modules/receptionist/outbound');
+const { isWithinQuietHours, quietHoursConfigurationReason, setProviderBoundaryTestHookForTests } = await import('../modules/receptionist/outbound');
 const { isDestinationOptedOut } = await import('../lib/campaigns');
 const { runWithJobTenantContext } = await import('../lib/tenantContext');
 
@@ -36,6 +36,17 @@ const originalRetell = {
 function phoneFor(seed: string, suffix = 0): string {
   const digits = BigInt(`0x${seed.replaceAll('-', '').slice(0, 14)}`) % 9_000_000_000n;
   return `+1${(digits + 1_000_000_000n + BigInt(suffix)).toString().slice(-10)}`;
+}
+
+function quietWindowOutsideNow(timezone = 'America/New_York'): { quietHoursStart: string; quietHoursEnd: string } {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone, hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(new Date());
+  const hour = Number(parts.find(part => part.type === 'hour')?.value ?? 0) % 24;
+  const minute = Number(parts.find(part => part.type === 'minute')?.value ?? 0);
+  const now = hour * 60 + minute;
+  const format = (value: number) => `${String(Math.floor(value / 60) % 24).padStart(2, '0')}:${String(value % 60).padStart(2, '0')}`;
+  return { quietHoursStart: format((now + 60) % 1440), quietHoursEnd: format((now + 61) % 1440) };
 }
 
 async function makeTenant() {
@@ -181,8 +192,14 @@ async function createCampaign(
     maxRetryAttempts?: number;
     bookingMode?: 'APPOINTMENT_REQUEST_ONLY' | 'DIRECT_BOOKING_IF_SLOT_AVAILABLE';
     receptionistCampaignId?: string;
+    purpose?: 'CARE_COORDINATION' | 'APPOINTMENT_REMINDER' | 'PATIENT_REACTIVATION';
+    legalBasis?: 'EXPLICIT_CONSENT' | 'TREATMENT_OPERATIONS';
+    policyVersion?: string;
+    quietHoursStart?: string | null;
+    quietHoursEnd?: string | null;
   } = {},
 ) {
+  const defaultQuietHours = quietWindowOutsideNow();
   const response = await app.inject({
     method: 'POST',
     url: '/v1/receptionist/outbound-campaigns',
@@ -197,9 +214,11 @@ async function createCampaign(
       receptionistCampaignId: options.receptionistCampaignId,
       defaultBranchId: options.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE' ? tenant.branchId : undefined,
       defaultService: options.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE' ? 'Consultation' : undefined,
-      purpose: 'CARE_COORDINATION',
-      legalBasis: 'TREATMENT_OPERATIONS',
-      policyVersion: 'OUTBOUND-TEST-1',
+      purpose: options.purpose ?? 'CARE_COORDINATION',
+      legalBasis: options.legalBasis ?? 'TREATMENT_OPERATIONS',
+      policyVersion: options.policyVersion ?? 'OUTBOUND-TEST-1',
+      quietHoursStart: options.quietHoursStart === undefined ? defaultQuietHours.quietHoursStart : options.quietHoursStart,
+      quietHoursEnd: options.quietHoursEnd === undefined ? defaultQuietHours.quietHoursEnd : options.quietHoursEnd,
       maxRetryAttempts: options.maxRetryAttempts ?? 1,
     },
   });
@@ -286,6 +305,150 @@ function deferred() {
   const promise = new Promise<void>(done => { resolve = done; });
   return { promise, resolve };
 }
+
+describe('AI receptionist persistent reconciliation evidence', () => {
+  it('survives refresh with provider/local IDs, stays fail-closed, and disappears only after durable resolution', async () => {
+    const tenant = await makeTenant();
+    const foreignTenant = await makeTenant();
+    const campaignId = await createCampaign(tenant);
+    const foreignCampaignId = await createCampaign(foreignTenant);
+    const target = await addPatientTarget(tenant, campaignId, 990);
+    const call = await db.receptionistCallLog.create({ data: {
+      tenantId: tenant.id, clinicId: tenant.clinicId, outboundCampaignId: campaignId,
+      targetId: target.id, retellCallId: `provider-reconcile-${randomUUID()}`,
+      callerPhone: target.phone, direction: 'outbound', outcome: 'ESCALATED', endedAt: new Date(),
+    } });
+    await db.receptionistCallTarget.update({
+      where: { id: target.id },
+      data: { status: 'FAILED', lastOutcome: 'RECONCILIATION_REQUIRED', lastCallLogId: call.id },
+    });
+    const signal = await db.operationalSignal.create({ data: {
+      tenantId: tenant.id, signalType: 'receptionist_outbound_provider_acceptance_unknown',
+      entityType: 'receptionistCallLog', entityId: call.id, severity: 'critical', score: 100,
+      reason: 'Provider acceptance requires reconciliation.', status: 'open',
+    } });
+    const task = await db.staffTask.create({ data: {
+      tenantId: tenant.id, title: 'Reconcile outbound provider call', priority: 'CRITICAL', status: 'OPEN',
+      metadata: { workflow: 'receptionist_outbound_reconciliation', callLogId: call.id, providerCallId: call.retellCallId },
+    } });
+
+    const read = () => app.inject({
+      method: 'GET', url: `/v1/receptionist/outbound-campaigns/${campaignId}/reconciliations`, headers: auth(tenant),
+    });
+    const first = await read();
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toEqual([expect.objectContaining({
+      localCallLogId: call.id, providerCallId: call.retellCallId, targetId: target.id,
+      triggerSources: ['RECONCILIATION_REQUIRED', 'RECONCILIATION_SIGNAL', 'RECONCILIATION_TASK'],
+      signalIds: [signal.id], signalStatuses: ['open'],
+      reviewTaskIds: [task.id], reviewTaskStatuses: ['OPEN'],
+    })]);
+    const afterNavigation = await read();
+    expect(afterNavigation.json()).toEqual(first.json());
+    const crossTenant = await app.inject({
+      method: 'GET', url: `/v1/receptionist/outbound-campaigns/${foreignCampaignId}/reconciliations`, headers: auth(tenant),
+    });
+    expect(crossTenant.statusCode).toBe(404);
+
+    await db.operationalSignal.update({ where: { id: signal.id }, data: { status: 'resolved' } });
+    expect((await read()).json()).toHaveLength(1);
+    await db.staffTask.update({ where: { id: task.id }, data: { status: 'COMPLETED' } });
+    const resolved = await read();
+    expect(resolved.statusCode).toBe(200);
+    expect(resolved.json()).toEqual([]);
+    expect(await db.auditEvent.count({
+      where: { tenantId: tenant.id, action: 'receptionist.outboundReconciliation.listRead', resourceId: campaignId },
+    })).toBe(4);
+  });
+
+  it('does not mistake an ordinary escalation for provider-acceptance uncertainty', async () => {
+    const tenant = await makeTenant();
+    const campaignId = await createCampaign(tenant);
+    const target = await addPatientTarget(tenant, campaignId, 991);
+    await db.receptionistCallLog.create({ data: {
+      tenantId: tenant.id, clinicId: tenant.clinicId, outboundCampaignId: campaignId,
+      targetId: target.id, retellCallId: `provider-handoff-${randomUUID()}`,
+      callerPhone: target.phone, direction: 'outbound', outcome: 'ESCALATED', endedAt: new Date(),
+    } });
+
+    const response = await app.inject({
+      method: 'GET', url: `/v1/receptionist/outbound-campaigns/${campaignId}/reconciliations`, headers: auth(tenant),
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([]);
+  });
+
+  it('keeps an older unresolved target visible after more than 100 newer call logs', async () => {
+    const tenant = await makeTenant();
+    const campaignId = await createCampaign(tenant);
+    const target = await addPatientTarget(tenant, campaignId, 992);
+    const oldCall = await db.receptionistCallLog.create({ data: {
+      tenantId: tenant.id, clinicId: tenant.clinicId, outboundCampaignId: campaignId,
+      targetId: target.id, retellCallId: `provider-old-reconcile-${randomUUID()}`,
+      callerPhone: target.phone, direction: 'outbound', outcome: 'ESCALATED',
+      createdAt: new Date('2025-01-01T00:00:00.000Z'), endedAt: new Date('2025-01-01T00:01:00.000Z'),
+    } });
+    await db.receptionistCallTarget.update({
+      where: { id: target.id },
+      data: { status: 'FAILED', lastOutcome: 'RECONCILIATION_REQUIRED', lastCallLogId: oldCall.id },
+    });
+    await db.receptionistCallLog.createMany({
+      data: Array.from({ length: 101 }, (_, index) => ({
+        tenantId: tenant.id, clinicId: tenant.clinicId, outboundCampaignId: campaignId,
+        retellCallId: `provider-newer-${index}-${randomUUID()}`, callerPhone: `+1415555${String(index).padStart(4, '0')}`,
+        direction: 'outbound', outcome: 'NO_ANSWER' as const, endedAt: new Date(),
+      })),
+    });
+
+    const response = await app.inject({
+      method: 'GET', url: `/v1/receptionist/outbound-campaigns/${campaignId}/reconciliations`, headers: auth(tenant),
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([expect.objectContaining({
+      localCallLogId: oldCall.id, providerCallId: oldCall.retellCallId,
+      triggerSources: ['RECONCILIATION_REQUIRED'],
+    })]);
+  });
+});
+
+describe('AI receptionist fail-closed quiet hours', () => {
+  it.each([
+    { start: null, end: null, timezone: 'America/New_York', required: true, reason: 'quiet_hours_missing' },
+    { start: '21:00', end: null, timezone: 'America/New_York', required: true, reason: 'quiet_hours_incomplete' },
+    { start: '9:00', end: '17:00', timezone: 'America/New_York', required: true, reason: 'quiet_hours_invalid' },
+    { start: '21:00', end: '21:00', timezone: 'America/New_York', required: true, reason: 'quiet_hours_equal' },
+    { start: '21:00', end: '08:00', timezone: 'Not/A_Timezone', required: true, reason: 'quiet_hours_timezone_invalid' },
+  ])('rejects invalid deployment configuration: $reason', ({ start, end, timezone, required, reason }) => {
+    expect(quietHoursConfigurationReason(start, end, timezone, required)).toBe(reason);
+    expect(isWithinQuietHours(start, end, timezone)).toBe(true);
+  });
+
+  it('accepts an omitted draft window but requires it for approval', () => {
+    expect(quietHoursConfigurationReason(null, null, 'America/New_York', false)).toBeNull();
+    expect(quietHoursConfigurationReason('21:00', '08:00', 'America/New_York', true)).toBeNull();
+  });
+
+  it('normalizes the provider hour 24 to minute zero without failing open', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-15T05:00:00.000Z'));
+    try {
+      expect(isWithinQuietHours('23:00', '01:00', 'America/New_York')).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('evaluates spring-forward DST using the clinic timezone wall clock', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-03-08T07:30:00.000Z'));
+    try {
+      expect(isWithinQuietHours('01:00', '04:00', 'America/New_York')).toBe(true);
+      expect(isWithinQuietHours('04:00', '05:00', 'America/New_York')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe('AI receptionist DNC evidence and provider-boundary linearization', () => {
   it('atomically records and reason-revokes a manual DNC while preserving immutable evidence', async () => {
@@ -482,6 +645,105 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
     expect(optOut.occurredAt.getTime()).toBeGreaterThanOrEqual(intent.occurredAt.getTime());
   }, 30_000);
 
+  it('launches explicit reactivation only with exact immutable grant evidence bound to provider intent', async () => {
+    const tenant = await makeTenant();
+    const campaignId = await createCampaign(tenant, {
+      status: 'RUNNING',
+      purpose: 'PATIENT_REACTIVATION',
+      legalBasis: 'EXPLICIT_CONSENT',
+      policyVersion: 'REACTIVATION-2026-2',
+    });
+    const target = await addPatientTarget(tenant, campaignId, 723);
+    const grant = await db.receptionistVoiceConsentEvent.create({ data: {
+      tenantId: tenant.id,
+      patientId: target.patientId,
+      purpose: 'PATIENT_REACTIVATION',
+      granted: true,
+      policyVersion: 'REACTIVATION-2026-2',
+      disclosureTextHash: 'b'.repeat(64),
+      evidenceReference: 'reactivation-written-grant-723',
+      captureMethod: 'written',
+      source: 'patient_written',
+      jurisdiction: 'NY',
+    } });
+    const providerFetch = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+      call_id: 'retell_immutable_consent_call', agent_id: tenant.providerAgentId, agent_version: 1,
+    }), { status: 201, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', providerFetch);
+    const response = await app.inject({
+      method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaignId}/call`, headers: auth(tenant),
+      payload: { targetId: target.id, phone: target.phone },
+    });
+    expect(response.statusCode).toBe(201);
+    expect(providerFetch).toHaveBeenCalledTimes(1);
+    expect(await db.receptionistOutboundProviderIntent.findFirstOrThrow({
+      where: { tenantId: tenant.id, callLogId: response.json().callLogId },
+    })).toMatchObject({
+      outboundCampaignId: campaignId,
+      targetId: target.id,
+      voiceConsentEventId: grant.id,
+      purpose: 'PATIENT_REACTIVATION',
+      policyVersion: 'REACTIVATION-2026-2',
+    });
+  }, 30_000);
+
+  it.each(['ReceptionistOutboundProviderIntent', 'AuditEvent', 'BusinessEvent'] as const)(
+    'cleans the reservation and makes zero provider calls when final %s evidence fails',
+    async table => {
+      const tenant = await makeTenant();
+      const campaignId = await createCampaign(tenant, { status: 'RUNNING' });
+      const target = await addPatientTarget(tenant, campaignId, table === 'AuditEvent' ? 725 : table === 'BusinessEvent' ? 726 : 727);
+      const providerFetch = vi.fn<typeof fetch>();
+      vi.stubGlobal('fetch', providerFetch);
+      const functionName = `outbound_intent_${table.toLowerCase()}_${tenant.id.replaceAll('-', '')}`;
+      try {
+        await db.$executeRawUnsafe(`
+          CREATE OR REPLACE FUNCTION "${functionName}"() RETURNS trigger AS $$
+          BEGIN
+            IF NEW."tenantId" = '${tenant.id}'::uuid THEN
+              ${table === 'AuditEvent'
+                ? "IF NEW.\"action\" = 'receptionist.outbound.providerIntent.authorized' THEN RAISE EXCEPTION 'injected final AuditEvent failure'; END IF;"
+                : table === 'BusinessEvent'
+                  ? "IF NEW.\"eventType\" = 'receptionist.outbound.provider_intent_authorized' THEN RAISE EXCEPTION 'injected final BusinessEvent failure'; END IF;"
+                  : "RAISE EXCEPTION 'injected final ProviderIntent failure';"}
+            END IF;
+            RETURN NEW;
+          END;
+          $$ LANGUAGE plpgsql;
+          CREATE TRIGGER "${functionName}_trigger"
+          BEFORE INSERT ON "${table}"
+          FOR EACH ROW EXECUTE FUNCTION "${functionName}"();
+        `);
+        const response = await app.inject({
+          method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaignId}/call`, headers: auth(tenant),
+          payload: { targetId: target.id, phone: target.phone },
+        });
+        expect(response.statusCode, JSON.stringify(response.json())).toBe(503);
+        expect(response.json()).toMatchObject({
+          status: 'blocked', reason: 'provider_intent_evidence_failed',
+          trackingDegraded: true,
+          cleanupAuditRecorded: true,
+        });
+        expect(providerFetch).not.toHaveBeenCalled();
+        expect(await db.receptionistCallLog.findUniqueOrThrow({ where: { id: response.json().callLogId } })).toMatchObject({ outcome: 'FAILED' });
+        expect(await db.receptionistCallTarget.findUniqueOrThrow({ where: { id: target.id } })).toMatchObject({
+          status: 'PENDING', attempts: 0, lastOutcome: 'PROVIDER_INTENT_EVIDENCE_FAILED',
+        });
+        const durableIntentCount = await db.$queryRaw<Array<{ count: bigint }>>`
+          SELECT COUNT(*)::bigint AS count FROM "ReceptionistOutboundProviderIntent"
+          WHERE "tenantId" = ${tenant.id}::uuid AND "callLogId" = ${response.json().callLogId}::uuid
+        `.catch(() => [{ count: 0n }]);
+        expect(durableIntentCount[0]?.count ?? 0n).toBe(0n);
+      } finally {
+        await db.$executeRawUnsafe(`
+          DROP TRIGGER IF EXISTS "${functionName}_trigger" ON "${table}";
+          DROP FUNCTION IF EXISTS "${functionName}"();
+        `);
+      }
+    },
+    30_000,
+  );
+
   it('cancels a committed provider intent when the kill switch wins before Retell dispatch', async () => {
     const tenant = await makeTenant();
     const campaignId = await createCampaign(tenant, { status: 'RUNNING' });
@@ -518,6 +780,41 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
     expect(response.json()).toMatchObject({ status: 'cancelled', reason: 'outbound_stopped' });
     expect(providerFetch).not.toHaveBeenCalled();
     expect(await db.receptionistCallLog.findUniqueOrThrow({ where: { id: response.json().callLogId } })).toMatchObject({ outcome: 'ESCALATED' });
+  }, 30_000);
+
+  it('releases target and attempt when campaign pauses after intent but before provider submission', async () => {
+    const tenant = await makeTenant();
+    const campaignId = await createCampaign(tenant, { status: 'RUNNING' });
+    const target = await addPatientTarget(tenant, campaignId, 733);
+    const intentCommitted = deferred();
+    const release = deferred();
+    setProviderBoundaryTestHookForTests(async stage => {
+      if (stage === 'provider_intent_committed') {
+        intentCommitted.resolve();
+        await release.promise;
+      }
+    });
+    const providerFetch = vi.fn<typeof fetch>();
+    vi.stubGlobal('fetch', providerFetch);
+    const call = app.inject({
+      method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaignId}/call`, headers: auth(tenant),
+      payload: { targetId: target.id, phone: target.phone },
+    });
+    await intentCommitted.promise;
+    const paused = await app.inject({
+      method: 'PATCH', url: `/v1/receptionist/outbound-campaigns/${campaignId}`, headers: auth(tenant), payload: { status: 'PAUSED' },
+    });
+    expect(paused.statusCode).toBe(200);
+    release.resolve();
+
+    const response = await call;
+    expect(response.statusCode).toBe(423);
+    expect(response.json()).toMatchObject({ status: 'cancelled', reason: 'provider_intent_cancelled' });
+    expect(providerFetch).not.toHaveBeenCalled();
+    expect(await db.receptionistCallTarget.findUniqueOrThrow({ where: { id: target.id } })).toMatchObject({
+      status: 'PENDING', attempts: 0, lastOutcome: 'PROVIDER_INTENT_CANCELLED',
+    });
+    expect(await db.receptionistCallLog.findUniqueOrThrow({ where: { id: response.json().callLogId } })).toMatchObject({ outcome: 'FAILED' });
   }, 30_000);
 
   it('stops an accepted provider call when the kill switch wins while Retell is in flight', async () => {
@@ -933,6 +1230,55 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
 });
 
 describe('AI receptionist outbound authority and target integrity', () => {
+  it('requires strict deployable quiet hours and fails closed on invalid clinic timezone at dispatch', async () => {
+    const tenant = await makeTenant();
+    const basePayload = {
+      clinicId: tenant.clinicId,
+      agentId: tenant.agentId,
+      name: `Quiet ${randomUUID().slice(0, 8)}`,
+      script: 'Call the patient about care coordination.',
+      purpose: 'CARE_COORDINATION',
+      legalBasis: 'TREATMENT_OPERATIONS',
+      policyVersion: 'OUTBOUND-TEST-1',
+    };
+    const invalidSyntax = await app.inject({
+      method: 'POST', url: '/v1/receptionist/outbound-campaigns', headers: auth(tenant),
+      payload: { ...basePayload, quietHoursStart: '9:00', quietHoursEnd: '17:00' },
+    });
+    expect(invalidSyntax.statusCode).toBe(400);
+
+    const equalWindow = await app.inject({
+      method: 'POST', url: '/v1/receptionist/outbound-campaigns', headers: auth(tenant),
+      payload: { ...basePayload, name: `${basePayload.name} equal`, quietHoursStart: '21:00', quietHoursEnd: '21:00' },
+    });
+    expect(equalWindow.statusCode).toBe(409);
+    expect(equalWindow.json()).toMatchObject({ message: expect.stringContaining('quiet_hours_equal') });
+
+    const missingWindow = await app.inject({
+      method: 'POST', url: '/v1/receptionist/outbound-campaigns', headers: auth(tenant), payload: basePayload,
+    });
+    expect(missingWindow.statusCode).toBe(201);
+    const missingApproval = await app.inject({
+      method: 'POST', url: `/v1/receptionist/outbound-campaigns/${missingWindow.json().id}/approve`, headers: auth(tenant),
+      payload: { approvalConfirmed: true, status: 'RUNNING' },
+    });
+    expect(missingApproval.statusCode).toBe(409);
+    expect(missingApproval.json()).toMatchObject({ message: expect.stringContaining('quiet_hours_missing') });
+
+    const campaignId = await createCampaign(tenant, { status: 'RUNNING' });
+    const target = await addPatientTarget(tenant, campaignId, 799);
+    await db.receptionistClinic.update({ where: { id: tenant.clinicId }, data: { timezone: 'Not/A_Timezone' } });
+    const providerFetch = vi.fn<typeof fetch>();
+    vi.stubGlobal('fetch', providerFetch);
+    const blocked = await app.inject({
+      method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaignId}/call`, headers: auth(tenant),
+      payload: { targetId: target.id, phone: target.phone },
+    });
+    expect(blocked.statusCode).toBe(409);
+    expect(blocked.json()).toMatchObject({ status: 'blocked', reason: 'quiet_hours_timezone_invalid' });
+    expect(providerFetch).not.toHaveBeenCalled();
+  });
+
   it('requires OWNER/ADMIN attestation and freezes approved request-only authority', async () => {
     const tenant = await makeTenant();
     const campaignId = await createCampaign(tenant);
@@ -986,6 +1332,112 @@ describe('AI receptionist outbound authority and target integrity', () => {
     });
     expect(mutated.statusCode).toBe(409);
     expect(mutated.json()).toMatchObject({ message: expect.stringContaining('outbound_authority_immutable') });
+  });
+
+  it('serializes Studio pause ahead of final provider intent and releases the reserved target', async () => {
+    const tenant = await makeTenant();
+    const authority = await createDirectAuthority(tenant);
+    const campaignId = await createCampaign(tenant, {
+      bookingMode: 'DIRECT_BOOKING_IF_SLOT_AVAILABLE',
+      receptionistCampaignId: authority.id,
+      status: 'RUNNING',
+    });
+    const target = await addPatientTarget(tenant, campaignId, 801);
+    const beforeFinalLocks = deferred();
+    const release = deferred();
+    setProviderBoundaryTestHookForTests(async stage => {
+      if (stage === 'before_suppression_fence') {
+        beforeFinalLocks.resolve();
+        await release.promise;
+      }
+    });
+    const providerFetch = vi.fn<typeof fetch>();
+    vi.stubGlobal('fetch', providerFetch);
+
+    const call = app.inject({
+      method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaignId}/call`, headers: auth(tenant),
+      payload: { targetId: target.id, phone: target.phone },
+    });
+    await beforeFinalLocks.promise;
+    const paused = await app.inject({
+      method: 'PATCH', url: `/v1/receptionist/campaigns/${authority.id}`, headers: auth(tenant),
+      payload: { status: 'PAUSED' },
+    });
+    expect(paused.statusCode).toBe(200);
+    release.resolve();
+
+    const response = await call;
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ status: 'blocked', reason: 'direct_booking_authority_inactive_or_foreign' });
+    expect(providerFetch).not.toHaveBeenCalled();
+    expect(await db.receptionistCallLog.findUniqueOrThrow({ where: { id: response.json().callLogId } })).toMatchObject({ outcome: 'FAILED' });
+    expect(await db.receptionistCallTarget.findUniqueOrThrow({ where: { id: target.id } })).toMatchObject({
+      status: 'PENDING', attempts: 0, lastOutcome: 'BLOCKED',
+    });
+  }, 30_000);
+
+  it('calculates target voice authorization from exact immutable purpose/policy evidence and latest revocation', async () => {
+    const tenant = await makeTenant();
+    const patient = await createPatient(tenant, 802);
+    const campaignId = await createCampaign(tenant, {
+      purpose: 'PATIENT_REACTIVATION',
+      legalBasis: 'EXPLICIT_CONSENT',
+      policyVersion: 'REACTIVATION-2026-1',
+    });
+    const getCandidates = () => app.inject({
+      method: 'GET',
+      url: `/v1/receptionist/outbound-target-candidates?campaignId=${campaignId}&q=${encodeURIComponent(patient.phone ?? '')}`,
+      headers: auth(tenant),
+    });
+    const missing = await getCandidates();
+    expect(missing.statusCode).toBe(200);
+    expect(missing.json()).toEqual([expect.objectContaining({
+      id: patient.id,
+      voiceAuthorizationReady: false,
+      voiceAuthorizationReason: 'consent_missing_or_incompatible',
+    })]);
+
+    const grant = await db.receptionistVoiceConsentEvent.create({ data: {
+      tenantId: tenant.id,
+      patientId: patient.id,
+      purpose: 'PATIENT_REACTIVATION',
+      granted: true,
+      policyVersion: 'REACTIVATION-2026-1',
+      disclosureTextHash: 'a'.repeat(64),
+      evidenceReference: 'written-consent-802',
+      captureMethod: 'written',
+      source: 'patient_written',
+      jurisdiction: 'NY',
+    } });
+    const ready = await getCandidates();
+    expect(ready.json()).toEqual([expect.objectContaining({
+      id: patient.id,
+      voiceAuthorizationReady: true,
+      voiceAuthorizationReason: 'compatible_immutable_consent',
+    })]);
+
+    await db.receptionistVoiceConsentEvent.create({ data: {
+      tenantId: tenant.id,
+      patientId: patient.id,
+      purpose: 'PATIENT_REACTIVATION',
+      granted: false,
+      policyVersion: 'REACTIVATION-2026-1',
+      disclosureTextHash: 'a'.repeat(64),
+      evidenceReference: `revocation-of-${grant.id}`,
+      captureMethod: 'written',
+      source: 'patient_written',
+      jurisdiction: 'NY',
+      occurredAt: new Date(Date.now() + 1_000),
+    } });
+    const revoked = await getCandidates();
+    expect(revoked.json()).toEqual([expect.objectContaining({
+      id: patient.id,
+      voiceAuthorizationReady: false,
+      voiceAuthorizationReason: 'consent_missing_or_incompatible',
+    })]);
+    await expect(db.receptionistVoiceConsentEvent.update({
+      where: { id: grant.id }, data: { policyVersion: 'REWRITTEN' },
+    })).rejects.toThrow();
   });
 
   it('enforces exactly one tenant-owned identity and a canonical identity phone at the API and database', async () => {

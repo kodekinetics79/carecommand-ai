@@ -1,4 +1,5 @@
 import { env } from '../config/env';
+import { db } from './db';
 import { channelStatus, isSuppressed, toE164, isValidE164, isValidEmail, type CommChannel } from './campaigns';
 
 // ===========================================================================
@@ -22,6 +23,12 @@ export interface SendResult { ok: boolean; status: 'sent' | 'pending' | 'failed'
 // is required — a send with no tenant can never be safely consent-checked, and
 // making it required forces every call site to be explicit (fail-closed).
 export interface SendContext { tenantId: string; patientId?: string | null; leadId?: string | null }
+
+type ConfirmationAuthorization = {
+  tenantId: string;
+  eventId: string;
+  attemptNumber: number;
+};
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 8000): Promise<Response> {
   const controller = new AbortController();
@@ -78,6 +85,65 @@ export async function sendMessage(channel: CommChannel, destination: string, sub
   if (await isSuppressed(context.tenantId, { patientId: context.patientId ?? null, leadId: context.leadId ?? null, destination }, channel)) {
     return { ok: false, status: 'suppressed', mode: 'suppressed', failureReason: 'suppressed_or_opted_out' };
   }
+
+  return sendToConfiguredProvider(channel, destination, subject, body, idempotencyKey, status);
+}
+
+/**
+ * The only suppression-free send path. It is limited to a currently leased
+ * appointment-confirmation attempt with an exact committed PROVIDER_INTENT and
+ * the destination owned by that event's patient. Suppression was linearized by
+ * the database transaction that appended that intent; a later opt-out applies
+ * to future attempts and must not rewrite this already-authorized boundary.
+ */
+export async function sendAuthorizedAppointmentConfirmation(
+  channel: 'sms' | 'email',
+  destination: string,
+  subject: string,
+  body: string,
+  idempotencyKey: string,
+  authorization: ConfirmationAuthorization,
+): Promise<SendResult> {
+  const intent = await db.notificationDeliveryAttempt.findUnique({
+    where: { tenantId_notificationEventId_attemptNumber_phase: {
+      tenantId: authorization.tenantId,
+      notificationEventId: authorization.eventId,
+      attemptNumber: authorization.attemptNumber,
+      phase: 'PROVIDER_INTENT',
+    } },
+    include: { notificationEvent: { include: {
+      appointment: { select: { patient: { select: { phone: true, email: true } } } },
+      deliveryAttempts: {
+        where: { attemptNumber: authorization.attemptNumber, phase: { in: ['RESULT', 'RECEIPT'] } },
+        select: { id: true },
+      },
+    } } },
+  });
+  const event = intent?.notificationEvent;
+  const expectedDestination = channel === 'sms' ? event?.appointment?.patient.phone : event?.appointment?.patient.email;
+  const destinationMatches = channel === 'sms'
+    ? toE164(expectedDestination ?? '') === toE164(destination)
+    : (expectedDestination ?? '').trim().toLowerCase() === destination.trim().toLowerCase();
+  if (!intent || intent.status !== 'provider_intent_committed' || !intent.completedAt
+    || event?.source !== 'receptionist.appointment_confirmation'
+    || event.status !== 'retrying' || event.attempts !== authorization.attemptNumber
+    || event?.deliveryAttempts.length !== 0
+    || event.channel !== channel || event.idempotencyKey !== idempotencyKey || !destinationMatches) {
+    return { ok: false, status: 'failed', mode: 'configured_pending_provider', failureReason: 'durable_authorization_invalid' };
+  }
+  const status = channelStatus(channel);
+  if (status.setupRequired) return { ok: false, status: 'setup_required', mode: 'setup_required' };
+  return sendToConfiguredProvider(channel, destination, subject, body, idempotencyKey, status);
+}
+
+async function sendToConfiguredProvider(
+  channel: CommChannel,
+  destination: string,
+  subject: string,
+  body: string,
+  idempotencyKey: string,
+  status: ReturnType<typeof channelStatus>,
+): Promise<SendResult> {
 
   // Explicit dev mock (credentials starting with "mock", non-production only).
   if (status.mock && env.NODE_ENV !== 'production') {

@@ -160,6 +160,8 @@ model Tenant {
   receptionistRecordingConsentEvents  ReceptionistRecordingConsentEvent[]
   receptionistArtifactLifecycleEvents ReceptionistArtifactLifecycleEvent[]
   receptionistCallLegalHolds          ReceptionistCallLegalHold[]
+  receptionistVoiceConsentEvents      ReceptionistVoiceConsentEvent[]
+  receptionistOutboundProviderIntents ReceptionistOutboundProviderIntent[]
   passwordResetTokens                 PasswordResetToken[]
   complianceFrameworks                ComplianceFramework[]
   complianceControls                  ComplianceControl[]
@@ -252,6 +254,7 @@ model User {
   passwordResetTokens    PasswordResetToken[]
   approvedOutboundCampaigns ReceptionistOutboundCampaign[] @relation("OutboundAuthorityApprover")
   receptionistOptOutRevocations ReceptionistOptOut[] @relation("ReceptionistOptOutRevoker")
+  receptionistVoiceConsentEvents ReceptionistVoiceConsentEvent[] @relation("ReceptionistVoiceConsentActor")
 
   @@unique([tenantId, email])
   @@unique([tenantId, id])
@@ -299,8 +302,10 @@ model Branch {
   appointmentRequests            AppointmentRequest[]
   devices                        Device[]
   receptionistLocations          ReceptionistLocation[]
+  receptionistOutboundCampaignDefaults ReceptionistOutboundCampaign[] @relation("ReceptionistOutboundDefaultBranch")
 
   @@unique([tenantId, name])
+  @@unique([tenantId, id])
   @@index([tenantId, active])
 }
 
@@ -351,6 +356,7 @@ model Patient {
   reviewRequests                 ReviewRequest[]
 
   communicationConsents CommunicationConsent[]
+  receptionistVoiceConsentEvents ReceptionistVoiceConsentEvent[]
   campaignSuppressions  CampaignSuppression[]
   intakePackets         PatientIntakePacket[]
   patientConsentRecords PatientConsentRecord[]
@@ -503,6 +509,7 @@ model Lead {
   patient             Patient?             @relation(fields: [patientId], references: [id], onDelete: SetNull)
   appointmentRequests AppointmentRequest[]
   receptionistCallTargets ReceptionistCallTarget[]
+  receptionistVoiceConsentEvents ReceptionistVoiceConsentEvent[]
 
   @@unique([tenantId, id])
   @@index([tenantId, stage, createdAt])
@@ -1471,6 +1478,7 @@ model ReceptionistClinic {
   outboundCampaigns    ReceptionistOutboundCampaign[]
 
   @@unique([tenantId, name])
+  @@unique([tenantId, id])
   @@index([tenantId, active])
 }
 
@@ -1595,6 +1603,7 @@ model ReceptionistCampaign {
 
   @@index([tenantId, clinicId, status])
   @@unique([tenantId, clinicId, id])
+  @@unique([tenantId, id])
 }
 
 model ReceptionistIntakeField {
@@ -1673,9 +1682,12 @@ model ReceptionistCallLog {
   createdAt                    DateTime                             @default(now())
   updatedAt                    DateTime                             @updatedAt
   tenant                       Tenant                               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  clinic                       ReceptionistClinic?                  @relation(fields: [clinicId], references: [id], onDelete: SetNull)
-  campaign                     ReceptionistCampaign?                @relation(fields: [campaignId], references: [id], onDelete: SetNull)
-  outboundCampaign             ReceptionistOutboundCampaign?        @relation(fields: [outboundCampaignId], references: [id], onDelete: SetNull)
+  clinic                       ReceptionistClinic?                  @relation(fields: [tenantId, clinicId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallLog_clinic_scope_fkey")
+  campaign                     ReceptionistCampaign?                @relation(fields: [tenantId, campaignId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallLog_campaign_scope_fkey")
+  outboundCampaign             ReceptionistOutboundCampaign?        @relation(fields: [tenantId, outboundCampaignId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallLog_outbound_campaign_scope_fkey")
+  target                       ReceptionistCallTarget?               @relation("ReceptionistCallLogTarget", fields: [tenantId, outboundCampaignId, targetId], references: [tenantId, campaignId, id], onDelete: Restrict, map: "ReceptionistCallLog_target_ownership_fkey")
+  lastForTargets               ReceptionistCallTarget[]              @relation("ReceptionistCallTargetLastCall")
+  outboundProviderIntent       ReceptionistOutboundProviderIntent?
   recordingConsentEvents       ReceptionistRecordingConsentEvent[]
   artifactLifecycleEvents      ReceptionistArtifactLifecycleEvent[]
   legalHolds                   ReceptionistCallLegalHold[]
@@ -1683,6 +1695,7 @@ model ReceptionistCallLog {
   appointments                 Appointment[]                      @relation("AppointmentSourceCall")
 
   @@unique([tenantId, id])
+  @@unique([tenantId, outboundCampaignId, id])
   @@index([tenantId, outcome, createdAt])
   @@index([outboundCampaignId])
   @@index([tenantId, recordingRetentionExpiresAt])
@@ -1769,6 +1782,62 @@ model ReceptionistOptOut {
   revokedBy     User?                     @relation("ReceptionistOptOutRevoker", fields: [tenantId, revokedByUserId], references: [tenantId, id], onDelete: Restrict)
 
   @@index([tenantId, createdAt])
+}
+
+// Append-only evidence for outbound voice permission. The database requires
+// exactly one patient/lead identity and freezes every field after insertion.
+// A later grant or revocation is a new event, never an overwrite.
+model ReceptionistVoiceConsentEvent {
+  id                 String    @id @default(uuid()) @db.Uuid
+  tenantId           String    @db.Uuid
+  patientId          String?   @db.Uuid
+  leadId             String?   @db.Uuid
+  purpose            String
+  granted            Boolean
+  policyVersion      String
+  disclosureTextHash String
+  evidenceReference  String
+  captureMethod      String
+  source             String
+  actorUserId        String?   @db.Uuid
+  jurisdiction       String?
+  expiresAt          DateTime?
+  occurredAt         DateTime  @default(now())
+  createdAt          DateTime  @default(now())
+  tenant             Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  patient            Patient?  @relation(fields: [tenantId, patientId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistVoiceConsentEvent_patient_scope_fkey")
+  lead               Lead?     @relation(fields: [tenantId, leadId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistVoiceConsentEvent_lead_scope_fkey")
+  actorUser          User?     @relation("ReceptionistVoiceConsentActor", fields: [tenantId, actorUserId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistVoiceConsentEvent_actor_scope_fkey")
+  providerIntents    ReceptionistOutboundProviderIntent[]
+
+  @@unique([tenantId, id])
+  @@index([tenantId, patientId, purpose, policyVersion, occurredAt(sort: Desc), granted(sort: Asc), id(sort: Desc)], map: "ReceptionistVoiceConsentEvent_patient_lookup_idx")
+  @@index([tenantId, leadId, purpose, policyVersion, occurredAt(sort: Desc), granted(sort: Asc), id(sort: Desc)], map: "ReceptionistVoiceConsentEvent_lead_lookup_idx")
+}
+
+// Authoritative, append-only commit marker immediately preceding an outbound
+// provider request. Its insert trigger holds suppression fences and rechecks
+// destination, identity, campaign purpose/policy, and compatible consent.
+model ReceptionistOutboundProviderIntent {
+  id                    String    @id @default(uuid()) @db.Uuid
+  tenantId              String    @db.Uuid
+  callLogId             String    @db.Uuid
+  outboundCampaignId    String    @db.Uuid
+  targetId              String?   @db.Uuid
+  voiceConsentEventId   String?   @db.Uuid
+  purpose               String
+  policyVersion         String
+  authorizedAt          DateTime  @default(now())
+  createdAt             DateTime  @default(now())
+  tenant                Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  callLog               ReceptionistCallLog @relation(fields: [tenantId, callLogId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistOutboundProviderIntent_call_scope_fkey")
+  outboundCampaign      ReceptionistOutboundCampaign @relation(fields: [tenantId, outboundCampaignId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistOutboundProviderIntent_campaign_scope_fkey")
+  target                ReceptionistCallTarget? @relation(fields: [tenantId, outboundCampaignId, targetId], references: [tenantId, campaignId, id], onDelete: Restrict, map: "ReceptionistOutboundProviderIntent_target_ownership_fkey")
+  voiceConsentEvent     ReceptionistVoiceConsentEvent? @relation(fields: [tenantId, voiceConsentEventId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistOutboundProviderIntent_consent_scope_fkey")
+
+  @@unique([tenantId, callLogId])
+  @@index([tenantId, outboundCampaignId, authorizedAt], map: "ReceptionistOutboundProviderIntent_campaign_idx")
+  @@index([tenantId, targetId, authorizedAt], map: "ReceptionistOutboundProviderIntent_target_idx")
 }
 
 // ===========================================================================
@@ -2328,13 +2397,16 @@ model ReceptionistOutboundCampaign {
   createdAt               DateTime                 @default(now())
   updatedAt               DateTime                 @updatedAt
   tenant                  Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  clinic                  ReceptionistClinic       @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  clinic                  ReceptionistClinic       @relation(fields: [tenantId, clinicId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistOutboundCampaign_clinic_scope_fkey")
   agent                   ReceptionistAgent?       @relation(fields: [tenantId, clinicId, agentId], references: [tenantId, clinicId, id], onDelete: Restrict, map: "ReceptionistOutboundCampaign_agent_scope_fkey")
   receptionistCampaign    ReceptionistCampaign?    @relation("OutboundBookingAuthority", fields: [tenantId, clinicId, receptionistCampaignId], references: [tenantId, clinicId, id], onDelete: Restrict, map: "ReceptionistOutboundCampaign_booking_authority_fkey")
   authorityApprovedBy     User?                     @relation("OutboundAuthorityApprover", fields: [tenantId, authorityApprovedById], references: [tenantId, id], onDelete: Restrict)
+  defaultBranch           Branch?                   @relation("ReceptionistOutboundDefaultBranch", fields: [tenantId, defaultBranchId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistOutboundCampaign_default_branch_scope_fkey")
   targets                 ReceptionistCallTarget[]
   callLogs                ReceptionistCallLog[]
+  providerIntents         ReceptionistOutboundProviderIntent[]
 
+  @@unique([tenantId, id])
   @@index([tenantId, status])
   @@index([tenantId, clinicId])
   @@index([tenantId, receptionistCampaignId])
@@ -2357,10 +2429,14 @@ model ReceptionistCallTarget {
   createdAt     DateTime                     @default(now())
   updatedAt     DateTime                     @updatedAt
   tenant        Tenant                       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  campaign      ReceptionistOutboundCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  campaign      ReceptionistOutboundCampaign @relation(fields: [tenantId, campaignId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallTarget_campaign_scope_fkey")
   patient       Patient?                     @relation(fields: [tenantId, patientId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallTarget_patient_scope_fkey")
   lead          Lead?                        @relation(fields: [tenantId, leadId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallTarget_lead_scope_fkey")
+  callLogs      ReceptionistCallLog[] @relation("ReceptionistCallLogTarget")
+  lastCallLog   ReceptionistCallLog? @relation("ReceptionistCallTargetLastCall", fields: [tenantId, campaignId, lastCallLogId], references: [tenantId, outboundCampaignId, id], onDelete: Restrict, map: "ReceptionistCallTarget_last_call_ownership_fkey")
+  providerIntents ReceptionistOutboundProviderIntent[]
 
+  @@unique([tenantId, campaignId, id])
   @@index([tenantId, campaignId, status])
   @@unique([tenantId, campaignId, phone])
 }

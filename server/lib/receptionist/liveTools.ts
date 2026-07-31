@@ -728,7 +728,7 @@ export async function checkAvailability(ctx: ToolContext, args: Record<string, u
 }
 
 type BookingTransactionResult =
-  | { kind: 'booked'; tenantId: string; appointmentId: string; requestId: string; patientId: string; firstName: string; email: string | null; phone: string | null; service: string; startsAt: Date; timezone: string; smsEnabled: boolean; emailEnabled: boolean; messagingConsent: boolean | null; duplicate: boolean }
+  | { kind: 'booked'; tenantId: string; appointmentId: string; requestId: string; patientId: string; firstName: string; email: string | null; phone: string | null; service: string; startsAt: Date; timezone: string; locationName: string; locationAddress: string | null; providerName: string | null; smsEnabled: boolean; emailEnabled: boolean; messagingConsent: boolean | null; duplicate: boolean }
   | { kind: 'review'; requestId: string; duplicate: boolean; message: string }
   | { kind: 'rejected'; message: string };
 
@@ -810,7 +810,12 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
     });
     const existingAppointment = await tx.appointment.findFirst({
       where: { tenantId: ctx.tenantId, receptionistCallLogId: trusted.callLogId, deletedAt: null },
-      select: { id: true, patientId: true, service: true, startsAt: true, branch: { select: { timezone: true } }, patient: { select: { firstName: true, email: true, phone: true } } },
+      select: {
+        id: true, patientId: true, service: true, startsAt: true,
+        branch: { select: { timezone: true, name: true, location: true } },
+        providerProfile: { select: { user: { select: { displayName: true } } } },
+        patient: { select: { firstName: true, email: true, phone: true } },
+      },
     });
     if (existingAppointment) {
       if (!existingRequest?.bookedAppointmentId || existingRequest.bookedAppointmentId !== existingAppointment.id || existingRequest.status !== 'BOOKED') {
@@ -821,7 +826,10 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
         patientId: existingAppointment.patientId, firstName: existingAppointment.patient.firstName,
         email: existingAppointment.patient.email, phone: validPhone(existingAppointment.patient.phone),
         service: existingAppointment.service, startsAt: existingAppointment.startsAt,
-        timezone: existingAppointment.branch.timezone, smsEnabled: campaign.smsConfirmation,
+        timezone: existingAppointment.branch.timezone, locationName: existingAppointment.branch.name,
+        locationAddress: existingAppointment.branch.location.trim() || null,
+        providerName: existingAppointment.providerProfile?.user.displayName.trim() || null,
+        smsEnabled: campaign.smsConfirmation,
         emailEnabled: campaign.emailConfirmation,
         messagingConsent: typeof (existingRequest.rawCollectedFields as Record<string, unknown> | null)?.messaging_consent === 'boolean'
           ? (existingRequest.rawCollectedFields as Record<string, unknown>).messaging_consent as boolean
@@ -838,7 +846,8 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
         where: { id: existingRequest.bookedAppointmentId, tenantId: ctx.tenantId, deletedAt: null },
         select: {
           id: true, patientId: true, providerProfileId: true, receptionistCallLogId: true,
-          service: true, startsAt: true, branch: { select: { timezone: true } },
+          service: true, startsAt: true, branch: { select: { timezone: true, name: true, location: true } },
+          providerProfile: { select: { user: { select: { displayName: true } } } },
           patient: { select: { firstName: true, email: true, phone: true } },
         },
       });
@@ -857,7 +866,10 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
         patientId: linkedAppointment.patientId, firstName: linkedAppointment.patient.firstName,
         email: linkedAppointment.patient.email, phone: validPhone(linkedAppointment.patient.phone),
         service: linkedAppointment.service, startsAt: linkedAppointment.startsAt,
-        timezone: linkedAppointment.branch.timezone, smsEnabled: campaign.smsConfirmation,
+        timezone: linkedAppointment.branch.timezone, locationName: linkedAppointment.branch.name,
+        locationAddress: linkedAppointment.branch.location.trim() || null,
+        providerName: linkedAppointment.providerProfile?.user.displayName.trim() || null,
+        smsEnabled: campaign.smsConfirmation,
         emailEnabled: campaign.emailConfirmation,
         messagingConsent: typeof (existingRequest.rawCollectedFields as Record<string, unknown> | null)?.messaging_consent === 'boolean'
           ? (existingRequest.rawCollectedFields as Record<string, unknown>).messaging_consent as boolean
@@ -948,7 +960,11 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
     }
     const providers = await tx.providerProfile.findMany({
       where: { tenantId: ctx.tenantId, branchId: trusted.branchId!, user: { active: true } },
-      select: { id: true }, take: 2,
+      select: {
+        id: true,
+        user: { select: { displayName: true } },
+        branch: { select: { name: true, location: true } },
+      }, take: 2,
     });
     const schedulingService = await resolveSchedulingService({ tenantId: ctx.tenantId, service, fallbackDurationMin: SLOT_MIN }, tx);
     if (providers.length !== 1 || !schedulingService) {
@@ -1071,6 +1087,9 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
     return {
       kind: 'booked', tenantId: ctx.tenantId, appointmentId: appointment.id, requestId: request.id, patientId: patient.id,
       firstName, email, phone, service: schedulingService.name, startsAt, timezone: trusted.branchTimezone!,
+      locationName: providers[0].branch.name,
+      locationAddress: providers[0].branch.location.trim() || null,
+      providerName: providers[0].user.displayName.trim() || null,
       smsEnabled: campaign.smsConfirmation, emailEnabled: campaign.emailConfirmation, messagingConsent, duplicate: false,
     };
   });
@@ -1086,6 +1105,13 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
   if (result.kind === 'review') return { booked: false, needs_review: true, duplicate: result.duplicate, appointment_request_id: result.requestId, message: result.message };
 
   const localLabel = localAppointmentLabel(result.startsAt, result.timezone);
+  const timezoneLabel = new Intl.DateTimeFormat('en-US', {
+    timeZone: result.timezone,
+    timeZoneName: 'long',
+  }).formatToParts(result.startsAt).find(part => part.type === 'timeZoneName')?.value ?? result.timezone;
+  const spokenLocation = [result.locationName, result.locationAddress].filter(Boolean).join(', ');
+  const spokenProvider = result.providerName ? `, with ${result.providerName}` : '';
+  const spokenBooking = `${result.service} on ${localLabel} ${timezoneLabel} at ${spokenLocation}${spokenProvider}`;
   // Both the first response and canonical replays drain the same durable
   // outbox. Already accepted rows no-op; queued/failed (or stale retrying)
   // rows are claimable, so a process failure after booking commit is repaired
@@ -1102,11 +1128,15 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
   const acceptedNow = confirmations.sms.acceptedNow || confirmations.email.acceptedNow;
   return {
     booked: true, duplicate: result.duplicate || undefined, appointment_id: result.appointmentId,
+    starts_at: result.startsAt.toISOString(), timezone: result.timezone,
+    spoken_time: `${localLabel} ${timezoneLabel}`,
+    location_name: result.locationName, location_address: result.locationAddress,
+    provider_name: result.providerName, service: result.service,
     sms_sent: false, sms_accepted: confirmations.sms.acceptedNow, sms_status: confirmations.sms.status,
     email_sent: false, email_accepted: confirmations.email.acceptedNow, email_status: confirmations.email.status,
     message: result.duplicate
-      ? `You're already booked for ${result.service} on ${localLabel}.${acceptedNow ? ' A pending confirmation was accepted by the messaging provider.' : ''}`
-      : `Perfect, ${result.firstName} — you're booked for ${result.service} on ${localLabel}.${acceptedNow ? ' A confirmation was accepted by the messaging provider.' : ''}`,
+      ? `You're already booked for ${spokenBooking}.${acceptedNow ? ' A pending confirmation was accepted by the messaging provider.' : ''}`
+      : `Perfect, ${result.firstName} — you're booked for ${spokenBooking}.${acceptedNow ? ' A confirmation was accepted by the messaging provider.' : ''}`,
   };
 }
 

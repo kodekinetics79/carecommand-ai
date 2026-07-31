@@ -6,11 +6,13 @@ import { clearSession, getAccessToken, refreshSession, setAccessTokenOnly } from
 export class ApiError extends Error {
   readonly status: number;
   readonly code?: string;
-  constructor(status: number, message: string, code?: string) {
+  readonly details?: Readonly<Record<string, unknown>>;
+  constructor(status: number, message: string, code?: string, details?: Readonly<Record<string, unknown>>) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -68,10 +70,10 @@ async function rawApiRequest<T>(path: string, init?: RequestInit, retryOnRefresh
   if (!response.ok) {
     let message = `API request failed: ${response.status}`;
     let code: string | undefined;
-    const body = await response.json().catch(() => null) as { message?: string; error?: string } | null;
-    if (body?.message) message = body.message;
+    const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+    if (typeof body?.message === 'string') message = body.message;
     if (typeof body?.error === 'string') code = body.error;
-    throw new ApiError(response.status, message, code);
+    throw new ApiError(response.status, message, code, body ?? undefined);
   }
   if (response.status === 204 || response.headers.get('content-length') === '0') {
     return undefined as T;

@@ -1,4 +1,4 @@
-import { apiRequest } from './api';
+import { ApiError, apiRequest } from './api';
 
 // --- Types -----------------------------------------------------------------
 
@@ -271,8 +271,31 @@ export interface CallTarget {
   email: string | null;
   status: CallTargetStatus;
   attempts: number;
+  lastCallLogId: string | null;
   lastOutcome: string | null;
   createdAt: string;
+}
+
+export interface OutboundReconciliationEvidence {
+  localCallLogId: string;
+  providerCallId: string | null;
+  targetId: string | null;
+  triggerSources: Array<'RECONCILIATION_REQUIRED' | 'RECONCILIATION_SIGNAL' | 'RECONCILIATION_TASK'>;
+  signalIds: string[];
+  signalStatuses: string[];
+  reviewTaskIds: string[];
+  reviewTaskStatuses: string[];
+  createdAt: string;
+}
+
+export const OUTBOUND_RECONCILIATION_WARNING = 'possible live provider call—do not retry';
+
+/** Successful refresh replaces durable state; a failed refresh preserves it. */
+export function mergeReconciliationRefresh(
+  current: OutboundReconciliationEvidence[],
+  refresh: { ok: true; rows: OutboundReconciliationEvidence[] } | { ok: false },
+): OutboundReconciliationEvidence[] {
+  return refresh.ok ? refresh.rows : current;
 }
 
 export interface OutboundTargetCandidate {
@@ -280,7 +303,8 @@ export interface OutboundTargetCandidate {
   id: string;
   name: string;
   phone: string;
-  voiceConsentReady: boolean;
+  voiceAuthorizationReady: boolean;
+  voiceAuthorizationReason: 'compatible_immutable_consent' | 'treatment_operations' | 'suppressed' | 'consent_missing_or_incompatible';
 }
 
 export interface BookingRequest {
@@ -326,10 +350,194 @@ export interface ConfirmationDelivery {
   createdAt: string;
 }
 
+export type LaunchBlockReason =
+  | 'campaign_not_running' | 'outbound_authority_unapproved' | 'outbound_stopped'
+  | 'invalid_e164_destination' | 'adhoc_call_not_authorized'
+  | 'target_identity_unbound' | 'target_identity_mismatch' | 'target_not_dialable'
+  | 'positive_voice_consent_missing' | 'concurrency_limit_reached' | 'voice_minutes_limit_reached'
+  | 'target_identity_changed' | 'shared_suppression_gate' | 'campaign_authority_changed'
+  | 'quiet_hours' | 'provider_intent_evidence_failed'
+  | 'campaign_authority_invalid' | 'agent_unlinked' | 'agent_inactive' | 'agent_unverified'
+  | 'agent_configuration_changed' | 'agent_verification_stale'
+  | 'direct_booking_authority_unlinked' | 'direct_booking_authority_unattested'
+  | 'direct_booking_agent_mismatch' | 'direct_booking_branch_missing'
+  | 'direct_booking_branch_not_eligible' | 'direct_booking_service_missing'
+  | 'direct_booking_service_mismatch' | 'outbound_purpose_or_legal_basis_missing'
+  | 'clinic_inactive_or_foreign' | 'branch_inactive_or_foreign' | 'branch_not_mapped_to_clinic'
+  | 'agent_scope_mismatch' | 'direct_booking_authority_inactive_or_foreign'
+  | 'quiet_hours_missing' | 'quiet_hours_incomplete' | 'quiet_hours_invalid'
+  | 'quiet_hours_equal' | 'quiet_hours_timezone_invalid';
+
+type LaunchEvidence = {
+  callId?: string;
+  callLogId?: string;
+  providerStopApplied?: boolean;
+  reviewRecorded?: boolean;
+  signalRecorded?: boolean;
+  auditRecorded?: boolean;
+  businessEventRecorded?: boolean;
+  reviewTaskId?: string | null;
+  signalId?: string | null;
+};
+
 export type LaunchCallResult =
-  | { status: 'launched'; callId: string; callLogId: string; mock: boolean }
+  | ({ status: 'launched'; callId: string; callLogId: string; mock: boolean; trackingDegraded: boolean } & LaunchEvidence)
   | { status: 'setup_required'; missing: string[] }
-  | { status: 'failed'; error: string; callLogId?: string };
+  | ({ status: 'skipped'; reason: 'opted_out' | 'quiet_hours'; callLogId?: string } & LaunchEvidence)
+  | ({ status: 'blocked'; reason: LaunchBlockReason } & LaunchEvidence)
+  | ({ status: 'cancelled'; reason: 'outbound_stopped' | 'provider_intent_cancelled' } & LaunchEvidence)
+  | ({ status: 'reconciliation_required'; reason?: string; error?: string } & LaunchEvidence)
+  | ({ status: 'failed'; error: string } & LaunchEvidence)
+  | { status: 'unknown_response'; receivedStatus?: string };
+
+const LAUNCH_RESULT_STATUSES = new Set([
+  'launched', 'setup_required', 'skipped', 'blocked', 'cancelled',
+  'reconciliation_required', 'failed',
+]);
+const LAUNCH_BLOCK_REASONS = new Set<LaunchBlockReason>([
+  'campaign_not_running', 'outbound_authority_unapproved', 'outbound_stopped',
+  'invalid_e164_destination', 'adhoc_call_not_authorized', 'target_identity_unbound',
+  'target_identity_mismatch', 'target_not_dialable', 'positive_voice_consent_missing',
+  'concurrency_limit_reached', 'voice_minutes_limit_reached', 'target_identity_changed',
+  'shared_suppression_gate', 'campaign_authority_invalid', 'agent_unlinked',
+  'campaign_authority_changed', 'quiet_hours', 'provider_intent_evidence_failed',
+  'agent_inactive', 'agent_unverified', 'agent_configuration_changed',
+  'agent_verification_stale', 'direct_booking_authority_unlinked',
+  'direct_booking_authority_unattested', 'direct_booking_agent_mismatch',
+  'direct_booking_branch_missing', 'direct_booking_branch_not_eligible',
+  'direct_booking_service_missing', 'direct_booking_service_mismatch',
+  'outbound_purpose_or_legal_basis_missing', 'clinic_inactive_or_foreign',
+  'branch_inactive_or_foreign', 'branch_not_mapped_to_clinic', 'agent_scope_mismatch',
+  'direct_booking_authority_inactive_or_foreign', 'quiet_hours_missing',
+  'quiet_hours_incomplete', 'quiet_hours_invalid', 'quiet_hours_equal',
+  'quiet_hours_timezone_invalid',
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function optionalEvidenceValid(value: Record<string, unknown>): boolean {
+  return ['providerStopApplied', 'reviewRecorded', 'signalRecorded', 'auditRecorded', 'businessEventRecorded', 'trackingDegraded']
+    .every(key => value[key] === undefined || typeof value[key] === 'boolean')
+    && ['callId', 'callLogId'].every(key => value[key] === undefined || typeof value[key] === 'string')
+    && ['reviewTaskId', 'signalId'].every(key => value[key] === undefined || value[key] === null || typeof value[key] === 'string');
+}
+
+export function parseLaunchResult(value: unknown): LaunchCallResult {
+  if (!isRecord(value) || typeof value.status !== 'string') return { status: 'unknown_response' };
+  if (!optionalEvidenceValid(value)) return { status: 'unknown_response', receivedStatus: value.status };
+  if (value.status === 'launched' && typeof value.callId === 'string' && typeof value.callLogId === 'string'
+    && typeof value.mock === 'boolean' && typeof value.trackingDegraded === 'boolean') return value as LaunchCallResult;
+  if (value.status === 'setup_required' && Array.isArray(value.missing) && value.missing.every(item => typeof item === 'string')) return value as LaunchCallResult;
+  if (value.status === 'skipped' && (value.reason === 'opted_out' || value.reason === 'quiet_hours')) return value as LaunchCallResult;
+  if (value.status === 'blocked' && typeof value.reason === 'string' && LAUNCH_BLOCK_REASONS.has(value.reason as LaunchBlockReason)) return value as LaunchCallResult;
+  if (value.status === 'cancelled' && (value.reason === 'outbound_stopped' || value.reason === 'provider_intent_cancelled')) return value as LaunchCallResult;
+  if (value.status === 'reconciliation_required' && typeof value.callLogId === 'string'
+    && (value.reason === undefined || typeof value.reason === 'string') && (value.error === undefined || typeof value.error === 'string')) return value as LaunchCallResult;
+  if (value.status === 'failed' && typeof value.error === 'string' && typeof value.callLogId === 'string') return value as LaunchCallResult;
+  return { status: 'unknown_response', receivedStatus: value.status };
+}
+
+/** Preserve the server's structured non-2xx launch decision for fail-safe UI. */
+export function launchResultFromError(error: unknown): LaunchCallResult | null {
+  if (!(error instanceof ApiError) || !error.details) return null;
+  const status = error.details.status;
+  if (typeof status !== 'string') return null;
+  if (!LAUNCH_RESULT_STATUSES.has(status)) return { status: 'unknown_response', receivedStatus: status };
+  return parseLaunchResult(error.details);
+}
+
+export type LaunchPresentation = { kind: 'ok' | 'warn' | 'err'; text: string; refresh: boolean };
+
+function launchWords(value: string) {
+  return value.replaceAll('_', ' ');
+}
+
+export function presentLaunchResult(result: LaunchCallResult): LaunchPresentation {
+  switch (result.status) {
+    case 'launched':
+      return result.trackingDegraded
+        ? { kind: 'warn', text: `Provider accepted call ${result.callId}, but local tracking or audit evidence is degraded. Do not retry; reconcile the call log.`, refresh: true }
+        : { kind: 'ok', text: `Call accepted by the provider${result.mock ? ' in mock mode' : ''} — call id ${result.callId}. Delivery/connection is not yet proven.`, refresh: true };
+    case 'setup_required':
+      return { kind: 'warn', text: `No call was placed. Setup is incomplete: ${result.missing.join(', ')}.`, refresh: false };
+    case 'skipped':
+      return { kind: 'warn', text: result.reason === 'opted_out' ? 'No call was placed: the destination is suppressed by do-not-contact evidence.' : 'No call was placed: the clinic is currently inside configured quiet hours.', refresh: true };
+    case 'blocked':
+      return { kind: 'err', text: `No call was placed. Launch was blocked: ${launchWords(result.reason)}. Correct the authority or safety condition before retrying.`, refresh: true };
+    case 'cancelled':
+      return { kind: 'warn', text: `The launch was cancelled (${launchWords(result.reason)}).${result.providerStopApplied === true ? ' Provider stop was confirmed.' : ' Do not assume provider submission; check the call log before retrying.'}`, refresh: true };
+    case 'reconciliation_required': {
+      const missingEvidence = [
+        result.providerStopApplied === false ? 'provider stop unconfirmed' : null,
+        result.reviewRecorded === false ? 'review task not recorded' : null,
+        result.signalRecorded === false ? 'operational signal not recorded' : null,
+        result.auditRecorded === false ? 'audit event not recorded' : null,
+        result.businessEventRecorded === false ? 'business event not recorded' : null,
+      ].filter(Boolean).join(', ');
+      return { kind: 'err', text: `Provider acceptance is uncertain; do not retry. Reconcile call ${result.callId ?? result.callLogId ?? 'in the call log'}${result.error ? ` (${launchWords(result.error)})` : ''}.${missingEvidence ? ` Degraded evidence: ${missingEvidence}.` : ''}`, refresh: true };
+    }
+    case 'failed': {
+      const degraded = [result.reviewRecorded === false ? 'review task' : null, result.signalRecorded === false ? 'operational signal' : null].filter(Boolean).join(' and ');
+      return { kind: 'err', text: `Provider rejected the launch: ${launchWords(result.error)}. No successful call is claimed.${degraded ? ` The ${degraded} could not be recorded.` : ''}`, refresh: true };
+    }
+    case 'unknown_response':
+      return { kind: 'err', text: `Unknown or malformed launch response (${result.receivedStatus || 'missing status'}). Do not retry; reconcile provider and local call evidence.`, refresh: true };
+  }
+}
+
+const STRICT_OUTBOUND_HH_MM = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+
+export function validateOutboundQuietHours(startValue: string | null | undefined, endValue: string | null | undefined, timezone: string): string | null {
+  const start = startValue?.trim() ?? '';
+  const end = endValue?.trim() ?? '';
+  if (!start && !end) return 'Quiet hours are required before campaign approval.';
+  if (!start || !end) return 'Quiet hours require both a start and end time.';
+  if (!STRICT_OUTBOUND_HH_MM.test(start) || !STRICT_OUTBOUND_HH_MM.test(end)) return 'Quiet hours must use strict 24-hour HH:mm format.';
+  if (start === end) return 'Quiet-hours start and end cannot be equal.';
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format(new Date());
+  } catch {
+    return 'The clinic timezone is invalid; outbound scheduling is blocked.';
+  }
+  return null;
+}
+
+export interface OutboundControlStatus {
+  stopped: boolean;
+  reason?: string | null;
+  changedAt?: string | null;
+}
+
+export interface OutboundStopResult {
+  stopped: true;
+  activeCancellation: {
+    requested: number;
+    confirmed: number;
+    failed: number;
+    unconfirmed: number;
+    unboundIntentsQuarantined: number;
+    reconciliationRequired: number;
+    signalRecorded: number;
+    reviewRecorded: number;
+    auditRecorded: boolean;
+  };
+}
+
+export interface BookingReconciliationResult {
+  status: 'BOOKED';
+  requestId: string;
+  appointmentId: string;
+  duplicate: boolean;
+  appointment: {
+    service: string;
+    startsAt: string;
+    timezone: string;
+    locationName: string;
+    providerName: string | null;
+  };
+}
 
 export interface OutboundCampaignInput {
   clinicId: string;
@@ -464,16 +672,31 @@ export const receptionistApi = {
   updateOutboundCampaign: (id: string, body: Partial<OutboundCampaignInput>) => apiRequest<OutboundCampaign>(`${base}/outbound-campaigns/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   approveOutboundCampaign: (id: string, status: 'SCHEDULED' | 'RUNNING') => apiRequest<OutboundCampaign>(`${base}/outbound-campaigns/${id}/approve`, { method: 'POST', body: JSON.stringify({ approvalConfirmed: true, status }) }),
   listTargets: (campaignId: string) => apiRequest<CallTarget[]>(`${base}/outbound-campaigns/${campaignId}/targets`),
-  listOutboundTargetCandidates: (q = '') => apiRequest<OutboundTargetCandidate[]>(`${base}/outbound-target-candidates${q ? `?q=${encodeURIComponent(q)}` : ''}`),
+  listOutboundTargetCandidates: (campaignId: string, q = '') => apiRequest<OutboundTargetCandidate[]>(`${base}/outbound-target-candidates?campaignId=${encodeURIComponent(campaignId)}${q ? `&q=${encodeURIComponent(q)}` : ''}`),
   addTargets: (campaignId: string, targets: Array<Partial<CallTarget> & { phone: string }>) =>
     apiRequest<{ added: number }>(`${base}/outbound-campaigns/${campaignId}/targets`, { method: 'POST', body: JSON.stringify({ targets }) }),
   deleteTarget: (campaignId: string, id: string) =>
     apiRequest<void>(`${base}/outbound-campaigns/${campaignId}/targets/${id}`, { method: 'DELETE' }),
-  launchCall: (campaignId: string, body: { phone: string; firstName?: string; lastName?: string; email?: string; targetId?: string }) =>
-    apiRequest<LaunchCallResult>(`${base}/outbound-campaigns/${campaignId}/call`, { method: 'POST', body: JSON.stringify(body) }),
+  launchCall: async (campaignId: string, body: { phone: string; firstName?: string; lastName?: string; email?: string; targetId?: string }) => {
+    try {
+      const result = await apiRequest<unknown>(`${base}/outbound-campaigns/${campaignId}/call`, { method: 'POST', body: JSON.stringify(body) });
+      return parseLaunchResult(result);
+    } catch (error) {
+      const decision = launchResultFromError(error);
+      if (decision) return decision;
+      throw error;
+    }
+  },
+  outboundControl: () => apiRequest<OutboundControlStatus>(`${base}/outbound-control`),
+  stopOutbound: (reason: string) => apiRequest<OutboundStopResult>(`${base}/outbound-control`, {
+    method: 'POST', body: JSON.stringify({ stopped: true, reason }),
+  }),
   listOutboundCallLogs: (campaignId: string) => apiRequest<CallLog[]>(`${base}/outbound-campaigns/${campaignId}/call-logs`),
+  listOutboundReconciliations: (campaignId: string) => apiRequest<OutboundReconciliationEvidence[]>(`${base}/outbound-campaigns/${campaignId}/reconciliations`),
   listBookingRequests: (status?: BookingRequestStatus) => apiRequest<BookingRequest[]>(`${base}/booking-requests${status ? `?status=${status}` : ''}`),
   listConfirmationDeliveries: (limit = 100) => apiRequest<ConfirmationDelivery[]>(`${base}/confirmation-deliveries?limit=${limit}`),
   updateBookingRequest: (id: string, body: { status?: BookingRequestStatus; outcomeReason?: string }) =>
     apiRequest<BookingRequest>(`${base}/booking-requests/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  reconcileBookingRequest: (id: string, body: { appointmentId: string; outcomeReason: string; acknowledgeRequestDifferences: true }) =>
+    apiRequest<BookingReconciliationResult>(`${base}/booking-requests/${id}/reconcile`, { method: 'POST', body: JSON.stringify(body) }),
 };

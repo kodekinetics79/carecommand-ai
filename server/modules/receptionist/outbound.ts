@@ -15,7 +15,11 @@ import { agentReadinessReason } from '../../lib/receptionist/agentReadiness';
 import { runWithTenantContext } from '../../lib/tenantContext';
 import { Prisma } from '../../generated/prisma/client';
 import { fingerprintJson } from './intakeContract';
-import { isVoiceSuppressedTx, lockSuppressionFences } from '../../lib/receptionist/dncFence';
+import {
+  authorizeOutboundProviderIntentTx,
+  compatibleVoiceConsentEventTx,
+  isChannelSuppressedTx,
+} from '../../lib/receptionist/dncFence';
 
 const uuid = z.string().uuid();
 const idParam = z.object({ id: uuid });
@@ -27,6 +31,7 @@ const RUNNABLE_CAMPAIGN_STATUS = 'RUNNING';
 const DIALABLE_TARGET_STATUS = 'PENDING';
 const OUTBOUND_PURPOSES = ['CARE_COORDINATION', 'APPOINTMENT_REMINDER', 'PATIENT_REACTIVATION'] as const;
 const OUTBOUND_LEGAL_BASES = ['EXPLICIT_CONSENT', 'TREATMENT_OPERATIONS'] as const;
+const STRICT_HH_MM = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 export const MAX_TENANT_ACTIVE_CALLS = 3;
 export const DEFAULT_VOICE_MINUTES_LIMIT = 500;
 
@@ -121,19 +126,6 @@ async function outboundStopped(tenantId: string): Promise<boolean> {
   return usage?.killSwitch === true;
 }
 
-async function hasPositiveVoiceConsent(tenantId: string, target: { patientId?: string | null; leadId?: string | null }): Promise<boolean> {
-  if (!target.patientId && !target.leadId) return false;
-  return runWithTenantContext(tenantId, async tx => (await tx.communicationConsent.count({
-    where: {
-      tenantId,
-      patientId: target.patientId ?? null,
-      leadId: target.leadId ?? null,
-      channel: 'voice',
-      status: { in: ['opted_in', 'granted'] },
-    },
-  })) > 0);
-}
-
 async function targetIdentityIsBound(
   tenantId: string,
   target: { patientId?: string | null; leadId?: string | null },
@@ -188,10 +180,22 @@ async function validateOutboundAssignments(
     purpose: string | null | undefined;
     legalBasis: string | null | undefined;
     policyVersion: string | null | undefined;
+    quietHoursStart: string | null | undefined;
+    quietHoursEnd: string | null | undefined;
   },
 ) {
-  const clinic = await tx.receptionistClinic.findFirst({ where: { id: input.clinicId, tenantId: input.tenantId, active: true }, select: { id: true } });
+  const clinic = await tx.receptionistClinic.findFirst({
+    where: { id: input.clinicId, tenantId: input.tenantId, active: true },
+    select: { id: true, timezone: true },
+  });
   if (!clinic) throw new Error('clinic_inactive_or_foreign');
+  const quietHoursReason = quietHoursConfigurationReason(
+    input.quietHoursStart,
+    input.quietHoursEnd,
+    clinic.timezone,
+    input.requireReady,
+  );
+  if (quietHoursReason) throw new Error(quietHoursReason);
   if (input.branchId) {
     const branch = await tx.branch.findFirst({ where: { id: input.branchId, tenantId: input.tenantId, active: true }, select: { id: true } });
     if (!branch) throw new Error('branch_inactive_or_foreign');
@@ -269,18 +273,74 @@ function outboundAssignmentReason(error: unknown) {
     'direct_booking_service_missing', 'direct_booking_authority_inactive_or_foreign', 'direct_booking_agent_mismatch',
     'direct_booking_authority_unattested', 'direct_booking_service_mismatch', 'direct_booking_branch_not_eligible',
     'direct_booking_authority_immutable', 'outbound_authority_immutable', 'outbound_authority_approval_required',
+    'quiet_hours_missing', 'quiet_hours_incomplete', 'quiet_hours_invalid', 'quiet_hours_equal', 'quiet_hours_timezone_invalid',
   ].includes(reason) ? reason : null;
+}
+
+function providerIntentBlockReason(error: unknown): string | null {
+  const message = error instanceof Error ? error.message : String(error);
+  // Prisma includes the source invocation in some database error messages. A
+  // broad substring check can therefore mistake a different trigger failure
+  // for a known compliance rejection merely because the nearby source names
+  // one of our sentinel errors. Match direct application sentinels exactly,
+  // and database-raised messages only in Prisma/Postgres message fields.
+  const direct = (sentinel: string) => message === sentinel;
+  const raised = (phrase: string) => {
+    const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(?:ERROR:\\s*|message:\\s*["'])${escaped}(?:["'\\n]|$)`, 'i').test(message);
+  };
+  if (direct('outbound_provider_intent_suppressed')
+    || raised('Outbound provider intent is suppressed at the linearization point')
+    || raised('Outbound provider intent is denied by latest legacy patient consent')) return 'shared_suppression_gate';
+  if (direct('outbound_provider_intent_consent_missing')
+    || raised('Outbound provider intent requires immutable compatible voice consent evidence')
+    || raised('Outbound provider intent voice consent is stale, revoked, expired, or incompatible')) return 'positive_voice_consent_missing';
+  if (direct('outbound_provider_intent_target_missing')
+    || direct('outbound_provider_intent_destination_mismatch')
+    || raised('Outbound provider intent target is not the exact claimed destination')) return 'target_identity_changed';
+  if (raised('Outbound provider intent campaign authority/purpose/policy is not current')
+    || raised('Outbound provider intent is missing exact authority evidence')) return 'campaign_authority_invalid';
+  return null;
 }
 
 // --- Quiet-hours enforcement (per outbound campaign, clinic timezone) --------
 function parseHm(value?: string | null): number | null {
   if (!value) return null;
-  const m = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
-  if (!m) return null;
-  const h = Number(m[1]);
-  const min = Number(m[2]);
+  const normalized = value.trim();
+  if (!STRICT_HH_MM.test(normalized)) return null;
+  const [hour, minute] = normalized.split(':');
+  const h = Number(hour);
+  const min = Number(minute);
   if (h > 23 || min > 59) return null;
   return h * 60 + min;
+}
+
+function timezoneIsValid(timezone: string): boolean {
+  if (!timezone.trim()) return false;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format(new Date());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function quietHoursConfigurationReason(
+  start: string | null | undefined,
+  end: string | null | undefined,
+  timezone: string,
+  required: boolean,
+): 'quiet_hours_missing' | 'quiet_hours_incomplete' | 'quiet_hours_invalid' | 'quiet_hours_equal' | 'quiet_hours_timezone_invalid' | null {
+  const hasStart = typeof start === 'string' && start.trim().length > 0;
+  const hasEnd = typeof end === 'string' && end.trim().length > 0;
+  if (!hasStart && !hasEnd) return required ? 'quiet_hours_missing' : null;
+  if (hasStart !== hasEnd) return 'quiet_hours_incomplete';
+  const parsedStart = parseHm(start);
+  const parsedEnd = parseHm(end);
+  if (parsedStart === null || parsedEnd === null) return 'quiet_hours_invalid';
+  if (parsedStart === parsedEnd) return 'quiet_hours_equal';
+  if (!timezoneIsValid(timezone)) return 'quiet_hours_timezone_invalid';
+  return null;
 }
 
 function nowMinutesInTz(timezone: string): number | null {
@@ -296,14 +356,14 @@ function nowMinutesInTz(timezone: string): number | null {
 }
 
 // True when "now" (in the clinic timezone) falls inside the campaign's quiet
-// window. Handles overnight windows (e.g. 21:00–08:00 wraps midnight). An unset
-// or empty window is never quiet.
+// window. Handles overnight windows (e.g. 21:00–08:00 wraps midnight). Invalid
+// configuration is treated as quiet so callers fail closed.
 export function isWithinQuietHours(start: string | null | undefined, end: string | null | undefined, timezone: string): boolean {
   const s = parseHm(start);
   const e = parseHm(end);
-  if (s === null || e === null || s === e) return false;
+  if (s === null || e === null || s === e || !timezoneIsValid(timezone)) return true;
   const now = nowMinutesInTz(timezone);
-  if (now === null) return false;
+  if (now === null) return true;
   return s < e ? now >= s && now < e : now >= s || now < e;
 }
 
@@ -314,9 +374,17 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
   // platform operator. This intentionally reuses the existing tenant-wide AI
   // kill switch so there is one authoritative emergency control. The platform
   // control-tower endpoint remains an independent administrative path.
-  app.get('/outbound-control', { preHandler: writeRoles }, async request => ({
-    stopped: await outboundStopped(request.auth.tenantId),
-  }));
+  app.get('/outbound-control', { preHandler: writeRoles }, async request => {
+    const usage = await db.tenantAiUsage.findUnique({
+      where: { tenantId: request.auth.tenantId },
+      select: { killSwitch: true, killSwitchReason: true, updatedAt: true },
+    });
+    return {
+      stopped: usage?.killSwitch === true,
+      reason: usage?.killSwitch ? usage.killSwitchReason : null,
+      changedAt: usage?.killSwitch ? usage.updatedAt : null,
+    };
+  });
 
   app.post('/outbound-control', { preHandler: ownerAdminRoles }, async request => {
     // Tenant operators may always fail safe. Only the independent platform
@@ -533,8 +601,8 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     bookingMode: z.enum(['APPOINTMENT_REQUEST_ONLY', 'DIRECT_BOOKING_IF_SLOT_AVAILABLE']).default('APPOINTMENT_REQUEST_ONLY'),
     defaultBranchId: uuid.optional().nullable(),
     defaultService: z.string().max(160).optional().nullable(),
-    quietHoursStart: z.string().max(10).optional().nullable(),
-    quietHoursEnd: z.string().max(10).optional().nullable(),
+    quietHoursStart: z.string().trim().regex(STRICT_HH_MM).optional().nullable(),
+    quietHoursEnd: z.string().trim().regex(STRICT_HH_MM).optional().nullable(),
     maxRetryAttempts: z.number().int().min(0).max(10).default(1),
   });
   const campaignUpdate = campaignCreate.partial().omit({ clinicId: true }).extend({
@@ -566,6 +634,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
           tenantId: request.auth.tenantId, clinicId: input.clinicId, agentId: input.agentId, branchId: input.defaultBranchId,
           bookingMode: input.bookingMode, receptionistCampaignId: input.receptionistCampaignId,
           defaultService: input.defaultService, purpose: input.purpose, legalBasis: input.legalBasis, policyVersion: input.policyVersion,
+          quietHoursStart: input.quietHoursStart, quietHoursEnd: input.quietHoursEnd,
           requireReady: false,
         });
         const { customQuestions, defaultBranchId, agentId, receptionistCampaignId, ...rest } = input;
@@ -638,6 +707,8 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
           purpose: input.purpose === undefined ? existing.purpose : input.purpose,
           legalBasis: input.legalBasis === undefined ? existing.legalBasis : input.legalBasis,
           policyVersion: input.policyVersion === undefined ? existing.policyVersion : input.policyVersion,
+          quietHoursStart: input.quietHoursStart === undefined ? existing.quietHoursStart : input.quietHoursStart,
+          quietHoursEnd: input.quietHoursEnd === undefined ? existing.quietHoursEnd : input.quietHoursEnd,
           requireReady: nextStatus === 'SCHEDULED' || nextStatus === 'RUNNING',
         });
         const { customQuestions, ...rest } = input;
@@ -686,6 +757,8 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
           purpose: campaign.purpose,
           legalBasis: campaign.legalBasis,
           policyVersion: campaign.policyVersion,
+          quietHoursStart: campaign.quietHoursStart,
+          quietHoursEnd: campaign.quietHoursEnd,
           requireReady: true,
         });
         const authorityFingerprint = outboundAuthorityFingerprint(campaign);
@@ -716,8 +789,16 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
 
   // ----- Targets ----------------------------------------------------------
   app.get('/outbound-target-candidates', { preHandler: callArtifactRead }, async request => {
-    const { q } = z.object({ q: z.string().trim().max(120).optional() }).parse(request.query);
+    const { q, campaignId } = z.object({ campaignId: uuid, q: z.string().trim().max(120).optional() }).parse(request.query);
     const query = q?.trim();
+    const campaign = await db.receptionistOutboundCampaign.findFirst({
+      where: { id: campaignId, tenantId: request.auth.tenantId },
+      select: { purpose: true, policyVersion: true, legalBasis: true },
+    });
+    if (!campaign) throw app.httpErrors.notFound('Outbound campaign not found');
+    if (!campaign.purpose || !campaign.policyVersion || !campaign.legalBasis) {
+      throw app.httpErrors.conflict('Outbound campaign purpose, policy version, and legal basis are required before selecting targets.');
+    }
     const [patients, leads] = await runWithTenantContext(request.auth.tenantId, tx => Promise.all([
       tx.patient.findMany({
         where: {
@@ -742,17 +823,43 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       ...patients.map(patient => ({ type: 'patient' as const, id: patient.id, name: `${patient.firstName} ${patient.lastName}`, phone: toE164(patient.phone ?? '') })),
       ...leads.map(lead => ({ type: 'lead' as const, id: lead.id, name: lead.name, phone: toE164(lead.phone ?? '') })),
     ].filter(identity => isValidE164(identity.phone));
-    const consents = await runWithTenantContext(request.auth.tenantId, tx => tx.communicationConsent.findMany({
-      where: {
-        tenantId: request.auth.tenantId, channel: 'voice', status: { in: ['opted_in', 'granted'] },
-        OR: identities.map(identity => identity.type === 'patient' ? { patientId: identity.id } : { leadId: identity.id }),
-      },
-      select: { patientId: true, leadId: true },
-    }));
-    return identities.map(identity => ({
-      ...identity,
-      voiceConsentReady: consents.some(consent => identity.type === 'patient' ? consent.patientId === identity.id : consent.leadId === identity.id),
-    }));
+    const requiresImmutableConsent = campaign.legalBasis === 'EXPLICIT_CONSENT' || campaign.purpose === 'PATIENT_REACTIVATION';
+    return runWithTenantContext(request.auth.tenantId, async tx => {
+      const candidates: Array<(typeof identities)[number] & {
+        voiceAuthorizationReady: boolean;
+        voiceAuthorizationReason: 'suppressed' | 'compatible_immutable_consent' | 'consent_missing_or_incompatible' | 'treatment_operations';
+      }> = [];
+      for (const identity of identities) {
+        const targetIdentity = identity.type === 'patient'
+          ? { patientId: identity.id, leadId: null }
+          : { patientId: null, leadId: identity.id };
+        const suppressed = await isChannelSuppressedTx(tx, {
+          tenantId: request.auth.tenantId,
+          destination: identity.phone,
+          channel: 'voice',
+          ...targetIdentity,
+        });
+        const consent = !suppressed && requiresImmutableConsent
+          ? await compatibleVoiceConsentEventTx(tx, {
+            tenantId: request.auth.tenantId,
+            ...targetIdentity,
+            purpose: campaign.purpose as (typeof OUTBOUND_PURPOSES)[number],
+            policyVersion: campaign.policyVersion!,
+          })
+          : null;
+        const voiceAuthorizationReason = suppressed
+          ? 'suppressed' as const
+          : requiresImmutableConsent
+            ? consent ? 'compatible_immutable_consent' as const : 'consent_missing_or_incompatible' as const
+            : 'treatment_operations' as const;
+        candidates.push({
+          ...identity,
+          voiceAuthorizationReady: !suppressed && (!requiresImmutableConsent || consent !== null),
+          voiceAuthorizationReason,
+        });
+      }
+      return candidates;
+    });
   });
 
   app.get('/outbound-campaigns/:id/targets', { preHandler: callArtifactRead }, async request => {
@@ -871,6 +978,8 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         purpose: campaign.purpose,
         legalBasis: campaign.legalBasis,
         policyVersion: campaign.policyVersion,
+        quietHoursStart: campaign.quietHoursStart,
+        quietHoursEnd: campaign.quietHoursEnd,
         requireReady: true,
       }));
     } catch (error) {
@@ -927,11 +1036,6 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
 
     const dialIdentity = target ?? body;
 
-    const requiresPositiveConsent = campaign.legalBasis === 'EXPLICIT_CONSENT' || campaign.purpose === 'PATIENT_REACTIVATION';
-    if (target && requiresPositiveConsent && !(await hasPositiveVoiceConsent(request.auth.tenantId, target))) {
-      await audit(request, { action: 'receptionist.call.suppressed', resource: 'receptionistCallTarget', resourceId: target.id, metadata: { campaignId: campaign.id, reason: 'positive_voice_consent_missing' } });
-      return reply.code(409).send({ status: 'blocked', reason: 'positive_voice_consent_missing' });
-    }
     if (await isSuppressed(request.auth.tenantId, {
       patientId: target?.patientId ?? null,
       leadId: target?.leadId ?? null,
@@ -959,7 +1063,24 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     }
 
     // ---- Quiet-hours gate: never dial during the campaign's quiet window ----
-    // Temporary skip (target stays PENDING for a later retry); recorded via audit.
+    // Invalid/missing configuration is a deployment error, never an implicit
+    // authorization to dial. A valid active window is a temporary skip and the
+    // target remains PENDING for a later retry.
+    const quietHoursReason = quietHoursConfigurationReason(
+      campaign.quietHoursStart,
+      campaign.quietHoursEnd,
+      campaign.clinic.timezone,
+      true,
+    );
+    if (quietHoursReason) {
+      await audit(request, {
+        action: 'receptionist.call.blocked',
+        resource: 'receptionistOutboundCampaign',
+        resourceId: campaign.id,
+        metadata: { reason: quietHoursReason, targetId: body.targetId ?? null },
+      });
+      return reply.code(409).send({ status: 'blocked', reason: quietHoursReason });
+    }
     if (isWithinQuietHours(campaign.quietHoursStart, campaign.quietHoursEnd, campaign.clinic.timezone)) {
       await audit(request, { action: 'receptionist.call.skipped', resource: 'receptionistOutboundCampaign', resourceId: campaign.id, metadata: { reason: 'quiet_hours', targetId: body.targetId ?? null } });
       return reply.code(200).send({ status: 'skipped', reason: 'quiet_hours' });
@@ -1048,6 +1169,31 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       return reply.code(statusCode).send({ status: 'blocked', reason: reservation.blocked });
     }
     const { callLog } = reservation;
+    const releaseReservedAttempt = async (lastOutcome: string) => db.$transaction(async tx => {
+      const released = await tx.receptionistCallLog.updateMany({
+        where: {
+          id: callLog.id,
+          tenantId: request.auth.tenantId,
+          outcome: 'IN_PROGRESS',
+          endedAt: null,
+          retellCallId: null,
+        },
+        data: { outcome: 'FAILED', endedAt: new Date() },
+      });
+      if (released.count === 1 && target) {
+        await tx.receptionistCallTarget.updateMany({
+          where: {
+            id: target.id,
+            tenantId: request.auth.tenantId,
+            campaignId: campaign.id,
+            status: 'CALLING',
+            attempts: { gt: 0 },
+          },
+          data: { status: 'PENDING', attempts: { decrement: 1 }, lastOutcome, lastCallLogId: callLog.id },
+        });
+      }
+      return released.count === 1;
+    });
 
     // Re-check immediately before the irreversible provider boundary. This
     // closes the window where an operator stops outbound or pauses a campaign
@@ -1088,6 +1234,8 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
             purpose: currentCampaign.purpose,
             legalBasis: currentCampaign.legalBasis,
             policyVersion: currentCampaign.policyVersion,
+            quietHoursStart: currentCampaign.quietHoursStart,
+            quietHoursEnd: currentCampaign.quietHoursEnd,
             requireReady: true,
           }));
         } catch (error) {
@@ -1100,9 +1248,6 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       || currentTarget.leadId !== target.leadId
       || currentTarget.phone !== canonicalDialDestination
       || currentTarget.status !== 'CALLING')) boundaryAuthorityReason = 'target_identity_changed';
-    if (!boundaryAuthorityReason && currentTarget && requiresPositiveConsent && !(await hasPositiveVoiceConsent(request.auth.tenantId, currentTarget))) {
-      boundaryAuthorityReason = 'positive_voice_consent_missing';
-    }
     if (!boundaryAuthorityReason && currentTarget && !(await targetIdentityIsBound(request.auth.tenantId, currentTarget, canonicalDialDestination))) {
       boundaryAuthorityReason = 'target_identity_unbound';
     }
@@ -1112,15 +1257,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       destination: canonicalDialDestination,
     }, 'voice')) boundaryAuthorityReason = 'shared_suppression_gate';
     if (stoppedAtBoundary || currentCampaign?.status !== RUNNABLE_CAMPAIGN_STATUS || boundaryAuthorityReason) {
-      await db.$transaction(async tx => {
-        await tx.receptionistCallLog.update({ where: { id: callLog.id }, data: { outcome: 'FAILED', endedAt: new Date() } });
-        if (target) {
-          await tx.receptionistCallTarget.updateMany({
-            where: { id: target.id, tenantId: request.auth.tenantId, campaignId: campaign.id, status: 'CALLING' },
-            data: { status: 'PENDING', attempts: { decrement: 1 }, lastOutcome: 'BLOCKED', lastCallLogId: callLog.id },
-          });
-        }
-      });
+      await releaseReservedAttempt('BLOCKED');
       const reason = stoppedAtBoundary ? 'outbound_stopped'
         : currentCampaign?.status !== RUNNABLE_CAMPAIGN_STATUS ? 'campaign_not_running'
           : boundaryAuthorityReason!;
@@ -1130,19 +1267,16 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     }
 
     await providerBoundaryTestHook?.('before_suppression_fence');
-    const providerIntent = await db.$transaction(async tx => {
-      await lockSuppressionFences(tx, {
-        tenantId: request.auth.tenantId,
-        destinations: [canonicalDialDestination],
-        patientId: currentTarget?.patientId,
-        leadId: currentTarget?.leadId,
-      });
-      await providerBoundaryTestHook?.('suppression_fence_acquired');
-
+    const providerIntentAttempt = await db.$transaction(async tx => {
+      // Canonical multi-domain lock order is configuration then suppression.
+      // Studio pause/configuration writes take the same configuration lock, so
+      // either their mutation commits first and this launch observes it, or the
+      // provider intent commits first and the mutation is ordered afterward.
+      await lockOutboundConfiguration(tx, request.auth.tenantId);
       const finalUsage = await tx.tenantAiUsage.findUnique({ where: { tenantId: request.auth.tenantId }, select: { killSwitch: true } });
       const finalCampaign = await tx.receptionistOutboundCampaign.findFirst({
           where: { id: campaign.id, tenantId: request.auth.tenantId },
-          include: { agent: true, receptionistCampaign: true },
+          include: { agent: true, receptionistCampaign: true, clinic: { select: { timezone: true } } },
         });
       const finalTarget = target
         ? await tx.receptionistCallTarget.findFirst({ where: { id: target.id, tenantId: request.auth.tenantId, campaignId: campaign.id } })
@@ -1153,51 +1287,117 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         || finalCampaign.authorityFingerprint !== outboundAuthorityFingerprint(finalCampaign)) {
         return { blocked: 'outbound_authority_unapproved' as const };
       }
+      const finalAuthorityMatches = finalCampaign.receptionistCampaignId === campaign.receptionistCampaignId
+        && finalCampaign.agentId === campaign.agentId
+        && finalCampaign.bookingMode === campaign.bookingMode
+        && finalCampaign.defaultBranchId === campaign.defaultBranchId
+        && finalCampaign.defaultService === campaign.defaultService
+        && finalCampaign.policyVersion === campaign.policyVersion
+        && finalCampaign.authorityApprovedAt?.getTime() === campaign.authorityApprovedAt?.getTime()
+        && finalCampaign.authorityApprovedById === campaign.authorityApprovedById;
+      if (!finalAuthorityMatches) return { blocked: 'campaign_authority_changed' as const };
+      try {
+        await validateOutboundAssignments(tx, {
+          tenantId: request.auth.tenantId,
+          clinicId: finalCampaign.clinicId,
+          agentId: finalCampaign.agentId,
+          branchId: finalCampaign.defaultBranchId,
+          bookingMode: finalCampaign.bookingMode,
+          receptionistCampaignId: finalCampaign.receptionistCampaignId,
+          defaultService: finalCampaign.defaultService,
+          purpose: finalCampaign.purpose,
+          legalBasis: finalCampaign.legalBasis,
+          policyVersion: finalCampaign.policyVersion,
+          quietHoursStart: finalCampaign.quietHoursStart,
+          quietHoursEnd: finalCampaign.quietHoursEnd,
+          requireReady: true,
+        });
+      } catch (error) {
+        return { blocked: (outboundAssignmentReason(error) ?? 'campaign_authority_invalid') as string };
+      }
+      const finalQuietHoursReason = quietHoursConfigurationReason(
+        finalCampaign.quietHoursStart,
+        finalCampaign.quietHoursEnd,
+        finalCampaign.clinic.timezone,
+        true,
+      );
+      if (finalQuietHoursReason) return { blocked: finalQuietHoursReason };
+      if (isWithinQuietHours(finalCampaign.quietHoursStart, finalCampaign.quietHoursEnd, finalCampaign.clinic.timezone)) {
+        return { blocked: 'quiet_hours' as const };
+      }
       if (target && (!finalTarget
         || finalTarget.patientId !== target.patientId
         || finalTarget.leadId !== target.leadId
         || finalTarget.phone !== canonicalDialDestination
         || finalTarget.status !== 'CALLING')) return { blocked: 'target_identity_changed' as const };
 
-      if (finalTarget && requiresPositiveConsent) {
-        const positiveConsent = await tx.communicationConsent.count({ where: {
-          tenantId: request.auth.tenantId,
-          patientId: finalTarget.patientId ?? null,
-          leadId: finalTarget.leadId ?? null,
-          channel: 'voice', status: { in: ['opted_in', 'granted'] },
-        } });
-        if (positiveConsent === 0) return { blocked: 'positive_voice_consent_missing' as const };
-      }
-      if (await isVoiceSuppressedTx(tx, {
+      const durableIntent = await authorizeOutboundProviderIntentTx(tx, {
         tenantId: request.auth.tenantId,
+        callLogId: callLog.id,
+        outboundCampaignId: finalCampaign.id,
+        targetId: finalTarget?.id,
         destination: canonicalDialDestination,
-        patientId: finalTarget?.patientId,
-        leadId: finalTarget?.leadId,
-      })) return { blocked: 'shared_suppression_gate' as const };
+        purpose: finalCampaign.purpose as (typeof OUTBOUND_PURPOSES)[number],
+        policyVersion: finalCampaign.policyVersion!,
+        legalBasis: finalCampaign.legalBasis as (typeof OUTBOUND_LEGAL_BASES)[number],
+      });
+      await providerBoundaryTestHook?.('suppression_fence_acquired');
 
       const linearizedAt = new Date();
       await tx.auditEvent.create({ data: {
         tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
         action: 'receptionist.outbound.providerIntent.authorized', resource: 'receptionistCallLog', resourceId: callLog.id,
         requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'], occurredAt: linearizedAt,
-        metadata: { campaignId: campaign.id, targetId: body.targetId ?? null, suppressionFence: 'held_at_commit' },
+        metadata: { campaignId: campaign.id, targetId: body.targetId ?? null, providerIntentId: durableIntent.id, suppressionFence: 'held_at_commit' },
       } });
       await tx.businessEvent.create({ data: {
         tenantId: request.auth.tenantId, eventType: 'receptionist.outbound.provider_intent_authorized',
         entityType: 'receptionistCallLog', entityId: callLog.id, sourceModule: 'receptionist', occurredAt: linearizedAt,
-        payload: { campaignId: campaign.id, targetId: body.targetId ?? null, suppressionFence: 'held_at_commit' },
+        payload: { campaignId: campaign.id, targetId: body.targetId ?? null, providerIntentId: durableIntent.id, suppressionFence: 'held_at_commit' },
       } });
-      return { campaign: finalCampaign };
-    });
+      return { campaign: finalCampaign, providerIntentId: durableIntent.id };
+    }).then(value => ({ ok: true as const, value })).catch(error => ({ ok: false as const, error }));
+
+    if (!providerIntentAttempt.ok) {
+      const blockedReason = providerIntentBlockReason(providerIntentAttempt.error);
+      await releaseReservedAttempt(blockedReason ? 'BLOCKED' : 'PROVIDER_INTENT_EVIDENCE_FAILED');
+      // An expected compliance rejection is not an observability outage. An
+      // unexpected mandatory evidence failure is degraded even when the
+      // separate cleanup audit succeeds.
+      const trackingDegraded = blockedReason === null;
+      let cleanupAuditRecorded = false;
+      try {
+        await audit(request, {
+          action: 'receptionist.call.blocked',
+          resource: 'receptionistCallLog',
+          resourceId: callLog.id,
+          metadata: { campaignId: campaign.id, reason: blockedReason ?? 'provider_intent_evidence_failed' },
+        });
+        cleanupAuditRecorded = true;
+      } catch {
+        // The false initializer is the truthful cleanup-audit result.
+      }
+      if (blockedReason) {
+        request.log.warn({ callLogId: callLog.id, campaignId: campaign.id, reason: blockedReason }, 'Outbound provider intent blocked before provider submission');
+      } else {
+        request.log.error({
+          err: providerIntentAttempt.error,
+          callLogId: callLog.id,
+          campaignId: campaign.id,
+        }, 'Outbound provider intent evidence failed before provider submission');
+      }
+      return reply.code(blockedReason ? 409 : 503).send({
+        status: 'blocked',
+        reason: blockedReason ?? 'provider_intent_evidence_failed',
+        callLogId: callLog.id,
+        trackingDegraded,
+        cleanupAuditRecorded,
+      });
+    }
+    const providerIntent = providerIntentAttempt.value;
 
     if ('blocked' in providerIntent) {
-      await db.$transaction(async tx => {
-        await tx.receptionistCallLog.update({ where: { id: callLog.id }, data: { outcome: 'FAILED', endedAt: new Date() } });
-        if (target) await tx.receptionistCallTarget.updateMany({
-          where: { id: target.id, tenantId: request.auth.tenantId, campaignId: campaign.id, status: 'CALLING' },
-          data: { status: 'PENDING', attempts: { decrement: 1 }, lastOutcome: 'BLOCKED', lastCallLogId: callLog.id },
-        });
-      });
+      await releaseReservedAttempt('BLOCKED');
       await audit(request, { action: 'receptionist.call.blocked', resource: 'receptionistCallLog', resourceId: callLog.id, metadata: { campaignId: campaign.id, reason: `${providerIntent.blocked}_at_provider_intent` } });
       const code = providerIntent.blocked === 'outbound_stopped' ? 423 : 409;
       return reply.code(code).send({ status: 'blocked', reason: providerIntent.blocked, callLogId: callLog.id });
@@ -1214,15 +1414,22 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       db.receptionistOutboundCampaign.findFirst({ where: { id: campaign.id, tenantId: request.auth.tenantId }, select: { status: true } }),
     ]);
     if (!intentCall || intentCall.outcome !== 'IN_PROGRESS' || intentCall.endedAt || stoppedAfterIntent || campaignAfterIntent?.status !== RUNNABLE_CAMPAIGN_STATUS) {
-      await db.receptionistCallLog.updateMany({
-        where: { id: callLog.id, tenantId: request.auth.tenantId, outcome: 'IN_PROGRESS', endedAt: null, retellCallId: null },
-        data: { outcome: 'FAILED', endedAt: new Date() },
+      const released = await releaseReservedAttempt('PROVIDER_INTENT_CANCELLED');
+      let trackingDegraded = false;
+      try {
+        await audit(request, {
+          action: 'receptionist.call.cancelledBeforeProvider', resource: 'receptionistCallLog', resourceId: callLog.id,
+          metadata: { campaignId: campaign.id, reason: stoppedAfterIntent ? 'outbound_stopped_after_intent' : 'provider_intent_cancelled', released },
+        });
+      } catch {
+        trackingDegraded = true;
+      }
+      return reply.code(423).send({
+        status: 'cancelled',
+        reason: stoppedAfterIntent ? 'outbound_stopped' : 'provider_intent_cancelled',
+        callLogId: callLog.id,
+        trackingDegraded,
       });
-      await audit(request, {
-        action: 'receptionist.call.cancelledBeforeProvider', resource: 'receptionistCallLog', resourceId: callLog.id,
-        metadata: { campaignId: campaign.id, reason: stoppedAfterIntent ? 'outbound_stopped_after_intent' : 'provider_intent_cancelled' },
-      });
-      return reply.code(423).send({ status: 'cancelled', reason: stoppedAfterIntent ? 'outbound_stopped' : 'provider_intent_cancelled', callLogId: callLog.id });
     }
     const result = await createPhoneCall({
       toNumber: canonicalDialDestination,

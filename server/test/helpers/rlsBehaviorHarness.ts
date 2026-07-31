@@ -60,6 +60,8 @@ const APPEND_ONLY = new Set([
   'ReceptionistArtifactLifecycleEvent',
   'ReceptionistRecordingConsentEvent',
   'NotificationDeliveryAttempt',
+  'ReceptionistVoiceConsentEvent',
+  'ReceptionistOutboundProviderIntent',
 ]);
 
 function schemaProtectedTables(): string[] {
@@ -691,11 +693,44 @@ export class RlsBehaviorHarness {
     // Outbound targets require exactly one durable identity. The patient/lead
     // FKs are nullable individually, so the generic required-FK resolver
     // cannot infer this table-level XOR contract.
-    if (table === 'ReceptionistCallTarget') {
+    if (table === 'ReceptionistCallTarget' || table === 'CommunicationConsent' || table === 'ReceptionistVoiceConsentEvent') {
       const patient = this.fixtures.get(key('Patient', tenantId));
       if (!patient) return null;
       values.set('patientId', patient.row.id);
       values.delete('leadId');
+    }
+    if (table === 'ReceptionistVoiceConsentEvent') {
+      values.set('purpose', 'PATIENT_REACTIVATION');
+      values.set('policyVersion', 'rls-policy-v1');
+      values.set('disclosureTextHash', 'a'.repeat(64));
+      values.set('evidenceReference', `rls:${tenantId}`);
+      values.set('captureMethod', 'written');
+      values.set('source', 'patient_written');
+    }
+    if (table === 'ReceptionistOutboundProviderIntent') {
+      const campaignId = values.get('outboundCampaignId');
+      const callLogId = values.get('callLogId');
+      if (typeof campaignId !== 'string' || typeof callLogId !== 'string') return null;
+      const actorId = tenantId === this.tenantA ? this.actorA : this.actorB;
+      await this.owner.query(
+        `UPDATE "ReceptionistOutboundCampaign"
+         SET status='RUNNING', purpose='CARE_COORDINATION', "legalBasis"='TREATMENT_OPERATIONS',
+             "policyVersion"='rls-policy-v1', "authorityApprovedAt"=statement_timestamp(),
+             "authorityApprovedById"=$1, "authorityFingerprint"=$2
+         WHERE "tenantId"=$3 AND id=$4`,
+        [actorId, 'f'.repeat(64), tenantId, campaignId],
+      );
+      await this.owner.query(
+        `UPDATE "ReceptionistCallLog"
+         SET direction='outbound', outcome='IN_PROGRESS', "endedAt"=NULL, "retellCallId"=NULL,
+             "outboundCampaignId"=$1, "targetId"=NULL, "callerPhone"=$2
+         WHERE "tenantId"=$3 AND id=$4`,
+        [campaignId, syntheticE164Phone(`provider-intent:${tenantId}`), tenantId, callLogId],
+      );
+      values.set('purpose', 'CARE_COORDINATION');
+      values.set('policyVersion', 'rls-policy-v1');
+      values.delete('targetId');
+      values.delete('voiceConsentEventId');
     }
     const record = await this.insertRecord(table, values, tenantId);
     this.restrictedInsertEvidence.add(key(table, tenantId));

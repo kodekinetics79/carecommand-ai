@@ -2,14 +2,17 @@ import 'dotenv/config';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { isIsolationDenial, isRlsDenial, RLS_TABLE_ADAPTERS, RlsBehaviorHarness } from './helpers/rlsBehaviorHarness';
 
-const IMMUTABLE_DENIALS = ['42501', '55000', 'P0001'];
+const IMMUTABLE_DENIALS = ['42501', '23514', '55000', 'P0001'];
 const REASSIGNMENT_DENIALS = ['42501', '23503', '23505', '23514', '55000', 'P0001'];
+const STRICT_APPEND_ONLY_RLS = new Set([
+  'NotificationDeliveryAttempt', 'ReceptionistVoiceConsentEvent', 'ReceptionistOutboundProviderIntent',
+]);
 
 if (!process.env.RLS_DISPOSABLE_DB) {
   describe('RLS behavioral evidence execution guard', () => {
     it('requires the explicit disposable-database lifecycle', () => {
       expect(process.env.RLS_DISPOSABLE_DB).toBeUndefined();
-      expect(RLS_TABLE_ADAPTERS).toHaveLength(120);
+      expect(RLS_TABLE_ADAPTERS).toHaveLength(122);
     });
   });
 } else {
@@ -24,9 +27,9 @@ if (!process.env.RLS_DISPOSABLE_DB) {
   });
 
   describe('RLS behavioral adapter inventory', () => {
-    it('contains exactly one adapter for all 120 deployed protected tables', () => {
-      expect(RLS_TABLE_ADAPTERS).toHaveLength(120);
-      expect(new Set(RLS_TABLE_ADAPTERS.map(adapter => adapter.table)).size).toBe(120);
+    it('contains exactly one adapter for all 122 deployed protected tables', () => {
+      expect(RLS_TABLE_ADAPTERS).toHaveLength(122);
+      expect(new Set(RLS_TABLE_ADAPTERS.map(adapter => adapter.table)).size).toBe(122);
     });
   });
 
@@ -65,9 +68,9 @@ if (!process.env.RLS_DISPOSABLE_DB) {
         expect(own.errorCode).toBe('42501');
         expect(cross.errorCode).toBe('42501');
         expect(none.errorCode).toBe('42501');
-      } else if (adapter.mode === 'APPEND_ONLY') {
+      } else if (adapter.mode === 'APPEND_ONLY' || adapter.table === 'ReceptionistOptOut') {
         expect(IMMUTABLE_DENIALS).toContain(own.errorCode);
-        if (adapter.table === 'NotificationDeliveryAttempt') {
+        if (STRICT_APPEND_ONLY_RLS.has(adapter.table)) {
           expect(cross.errorCode).toBe('42501');
           expect(none.errorCode).toBe('42501');
         } else {
@@ -95,9 +98,9 @@ if (!process.env.RLS_DISPOSABLE_DB) {
         expect(own.errorCode).toBe('42501');
         expect(cross.errorCode).toBe('42501');
         expect(none.errorCode).toBe('42501');
-      } else if (adapter.mode === 'APPEND_ONLY') {
+      } else if (adapter.mode === 'APPEND_ONLY' || adapter.table === 'ReceptionistOptOut') {
         expect(IMMUTABLE_DENIALS).toContain(own.errorCode);
-        if (adapter.table === 'NotificationDeliveryAttempt') {
+        if (STRICT_APPEND_ONLY_RLS.has(adapter.table)) {
           expect(cross.errorCode).toBe('42501');
           expect(none.errorCode).toBe('42501');
         } else {
@@ -134,10 +137,10 @@ if (!process.env.RLS_DISPOSABLE_DB) {
         expect(noneUpdate.errorCode).toBe('42501');
         expect(crossDelete.errorCode).toBe('42501');
         expect(noneDelete.errorCode).toBe('42501');
-      } else if (adapter.mode === 'APPEND_ONLY') {
+      } else if (adapter.mode === 'APPEND_ONLY' || adapter.table === 'ReceptionistOptOut') {
         expect(IMMUTABLE_DENIALS).toContain(evidence.bulkUpdate.errorCode);
         expect(IMMUTABLE_DENIALS).toContain(evidence.bulkDelete.errorCode);
-        if (adapter.table === 'NotificationDeliveryAttempt') {
+        if (STRICT_APPEND_ONLY_RLS.has(adapter.table)) {
           expect(crossUpdate.errorCode).toBe('42501');
           expect(noneUpdate.errorCode).toBe('42501');
           expect(crossDelete.errorCode).toBe('42501');

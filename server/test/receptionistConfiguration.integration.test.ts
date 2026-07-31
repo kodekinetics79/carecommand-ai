@@ -33,6 +33,16 @@ const intakeLegacyPause = intakeMigrationSql.match(/WITH paused AS \([\s\S]*?FRO
 
 const phone = () => `+1${(BigInt(`0x${randomUUID().replace(/-/g, '').slice(0, 14)}`) % 10_000_000_000n).toString().padStart(10, '0')}`;
 
+function quietWindowOutsideNow(timezone = 'America/New_York') {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone, hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(new Date());
+  const now = (Number(parts.find(part => part.type === 'hour')?.value ?? 0) % 24) * 60
+    + Number(parts.find(part => part.type === 'minute')?.value ?? 0);
+  const format = (minutes: number) => `${String(Math.floor(minutes / 60) % 24).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`;
+  return { quietHoursStart: format((now + 60) % 1440), quietHoursEnd: format((now + 61) % 1440) };
+}
+
 function listedRetellAgent(agentId: string, version: number, tags: string[] = ['prod']) {
   return {
     has_more: false,
@@ -686,11 +696,21 @@ describe('AI receptionist trusted configuration', () => {
 
     const outbound = await app.inject({
       method: 'POST', url: '/v1/receptionist/outbound-campaigns', headers: auth(t, 'OWNER'),
-      payload: { clinicId, agentId: unverified.id, name: 'Unsafe outbound activation', script: 'Call the patient.' },
+      payload: {
+        clinicId, agentId: unverified.id, name: 'Unsafe outbound activation', script: 'Call the patient.',
+        purpose: 'CARE_COORDINATION', legalBasis: 'TREATMENT_OPERATIONS', policyVersion: 'CONFIG-READINESS-1',
+        ...quietWindowOutsideNow(),
+      },
     });
     expect(outbound.statusCode).toBe(201);
-    const run = await app.inject({
+    const patchActivation = await app.inject({
       method: 'PATCH', url: `/v1/receptionist/outbound-campaigns/${outbound.json().id}`, headers: auth(t, 'OWNER'), payload: { status: 'RUNNING' },
+    });
+    expect(patchActivation.statusCode).toBe(409);
+    expect(patchActivation.json().message).toContain('outbound_authority_approval_required');
+    const run = await app.inject({
+      method: 'POST', url: `/v1/receptionist/outbound-campaigns/${outbound.json().id}/approve`, headers: auth(t, 'OWNER'),
+      payload: { approvalConfirmed: true, status: 'RUNNING' },
     });
     expect(run.statusCode).toBe(409);
     expect(run.json().message).toContain('agent_unverified');
@@ -706,7 +726,8 @@ describe('AI receptionist trusted configuration', () => {
       providerVerificationExpiresAt: new Date(now.getTime() - 24 * 60 * 60 * 1_000),
     } });
     const staleRun = await app.inject({
-      method: 'PATCH', url: `/v1/receptionist/outbound-campaigns/${outbound.json().id}`, headers: auth(t, 'OWNER'), payload: { status: 'RUNNING' },
+      method: 'POST', url: `/v1/receptionist/outbound-campaigns/${outbound.json().id}/approve`, headers: auth(t, 'OWNER'),
+      payload: { approvalConfirmed: true, status: 'RUNNING' },
     });
     expect(staleRun.statusCode).toBe(409);
     expect(staleRun.json().message).toContain('agent_verification_stale');

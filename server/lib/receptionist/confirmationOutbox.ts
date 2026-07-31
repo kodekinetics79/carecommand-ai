@@ -1,7 +1,7 @@
 import type { Prisma } from '../../generated/prisma/client';
-import { sendMessage, type SendResult } from '../commsProvider';
-import { isSuppressed } from '../campaigns';
+import { sendAuthorizedAppointmentConfirmation, type SendResult } from '../commsProvider';
 import { getTenantContext, runWithJobTenantContext, runWithTenantContext } from '../tenantContext';
+import { isChannelSuppressedTx, lockSuppressionFences } from './dncFence';
 
 export const CONFIRMATION_OUTBOX_SOURCE = 'receptionist.appointment_confirmation';
 const RETRYING_LEASE_MS = 5 * 60_000;
@@ -9,6 +9,19 @@ const MAX_BACKOFF_MS = 60 * 60_000;
 
 type ConfirmationChannel = 'sms' | 'email';
 export type ConfirmationDispatch = { sent: boolean; status: string; acceptedNow: boolean };
+type ConfirmationBoundaryStage = 'before_suppression_fence' | 'suppression_fence_acquired' | 'provider_intent_committed';
+let confirmationBoundaryTestHook: ((stage: ConfirmationBoundaryStage) => Promise<void>) | null = null;
+
+export function setConfirmationBoundaryTestHook(
+  hook: ((stage: ConfirmationBoundaryStage) => Promise<void>) | null,
+) {
+  // Some integration lanes intentionally load the development environment so
+  // the full provider/configuration graph is available. Production is the only
+  // runtime in which installing an interleaving hook must be impossible; no
+  // application path wires this test-only seam.
+  if (process.env.NODE_ENV === 'production' && hook) throw new Error('confirmation_boundary_hook_test_only');
+  confirmationBoundaryTestHook = hook;
+}
 
 function providerCode(mode: SendResult['mode']): string {
   if (mode === 'mock_dev') return 'mock';
@@ -33,13 +46,13 @@ function appointmentLabel(startsAt: Date, timezone: string): string {
 
 async function appendAttempt(
   tx: Prisma.TransactionClient,
-  input: { tenantId: string; eventId: string; attemptNumber: number; status: string; provider?: string | null; providerMessageId?: string | null; failureCode?: string | null; completed?: boolean },
+  input: { tenantId: string; eventId: string; attemptNumber: number; phase?: 'INTENT' | 'PROVIDER_INTENT' | 'RESULT' | 'RECEIPT'; status: string; provider?: string | null; providerMessageId?: string | null; failureCode?: string | null; completed?: boolean },
 ) {
   await tx.notificationDeliveryAttempt.create({ data: {
     tenantId: input.tenantId,
     notificationEventId: input.eventId,
     attemptNumber: input.attemptNumber,
-    phase: input.status === 'started' ? 'INTENT' : 'RESULT',
+    phase: input.phase ?? (input.status === 'started' ? 'INTENT' : 'RESULT'),
     status: input.status,
     provider: input.provider ?? undefined,
     providerMessageId: input.providerMessageId ?? undefined,
@@ -86,16 +99,36 @@ async function claimConfirmation(tenantId: string, eventId: string): Promise<Cla
     // provider accepted it before the process stopped. Preserve the ambiguity
     // for manual/provider reconciliation; never auto-resend it.
     if (event.status === 'retrying') {
-      if (event.updatedAt.getTime() > Date.now() - RETRYING_LEASE_MS) return { sent: false, status: 'retry_in_progress', acceptedNow: false };
+      const leaseIntent = await tx.notificationDeliveryAttempt.findUnique({
+        where: { tenantId_notificationEventId_attemptNumber_phase: {
+          tenantId, notificationEventId: eventId, attemptNumber: event.attempts, phase: 'INTENT',
+        } },
+        select: { startedAt: true },
+      });
+      if ((leaseIntent?.startedAt ?? event.updatedAt).getTime() > Date.now() - RETRYING_LEASE_MS) {
+        return { sent: false, status: 'retry_in_progress', acceptedNow: false };
+      }
+      const providerIntent = await tx.notificationDeliveryAttempt.findUnique({
+        where: { tenantId_notificationEventId_attemptNumber_phase: {
+          tenantId, notificationEventId: eventId, attemptNumber: event.attempts, phase: 'PROVIDER_INTENT',
+        } },
+        select: { id: true },
+      });
+      const exhausted = event.attempts >= event.maxAttempts;
+      const status = providerIntent ? 'delivery_unknown' : exhausted ? 'dead_lettered' : 'failed';
       await appendAttempt(tx, {
-        tenantId, eventId, attemptNumber: event.attempts, status: 'delivery_unknown',
+        tenantId, eventId, attemptNumber: event.attempts, status,
         failureCode: 'dispatch_lease_expired', completed: true,
       });
       await tx.notificationEvent.updateMany({
         where: { id: eventId, tenantId },
-        data: { status: 'delivery_unknown', failureReason: 'dispatch_lease_expired', nextAttemptAt: null, deadLetteredAt: new Date() },
+        data: {
+          status, failureReason: 'dispatch_lease_expired',
+          nextAttemptAt: status === 'failed' ? retryAt(event.attempts) : null,
+          deadLetteredAt: status === 'failed' ? null : new Date(),
+        },
       });
-      return { sent: false, status: 'delivery_unknown', acceptedNow: false };
+      return { sent: false, status, acceptedNow: false };
     }
     if (!['queued', 'failed'].includes(event.status) || (event.nextAttemptAt && event.nextAttemptAt > new Date())) {
       return { sent: false, status: event.status, acceptedNow: false };
@@ -107,9 +140,10 @@ async function claimConfirmation(tenantId: string, eventId: string): Promise<Cla
       });
       return { sent: false, status: 'dead_lettered', acceptedNow: false };
     }
+    const attemptNumber = event.attempts + 1;
+    await appendAttempt(tx, { tenantId, eventId, attemptNumber, status: 'started' });
     const appointment = event.appointment;
     if (!appointment || appointment.deletedAt || appointment.status !== 'CONFIRMED' || appointment.patient.deletedAt) {
-      const attemptNumber = event.attempts + 1;
       await appendAttempt(tx, {
         tenantId, eventId, attemptNumber, status: 'suppressed', failureCode: 'appointment_not_confirmed', completed: true,
       });
@@ -121,7 +155,6 @@ async function claimConfirmation(tenantId: string, eventId: string): Promise<Cla
     }
     const destination = event.channel === 'sms' ? appointment.patient.phone : appointment.patient.email;
     if (!destination) {
-      const attemptNumber = event.attempts + 1;
       await appendAttempt(tx, {
         tenantId, eventId, attemptNumber, status: 'dead_lettered', failureCode: 'destination_unavailable', completed: true,
       });
@@ -131,8 +164,6 @@ async function claimConfirmation(tenantId: string, eventId: string): Promise<Cla
       });
       return { sent: false, status: 'destination_unavailable', acceptedNow: false };
     }
-    const attemptNumber = event.attempts + 1;
-    await appendAttempt(tx, { tenantId, eventId, attemptNumber, status: 'started' });
     const claimed = await tx.notificationEvent.updateMany({
       where: { id: eventId, tenantId, status: { in: ['queued', 'failed'] }, attempts: event.attempts },
       data: { status: 'retrying', attempts: attemptNumber, failureReason: null, nextAttemptAt: null },
@@ -145,6 +176,49 @@ async function claimConfirmation(tenantId: string, eventId: string): Promise<Cla
       consentEvidence: event.consentResult === 'granted_unchecked' ? 'granted' : 'not_suppressed_transactional',
       service: appointment.service, startsAt: appointment.startsAt, timezone: appointment.branch.timezone,
     };
+  });
+}
+
+async function commitConfirmationProviderIntent(
+  claim: ClaimedConfirmation,
+): Promise<ConfirmationDispatch | null> {
+  return runWithTenantContext(claim.tenantId, async tx => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-confirmation:${claim.tenantId}:${claim.eventId}`})::bigint)`;
+    await lockSuppressionFences(tx, {
+      tenantId: claim.tenantId,
+      destinations: [claim.destination],
+      patientId: claim.patientId,
+    });
+    await confirmationBoundaryTestHook?.('suppression_fence_acquired');
+    const current = await tx.notificationEvent.findFirst({
+      where: { id: claim.eventId, tenantId: claim.tenantId },
+      select: { status: true, attempts: true },
+    });
+    if (!current || current.status !== 'retrying' || current.attempts !== claim.attemptNumber) {
+      return { sent: false, status: current?.status ?? 'outbox_unavailable', acceptedNow: false };
+    }
+    if (await isChannelSuppressedTx(tx, {
+      tenantId: claim.tenantId,
+      destination: claim.destination,
+      channel: claim.channel,
+      patientId: claim.patientId,
+    })) {
+      await appendAttempt(tx, {
+        tenantId: claim.tenantId, eventId: claim.eventId, attemptNumber: claim.attemptNumber,
+        status: 'suppressed', provider: 'suppression_gate',
+        failureCode: 'suppressed_by_shared_gate', completed: true,
+      });
+      await tx.notificationEvent.updateMany({ where: { id: claim.eventId, tenantId: claim.tenantId }, data: {
+        status: 'suppressed', provider: 'suppression_gate', failureReason: 'suppressed_by_shared_gate',
+        consentResult: 'denied', consentChecked: true, nextAttemptAt: null,
+      } });
+      return { sent: false, status: 'suppressed', acceptedNow: false };
+    }
+    await appendAttempt(tx, {
+      tenantId: claim.tenantId, eventId: claim.eventId, attemptNumber: claim.attemptNumber,
+      phase: 'PROVIDER_INTENT', status: 'provider_intent_committed', completed: true,
+    });
+    return null;
   });
 }
 
@@ -179,7 +253,7 @@ async function finalizeClaim(
       } });
       return { sent: false, status: exhausted ? 'dead_lettered' : preProviderFailureCode, acceptedNow: false };
     }
-    if (result?.status === 'sent') {
+    if (result?.status === 'sent' && result.providerMessageId) {
       await appendAttempt(tx, {
         tenantId: claim.tenantId, eventId: claim.eventId, attemptNumber: claim.attemptNumber,
         status: 'accepted', provider, providerMessageId: result.providerMessageId, completed: true,
@@ -235,27 +309,25 @@ async function dispatchEvent(tenantId: string, eventId: string): Promise<Confirm
   if (!isClaim(claim)) return claim;
   const label = appointmentLabel(claim.startsAt, claim.timezone);
   const body = `Hi ${claim.firstName}, your ${claim.service} is confirmed for ${label}.`;
-  let suppressed: boolean;
+  let intentOutcome: ConfirmationDispatch | null;
   try {
-    suppressed = await isSuppressed(tenantId, { patientId: claim.patientId, destination: claim.destination }, claim.channel);
+    await confirmationBoundaryTestHook?.('before_suppression_fence');
+    intentOutcome = await commitConfirmationProviderIntent(claim);
   } catch {
-    // Consent/suppression could not be evaluated, so no provider submission was
-    // attempted. This is retryable known non-submission, never acceptance
-    // ambiguity. Raw database/provider text is intentionally not persisted.
     return finalizeClaim(claim, null, 'suppression_gate_unavailable');
   }
+  if (intentOutcome) return intentOutcome;
+  await confirmationBoundaryTestHook?.('provider_intent_committed');
   let result: SendResult | null = null;
   try {
-    result = suppressed
-      ? { ok: false, status: 'suppressed', mode: 'suppressed', failureReason: 'suppressed_or_opted_out' }
-      : await sendMessage(
-        claim.channel,
-        claim.destination,
-        'Appointment confirmed',
-        claim.channel === 'sms' ? `${body} Reply STOP to opt out.` : body,
-        claim.idempotencyKey,
-        { tenantId, patientId: claim.patientId },
-      );
+    result = await sendAuthorizedAppointmentConfirmation(
+      claim.channel,
+      claim.destination,
+      'Appointment confirmed',
+      claim.channel === 'sms' ? `${body} Reply STOP to opt out.` : body,
+      claim.idempotencyKey,
+      { tenantId, eventId: claim.eventId, attemptNumber: claim.attemptNumber },
+    );
   } catch {
     // Normalized as provider_acceptance_unknown by finalizeClaim. Raw provider
     // text/destinations are intentionally excluded from durable evidence.
@@ -309,7 +381,7 @@ export async function dispatchDueAppointmentConfirmations(tenantId: string, limi
         source: CONFIRMATION_OUTBOX_SOURCE,
         OR: [
           { status: { in: ['queued', 'failed'] }, nextAttemptAt: { lte: new Date() } },
-          { status: 'retrying', updatedAt: { lte: new Date(Date.now() - RETRYING_LEASE_MS) } },
+          { status: 'retrying' },
         ],
       },
       orderBy: { createdAt: 'asc' },

@@ -169,6 +169,12 @@ async function configureIntake(t: T, fields: Parameters<typeof compileIntakeCont
 }
 
 async function createRunnableOutboundTarget(t: T, phone: string) {
+  const nowParts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(new Date());
+  const nowMinutes = (Number(nowParts.find(part => part.type === 'hour')?.value) % 24) * 60
+    + Number(nowParts.find(part => part.type === 'minute')?.value);
+  const formatMinutes = (minutes: number) => `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`;
   await db.patient.update({ where: { id: t.patientId }, data: { phone } });
   const created = await app.inject({
     method: 'POST', url: '/v1/receptionist/outbound-campaigns', headers: adminAuth(t),
@@ -176,6 +182,8 @@ async function createRunnableOutboundTarget(t: T, phone: string) {
       clinicId: t.clinicId, agentId: t.agentId, name: 'Compliance gate', script: 'Call the patient.',
       requiredFields: ['firstName', 'lastName', 'phone'], bookingMode: 'APPOINTMENT_REQUEST_ONLY',
       purpose: 'CARE_COORDINATION', legalBasis: 'TREATMENT_OPERATIONS', policyVersion: 'OUTBOUND-TEST-1',
+      quietHoursStart: formatMinutes((nowMinutes + 60) % 1440),
+      quietHoursEnd: formatMinutes((nowMinutes + 61) % 1440),
     },
   });
   expect(created.statusCode).toBe(201);
@@ -451,6 +459,162 @@ describe('receptionist /fn booking — real availability + booking', () => {
     expect(retryBooking.json()).toMatchObject({ booked: false, needs_human: true });
     expect(await db.appointment.count({ where: { tenantId: t.id } })).toBe(0);
     expect((await db.appointmentRequest.findUniqueOrThrow({ where: { id: requestId } })).status).toBe('REJECTED');
+    const startsAt = new Date(`${futureDate(9)}T14:00:00.000Z`);
+    const appointment = await db.appointment.create({ data: {
+      tenantId: t.id, branchId: t.branchId, patientId: t.patientId,
+      providerProfileId: t.providerId, providerRef: t.providerId, service: t.appointmentType,
+      startsAt, endsAt: new Date(startsAt.getTime() + 30 * 60_000), status: 'CONFIRMED', channel: 'EMAIL',
+    } });
+    const terminalReconcile = await app.inject({
+      method: 'POST', url: `/v1/receptionist/booking-requests/${requestId}/reconcile`, headers: adminAuth(t),
+      payload: { appointmentId: appointment.id, outcomeReason: 'Attempted after terminal rejection.', acknowledgeRequestDifferences: true },
+    });
+    expect(terminalReconcile.statusCode).toBe(409);
+  });
+
+  it('reconciles a review only to one exact canonical provider-backed appointment with atomic audit evidence', async () => {
+    const t = await makeTenant();
+    const other = await makeTenant();
+    const callId = `staff-schedule-${randomUUID()}`;
+    const review = await fn(t, 'book_appointment', {
+      first_name: 'Schedule', last_name: 'Review', appointment_date: 'invalid', appointment_time: 'later',
+    }, callId, '+15551114444');
+    const requestId = (review.json() as { appointment_request_id: string }).appointment_request_id;
+    const startsAt = new Date(`${futureDate(7)}T14:00:00.000Z`);
+    const appointment = await db.appointment.create({ data: {
+      tenantId: t.id, branchId: t.branchId, patientId: t.patientId,
+      providerProfileId: t.providerId, providerRef: t.providerId, service: t.appointmentType,
+      startsAt, endsAt: new Date(startsAt.getTime() + 30 * 60_000), status: 'CONFIRMED', channel: 'EMAIL',
+    } });
+    const foreignAppointment = await db.appointment.create({ data: {
+      tenantId: other.id, branchId: other.branchId, patientId: other.patientId,
+      providerProfileId: other.providerId, providerRef: other.providerId, service: other.appointmentType,
+      startsAt, endsAt: new Date(startsAt.getTime() + 30 * 60_000), status: 'CONFIRMED', channel: 'EMAIL',
+    } });
+    const otherPatient = await db.patient.create({ data: {
+      tenantId: t.id, branchId: t.branchId, firstName: 'Different', lastName: 'Patient', lifecycleStage: 'ACTIVE',
+    } });
+    const patientMismatch = await db.appointment.create({ data: {
+      tenantId: t.id, branchId: t.branchId, patientId: otherPatient.id,
+      providerProfileId: t.providerId, providerRef: t.providerId, service: t.appointmentType,
+      startsAt: new Date(startsAt.getTime() + 60 * 60_000), endsAt: new Date(startsAt.getTime() + 90 * 60_000), status: 'CONFIRMED', channel: 'EMAIL',
+    } });
+    await db.appointmentRequest.update({ where: { id: requestId }, data: { patientId: t.patientId } });
+    const secondBranch = await db.branch.create({ data: { tenantId: t.id, name: 'Other branch', location: 'Y', timezone: 'UTC', active: true } });
+    const secondProviderUser = await db.user.create({ data: {
+      tenantId: t.id, role: 'PROVIDER', active: true, email: `other-provider-${t.id.slice(0, 8)}@bk.test`, displayName: 'Dr Other',
+    } });
+    const secondProvider = await db.providerProfile.create({ data: { tenantId: t.id, branchId: secondBranch.id, userId: secondProviderUser.id, specialty: 'Primary Care' } });
+    const secondPatient = await db.patient.create({ data: { tenantId: t.id, branchId: secondBranch.id, firstName: 'Other', lastName: 'Branch', lifecycleStage: 'ACTIVE' } });
+    const branchMismatch = await db.appointment.create({ data: {
+      tenantId: t.id, branchId: secondBranch.id, patientId: secondPatient.id,
+      providerProfileId: secondProvider.id, providerRef: secondProvider.id, service: t.appointmentType,
+      startsAt, endsAt: new Date(startsAt.getTime() + 30 * 60_000), status: 'CONFIRMED', channel: 'EMAIL',
+    } });
+    const otherSourceCall = await db.receptionistCallLog.create({ data: {
+      tenantId: t.id, clinicId: t.clinicId, campaignId: t.campaignId,
+      retellCallId: `different-source-${randomUUID()}`, direction: 'inbound', outcome: 'IN_PROGRESS',
+    } });
+    const sourceMismatch = await db.appointment.create({ data: {
+      tenantId: t.id, branchId: t.branchId, patientId: t.patientId,
+      providerProfileId: t.providerId, providerRef: t.providerId, receptionistCallLogId: otherSourceCall.id,
+      service: t.appointmentType, startsAt: new Date(startsAt.getTime() + 120 * 60_000),
+      endsAt: new Date(startsAt.getTime() + 150 * 60_000), status: 'CONFIRMED', channel: 'EMAIL',
+    } });
+    const payload = {
+      appointmentId: appointment.id, outcomeReason: 'Scheduled by front desk after reviewing the caller request.',
+      acknowledgeRequestDifferences: true,
+    };
+    const foreign = await app.inject({
+      method: 'POST', url: `/v1/receptionist/booking-requests/${requestId}/reconcile`, headers: adminAuth(t),
+      payload: { ...payload, appointmentId: foreignAppointment.id },
+    });
+    expect(foreign.statusCode).toBe(400);
+    for (const candidateId of [patientMismatch.id, branchMismatch.id, sourceMismatch.id]) {
+      const mismatch = await app.inject({
+        method: 'POST', url: `/v1/receptionist/booking-requests/${requestId}/reconcile`, headers: adminAuth(t),
+        payload: { ...payload, appointmentId: candidateId },
+      });
+      expect(mismatch.statusCode).toBe(409);
+    }
+
+    const reconcile = () => app.inject({
+      method: 'POST', url: `/v1/receptionist/booking-requests/${requestId}/reconcile`, headers: adminAuth(t), payload,
+    });
+    const [first, replay] = await Promise.all([reconcile(), reconcile()]);
+    expect([first.statusCode, replay.statusCode]).toEqual([200, 200]);
+    expect([first.json(), replay.json()]).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: 'BOOKED', appointmentId: appointment.id, duplicate: false }),
+      expect.objectContaining({ status: 'BOOKED', appointmentId: appointment.id, duplicate: true }),
+    ]));
+    expect(await db.appointmentRequest.findUniqueOrThrow({ where: { id: requestId } })).toMatchObject({
+      status: 'BOOKED', bookedAppointmentId: appointment.id, patientId: t.patientId, branchId: t.branchId,
+    });
+    expect(await db.appointment.findUniqueOrThrow({ where: { id: appointment.id } })).toMatchObject({
+      receptionistCallLogId: expect.any(String), providerProfileId: t.providerId,
+    });
+    expect(await db.auditEvent.count({ where: { tenantId: t.id, action: 'receptionist.appointmentRequest.reconciledToCanonicalAppointment', resourceId: requestId } })).toBe(1);
+    expect(await db.businessEvent.count({ where: { tenantId: t.id, eventType: 'receptionist.appointmentRequest.reconciled', entityId: requestId } })).toBe(1);
+    const differentReplay = await app.inject({
+      method: 'POST', url: `/v1/receptionist/booking-requests/${requestId}/reconcile`, headers: adminAuth(t),
+      payload: { ...payload, appointmentId: patientMismatch.id },
+    });
+    expect(differentReplay.statusCode).toBe(409);
+  });
+
+  it.each([
+    ['AuditEvent', `NEW.action = 'receptionist.appointmentRequest.reconciledToCanonicalAppointment'`],
+    ['BusinessEvent', `NEW."eventType" = 'receptionist.appointmentRequest.reconciled'`],
+  ])('rolls the entire request reconciliation back when mandatory %s evidence fails', async (table, evidencePredicate) => {
+    const t = await makeTenant();
+    const callId = `reconcile-rollback-${randomUUID()}`;
+    const review = await fn(t, 'book_appointment', {
+      first_name: 'Rollback', last_name: 'Review', appointment_date: 'invalid', appointment_time: 'later',
+    }, callId, '+15551115555');
+    const requestId = (review.json() as { appointment_request_id: string }).appointment_request_id;
+    const requestBefore = await db.appointmentRequest.findUniqueOrThrow({ where: { id: requestId } });
+    const startsAt = new Date(`${futureDate(11)}T15:00:00.000Z`);
+    const appointment = await db.appointment.create({ data: {
+      tenantId: t.id, branchId: t.branchId, patientId: t.patientId,
+      providerProfileId: t.providerId, providerRef: t.providerId, service: t.appointmentType,
+      startsAt, endsAt: new Date(startsAt.getTime() + 30 * 60_000), status: 'CONFIRMED', channel: 'EMAIL',
+    } });
+    const suffix = randomUUID().replaceAll('-', '');
+    const functionName = `test_reconcile_evidence_${suffix}`;
+    const triggerName = `${functionName}_trg`;
+    await db.$executeRawUnsafe(`
+      CREATE FUNCTION public."${functionName}"() RETURNS trigger LANGUAGE plpgsql AS $fn$
+      BEGIN
+        IF NEW."tenantId" = '${t.id}'::uuid AND ${evidencePredicate} THEN
+          RAISE EXCEPTION 'injected reconciliation evidence failure';
+        END IF;
+        RETURN NEW;
+      END $fn$
+    `);
+    await db.$executeRawUnsafe(`CREATE TRIGGER "${triggerName}" BEFORE INSERT ON public."${table}" FOR EACH ROW EXECUTE FUNCTION public."${functionName}"()`);
+    const removeFault = async () => {
+      await db.$executeRawUnsafe(`DROP TRIGGER IF EXISTS "${triggerName}" ON public."${table}"`);
+      await db.$executeRawUnsafe(`DROP FUNCTION IF EXISTS public."${functionName}"()`);
+    };
+    databaseCleanup.push(removeFault);
+    const reconcile = () => app.inject({
+      method: 'POST', url: `/v1/receptionist/booking-requests/${requestId}/reconcile`, headers: adminAuth(t),
+      payload: {
+        appointmentId: appointment.id, outcomeReason: 'Front desk completed canonical scheduling review.',
+        acknowledgeRequestDifferences: true,
+      },
+    });
+    const failed = await reconcile();
+    expect(failed.statusCode).toBe(500);
+    expect(await db.appointmentRequest.findUniqueOrThrow({ where: { id: requestId } })).toMatchObject({
+      status: requestBefore.status, bookedAppointmentId: null,
+    });
+    expect((await db.appointment.findUniqueOrThrow({ where: { id: appointment.id } })).receptionistCallLogId).toBeNull();
+    expect((await db.receptionistCallLog.findFirstOrThrow({ where: { tenantId: t.id, retellCallId: callId } })).outcome).toBe('IN_PROGRESS');
+    expect(await db.auditEvent.count({ where: { tenantId: t.id, action: 'receptionist.appointmentRequest.reconciledToCanonicalAppointment', resourceId: requestId } })).toBe(0);
+    expect(await db.businessEvent.count({ where: { tenantId: t.id, eventType: 'receptionist.appointmentRequest.reconciled', entityId: requestId } })).toBe(0);
+    await removeFault(); databaseCleanup.pop();
+    expect((await reconcile()).statusCode).toBe(200);
   });
 
   it('rolls back a needs-review request when the mandatory live-agent audit fails, then retries cleanly', async () => {

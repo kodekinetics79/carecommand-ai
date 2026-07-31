@@ -1222,6 +1222,226 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
     return row;
   });
 
+  // Persistent, minimum-necessary reconciliation state for the Studio. This
+  // is rebuilt from durable call/target safety state on every refresh; a
+  // transient launch toast is never the only warning that a provider call may
+  // still be live. Explicitly resolved signal/task evidence removes the row.
+  app.get('/outbound-campaigns/:id/reconciliations', { preHandler: callArtifactRead }, async request => {
+    const { id } = idParam.parse(request.params);
+    const campaign = await db.receptionistOutboundCampaign.findFirst({
+      where: { id, tenantId: request.auth.tenantId }, select: { id: true },
+    });
+    if (!campaign) throw app.httpErrors.notFound('Campaign not found');
+    const reconciliationSignalTypes = [
+      'receptionist_outbound_stop_unconfirmed_after_acceptance',
+      'receptionist_outbound_provider_acceptance_unknown',
+      'receptionist_outbound_local_binding_failed',
+      'receptionist_provider_deployment_mismatch',
+    ];
+    const reconciliationTaskWorkflows = [
+      'receptionist_outbound_reconciliation',
+      'receptionist_outbound_stop_reconciliation',
+    ];
+    // Candidate discovery is driven by durable reconciliation evidence, not
+    // the generic ESCALATED outcome (which is also used for ordinary handoffs
+    // and incomplete booking payloads). Target lastCallLogIds are fetched
+    // exactly, so a critical older row cannot fall out of a recent-log window.
+    const [targets, signals, taskRows] = await Promise.all([
+      db.receptionistCallTarget.findMany({
+        where: { tenantId: request.auth.tenantId, campaignId: id, lastOutcome: 'RECONCILIATION_REQUIRED', lastCallLogId: { not: null } },
+        select: { id: true, lastCallLogId: true },
+      }),
+      db.operationalSignal.findMany({
+        where: {
+          tenantId: request.auth.tenantId, entityType: 'receptionistCallLog',
+          entityId: { not: null }, signalType: { in: reconciliationSignalTypes },
+        },
+        select: { id: true, entityId: true, status: true }, orderBy: { createdAt: 'asc' },
+      }),
+      db.staffTask.findMany({
+        where: {
+          tenantId: request.auth.tenantId,
+          OR: reconciliationTaskWorkflows.map(workflow => ({ metadata: { path: ['workflow'], equals: workflow } })),
+        },
+        select: { id: true, status: true, metadata: true },
+        orderBy: { createdAt: 'asc' },
+      }),
+    ]);
+    const tasks = taskRows.flatMap(task => {
+      const metadata = task.metadata && typeof task.metadata === 'object' && !Array.isArray(task.metadata)
+        ? task.metadata as Prisma.JsonObject
+        : null;
+      const workflow = typeof metadata?.workflow === 'string' ? metadata.workflow : '';
+      const callLogId = typeof metadata?.callLogId === 'string' ? metadata.callLogId : null;
+      return callLogId && workflow.startsWith('receptionist_outbound') && workflow.includes('reconcil')
+        ? [{ id: task.id, status: task.status, callLogId }]
+        : [];
+    });
+    const isUuid = (value: string | null): value is string => value !== null && uuid.safeParse(value).success;
+    const candidateCallLogIds = [...new Set([
+      ...targets.map(target => target.lastCallLogId).filter(isUuid),
+      ...signals.map(signal => signal.entityId).filter(isUuid),
+      ...tasks.map(task => task.callLogId).filter(isUuid),
+    ])];
+    const candidateLogs = candidateCallLogIds.length === 0 ? [] : await db.receptionistCallLog.findMany({
+      where: {
+        tenantId: request.auth.tenantId, outboundCampaignId: id,
+        id: { in: candidateCallLogIds },
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, retellCallId: true, targetId: true, outcome: true, createdAt: true },
+    });
+    const targetByCall = new Map(targets.map(target => [target.lastCallLogId!, target.id]));
+    const active = candidateLogs.flatMap(log => {
+      const callSignals = signals.filter(signal => signal.entityId === log.id);
+      const callTasks = tasks.filter(task => task.callLogId === log.id);
+      const signalsResolved = callSignals.length > 0 && callSignals.every(signal => signal.status === 'resolved');
+      const tasksResolved = callTasks.length > 0 && callTasks.every(task => task.status === 'COMPLETED');
+      const durableResolution = callSignals.length > 0
+        ? signalsResolved && (callTasks.length === 0 || tasksResolved)
+        : tasksResolved;
+      if (durableResolution) return [];
+      return [{
+        localCallLogId: log.id,
+        providerCallId: log.retellCallId,
+        targetId: log.targetId ?? targetByCall.get(log.id) ?? null,
+        triggerSources: [
+          ...(targetByCall.has(log.id) ? ['RECONCILIATION_REQUIRED' as const] : []),
+          ...(callSignals.length > 0 ? ['RECONCILIATION_SIGNAL' as const] : []),
+          ...(callTasks.length > 0 ? ['RECONCILIATION_TASK' as const] : []),
+        ],
+        signalIds: callSignals.map(signal => signal.id),
+        signalStatuses: callSignals.map(signal => signal.status),
+        reviewTaskIds: callTasks.map(task => task.id),
+        reviewTaskStatuses: callTasks.map(task => task.status),
+        createdAt: log.createdAt,
+      }];
+    });
+    await audit(request, {
+      action: 'receptionist.outboundReconciliation.listRead', resource: 'receptionistOutboundCampaign',
+      resourceId: id, metadata: { activeCount: active.length },
+    });
+    return active;
+  });
+
+  // Staff never "mark" a request booked. They first create the appointment
+  // through the canonical scheduler, then bind that exact provider-backed
+  // appointment here. The request, source-call link, and audit evidence commit
+  // atomically so the queue cannot claim success without an Appointment FK.
+  app.post('/booking-requests/:id/reconcile', { preHandler: writeRoles }, async request => {
+    const { id } = idParam.parse(request.params);
+    const input = z.object({
+      appointmentId: uuid,
+      outcomeReason: z.string().trim().min(5).max(1000),
+      acknowledgeRequestDifferences: z.literal(true),
+    }).strict().parse(request.body);
+
+    return runWithTenantContext(request.auth.tenantId, async tx => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-request-reconcile:${request.auth.tenantId}:${id}`})::bigint)`;
+      const existing = await tx.appointmentRequest.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+      if (!existing) throw app.httpErrors.notFound('Request not found');
+      if (existing.status === 'BOOKED') {
+        if (existing.bookedAppointmentId !== input.appointmentId) {
+          throw app.httpErrors.conflict('This request is already linked to a different canonical appointment.');
+        }
+        const replay = await tx.appointment.findFirst({
+          where: { id: input.appointmentId, tenantId: request.auth.tenantId, deletedAt: null },
+          select: {
+            id: true, service: true, startsAt: true,
+            branch: { select: { timezone: true, name: true } },
+            providerProfile: { select: { user: { select: { displayName: true } } } },
+          },
+        });
+        if (!replay) throw app.httpErrors.conflict('The linked canonical appointment is no longer available.');
+        return {
+          status: 'BOOKED' as const, requestId: existing.id, appointmentId: replay.id, duplicate: true,
+          appointment: {
+            service: replay.service, startsAt: replay.startsAt, timezone: replay.branch.timezone,
+            locationName: replay.branch.name, providerName: replay.providerProfile?.user.displayName ?? null,
+          },
+        };
+      }
+      if (!['PENDING_REVIEW', 'MISSING_INFO'].includes(existing.status)) {
+        throw app.httpErrors.conflict('A terminal appointment request cannot be reconciled to a booking.');
+      }
+      if (existing.source === 'ai_receptionist' && !existing.callLogId) {
+        throw app.httpErrors.conflict('The AI receptionist request has no trusted source call and cannot be marked booked.');
+      }
+
+      const appointment = await tx.appointment.findFirst({
+        where: {
+          id: input.appointmentId, tenantId: request.auth.tenantId, deletedAt: null,
+          status: { notIn: ['CANCELED', 'NO_SHOW'] },
+        },
+        select: {
+          id: true, branchId: true, patientId: true, providerProfileId: true,
+          receptionistCallLogId: true, service: true, startsAt: true,
+          branch: { select: { timezone: true, name: true } },
+          providerProfile: { select: { user: { select: { displayName: true } } } },
+        },
+      });
+      if (!appointment) throw app.httpErrors.badRequest('Select an active canonical appointment.');
+      if (!appointment.providerProfileId || !appointment.providerProfile?.user.displayName) {
+        throw app.httpErrors.conflict('The appointment has no canonical provider and cannot reconcile this request.');
+      }
+      if (existing.branchId && appointment.branchId !== existing.branchId) {
+        throw app.httpErrors.conflict('The appointment belongs to a different branch than the request.');
+      }
+      if (existing.patientId && appointment.patientId !== existing.patientId) {
+        throw app.httpErrors.conflict('The appointment belongs to a different patient than the request.');
+      }
+      if (appointment.receptionistCallLogId && appointment.receptionistCallLogId !== existing.callLogId) {
+        throw app.httpErrors.conflict('The appointment is already bound to another receptionist call.');
+      }
+      const alreadyLinked = await tx.appointmentRequest.findFirst({
+        where: { tenantId: request.auth.tenantId, bookedAppointmentId: appointment.id, id: { not: existing.id } },
+        select: { id: true },
+      });
+      if (alreadyLinked) throw app.httpErrors.conflict('The appointment is already linked to another request.');
+
+      const differences = [
+        existing.requestedService && existing.requestedService.trim().toLocaleLowerCase() !== appointment.service.trim().toLocaleLowerCase() ? 'service' : null,
+        existing.requestedDateTime && existing.requestedDateTime.getTime() !== appointment.startsAt.getTime() ? 'dateTime' : null,
+      ].filter((value): value is string => value !== null);
+      if (existing.callLogId && !appointment.receptionistCallLogId) {
+        await tx.appointment.update({ where: { id: appointment.id }, data: { receptionistCallLogId: existing.callLogId } });
+      }
+      const updated = await tx.appointmentRequest.update({
+        where: { id: existing.id },
+        data: {
+          status: 'BOOKED', bookedAppointmentId: appointment.id,
+          branchId: appointment.branchId, patientId: appointment.patientId,
+          missingFields: [], outcomeReason: input.outcomeReason,
+        },
+      });
+      if (existing.callLogId) {
+        await tx.receptionistCallLog.updateMany({
+          where: { id: existing.callLogId, tenantId: request.auth.tenantId, outcome: 'IN_PROGRESS' },
+          data: { outcome: 'BOOKED' },
+        });
+      }
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+        action: 'receptionist.appointmentRequest.reconciledToCanonicalAppointment',
+        resource: 'appointmentRequest', resourceId: existing.id,
+        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
+        metadata: { appointmentId: appointment.id, differences, reasonRecorded: true, requestDifferencesAcknowledged: true },
+      } });
+      await tx.businessEvent.create({ data: {
+        tenantId: request.auth.tenantId, eventType: 'receptionist.appointmentRequest.reconciled',
+        entityType: 'appointmentRequest', entityId: existing.id, sourceModule: 'receptionist',
+        payload: { appointmentId: appointment.id, differences },
+      } });
+      return {
+        status: 'BOOKED' as const, requestId: updated.id, appointmentId: appointment.id, duplicate: false,
+        appointment: {
+          service: appointment.service, startsAt: appointment.startsAt, timezone: appointment.branch.timezone,
+          locationName: appointment.branch.name, providerName: appointment.providerProfile.user.displayName,
+        },
+      };
+    });
+  });
+
   // Delivery state is operational evidence, not a cosmetic "sent" flag. Staff
   // must be able to distinguish provider acceptance from proven delivery and
   // see ambiguous/dead-lettered confirmations that require reconciliation.

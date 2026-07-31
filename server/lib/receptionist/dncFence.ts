@@ -2,6 +2,8 @@ import type { Prisma, ReceptionistOptOutChannel } from '../../generated/prisma/c
 
 type DncChannel = 'voice' | 'sms' | 'email' | 'whatsapp';
 
+type OutboundPurpose = 'CARE_COORDINATION' | 'APPOINTMENT_REMINDER' | 'PATIENT_REACTIVATION';
+
 const CHANNELS: Record<DncChannel, ReceptionistOptOutChannel[]> = {
   voice: ['ALL', 'VOICE'],
   sms: ['ALL', 'SMS'],
@@ -91,18 +93,125 @@ export async function isVoiceSuppressedTx(
   tx: Prisma.TransactionClient,
   input: { tenantId: string; destination: string; patientId?: string | null; leadId?: string | null },
 ): Promise<boolean> {
+  return isChannelSuppressedTx(tx, { ...input, channel: 'voice' });
+}
+
+export async function isChannelSuppressedTx(
+  tx: Prisma.TransactionClient,
+  input: {
+    tenantId: string;
+    destination: string;
+    channel: DncChannel;
+    patientId?: string | null;
+    leadId?: string | null;
+  },
+): Promise<boolean> {
   const identity = { tenantId: input.tenantId, patientId: input.patientId ?? null, leadId: input.leadId ?? null };
-  const communicationOptOut = await tx.communicationConsent.count({ where: { ...identity, channel: 'voice', status: 'opted_out' } });
-  const campaignSuppression = await tx.campaignSuppression.count({ where: { ...identity, channel: 'voice', active: true } });
+  const communicationOptOut = await tx.communicationConsent.count({ where: { ...identity, channel: input.channel, status: 'opted_out' } });
+  const campaignSuppression = await tx.campaignSuppression.count({ where: { ...identity, channel: input.channel, active: true } });
   if (communicationOptOut > 0 || campaignSuppression > 0) return true;
 
   if (input.patientId) {
-    const latestMarketing = await tx.consentEvent.findFirst({
-      where: { tenantId: input.tenantId, patientId: input.patientId, purpose: 'MARKETING' },
-      orderBy: { occurredAt: 'desc' },
+    const purpose = input.channel === 'voice' ? 'MARKETING'
+      : input.channel === 'sms' ? 'SMS'
+        : input.channel === 'email' ? 'EMAIL' : 'WHATSAPP';
+    const latestLegacy = await tx.consentEvent.findFirst({
+      where: { tenantId: input.tenantId, patientId: input.patientId, purpose },
+      orderBy: [{ occurredAt: 'desc' }, { id: 'desc' }],
       select: { granted: true },
     });
-    if (latestMarketing?.granted === false) return true;
+    if (latestLegacy?.granted === false) return true;
   }
-  return isDestinationOptedOutTx(tx, input.tenantId, input.destination, 'voice');
+  return isDestinationOptedOutTx(tx, input.tenantId, input.destination, input.channel);
+}
+
+export async function compatibleVoiceConsentEventTx(
+  tx: Prisma.TransactionClient,
+  input: {
+    tenantId: string;
+    patientId?: string | null;
+    leadId?: string | null;
+    purpose: OutboundPurpose;
+    policyVersion: string;
+    at?: Date;
+  },
+): Promise<{ id: string } | null> {
+  const at = input.at ?? new Date();
+  const latest = await tx.receptionistVoiceConsentEvent.findFirst({
+    where: {
+      tenantId: input.tenantId,
+      patientId: input.patientId ?? null,
+      leadId: input.leadId ?? null,
+      purpose: input.purpose,
+      policyVersion: input.policyVersion,
+    },
+    // A revocation wins a timestamp tie; UUID ordering must never decide
+    // whether permission exists.
+    orderBy: [{ occurredAt: 'desc' }, { granted: 'asc' }, { id: 'desc' }],
+    select: { id: true, granted: true, expiresAt: true },
+  });
+  if (!latest?.granted || (latest.expiresAt && latest.expiresAt <= at)) return null;
+  return { id: latest.id };
+}
+
+/**
+ * Creates the authoritative provider-intent marker inside the caller's short
+ * transaction. The database trigger independently repeats the exact ownership,
+ * suppression, campaign-purpose/policy, and immutable-consent checks.
+ */
+export async function authorizeOutboundProviderIntentTx(
+  tx: Prisma.TransactionClient,
+  input: {
+    tenantId: string;
+    callLogId: string;
+    outboundCampaignId: string;
+    targetId?: string | null;
+    destination: string;
+    purpose: OutboundPurpose;
+    policyVersion: string;
+    legalBasis: 'EXPLICIT_CONSENT' | 'TREATMENT_OPERATIONS';
+  },
+) {
+  const target = input.targetId ? await tx.receptionistCallTarget.findFirst({
+    where: { id: input.targetId, tenantId: input.tenantId, campaignId: input.outboundCampaignId },
+    select: { patientId: true, leadId: true, phone: true },
+  }) : null;
+  if (input.targetId && !target) throw new Error('outbound_provider_intent_target_missing');
+  if (target && canonicalDncDestination(target.phone) !== canonicalDncDestination(input.destination)) {
+    throw new Error('outbound_provider_intent_destination_mismatch');
+  }
+
+  await lockSuppressionFences(tx, {
+    tenantId: input.tenantId,
+    destinations: [input.destination],
+    patientId: target?.patientId,
+    leadId: target?.leadId,
+  });
+  if (await isChannelSuppressedTx(tx, {
+    tenantId: input.tenantId,
+    destination: input.destination,
+    channel: 'voice',
+    patientId: target?.patientId,
+    leadId: target?.leadId,
+  })) throw new Error('outbound_provider_intent_suppressed');
+
+  const requiresConsent = input.legalBasis === 'EXPLICIT_CONSENT' || input.purpose === 'PATIENT_REACTIVATION';
+  const consent = requiresConsent ? await compatibleVoiceConsentEventTx(tx, {
+    tenantId: input.tenantId,
+    patientId: target?.patientId,
+    leadId: target?.leadId,
+    purpose: input.purpose,
+    policyVersion: input.policyVersion,
+  }) : null;
+  if (requiresConsent && !consent) throw new Error('outbound_provider_intent_consent_missing');
+
+  return tx.receptionistOutboundProviderIntent.create({ data: {
+    tenantId: input.tenantId,
+    callLogId: input.callLogId,
+    outboundCampaignId: input.outboundCampaignId,
+    targetId: input.targetId ?? undefined,
+    voiceConsentEventId: consent?.id,
+    purpose: input.purpose,
+    policyVersion: input.policyVersion,
+  } });
 }

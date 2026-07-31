@@ -5,11 +5,11 @@ import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const sendMessage = vi.hoisted(() => vi.fn());
 const suppressionGate = vi.hoisted(() => vi.fn());
-vi.mock('../lib/commsProvider', () => ({ sendMessage }));
-vi.mock('../lib/campaigns', async importOriginal => {
-  const actual = await importOriginal<typeof import('../lib/campaigns')>();
-  suppressionGate.mockImplementation(actual.isSuppressed);
-  return { ...actual, isSuppressed: suppressionGate };
+vi.mock('../lib/commsProvider', () => ({ sendAuthorizedAppointmentConfirmation: sendMessage }));
+vi.mock('../lib/receptionist/dncFence', async importOriginal => {
+  const actual = await importOriginal<typeof import('../lib/receptionist/dncFence')>();
+  suppressionGate.mockImplementation(actual.isChannelSuppressedTx);
+  return { ...actual, isChannelSuppressedTx: suppressionGate };
 });
 
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
@@ -17,6 +17,7 @@ const {
   CONFIRMATION_OUTBOX_SOURCE,
   dispatchDueAppointmentConfirmations,
   processAppointmentConfirmations,
+  setConfirmationBoundaryTestHook,
 } = await import('../lib/receptionist/confirmationOutbox');
 const { runWithJobTenantContext } = await import('../lib/tenantContext');
 
@@ -54,17 +55,37 @@ async function fixture(options: FixtureOptions = {}) {
       status: options.appointmentStatus ?? 'CONFIRMED', channel: 'CALL',
     },
   });
-  const event = options.createEvent === false ? null : await db.notificationEvent.create({
+  let event = options.createEvent === false ? null : await db.notificationEvent.create({
     data: {
       tenantId, appointmentId: appointment.id, patientId: patient.id,
       recipientType: 'patient', channel: 'sms', source: CONFIRMATION_OUTBOX_SOURCE,
-      idempotencyKey: `${appointment.id}:sms`, status: options.eventStatus ?? 'queued',
-      attempts: options.attempts ?? 0, maxAttempts: options.maxAttempts ?? 5,
+      idempotencyKey: `${appointment.id}:sms`, status: 'queued',
+      attempts: 0, maxAttempts: options.maxAttempts ?? 5,
       nextAttemptAt: options.nextAttemptAt === undefined ? new Date() : options.nextAttemptAt,
-      updatedAt: options.updatedAt,
       consentChecked: false, consentResult: options.consentResult ?? 'granted_unchecked',
     },
   });
+  if (event && options.eventStatus && options.eventStatus !== 'queued') {
+    const attemptNumber = options.attempts ?? 1;
+    if (attemptNumber !== 1) throw new Error('fixture only supports constructing the first active/failed attempt');
+    await db.notificationDeliveryAttempt.create({ data: {
+      tenantId, notificationEventId: event.id, attemptNumber, phase: 'INTENT', status: 'started',
+      startedAt: options.updatedAt,
+    } });
+    event = await db.notificationEvent.update({ where: { id: event.id }, data: {
+      status: 'retrying', attempts: attemptNumber, nextAttemptAt: null,
+    } });
+    if (options.eventStatus === 'failed') {
+      await db.notificationDeliveryAttempt.create({ data: {
+        tenantId, notificationEventId: event.id, attemptNumber, phase: 'RESULT', status: 'failed',
+        provider: 'configured_pending', failureCode: 'provider_not_submitted', completedAt: new Date(),
+      } });
+      event = await db.notificationEvent.update({ where: { id: event.id }, data: {
+        status: 'failed', provider: 'configured_pending', failureReason: 'provider_not_submitted',
+        nextAttemptAt: options.nextAttemptAt === undefined ? new Date() : options.nextAttemptAt,
+      } });
+    }
+  }
   return { tenantId, patient, appointment, event };
 }
 
@@ -99,6 +120,7 @@ describeDisposable('receptionist confirmation outbox — durable provider bounda
   beforeEach(() => {
     sendMessage.mockReset();
     suppressionGate.mockClear();
+    setConfirmationBoundaryTestHook(null);
   });
 
   afterAll(async () => {
@@ -136,10 +158,12 @@ describeDisposable('receptionist confirmation outbox — durable provider bounda
     });
     expect(attempts.map(attempt => ({ phase: attempt.phase, status: attempt.status }))).toEqual([
       { phase: 'INTENT', status: 'started' },
+      { phase: 'PROVIDER_INTENT', status: 'provider_intent_committed' },
       { phase: 'RESULT', status: 'accepted' },
     ]);
     expect(attempts[0]!.completedAt).toBeNull();
     expect(attempts[1]!.completedAt).not.toBeNull();
+    expect(attempts[2]!.completedAt).not.toBeNull();
 
     await expect(dispatch(item.tenantId)).resolves.toEqual({ scanned: 0 });
     await expect(processConfirmations(item, true)).resolves.toMatchObject({ sms: { status: 'already_accepted', acceptedNow: false } });
@@ -199,25 +223,79 @@ describeDisposable('receptionist confirmation outbox — durable provider bounda
       eventStatus: 'retrying', attempts: 1, nextAttemptAt: null,
       updatedAt: new Date(Date.now() - 6 * 60_000),
     });
-    await db.notificationDeliveryAttempt.create({
-      data: {
-        tenantId: item.tenantId, notificationEventId: item.event!.id,
-        attemptNumber: 1, phase: 'INTENT', status: 'started',
-      },
-    });
-
     await expect(dispatch(item.tenantId)).resolves.toEqual({ scanned: 1 });
 
     expect(sendMessage).not.toHaveBeenCalled();
     await expect(db.notificationEvent.findUniqueOrThrow({ where: { id: item.event!.id } })).resolves.toMatchObject({
-      status: 'delivery_unknown', attempts: 1, failureReason: 'dispatch_lease_expired',
+      status: 'failed', attempts: 1, failureReason: 'dispatch_lease_expired',
     });
     const result = await db.notificationDeliveryAttempt.findUniqueOrThrow({
       where: { tenantId_notificationEventId_attemptNumber_phase: {
         tenantId: item.tenantId, notificationEventId: item.event!.id, attemptNumber: 1, phase: 'RESULT',
       } },
     });
-    expect(result.status).toBe('delivery_unknown');
+    expect(result.status).toBe('failed');
+  });
+
+  it('quarantines an expired lease after committed provider intent because acceptance is unknowable', async () => {
+    const item = await fixture({
+      eventStatus: 'retrying', attempts: 1, nextAttemptAt: null,
+      updatedAt: new Date(Date.now() - 6 * 60_000),
+    });
+    await db.notificationDeliveryAttempt.create({ data: {
+      tenantId: item.tenantId, notificationEventId: item.event!.id,
+      attemptNumber: 1, phase: 'PROVIDER_INTENT', status: 'provider_intent_committed', completedAt: new Date(),
+    } });
+
+    await expect(dispatch(item.tenantId)).resolves.toEqual({ scanned: 1 });
+    expect(sendMessage).not.toHaveBeenCalled();
+    await expect(db.notificationEvent.findUniqueOrThrow({ where: { id: item.event!.id } })).resolves.toMatchObject({
+      status: 'delivery_unknown', attempts: 1, failureReason: 'dispatch_lease_expired',
+    });
+  });
+
+  it('linearizes confirmation DNC: suppression winning the fence yields zero provider submissions', async () => {
+    const item = await fixture();
+    let inserted = false;
+    setConfirmationBoundaryTestHook(async stage => {
+      if (stage !== 'before_suppression_fence' || inserted) return;
+      inserted = true;
+      await db.receptionistOptOut.create({ data: {
+        tenantId: item.tenantId, contactPhone: item.patient.phone, channel: 'VOICE', reason: 'Concurrent patient opt out',
+      } });
+      // The confirmation is SMS, so add the exact suppressing channel as a
+      // second durable row before the provider-intent transaction begins.
+      await db.receptionistOptOut.create({ data: {
+        tenantId: item.tenantId, contactPhone: item.patient.phone, channel: 'SMS', reason: 'Concurrent patient opt out',
+      } });
+    });
+
+    await expect(dispatch(item.tenantId)).resolves.toEqual({ scanned: 1 });
+    expect(sendMessage).not.toHaveBeenCalled();
+    await expect(db.notificationEvent.findUniqueOrThrow({ where: { id: item.event!.id } })).resolves.toMatchObject({ status: 'suppressed' });
+  });
+
+  it('linearizes confirmation DNC: committed intent wins once and no DB transaction spans the provider call', async () => {
+    const item = await fixture();
+    let inserted = false;
+    setConfirmationBoundaryTestHook(async stage => {
+      if (stage !== 'provider_intent_committed' || inserted) return;
+      inserted = true;
+      // This insert takes the same destination fence. Completing here proves
+      // the provider-intent transaction released it before the provider call.
+      await db.receptionistOptOut.create({ data: {
+        tenantId: item.tenantId, contactPhone: item.patient.phone, channel: 'SMS', reason: 'Opt out ordered after intent',
+      } });
+    });
+    sendMessage.mockResolvedValue({ ok: true, status: 'sent', mode: 'mock_dev', providerMessageId: 'intent-won-once' });
+
+    await expect(dispatch(item.tenantId)).resolves.toEqual({ scanned: 1 });
+    expect(sendMessage).toHaveBeenCalledOnce();
+    await expect(db.notificationEvent.findUniqueOrThrow({ where: { id: item.event!.id } })).resolves.toMatchObject({
+      status: 'accepted', providerMessageId: 'intent-won-once',
+    });
+    await expect(dispatch(item.tenantId)).resolves.toEqual({ scanned: 0 });
+    expect(sendMessage).toHaveBeenCalledOnce();
   });
 
   it('backs off a known non-submission and dead-letters at the bounded attempt limit', async () => {
@@ -313,6 +391,53 @@ describeDisposable('receptionist confirmation outbox — durable provider bounda
     await expect(db.notificationEvent.delete({ where: { id: generic.id } })).resolves.toMatchObject({ id: generic.id });
   });
 
+  it('rejects fabricated initial terminal states and unordered provider/result evidence in raw SQL', async () => {
+    const item = await fixture({ createEvent: false });
+    const forgedId = randomUUID();
+    await expect(db.$executeRaw`
+      INSERT INTO "NotificationEvent" (
+        id,"tenantId","appointmentId","patientId","recipientType",channel,status,attempts,
+        "consentChecked","consentResult",source,"idempotencyKey",provider,"providerMessageId","acceptedAt","nextAttemptAt"
+      ) VALUES (
+        ${forgedId}::uuid,${item.tenantId}::uuid,${item.appointment.id}::uuid,${item.patient.id}::uuid,
+        'patient','sms','accepted',1,true,'granted',${CONFIRMATION_OUTBOX_SOURCE},${`${forgedId}:sms`},
+        'forged','forged-id',CURRENT_TIMESTAMP,NULL
+      )
+    `).rejects.toThrow(/must begin as an unsubmitted queued event/i);
+
+    const queued = await fixture();
+    await expect(db.notificationDeliveryAttempt.create({ data: {
+      tenantId: queued.tenantId, notificationEventId: queued.event!.id, attemptNumber: 1,
+      phase: 'RESULT', status: 'failed', failureCode: 'provider_not_submitted', completedAt: new Date(),
+    } })).rejects.toThrow(/ordered INTENT/i);
+    await expect(db.notificationDeliveryAttempt.create({ data: {
+      tenantId: queued.tenantId, notificationEventId: queued.event!.id, attemptNumber: 1,
+      phase: 'PROVIDER_INTENT', status: 'provider_intent_committed', completedAt: new Date(),
+    } })).rejects.toThrow(/active ordered lease/i);
+  });
+
+  it('requires a matching delivery receipt and preserves accepted evidence during accepted-to-delivered', async () => {
+    const item = await fixture();
+    sendMessage.mockResolvedValue({ ok: true, status: 'sent', mode: 'mock_dev', providerMessageId: 'delivery-receipt-1' });
+    await dispatch(item.tenantId);
+    const accepted = await db.notificationEvent.findUniqueOrThrow({ where: { id: item.event!.id } });
+    await expect(db.notificationEvent.update({ where: { id: accepted.id }, data: {
+      status: 'delivered', deliveredAt: new Date(),
+    } })).rejects.toThrow(/matching immutable provider receipt/i);
+    await db.notificationDeliveryAttempt.create({ data: {
+      tenantId: item.tenantId, notificationEventId: accepted.id, attemptNumber: 1,
+      phase: 'RECEIPT', status: 'delivered', provider: accepted.provider,
+      providerMessageId: accepted.providerMessageId, completedAt: new Date(),
+    } });
+    const deliveredAt = new Date();
+    await expect(db.notificationEvent.update({ where: { id: accepted.id }, data: {
+      status: 'delivered', deliveredAt,
+    } })).resolves.toMatchObject({ status: 'delivered', providerMessageId: 'delivery-receipt-1' });
+    await expect(db.notificationEvent.update({ where: { id: accepted.id }, data: {
+      providerMessageId: 'rewritten',
+    } })).rejects.toThrow(/terminal evidence is immutable/i);
+  });
+
   it.each([
     { label: 'explicit true', consent: true, persisted: 'granted_unchecked', final: 'granted' },
     { label: 'absent', consent: null, persisted: 'not_recorded_transactional', final: 'not_suppressed_transactional' },
@@ -350,7 +475,7 @@ describeDisposable('receptionist confirmation outbox — durable provider bounda
 
     expect(sendMessage).not.toHaveBeenCalled();
     await expect(db.notificationEvent.findUniqueOrThrow({ where: { id: item.event!.id } })).resolves.toMatchObject({
-      status: 'suppressed', attempts: 0, failureReason: 'suppressed_by_call_consent',
+      status: 'suppressed', attempts: eventStatus === 'failed' ? 1 : 0, failureReason: 'suppressed_by_call_consent',
       consentChecked: true, consentResult: 'denied', nextAttemptAt: null,
     });
   });

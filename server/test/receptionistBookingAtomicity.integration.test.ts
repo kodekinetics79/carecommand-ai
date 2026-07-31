@@ -14,8 +14,18 @@ vi.mock('../workers/queues', () => ({
   registerCampaignSchedules: async () => undefined,
 }));
 
+const confirmationProviderSend = vi.hoisted(() => vi.fn(async () => ({
+  ok: true as const,
+  status: 'sent' as const,
+  mode: 'mock_dev' as const,
+  providerMessageId: 'mock-confirmation',
+})));
+
 vi.mock('../lib/commsProvider', () => ({
-  sendMessage: vi.fn(async () => ({ ok: true, status: 'sent', mode: 'mock_dev', providerMessageId: 'mock-confirmation' })),
+  // Both exports share one spy: general communications still use sendMessage,
+  // while receptionist confirmations cross only the durable-intent path.
+  sendMessage: confirmationProviderSend,
+  sendAuthorizedAppointmentConfirmation: confirmationProviderSend,
 }));
 
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
@@ -196,6 +206,14 @@ describe('canonical receptionist booking atomicity — independent integration o
     ]);
     expect(left).toMatchObject({ booked: true });
     expect(right).toMatchObject({ booked: true });
+    for (const result of [left, right]) {
+      expect(result).toMatchObject({
+        timezone: 'UTC', location_name: 'Atomic branch', location_address: 'Test',
+        provider_name: 'Dr Atomic', service: 'Consultation',
+        spoken_time: expect.stringContaining('Coordinated Universal Time'),
+      });
+      expect(result.message).toMatch(/Atomic branch, Test, with Dr Atomic/);
+    }
     expect(new Set([left.appointment_id, right.appointment_id]).size).toBe(1);
     expect([left, right].filter(result => result.duplicate === true)).toHaveLength(1);
 
@@ -232,14 +250,19 @@ describe('canonical receptionist booking atomicity — independent integration o
     expect(sendMessageMock).toHaveBeenCalledTimes(1);
     const event = await db.notificationEvent.findFirstOrThrow({ where: { tenantId: f.tenantId, appointmentId: result.appointment_id as string, channel: 'sms' } });
     expect(event).toMatchObject({ status: 'accepted', attempts: 1, consentChecked: true, consentResult: expectedConsent });
-    expect(await db.notificationDeliveryAttempt.findMany({ where: { tenantId: f.tenantId, notificationEventId: event.id }, orderBy: { phase: 'asc' } })).toEqual(expect.arrayContaining([
-      expect.objectContaining({ phase: 'INTENT', status: 'started', attemptNumber: 1 }),
-      expect.objectContaining({ phase: 'RESULT', status: 'accepted', attemptNumber: 1 }),
-    ]));
+    const attempts = await db.notificationDeliveryAttempt.findMany({
+      where: { tenantId: f.tenantId, notificationEventId: event.id }, orderBy: { phase: 'asc' },
+      select: { phase: true, status: true, attemptNumber: true },
+    });
+    expect(attempts).toEqual([
+      { phase: 'INTENT', status: 'started', attemptNumber: 1 },
+      { phase: 'PROVIDER_INTENT', status: 'provider_intent_committed', attemptNumber: 1 },
+      { phase: 'RESULT', status: 'accepted', attemptNumber: 1 },
+    ]);
     const replay = await f.invoke({ ...f.baseArgs, ...(consentValue === undefined ? {} : { messaging_consent: consentValue }) });
     expect(replay).toMatchObject({ booked: true, duplicate: true, sms_sent: false, sms_accepted: false, sms_status: 'already_accepted' });
     expect(sendMessageMock).toHaveBeenCalledTimes(1);
-    expect(await db.notificationDeliveryAttempt.count({ where: { tenantId: f.tenantId, notificationEventId: event.id } })).toBe(2);
+    expect(await db.notificationDeliveryAttempt.count({ where: { tenantId: f.tenantId, notificationEventId: event.id } })).toBe(3);
   });
 
   it('exposes tenant-scoped accepted-versus-delivered evidence to authorized receptionist staff', async () => {

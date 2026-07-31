@@ -6,6 +6,7 @@ import { requirePortalAccess, requirePortalFeature, portalAudit } from '../../li
 import { publicView, submitSectionMutation, emitSectionSubmissionEffects, submitPacketMutation, emitPacketSubmissionEffects, readinessScore } from '../../lib/intake';
 import { computeProviderSlots, findSlotConflict, getSchedulingPolicy, isDoubleBookConflictError, resolveSchedulingService, unmetPreVisitRequirements } from '../../lib/scheduling';
 import { evaluateDepositForAppointment } from '../../lib/deposits';
+import { canonicalDncDestination } from '../../lib/receptionist/dncFence';
 
 // Appointment states a patient can still act on from the portal. COMPLETED /
 // ARRIVED / NO_SHOW are terminal-for-the-patient (staff-only from here on).
@@ -500,17 +501,25 @@ export const portalRoutes: FastifyPluginAsync = async app => {
 
   app.get('/preferences', async request => {
     const { tenantId, patientId } = request.portal!;
-    const [events, voiceConsents] = await Promise.all([
+    const [events, voiceConsents, patient, voiceOptOuts] = await Promise.all([
       db.consentEvent.findMany({ where: { tenantId, patientId }, orderBy: { occurredAt: 'desc' } }),
       db.communicationConsent.findMany({ where: { tenantId, patientId, channel: 'voice' }, orderBy: { capturedAt: 'desc' }, select: { status: true } }),
+      db.patient.findFirst({ where: { tenantId, id: patientId }, select: { phone: true } }),
+      db.receptionistOptOut.findMany({ where: { tenantId, revokedAt: null, channel: { in: ['ALL', 'VOICE'] }, contactPhone: { not: null } }, select: { contactPhone: true } }),
     ]);
     const latest = (purpose: string) => events.find(e => e.purpose === purpose)?.granted ?? false;
-    const voice = voiceConsents[0]?.status === 'opted_in';
+    const phone = canonicalDncDestination(patient?.phone ?? '');
+    const globallyOptedOut = Boolean(phone) && voiceOptOuts.some(row => canonicalDncDestination(row.contactPhone ?? '') === phone);
+    const voice = !globallyOptedOut && voiceConsents[0]?.status === 'opted_in';
     return { sms: latest('SMS'), email: latest('EMAIL'), whatsapp: latest('WHATSAPP'), voice, marketing: latest('MARKETING') };
   });
   app.patch('/preferences', async request => {
     const { tenantId, patientId } = request.portal!;
-    const body = z.object({ sms: z.boolean().optional(), email: z.boolean().optional(), whatsapp: z.boolean().optional(), voice: z.boolean().optional(), marketing: z.boolean().optional() }).refine(value => Object.values(value).some(v => v !== undefined), { message: 'Provide at least one preference.' }).parse(request.body);
+    const body = z.object({ sms: z.boolean().optional(), email: z.boolean().optional(), whatsapp: z.boolean().optional(), voice: z.boolean().optional(), marketing: z.boolean().optional() })
+      .refine(value => Object.values(value).some(v => v !== undefined), { message: 'Provide at least one preference.' }).parse(request.body);
+    if (body.voice === true) {
+      throw app.httpErrors.conflict('Voice opt-in requires a purpose-specific disclosure and consent workflow; the generic preference toggle cannot grant outbound authority.');
+    }
     const updates: Array<[string, boolean]> = [];
     if (body.sms !== undefined) updates.push(['SMS', body.sms]);
     if (body.email !== undefined) updates.push(['EMAIL', body.email]);
@@ -523,10 +532,18 @@ export const portalRoutes: FastifyPluginAsync = async app => {
         // use ConsentEvent; voice uses CommunicationConsent so the portal can read
         // and persist it without expanding the legacy enum. No history is erased.
         if (purpose === 'VOICE') {
-          await upsertVoiceConsent(tx, tenantId, patientId, granted);
+          await recordPortalVoiceOptOut(tx, tenantId, patientId);
           continue;
         }
         await tx.consentEvent.create({ data: { tenantId, patientId, purpose: purpose as 'SMS' | 'EMAIL' | 'WHATSAPP' | 'MARKETING', granted, source: 'patient_portal' } });
+      }
+      if (body.voice !== undefined) {
+        await tx.businessEvent.create({ data: {
+          tenantId,
+          eventType: 'receptionist.voice_global_opt_out.recorded',
+          entityType: 'patient', entityId: patientId, sourceModule: 'patient_portal',
+          payload: { channel: 'voice', granted: false },
+        } });
       }
       await portalAudit(tenantId, 'portal.preference.updated', patientId, request, { changed: updates.map(u => u[0]) }, { critical: true, tx });
     });
@@ -555,17 +572,18 @@ function safePaymentUrl(value: string | null): string | null {
 }
 function maskMember(m: string): string { return m.length <= 4 ? '••••' : `••••${m.slice(-4)}`; }
 const insuranceSchema = z.object({ planName: z.string().trim().min(1).max(120), memberId: z.string().trim().min(2).max(80), groupNumber: z.string().trim().max(80).optional(), subscriberName: z.string().trim().max(120).optional() });
-async function upsertVoiceConsent(tx: Prisma.TransactionClient, tenantId: string, patientId: string, granted: boolean) {
-  const existing = await tx.communicationConsent.findFirst({ where: { tenantId, patientId, channel: 'voice' } });
-  const data = {
-    status: granted ? 'opted_in' : 'opted_out',
-    source: 'patient_portal',
-    capturedAt: new Date(),
-    revokedAt: granted ? null : new Date(),
-    metadata: { source: 'patient_portal', channel: 'voice' },
-  };
-  if (existing) await tx.communicationConsent.update({ where: { id: existing.id }, data });
-  else await tx.communicationConsent.create({ data: { tenantId, patientId, channel: 'voice', ...data } });
+async function recordPortalVoiceOptOut(tx: Prisma.TransactionClient, tenantId: string, patientId: string) {
+  const patient = await tx.patient.findFirst({ where: { tenantId, id: patientId, deletedAt: null }, select: { phone: true } });
+  const phone = canonicalDncDestination(patient?.phone ?? '');
+  if (!phone) throw new Error('portal_voice_opt_out_destination_unavailable');
+  const active = await tx.receptionistOptOut.findMany({
+    where: { tenantId, revokedAt: null, channel: { in: ['ALL', 'VOICE'] }, contactPhone: { not: null } },
+    select: { contactPhone: true },
+  });
+  if (active.some(row => canonicalDncDestination(row.contactPhone ?? '') === phone)) return;
+  await tx.receptionistOptOut.create({ data: {
+    tenantId, contactPhone: phone, channel: 'VOICE', reason: 'Patient portal global voice opt-out',
+  } });
 }
 async function firstBranch(tenantId: string): Promise<string> {
   const b = await db.branch.findFirst({ where: { tenantId }, select: { id: true } });
