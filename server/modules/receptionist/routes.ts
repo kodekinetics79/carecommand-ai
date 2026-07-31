@@ -37,6 +37,8 @@ import {
 import { agentReadinessReason } from '../../lib/receptionist/agentReadiness';
 import { validateIanaTimezone } from '../../lib/scheduling';
 import { Prisma } from '../../generated/prisma/client';
+import { requireRoles } from '../../plugins/roles';
+import { lockDncDestinationFence } from '../../lib/receptionist/dncFence';
 import {
   enforceInvalidRetellSignatureRateLimit,
   enforceVerifiedRetellRateLimit,
@@ -56,6 +58,7 @@ const RECEPTIONIST_CALL_LEASE_MS = 4 * 60 * 60 * 1_000;
 const idParam = z.object({ id: uuid });
 const writeRoles = requireReceptionistPermission(RECEPTIONIST_PERMISSIONS.MANAGE);
 const callArtifactRead = requireReceptionistPermission(RECEPTIONIST_PERMISSIONS.CALL_ARTIFACTS_READ);
+const ownerAdminRoles = requireRoles('OWNER', 'ADMIN');
 const e164Phone = z.string().trim().max(40)
   .transform(value => value.replace(/[().\s-]/g, ''))
   .refine(value => /^\+[1-9]\d{7,14}$/.test(value), 'Phone must include country code in E.164 format');
@@ -1219,6 +1222,38 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
     return row;
   });
 
+  // Delivery state is operational evidence, not a cosmetic "sent" flag. Staff
+  // must be able to distinguish provider acceptance from proven delivery and
+  // see ambiguous/dead-lettered confirmations that require reconciliation.
+  app.get('/confirmation-deliveries', { preHandler: callArtifactRead }, async request => {
+    const query = z.object({ limit: z.coerce.number().int().min(1).max(200).default(100) }).parse(request.query);
+    const rows = await db.notificationEvent.findMany({
+      where: { tenantId: request.auth.tenantId, source: 'receptionist.appointment_confirmation' },
+      orderBy: { createdAt: 'desc' },
+      take: query.limit,
+      select: {
+        id: true, appointmentId: true, patientId: true, channel: true, status: true,
+        attempts: true, maxAttempts: true, failureReason: true, provider: true,
+        acceptedAt: true, deliveredAt: true, deadLetteredAt: true, createdAt: true,
+        appointment: { select: { service: true, startsAt: true } },
+        patient: { select: { firstName: true, lastName: true } },
+      },
+    });
+    await audit(request, {
+      action: 'receptionist.confirmationDelivery.listRead',
+      resource: 'notificationEvent',
+      metadata: { count: rows.length },
+    });
+    return rows.map(row => ({
+      ...row,
+      patientName: row.patient ? `${row.patient.firstName} ${row.patient.lastName}`.trim() : null,
+      appointmentService: row.appointment?.service ?? null,
+      appointmentStartsAt: row.appointment?.startsAt ?? null,
+      patient: undefined,
+      appointment: undefined,
+    }));
+  });
+
   // ===== Call logs (read) =================================================
   app.get('/call-logs', { preHandler: callArtifactRead }, async request => {
     const query = z.object({
@@ -1273,17 +1308,25 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
   // ===== Opt-outs =========================================================
   const optOutCreate = z.object({
     clinicId: uuid.optional().nullable(),
-    contactPhone: z.string().trim().max(40).optional().nullable(),
-    contactEmail: z.string().trim().max(160).optional().nullable(),
+    contactPhone: optionalE164Phone,
+    contactEmail: z.string().trim().email().max(160).transform(value => value.toLowerCase()).optional().nullable(),
     channel: z.enum(['VOICE', 'SMS', 'EMAIL', 'ALL']).optional(),
-    reason: z.string().trim().max(300).optional().nullable(),
-  }).refine(value => value.contactPhone || value.contactEmail, {
-    message: 'A phone number or email is required',
+    reason: z.string().trim().min(3).max(300),
+  }).strict().superRefine((value, ctx) => {
+    if (!value.contactPhone && !value.contactEmail) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'A phone number or email is required' });
+    if ((value.channel === 'VOICE' || value.channel === 'SMS') && !value.contactPhone) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${value.channel} opt-outs require a phone number` });
+    }
+    if (value.channel === 'EMAIL' && !value.contactEmail) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'EMAIL opt-outs require an email address' });
   });
+  const optOutRevocation = z.object({
+    reason: z.string().trim().min(5).max(500),
+    acknowledgeReactivationRisk: z.literal(true),
+  }).strict();
 
   app.get('/opt-outs', { preHandler: callArtifactRead }, async request => {
     return db.receptionistOptOut.findMany({
-      where: { tenantId: request.auth.tenantId },
+      where: { tenantId: request.auth.tenantId, revokedAt: null },
       orderBy: { createdAt: 'desc' },
       take: 200,
     });
@@ -1291,17 +1334,54 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
 
   app.post('/opt-outs', { preHandler: writeRoles }, async (request, reply) => {
     const input = optOutCreate.parse(request.body);
-    const row = await db.receptionistOptOut.create({ data: { tenantId: request.auth.tenantId, ...input } });
-    await audit(request, { action: 'receptionistOptOut.created', resource: 'receptionistOptOut', resourceId: row.id });
+    const row = await runWithTenantContext(request.auth.tenantId, async tx => {
+      await lockDncDestinationFence(tx, request.auth.tenantId, [input.contactPhone, input.contactEmail]);
+      if (input.clinicId && !(await tx.receptionistClinic.findFirst({ where: { id: input.clinicId, tenantId: request.auth.tenantId }, select: { id: true } }))) {
+        throw app.httpErrors.badRequest('Clinic does not belong to this tenant.');
+      }
+      const created = await tx.receptionistOptOut.create({ data: { tenantId: request.auth.tenantId, ...input } });
+      const occurredAt = new Date();
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+        action: 'receptionistOptOut.created', resource: 'receptionistOptOut', resourceId: created.id,
+        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'], occurredAt,
+        metadata: { channel: created.channel, clinicId: created.clinicId, reasonRecorded: true, source: 'manual_api' },
+      } });
+      await tx.businessEvent.create({ data: {
+        tenantId: request.auth.tenantId, eventType: 'receptionist.dnc.activated', entityType: 'receptionistOptOut',
+        entityId: created.id, sourceModule: 'receptionist', occurredAt,
+        payload: { channel: created.channel, clinicId: created.clinicId, source: 'manual_api' },
+      } });
+      return created;
+    });
     return reply.code(201).send(row);
   });
 
-  app.delete('/opt-outs/:id', { preHandler: writeRoles }, async (request, reply) => {
+  app.delete('/opt-outs/:id', { preHandler: [ownerAdminRoles, writeRoles] }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
-    const existing = await db.receptionistOptOut.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Opt-out not found');
-    await db.receptionistOptOut.delete({ where: { id } });
-    await audit(request, { action: 'receptionistOptOut.deleted', resource: 'receptionistOptOut', resourceId: id });
+    const input = optOutRevocation.parse(request.body);
+    await runWithTenantContext(request.auth.tenantId, async tx => {
+      const existing = await tx.receptionistOptOut.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+      if (!existing) throw app.httpErrors.notFound('Opt-out not found');
+      await lockDncDestinationFence(tx, request.auth.tenantId, [existing.contactPhone, existing.contactEmail]);
+      const revokedAt = new Date();
+      const changed = await tx.receptionistOptOut.updateMany({
+        where: { id, tenantId: request.auth.tenantId, revokedAt: null },
+        data: { revokedAt, revokedByUserId: request.auth.userId, revocationReason: input.reason },
+      });
+      if (changed.count !== 1) throw app.httpErrors.conflict('Opt-out suppression has already been revoked.');
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+        action: 'receptionistOptOut.revoked', resource: 'receptionistOptOut', resourceId: id,
+        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'], occurredAt: revokedAt,
+        metadata: { channel: existing.channel, clinicId: existing.clinicId, reasonRecorded: true, acknowledgement: 'reactivation_risk_confirmed' },
+      } });
+      await tx.businessEvent.create({ data: {
+        tenantId: request.auth.tenantId, eventType: 'receptionist.dnc.revoked', entityType: 'receptionistOptOut',
+        entityId: id, sourceModule: 'receptionist', occurredAt: revokedAt,
+        payload: { channel: existing.channel, clinicId: existing.clinicId, authorizedRole: request.auth.role, acknowledgement: 'reactivation_risk_confirmed' },
+      } });
+    });
     return reply.code(204).send();
   });
 
@@ -1313,7 +1393,7 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
       db.receptionistCampaign.findMany({ where: { tenantId }, select: { status: true } }),
       db.receptionistCallLog.findMany({ where: { tenantId }, select: { outcome: true, durationSeconds: true } }),
       db.receptionistAppointmentRequest.count({ where: { tenantId } }),
-      db.receptionistOptOut.count({ where: { tenantId } }),
+      db.receptionistOptOut.count({ where: { tenantId, revokedAt: null } }),
     ]);
     const booked = callLogs.filter(call => call.outcome === 'BOOKED').length;
     const totalCalls = callLogs.length;
@@ -1339,16 +1419,6 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
 };
 
 // --- Idempotency + signature helpers for the public webhook ----------------
-async function claimWebhookIdempotency(scope: string, key: string, tenantId?: string): Promise<boolean> {
-  try {
-    await db.idempotencyKey.create({ data: { scope, key, tenantId } });
-    return true;
-  } catch (error) {
-    if ((error as { code?: string }).code === 'P2002') return false;
-    throw error;
-  }
-}
-
 const RETELL_SIGNATURE_TOLERANCE_MS = 5 * 60 * 1_000;
 
 // Current Retell contract: `v=<unix-ms>,d=<hex>` where the digest covers the
@@ -1779,24 +1849,45 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       ? existingCall.callerPhone
       : call.from_number;
     if (outcome === 'OPTED_OUT' && (optOutPhone || custom.email)) {
-      if (await claimWebhookIdempotency('retell.optout', `${tenantId}:${idempotencyAnchor}`, tenantId)) {
-        await db.receptionistOptOut.create({
-          data: { tenantId, clinicId: trustedClinicId, contactPhone: optOutPhone, contactEmail: typeof custom.email === 'string' ? custom.email : undefined, channel: 'ALL', reason: 'Requested during AI call' },
+      const contactEmail = typeof custom.email === 'string' && custom.email.trim().length <= 160
+        ? custom.email.trim().toLowerCase()
+        : undefined;
+      await db.$transaction(async tx => {
+        await lockDncDestinationFence(tx, tenantId, [optOutPhone, contactEmail]);
+        const scope = 'retell.optout';
+        const key = `${tenantId}:${idempotencyAnchor}`;
+        const prior = await tx.idempotencyKey.findUnique({ where: { scope_key: { scope, key } }, select: { id: true } });
+        if (prior) return;
+        const row = await tx.receptionistOptOut.create({
+          data: { tenantId, clinicId: trustedClinicId, contactPhone: optOutPhone, contactEmail, channel: 'ALL', reason: 'Requested during AI call' },
         });
-      }
+        await tx.idempotencyKey.create({ data: { scope, key, tenantId, resultId: row.id } });
+        const occurredAt = new Date();
+        await tx.auditEvent.create({ data: {
+          tenantId, action: 'receptionist.optout.recorded', resource: 'receptionistOptOut', resourceId: row.id,
+          occurredAt, metadata: { channel: 'ALL', source: 'retell_webhook' },
+        } });
+        await tx.businessEvent.create({ data: {
+          tenantId, eventType: 'receptionist.dnc.activated', entityType: 'receptionistOptOut', entityId: row.id,
+          sourceModule: 'receptionist', occurredAt, payload: { channel: 'ALL', source: 'retell_webhook' },
+        } });
+      });
     }
 
     if (outcomeRaw === 'BOOKED' && !canonicalBooking) {
       const boundedText = (value: unknown, max: number) => typeof value === 'string' && value.trim() && value.length <= max ? value.trim() : null;
-      const analysisAnswers = Object.fromEntries(Object.entries({
-        first_name: boundedText(custom.first_name, 80),
-        last_name: boundedText(custom.last_name, 80),
-        appointment_date: boundedText(custom.appointment_date ?? custom.preferred_date, 10),
-        appointment_time: boundedText(custom.appointment_time ?? custom.preferred_time, 8),
-        preferred_service: boundedText(custom.preferred_service, 120),
-        email: boundedText(custom.email, 160),
-        observed_phone: canonicalRetellDestination(persistedCall.callerPhone ?? undefined),
-      }).filter(([, value]) => value !== null));
+      const mayPersistAnalysisPhi = persistedCall.recordingConsentStatus === 'GRANTED';
+      const analysisAnswers = mayPersistAnalysisPhi
+        ? Object.fromEntries(Object.entries({
+          first_name: boundedText(custom.first_name, 80),
+          last_name: boundedText(custom.last_name, 80),
+          appointment_date: boundedText(custom.appointment_date ?? custom.preferred_date, 10),
+          appointment_time: boundedText(custom.appointment_time ?? custom.preferred_time, 8),
+          preferred_service: boundedText(custom.preferred_service, 120),
+          email: boundedText(custom.email, 160),
+          observed_phone: canonicalRetellDestination(persistedCall.callerPhone ?? undefined),
+        }).filter(([, value]) => value !== null))
+        : { issue_codes: ['provider_claimed_booking_without_canonical_evidence', 'consent_not_granted_phi_omitted'] };
       await db.$transaction(async tx => {
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-call-lifecycle:${tenantId}:${providerCallId}`})::bigint)`;
         const existing = await tx.appointmentRequest.findFirst({ where: { tenantId, callLogId: persistedCall.id }, select: { id: true } });
@@ -1804,11 +1895,11 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         const requestRow = await tx.appointmentRequest.create({
           data: {
             tenantId, callLogId: persistedCall.id,
-            campaignId: persistedCall.outboundCampaignId ?? persistedCall.campaignId,
-            requestedService: boundedText(custom.preferred_service, 120),
-            collectedName: [boundedText(custom.first_name, 80), boundedText(custom.last_name, 80)].filter(Boolean).join(' ') || null,
-            collectedPhone: canonicalRetellDestination(persistedCall.callerPhone ?? undefined),
-            collectedEmail: boundedText(custom.email, 160),
+            campaignId: persistedCall.campaignId,
+            requestedService: mayPersistAnalysisPhi ? boundedText(custom.preferred_service, 120) : null,
+            collectedName: mayPersistAnalysisPhi ? ([boundedText(custom.first_name, 80), boundedText(custom.last_name, 80)].filter(Boolean).join(' ') || null) : null,
+            collectedPhone: mayPersistAnalysisPhi ? canonicalRetellDestination(persistedCall.callerPhone ?? undefined) : null,
+            collectedEmail: mayPersistAnalysisPhi ? boundedText(custom.email, 160) : null,
             rawCollectedFields: analysisAnswers,
             source: 'retell_analysis_review_only', status: 'PENDING_REVIEW', missingFields: [],
             outcomeReason: 'Provider analysis claimed booking without canonical signed-tool appointment evidence',
@@ -1822,7 +1913,11 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         });
         await tx.auditEvent.create({ data: {
           tenantId, action: 'receptionist.appointmentRequest.analysisReviewCreated', resource: 'appointmentRequest',
-          resourceId: requestRow.id, userAgent: 'retell-webhook', metadata: { callLogId: persistedCall.id, bookingAuthority: false },
+          resourceId: requestRow.id, userAgent: 'retell-webhook', metadata: {
+            callLogId: persistedCall.id, bookingAuthority: false,
+            outboundCampaignId: persistedCall.outboundCampaignId,
+            analysisPhiPersisted: mayPersistAnalysisPhi,
+          },
         } });
         await tx.businessEvent.create({ data: {
           tenantId, eventType: 'receptionist.appointmentRequest.created', entityType: 'appointmentRequest',

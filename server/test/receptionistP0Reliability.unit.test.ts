@@ -128,6 +128,7 @@ describe('receptionist P0 reliability', () => {
     expect(result).toEqual({
       ok: false,
       error: 'retell_deployment_mismatch',
+      acceptance: stopApplied ? 'rejected' : 'unknown',
       callId: 'call-mismatch',
       providerStopApplied: stopApplied,
       ...(stopError ? { providerStopError: stopError } : {}),
@@ -148,6 +149,19 @@ describe('receptionist P0 reliability', () => {
     await expect(createPhoneCall({
       toNumber: '+12125550101', agentId: 'agent-v0', agentVersion: 0, dynamicVariables: {}, metadata: {},
     })).resolves.toEqual({ ok: true, callId: 'call-v0', mock: false });
+  });
+
+  it.each([
+    [400, 'rejected'], [401, 'rejected'], [403, 'rejected'], [404, 'rejected'], [422, 'rejected'],
+    [408, 'unknown'], [409, 'unknown'], [425, 'unknown'], [429, 'unknown'], [500, 'unknown'], [503, 'unknown'],
+  ] as const)('classifies provider HTTP %s acceptance conservatively as %s', async (statusCode, acceptance) => {
+    env.RETELL_API_KEY = 'real-retell-key';
+    env.RETELL_FROM_NUMBER = '+12125550199';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: 'normalized-away' }), { status: statusCode })));
+
+    await expect(createPhoneCall({
+      toNumber: '+12125550101', agentId: 'agent-campaign', agentVersion: 7, dynamicVariables: {}, metadata: {},
+    })).resolves.toEqual({ ok: false, error: `retell_error_${statusCode}`, acceptance });
   });
 
   it('uses Retell stop-call for an active cancellation and never claims a mock stop was applied', async () => {

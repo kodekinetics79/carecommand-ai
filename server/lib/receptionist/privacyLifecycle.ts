@@ -46,6 +46,16 @@ export async function recordRecordingConsent(input: {
 }) {
   const idempotencyKey = `${input.callLogId}:${input.decision}`;
   return db.$transaction(async tx => {
+    const callIdentity = await tx.receptionistCallLog.findFirst({
+      where: { id: input.callLogId, tenantId: input.tenantId },
+      select: { retellCallId: true },
+    });
+    if (!callIdentity) throw new Error('call_log_not_found');
+    // Consent and autonomous booking share this exact first lock. If a refusal
+    // or withdrawal wins, booking subsequently reads the terminal status and
+    // fails closed; if booking wins, its transaction is already committed
+    // before the later consent transition proceeds.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-call-lifecycle:${input.tenantId}:${callIdentity.retellCallId ?? input.callLogId}`})::bigint)`;
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`recording-consent:${input.tenantId}:${input.callLogId}`})::bigint)`;
     const call = await tx.receptionistCallLog.findFirst({ where: { id: input.callLogId, tenantId: input.tenantId }, select: { id: true, recordingConsentStatus: true } });
     if (!call) throw new Error('call_log_not_found');
@@ -106,9 +116,14 @@ export async function ingestCallArtifacts(input: {
 }) {
   const from = input.retentionFrom ?? new Date();
   return db.$transaction(async tx => {
-    // Serialize artifact ingestion with consent changes. The consent decision
-    // is read on the same transaction/connection as the artifact write, so a
-    // concurrent refusal or withdrawal cannot race past an earlier read.
+    const callIdentity = await tx.receptionistCallLog.findFirst({
+      where: { id: input.callLogId, tenantId: input.tenantId },
+      select: { retellCallId: true },
+    });
+    if (!callIdentity) throw new Error('call_log_not_found');
+    // Preserve the same lifecycle -> consent lock order used by booking and
+    // consent mutation, then read/write artifacts on this transaction.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-call-lifecycle:${input.tenantId}:${callIdentity.retellCallId ?? input.callLogId}`})::bigint)`;
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`recording-consent:${input.tenantId}:${input.callLogId}`})::bigint)`;
     const call = await tx.receptionistCallLog.findFirst({
       where: { id: input.callLogId, tenantId: input.tenantId },

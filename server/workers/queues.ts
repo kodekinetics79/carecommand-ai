@@ -66,7 +66,8 @@ export type ComplianceJobName =
   | 'backup-placeholder'
   | 'access-review-reminder'
   | 'vendor-review-reminder'
-  | 'security-scan-placeholder';
+  | 'security-scan-placeholder'
+  | 'receptionist-confirmation-dispatch';
 
 export type ScheduledTickData = { _otel?: TraceCarrier };
 export type ScheduledQueueData = ScheduledTickData | TenantJobEnvelope;
@@ -94,6 +95,7 @@ const COMPLIANCE_SCHEDULES: Array<{ id: string; name: ComplianceJobName; pattern
   { id: 'compliance-access-review', name: 'access-review-reminder', pattern: '0 3 * * 1' },     // weekly Mon 03:00
   { id: 'compliance-vendor-review', name: 'vendor-review-reminder', pattern: '0 4 1 * *' },     // monthly 1st 04:00
   { id: 'compliance-security-scan', name: 'security-scan-placeholder', pattern: '45 2 * * *' }, // daily 02:45 (no-op unless data supplied)
+  { id: 'receptionist-confirmation-dispatch', name: 'receptionist-confirmation-dispatch', pattern: '* * * * *' }, // every minute
 ];
 
 export async function registerComplianceSchedules() {

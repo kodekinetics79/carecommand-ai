@@ -59,6 +59,7 @@ const APPEND_ONLY = new Set([
   'ConsentEvent',
   'ReceptionistArtifactLifecycleEvent',
   'ReceptionistRecordingConsentEvent',
+  'NotificationDeliveryAttempt',
 ]);
 
 function schemaProtectedTables(): string[] {
@@ -616,6 +617,14 @@ export class RlsBehaviorHarness {
     const columns = this.columns.get(table) ?? [];
     const change = new Set([...(this.primaryKeys.get(table) ?? []), ...(this.uniqueColumns.get(table) ?? [])]);
     change.delete(table === 'Tenant' ? 'id' : 'tenantId');
+    // A delivery-attempt clone can remain bound to the same event and status;
+    // changing its primary key plus attempt number is sufficient to avoid the
+    // composite unique key while preserving its FK and status CHECK contract.
+    if (table === 'NotificationDeliveryAttempt') {
+      change.delete('notificationEventId');
+      change.delete('phase');
+      change.delete('status');
+    }
     for (const name of change) {
       const column = columns.find(item => item.name === name);
       if (!column || clone[name] == null) continue;
@@ -672,6 +681,21 @@ export class RlsBehaviorHarness {
     for (const column of columns) {
       if (column.generated || values.has(column.name) || !column.notNull || column.hasDefault) continue;
       values.set(column.name, syntheticScalar(column, tenantId.slice(0, 8)));
+    }
+    // Satisfy the append-only attempt state machine without weakening its DB
+    // CHECKs merely for synthetic behavioral evidence.
+    if (table === 'NotificationDeliveryAttempt') {
+      values.set('phase', 'INTENT');
+      values.set('status', 'started');
+    }
+    // Outbound targets require exactly one durable identity. The patient/lead
+    // FKs are nullable individually, so the generic required-FK resolver
+    // cannot infer this table-level XOR contract.
+    if (table === 'ReceptionistCallTarget') {
+      const patient = this.fixtures.get(key('Patient', tenantId));
+      if (!patient) return null;
+      values.set('patientId', patient.row.id);
+      values.delete('leadId');
     }
     const record = await this.insertRecord(table, values, tenantId);
     this.restrictedInsertEvidence.add(key(table, tenantId));

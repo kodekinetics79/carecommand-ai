@@ -168,6 +168,32 @@ async function configureIntake(t: T, fields: Parameters<typeof compileIntakeCont
   return contract;
 }
 
+async function createRunnableOutboundTarget(t: T, phone: string) {
+  await db.patient.update({ where: { id: t.patientId }, data: { phone } });
+  const created = await app.inject({
+    method: 'POST', url: '/v1/receptionist/outbound-campaigns', headers: adminAuth(t),
+    payload: {
+      clinicId: t.clinicId, agentId: t.agentId, name: 'Compliance gate', script: 'Call the patient.',
+      requiredFields: ['firstName', 'lastName', 'phone'], bookingMode: 'APPOINTMENT_REQUEST_ONLY',
+      purpose: 'CARE_COORDINATION', legalBasis: 'TREATMENT_OPERATIONS', policyVersion: 'OUTBOUND-TEST-1',
+    },
+  });
+  expect(created.statusCode).toBe(201);
+  const campaignId = (created.json() as { id: string }).id;
+  const approved = await app.inject({
+    method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaignId}/approve`, headers: adminAuth(t),
+    payload: { approvalConfirmed: true, status: 'RUNNING' },
+  });
+  expect(approved.statusCode).toBe(200);
+  const added = await app.inject({
+    method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaignId}/targets`, headers: adminAuth(t),
+    payload: { targets: [{ patientId: t.patientId, phone, firstName: 'Pat', lastName: 'Roe' }] },
+  });
+  expect(added.statusCode).toBe(201);
+  const target = await db.receptionistCallTarget.findFirstOrThrow({ where: { tenantId: t.id, campaignId, phone } });
+  return { campaignId, targetId: target.id };
+}
+
 beforeAll(async () => {
   env.RETELL_API_KEY = RETELL_KEY;
   app = await buildApp();
@@ -388,6 +414,43 @@ describe('receptionist /fn booking — real availability + booking', () => {
     expect(review).toHaveLength(1);
     expect(review[0].status).toBe('MISSING_INFO');
     expect(review[0].collectedPhone).toBe('+15551112222'); // bound to the verified caller
+  });
+
+  it('requires an explicit REJECTED review action, idempotently emits one event, and never reopens to BOOKED', async () => {
+    const t = await makeTenant();
+    const callId = `staff-review-${randomUUID()}`;
+    const reviewResponse = await fn(t, 'book_appointment', {
+      first_name: 'Staff', last_name: 'Review', appointment_date: 'invalid', appointment_time: 'later',
+    }, callId, '+15551113333');
+    const requestId = (reviewResponse.json() as { appointment_request_id: string }).appointment_request_id;
+    const reasonOnly = await app.inject({
+      method: 'PATCH', url: `/v1/receptionist/booking-requests/${requestId}`, headers: adminAuth(t),
+      payload: { outcomeReason: 'Caller requested cancellation' },
+    });
+    expect(reasonOnly.statusCode).toBe(400);
+
+    const reject = () => app.inject({
+      method: 'PATCH', url: `/v1/receptionist/booking-requests/${requestId}`, headers: adminAuth(t),
+      payload: { status: 'REJECTED', outcomeReason: 'Caller requested cancellation' },
+    });
+    const [first, replay] = await Promise.all([reject(), reject()]);
+    expect(first.statusCode).toBe(200);
+    expect(replay.statusCode).toBe(200);
+    expect(await db.auditEvent.count({ where: { tenantId: t.id, action: 'receptionist.appointmentRequest.reviewTransitioned', resourceId: requestId } })).toBe(1);
+    expect(await db.businessEvent.count({ where: { tenantId: t.id, eventType: 'receptionist.appointmentRequest.reviewTransitioned', entityId: requestId } })).toBe(1);
+
+    const conflict = await app.inject({
+      method: 'PATCH', url: `/v1/receptionist/booking-requests/${requestId}`, headers: adminAuth(t),
+      payload: { status: 'REJECTED', outcomeReason: 'Different terminal reason' },
+    });
+    expect(conflict.statusCode).toBe(409);
+
+    const retryBooking = await fn(t, 'book_appointment', {
+      first_name: 'Staff', last_name: 'Review', appointment_date: futureDate(8), appointment_time: '09:00',
+    }, callId, '+15551113333');
+    expect(retryBooking.json()).toMatchObject({ booked: false, needs_human: true });
+    expect(await db.appointment.count({ where: { tenantId: t.id } })).toBe(0);
+    expect((await db.appointmentRequest.findUniqueOrThrow({ where: { id: requestId } })).status).toBe('REJECTED');
   });
 
   it('rolls back a needs-review request when the mandatory live-agent audit fails, then retries cleanly', async () => {
@@ -709,23 +772,22 @@ describe('receptionist outbound dial — opt-out gate (FIX 4)', () => {
     const t = await makeTenant();
     const optedPhone = '+15553330001';
     await db.receptionistOptOut.create({ data: { tenantId: t.id, contactPhone: optedPhone, channel: 'ALL', reason: 'AI call' } });
-    const campaign = await db.receptionistOutboundCampaign.create({ data: { tenantId: t.id, clinicId: t.clinicId, agentId: t.agentId, name: 'Cleanup', script: 'Call the patient.', requiredFields: ['firstName', 'lastName', 'phone'], status: 'RUNNING' }, select: { id: true } });
+    const campaign = await createRunnableOutboundTarget(t, optedPhone);
 
-    const res = await app.inject({ method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaign.id}/call`, headers: adminAuth(t), payload: { phone: optedPhone, firstName: 'Opted', lastName: 'Out' } });
+    const res = await app.inject({ method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaign.campaignId}/call`, headers: adminAuth(t), payload: { phone: optedPhone, firstName: 'Pat', lastName: 'Roe', targetId: campaign.targetId } });
     expect(res.statusCode).toBe(200);
     const body = res.json() as { status: string; reason?: string };
     expect(body.status).toBe('skipped');
     expect(body.reason).toBe('opted_out');
 
-    // Recorded as OPTED_OUT and NEVER dialed (no IN_PROGRESS call log).
-    expect(await db.receptionistCallLog.count({ where: { tenantId: t.id, callerPhone: optedPhone, outcome: 'OPTED_OUT' } })).toBe(1);
+    // Suppressed before provider submission; never creates an in-progress call.
     expect(await db.receptionistCallLog.count({ where: { tenantId: t.id, outcome: 'IN_PROGRESS' } })).toBe(0);
   });
 
   it('a non-opted-out number is NOT skipped by the gate (contrast: falls through to provider setup)', async () => {
     const t = await makeTenant();
-    const campaign = await db.receptionistOutboundCampaign.create({ data: { tenantId: t.id, clinicId: t.clinicId, agentId: t.agentId, name: 'Cleanup', script: 'Call the patient.', requiredFields: ['firstName', 'lastName', 'phone'], status: 'RUNNING' }, select: { id: true } });
-    const res = await app.inject({ method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaign.id}/call`, headers: adminAuth(t), payload: { phone: '+15553330002', firstName: 'Fresh', lastName: 'Lead' } });
+    const campaign = await createRunnableOutboundTarget(t, '+15553330002');
+    const res = await app.inject({ method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaign.campaignId}/call`, headers: adminAuth(t), payload: { phone: '+15553330002', firstName: 'Pat', lastName: 'Roe', targetId: campaign.targetId } });
     expect(res.statusCode).toBe(200);
     // Retell is unconfigured in test → the gate passed and we reach setup_required
     // (proving the opt-out gate is specific, not a blanket skip).

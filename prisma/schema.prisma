@@ -204,6 +204,7 @@ model Tenant {
   deviceReadings                      DeviceReading[]
   readingAlerts                       ReadingAlert[]
   notificationEvents                  NotificationEvent[]
+  notificationDeliveryAttempts        NotificationDeliveryAttempt[]
   morningBriefingSignals              MorningBriefingSignal[]
   insuranceProviders                  InsuranceProvider[]
   deviceProviders                     DeviceProvider[]
@@ -249,8 +250,11 @@ model User {
   partnerReportsReviewed PartnerReport[]      @relation("PartnerReportReviewer")
   clinicAccesses         UserClinicAccess[]
   passwordResetTokens    PasswordResetToken[]
+  approvedOutboundCampaigns ReceptionistOutboundCampaign[] @relation("OutboundAuthorityApprover")
+  receptionistOptOutRevocations ReceptionistOptOut[] @relation("ReceptionistOptOutRevoker")
 
   @@unique([tenantId, email])
+  @@unique([tenantId, id])
   @@index([tenantId, role])
 }
 
@@ -350,8 +354,11 @@ model Patient {
   campaignSuppressions  CampaignSuppression[]
   intakePackets         PatientIntakePacket[]
   patientConsentRecords PatientConsentRecord[]
+  notificationEvents    NotificationEvent[]
+  receptionistCallTargets ReceptionistCallTarget[]
 
   @@unique([tenantId, externalRef])
+  @@unique([tenantId, id])
   @@index([tenantId, branchId, deletedAt])
   @@index([tenantId, lifecycleStage, churnRisk])
 }
@@ -394,9 +401,10 @@ model Appointment {
   depositRequirements            DepositRequirement[]
   revenueProtectionAlerts        RevenueProtectionAlert[]
   serviceCatalogItem             ServiceCatalogItem?             @relation(fields: [serviceCatalogItemId], references: [id], onDelete: SetNull)
-  providerProfile                ProviderProfile?                @relation(fields: [providerProfileId], references: [id], onDelete: SetNull)
+  providerProfile                ProviderProfile?                @relation(fields: [providerProfileId], references: [id], onDelete: Restrict)
   sourceCallLog                  ReceptionistCallLog?             @relation("AppointmentSourceCall", fields: [tenantId, receptionistCallLogId], references: [tenantId, id], onDelete: Restrict)
   appointmentRequests            AppointmentRequest[]             @relation("AppointmentRequestBookedAppointment")
+  notificationEvents             NotificationEvent[]
 
   @@unique([tenantId, id])
   @@unique([tenantId, receptionistCallLogId])
@@ -494,7 +502,9 @@ model Lead {
   tenant              Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   patient             Patient?             @relation(fields: [patientId], references: [id], onDelete: SetNull)
   appointmentRequests AppointmentRequest[]
+  receptionistCallTargets ReceptionistCallTarget[]
 
+  @@unique([tenantId, id])
   @@index([tenantId, stage, createdAt])
 }
 
@@ -1581,8 +1591,10 @@ model ReceptionistCampaign {
   intakeFields        ReceptionistIntakeField[]
   appointmentRequests ReceptionistAppointmentRequest[]
   callLogs            ReceptionistCallLog[]
+  outboundAuthorityCampaigns ReceptionistOutboundCampaign[] @relation("OutboundBookingAuthority")
 
   @@index([tenantId, clinicId, status])
+  @@unique([tenantId, clinicId, id])
 }
 
 model ReceptionistIntakeField {
@@ -1749,8 +1761,12 @@ model ReceptionistOptOut {
   channel      ReceptionistOptOutChannel @default(ALL)
   reason       String?
   createdAt    DateTime                  @default(now())
+  revokedAt    DateTime?
+  revokedByUserId String?                 @db.Uuid
+  revocationReason String?
   tenant       Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   clinic       ReceptionistClinic?       @relation(fields: [clinicId], references: [id], onDelete: SetNull)
+  revokedBy     User?                     @relation("ReceptionistOptOutRevoker", fields: [tenantId, revokedByUserId], references: [tenantId, id], onDelete: Restrict)
 
   @@index([tenantId, createdAt])
 }
@@ -2289,8 +2305,15 @@ model ReceptionistOutboundCampaign {
   tenantId                String                   @db.Uuid
   clinicId                String                   @db.Uuid
   agentId                 String?                  @db.Uuid
+  receptionistCampaignId  String?                  @db.Uuid
   name                    String
   script                  String
+  purpose                 String?
+  legalBasis              String?
+  policyVersion           String?
+  authorityApprovedAt     DateTime?
+  authorityApprovedById   String?                  @db.Uuid
+  authorityFingerprint    String?
   requiredFields          String[]
   customQuestions         Json?
   consentText             String?
@@ -2307,11 +2330,14 @@ model ReceptionistOutboundCampaign {
   tenant                  Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   clinic                  ReceptionistClinic       @relation(fields: [clinicId], references: [id], onDelete: Cascade)
   agent                   ReceptionistAgent?       @relation(fields: [tenantId, clinicId, agentId], references: [tenantId, clinicId, id], onDelete: Restrict, map: "ReceptionistOutboundCampaign_agent_scope_fkey")
+  receptionistCampaign    ReceptionistCampaign?    @relation("OutboundBookingAuthority", fields: [tenantId, clinicId, receptionistCampaignId], references: [tenantId, clinicId, id], onDelete: Restrict, map: "ReceptionistOutboundCampaign_booking_authority_fkey")
+  authorityApprovedBy     User?                     @relation("OutboundAuthorityApprover", fields: [tenantId, authorityApprovedById], references: [tenantId, id], onDelete: Restrict)
   targets                 ReceptionistCallTarget[]
   callLogs                ReceptionistCallLog[]
 
   @@index([tenantId, status])
   @@index([tenantId, clinicId])
+  @@index([tenantId, receptionistCampaignId])
 }
 
 model ReceptionistCallTarget {
@@ -2332,8 +2358,11 @@ model ReceptionistCallTarget {
   updatedAt     DateTime                     @updatedAt
   tenant        Tenant                       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   campaign      ReceptionistOutboundCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  patient       Patient?                     @relation(fields: [tenantId, patientId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallTarget_patient_scope_fkey")
+  lead          Lead?                        @relation(fields: [tenantId, leadId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallTarget_lead_scope_fkey")
 
   @@index([tenantId, campaignId, status])
+  @@unique([tenantId, campaignId, phone])
 }
 
 model AppointmentRequest {
@@ -3010,6 +3039,7 @@ model NotificationEvent {
   id              String    @id @default(uuid()) @db.Uuid
   tenantId        String    @db.Uuid
   alertId         String?   @db.Uuid
+  appointmentId   String?   @db.Uuid
   patientId       String?   @db.Uuid
   recipientType   String // patient | doctor | nurse | care_coordinator
   recipientUserId String?   @db.Uuid
@@ -3020,12 +3050,48 @@ model NotificationEvent {
   failureReason   String?
   consentChecked  Boolean   @default(false)
   consentResult   String? // granted | denied | not_required
+  source          String?
+  idempotencyKey  String?
+  provider        String?
+  providerMessageId String?
+  maxAttempts     Int       @default(5)
+  nextAttemptAt   DateTime? @default(now())
   createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @default(now()) @updatedAt
   sentAt          DateTime?
+  acceptedAt      DateTime?
+  deliveredAt     DateTime?
+  deadLetteredAt  DateTime?
   tenant          Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  appointment     Appointment? @relation(fields: [tenantId, appointmentId], references: [tenantId, id], onDelete: Restrict)
+  patient         Patient?   @relation(fields: [tenantId, patientId], references: [tenantId, id], onDelete: Restrict)
+  deliveryAttempts NotificationDeliveryAttempt[]
 
+  @@unique([tenantId, id])
   @@index([tenantId, createdAt])
   @@index([tenantId, alertId])
+  @@index([tenantId, appointmentId])
+  @@unique([tenantId, source, idempotencyKey])
+  @@unique([tenantId, appointmentId, channel, source])
+}
+
+model NotificationDeliveryAttempt {
+  id                  String   @id @default(uuid()) @db.Uuid
+  tenantId            String   @db.Uuid
+  notificationEventId String   @db.Uuid
+  attemptNumber       Int
+  phase               String
+  status              String
+  provider            String?
+  providerMessageId   String?
+  failureCode         String?
+  startedAt           DateTime @default(now())
+  completedAt         DateTime?
+  tenant              Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  notificationEvent   NotificationEvent @relation(fields: [tenantId, notificationEventId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([tenantId, notificationEventId, attemptNumber, phase])
+  @@index([tenantId, status, startedAt])
 }
 
 // Precomputed daily operational briefing signals (summary only — no diagnosis).

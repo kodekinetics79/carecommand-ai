@@ -6,14 +6,14 @@ import type { PrismaClient } from '../../generated/prisma/client';
  * tenant-consistency FK on the same relation without a destructive rewrite.
  */
 export const TENANT_INTEGRITY_MANIFEST = Object.freeze({
-  compositeForeignKeys: 121,
-  childSupportingIndexes: 121,
-  parentUniqueIndexes: 29,
-  totalManagedIndexes: 150,
-  // Nine managed indexes are structurally represented by ordinary Prisma
+  compositeForeignKeys: 123,
+  childSupportingIndexes: 123,
+  parentUniqueIndexes: 31,
+  totalManagedIndexes: 154,
+  // Twelve managed indexes are structurally represented by ordinary Prisma
   // indexes. Prisma therefore preserves them even though their physical names
   // use the migration-owned prefixes; only the remainder appears in diff SQL.
-  prismaDiffManagedIndexes: 141,
+  prismaDiffManagedIndexes: 142,
   foreignKeyPrefix: 'rls_fk_',
   childIndexPrefix: 'rls_ix_',
   parentIndexPrefix: 'rls_uq_',

@@ -184,6 +184,9 @@ export interface OptOut {
   channel: OptOutChannel;
   reason: string | null;
   createdAt: string;
+  revokedAt: string | null;
+  revokedByUserId: string | null;
+  revocationReason: string | null;
 }
 
 export interface Overview {
@@ -223,6 +226,7 @@ export interface RetellStatus {
   mock: boolean;
   missing: string[];
   readyAgents: number;
+  adhocTestCallsAllowed: boolean;
   checklist: Array<{ key: string; label: string; set: boolean }>;
 }
 
@@ -230,8 +234,15 @@ export interface OutboundCampaign {
   id: string;
   clinicId: string;
   agentId: string | null;
+  receptionistCampaignId: string | null;
   name: string;
   script: string;
+  purpose: 'CARE_COORDINATION' | 'APPOINTMENT_REMINDER' | 'PATIENT_REACTIVATION' | null;
+  legalBasis: 'EXPLICIT_CONSENT' | 'TREATMENT_OPERATIONS' | null;
+  policyVersion: string | null;
+  authorityApprovedAt: string | null;
+  authorityApprovedById: string | null;
+  authorityFingerprint: string | null;
   requiredFields: OutboundRequiredField[];
   customQuestions: unknown;
   consentText: string | null;
@@ -264,6 +275,14 @@ export interface CallTarget {
   createdAt: string;
 }
 
+export interface OutboundTargetCandidate {
+  type: 'patient' | 'lead';
+  id: string;
+  name: string;
+  phone: string;
+  voiceConsentReady: boolean;
+}
+
 export interface BookingRequest {
   id: string;
   branchId: string | null;
@@ -284,6 +303,29 @@ export interface BookingRequest {
   createdAt: string;
 }
 
+export type ConfirmationDeliveryStatus =
+  | 'queued' | 'retrying' | 'failed' | 'suppressed'
+  | 'accepted' | 'delivered' | 'dead_lettered' | 'delivery_unknown';
+
+export interface ConfirmationDelivery {
+  id: string;
+  appointmentId: string | null;
+  patientId: string | null;
+  patientName: string | null;
+  appointmentService: string | null;
+  appointmentStartsAt: string | null;
+  channel: string;
+  status: ConfirmationDeliveryStatus;
+  attempts: number;
+  maxAttempts: number;
+  failureReason: string | null;
+  provider: string | null;
+  acceptedAt: string | null;
+  deliveredAt: string | null;
+  deadLetteredAt: string | null;
+  createdAt: string;
+}
+
 export type LaunchCallResult =
   | { status: 'launched'; callId: string; callLogId: string; mock: boolean }
   | { status: 'setup_required'; missing: string[] }
@@ -292,8 +334,12 @@ export type LaunchCallResult =
 export interface OutboundCampaignInput {
   clinicId: string;
   agentId?: string | null;
+  receptionistCampaignId?: string | null;
   name: string;
   script: string;
+  purpose?: 'CARE_COORDINATION' | 'APPOINTMENT_REMINDER' | 'PATIENT_REACTIVATION' | null;
+  legalBasis?: 'EXPLICIT_CONSENT' | 'TREATMENT_OPERATIONS' | null;
+  policyVersion?: string | null;
   requiredFields?: OutboundRequiredField[];
   consentText?: string | null;
   humanHandoffInstruction?: string | null;
@@ -405,7 +451,10 @@ export const receptionistApi = {
   listAppointmentRequests: (clinicId: string) => apiRequest<AppointmentRequest[]>(`${base}/appointment-requests?clinicId=${clinicId}`),
   listOptOuts: () => apiRequest<OptOut[]>(`${base}/opt-outs`),
   createOptOut: (body: Partial<OptOut> & { clinicId?: string }) => apiRequest<OptOut>(`${base}/opt-outs`, { method: 'POST', body: JSON.stringify(body) }),
-  deleteOptOut: (id: string) => apiRequest<void>(`${base}/opt-outs/${id}`, { method: 'DELETE' }),
+  revokeOptOut: (id: string, reason: string) => apiRequest<void>(`${base}/opt-outs/${id}`, {
+    method: 'DELETE',
+    body: JSON.stringify({ reason, acknowledgeReactivationRisk: true }),
+  }),
 
   // --- Outbound calling ----------------------------------------------------
   retellStatus: () => apiRequest<RetellStatus>(`${base}/retell-status`),
@@ -413,7 +462,9 @@ export const receptionistApi = {
   getOutboundCampaign: (id: string) => apiRequest<OutboundCampaign>(`${base}/outbound-campaigns/${id}`),
   createOutboundCampaign: (body: OutboundCampaignInput) => apiRequest<OutboundCampaign>(`${base}/outbound-campaigns`, { method: 'POST', body: JSON.stringify(body) }),
   updateOutboundCampaign: (id: string, body: Partial<OutboundCampaignInput>) => apiRequest<OutboundCampaign>(`${base}/outbound-campaigns/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  approveOutboundCampaign: (id: string, status: 'SCHEDULED' | 'RUNNING') => apiRequest<OutboundCampaign>(`${base}/outbound-campaigns/${id}/approve`, { method: 'POST', body: JSON.stringify({ approvalConfirmed: true, status }) }),
   listTargets: (campaignId: string) => apiRequest<CallTarget[]>(`${base}/outbound-campaigns/${campaignId}/targets`),
+  listOutboundTargetCandidates: (q = '') => apiRequest<OutboundTargetCandidate[]>(`${base}/outbound-target-candidates${q ? `?q=${encodeURIComponent(q)}` : ''}`),
   addTargets: (campaignId: string, targets: Array<Partial<CallTarget> & { phone: string }>) =>
     apiRequest<{ added: number }>(`${base}/outbound-campaigns/${campaignId}/targets`, { method: 'POST', body: JSON.stringify({ targets }) }),
   deleteTarget: (campaignId: string, id: string) =>
@@ -422,6 +473,7 @@ export const receptionistApi = {
     apiRequest<LaunchCallResult>(`${base}/outbound-campaigns/${campaignId}/call`, { method: 'POST', body: JSON.stringify(body) }),
   listOutboundCallLogs: (campaignId: string) => apiRequest<CallLog[]>(`${base}/outbound-campaigns/${campaignId}/call-logs`),
   listBookingRequests: (status?: BookingRequestStatus) => apiRequest<BookingRequest[]>(`${base}/booking-requests${status ? `?status=${status}` : ''}`),
+  listConfirmationDeliveries: (limit = 100) => apiRequest<ConfirmationDelivery[]>(`${base}/confirmation-deliveries?limit=${limit}`),
   updateBookingRequest: (id: string, body: { status?: BookingRequestStatus; outcomeReason?: string }) =>
     apiRequest<BookingRequest>(`${base}/booking-requests/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
 };

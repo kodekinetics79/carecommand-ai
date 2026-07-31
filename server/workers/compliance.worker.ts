@@ -9,6 +9,8 @@ import {
 } from './queues';
 import { assertSchedulerTick, validateTenantJobEnvelope } from '../lib/jobEnvelope';
 import { resolveActiveJobTenantIds } from '../lib/jobTenantResolver';
+import { runWithJobTenantContext } from '../lib/tenantContext';
+import { dispatchDueAppointmentConfirmations } from '../lib/receptionist/confirmationOutbox';
 import {
   runReadinessRecalc,
   runEvidenceExpiry,
@@ -28,13 +30,14 @@ const COMPLIANCE_SCHEDULERS: Record<ComplianceJobName, string> = {
   'access-review-reminder': 'compliance-access-review',
   'vendor-review-reminder': 'compliance-vendor-review',
   'security-scan-placeholder': 'compliance-security-scan',
+  'receptionist-confirmation-dispatch': 'receptionist-confirmation-dispatch',
 };
 
 function isComplianceJobName(name: string): name is ComplianceJobName {
   return Object.hasOwn(COMPLIANCE_SCHEDULERS, name);
 }
 
-async function runTenantComplianceJob(operation: ComplianceJobName, tenantId: string): Promise<void> {
+export async function runTenantComplianceJob(operation: ComplianceJobName, tenantId: string): Promise<void> {
   switch (operation) {
     case 'readiness-recalc': await runReadinessRecalc(tenantId); break;
     case 'evidence-expiry': await runEvidenceExpiry(tenantId); break;
@@ -43,6 +46,13 @@ async function runTenantComplianceJob(operation: ComplianceJobName, tenantId: st
     case 'vendor-review-reminder': await runVendorReviewReminder(tenantId); break;
     case 'security-scan-placeholder':
       console.info('[compliance-job] security scanner not integrated; awaiting supplied scan data');
+      break;
+    case 'receptionist-confirmation-dispatch':
+      await runWithJobTenantContext(
+        tenantId,
+        async () => { await dispatchDueAppointmentConfirmations(tenantId); },
+        'worker:receptionist-confirmation',
+      );
       break;
   }
 }

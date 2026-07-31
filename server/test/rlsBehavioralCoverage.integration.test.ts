@@ -9,7 +9,7 @@ if (!process.env.RLS_DISPOSABLE_DB) {
   describe('RLS behavioral evidence execution guard', () => {
     it('requires the explicit disposable-database lifecycle', () => {
       expect(process.env.RLS_DISPOSABLE_DB).toBeUndefined();
-      expect(RLS_TABLE_ADAPTERS).toHaveLength(119);
+      expect(RLS_TABLE_ADAPTERS).toHaveLength(120);
     });
   });
 } else {
@@ -24,9 +24,9 @@ if (!process.env.RLS_DISPOSABLE_DB) {
   });
 
   describe('RLS behavioral adapter inventory', () => {
-    it('contains exactly one adapter for all 119 deployed protected tables', () => {
-      expect(RLS_TABLE_ADAPTERS).toHaveLength(119);
-      expect(new Set(RLS_TABLE_ADAPTERS.map(adapter => adapter.table)).size).toBe(119);
+    it('contains exactly one adapter for all 120 deployed protected tables', () => {
+      expect(RLS_TABLE_ADAPTERS).toHaveLength(120);
+      expect(new Set(RLS_TABLE_ADAPTERS.map(adapter => adapter.table)).size).toBe(120);
     });
   });
 
@@ -67,8 +67,13 @@ if (!process.env.RLS_DISPOSABLE_DB) {
         expect(none.errorCode).toBe('42501');
       } else if (adapter.mode === 'APPEND_ONLY') {
         expect(IMMUTABLE_DENIALS).toContain(own.errorCode);
-        expect(cross).toEqual({ count: 0, changed: false });
-        expect(none).toEqual({ count: 0, changed: false });
+        if (adapter.table === 'NotificationDeliveryAttempt') {
+          expect(cross.errorCode).toBe('42501');
+          expect(none.errorCode).toBe('42501');
+        } else {
+          expect(cross).toEqual({ count: 0, changed: false });
+          expect(none).toEqual({ count: 0, changed: false });
+        }
       } else {
         expect(own).toEqual({ count: 1, changed: true });
         expect(cross).toEqual({ count: 0, changed: false });
@@ -92,8 +97,13 @@ if (!process.env.RLS_DISPOSABLE_DB) {
         expect(none.errorCode).toBe('42501');
       } else if (adapter.mode === 'APPEND_ONLY') {
         expect(IMMUTABLE_DENIALS).toContain(own.errorCode);
-        expect(cross).toEqual({ count: 0 });
-        expect(none).toEqual({ count: 0 });
+        if (adapter.table === 'NotificationDeliveryAttempt') {
+          expect(cross.errorCode).toBe('42501');
+          expect(none.errorCode).toBe('42501');
+        } else {
+          expect(cross).toEqual({ count: 0 });
+          expect(none).toEqual({ count: 0 });
+        }
       } else {
         expect(own).toEqual({ count: 1 });
         expect(cross).toEqual({ count: 0 });
@@ -127,10 +137,17 @@ if (!process.env.RLS_DISPOSABLE_DB) {
       } else if (adapter.mode === 'APPEND_ONLY') {
         expect(IMMUTABLE_DENIALS).toContain(evidence.bulkUpdate.errorCode);
         expect(IMMUTABLE_DENIALS).toContain(evidence.bulkDelete.errorCode);
-        expect(crossUpdate).toEqual({ count: 0, changed: false });
-        expect(noneUpdate).toEqual({ count: 0, changed: false });
-        expect(crossDelete).toEqual({ count: 0 });
-        expect(noneDelete).toEqual({ count: 0 });
+        if (adapter.table === 'NotificationDeliveryAttempt') {
+          expect(crossUpdate.errorCode).toBe('42501');
+          expect(noneUpdate.errorCode).toBe('42501');
+          expect(crossDelete.errorCode).toBe('42501');
+          expect(noneDelete.errorCode).toBe('42501');
+        } else {
+          expect(crossUpdate).toEqual({ count: 0, changed: false });
+          expect(noneUpdate).toEqual({ count: 0, changed: false });
+          expect(crossDelete).toEqual({ count: 0 });
+          expect(noneDelete).toEqual({ count: 0 });
+        }
       } else {
         expect(evidence.bulkUpdate.count).toBeGreaterThan(0);
         expect(evidence.bulkUpdate.changed).toBe(true);

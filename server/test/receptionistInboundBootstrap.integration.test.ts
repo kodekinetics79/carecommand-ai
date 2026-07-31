@@ -272,5 +272,9 @@ describe('Retell first-ever inbound trusted destination bootstrap', () => {
     expect((await db.receptionistCallLog.findFirstOrThrow({ where: { tenantId: t.id, retellCallId: callId } })).outcome).toBe('ESCALATED');
     expect(await db.appointment.count({ where: { tenantId: t.id } })).toBe(0);
     expect(await db.appointmentRequest.count({ where: { tenantId: t.id, status: 'PENDING_REVIEW', source: 'retell_analysis_review_only' } })).toBe(1);
+    const review = await db.appointmentRequest.findFirstOrThrow({ where: { tenantId: t.id, source: 'retell_analysis_review_only' } });
+    expect(review).toMatchObject({ collectedName: null, collectedPhone: null, collectedEmail: null, requestedService: null });
+    expect(review.rawCollectedFields).toEqual({ issue_codes: ['provider_claimed_booking_without_canonical_evidence', 'consent_not_granted_phi_omitted'] });
+    expect(JSON.stringify(review.rawCollectedFields)).not.toContain('Synthetic');
   });
 });

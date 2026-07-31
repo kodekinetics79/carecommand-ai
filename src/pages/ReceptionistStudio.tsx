@@ -17,7 +17,7 @@ import {
   type PromptResult, type RetellConfig, type CallLog, type AppointmentRequest, type OptOut, type Overview,
   type RetellStatus, type OutboundCampaign, type OutboundRequiredField, type OutboundBookingMode,
   type CallTarget, type BookingRequest, type BookingRequestStatus, type OutboundCampaignInput,
-  type Location, type SchedulingBranch, type WeeklyHours,
+  type Location, type SchedulingBranch, type WeeklyHours, type OutboundTargetCandidate, type ConfirmationDelivery,
 } from '../lib/receptionist';
 
 type Tab = 'clinic' | 'campaign' | 'intake' | 'preview' | 'retell' | 'outbound' | 'activity';
@@ -1061,6 +1061,11 @@ function ActivityPanel({ clinicId }: { clinicId: string }) {
   const [requests, setRequests] = useState<AppointmentRequest[]>([]);
   const [optOuts, setOptOuts] = useState<OptOut[]>([]);
   const [sub, setSub] = useState<'calls' | 'requests' | 'optouts'>('calls');
+  const [revokingId, setRevokingId] = useState<string | null>(null);
+  const [revocationReason, setRevocationReason] = useState('');
+  const [revocationAcknowledged, setRevocationAcknowledged] = useState(false);
+  const [revocationPending, setRevocationPending] = useState(false);
+  const [revocationError, setRevocationError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     const [c, r, o] = await Promise.all([api.listCallLogs(clinicId), api.listAppointmentRequests(clinicId), api.listOptOuts()]);
@@ -1077,9 +1082,18 @@ function ActivityPanel({ clinicId }: { clinicId: string }) {
     return () => { active = false; };
   }, [clinicId]);
 
-  async function removeOptOut(id: string) {
-    await api.deleteOptOut(id);
-    await load();
+  async function revokeOptOut() {
+    if (!revokingId || revocationReason.trim().length < 5 || !revocationAcknowledged) return;
+    setRevocationPending(true); setRevocationError(null);
+    try {
+      await api.revokeOptOut(revokingId, revocationReason.trim());
+      setRevokingId(null); setRevocationReason(''); setRevocationAcknowledged(false);
+      await load();
+    } catch (error) {
+      setRevocationError(error instanceof Error ? error.message : 'Do-not-contact revocation was denied.');
+    } finally {
+      setRevocationPending(false);
+    }
   }
 
   return (
@@ -1141,9 +1155,37 @@ function ActivityPanel({ clinicId }: { clinicId: string }) {
                   <p className="text-[11px] text-t3 truncate">{o.channel} · {o.reason ?? 'No reason given'}</p>
                 </div>
               </div>
-              <button type="button" aria-label="Remove do-not-contact entry" title="Remove" onClick={() => removeOptOut(o.id)} className="text-t3 hover:text-red-v shrink-0"><Trash2 className="w-3.5 h-3.5" /></button>
+              <button
+                type="button"
+                aria-label="Review do-not-contact revocation"
+                title="Review reactivation"
+                onClick={() => { setRevokingId(o.id); setRevocationReason(''); setRevocationAcknowledged(false); setRevocationError(null); }}
+                className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--red-soft)] shrink-0"
+              >Review reactivation</button>
             </div>
           ))}
+          {revokingId && (
+            <div role="dialog" aria-label="Revoke do-not-contact suppression" className="rounded-xl border border-red-v/40 bg-[var(--red-soft)] p-4 space-y-3">
+              <div>
+                <p className="text-sm font-bold text-t1">Reactivate contact permission</p>
+                <p className="text-xs text-t3 mt-1">Owner or admin authorization is required. This preserves the original do-not-contact record and adds revocation evidence; it does not delete history.</p>
+              </div>
+              <Field label="Reason for reactivation" required hint="Record the verified patient request or other authorized basis (5–500 characters).">
+                <TextArea value={revocationReason} onChange={event => setRevocationReason(event.target.value)} maxLength={500} placeholder="Verified patient requested contact reactivation on…" />
+              </Field>
+              <label className="flex items-start gap-2 text-xs text-t2">
+                <input type="checkbox" checked={revocationAcknowledged} onChange={event => setRevocationAcknowledged(event.target.checked)} className="mt-0.5" />
+                <span>I confirm the reactivation was authorized and understand outbound contact may resume after this durable revocation is recorded.</span>
+              </label>
+              {revocationError && <p role="alert" className="text-xs text-red-v">{revocationError}</p>}
+              <div className="flex gap-2">
+                <button type="button" disabled={revocationPending || revocationReason.trim().length < 5 || !revocationAcknowledged} onClick={() => void revokeOptOut()} className="rounded-lg bg-red-v px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50">
+                  {revocationPending ? 'Recording…' : 'Record authorized reactivation'}
+                </button>
+                <button type="button" disabled={revocationPending} onClick={() => { setRevokingId(null); setRevocationError(null); }} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-t2">Cancel</button>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -1163,47 +1205,46 @@ const requestBadge: Record<BookingRequestStatus, string> = {
 const EMPTY_CAMPAIGN: OutboundCampaignInput = {
   clinicId: '', name: '', script: '', requiredFields: ['firstName', 'lastName', 'phone'],
   consentText: '', humanHandoffInstruction: '', bookingMode: 'APPOINTMENT_REQUEST_ONLY',
+  receptionistCampaignId: '', purpose: 'CARE_COORDINATION', legalBasis: 'TREATMENT_OPERATIONS', policyVersion: '',
   defaultBranchId: '', defaultService: '', quietHoursStart: '', quietHoursEnd: '', maxRetryAttempts: 1,
 };
 
 function OutboundPanel({ clinic }: { clinic: Clinic }) {
   const [status, setStatus] = useState<RetellStatus | null>(null);
   const [campaigns, setCampaigns] = useState<OutboundCampaign[]>([]);
+  const [bookingAuthorities, setBookingAuthorities] = useState<Campaign[]>([]);
   const [requests, setRequests] = useState<BookingRequest[]>([]);
+  const [deliveries, setDeliveries] = useState<ConfirmationDelivery[]>([]);
+  const [loadErrors, setLoadErrors] = useState<string[]>([]);
   const [selectedId, setSelectedId] = useState<string>('');
   const [creating, setCreating] = useState(false);
   const [loading, setLoading] = useState(true);
 
   const reload = useCallback(async () => {
-    const [st, camps, reqs] = await Promise.all([
-      api.retellStatus().catch(() => null),
-      api.listOutboundCampaigns(clinic.id).catch(() => [] as OutboundCampaign[]),
-      api.listBookingRequests().catch(() => [] as BookingRequest[]),
+    const results = await Promise.allSettled([
+      api.retellStatus(),
+      api.listOutboundCampaigns(clinic.id),
+      api.listBookingRequests(),
+      api.listCampaigns(clinic.id),
+      api.listConfirmationDeliveries(),
     ]);
-    setStatus(st);
-    setCampaigns(camps);
-    setRequests(reqs);
-    setSelectedId(prev => (prev && camps.some(c => c.id === prev) ? prev : camps[0]?.id ?? ''));
+    const labels = ['Retell status', 'outbound campaigns', 'appointment requests', 'booking authorities', 'confirmation delivery evidence'];
+    setLoadErrors(results.flatMap((result, index) => result.status === 'rejected' ? [`${labels[index]} could not be loaded.`] : []));
+    const [st, camps, reqs, authorities, confirmationRows] = results;
+    if (st.status === 'fulfilled') setStatus(st.value);
+    if (camps.status === 'fulfilled') {
+      setCampaigns(camps.value);
+      setSelectedId(prev => (prev && camps.value.some(c => c.id === prev) ? prev : camps.value[0]?.id ?? ''));
+    }
+    if (reqs.status === 'fulfilled') setRequests(reqs.value);
+    if (authorities.status === 'fulfilled') setBookingAuthorities(authorities.value.filter(c => c.status === 'ACTIVE'));
+    if (confirmationRows.status === 'fulfilled') setDeliveries(confirmationRows.value);
     setLoading(false);
   }, [clinic.id]);
 
   useEffect(() => {
-    let active = true;
-    void (async () => {
-      const [st, camps, reqs] = await Promise.all([
-        api.retellStatus().catch(() => null),
-        api.listOutboundCampaigns(clinic.id).catch(() => [] as OutboundCampaign[]),
-        api.listBookingRequests().catch(() => [] as BookingRequest[]),
-      ]);
-      if (!active) return;
-      setStatus(st);
-      setCampaigns(camps);
-      setRequests(reqs);
-      setSelectedId(prev => (prev && camps.some(c => c.id === prev) ? prev : camps[0]?.id ?? ''));
-      setLoading(false);
-    })();
-    return () => { active = false; };
-  }, [clinic.id]);
+    void (async () => { await reload(); })();
+  }, [reload]);
 
   const selected = campaigns.find(c => c.id === selectedId) ?? null;
 
@@ -1212,6 +1253,17 @@ function OutboundPanel({ clinic }: { clinic: Clinic }) {
   return (
     <div className="space-y-5">
       <RetellStatusCard status={status} />
+      {loadErrors.length > 0 && (
+        <div role="alert" className="cc-card border-l-4 border-l-red-v p-4">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-sm font-bold text-red-v">Outbound data is incomplete</p>
+              <p className="text-xs text-t3 mt-1">{loadErrors.join(' ')} Existing data is preserved; empty results are not assumed.</p>
+            </div>
+            <button type="button" onClick={() => void reload()} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-t2">Retry</button>
+          </div>
+        </div>
+      )}
 
       <div className="grid lg:grid-cols-[260px_1fr] gap-5">
         {/* Campaign list */}
@@ -1220,7 +1272,7 @@ function OutboundPanel({ clinic }: { clinic: Clinic }) {
             <span className="text-[11px] font-bold uppercase tracking-wide text-t3">Campaigns</span>
             <button type="button" aria-label="New outbound campaign" title="New outbound campaign" onClick={() => { setCreating(true); setSelectedId(''); }} className="text-indigo hover:opacity-80"><Plus className="w-4 h-4" /></button>
           </div>
-          {campaigns.length === 0 && !creating && <p className="px-1 py-3 text-xs text-t3">No outbound campaigns yet.</p>}
+          {campaigns.length === 0 && !creating && loadErrors.length === 0 && <p className="px-1 py-3 text-xs text-t3">No outbound campaigns yet.</p>}
           {campaigns.map(c => (
             <button
               key={c.id}
@@ -1239,6 +1291,8 @@ function OutboundPanel({ clinic }: { clinic: Clinic }) {
           {creating && (
             <CampaignBuilder
               clinicId={clinic.id}
+              bookingAuthorities={bookingAuthorities}
+              locations={clinic.locations ?? []}
               onCancel={() => setCreating(false)}
               onSaved={async (id) => { setCreating(false); await reload(); setSelectedId(id); }}
             />
@@ -1253,6 +1307,7 @@ function OutboundPanel({ clinic }: { clinic: Clinic }) {
       </div>
 
       <BookingRequestQueue requests={requests} onChanged={reload} />
+      <ConfirmationDeliveryQueue deliveries={deliveries} loadFailed={loadErrors.some(error => error.startsWith('confirmation delivery evidence'))} onRetry={reload} />
     </div>
   );
 }
@@ -1308,17 +1363,19 @@ function RequiredFieldPicker({ value, onChange }: { value: OutboundRequiredField
   );
 }
 
-function CampaignFormFields({ form, set }: { form: OutboundCampaignInput; set: (patch: Partial<OutboundCampaignInput>) => void }) {
+function CampaignFormFields({ form, set, bookingAuthorities, locations }: { form: OutboundCampaignInput; set: (patch: Partial<OutboundCampaignInput>) => void; bookingAuthorities: Campaign[]; locations: Location[] }) {
   return (
     <>
       <Field label="Campaign name" required>
         <TextInput value={form.name} onChange={e => set({ name: e.target.value })} placeholder="June reactivation outreach" />
       </Field>
       <Field label="Call script" required hint="What the agent should say. Keep it scheduling-focused — the AI must not give medical advice.">
-        <TextArea rows={4} value={form.script} onChange={e => set({ script: e.target.value })} placeholder="Hi, this is {{agent_name}} calling from {{clinic_name}}..." />
+        <TextArea rows={4} disabled={form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'} value={form.script} onChange={e => set({ script: e.target.value })} placeholder="Hi, this is {{agent_name}} calling from {{clinic_name}}..." />
       </Field>
       <Field label="Required fields to collect" hint="The agent will route to staff review if any of these are missing.">
-        <RequiredFieldPicker value={form.requiredFields ?? []} onChange={v => set({ requiredFields: v })} />
+        {form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'
+          ? <p className="text-xs text-t3">Controlled by the linked attested booking campaign.</p>
+          : <RequiredFieldPicker value={form.requiredFields ?? []} onChange={v => set({ requiredFields: v })} />}
       </Field>
       <Field label="Consent / disclaimer text" hint="Spoken disclosure the agent reads at the start of the call.">
         <TextArea rows={2} value={form.consentText ?? ''} onChange={e => set({ consentText: e.target.value })} placeholder="This call may be recorded. You can opt out at any time." />
@@ -1332,12 +1389,56 @@ function CampaignFormFields({ form, set }: { form: OutboundCampaignInput; set: (
           <option value="DIRECT_BOOKING_IF_SLOT_AVAILABLE">Direct booking if a slot is available</option>
         </Select>
       </Field>
+      {form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE' && (
+        <Field label="Attested booking campaign ID" required hint="Direct booking uses this active Receptionist Campaign as the sole prompt, intake, service, location, and tool authority.">
+          <Select aria-label="Attested booking campaign" value={form.receptionistCampaignId ?? ''} onChange={e => {
+            const authority = bookingAuthorities.find(c => c.id === e.target.value);
+            const eligibleLocation = locations.find(location => authority?.eligibleLocationIds.includes(location.id) && location.active && location.branchId);
+            set({
+              receptionistCampaignId: e.target.value || null,
+              agentId: authority?.agentId ?? null,
+              defaultService: authority?.appointmentType ?? null,
+              defaultBranchId: eligibleLocation?.branchId ?? null,
+              script: authority?.offerScript ?? form.script,
+            });
+          }}>
+            <option value="">Select active attested campaign</option>
+            {bookingAuthorities.map(authority => <option key={authority.id} value={authority.id}>{authority.name} — {authority.appointmentType}</option>)}
+          </Select>
+        </Field>
+      )}
+      <div className="grid grid-cols-3 gap-3">
+        <Field label="Call purpose" required>
+          <Select aria-label="Call purpose" value={form.purpose ?? ''} onChange={e => set({ purpose: e.target.value as OutboundCampaignInput['purpose'] })}>
+            <option value="CARE_COORDINATION">Care coordination</option>
+            <option value="APPOINTMENT_REMINDER">Appointment reminder</option>
+            <option value="PATIENT_REACTIVATION">Patient reactivation</option>
+          </Select>
+        </Field>
+        <Field label="Legal basis" required>
+          <Select aria-label="Legal basis" value={form.legalBasis ?? ''} onChange={e => set({ legalBasis: e.target.value as OutboundCampaignInput['legalBasis'] })}>
+            <option value="TREATMENT_OPERATIONS">Treatment / operations</option>
+            <option value="EXPLICIT_CONSENT">Explicit consent</option>
+          </Select>
+        </Field>
+        <Field label="Policy version" required hint="Approved outbound policy identifier.">
+          <TextInput value={form.policyVersion ?? ''} onChange={e => set({ policyVersion: e.target.value })} placeholder="OUTBOUND-2026-01" />
+        </Field>
+      </div>
       <div className="grid grid-cols-2 gap-3">
         <Field label="Default branch ID" hint="Required for direct booking.">
-          <TextInput value={form.defaultBranchId ?? ''} onChange={e => set({ defaultBranchId: e.target.value })} placeholder="branch uuid (optional)" />
+          {form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE' ? (
+            <Select aria-label="Eligible booking branch" value={form.defaultBranchId ?? ''} onChange={e => set({ defaultBranchId: e.target.value || null })}>
+              <option value="">Select eligible mapped branch</option>
+              {locations.filter(location => {
+                const authority = bookingAuthorities.find(c => c.id === form.receptionistCampaignId);
+                return authority?.eligibleLocationIds.includes(location.id) && location.active && location.branchId;
+              }).map(location => <option key={location.id} value={location.branchId!}>{location.name}</option>)}
+            </Select>
+          ) : <TextInput value={form.defaultBranchId ?? ''} onChange={e => set({ defaultBranchId: e.target.value })} placeholder="branch uuid (optional)" />}
         </Field>
         <Field label="Default service">
-          <TextInput value={form.defaultService ?? ''} onChange={e => set({ defaultService: e.target.value })} placeholder="Consultation" />
+          <TextInput disabled={form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'} value={form.defaultService ?? ''} onChange={e => set({ defaultService: e.target.value })} placeholder="Consultation" />
         </Field>
       </div>
       <div className="grid grid-cols-3 gap-3">
@@ -1349,7 +1450,7 @@ function CampaignFormFields({ form, set }: { form: OutboundCampaignInput; set: (
   );
 }
 
-function CampaignBuilder({ clinicId, onSaved, onCancel }: { clinicId: string; onSaved: (id: string) => void; onCancel: () => void }) {
+function CampaignBuilder({ clinicId, bookingAuthorities, locations, onSaved, onCancel }: { clinicId: string; bookingAuthorities: Campaign[]; locations: Location[]; onSaved: (id: string) => void; onCancel: () => void }) {
   const [form, setForm] = useState<OutboundCampaignInput>({ ...EMPTY_CAMPAIGN, clinicId });
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -1380,7 +1481,7 @@ function CampaignBuilder({ clinicId, onSaved, onCancel }: { clinicId: string; on
   return (
     <div className="cc-card p-5 space-y-4">
       <h3 className="text-sm font-bold text-t1 flex items-center gap-2"><Megaphone className="w-4 h-4 text-indigo" /> New outbound campaign</h3>
-      <CampaignFormFields form={form} set={set} />
+      <CampaignFormFields form={form} set={set} bookingAuthorities={bookingAuthorities} locations={locations} />
       {err && <p className="text-xs text-red-v">{err}</p>}
       <div className="flex gap-2">
         <button type="button" disabled={saving || !form.name || !form.script} onClick={save} className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50">
@@ -1399,28 +1500,25 @@ function CampaignDetail({ campaign, status, onChanged }: { campaign: OutboundCam
   const [firstName, setFirstName] = useState('');
   const [launchMsg, setLaunchMsg] = useState<{ kind: 'ok' | 'warn' | 'err'; text: string } | null>(null);
   const [launching, setLaunching] = useState(false);
+  const [campaignActionPending, setCampaignActionPending] = useState(false);
+  const [detailErrors, setDetailErrors] = useState<string[]>([]);
 
   const reloadDetail = useCallback(async () => {
-    const [t, l] = await Promise.all([
-      api.listTargets(campaign.id).catch(() => [] as CallTarget[]),
-      api.listOutboundCallLogs(campaign.id).catch(() => [] as CallLog[]),
+    const [targetResult, logResult] = await Promise.allSettled([
+      api.listTargets(campaign.id),
+      api.listOutboundCallLogs(campaign.id),
     ]);
-    setTargets(t); setLogs(l);
+    setDetailErrors([
+      ...(targetResult.status === 'rejected' ? ['Targets could not be loaded.'] : []),
+      ...(logResult.status === 'rejected' ? ['Call logs could not be loaded.'] : []),
+    ]);
+    if (targetResult.status === 'fulfilled') setTargets(targetResult.value);
+    if (logResult.status === 'fulfilled') setLogs(logResult.value);
   }, [campaign.id]);
 
   useEffect(() => {
-    let active = true;
-    void (async () => {
-      const [t, l] = await Promise.all([
-        api.listTargets(campaign.id).catch(() => [] as CallTarget[]),
-        api.listOutboundCallLogs(campaign.id).catch(() => [] as CallLog[]),
-      ]);
-      if (!active) return;
-      setTargets(t);
-      setLogs(l);
-    })();
-    return () => { active = false; };
-  }, [campaign.id]);
+    void (async () => { await reloadDetail(); })();
+  }, [reloadDetail]);
 
   async function launch(targetId?: string, toPhone?: string) {
     const dial = toPhone ?? phone;
@@ -1445,13 +1543,51 @@ function CampaignDetail({ campaign, status, onChanged }: { campaign: OutboundCam
 
   const configured = status?.configured ?? false;
 
+  async function approveAndRun() {
+    if (!window.confirm(`Approve policy ${campaign.policyVersion ?? '(missing)'} and start this outbound campaign?`)) return;
+    setCampaignActionPending(true); setLaunchMsg(null);
+    try {
+      await api.approveOutboundCampaign(campaign.id, 'RUNNING');
+      setLaunchMsg({ kind: 'ok', text: 'Authority approved and campaign started.' });
+      await onChanged();
+    } catch (e) {
+      setLaunchMsg({ kind: 'err', text: e instanceof Error ? e.message : 'Approval failed.' });
+    } finally { setCampaignActionPending(false); }
+  }
+
+  async function pauseCampaign() {
+    setCampaignActionPending(true); setLaunchMsg(null);
+    try {
+      await api.updateOutboundCampaign(campaign.id, { status: 'PAUSED' });
+      setLaunchMsg({ kind: 'ok', text: 'Campaign paused. No new calls can launch.' });
+      await onChanged();
+    } catch (e) {
+      setLaunchMsg({ kind: 'err', text: e instanceof Error ? e.message : 'Pause failed.' });
+    } finally { setCampaignActionPending(false); }
+  }
+
   return (
     <div className="space-y-5">
-      <div className="cc-card p-5 space-y-3">
-        <div className="flex items-center justify-between">
-          <h3 className="text-sm font-bold text-t1">{campaign.name}</h3>
-          <span className="badge badge-blue">{campaign.status}</span>
+      {detailErrors.length > 0 && (
+        <div role="alert" className="rounded-xl border border-red-v/40 bg-[var(--red-soft)] p-3 flex items-center justify-between gap-3">
+          <p className="text-xs text-red-v">{detailErrors.join(' ')} Existing rows remain visible; retry before acting.</p>
+          <button type="button" onClick={() => void reloadDetail()} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-xs font-semibold text-t2">Retry</button>
         </div>
+      )}
+      <div className="cc-card p-5 space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <h3 className="text-sm font-bold text-t1">{campaign.name}</h3>
+          <div className="flex items-center gap-2">
+            <span className="badge badge-blue">{campaign.status}</span>
+            {campaign.status === 'RUNNING'
+              ? <button type="button" disabled={campaignActionPending} onClick={pauseCampaign} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-xs font-semibold text-t2">Pause</button>
+              : <button type="button" disabled={campaignActionPending || !campaign.policyVersion} onClick={approveAndRun} className="rounded-lg bg-indigo px-2.5 py-1 text-xs font-semibold text-white disabled:opacity-50">Approve & run</button>}
+          </div>
+        </div>
+        <p className="text-[11px] text-t3">
+          Policy {campaign.policyVersion ?? 'not configured'} · {campaign.authorityApprovedAt ? `approved ${new Date(campaign.authorityApprovedAt).toLocaleString()} by ${campaign.authorityApprovedById ?? 'unknown'}` : 'not approved'}
+          {campaign.authorityFingerprint ? ` · evidence ${campaign.authorityFingerprint.slice(0, 12)}…` : ''}
+        </p>
         <p className="text-xs text-t3 whitespace-pre-wrap">{campaign.script}</p>
         <div className="flex flex-wrap gap-1.5">
           {campaign.requiredFields.map(f => <span key={f} className="badge badge-violet">{f}</span>)}
@@ -1467,20 +1603,22 @@ function CampaignDetail({ campaign, status, onChanged }: { campaign: OutboundCam
             <AlertCircle className="w-4 h-4" /> Retell isn’t configured — launching returns a setup-required notice instead of placing a call.
           </div>
         )}
-        <div className="grid grid-cols-[1fr_1fr_auto] gap-2 items-end">
-          <Field label="Phone number"><TextInput value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 010 0000" /></Field>
-          <Field label="First name (optional)"><TextInput value={firstName} onChange={e => setFirstName(e.target.value)} placeholder="Jordan" /></Field>
-          <button type="button" disabled={launching || !phone} onClick={() => launch()} className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50 h-[38px]">
-            {launching ? <Loader2 className="w-4 h-4 animate-spin" /> : <PhoneOutgoing className="w-4 h-4" />} Call
-          </button>
-        </div>
+        {status?.adhocTestCallsAllowed ? (
+          <div className="grid grid-cols-[1fr_1fr_auto] gap-2 items-end">
+            <Field label="Sandbox phone number"><TextInput value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 010 0000" /></Field>
+            <Field label="First name (optional)"><TextInput value={firstName} onChange={e => setFirstName(e.target.value)} placeholder="Jordan" /></Field>
+            <button type="button" disabled={launching || !phone || campaign.status !== 'RUNNING' || !configured} onClick={() => launch()} className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50 h-[38px]">
+              {launching ? <Loader2 className="w-4 h-4 animate-spin" /> : <PhoneOutgoing className="w-4 h-4" />} Sandbox call
+            </button>
+          </div>
+        ) : <p className="text-xs text-t3">Production calls must use an authorized patient or lead target below.</p>}
         {launchMsg && (
           <p className={`text-xs ${launchMsg.kind === 'ok' ? 'text-emerald-v' : launchMsg.kind === 'warn' ? 'text-amber-v' : 'text-red-v'}`}>{launchMsg.text}</p>
         )}
       </div>
 
       {/* Targets */}
-      <TargetList campaign={campaign} targets={targets} onAdded={reloadDetail} onCall={(t) => launch(t.id, t.phone)} canCall={!launching} />
+      <TargetList campaign={campaign} targets={targets} onAdded={reloadDetail} onCall={(t) => launch(t.id, t.phone)} canCall={!launching && configured && campaign.status === 'RUNNING'} />
 
       {/* Call logs */}
       <div className="cc-card p-5">
@@ -1504,17 +1642,26 @@ function CampaignDetail({ campaign, status, onChanged }: { campaign: OutboundCam
 }
 
 function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign: OutboundCampaign; targets: CallTarget[]; onAdded: () => void; onCall: (t: CallTarget) => void; canCall: boolean }) {
-  const [phone, setPhone] = useState('');
-  const [first, setFirst] = useState('');
+  const [candidates, setCandidates] = useState<OutboundTargetCandidate[]>([]);
+  const [selectedCandidate, setSelectedCandidate] = useState('');
   const [busy, setBusy] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const requiresPositiveVoiceConsent = campaign.legalBasis === 'EXPLICIT_CONSENT' || campaign.purpose === 'PATIENT_REACTIVATION';
+
+  useEffect(() => {
+    void api.listOutboundTargetCandidates().then(setCandidates).catch(() => setCandidates([]));
+  }, [campaign.id]);
 
   async function add() {
-    if (!phone) return;
+    const candidate = candidates.find(item => `${item.type}:${item.id}` === selectedCandidate);
+    if (!candidate) return;
     setBusy(true);
     try {
-      await api.addTargets(campaign.id, [{ phone, firstName: first || undefined }]);
-      setPhone(''); setFirst('');
+      await api.addTargets(campaign.id, [{
+        phone: candidate.phone,
+        ...(candidate.type === 'patient' ? { patientId: candidate.id } : { leadId: candidate.id }),
+      }]);
+      setSelectedCandidate('');
       onAdded();
     } finally {
       setBusy(false);
@@ -1535,14 +1682,22 @@ function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign:
   return (
     <div className="cc-card p-5 space-y-3">
       <h4 className="text-sm font-bold text-t1 flex items-center gap-2"><Phone className="w-4 h-4 text-indigo" /> Target list ({targets.length})</h4>
-      <div className="grid grid-cols-[1fr_1fr_auto] gap-2 items-end">
-        <Field label="Phone"><TextInput value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 010 0001" /></Field>
-        <Field label="First name"><TextInput value={first} onChange={e => setFirst(e.target.value)} placeholder="Optional" /></Field>
-        <button type="button" disabled={busy || !phone} onClick={add} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50 h-[38px]"><Plus className="w-4 h-4" /> Add</button>
+      <div className="grid grid-cols-[1fr_auto] gap-2 items-end">
+        <Field label="Authorized patient or lead">
+          <Select aria-label="Authorized outbound target" value={selectedCandidate} onChange={e => setSelectedCandidate(e.target.value)}>
+            <option value="">Select an identity with a canonical phone</option>
+            {candidates.filter(candidate => !requiresPositiveVoiceConsent || candidate.voiceConsentReady).map(candidate => <option key={`${candidate.type}:${candidate.id}`} value={`${candidate.type}:${candidate.id}`}>{candidate.name} · {candidate.phone} · {candidate.voiceConsentReady ? 'voice consent ready' : 'treatment/operations policy'}</option>)}
+          </Select>
+        </Field>
+        <button type="button" disabled={busy || !selectedCandidate} onClick={add} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50 h-[38px]"><Plus className="w-4 h-4" /> Add</button>
       </div>
       {targets.length > 0 && (
         <div className="space-y-1.5">
               {targets.map(t => (
+                (() => {
+                  const candidate = candidates.find(item => item.id === (t.patientId ?? t.leadId));
+                  const consentReady = !requiresPositiveVoiceConsent || candidate?.voiceConsentReady === true;
+                  return (
                 <div key={t.id} className="flex items-center justify-between rounded-lg border border-[var(--b1)] px-3 py-2 text-xs">
                   <div className="flex items-center gap-2">
                     <span className="badge badge-blue">{t.status}</span>
@@ -1550,7 +1705,7 @@ function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign:
                     <span className="text-t3">{t.phone}</span>
                   </div>
                   <div className="flex items-center gap-2">
-                    <button type="button" disabled={!canCall} onClick={() => onCall(t)} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 font-semibold text-indigo hover:bg-[var(--s2)] disabled:opacity-50">
+                    <button type="button" disabled={!canCall || t.status !== 'PENDING' || !consentReady} title={!consentReady ? 'Positive voice consent is required' : !canCall ? 'Campaign must be running and provider-ready' : t.status !== 'PENDING' ? `Target is ${t.status}` : 'Call target'} onClick={() => onCall(t)} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 font-semibold text-indigo hover:bg-[var(--s2)] disabled:opacity-50">
                       <PhoneOutgoing className="w-3 h-3" /> Call
                     </button>
                     <button
@@ -1563,6 +1718,8 @@ function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign:
                     </button>
                   </div>
                 </div>
+                  );
+                })()
               ))}
         </div>
       )}
@@ -1605,6 +1762,59 @@ function BookingRequestQueue({ requests, onChanged }: { requests: BookingRequest
               </div>
             </div>
           ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const confirmationPresentation: Record<string, { badge: string; label: string; guidance: string; title: string }> = {
+  queued: { badge: 'badge badge-blue', label: 'Queued', guidance: 'Waiting for the delivery worker.', title: 'No provider submission has been attempted yet.' },
+  retrying: { badge: 'badge badge-amber', label: 'Retrying', guidance: 'A known non-submission is scheduled for another attempt.', title: 'The prior attempt is known not to have been submitted to the provider.' },
+  failed: { badge: 'badge badge-red', label: 'Failed', guidance: 'Check configuration before the next scheduled attempt.', title: 'The provider did not accept this attempt; retry policy may continue.' },
+  dead_lettered: { badge: 'badge badge-red', label: 'Needs action', guidance: 'Resolve the failure and contact the patient manually only after checking consent and duplicate risk.', title: 'Automatic attempts stopped without provider acceptance.' },
+  delivery_unknown: { badge: 'badge badge-red', label: 'Reconcile', guidance: 'Review provider logs before any manual resend; delivery may already have occurred.', title: 'Provider acceptance is ambiguous. Automatic resend is disabled to prevent duplicates.' },
+  suppressed: { badge: 'badge badge-blue', label: 'Suppressed', guidance: 'No message was sent because consent, do-not-contact, or appointment state blocked it.', title: 'Suppressed before provider submission.' },
+  accepted: { badge: 'badge badge-emerald', label: 'Provider accepted', guidance: 'Delivery is not yet proven.', title: 'The provider accepted the message. This does not prove recipient delivery.' },
+  delivered: { badge: 'badge badge-emerald', label: 'Delivered', guidance: 'Provider delivery evidence was recorded.', title: 'Delivery evidence was received and recorded.' },
+};
+
+function ConfirmationDeliveryQueue({ deliveries, loadFailed, onRetry }: { deliveries: ConfirmationDelivery[]; loadFailed: boolean; onRetry: () => Promise<void> }) {
+  return (
+    <div className="cc-card p-5">
+      <h3 className="text-sm font-bold text-t1 mb-1 flex items-center gap-2"><ShieldCheck className="w-4 h-4 text-indigo" /> Appointment confirmation delivery ({deliveries.length})</h3>
+      <p className="text-xs text-t3 mb-3">Provider acceptance and confirmed delivery are shown separately. Red items require staff review and are never silently retried when acceptance is uncertain.</p>
+      {loadFailed ? (
+        <div role="alert" className="rounded-lg border border-red-v/40 bg-[var(--red-soft)] p-3 flex items-center justify-between gap-3">
+          <p className="text-xs text-red-v">Delivery evidence is unavailable. Do not assume confirmations were sent or delivered.</p>
+          <button type="button" onClick={() => void onRetry()} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-xs font-semibold text-t2">Retry</button>
+        </div>
+      ) : deliveries.length === 0 ? <p className="text-xs text-t3">No confirmation delivery events yet.</p> : (
+        <div className="space-y-2">
+          {deliveries.map(delivery => {
+            const presentation = confirmationPresentation[delivery.status] ?? confirmationPresentation.failed;
+            return (
+              <div key={delivery.id} className="rounded-lg border border-[var(--b1)] px-3 py-2.5">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className={presentation.badge} title={presentation.title}>{presentation.label}</span>
+                      <span className="text-sm font-semibold text-t1 truncate">{delivery.patientName || 'Patient'} · {delivery.channel.toUpperCase()}</span>
+                    </div>
+                    <p className="mt-1 text-[11px] text-t3">{presentation.guidance}</p>
+                  </div>
+                  <span className="text-[11px] text-t3 shrink-0">Attempt {delivery.attempts}/{delivery.maxAttempts}</span>
+                </div>
+                <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-t3">
+                  {delivery.appointmentService && <span>{delivery.appointmentService}</span>}
+                  {delivery.appointmentStartsAt && <span>{new Date(delivery.appointmentStartsAt).toLocaleString()}</span>}
+                  {delivery.failureReason && <span className="text-red-v">Code: {delivery.failureReason}</span>}
+                  {delivery.acceptedAt && !delivery.deliveredAt && <span>Accepted {new Date(delivery.acceptedAt).toLocaleString()}</span>}
+                  {delivery.deliveredAt && <span>Delivered {new Date(delivery.deliveredAt).toLocaleString()}</span>}
+                </div>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>

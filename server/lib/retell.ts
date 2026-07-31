@@ -32,7 +32,7 @@ export interface CreatePhoneCallInput {
 }
 export type CreatePhoneCallResult =
   | { ok: true; callId: string; mock: boolean }
-  | { ok: false; error: string; callId?: string; providerStopApplied?: boolean; providerStopError?: string };
+  | { ok: false; error: string; acceptance: 'rejected' | 'unknown'; callId?: string; providerStopApplied?: boolean; providerStopError?: string };
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 8000) {
   const controller = new AbortController();
@@ -46,9 +46,9 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 8000
 
 export async function createPhoneCall(input: CreatePhoneCallInput): Promise<CreatePhoneCallResult> {
   const status = retellConfigStatus();
-  if (!status.configured) return { ok: false, error: 'setup_required' };
+  if (!status.configured) return { ok: false, error: 'setup_required', acceptance: 'rejected' };
   if (!input.agentId || !Number.isSafeInteger(input.agentVersion) || input.agentVersion < 0) {
-    return { ok: false, error: 'agent_setup_required' };
+    return { ok: false, error: 'agent_setup_required', acceptance: 'rejected' };
   }
 
   // Mock path: returns a synthetic call id without any network call. Only when
@@ -89,14 +89,22 @@ export async function createPhoneCall(input: CreatePhoneCallInput): Promise<Crea
       agent_id?: string;
       agent_version?: number;
     } | null;
-    if (!response.ok) return { ok: false, error: `retell_error_${response.status}` };
+    if (!response.ok) {
+      // Only responses that definitively reject the request before call creation
+      // are safe to expose as retryable. Timeouts, conflicts, throttling and
+      // server errors can occur after receipt and therefore require provider
+      // reconciliation instead of an automatic redial.
+      const acceptance = [400, 401, 403, 404, 422].includes(response.status) ? 'rejected' : 'unknown';
+      return { ok: false, error: `retell_error_${response.status}`, acceptance };
+    }
     const callId = body?.call_id ?? body?.callId;
-    if (!callId) return { ok: false, error: 'retell_no_call_id' };
+    if (!callId) return { ok: false, error: 'retell_no_call_id', acceptance: 'unknown' };
     if (body?.agent_id !== input.agentId || body?.agent_version !== input.agentVersion) {
       const stopped = await stopPhoneCall(callId);
       return {
         ok: false,
         error: 'retell_deployment_mismatch',
+        acceptance: stopped.ok && stopped.applied ? 'rejected' : 'unknown',
         callId,
         providerStopApplied: stopped.ok && stopped.applied,
         ...(!stopped.ok ? { providerStopError: stopped.error } : {}),
@@ -104,7 +112,7 @@ export async function createPhoneCall(input: CreatePhoneCallInput): Promise<Crea
     }
     return { ok: true, callId, mock: false };
   } catch {
-    return { ok: false, error: 'retell_request_failed' };
+    return { ok: false, error: 'retell_request_failed', acceptance: 'unknown' };
   }
 }
 

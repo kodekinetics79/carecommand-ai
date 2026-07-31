@@ -1,7 +1,6 @@
 import { db } from '../db';
 import { createHash, randomUUID } from 'node:crypto';
 import type { Prisma } from '../../generated/prisma/client';
-import { sendMessage } from '../commsProvider';
 import { toE164, isValidE164 } from '../campaigns';
 import { getOpenSlots, parseSlot, speakTime, SLOT_MIN } from './availability';
 import { findSlotConflict, getSchedulingPolicy, isDoubleBookConflictError, resolveSchedulingService, unmetPreVisitRequirements } from '../scheduling';
@@ -19,6 +18,8 @@ import {
   renderRecordingDisclosure,
 } from './privacyLifecycle';
 import { restrictCallToBasicAttributes } from '../retell';
+import { CONFIRMATION_OUTBOX_SOURCE, processAppointmentConfirmations } from './confirmationOutbox';
+import { lockDncDestinationFence } from './dncFence';
 
 // Real-time tools the AI receptionist invokes DURING a call (Retell custom
 // functions). Each returns a JSON result with a `message` the agent can speak.
@@ -666,6 +667,7 @@ export async function recordDoNotCall(ctx: ToolContext, args: Record<string, unk
   const key = `${ctx.tenantId}:${callId}`;
   const result = await db.$transaction(async tx => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-dnc:${key}`})::bigint)`;
+    await lockDncDestinationFence(tx, ctx.tenantId, [phone]);
     const prior = await tx.idempotencyKey.findUnique({ where: { scope_key: { scope: 'receptionist.voice-optout', key } }, select: { resultId: true } });
     if (prior?.resultId) return { id: prior.resultId, duplicate: true };
     const row = await tx.receptionistOptOut.create({
@@ -674,6 +676,10 @@ export async function recordDoNotCall(ctx: ToolContext, args: Record<string, unk
     });
     await tx.idempotencyKey.create({ data: { tenantId: ctx.tenantId, scope: 'receptionist.voice-optout', key, resultId: row.id } });
     await tx.auditEvent.create({ data: { tenantId: ctx.tenantId, action: 'receptionist.optout.recorded', resource: 'receptionistOptOut', resourceId: row.id, metadata: { channel: 'ALL', source: 'retell_live_call' } } });
+    await tx.businessEvent.create({ data: {
+      tenantId: ctx.tenantId, eventType: 'receptionist.dnc.activated', entityType: 'receptionistOptOut',
+      entityId: row.id, sourceModule: 'receptionist', payload: { channel: 'ALL', source: 'retell_live_call' },
+    } });
     return { id: row.id, duplicate: false };
   });
   return { recorded: true, duplicate: result.duplicate, opt_out_id: result.id, message: 'I recorded your request. We will not make further outreach calls to this number.' };
@@ -722,7 +728,7 @@ export async function checkAvailability(ctx: ToolContext, args: Record<string, u
 }
 
 type BookingTransactionResult =
-  | { kind: 'booked'; appointmentId: string; requestId: string; patientId: string; firstName: string; email: string | null; phone: string | null; service: string; startsAt: Date; timezone: string; smsEnabled: boolean; emailEnabled: boolean; duplicate: boolean }
+  | { kind: 'booked'; tenantId: string; appointmentId: string; requestId: string; patientId: string; firstName: string; email: string | null; phone: string | null; service: string; startsAt: Date; timezone: string; smsEnabled: boolean; emailEnabled: boolean; messagingConsent: boolean | null; duplicate: boolean }
   | { kind: 'review'; requestId: string; duplicate: boolean; message: string }
   | { kind: 'rejected'; message: string };
 
@@ -733,9 +739,16 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
     return { booked: false, needs_human: true, message: 'I cannot bind this request to the exact active call and booking configuration. Please contact the front desk.' };
   }
   const validation = validateAttestedBookingArgs(trusted.intakeSnapshot, args);
-  const firstName = sanitizeText(args.first_name, MAX_NAME);
-  const lastName = sanitizeText(args.last_name, MAX_NAME);
-  const email = typeof args.email === 'string' ? args.email.trim() : null;
+  // Typed review columns are derived only from schema-recognized, valid scalar
+  // answers. Raw provider arguments are never allowed to bypass the attested
+  // contract merely because the overall request is being routed to review.
+  const recognizedAnswers = validation.answers ?? {};
+  const firstName = sanitizeText(recognizedAnswers.first_name, MAX_NAME);
+  const lastName = sanitizeText(recognizedAnswers.last_name, MAX_NAME);
+  const email = typeof recognizedAnswers.email === 'string' ? recognizedAnswers.email.trim() : null;
+  const messagingConsent = typeof recognizedAnswers.messaging_consent === 'boolean'
+    ? recognizedAnswers.messaging_consent
+    : null;
   const service = trusted.intakeSnapshot.appointmentType;
   const phone = validPhone(trusted.observedPhone);
   const persistedAnswers = validation.answers
@@ -744,8 +757,8 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
   const answerIssues = persistedAnswers ? [] : ['answers:maximum_bytes_with_provenance'];
   const rawAnswers: Prisma.InputJsonValue = persistedAnswers
     ?? { observed_phone: phone, unpersisted: true, reason: 'invalid_or_oversized_contract_answers' };
-  const date = typeof args.appointment_date === 'string' ? args.appointment_date : '';
-  const time = typeof args.appointment_time === 'string' ? args.appointment_time : '';
+  const date = typeof recognizedAnswers.appointment_date === 'string' ? recognizedAnswers.appointment_date : '';
+  const time = typeof recognizedAnswers.appointment_time === 'string' ? recognizedAnswers.appointment_time : '';
   const startsAt = trusted.branchTimezone ? parseSlot(date, time, trusted.branchTimezone) : null;
   const idempotencyKey = `${ctx.tenantId}:${trusted.callLogId}`;
 
@@ -804,13 +817,56 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
         return { kind: 'rejected', message: 'The existing booking evidence is inconsistent. A staff member must review it.' };
       }
       return {
-        kind: 'booked', appointmentId: existingAppointment.id, requestId: existingRequest.id,
+        kind: 'booked', tenantId: ctx.tenantId, appointmentId: existingAppointment.id, requestId: existingRequest.id,
         patientId: existingAppointment.patientId, firstName: existingAppointment.patient.firstName,
         email: existingAppointment.patient.email, phone: validPhone(existingAppointment.patient.phone),
         service: existingAppointment.service, startsAt: existingAppointment.startsAt,
         timezone: existingAppointment.branch.timezone, smsEnabled: campaign.smsConfirmation,
-        emailEnabled: campaign.emailConfirmation, duplicate: true,
+        emailEnabled: campaign.emailConfirmation,
+        messagingConsent: typeof (existingRequest.rawCollectedFields as Record<string, unknown> | null)?.messaging_consent === 'boolean'
+          ? (existingRequest.rawCollectedFields as Record<string, unknown>).messaging_consent as boolean
+          : null,
+        duplicate: true,
       };
+    }
+    // Migration-era bookings may have the request FK but lack the newly added
+    // source-call column on Appointment. Treat that FK as canonical evidence:
+    // repair only the unambiguous, provider-backed row and replay it. Never
+    // create a second appointment for the same call.
+    if (existingRequest?.status === 'BOOKED' && existingRequest.bookedAppointmentId) {
+      const linkedAppointment = await tx.appointment.findFirst({
+        where: { id: existingRequest.bookedAppointmentId, tenantId: ctx.tenantId, deletedAt: null },
+        select: {
+          id: true, patientId: true, providerProfileId: true, receptionistCallLogId: true,
+          service: true, startsAt: true, branch: { select: { timezone: true } },
+          patient: { select: { firstName: true, email: true, phone: true } },
+        },
+      });
+      if (!linkedAppointment || !linkedAppointment.providerProfileId
+        || (linkedAppointment.receptionistCallLogId && linkedAppointment.receptionistCallLogId !== trusted.callLogId)) {
+        return { kind: 'rejected', message: 'The existing booking evidence is inconsistent. A staff member must review it.' };
+      }
+      if (!linkedAppointment.receptionistCallLogId) {
+        await tx.appointment.update({
+          where: { id: linkedAppointment.id },
+          data: { receptionistCallLogId: trusted.callLogId },
+        });
+      }
+      return {
+        kind: 'booked', tenantId: ctx.tenantId, appointmentId: linkedAppointment.id, requestId: existingRequest.id,
+        patientId: linkedAppointment.patientId, firstName: linkedAppointment.patient.firstName,
+        email: linkedAppointment.patient.email, phone: validPhone(linkedAppointment.patient.phone),
+        service: linkedAppointment.service, startsAt: linkedAppointment.startsAt,
+        timezone: linkedAppointment.branch.timezone, smsEnabled: campaign.smsConfirmation,
+        emailEnabled: campaign.emailConfirmation,
+        messagingConsent: typeof (existingRequest.rawCollectedFields as Record<string, unknown> | null)?.messaging_consent === 'boolean'
+          ? (existingRequest.rawCollectedFields as Record<string, unknown>).messaging_consent as boolean
+          : null,
+        duplicate: true,
+      };
+    }
+    if (existingRequest && !['PENDING_REVIEW', 'MISSING_INFO'].includes(existingRequest.status)) {
+      return { kind: 'rejected', message: 'This appointment request already has a terminal staff decision. A staff member must review it.' };
     }
     if (call.outcome === 'BOOKED') return { kind: 'rejected', message: 'The call is marked booked without canonical appointment evidence. A staff member must review it.' };
     if (call.outcome !== 'IN_PROGRESS') {
@@ -842,7 +898,7 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
           where: { id: existingRequest.id },
           data: {
             branchId: trusted.branchId, campaignId: trusted.campaignId, requestedService: service,
-            collectedName: [firstName, lastName].filter(Boolean).join(' ') || null,
+            collectedName: firstName && lastName ? `${firstName} ${lastName}` : null,
             collectedPhone: phone, collectedEmail: email, rawCollectedFields: rawAnswers,
             requestedDateTime: startsAt, status: 'MISSING_INFO', missingFields, outcomeReason: reason,
           },
@@ -852,7 +908,7 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
           data: {
             tenantId: ctx.tenantId, branchId: trusted.branchId, campaignId: trusted.campaignId,
             callLogId: trusted.callLogId, requestedService: service,
-            collectedName: [firstName, lastName].filter(Boolean).join(' ') || null,
+            collectedName: firstName && lastName ? `${firstName} ${lastName}` : null,
             collectedPhone: phone, collectedEmail: email, rawCollectedFields: rawAnswers,
             requestedDateTime: startsAt, source: 'ai_receptionist', status: 'MISSING_INFO',
             missingFields, outcomeReason: reason,
@@ -965,24 +1021,57 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
         },
         select: { id: true },
       });
+    if (messagingConsent !== null) {
+      await tx.consentEvent.createMany({ data: (['SMS', 'EMAIL'] as const).map(purpose => ({
+        tenantId: ctx.tenantId,
+        patientId: patient.id,
+        purpose,
+        granted: messagingConsent,
+        source: 'receptionist_attested_call',
+        metadata: { callLogId: trusted.callLogId, appointmentId: appointment.id },
+      })) });
+    }
+    if (messagingConsent !== false) {
+      const channels = [
+        campaign.smsConfirmation && phone ? 'sms' : null,
+        campaign.emailConfirmation && email ? 'email' : null,
+      ].filter((channel): channel is 'sms' | 'email' => channel !== null);
+      if (channels.length) await tx.notificationEvent.createMany({
+        data: channels.map(channel => ({
+          tenantId: ctx.tenantId,
+          appointmentId: appointment.id,
+          patientId: patient.id,
+          recipientType: 'patient',
+          channel,
+          status: 'queued',
+          attempts: 0,
+          consentChecked: false,
+          consentResult: messagingConsent === true ? 'granted_unchecked' : 'not_recorded_transactional',
+          source: CONFIRMATION_OUTBOX_SOURCE,
+          idempotencyKey: `${appointment.id}:${channel}`,
+        })),
+        skipDuplicates: true,
+      });
+    }
     await tx.idempotencyKey.upsert({
       where: { scope_key: { scope: 'receptionist.live-booking', key: idempotencyKey } },
       update: { tenantId: ctx.tenantId, resultId: request.id },
       create: { tenantId: ctx.tenantId, scope: 'receptionist.live-booking', key: idempotencyKey, resultId: request.id },
     });
     await auditLive(ctx.tenantId, 'receptionist.appointment.booked', appointment.id, {
-      branchId: trusted.branchId, appointmentRequestId: request.id, callLogId: trusted.callLogId, via: 'live_call',
+      branchId: trusted.branchId, appointmentRequestId: request.id, callLogId: trusted.callLogId,
+      via: 'live_call', messagingConsent,
     }, tx);
     await tx.businessEvent.create({ data: {
       tenantId: ctx.tenantId, eventType: 'receptionist.appointment.booked', entityType: 'appointment',
       entityId: appointment.id, sourceModule: 'receptionist',
-      payload: { appointmentRequestId: request.id, callLogId: trusted.callLogId, live: true },
+      payload: { appointmentRequestId: request.id, callLogId: trusted.callLogId, live: true, messagingConsent },
     } });
     await tx.receptionistCallLog.update({ where: { id: trusted.callLogId }, data: { outcome: 'BOOKED' } });
     return {
-      kind: 'booked', appointmentId: appointment.id, requestId: request.id, patientId: patient.id,
+      kind: 'booked', tenantId: ctx.tenantId, appointmentId: appointment.id, requestId: request.id, patientId: patient.id,
       firstName, email, phone, service: schedulingService.name, startsAt, timezone: trusted.branchTimezone!,
-      smsEnabled: campaign.smsConfirmation, emailEnabled: campaign.emailConfirmation, duplicate: false,
+      smsEnabled: campaign.smsConfirmation, emailEnabled: campaign.emailConfirmation, messagingConsent, duplicate: false,
     };
   });
 
@@ -997,27 +1086,27 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
   if (result.kind === 'review') return { booked: false, needs_review: true, duplicate: result.duplicate, appointment_request_id: result.requestId, message: result.message };
 
   const localLabel = localAppointmentLabel(result.startsAt, result.timezone);
-  if (result.duplicate) {
-    return {
-      booked: true, duplicate: true, appointment_id: result.appointmentId,
-      sms_sent: false, sms_status: 'not_sent_replay', email_sent: false, email_status: 'not_sent_replay',
-      message: `You're already booked for ${result.service} on ${localLabel}. No duplicate confirmation was sent.`,
-    };
-  }
-  const confirmationBody = `Hi ${result.firstName}, your ${result.service} is confirmed for ${localLabel}.`;
-  const sms = result.smsEnabled && result.phone
-    ? await sendMessage('sms', result.phone, 'Appointment confirmed', `${confirmationBody} Reply STOP to opt out.`, `appt-confirm-sms-${result.appointmentId}`, { tenantId: ctx.tenantId, patientId: result.patientId }).catch(() => null)
-    : null;
-  const emailResult = result.emailEnabled && result.email
-    ? await sendMessage('email', result.email, 'Appointment confirmed', confirmationBody, `appt-confirm-email-${result.appointmentId}`, { tenantId: ctx.tenantId, patientId: result.patientId }).catch(() => null)
-    : null;
-  const smsSent = sms?.status === 'sent';
-  const emailSent = emailResult?.status === 'sent';
+  // Both the first response and canonical replays drain the same durable
+  // outbox. Already accepted rows no-op; queued/failed (or stale retrying)
+  // rows are claimable, so a process failure after booking commit is repaired
+  // without creating another appointment or another accepted send.
+  const confirmations = await processAppointmentConfirmations({
+    tenantId: result.tenantId,
+    appointmentId: result.appointmentId,
+    messagingConsent: result.messagingConsent,
+    smsEnabled: result.smsEnabled,
+    emailEnabled: result.emailEnabled,
+    phone: result.phone,
+    email: result.email,
+  });
+  const acceptedNow = confirmations.sms.acceptedNow || confirmations.email.acceptedNow;
   return {
-    booked: true, appointment_id: result.appointmentId,
-    sms_sent: smsSent, sms_status: sms?.status ?? (result.smsEnabled ? 'destination_unavailable' : 'disabled'),
-    email_sent: emailSent, email_status: emailResult?.status ?? (result.emailEnabled ? 'destination_unavailable' : 'disabled'),
-    message: `Perfect, ${result.firstName} — you're booked for ${result.service} on ${localLabel}.${smsSent || emailSent ? ' A confirmation was sent.' : ''}`,
+    booked: true, duplicate: result.duplicate || undefined, appointment_id: result.appointmentId,
+    sms_sent: false, sms_accepted: confirmations.sms.acceptedNow, sms_status: confirmations.sms.status,
+    email_sent: false, email_accepted: confirmations.email.acceptedNow, email_status: confirmations.email.status,
+    message: result.duplicate
+      ? `You're already booked for ${result.service} on ${localLabel}.${acceptedNow ? ' A pending confirmation was accepted by the messaging provider.' : ''}`
+      : `Perfect, ${result.firstName} — you're booked for ${result.service} on ${localLabel}.${acceptedNow ? ' A confirmation was accepted by the messaging provider.' : ''}`,
   };
 }
 

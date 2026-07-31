@@ -2,6 +2,7 @@ import { db } from './db';
 import { env } from '../config/env';
 import { runWithTenantContext } from './tenantContext';
 import type { ReceptionistOptOutChannel } from '../generated/prisma/client';
+import { canonicalDncDestination } from './receptionist/dncFence';
 
 // ===========================================================================
 // CRM Campaign / Reactivation engine helpers. Deterministic, tenant-scoped
@@ -163,23 +164,6 @@ export function isValidEmail(email: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((email ?? '').trim());
 }
 
-function phoneDigits(raw: string | null | undefined): string {
-  return (raw ?? '').replace(/\D/g, '');
-}
-
-// Two numbers match if their full digit strings are equal, or their last 10
-// digits are equal (handles a stored '+1 555…' vs a bare 10-digit destination).
-// Safe because the comparison is already tenant-scoped by the caller.
-function phonesEqual(a: string | null | undefined, b: string | null | undefined): boolean {
-  const da = phoneDigits(a);
-  const db_ = phoneDigits(b);
-  if (!da || !db_) return false;
-  if (da === db_) return true;
-  const la = da.slice(-10);
-  const lb = db_.slice(-10);
-  return la.length === 10 && la === lb;
-}
-
 // A comm channel maps to the ReceptionistOptOut channels that suppress it.
 // ALL suppresses everything; SMS/WHATSAPP -> SMS; EMAIL -> EMAIL; VOICE -> VOICE.
 const RECEPTIONIST_OPTOUT_CHANNELS: Record<CommChannel, ReceptionistOptOutChannel[]> = {
@@ -196,14 +180,14 @@ export async function isDestinationOptedOut(tenantId: string, destination: strin
   const isEmail = value.includes('@');
   const channels = RECEPTIONIST_OPTOUT_CHANNELS[channel];
   const rows = await db.receptionistOptOut.findMany({
-    where: { tenantId, channel: { in: channels }, ...(isEmail ? { contactEmail: { not: null } } : { contactPhone: { not: null } }) },
+    where: { tenantId, revokedAt: null, channel: { in: channels }, ...(isEmail ? { contactEmail: { not: null } } : { contactPhone: { not: null } }) },
     select: { contactPhone: true, contactEmail: true },
   });
   if (isEmail) {
-    const target = value.toLowerCase();
-    return rows.some(r => (r.contactEmail ?? '').trim().toLowerCase() === target);
+    const target = canonicalDncDestination(value);
+    return rows.some(r => canonicalDncDestination(r.contactEmail ?? '') === target);
   }
-  return rows.some(r => phonesEqual(r.contactPhone, value));
+  return rows.some(r => canonicalDncDestination(r.contactPhone ?? '') === canonicalDncDestination(value));
 }
 
 export async function isSuppressed(tenantId: string, target: { patientId?: string | null; leadId?: string | null; destination?: string | null }, channel: CommChannel): Promise<boolean> {

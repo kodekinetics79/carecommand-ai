@@ -56,8 +56,8 @@ describe('dedicated platform database plane', () => {
   });
 
   it('preserves the SQL-owned tenant-integrity manifest', async () => {
-    expect(TENANT_INTEGRITY_MANIFEST.compositeForeignKeys).toBe(121);
-    expect(TENANT_INTEGRITY_MANIFEST.totalManagedIndexes).toBe(150);
+    expect(TENANT_INTEGRITY_MANIFEST.compositeForeignKeys).toBe(122);
+    expect(TENANT_INTEGRITY_MANIFEST.totalManagedIndexes).toBe(152);
     await expect(inspectTenantIntegrityManifest(fixtureDb)).resolves.toEqual([]);
   });
 

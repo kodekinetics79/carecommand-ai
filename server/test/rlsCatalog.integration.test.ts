@@ -18,6 +18,7 @@ type PolicyRow = {
 // PlatformAuditEvent has an optional tenantId that identifies a target rather
 // than row ownership. It is the only explicit tenant-column RLS exemption.
 const TENANT_COLUMN_EXEMPTIONS = new Set(['PlatformAuditEvent']);
+const APPEND_ONLY_TABLES = new Set(['AuditEvent', 'NotificationDeliveryAttempt']);
 
 function schemaTenantTables(): string[] {
   // Prisma 7's generated namespace no longer exposes DMMF at runtime. Read the
@@ -86,7 +87,7 @@ describe('RLS catalog guard — every tenant-owned model is deny-by-default', ()
     const defects: string[] = [];
     for (const table of expectedTables) {
       const policies = byTable.get(table) ?? [];
-      const expectedCommands = table === 'AuditEvent'
+      const expectedCommands = APPEND_ONLY_TABLES.has(table)
         ? ['INSERT', 'SELECT']
         : ['DELETE', 'INSERT', 'SELECT', 'UPDATE'];
       const commands = policies.map(policy => policy.command).sort();
