@@ -33,6 +33,16 @@ const intakeLegacyPause = intakeMigrationSql.match(/WITH paused AS \([\s\S]*?FRO
 
 const phone = () => `+1${(BigInt(`0x${randomUUID().replace(/-/g, '').slice(0, 14)}`) % 10_000_000_000n).toString().padStart(10, '0')}`;
 
+function listedRetellAgent(agentId: string, version: number, tags: string[] = ['prod']) {
+  return {
+    has_more: false,
+    items: [{
+      agent_id: agentId, agent_name: 'Fixture agent', channel: 'voice', user_modified_timestamp: Date.now(),
+      tags: Object.fromEntries(tags.map(tag => [tag, { version, dynamic_variables: {} }])),
+    }],
+  };
+}
+
 async function tenant(): Promise<TenantFixture> {
   const id = randomUUID();
   tenantIds.push(id);
@@ -360,7 +370,6 @@ describe('AI receptionist trusted configuration', () => {
       webhook_events: ['call_started', 'call_ended', 'call_analyzed'],
       data_storage_setting: 'basic_attributes_only', opt_in_signed_url: true,
       response_engine: { type: 'retell-llm', llm_id: 'llm_safe', version: 3 },
-      dynamic_variables: { clinic_name: 'Provider-ready clinic', appointment_type: '' },
       last_modification_timestamp: Date.now(),
     };
     let providerBookingTool = compileIntakeContract({
@@ -372,7 +381,8 @@ describe('AI receptionist trusted configuration', () => {
         llm_id: 'llm_safe', version: 3, is_published: true, tool_call_strict_mode: true,
         general_tools: [providerBookingTool],
       }
-      : providerPayload), { status: 200 }));
+      : String(url).includes('list-agents') ? listedRetellAgent('agent_pilot_exact', providerPayload.version as number, ['prod', 'production'])
+        : providerPayload), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
 
     try {
@@ -399,7 +409,7 @@ describe('AI receptionist trusted configuration', () => {
       expect(stored.providerResponseEngineGraphFingerprint).toMatch(/^[a-f0-9]{64}$/);
       expect(stored.providerBookToolFingerprint).toMatch(/^[a-f0-9]{64}$/);
       expect(stored.providerToolCallStrictMode).toBe(true);
-      expect(stored.providerEffectiveDynamicVariables).toEqual({ clinic_name: 'Provider-ready clinic', appointment_type: '' });
+      expect(stored.providerEffectiveDynamicVariables).toEqual({});
       expect(stored.providerVerifiedRevision).toBe(stored.providerConfigRevision);
       expect(stored.providerVerificationExpiresAt!.getTime()).toBeGreaterThan(stored.providerVerifiedAt!.getTime());
 
@@ -600,6 +610,8 @@ describe('AI receptionist trusted configuration', () => {
       vi.stubGlobal('fetch', vi.fn(async url => new Response(
         String(url).includes('/get-retell-llm/')
           ? 'response engine temporarily unavailable'
+          : String(url).includes('list-agents')
+            ? JSON.stringify(listedRetellAgent('agent_original', 5))
           : JSON.stringify({
             agent_id: 'agent_original', version: 5, assigned_tags: ['prod'], is_published: true,
             voice_id: 'voice', language: 'en-US', webhook_url: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`,
@@ -741,6 +753,7 @@ describe('AI receptionist trusted configuration', () => {
     }).snapshot.bookAppointmentToolContract;
     vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(String(url).includes('/get-retell-llm/')
       ? { llm_id: 'llm', version: 1, is_published: true, tool_call_strict_mode: true, general_tools: [auditTool] }
+      : String(url).includes('list-agents') ? listedRetellAgent('agent_audit_bound', 8)
       : {
         agent_id: 'agent_audit_bound', version: 8, assigned_tags: ['prod'], is_published: true,
         voice_id: 'voice', language: 'en-US',

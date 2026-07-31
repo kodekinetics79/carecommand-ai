@@ -25,6 +25,29 @@ function providerAgent(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function listedProviderAgent(
+  overrides: Record<string, unknown> = {},
+  dynamicVariables: Record<string, string> = {},
+) {
+  const agent = providerAgent(overrides);
+  const assignedTags = agent.assigned_tags as string[];
+  const rootTags = assignedTags.length ? assignedTags : ['prod'];
+  return {
+    has_more: false,
+    items: [{
+      agent_id: agent.agent_id,
+      agent_name: 'Pilot agent',
+      channel: 'voice',
+      tags: Object.fromEntries(rootTags.map(tag => [tag, { version: agent.version, dynamic_variables: dynamicVariables }])),
+      user_modified_timestamp: 1_754_000_000_000,
+    }],
+  };
+}
+
+function providerAgentApiBody(url: string | URL | Request, overrides: Record<string, unknown> = {}) {
+  return String(url).includes('list-agents') ? listedProviderAgent(overrides) : providerAgent(overrides);
+}
+
 function bookingTool(url = 'https://api.example.test/v1/receptionist/webhooks/retell/fn?clinicId=clinic-1') {
   return compileIntakeContract({
     campaignId: 'campaign-1', revision: 1, appointmentType: 'Consultation', eligibleLocations: [], fields: [], toolUrl: url,
@@ -47,7 +70,7 @@ describe('Retell agent provider contract', () => {
         llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
         general_tools: [bookingTool()],
       }
-      : providerAgent()), { status: 200 }));
+      : providerAgentApiBody(url)), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
 
     const result = await probeRetellAgent('agent_pilot', 'prod');
@@ -55,6 +78,13 @@ describe('Retell agent provider contract', () => {
     expect(fetchMock).toHaveBeenCalledWith(
       'https://api.retellai.com/get-agent/agent_pilot?version=prod',
       expect.objectContaining({ headers: { Authorization: 'Bearer retell-secret-value' } }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://api.retellai.com/v2/list-agents?limit=100&sort_order=descending',
+      expect.objectContaining({
+        method: 'POST',
+        headers: { Authorization: 'Bearer retell-secret-value', 'Content-Type': 'application/json' },
+      }),
     );
     expect(fetchMock).toHaveBeenCalledWith(
       'https://api.retellai.com/get-retell-llm/llm_pilot?version=9',
@@ -85,7 +115,7 @@ describe('Retell agent provider contract', () => {
         tool_call_strict_mode: true, tools: [tool], start_node_id: 'start',
         nodes: [{ id: 'start', type: 'function', tool_id: 'tool_booking', edges: [] }],
       }
-      : providerAgent({ response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 }));
+      : providerAgentApiBody(url, { response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
 
     const result = await probeRetellAgent('agent_pilot', 'prod');
@@ -111,7 +141,7 @@ describe('Retell agent provider contract', () => {
         llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
         general_prompt: prompt, general_tools: [bookingTool()],
       }
-      : providerAgent()), { status: 200 })));
+      : providerAgentApiBody(url)), { status: 200 })));
     const first = await probeRetellAgent('agent_pilot', 'prod');
     prompt = 'Drifted prompt that no longer asks the configured questions.';
     const second = await probeRetellAgent('agent_pilot', 'prod');
@@ -147,7 +177,7 @@ describe('Retell agent provider contract', () => {
     vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(
       String(url).includes('/get-retell-llm/') ? engines.llm
         : String(url).includes('/get-conversation-flow/') ? engines.flow
-          : agent,
+          : String(url).includes('list-agents') ? listedProviderAgent(agent) : agent,
     ), { status: 200 })));
     const llm = await probeRetellAgent('agent_pilot', 'prod');
     expect(llm).toMatchObject({ ok: true, snapshot: { bookToolProbeStatus: 'SUCCEEDED' } });
@@ -173,15 +203,15 @@ describe('Retell agent provider contract', () => {
         ],
         components: [
           {
-            conversation_flow_component_id: 'safe_component', start_node_id: 'component_start', tools: [tool],
+            name: 'safe_component', start_node_id: 'component_start', tools: [tool],
             nodes: [{ id: 'component_start', type: 'function', tool_id: 'component_booking', edges: [] }],
           },
           // The official tool name appears in the reachable component registry.
           // It must not manufacture reachability for this unrelated component.
-          { conversation_flow_component_id: 'book_appointment', component_type: 'local' },
+          { name: 'book_appointment', component_type: 'local' },
         ],
       }
-      : providerAgent({ response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 })));
+      : providerAgentApiBody(url, { response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 })));
 
     const result = await probeRetellAgent('agent_pilot', 'prod');
 
@@ -201,7 +231,7 @@ describe('Retell agent provider contract', () => {
         tool_call_strict_mode: true, tools: [reachable, shadow], start_node_id: 'start',
         nodes: [{ id: 'start', type: 'function', tool_id: 'booking_primary', edges: [] }],
       }
-      : providerAgent({ response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 })));
+      : providerAgentApiBody(url, { response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 })));
 
     const result = await probeRetellAgent('agent_pilot', 'prod');
 
@@ -223,7 +253,7 @@ describe('Retell agent provider contract', () => {
           { id: 'shadow', type: 'function', tool_id: 'booking_shadow' },
         ],
       }
-      : providerAgent({ response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 })));
+      : providerAgentApiBody(url, { response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 })));
     const result = await probeRetellAgent('agent_pilot', 'prod');
     expect(result).toMatchObject({ ok: true, snapshot: { bookToolSchema: null, bookToolFingerprint: null } });
   });
@@ -241,7 +271,7 @@ describe('Retell agent provider contract', () => {
         nodes: [{ id: 'start', type: 'component', component_id: 'intake' }],
         components: { intake: { name: 'intake', flex_mode: true, nodes: [{ id: 'isolated', type: 'function', tools: [componentTool] }] } },
       }
-      : providerAgent({ response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 })));
+      : providerAgentApiBody(url, { response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 })));
 
     const root = await probeRetellAgent('agent_pilot', 'prod');
     rootFlex = false;
@@ -278,30 +308,107 @@ describe('Retell agent provider contract', () => {
     env.RETELL_API_KEY = 'real-key';
     vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(String(url).includes('/get-conversation-flow/')
       ? engineBody
-      : providerAgent({ response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 })));
+      : providerAgentApiBody(url, { response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 })));
     const result = await probeRetellAgent('agent_pilot', 'prod');
     expect(result).toMatchObject({ ok: true, snapshot: { bookToolSchema: null, bookToolFingerprint: null } });
   });
 
-  it('binds safe effective tag variables into the provider fingerprint and rejects behavior/template overrides', async () => {
+  it('requires every official tag dynamic-variable default to remain empty', async () => {
     env.RETELL_API_KEY = 'real-key';
-    let dynamicVariables: Record<string, string> = { clinic_name: 'Care Clinic', appointment_type: '' };
+    let dynamicVariables: Record<string, string> = {};
     vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(String(url).includes('/get-retell-llm/')
       ? { llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true, general_tools: [bookingTool()] }
-      : providerAgent({ dynamic_variables: dynamicVariables })), { status: 200 })));
+      : String(url).includes('list-agents') ? listedProviderAgent({}, dynamicVariables)
+        : providerAgent()), { status: 200 })));
     const first = await probeRetellAgent('agent_pilot', 'prod');
-    dynamicVariables = { clinic_name: 'Care Clinic East', appointment_type: '' };
-    const changed = await probeRetellAgent('agent_pilot', 'prod');
-    if (!first.ok || !changed.ok) throw new Error('expected provider snapshots');
-    expect(first.snapshot.effectiveDynamicVariables).toEqual({ appointment_type: '', clinic_name: 'Care Clinic' });
-    expect(changed.snapshot.fingerprint).not.toBe(first.snapshot.fingerprint);
+    if (!first.ok) throw new Error('expected provider snapshot');
+    expect(first.snapshot.effectiveDynamicVariables).toEqual({});
 
-    dynamicVariables = { appointment_type: 'Unsafe override' };
+    dynamicVariables = { first_name: '' };
     await expect(probeRetellAgent('agent_pilot', 'prod')).resolves.toEqual({ ok: false, error: 'invalid_response' });
-    dynamicVariables = { clinic_name: '{{caller_override}}' };
+  });
+
+  it('paginates official List Agents metadata until it establishes one exact agent', async () => {
+    env.RETELL_API_KEY = 'real-key';
+    const fetchMock = vi.fn<typeof fetch>(async url => {
+      const value = String(url);
+      if (value.includes('/get-retell-llm/')) {
+        return new Response(JSON.stringify({ llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true, general_tools: [bookingTool()] }), { status: 200 });
+      }
+      if (value.includes('/v2/list-agents')) {
+        if (!value.includes('pagination_key=next_page')) {
+          return new Response(JSON.stringify({
+            has_more: true, pagination_key: 'next_page',
+            items: [{ agent_id: 'agent_pilot_archive', agent_name: 'Archive', channel: 'voice', tags: {}, user_modified_timestamp: 1 }],
+          }), { status: 200 });
+        }
+        return new Response(JSON.stringify(listedProviderAgent()), { status: 200 });
+      }
+      return new Response(JSON.stringify(providerAgent()), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await probeRetellAgent('agent_pilot', 'prod');
+    expect(result).toMatchObject({ ok: true, snapshot: { effectiveDynamicVariables: {} } });
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/v2/list-agents'))).toHaveLength(2);
+  });
+
+  it('uses the authenticated legacy direct-array fallback only on v2 404 and blocks unavailable or ambiguous metadata', async () => {
+    env.RETELL_API_KEY = 'real-key';
+    let listMode: 'array' | 'unavailable' | 'ambiguous' = 'array';
+    const fetchMock = vi.fn<typeof fetch>(async url => {
+      const value = String(url);
+      if (value.includes('/v2/list-agents')) {
+        if (listMode === 'array') return new Response('not found', { status: 404 });
+        if (listMode === 'unavailable') return new Response('unavailable', { status: 503 });
+        const item = listedProviderAgent().items[0]!;
+        return new Response(JSON.stringify({ has_more: false, items: [item, item] }), { status: 200 });
+      }
+      if (value.includes('/list-agents')) {
+        const item = listedProviderAgent().items[0]!;
+        return new Response(JSON.stringify([item]), { status: 200 });
+      }
+      if (value.includes('/get-retell-llm/')) {
+        return new Response(JSON.stringify({ llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true, general_tools: [bookingTool()] }), { status: 200 });
+      }
+      return new Response(JSON.stringify(providerAgent()), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(probeRetellAgent('agent_pilot', 'prod')).resolves.toMatchObject({ ok: true });
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://api.retellai.com/list-agents?limit=100',
+      expect.objectContaining({ headers: { Authorization: 'Bearer real-key' } }),
+    );
+    listMode = 'unavailable';
+    await expect(probeRetellAgent('agent_pilot', 'prod')).resolves.toEqual({ ok: false, error: 'provider_unavailable' });
+    listMode = 'ambiguous';
     await expect(probeRetellAgent('agent_pilot', 'prod')).resolves.toEqual({ ok: false, error: 'invalid_response' });
-    dynamicVariables = { undocumented_future_override: '' };
-    await expect(probeRetellAgent('agent_pilot', 'prod')).resolves.toEqual({ ok: false, error: 'invalid_response' });
+  });
+
+  it.each([
+    ['LLM prompt placeholder', 'retell-llm', {
+      llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+      general_prompt: 'Welcome {{first_name}}', general_tools: [bookingTool()],
+    }],
+    ['LLM default variable', 'retell-llm', {
+      llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+      default_dynamic_variables: { first_name: '' }, general_tools: [bookingTool()],
+    }],
+    ['flow condition placeholder', 'conversation-flow', {
+      conversation_flow_id: 'flow_pilot', version: 4, tool_call_strict_mode: true, start_node_id: 'start',
+      tools: [{ ...bookingTool(), tool_id: 'booking' }],
+      nodes: [{ id: 'start', type: 'function', tool_id: 'booking', edges: [{ destination_node_id: 'done', condition: '{{caller_choice}}' }] }, { id: 'done', type: 'end' }],
+    }],
+  ] as const)('rejects templates/defaults anywhere in executable behavior: %s', async (_name, engineType, engineBody) => {
+    env.RETELL_API_KEY = 'real-key';
+    vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(
+      String(url).includes('/get-retell-llm/') || String(url).includes('/get-conversation-flow/')
+        ? engineBody
+        : providerAgentApiBody(url, { response_engine: engineType === 'retell-llm'
+          ? { type: engineType, llm_id: 'llm_pilot', version: 9 }
+          : { type: engineType, conversation_flow_id: 'flow_pilot', version: 4 } }),
+    ), { status: 200 })));
+    const result = await probeRetellAgent('agent_pilot', 'prod');
+    expect(result).toMatchObject({ ok: true, snapshot: { bookToolSchema: null, bookToolFingerprint: null } });
   });
 
   it('fails closed when a reachable shared component is not recursively resolved', async () => {
@@ -316,7 +423,7 @@ describe('Retell agent provider contract', () => {
           { id: 'shared', type: 'component', component_type: 'shared', component_id: 'shared_hidden_tools' },
         ],
       }
-      : providerAgent({ response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 })));
+      : providerAgentApiBody(url, { response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 })));
 
     const result = await probeRetellAgent('agent_pilot', 'prod');
 
@@ -351,8 +458,8 @@ describe('Retell agent provider contract', () => {
       conversation_flow_id: 'flow_pilot', version: 4, tool_call_strict_mode: true, start_node_id: 'start',
       nodes: [{ id: 'start', type: 'component', component_id: 'duplicate' }],
       components: [
-        { conversation_flow_component_id: 'duplicate', flex_mode: true, tools: [bookingTool()] },
-        { conversation_flow_component_id: 'duplicate', flex_mode: true, tools: [] },
+        { name: 'duplicate', flex_mode: true, tools: [bookingTool()] },
+        { name: 'duplicate', flex_mode: true, tools: [] },
       ],
     }],
     ['flow duplicate official local component names', 'conversation-flow', {
@@ -371,10 +478,10 @@ describe('Retell agent provider contract', () => {
         two: { name: 'other', flex_mode: true, nodes: [{ id: 'two', type: 'end' }] },
       },
     }],
-    ['flow local component array without deterministic id', 'conversation-flow', {
+    ['flow local component array without required name', 'conversation-flow', {
       conversation_flow_id: 'flow_pilot', version: 4, tool_call_strict_mode: true, start_node_id: 'start',
       nodes: [{ id: 'start', type: 'component', component_id: 'local' }],
-      components: [{ name: 'local', flex_mode: true, nodes: [{ id: 'inside', type: 'end' }] }],
+      components: [{ flex_mode: true, nodes: [{ id: 'inside', type: 'end' }] }],
     }],
     ['flow missing start node', 'conversation-flow', {
       conversation_flow_id: 'flow_pilot', version: 4, tool_call_strict_mode: true, start_node_id: 'missing',
@@ -389,7 +496,7 @@ describe('Retell agent provider contract', () => {
     vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(
       String(url).includes('/get-retell-llm/') || String(url).includes('/get-conversation-flow/')
         ? engineBody
-        : providerAgent({ response_engine: engineType === 'retell-llm'
+        : providerAgentApiBody(url, { response_engine: engineType === 'retell-llm'
           ? { type: engineType, llm_id: 'llm_pilot', version: 9 }
           : { type: engineType, conversation_flow_id: 'flow_pilot', version: 4 } }),
     ), { status: 200 })));
@@ -411,7 +518,7 @@ describe('Retell agent provider contract', () => {
     [{ opt_in_signed_url: false }, 'signed_url_disabled'],
   ] as const)('rejects unsafe published-deployment state %#', async (overrides, expected) => {
     env.RETELL_API_KEY = 'real-key';
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(providerAgent(overrides)), { status: 200 })));
+    vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(providerAgentApiBody(url, overrides)), { status: 200 })));
     const result = await probeRetellAgent('agent_pilot', 'prod');
     if (!result.ok) throw new Error('expected parsed provider snapshot');
     expect(evaluateRetellAgentReadiness(result.snapshot, { versionTag: 'prod', webhookUrl })).toBe(expected);
@@ -433,7 +540,7 @@ describe('Retell agent provider contract', () => {
 
   it('accepts Retell agent and response-engine version zero', async () => {
     env.RETELL_API_KEY = 'real-key';
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(providerAgent({
+    vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(providerAgentApiBody(url, {
       version: 0,
       response_engine: { type: 'retell-llm', llm_id: 'llm-v0', version: 0 },
     })), { status: 200 })));

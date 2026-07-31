@@ -134,9 +134,11 @@ export interface RetellAgentSnapshot {
   fingerprint: string;
 }
 
+type RetellAgentProbeError = 'setup_required' | 'mock_not_verifiable' | 'unauthorized' | 'not_found' | 'invalid_request' | 'provider_unavailable' | 'invalid_response';
+
 export type RetellAgentProbeResult =
   | { ok: true; snapshot: RetellAgentSnapshot }
-  | { ok: false; error: 'setup_required' | 'mock_not_verifiable' | 'unauthorized' | 'not_found' | 'invalid_request' | 'provider_unavailable' | 'invalid_response' };
+  | { ok: false; error: RetellAgentProbeError };
 
 function nonEmptyString(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
@@ -157,35 +159,17 @@ function providerDate(value: unknown): Date | null {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
-const SAFE_NONEMPTY_PROVIDER_VARIABLES = new Set([
-  'agent_name', 'campaign_name', 'clinic_name', 'clinic_phone', 'clinic_timezone',
-  'clinic_website', 'first_name', 'human_fallback_number', 'offer_title',
-]);
-const EMPTY_ONLY_PROVIDER_VARIABLES = new Set([
-  'appointment_type', 'booking_mode', 'consent_text', 'disclosure',
-  'eligible_locations', 'human_handoff', 'required_fields', 'script',
-]);
-
-function providerEffectiveDynamicVariables(value: unknown): Record<string, string> | null {
+function emptyProviderDynamicVariables(value: unknown): Record<string, string> | null {
   if (value === undefined || value === null) return {};
   const values = record(value);
-  if (!values || Object.keys(values).length > 64) return null;
-  const normalized: Record<string, string> = {};
-  for (const key of Object.keys(values).sort()) {
-    const item = values[key];
-    if (!/^[a-z][a-z0-9_]{0,63}$/.test(key) || typeof item !== 'string' || item.length > 500) return null;
-    if (!SAFE_NONEMPTY_PROVIDER_VARIABLES.has(key) && !EMPTY_ONLY_PROVIDER_VARIABLES.has(key)) return null;
-    if ([...item].some(character => {
-      const code = character.charCodeAt(0);
-      return code <= 31 || code === 127;
-    }) || /\{\{|\}\}|\$\{/.test(item)) return null;
-    // Empty tag defaults are intentionally safe: the signed call launch owns
-    // those values. Non-empty provider defaults are limited to presentation
-    // fields and cannot override booking, identity, consent, or tool routing.
-    if (item !== '' && !SAFE_NONEMPTY_PROVIDER_VARIABLES.has(key)) return null;
-    normalized[key] = item;
-  }
-  return normalized;
+  return values && Object.keys(values).length === 0 ? {} : null;
+}
+
+function containsProviderTemplateSyntax(value: unknown): boolean {
+  if (typeof value === 'string') return /\{\{[^{}]+\}\}|\$\{[^{}]+\}/.test(value);
+  if (Array.isArray(value)) return value.some(containsProviderTemplateSyntax);
+  const valueRecord = record(value);
+  return valueRecord ? Object.values(valueRecord).some(containsProviderTemplateSyntax) : false;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -361,10 +345,9 @@ function reachableConversationFlowTools(body: Record<string, unknown>): { tools:
   if (Array.isArray(componentInput)) {
     for (const value of componentInput) {
       const component = record(value);
-      // Retell's local-component response is an object map. Array-shaped data
-      // is accepted only when every entry carries the provider's stable shared
-      // component identifier; guessed `id`/`component_id` aliases are unsafe.
-      const id = nonEmptyString(component?.conversation_flow_component_id);
+      // Retell local components are array entries whose required `name` is the
+      // identity referenced by a component node's `component_id`.
+      const id = nonEmptyString(component?.name);
       if (!component || !id) return null;
       componentEntries.push([id, component]);
     }
@@ -385,8 +368,8 @@ function reachableConversationFlowTools(body: Record<string, unknown>): { tools:
     if (record(componentInput)) {
       if (!name || componentNames.has(name)) return null;
       componentNames.set(name, id);
-    } else if (name) {
-      if (componentNames.has(name)) return null;
+    } else {
+      if (!name || componentNames.has(name)) return null;
       componentNames.set(name, id);
     }
   }
@@ -445,6 +428,9 @@ async function probeRetellBookTool(responseEngineType: string, responseEngineId:
       return { status: 'UNAVAILABLE' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint: null };
     }
     const graphFingerprint = fingerprintJson(body);
+    if (containsProviderTemplateSyntax(body) || !emptyProviderDynamicVariables(body.default_dynamic_variables)) {
+      return { status: 'SUCCEEDED' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint };
+    }
     const discovery = responseEngineType === 'retell-llm'
       ? { tools: reachableRetellLlmTools(body) }
       : reachableConversationFlowTools(body);
@@ -472,6 +458,86 @@ async function probeRetellBookTool(responseEngineType: string, responseEngineId:
   } catch {
     return { status: 'UNAVAILABLE' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint: null };
   }
+}
+
+async function probeRetellEmptyTagDefaults(
+  agentId: string,
+  versionTag: string,
+  expectedVersion: number,
+  assignedTags: string[],
+): Promise<{ ok: true; dynamicVariables: Record<string, string> } | { ok: false; error: RetellAgentProbeError }> {
+  let paginationKey: string | null = null;
+  let legacyEndpoint = false;
+  const seenPaginationKeys = new Set<string>();
+  const exactItems: Record<string, unknown>[] = [];
+  for (let page = 0; page < 25; page += 1) {
+    const buildUrl = (legacy: boolean) => {
+      const url = new URL(`${env.RETELL_BASE_URL}/${legacy ? 'list-agents' : 'v2/list-agents'}`);
+      url.searchParams.set('limit', '100');
+      if (!legacy) url.searchParams.set('sort_order', 'descending');
+      if (paginationKey) url.searchParams.set('pagination_key', paginationKey);
+      return url;
+    };
+    const requestList = (legacy: boolean) => fetchWithTimeout(buildUrl(legacy).toString(), legacy
+      ? { headers: { Authorization: `Bearer ${env.RETELL_API_KEY}` } }
+      : {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${env.RETELL_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filter_criteria: {
+            channel: { type: 'string', op: 'eq', value: 'voice' },
+            query: agentId,
+          },
+        }),
+      });
+    let response: Response;
+    try {
+      response = await requestList(legacyEndpoint);
+      if (!legacyEndpoint && response.status === 404) {
+        legacyEndpoint = true;
+        paginationKey = null;
+        seenPaginationKeys.clear();
+        response = await requestList(true);
+      }
+    } catch {
+      return { ok: false, error: 'provider_unavailable' };
+    }
+    if (response.status === 401 || response.status === 403) return { ok: false, error: 'unauthorized' };
+    if (response.status === 400 || response.status === 422) return { ok: false, error: 'invalid_request' };
+    if (!response.ok) return { ok: false, error: 'provider_unavailable' };
+    const body = await response.json().catch(() => null) as unknown;
+    const bodyRecord = record(body);
+    const items = Array.isArray(body) ? body : bodyRecord?.items;
+    if (!Array.isArray(items)) return { ok: false, error: 'invalid_response' };
+    for (const itemValue of items) {
+      const item = record(itemValue);
+      const listedAgentId = nonEmptyString(item?.agent_id);
+      if (!item || !listedAgentId) return { ok: false, error: 'invalid_response' };
+      if (listedAgentId === agentId) exactItems.push(item);
+    }
+    if (Array.isArray(body)) break;
+    if (bodyRecord?.has_more !== true) break;
+    const nextKey = nonEmptyString(bodyRecord.pagination_key);
+    if (!nextKey || seenPaginationKeys.has(nextKey)) return { ok: false, error: 'invalid_response' };
+    seenPaginationKeys.add(nextKey);
+    paginationKey = nextKey;
+    if (page === 24) return { ok: false, error: 'invalid_response' };
+  }
+  if (exactItems.length !== 1) return { ok: false, error: exactItems.length ? 'invalid_response' : 'not_found' };
+  const tags = record(exactItems[0]!.tags);
+  if (!tags) return { ok: false, error: 'invalid_response' };
+  for (const [tagName, metadataValue] of Object.entries(tags)) {
+    const metadata = record(metadataValue);
+    if (!nonEmptyString(tagName) || !metadata || !emptyProviderDynamicVariables(metadata.dynamic_variables)) {
+      return { ok: false, error: 'invalid_response' };
+    }
+  }
+  for (const assignedTag of assignedTags) {
+    const metadata = record(tags[assignedTag]);
+    if (!metadata || nonNegativeInteger(metadata.version) !== expectedVersion) return { ok: false, error: 'invalid_response' };
+  }
+  if (nonNegativeInteger(record(tags[versionTag])?.version) !== expectedVersion) return { ok: false, error: 'invalid_response' };
+  return { ok: true, dynamicVariables: {} };
 }
 
 /**
@@ -512,8 +578,9 @@ export async function probeRetellAgent(agentId: string, versionTag: string): Pro
     }
     const assignedTags = Array.isArray(body.assigned_tags) ? body.assigned_tags.filter((item): item is string => typeof item === 'string') : [];
     const webhookEvents = Array.isArray(body.webhook_events) ? body.webhook_events.filter((item): item is string => typeof item === 'string') : [];
-    const effectiveDynamicVariables = providerEffectiveDynamicVariables(body.dynamic_variables);
-    if (!effectiveDynamicVariables) return { ok: false, error: 'invalid_response' };
+    const tagDefaults = await probeRetellEmptyTagDefaults(agentId, versionTag, version, assignedTags);
+    if (!tagDefaults.ok) return tagDefaults;
+    const effectiveDynamicVariables = tagDefaults.dynamicVariables;
     const responseEngineVersion = nonNegativeInteger(responseEngine?.version);
     const bookTool = await probeRetellBookTool(responseEngineType, responseEngineId, responseEngineVersion);
     const safety = {
