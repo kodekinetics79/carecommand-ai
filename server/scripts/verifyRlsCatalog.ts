@@ -64,6 +64,12 @@ const READ_ONLY = new Set(['SELECT']);
 const READ_APPEND = new Set(['SELECT', 'INSERT']);
 const NO_PRIVILEGES = new Set<string>();
 const FULL_CRUD_EVIDENCE = new Set(['AiGuardrail']);
+const TENANT_APPEND_ONLY_TABLES = new Set([
+  'AuditEvent',
+  'NotificationDeliveryAttempt',
+  'ReceptionistOutboundProviderIntent',
+  'ReceptionistVoiceConsentEvent',
+]);
 
 const GLOBAL_CLASSIFICATIONS: Record<string, Classification> = {
   SubscriptionPlan: globalReference('D', 'Commercial subscription-plan catalogue.', READ_ONLY),
@@ -167,10 +173,10 @@ function classify(table: TableRow): Classification | null {
     };
   }
   if (table.has_tenant_id && table.tenant_id_not_null) {
-    const audit = table.table_name === 'AuditEvent';
+    const appendOnly = TENANT_APPEND_ONLY_TABLES.has(table.table_name);
     return {
-      category: audit ? 'F' : 'A',
-      purpose: audit ? 'Tenant append-only audit evidence.' : `${table.table_name} tenant application data.`,
+      category: appendOnly ? 'F' : 'A',
+      purpose: appendOnly ? `${table.table_name} tenant append-only evidence.` : `${table.table_name} tenant application data.`,
       tenantOwned: true,
       // Conservative classification: tenant application rows may contain PHI
       // directly or through JSON/relationship-derived operational context.
@@ -179,11 +185,11 @@ function classify(table: TableRow): Classification | null {
       directlyQueryable: true,
       accessPath: 'Verified request/portal/worker/webhook TenantContext through app_rls.',
       supportBehavior: 'Only explicit, reasoned, time-bounded support context; policy validation and audit required.',
-      requiredTest: audit
+      requiredTest: appendOnly
         ? 'Same-tenant SELECT/INSERT; cross/no-context denial; UPDATE/DELETE privilege denial.'
         : 'Table-driven same-tenant CRUD plus cross/no/inactive-context denial.',
       exemption: '',
-      expectedPrivileges: audit ? READ_APPEND : CRUD,
+      expectedPrivileges: appendOnly ? READ_APPEND : CRUD,
     };
   }
   return null;
@@ -348,11 +354,8 @@ async function main() {
     if (!table.rls_forced) failures.push(`Protected table "${table.table_name}" does not have FORCE RLS enabled.`);
     if (table.owner_name === role.role_name) failures.push(`Runtime role "${role.role_name}" owns protected table "${table.table_name}".`);
 
-    const commands = table.table_name === 'Tenant'
-      ? ['SELECT']
-      : table.table_name === 'AuditEvent'
-        ? ['SELECT', 'INSERT']
-        : ['SELECT', 'INSERT', 'UPDATE', 'DELETE'];
+    const commands = ['SELECT', 'INSERT', 'UPDATE', 'DELETE']
+      .filter(command => classification.expectedPrivileges.has(command));
     const publicPolicies = policies.filter(policy =>
       policy.table_name === table.table_name && policy.roles.includes('public'),
     );
