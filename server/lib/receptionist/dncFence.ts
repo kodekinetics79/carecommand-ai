@@ -104,6 +104,7 @@ export async function isChannelSuppressedTx(
     channel: DncChannel;
     patientId?: string | null;
     leadId?: string | null;
+    at?: Date;
   },
 ): Promise<boolean> {
   const identity = { tenantId: input.tenantId, patientId: input.patientId ?? null, leadId: input.leadId ?? null };
@@ -116,8 +117,10 @@ export async function isChannelSuppressedTx(
       : input.channel === 'sms' ? 'SMS'
         : input.channel === 'email' ? 'EMAIL' : 'WHATSAPP';
     const latestLegacy = await tx.consentEvent.findFirst({
-      where: { tenantId: input.tenantId, patientId: input.patientId, purpose },
-      orderBy: [{ occurredAt: 'desc' }, { id: 'desc' }],
+      where: { tenantId: input.tenantId, patientId: input.patientId, purpose, occurredAt: { lte: input.at ?? new Date() } },
+      // A deny wins a timestamp tie. UUID ordering is only a final stable
+      // ordering key and never determines whether permission exists.
+      orderBy: [{ occurredAt: 'desc' }, { granted: 'asc' }, { id: 'desc' }],
       select: { granted: true },
     });
     if (latestLegacy?.granted === false) return true;
@@ -136,7 +139,7 @@ export async function compatibleVoiceConsentEventTx(
     at?: Date;
   },
 ): Promise<{ id: string } | null> {
-  const at = input.at ?? new Date();
+  const at = input.at ?? (await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`)[0]!.now;
   const latest = await tx.receptionistVoiceConsentEvent.findFirst({
     where: {
       tenantId: input.tenantId,
@@ -144,6 +147,7 @@ export async function compatibleVoiceConsentEventTx(
       leadId: input.leadId ?? null,
       purpose: input.purpose,
       policyVersion: input.policyVersion,
+      occurredAt: { lte: at },
     },
     // A revocation wins a timestamp tie; UUID ordering must never decide
     // whether permission exists.
@@ -162,6 +166,8 @@ export async function compatibleVoiceConsentEventTx(
 export async function authorizeOutboundProviderIntentTx(
   tx: Prisma.TransactionClient,
   input: {
+    id: string;
+    correlationNonceHash: string;
     tenantId: string;
     callLogId: string;
     outboundCampaignId: string;
@@ -172,45 +178,101 @@ export async function authorizeOutboundProviderIntentTx(
     legalBasis: 'EXPLICIT_CONSENT' | 'TREATMENT_OPERATIONS';
   },
 ) {
-  const target = input.targetId ? await tx.receptionistCallTarget.findFirst({
-    where: { id: input.targetId, tenantId: input.tenantId, campaignId: input.outboundCampaignId },
-    select: { patientId: true, leadId: true, phone: true },
-  }) : null;
-  if (input.targetId && !target) throw new Error('outbound_provider_intent_target_missing');
-  if (target && canonicalDncDestination(target.phone) !== canonicalDncDestination(input.destination)) {
+  if (!/^[0-9a-f]{64}$/.test(input.correlationNonceHash)) {
+    throw new Error('outbound_provider_intent_correlation_hash_invalid');
+  }
+  if (!input.targetId) throw new Error('outbound_provider_intent_target_missing');
+
+  const [{ now: databaseNow }] = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+  const calls = await tx.$queryRaw<Array<{
+    targetId: string | null; callerPhone: string | null;
+  }>>`
+    SELECT "targetId", "callerPhone"
+    FROM "ReceptionistCallLog"
+    WHERE "tenantId"=${input.tenantId}::uuid AND id=${input.callLogId}::uuid
+      AND "outboundCampaignId"=${input.outboundCampaignId}::uuid
+    FOR UPDATE
+  `;
+  const call = calls[0];
+  if (!call || call.targetId !== input.targetId) throw new Error('outbound_provider_intent_call_boundary_mismatch');
+
+  const targets = await tx.$queryRaw<Array<{
+    patientId: string | null; leadId: string | null; phone: string;
+  }>>`
+    SELECT "patientId", "leadId", phone
+    FROM "ReceptionistCallTarget"
+    WHERE "tenantId"=${input.tenantId}::uuid AND "campaignId"=${input.outboundCampaignId}::uuid
+      AND id=${input.targetId}::uuid
+    FOR UPDATE
+  `;
+  const target = targets[0];
+  if (!target) throw new Error('outbound_provider_intent_target_missing');
+  if ((Number(Boolean(target.patientId)) + Number(Boolean(target.leadId))) !== 1) {
+    throw new Error('outbound_provider_intent_identity_invalid');
+  }
+  const destinationCanonical = canonicalDncDestination(input.destination);
+  if (!destinationCanonical
+      || canonicalDncDestination(target.phone) !== destinationCanonical
+      || canonicalDncDestination(call.callerPhone ?? '') !== destinationCanonical) {
     throw new Error('outbound_provider_intent_destination_mismatch');
   }
 
+  // Suppression/consent writers acquire these advisory locks before their FK
+  // checks. Match that order before taking the Patient/Lead row lock to avoid
+  // an identity-row/advisory-lock inversion under concurrent revocation.
   await lockSuppressionFences(tx, {
     tenantId: input.tenantId,
-    destinations: [input.destination],
-    patientId: target?.patientId,
-    leadId: target?.leadId,
+    destinations: [destinationCanonical],
+    patientId: target.patientId,
+    leadId: target.leadId,
   });
+
+  const identities = target.patientId
+    ? await tx.$queryRaw<Array<{ phone: string | null; deletedAt: Date | null; updatedAt: Date }>>`
+        SELECT phone, "deletedAt", "updatedAt" FROM "Patient"
+        WHERE "tenantId"=${input.tenantId}::uuid AND id=${target.patientId}::uuid FOR UPDATE
+      `
+    : await tx.$queryRaw<Array<{ phone: string | null; deletedAt: Date | null; updatedAt: Date }>>`
+        SELECT phone, "deletedAt", "updatedAt" FROM "Lead"
+        WHERE "tenantId"=${input.tenantId}::uuid AND id=${target.leadId!}::uuid FOR UPDATE
+      `;
+  const identity = identities[0];
+  if (!identity || identity.deletedAt) throw new Error('outbound_provider_intent_identity_inactive');
+  if (canonicalDncDestination(identity.phone ?? '') !== destinationCanonical) {
+    throw new Error('outbound_provider_intent_destination_mismatch');
+  }
   if (await isChannelSuppressedTx(tx, {
     tenantId: input.tenantId,
     destination: input.destination,
     channel: 'voice',
-    patientId: target?.patientId,
-    leadId: target?.leadId,
+    patientId: target.patientId,
+    leadId: target.leadId,
+    at: databaseNow,
   })) throw new Error('outbound_provider_intent_suppressed');
 
   const requiresConsent = input.legalBasis === 'EXPLICIT_CONSENT' || input.purpose === 'PATIENT_REACTIVATION';
   const consent = requiresConsent ? await compatibleVoiceConsentEventTx(tx, {
     tenantId: input.tenantId,
-    patientId: target?.patientId,
-    leadId: target?.leadId,
+    patientId: target.patientId,
+    leadId: target.leadId,
     purpose: input.purpose,
     policyVersion: input.policyVersion,
+    at: databaseNow,
   }) : null;
   if (requiresConsent && !consent) throw new Error('outbound_provider_intent_consent_missing');
 
   return tx.receptionistOutboundProviderIntent.create({ data: {
+    id: input.id,
     tenantId: input.tenantId,
     callLogId: input.callLogId,
     outboundCampaignId: input.outboundCampaignId,
     targetId: input.targetId ?? undefined,
+    patientId: target.patientId,
+    leadId: target.leadId,
     voiceConsentEventId: consent?.id,
+    destinationCanonical,
+    identityUpdatedAt: identity.updatedAt,
+    correlationNonceHash: input.correlationNonceHash,
     purpose: input.purpose,
     policyVersion: input.policyVersion,
   } });

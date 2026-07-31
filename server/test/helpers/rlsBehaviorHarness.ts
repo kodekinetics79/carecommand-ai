@@ -708,9 +708,25 @@ export class RlsBehaviorHarness {
       values.set('source', 'patient_written');
     }
     if (table === 'ReceptionistOutboundProviderIntent') {
-      const campaignId = values.get('outboundCampaignId');
-      const callLogId = values.get('callLogId');
-      if (typeof campaignId !== 'string' || typeof callLogId !== 'string') return null;
+      const campaign = this.fixtures.get(key('ReceptionistOutboundCampaign', tenantId));
+      const call = this.fixtures.get(key('ReceptionistCallLog', tenantId));
+      const campaignId = campaign?.row.id;
+      const callLogId = call?.row.id;
+      if (typeof campaignId !== 'string' || typeof callLogId !== 'string') {
+        throw new Error('Provider-intent RLS fixture is missing its required campaign/call dependency');
+      }
+      values.set('outboundCampaignId', campaignId);
+      values.set('callLogId', callLogId);
+      const target = this.fixtures.get(key('ReceptionistCallTarget', tenantId));
+      const patient = this.fixtures.get(key('Patient', tenantId));
+      if (!target || !patient) return null;
+      const destination = syntheticE164Phone(`provider-intent:${tenantId}`);
+      const identity = await this.owner.query<{ updatedAt: Date }>(
+        `UPDATE "Patient" SET phone=$1, "deletedAt"=NULL, "updatedAt"=statement_timestamp()
+         WHERE "tenantId"=$2 AND id=$3 RETURNING "updatedAt"`,
+        [destination, tenantId, patient.row.id],
+      );
+      if (!identity.rows[0]) throw new Error('Provider-intent RLS fixture could not lock its patient identity');
       const actorId = tenantId === this.tenantA ? this.actorA : this.actorB;
       await this.owner.query(
         `UPDATE "ReceptionistOutboundCampaign"
@@ -721,15 +737,27 @@ export class RlsBehaviorHarness {
         [actorId, 'f'.repeat(64), tenantId, campaignId],
       );
       await this.owner.query(
+        `UPDATE "ReceptionistCallTarget"
+         SET "campaignId"=$1, "patientId"=$2, "leadId"=NULL, phone=$3, status='CALLING'
+         WHERE "tenantId"=$4 AND id=$5`,
+        [campaignId, patient.row.id, destination, tenantId, target.row.id],
+      );
+      await this.owner.query(
         `UPDATE "ReceptionistCallLog"
          SET direction='outbound', outcome='IN_PROGRESS', "endedAt"=NULL, "retellCallId"=NULL,
-             "outboundCampaignId"=$1, "targetId"=NULL, "callerPhone"=$2
-         WHERE "tenantId"=$3 AND id=$4`,
-        [campaignId, syntheticE164Phone(`provider-intent:${tenantId}`), tenantId, callLogId],
+             "outboundCampaignId"=$1, "targetId"=$2, "callerPhone"=$3
+         WHERE "tenantId"=$4 AND id=$5`,
+        [campaignId, target.row.id, destination, tenantId, callLogId],
       );
       values.set('purpose', 'CARE_COORDINATION');
       values.set('policyVersion', 'rls-policy-v1');
-      values.delete('targetId');
+      values.set('targetId', target.row.id);
+      values.set('patientId', patient.row.id);
+      values.delete('leadId');
+      values.set('destinationCanonical', destination);
+      values.set('identityUpdatedAt', identity.rows[0].updatedAt);
+      values.set('correlationNonceHash', createHash('sha256').update(`provider-intent:${tenantId}`).digest('hex'));
+      values.set('boundaryVersion', 1);
       values.delete('voiceConsentEventId');
     }
     const record = await this.insertRecord(table, values, tenantId);
