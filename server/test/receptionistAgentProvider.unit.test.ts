@@ -2,7 +2,8 @@ import 'dotenv/config';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { env } from '../config/env';
 import { evaluateRetellAgentReadiness, probeRetellAgent } from '../lib/retell';
-import { compileIntakeContract } from '../modules/receptionist/intakeContract';
+import { bookAppointmentToolFingerprint, compileIntakeContract } from '../modules/receptionist/intakeContract';
+import { buildRetellConfig, type PromptConfig } from '../modules/receptionist/promptService';
 
 const original = { apiKey: env.RETELL_API_KEY, baseUrl: env.RETELL_BASE_URL };
 const webhookUrl = 'https://api.example.test/v1/receptionist/webhooks/retell';
@@ -62,6 +63,45 @@ afterEach(() => {
 });
 
 describe('Retell agent provider contract', () => {
+  it('round-trips the first-party export through exact provider attestation without templates', async () => {
+    env.RETELL_API_KEY = 'real-key';
+    env.RETELL_BASE_URL = 'https://api.retellai.com';
+    const config: PromptConfig = {
+      clinic: {
+        id: 'clinic-1', name: 'Example Clinic', phone: '+12125550100', timezone: 'America/New_York',
+        defaultLanguage: 'en-US', complianceDisclosure: 'Approved disclosure.',
+        doNotContactPolicy: 'Record opt out.',
+      },
+      agent: { name: 'Avery', voice: 'voice_verified', tone: 'warm', language: 'en-US' },
+      campaign: {
+        id: 'campaign-1', name: 'Pilot', campaignType: 'inbound', offerTitle: 'Care',
+        offerDescription: 'Schedule care', offerScript: 'Would you like to schedule?',
+        appointmentType: 'Consultation', eligibleLocationIds: ['location-1'],
+        smsConfirmation: true, emailConfirmation: false, intakeSchemaRevision: 1,
+      },
+      locations: [{ id: 'location-1', name: 'Main', address: '1 Main Street' }],
+      intakeFields: [],
+    };
+    const exported = buildRetellConfig(config, { webhookBaseUrl: 'https://api.example.test' });
+    expect(JSON.stringify(exported)).not.toMatch(/\{\{|\$\{/);
+
+    vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(String(url).includes('/get-retell-llm/')
+      ? {
+        llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+        general_prompt: exported.systemPrompt, general_tools: exported.tools,
+      }
+      : providerAgentApiBody(url)), { status: 200 })));
+
+    const result = await probeRetellAgent('agent_pilot', 'prod');
+    expect(result).toMatchObject({
+      ok: true,
+      snapshot: { bookToolProbeStatus: 'SUCCEEDED', toolCallStrictMode: true },
+    });
+    if (!result.ok) throw new Error('expected provider snapshot');
+    expect(bookAppointmentToolFingerprint(result.snapshot.bookToolSchema)).toBe(exported.intakeToolFingerprint);
+    expect(result.snapshot.bookToolFingerprint).toMatch(/^[a-f0-9]{64}$/);
+  });
+
   it('uses exact tag/auth GET contract and produces a non-secret deterministic safety snapshot', async () => {
     env.RETELL_API_KEY = 'retell-secret-value';
     env.RETELL_BASE_URL = 'https://api.retellai.com';

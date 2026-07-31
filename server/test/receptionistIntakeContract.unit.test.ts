@@ -139,5 +139,7 @@ describe('receptionist typed intake contract', () => {
     expect(exported.bookingFunction).toEqual(bookingTools[0]);
     expect(exported.intakeSchemaRevision).toBe(7);
     expect(exported.intakeToolFingerprint).toBe(bookAppointmentToolFingerprint(exported.bookingFunction));
+    expect(exported.systemPrompt).not.toMatch(/\{\{|\$\{/);
+    expect(JSON.stringify(exported)).not.toMatch(/\{\{|\$\{/);
   });
 });

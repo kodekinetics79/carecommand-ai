@@ -200,7 +200,6 @@ export function generateSystemPrompt(config: PromptConfig): string {
   const { clinic, agent, campaign, intakeFields } = config;
   const locations = locationList(config.locations, campaign.eligibleLocationIds);
   const locationNames = locations.map(location => location.name).join(', ') || clinic.name;
-  const primaryLocation = locations[0]?.name ?? clinic.name;
   const confirmationChannels = [campaign.smsConfirmation ? 'SMS' : null, campaign.emailConfirmation ? 'email' : null]
     .filter(Boolean)
     .join(' and ');
@@ -252,8 +251,8 @@ For each field: ask naturally, validate the answer, repeat back phone numbers an
 # Before booking, summarize
 "Perfect. I have ${summaryFieldList(intakeFields)}. Is everything correct?"
 
-# After booking, say
-"Great, your appointment is confirmed with ${clinic.name} for {{appointment_date_time}} at ${primaryLocation}. You'll receive a confirmation shortly. Please arrive 10 to 15 minutes early and bring a photo ID and insurance card if applicable."
+# After a successful booking tool result
+Say that the appointment is confirmed. Repeat the exact date, time, location, and provider only from the successful tool response. Mention a text or email confirmation only if the tool explicitly reports that it was sent. Never invent a slot or delivery status. You may remind the caller to arrive 10 to 15 minutes early and bring a photo ID and insurance card if applicable.
 
 If no slots are available, offer the next available options from the booking tool.
 
