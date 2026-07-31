@@ -98,6 +98,14 @@ const STANDARD_FIELD_KEY: Partial<Record<IntakeFieldType, string>> = {
 
 const CUSTOM_TYPES = new Set<IntakeFieldType>(['CUSTOM_TEXT', 'CUSTOM_DROPDOWN', 'CUSTOM_YES_NO']);
 const FORBIDDEN_MINIMUM_NECESSARY_TERMS = /\b(?:ssn|social security|credit card|cvv|bank account|medical history|diagnosis)\b/i;
+const PROVIDER_TEMPLATE_SYNTAX = /\{\{[^{}]+\}\}|\$\{[^{}]+\}/;
+
+function containsProviderTemplateSyntax(value: unknown): boolean {
+  if (typeof value === 'string') return PROVIDER_TEMPLATE_SYNTAX.test(value);
+  if (Array.isArray(value)) return value.some(containsProviderTemplateSyntax);
+  if (value && typeof value === 'object') return Object.values(value as Record<string, unknown>).some(containsProviderTemplateSyntax);
+  return false;
+}
 
 function canonicalize(value: unknown, parentKey?: string): unknown {
   if (Array.isArray(value)) {
@@ -129,6 +137,10 @@ export function normalizeBookAppointmentParameters(value: unknown): Record<strin
 
 export function normalizeBookAppointmentToolContract(value: unknown): ExecutableBookAppointmentContract | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  // Retell expands dynamic variables when a call starts. An attested booking
+  // contract must therefore contain no template that can mutate its endpoint,
+  // constants, descriptions, enum values, or other schema-critical content.
+  if (containsProviderTemplateSyntax(value)) return null;
   const tool = value as Record<string, unknown>;
   const parameters = normalizeBookAppointmentParameters(tool.parameters);
   const url = typeof tool.url === 'string' && tool.url.trim() ? tool.url.trim() : null;
@@ -190,6 +202,9 @@ export function validateIntakeFieldConfiguration(fields: IntakeFieldConfiguratio
     if (FORBIDDEN_MINIMUM_NECESSARY_TERMS.test(`${field.label} ${field.aiQuestion} ${field.validationRule ?? ''} ${(field.options ?? []).join(' ')}`)) {
       issues.push('Intake fields may not collect high-risk identifiers, payment credentials, diagnoses, or detailed medical history.');
     }
+    if (containsProviderTemplateSyntax([field.label, field.aiQuestion, field.validationRule, field.options])) {
+      issues.push('Intake field content may not contain provider dynamic-variable templates.');
+    }
     const options = field.options ?? [];
     if (options.some(option => !option.trim() || option.length > 120)) issues.push(`Options for ${field.label} must contain 1 to 120 characters.`);
     const normalizedOptions = new Set(options.map(option => option.trim().toLocaleLowerCase('en-US')));
@@ -233,9 +248,12 @@ export function compileIntakeContract(input: IntakeContractInput): { snapshot: I
   if (!Number.isSafeInteger(input.revision) || input.revision < 1) issues.push('The intake schema revision must be a positive integer.');
   if (input.appointmentType.trim().length < 2 || input.appointmentType.length > 120) issues.push('The configured appointment type must contain 2 to 120 characters.');
   if (!input.toolUrl.trim()) issues.push('The executable booking tool URL is required.');
+  if (containsProviderTemplateSyntax(input.appointmentType)) issues.push('The configured appointment type may not contain provider dynamic-variable templates.');
+  if (containsProviderTemplateSyntax(input.toolUrl)) issues.push('The executable booking tool URL may not contain provider dynamic-variable templates.');
   const fields = [...input.fields].sort((a, b) => a.sortOrder - b.sortOrder || (a.id ?? '').localeCompare(b.id ?? ''));
   if (new Set(input.eligibleLocations.map(location => location.id)).size !== input.eligibleLocations.length) issues.push('Eligible location identifiers must be unique.');
   if (input.eligibleLocations.some(location => !location.id.trim() || !location.name.trim())) issues.push('Eligible locations require stable identifiers and names.');
+  if (containsProviderTemplateSyntax(input.eligibleLocations)) issues.push('Eligible location content may not contain provider dynamic-variable templates.');
   const locationIds = [...new Set(input.eligibleLocations.map(location => location.id))].sort();
   const eligibleLocations = [...input.eligibleLocations]
     .map(location => ({ id: location.id, name: location.name }))

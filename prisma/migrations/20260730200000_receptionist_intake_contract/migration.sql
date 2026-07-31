@@ -27,22 +27,32 @@ ALTER TABLE "ReceptionistAgent"
 ALTER TABLE "ReceptionistAgent"
   ADD CONSTRAINT "ReceptionistAgent_provider_book_tool_shape_check"
   CHECK (
-    ("providerResponseEngineGraphFingerprint" IS NULL OR "providerResponseEngineGraphFingerprint" ~ '^[a-f0-9]{64}$')
-    AND (
-      (
-        "providerBookToolSchema" IS NULL
-        AND "providerBookToolFingerprint" IS NULL
-        AND "providerToolCallStrictMode" IS NULL
+    (
+      "providerBookToolSchema" IS NULL
+      AND "providerBookToolFingerprint" IS NULL
+      AND "providerToolCallStrictMode" IS NULL
+      AND (
+        "providerResponseEngineGraphFingerprint" IS NULL
+        OR (
+          "providerResponseEngineGraphFingerprint" IS NOT NULL
+          AND "providerResponseEngineGraphFingerprint" ~ '^[a-f0-9]{64}$'
+        )
       )
-      OR (
-        jsonb_typeof("providerBookToolSchema") = 'object'
-        AND "providerBookToolFingerprint" ~ '^[a-f0-9]{64}$'
-        AND "providerToolCallStrictMode" IS NOT NULL
-        AND "providerResponseEngineType" IN ('retell-llm', 'conversation-flow')
-        AND NULLIF("providerResponseEngineId", '') IS NOT NULL
-        AND "providerResponseEngineVersion" IS NOT NULL
-        AND "providerResponseEngineGraphFingerprint" ~ '^[a-f0-9]{64}$'
-      )
+    )
+    OR (
+      "providerBookToolSchema" IS NOT NULL
+      AND jsonb_typeof("providerBookToolSchema") = 'object'
+      AND "providerBookToolFingerprint" IS NOT NULL
+      AND "providerBookToolFingerprint" ~ '^[a-f0-9]{64}$'
+      AND "providerToolCallStrictMode" IS NOT NULL
+      AND "providerResponseEngineType" IS NOT NULL
+      AND "providerResponseEngineType" IN ('retell-llm', 'conversation-flow')
+      AND "providerResponseEngineId" IS NOT NULL
+      AND NULLIF(btrim("providerResponseEngineId"), '') IS NOT NULL
+      AND "providerResponseEngineVersion" IS NOT NULL
+      AND "providerResponseEngineVersion" >= 0
+      AND "providerResponseEngineGraphFingerprint" IS NOT NULL
+      AND "providerResponseEngineGraphFingerprint" ~ '^[a-f0-9]{64}$'
     )
   );
 
@@ -84,14 +94,23 @@ ALTER TABLE "ReceptionistCampaign"
         AND "intakeSchemaResponseEngineVersion" IS NULL
       )
       OR (
-        jsonb_typeof("intakeSchemaSnapshot") = 'object'
+        "intakeSchemaSnapshot" IS NOT NULL
+        AND jsonb_typeof("intakeSchemaSnapshot") = 'object'
+        AND "intakeSchemaFingerprint" IS NOT NULL
         AND "intakeSchemaFingerprint" ~ '^[a-f0-9]{64}$'
+        AND "intakeToolFingerprint" IS NOT NULL
         AND "intakeToolFingerprint" ~ '^[a-f0-9]{64}$'
+        AND "intakeSchemaAttestedRevision" IS NOT NULL
+        AND "intakeSchemaAttestedRevision" >= 1
         AND "intakeSchemaAttestedRevision" = "intakeSchemaRevision"
         AND "intakeSchemaAttestedAt" IS NOT NULL
+        AND "intakeSchemaProviderAgentId" IS NOT NULL
         AND "intakeSchemaProviderAgentId" ~ '^[A-Za-z0-9_-]{1,128}$'
+        AND "intakeSchemaProviderVersion" IS NOT NULL
         AND "intakeSchemaProviderVersion" >= 0
-        AND NULLIF("intakeSchemaResponseEngineId", '') IS NOT NULL
+        AND "intakeSchemaResponseEngineId" IS NOT NULL
+        AND NULLIF(btrim("intakeSchemaResponseEngineId"), '') IS NOT NULL
+        AND "intakeSchemaResponseEngineVersion" IS NOT NULL
         AND "intakeSchemaResponseEngineVersion" >= 0
       )
     ),
@@ -111,6 +130,14 @@ ALTER TABLE "ReceptionistCampaign"
         AND "intakeSchemaResponseEngineVersion" IS NOT NULL
       )
     );
+
+-- One tenant-scoped provider deployment can drive only one ACTIVE Studio
+-- campaign. This removes ambiguous tool-first routing at the database boundary.
+CREATE UNIQUE INDEX "ReceptionistCampaign_tenant_active_provider_deployment_unique"
+  ON "ReceptionistCampaign"("tenantId", "intakeSchemaProviderAgentId", "intakeSchemaProviderVersion")
+  WHERE status = 'ACTIVE'
+    AND "intakeSchemaProviderAgentId" IS NOT NULL
+    AND "intakeSchemaProviderVersion" IS NOT NULL;
 
 CREATE OR REPLACE FUNCTION "invalidate_receptionist_campaign_intake_contract"()
 RETURNS trigger

@@ -93,6 +93,31 @@ describe('receptionist typed intake contract', () => {
     expect(validateIntakeFieldConfiguration(invalid).join(' ')).toMatch(/Only one PHONE|sort orders|high-risk|between 2 and 20/i);
   });
 
+  it('rejects provider dynamic-variable templates in every attested critical surface', () => {
+    const base = {
+      campaignId, revision: 1, appointmentType: 'Consultation',
+      eligibleLocations: [{ id: clinicId, name: 'Main' }], fields: fields(), toolUrl,
+    };
+    expect(() => compileIntakeContract({ ...base, appointmentType: '{{appointment_type}}' })).toThrow(/dynamic-variable templates/i);
+    expect(() => compileIntakeContract({
+      ...base, eligibleLocations: [{ id: clinicId, name: '${preferred_location}' }],
+    })).toThrow(/dynamic-variable templates/i);
+    expect(() => compileIntakeContract({
+      ...base, fields: fields().map((field, index) => index === 1 ? { ...field, label: '{{intake_label}}' } : field),
+    })).toThrow(/dynamic-variable templates/i);
+    expect(() => compileIntakeContract({
+      ...base, fields: fields().map((field, index) => index === 1 ? { ...field, aiQuestion: '${intake_question}' } : field),
+    })).toThrow(/dynamic-variable templates/i);
+    expect(() => compileIntakeContract({ ...base, toolUrl: `${toolUrl}&campaignId={{campaign_id}}` })).toThrow(/dynamic-variable templates/i);
+
+    const compiled = compileIntakeContract(base);
+    const mutated = structuredClone(compiled.snapshot.bookAppointmentToolContract) as unknown as {
+      parameters: { properties: { service: { const: string } } };
+    };
+    mutated.parameters.properties.service.const = '{{per_call_service}}';
+    expect(bookAppointmentToolFingerprint(mutated)).toBeNull();
+  });
+
   it('exports the compatibility alias and tools array from the same executable object', () => {
     const config: PromptConfig = {
       clinic: {

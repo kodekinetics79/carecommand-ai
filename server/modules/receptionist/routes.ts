@@ -103,15 +103,21 @@ function providerSnapshotData(snapshot: RetellAgentSnapshot) {
     providerResponseEngineVersion: snapshot.responseEngineVersion,
     providerLastModifiedAt: snapshot.lastModifiedAt,
     providerFingerprint: snapshot.fingerprint,
-    ...(snapshot.bookToolProbeStatus !== 'UNAVAILABLE' ? {
-      providerResponseEngineGraphFingerprint: snapshot.responseEngineGraphFingerprint,
-      providerBookToolSchema: snapshot.bookToolSchema
-        ? snapshot.bookToolSchema as Prisma.InputJsonValue
-        : Prisma.DbNull,
-      providerBookToolFingerprint: snapshot.bookToolFingerprint,
-      providerToolCallStrictMode: snapshot.toolCallStrictMode,
-    } : {}),
+    providerResponseEngineGraphFingerprint: snapshot.responseEngineGraphFingerprint,
+    providerBookToolSchema: snapshot.bookToolSchema as Prisma.InputJsonValue,
+    providerBookToolFingerprint: snapshot.bookToolFingerprint,
+    providerToolCallStrictMode: snapshot.toolCallStrictMode,
   };
+}
+
+function providerIntakeEvidenceFailure(snapshot: RetellAgentSnapshot): string | null {
+  if (snapshot.bookToolProbeStatus === 'UNAVAILABLE') return 'provider_response_engine_unavailable';
+  if (snapshot.bookToolProbeStatus === 'UNSUPPORTED') return 'provider_response_engine_unsupported';
+  if (!snapshot.responseEngineGraphFingerprint || !snapshot.bookToolSchema || !snapshot.bookToolFingerprint) {
+    return 'provider_intake_contract_unattested';
+  }
+  if (snapshot.toolCallStrictMode !== true) return 'provider_intake_contract_not_strict';
+  return null;
 }
 
 async function assertCampaignAgent(
@@ -150,7 +156,7 @@ async function assertCampaignLocations(
 function campaignAssignmentError(error: unknown) {
   const code = error instanceof Error ? error.message : '';
   if (code.includes('active_intake_contract_immutable')) return 'active_intake_contract_immutable';
-  return ['agent_unlinked', 'agent_scope_mismatch', 'agent_inactive', 'agent_unverified', 'agent_configuration_changed', 'agent_verification_stale', 'location_scope_mismatch', 'intake_schema_unattested', 'intake_schema_mismatch', 'intake_schema_not_strict', 'active_intake_contract_immutable'].includes(code)
+  return ['agent_unlinked', 'agent_scope_mismatch', 'agent_inactive', 'agent_unverified', 'agent_configuration_changed', 'agent_verification_stale', 'location_scope_mismatch', 'intake_schema_unattested', 'intake_schema_mismatch', 'intake_schema_not_strict', 'active_intake_contract_immutable', 'active_provider_deployment_conflict'].includes(code)
     ? code
     : null;
 }
@@ -215,6 +221,17 @@ async function attestCampaignIntakeContract(
   if (bookAppointmentToolFingerprint(agent.providerBookToolSchema) !== contract.snapshot.bookAppointmentToolFingerprint) {
     throw new Error('intake_schema_mismatch');
   }
+  const deploymentConflict = await tx.receptionistCampaign.findFirst({
+    where: {
+      tenantId: campaign.tenantId,
+      id: { not: campaign.id },
+      status: 'ACTIVE',
+      intakeSchemaProviderAgentId: agent.providerAgentId,
+      intakeSchemaProviderVersion: agent.providerVersion,
+    },
+    select: { id: true },
+  });
+  if (deploymentConflict) throw new Error('active_provider_deployment_conflict');
   return {
     intakeSchemaSnapshot: contract.snapshot as unknown as Prisma.InputJsonValue,
     intakeSchemaFingerprint: contract.fingerprint,
@@ -736,7 +753,8 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
     const readinessFailure = probe.ok
       ? evaluateRetellAgentReadiness(probe.snapshot, { versionTag: before.providerVersionTag, webhookUrl: expectedRetellAgentWebhookUrl() })
       : null;
-    const safeError = probe.ok ? readinessFailure : probe.error;
+    const intakeEvidenceFailure = probe.ok ? providerIntakeEvidenceFailure(probe.snapshot) : null;
+    const safeError = probe.ok ? readinessFailure ?? intakeEvidenceFailure : probe.error;
 
     try {
       const updated = await runWithTenantContext(request.auth.tenantId, async tx => {
@@ -749,7 +767,15 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
           throw app.httpErrors.conflict('Agent configuration changed while provider verification was in progress. Retry verification.');
         }
 
-        const success = probe.ok && !readinessFailure;
+        const success = probe.ok && !readinessFailure && !intakeEvidenceFailure;
+        const failedCandidateChanged = probe.ok && current.providerStatus === 'VERIFIED'
+          && (
+            current.providerVersion !== probe.snapshot.version
+            || current.providerFingerprint !== probe.snapshot.fingerprint
+            || current.providerResponseEngineType !== probe.snapshot.responseEngineType
+            || current.providerResponseEngineId !== probe.snapshot.responseEngineId
+            || current.providerResponseEngineVersion !== probe.snapshot.responseEngineVersion
+          );
         const deploymentChanged = success && current.providerStatus === 'VERIFIED'
           && (
             current.providerVersion !== probe.snapshot.version
@@ -790,13 +816,13 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
           providerLastAttemptAt: attemptedAt,
           providerLastAttemptStatus: success ? 'SUCCEEDED' : 'FAILED',
           providerLastErrorCode: safeError,
-          ...(probe.ok ? providerSnapshotData(probe.snapshot) : {}),
+          ...(success ? providerSnapshotData(probe.snapshot) : {}),
           ...(success ? {
             providerStatus: 'VERIFIED' as const,
             providerVerifiedRevision: current.providerConfigRevision,
             providerVerifiedAt: attemptedAt,
             providerVerificationExpiresAt: new Date(attemptedAt.getTime() + RETELL_AGENT_VERIFICATION_TTL_MS),
-          } : (probe.ok || permanentProbeFailure) ? {
+          } : (permanentProbeFailure || (probe.ok && (current.providerStatus !== 'VERIFIED' || failedCandidateChanged))) ? {
             providerStatus: 'INVALID' as const,
             providerVerifiedRevision: null,
             providerVerifiedAt: null,
@@ -826,7 +852,9 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
           message: 'Provider deployment drift detected. Pause active and runnable campaigns before approving the new immutable version.',
         });
       }
-      if (!probe.ok && !permanentProbeFailure) return reply.code(503).send(updated.row);
+      if ((!probe.ok && !permanentProbeFailure) || intakeEvidenceFailure === 'provider_response_engine_unavailable') {
+        return reply.code(503).send(updated.row);
+      }
       return reply.code(200).send(updated.row);
     } catch (error) {
       if (isReceptionistDestinationConflict(error)) throw app.httpErrors.conflict('This active provider deployment is already assigned to another agent.');
@@ -931,6 +959,7 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
       if (invalid) throw app.httpErrors.badRequest(invalid);
       const reason = campaignAssignmentError(error);
       if (reason) throw app.httpErrors.conflict(`Campaign configuration is not deployable: ${reason}.`);
+      if (isReceptionistDestinationConflict(error)) throw app.httpErrors.conflict('This provider deployment already owns an active Studio campaign for the tenant.');
       throw error;
     }
   });
@@ -979,6 +1008,7 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
       if (invalid) throw app.httpErrors.badRequest(invalid);
       const reason = campaignAssignmentError(error);
       if (reason) throw app.httpErrors.conflict(`Campaign configuration is not deployable: ${reason}.`);
+      if (isReceptionistDestinationConflict(error)) throw app.httpErrors.conflict('This provider deployment already owns an active Studio campaign for the tenant.');
       throw error;
     }
   });
@@ -1942,7 +1972,7 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
             clinicId: trustedClinicId,
             campaignId: trustedCampaignId,
             retellCallId: providerCallId,
-            callerPhone: body.call?.from_number,
+            callerPhone: body.call?.direction === 'outbound' ? body.call.to_number : body.call?.from_number,
             direction: body.call?.direction ?? 'inbound',
             startedAt: new Date(),
           },
@@ -2041,6 +2071,15 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         ? campaign.intakeSchemaSnapshot as Record<string, unknown>
         : null;
       const semanticFingerprint = typeof snapshot?.semanticFingerprint === 'string' ? snapshot.semanticFingerprint : null;
+      const persistedCallerPhone = canonicalRetellDestination(activeCall.callerPhone ?? undefined);
+      const envelopeCallerPhone = canonicalRetellDestination(
+        body.call?.direction === 'outbound' ? body.call.to_number : body.call?.from_number,
+      );
+      const callerIdentityDrift = Boolean(persistedCallerPhone && envelopeCallerPhone && persistedCallerPhone !== envelopeCallerPhone);
+      const requiredPhone = Array.isArray(snapshot?.fields) && snapshot.fields.some(value => {
+        const field = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+        return field?.fieldType === 'PHONE' && field.required === true;
+      });
       const deploymentMatches = Boolean(
         campaign
         && snapshot
@@ -2053,12 +2092,20 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         && body.call?.agent_id === campaign?.intakeSchemaProviderAgentId
         && body.call?.agent_version === campaign?.intakeSchemaProviderVersion,
       );
-      if (!deploymentMatches) {
+      if (!deploymentMatches || callerIdentityDrift) {
         await flagRetellIngressReview(tenantId, providerCallId, 'Book tool intake contract did not match the persisted active campaign attestation');
         return reply.code(200).send({
           booked: false,
           needs_human: true,
           message: 'I cannot safely complete this booking because the active intake configuration changed. I recorded a staff review request.',
+        });
+      }
+      if (requiredPhone && !persistedCallerPhone) {
+        await flagRetellIngressReview(tenantId, providerCallId, 'Required phone intake identity was unavailable from the persisted signed call context');
+        return reply.code(200).send({
+          booked: false,
+          needs_human: true,
+          message: 'I cannot safely confirm the required callback number from this call. I recorded a front desk review request.',
         });
       }
       // Persisted call/campaign state is authoritative. Provider-applied consts
@@ -2071,7 +2118,7 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       {
         tenantId,
         callId: providerCallId,
-        callerPhone: (body.call?.direction === 'outbound' ? body.call.to_number : body.call?.from_number) ?? null,
+        callerPhone: activeCall.callerPhone,
       },
       body.name,
       trustedToolArgs,

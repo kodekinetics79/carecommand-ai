@@ -173,6 +173,11 @@ describe('receptionist /fn booking — real availability + booking', () => {
     }, signedCall, randomUUID());
     expect(selectorDrift.json()).toMatchObject({ booked: false, needs_human: true });
 
+    const callerMutation = await inject(callId, 'book_appointment', {
+      service: t.appointmentType, intake_contract_fingerprint: t.intakeSemanticFingerprint, intake_schema_revision: 1,
+    }, { ...signedCall, from_number: '+15559990000' });
+    expect(callerMutation.json()).toMatchObject({ booked: false, needs_human: true });
+
     const wrongCallId = `wrong-deployment-${randomUUID()}`;
     const wrongCall = { ...signedCall, call_id: wrongCallId, agent_id: 'agent_wrong' };
     expect((await inject(wrongCallId, 'record_recording_preference', { recording_decision: 'GRANTED' }, wrongCall)).statusCode).toBe(200);
@@ -181,6 +186,33 @@ describe('receptionist /fn booking — real availability + booking', () => {
     }, wrongCall);
     expect(wrongDeployment.json()).toMatchObject({ booked: false, needs_human: true });
     expect((await db.receptionistCallLog.findFirstOrThrow({ where: { tenantId: t.id, retellCallId: wrongCallId } })).campaignId).toBeNull();
+  });
+
+  it('hands off when required PHONE identity is missing from the signed persisted call context', async () => {
+    const t = await makeTenant();
+    const requiredPhoneContract = compileIntakeContract({
+      campaignId: t.campaignId, revision: 1, appointmentType: t.appointmentType, eligibleLocations: [],
+      fields: [{
+        id: randomUUID(), fieldType: 'PHONE', label: 'Callback phone', aiQuestion: 'May we use this calling number?',
+        options: [], required: true, confirmationRequired: false, sortOrder: 0,
+      }],
+      toolUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell/fn?clinicId=${t.clinicId}`,
+    });
+    await db.receptionistCampaign.update({
+      where: { id: t.campaignId },
+      data: {
+        intakeSchemaSnapshot: requiredPhoneContract.snapshot as never,
+        intakeSchemaFingerprint: requiredPhoneContract.fingerprint,
+      },
+    });
+    t.intakeSemanticFingerprint = requiredPhoneContract.snapshot.semanticFingerprint;
+
+    const response = await fn(t, 'book_appointment', {
+      first_name: 'No', last_name: 'Number', appointment_date: futureDate(3), appointment_time: '09:00',
+    }, `required-phone-${randomUUID()}`);
+
+    expect(response.json()).toMatchObject({ booked: false, needs_human: true });
+    expect(await db.appointment.count({ where: { tenantId: t.id } })).toBe(0);
   });
 
   it('uses the branch timezone and canonical catalog duration for offers and booking', async () => {

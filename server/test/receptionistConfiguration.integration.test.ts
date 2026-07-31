@@ -298,6 +298,53 @@ describe('AI receptionist trusted configuration', () => {
     expect((await db.receptionistLocation.findUniqueOrThrow({ where: { id: location.json().id } })).name).toBe('North office');
   });
 
+  it('rejects every partial provider and campaign attestation bundle through raw SQL', async () => {
+    const t = await tenant();
+    const clinicId = (await createClinic(t, { name: 'Attestation constraint clinic' })).json().id as string;
+    const agent = await db.receptionistAgent.create({
+      data: { tenantId: t.id, clinicId, name: 'Partial bundle probe' },
+    });
+    const campaign = await db.receptionistCampaign.create({
+      data: {
+        tenantId: t.id, clinicId, name: 'Partial attestation probe', offerTitle: 'Appointment',
+        offerDescription: 'Schedule care', offerScript: 'Schedule now', appointmentType: 'Consultation',
+        eligibleLocationIds: [],
+      },
+    });
+    const hashA = 'a'.repeat(64);
+    const hashB = 'b'.repeat(64);
+    const agentUpdates = [
+      `"providerBookToolSchema" = '{}'::jsonb`,
+      `"providerBookToolFingerprint" = '${hashA}'`,
+      `"providerToolCallStrictMode" = true`,
+      `"providerBookToolSchema" = '{}'::jsonb, "providerBookToolFingerprint" = '${hashA}', "providerToolCallStrictMode" = true, "providerResponseEngineType" = 'retell-llm', "providerResponseEngineId" = 'llm_partial', "providerResponseEngineVersion" = 1`,
+      `"providerBookToolSchema" = 'null'::jsonb, "providerBookToolFingerprint" = '${hashA}', "providerToolCallStrictMode" = true, "providerResponseEngineType" = 'retell-llm', "providerResponseEngineId" = 'llm_partial', "providerResponseEngineVersion" = 1, "providerResponseEngineGraphFingerprint" = '${hashB}'`,
+      `"providerBookToolSchema" = '{}'::jsonb, "providerBookToolFingerprint" = '${hashA}', "providerToolCallStrictMode" = true, "providerResponseEngineId" = 'llm_partial', "providerResponseEngineVersion" = 1, "providerResponseEngineGraphFingerprint" = '${hashB}'`,
+    ];
+    for (const update of agentUpdates) {
+      await expect(db.$executeRawUnsafe(`UPDATE "ReceptionistAgent" SET ${update} WHERE id = '${agent.id}'::uuid`))
+        .rejects.toThrow(/ReceptionistAgent_provider_book_tool_shape_check/);
+    }
+
+    const completeCampaignFields = `
+      "intakeSchemaFingerprint" = '${hashA}', "intakeToolFingerprint" = '${hashB}',
+      "intakeSchemaAttestedRevision" = 1, "intakeSchemaAttestedAt" = '2026-07-30T00:00:00Z',
+      "intakeSchemaProviderAgentId" = 'agent_partial', "intakeSchemaProviderVersion" = 1,
+      "intakeSchemaResponseEngineId" = 'llm_partial'`;
+    const campaignUpdates = [
+      `"intakeSchemaSnapshot" = '{}'::jsonb`,
+      `"intakeSchemaFingerprint" = '${hashA}'`,
+      `"intakeSchemaProviderVersion" = 1`,
+      `"intakeSchemaSnapshot" = '{}'::jsonb, ${completeCampaignFields}`,
+      `"intakeSchemaSnapshot" = 'null'::jsonb, ${completeCampaignFields}, "intakeSchemaResponseEngineVersion" = 1`,
+      `"intakeSchemaSnapshot" = '{}'::jsonb, "intakeSchemaFingerprint" = '${hashA}', "intakeToolFingerprint" = '${hashB}', "intakeSchemaAttestedRevision" = 2, "intakeSchemaAttestedAt" = '2026-07-30T00:00:00Z', "intakeSchemaProviderAgentId" = 'agent_partial', "intakeSchemaProviderVersion" = 1, "intakeSchemaResponseEngineId" = 'llm_partial', "intakeSchemaResponseEngineVersion" = 1`,
+    ];
+    for (const update of campaignUpdates) {
+      await expect(db.$executeRawUnsafe(`UPDATE "ReceptionistCampaign" SET ${update} WHERE id = '${campaign.id}'::uuid`))
+        .rejects.toThrow(/ReceptionistCampaign_intake_attestation_shape_check/);
+    }
+  });
+
   it('links and verifies one exact published provider deployment with durable safety evidence', async () => {
     const [owner, foreign] = await Promise.all([tenant(), tenant()]);
     const ownerClinic = (await createClinic(owner, { name: 'Provider-ready clinic' })).json().id as string;
@@ -411,6 +458,25 @@ describe('AI receptionist trusted configuration', () => {
         intakeSchemaProviderAgentId: 'agent_pilot_exact', intakeSchemaProviderVersion: 17,
       });
       expect(activeCampaign.json().intakeSchemaFingerprint).toMatch(/^[a-f0-9]{64}$/);
+      const duplicateActiveDeployment = await db.receptionistCampaign.create({
+        data: {
+          tenantId: owner.id, clinicId: ownerClinic, agentId, name: 'Ambiguous deployment duplicate',
+          offerTitle: 'Appointment', offerDescription: 'Schedule care', offerScript: 'Schedule now',
+          appointmentType: 'Consultation', eligibleLocationIds: [],
+          intakeSchemaRevision: activeCampaign.json().intakeSchemaRevision,
+          intakeSchemaSnapshot: activeCampaign.json().intakeSchemaSnapshot,
+          intakeSchemaFingerprint: activeCampaign.json().intakeSchemaFingerprint,
+          intakeToolFingerprint: activeCampaign.json().intakeToolFingerprint,
+          intakeSchemaAttestedRevision: activeCampaign.json().intakeSchemaAttestedRevision,
+          intakeSchemaAttestedAt: new Date(activeCampaign.json().intakeSchemaAttestedAt),
+          intakeSchemaProviderAgentId: activeCampaign.json().intakeSchemaProviderAgentId,
+          intakeSchemaProviderVersion: activeCampaign.json().intakeSchemaProviderVersion,
+          intakeSchemaResponseEngineId: activeCampaign.json().intakeSchemaResponseEngineId,
+          intakeSchemaResponseEngineVersion: activeCampaign.json().intakeSchemaResponseEngineVersion,
+        },
+      });
+      await expect(db.receptionistCampaign.update({ where: { id: duplicateActiveDeployment.id }, data: { status: 'ACTIVE' } }))
+        .rejects.toMatchObject({ code: 'P2002' });
       expect(intakeLegacyPause).toBeTruthy();
       await expect(db.$transaction(async tx => {
         await tx.$executeRawUnsafe(intakeLegacyPause!);
@@ -510,7 +576,9 @@ describe('AI receptionist trusted configuration', () => {
         providerVersion: 4, providerStatus: 'VERIFIED', providerPublished: true, providerAssignedTags: ['prod'],
         providerWebhookUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`,
         providerWebhookEvents: ['call_started', 'call_ended', 'call_analyzed'], providerDataStorageSetting: 'basic_attributes_only', providerSignedUrl: true,
-        providerResponseEngineType: 'retell-llm', providerResponseEngineId: 'llm-original',
+        providerResponseEngineType: 'retell-llm', providerResponseEngineId: 'llm-original', providerResponseEngineVersion: 2,
+        providerResponseEngineGraphFingerprint: 'b'.repeat(64), providerBookToolSchema: { fixture: true },
+        providerBookToolFingerprint: 'c'.repeat(64), providerToolCallStrictMode: true,
         providerFingerprint: 'a'.repeat(64), providerConfigRevision: 1, providerVerifiedRevision: 1,
         providerVerifiedAt: new Date(), providerVerificationExpiresAt: new Date(Date.now() + 60_000),
       },
@@ -523,6 +591,34 @@ describe('AI receptionist trusted configuration', () => {
       const unavailable = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agent.id}/verify-provider`, headers: auth(t, 'OWNER') });
       expect(unavailable.statusCode).toBe(503);
       expect(unavailable.json()).toMatchObject({ providerStatus: 'VERIFIED', providerVersion: 4, providerLastAttemptStatus: 'FAILED', providerLastErrorCode: 'provider_unavailable' });
+
+      vi.stubGlobal('fetch', vi.fn(async url => new Response(
+        String(url).includes('/get-retell-llm/')
+          ? 'response engine temporarily unavailable'
+          : JSON.stringify({
+            agent_id: 'agent_original', version: 5, assigned_tags: ['prod'], is_published: true,
+            voice_id: 'voice', language: 'en-US', webhook_url: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`,
+            webhook_events: ['call_started', 'call_ended', 'call_analyzed'], data_storage_setting: 'basic_attributes_only', opt_in_signed_url: true,
+            response_engine: { type: 'retell-llm', llm_id: 'llm-new', version: 9 },
+          }),
+        { status: String(url).includes('/get-retell-llm/') ? 503 : 200 },
+      )));
+      const unresolvedNewEngine = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agent.id}/verify-provider`, headers: auth(t, 'OWNER') });
+      expect(unresolvedNewEngine.statusCode).toBe(503);
+      expect(unresolvedNewEngine.json()).toMatchObject({
+        providerStatus: 'INVALID', providerVersion: 4, providerResponseEngineId: 'llm-original',
+        providerBookToolFingerprint: 'c'.repeat(64), providerLastAttemptStatus: 'FAILED',
+        providerLastErrorCode: 'provider_response_engine_unavailable',
+      });
+      const blockedActivation = await app.inject({
+        method: 'POST', url: '/v1/receptionist/campaigns', headers: auth(t, 'OWNER'),
+        payload: {
+          clinicId, agentId: agent.id, name: 'Unresolved engine campaign', status: 'ACTIVE',
+          offerTitle: 'Appointment', offerDescription: 'Schedule care', offerScript: 'Schedule now', appointmentType: 'Consultation',
+        },
+      });
+      expect(blockedActivation.statusCode).toBe(409);
+      expect(blockedActivation.json().message).toContain('agent_unverified');
 
       let release!: () => void;
       const pending = new Promise<void>(resolve => { release = resolve; });
@@ -634,13 +730,19 @@ describe('AI receptionist trusted configuration', () => {
       FOR EACH ROW EXECUTE FUNCTION receptionist_agent_audit_failure();
     `);
     env.RETELL_API_KEY = 'real-provider-key';
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
-      agent_id: 'agent_audit_bound', version: 8, assigned_tags: ['prod'], is_published: true,
-      voice_id: 'voice', language: 'en-US',
-      webhook_url: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`,
-      webhook_events: ['call_started', 'call_ended', 'call_analyzed'], data_storage_setting: 'basic_attributes_only', opt_in_signed_url: true,
-      response_engine: { type: 'retell-llm', llm_id: 'llm' },
-    }), { status: 200 })));
+    const auditTool = compileIntakeContract({
+      campaignId: 'audit-contract', revision: 1, appointmentType: 'Consultation', eligibleLocations: [], fields: [],
+      toolUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell/fn?clinicId=${clinicId}`,
+    }).snapshot.bookAppointmentToolContract;
+    vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(String(url).includes('/get-retell-llm/')
+      ? { llm_id: 'llm', version: 1, is_published: true, tool_call_strict_mode: true, general_tools: [auditTool] }
+      : {
+        agent_id: 'agent_audit_bound', version: 8, assigned_tags: ['prod'], is_published: true,
+        voice_id: 'voice', language: 'en-US',
+        webhook_url: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`,
+        webhook_events: ['call_started', 'call_ended', 'call_analyzed'], data_storage_setting: 'basic_attributes_only', opt_in_signed_url: true,
+        response_engine: { type: 'retell-llm', llm_id: 'llm', version: 1 },
+      }), { status: 200 })));
     try {
       const response = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agent.id}/verify-provider`, headers: auth(t, 'OWNER') });
       expect(response.statusCode).toBe(500);

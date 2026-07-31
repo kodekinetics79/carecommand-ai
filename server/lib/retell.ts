@@ -160,13 +160,6 @@ function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
-function referencedStrings(value: unknown, output = new Set<string>()): Set<string> {
-  if (typeof value === 'string') output.add(value);
-  else if (Array.isArray(value)) value.forEach(item => referencedStrings(item, output));
-  else if (record(value)) Object.values(value as Record<string, unknown>).forEach(item => referencedStrings(item, output));
-  return output;
-}
-
 function reachableRetellLlmTools(body: Record<string, unknown>): unknown[] | null {
   const general = Array.isArray(body.general_tools) ? [...body.general_tools] : [];
   if (!Array.isArray(body.states) || body.states.length === 0) return general;
@@ -174,7 +167,10 @@ function reachableRetellLlmTools(body: Record<string, unknown>): unknown[] | nul
   for (const item of body.states) {
     const state = record(item);
     const name = nonEmptyString(state?.name);
-    if (state && name) states.set(name, state);
+    if (state && name) {
+      if (states.has(name)) return null;
+      states.set(name, state);
+    }
   }
   const start = nonEmptyString(body.starting_state);
   if (!start || !states.has(start)) return null;
@@ -198,80 +194,151 @@ function reachableRetellLlmTools(body: Record<string, unknown>): unknown[] | nul
   return tools;
 }
 
-function reachableConversationFlowTools(body: Record<string, unknown>): unknown[] | null {
-  const reachableReferences = new Set<string>();
-  const embedded: unknown[] = [];
-  const componentRegistered: unknown[] = [];
-  const traverse = (nodeValues: unknown, startValue: unknown): boolean => {
-    if (!Array.isArray(nodeValues)) return false;
-    const nodes = new Map<string, Record<string, unknown>>();
-    for (const item of nodeValues) {
-      const node = record(item);
-      const id = nonEmptyString(node?.id);
-      if (node && id) nodes.set(id, node);
+type ConversationFlowTraversal = {
+  toolReferences: Set<string>;
+  componentReferences: Set<string>;
+  embeddedTools: Record<string, unknown>[];
+};
+
+function addReference(value: unknown, output: Set<string>) {
+  const direct = nonEmptyString(value);
+  if (direct) output.add(direct);
+}
+
+function collectNodeReferences(node: Record<string, unknown>, traversal: ConversationFlowTraversal) {
+  addReference(node.tool_id, traversal.toolReferences);
+  if (Array.isArray(node.tool_ids)) node.tool_ids.forEach(value => addReference(value, traversal.toolReferences));
+  if (Array.isArray(node.tools)) {
+    for (const value of node.tools) {
+      const tool = record(value);
+      if (tool && nonEmptyString(tool.name)) traversal.embeddedTools.push(tool);
+      else if (tool) addReference(tool.tool_id, traversal.toolReferences);
+      else addReference(value, traversal.toolReferences);
     }
-    const start = nonEmptyString(startValue);
-    if (!start || !nodes.has(start)) return false;
-    const queue = [start];
-    const visited = new Set<string>();
-    while (queue.length) {
-      const id = queue.shift()!;
-      if (visited.has(id)) continue;
-      visited.add(id);
-      const node = nodes.get(id);
-      if (!node) return false;
-      referencedStrings(node, reachableReferences);
-      if (Array.isArray(node.tools)) embedded.push(...node.tools);
-      if (Array.isArray(node.edges)) {
-        for (const edgeValue of node.edges) {
-          const destination = nonEmptyString(record(edgeValue)?.destination_node_id);
-          if (destination && !visited.has(destination)) queue.push(destination);
-        }
-      }
+  }
+  addReference(node.component_id, traversal.componentReferences);
+  addReference(node.conversation_flow_component_id, traversal.componentReferences);
+  if (Array.isArray(node.component_ids)) node.component_ids.forEach(value => addReference(value, traversal.componentReferences));
+}
+
+function edgeDestinations(value: unknown): string[] {
+  const values = Array.isArray(value) ? value : [value];
+  const destinations: string[] = [];
+  for (const item of values) {
+    const destination = nonEmptyString(record(item)?.destination_node_id);
+    if (destination) destinations.push(destination);
+  }
+  return destinations;
+}
+
+function traverseConversationFlowNodes(nodeValues: unknown, startValue: unknown): ConversationFlowTraversal | null {
+  if (!Array.isArray(nodeValues)) return null;
+  const nodes = new Map<string, Record<string, unknown>>();
+  for (const item of nodeValues) {
+    const node = record(item);
+    const id = nonEmptyString(node?.id);
+    if (node && id) {
+      if (nodes.has(id)) return null;
+      nodes.set(id, node);
     }
-    return true;
+  }
+  const start = nonEmptyString(startValue);
+  if (!start || !nodes.has(start)) return null;
+  const traversal: ConversationFlowTraversal = {
+    toolReferences: new Set<string>(), componentReferences: new Set<string>(), embeddedTools: [],
   };
-
-  if (!traverse(body.nodes, body.start_node_id)) return null;
-
-  // A reachable component/subagent node references its component by id/name.
-  // Traverse only those exact component graphs, including nested components;
-  // unreachable tool registries must never satisfy activation attestation.
-  const componentValues = Array.isArray(body.components)
-    ? body.components
-    : record(body.components) ? Object.values(body.components as Record<string, unknown>) : [];
-  const traversedComponents = new Set<string>();
-  let discovered = true;
-  while (discovered) {
-    discovered = false;
-    for (const value of componentValues) {
-      const component = record(value);
-      const id = nonEmptyString(component?.component_id) ?? nonEmptyString(component?.id) ?? nonEmptyString(component?.name);
-      if (!component || !id || traversedComponents.has(id) || !reachableReferences.has(id)) continue;
-      traversedComponents.add(id);
-      discovered = true;
-      referencedStrings(component, reachableReferences);
-      if (!traverse(component.nodes, component.start_node_id)) return null;
-      if (Array.isArray(component.tools)) {
-        if (component.flex_mode === true) embedded.push(...component.tools);
-        else componentRegistered.push(...component.tools);
+  const queue = [start];
+  const visited = new Set<string>();
+  while (queue.length) {
+    const id = queue.shift()!;
+    if (visited.has(id)) continue;
+    visited.add(id);
+    const node = nodes.get(id);
+    if (!node) return null;
+    collectNodeReferences(node, traversal);
+    for (const field of ['edges', 'edge', 'always_edge', 'else_edge', 'skip_response_edge'] as const) {
+      for (const destination of edgeDestinations(node[field])) {
+        if (!nodes.has(destination)) return null;
+        if (!visited.has(destination)) queue.push(destination);
       }
     }
   }
+  return traversal;
+}
 
-  const registered = [
-    ...(Array.isArray(body.tools) ? body.tools : []),
-    ...componentRegistered,
-  ];
-  const globallyReachable = body.flex_mode === true;
-  for (const item of registered) {
-    const tool = record(item);
-    if (!tool) continue;
+function registeredTools(values: unknown): Record<string, unknown>[] {
+  return Array.isArray(values) ? values.map(record).filter((value): value is Record<string, unknown> => value !== null) : [];
+}
+
+function referencedRegisteredTools(tools: Record<string, unknown>[], references: Set<string>, allReachable: boolean) {
+  return tools.filter(tool => {
     const id = nonEmptyString(tool.tool_id);
     const name = nonEmptyString(tool.name);
-    if (globallyReachable || (id && reachableReferences.has(id)) || (name && reachableReferences.has(name))) embedded.push(tool);
+    return allReachable || (id !== null && references.has(id)) || (name !== null && references.has(name));
+  });
+}
+
+function declaredConversationFlowBookingToolCount(body: Record<string, unknown>, components: Record<string, unknown>[]) {
+  const declarations = [
+    ...registeredTools(body.tools),
+    ...(Array.isArray(body.nodes) ? body.nodes.flatMap(value => registeredTools(record(value)?.tools)) : []),
+    ...components.flatMap(component => [
+      ...registeredTools(component.tools),
+      ...(Array.isArray(component.nodes) ? component.nodes.flatMap(value => registeredTools(record(value)?.tools)) : []),
+    ]),
+  ];
+  return declarations.filter(tool => nonEmptyString(tool.name) === 'book_appointment').length;
+}
+
+function reachableConversationFlowTools(body: Record<string, unknown>): { tools: unknown[]; declaredBookingToolCount: number } | null {
+  const componentValues = (Array.isArray(body.components)
+    ? body.components
+    : record(body.components) ? Object.values(body.components as Record<string, unknown>) : [])
+    .map(record)
+    .filter((value): value is Record<string, unknown> => value !== null);
+  const components = new Map<string, Record<string, unknown>>();
+  for (const component of componentValues) {
+    const id = nonEmptyString(component.conversation_flow_component_id)
+      ?? nonEmptyString(component.component_id)
+      ?? nonEmptyString(component.id);
+    if (id) {
+      if (components.has(id)) return null;
+      components.set(id, component);
+    }
   }
-  return embedded;
+
+  const declaredBookingToolCount = declaredConversationFlowBookingToolCount(body, componentValues);
+  const reachableTools: Record<string, unknown>[] = [];
+  const componentQueue: string[] = [];
+  if (body.flex_mode === true) {
+    reachableTools.push(...registeredTools(body.tools));
+  } else {
+    const rootTraversal = traverseConversationFlowNodes(body.nodes, body.start_node_id);
+    if (!rootTraversal) return null;
+    reachableTools.push(...rootTraversal.embeddedTools);
+    reachableTools.push(...referencedRegisteredTools(registeredTools(body.tools), rootTraversal.toolReferences, false));
+    componentQueue.push(...rootTraversal.componentReferences);
+  }
+
+  const traversedComponents = new Set<string>();
+  while (componentQueue.length) {
+    const componentId = componentQueue.shift()!;
+    if (traversedComponents.has(componentId)) continue;
+    traversedComponents.add(componentId);
+    const component = components.get(componentId);
+    if (!component) return null;
+    if (component.flex_mode === true) {
+      reachableTools.push(...registeredTools(component.tools));
+      continue;
+    }
+    const traversal = traverseConversationFlowNodes(component.nodes, component.start_node_id);
+    if (!traversal) return null;
+    reachableTools.push(...traversal.embeddedTools);
+    reachableTools.push(...referencedRegisteredTools(registeredTools(component.tools), traversal.toolReferences, false));
+    componentQueue.push(...traversal.componentReferences);
+  }
+
+  return { tools: reachableTools, declaredBookingToolCount };
 }
 
 async function probeRetellBookTool(responseEngineType: string, responseEngineId: string, responseEngineVersion: number | null) {
@@ -293,12 +360,18 @@ async function probeRetellBookTool(responseEngineType: string, responseEngineId:
       return { status: 'UNAVAILABLE' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint: null };
     }
     const graphFingerprint = fingerprintJson(body);
-    const tools = responseEngineType === 'retell-llm' ? reachableRetellLlmTools(body) : reachableConversationFlowTools(body);
-    if (!tools) return { status: 'SUCCEEDED' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint };
+    const discovery = responseEngineType === 'retell-llm'
+      ? { tools: reachableRetellLlmTools(body), declaredBookingToolCount: null }
+      : reachableConversationFlowTools(body);
+    if (!discovery || !discovery.tools) return { status: 'SUCCEEDED' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint };
+    const tools = discovery.tools;
     const bookingTools = tools.filter(tool => tool && typeof tool === 'object' && nonEmptyString((tool as Record<string, unknown>).name) === 'book_appointment') as Array<Record<string, unknown>>;
-    const contract = bookingTools.length === 1 ? normalizeBookAppointmentToolContract(bookingTools[0]) : null;
+    const noConversationFlowShadow = responseEngineType !== 'conversation-flow' || discovery.declaredBookingToolCount === 1;
+    const contract = bookingTools.length === 1 && noConversationFlowShadow ? normalizeBookAppointmentToolContract(bookingTools[0]) : null;
     const strictMode = body.tool_call_strict_mode === true;
-    const published = body.is_published === true;
+    // Retell LLM has its own publication flag. Conversation Flow does not;
+    // production publication is enforced on the exact agent tag/version.
+    const published = responseEngineType === 'conversation-flow' || body.is_published === true;
     if (!published || !contract) {
       return { status: 'SUCCEEDED' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint };
     }

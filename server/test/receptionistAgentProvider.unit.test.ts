@@ -81,7 +81,8 @@ describe('Retell agent provider contract', () => {
     const tool = { ...bookingTool(), tool_id: 'tool_booking' };
     const fetchMock = vi.fn<typeof fetch>(async url => new Response(JSON.stringify(String(url).includes('/get-conversation-flow/')
       ? {
-        conversation_flow_id: 'flow_pilot', version: 4, is_published: true, tool_call_strict_mode: true, tools: [tool], start_node_id: 'start',
+        conversation_flow_id: 'flow_pilot', version: 4, last_modification_timestamp: 1_754_000_000_000,
+        tool_call_strict_mode: true, tools: [tool], start_node_id: 'start',
         nodes: [{ id: 'start', type: 'function', tool_id: 'tool_booking', edges: [] }],
       }
       : providerAgent({ response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 }));
@@ -133,10 +134,11 @@ describe('Retell agent provider contract', () => {
         ],
       },
       flow: {
-        conversation_flow_id: 'flow_pilot', version: 4, is_published: true, tool_call_strict_mode: true,
-        start_node_id: 'start', nodes: [{ id: 'start', type: 'component', component_id: 'booking_component', edges: [] }],
+        conversation_flow_id: 'flow_pilot', version: 4, last_modification_timestamp: 1_754_000_000_000,
+        tool_call_strict_mode: true, start_node_id: 'start',
+        nodes: [{ id: 'start', type: 'subagent', conversation_flow_component_id: 'booking_component', edges: [] }],
         components: [{
-          component_id: 'booking_component', start_node_id: 'component_start', tools: [tool],
+          conversation_flow_component_id: 'booking_component', start_node_id: 'component_start', tools: [tool],
           nodes: [{ id: 'component_start', type: 'function', tool_id: 'component_booking', edges: [] }],
         }],
       },
@@ -153,6 +155,137 @@ describe('Retell agent provider contract', () => {
     agent = providerAgent({ response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } });
     const flow = await probeRetellAgent('agent_pilot', 'prod');
     expect(flow).toMatchObject({ ok: true, snapshot: { bookToolProbeStatus: 'SUCCEEDED' } });
+  });
+
+  it('traverses official conversation-flow edge forms without deriving references from tool registries', async () => {
+    env.RETELL_API_KEY = 'real-key';
+    const tool = { ...bookingTool(), tool_id: 'component_booking' };
+    vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(String(url).includes('/get-conversation-flow/')
+      ? {
+        conversation_flow_id: 'flow_pilot', version: 4, last_modification_timestamp: 1_754_000_000_000,
+        tool_call_strict_mode: true, start_node_id: 'start',
+        nodes: [
+          { id: 'start', type: 'conversation', always_edge: { destination_node_id: 'conditional' } },
+          { id: 'conditional', type: 'logic_split', else_edge: { destination_node_id: 'silent' } },
+          { id: 'silent', type: 'conversation', skip_response_edge: { destination_node_id: 'component' } },
+          { id: 'component', type: 'subagent', component_id: 'safe_component', edge: { destination_node_id: 'done' } },
+          { id: 'done', type: 'end' },
+        ],
+        components: [
+          {
+            conversation_flow_component_id: 'safe_component', start_node_id: 'component_start', tools: [tool],
+            nodes: [{ id: 'component_start', type: 'function', tool_id: 'component_booking', edges: [] }],
+          },
+          // The official tool name appears in the reachable component registry.
+          // It must not manufacture reachability for this unrelated component.
+          { conversation_flow_component_id: 'book_appointment', component_type: 'local' },
+        ],
+      }
+      : providerAgent({ response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 })));
+
+    const result = await probeRetellAgent('agent_pilot', 'prod');
+
+    expect(result).toMatchObject({
+      ok: true,
+      snapshot: { bookToolProbeStatus: 'SUCCEEDED', bookToolSchema: { name: 'book_appointment' } },
+    });
+  });
+
+  it('rejects an unreachable duplicate booking-tool declaration in a conversation flow', async () => {
+    env.RETELL_API_KEY = 'real-key';
+    const reachable = { ...bookingTool(), tool_id: 'booking_primary' };
+    const shadow = { ...bookingTool('https://shadow.example.test/fn'), tool_id: 'booking_shadow' };
+    vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(String(url).includes('/get-conversation-flow/')
+      ? {
+        conversation_flow_id: 'flow_pilot', version: 4, last_modification_timestamp: 1_754_000_000_000,
+        tool_call_strict_mode: true, tools: [reachable, shadow], start_node_id: 'start',
+        nodes: [{ id: 'start', type: 'function', tool_id: 'booking_primary', edges: [] }],
+      }
+      : providerAgent({ response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 })));
+
+    const result = await probeRetellAgent('agent_pilot', 'prod');
+
+    expect(result).toMatchObject({
+      ok: true,
+      snapshot: { bookToolProbeStatus: 'SUCCEEDED', bookToolSchema: null, bookToolFingerprint: null },
+    });
+  });
+
+  it('fails closed when a reachable shared component is not recursively resolved', async () => {
+    env.RETELL_API_KEY = 'real-key';
+    const tool = { ...bookingTool(), tool_id: 'booking_primary' };
+    vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(String(url).includes('/get-conversation-flow/')
+      ? {
+        conversation_flow_id: 'flow_pilot', version: 4, last_modification_timestamp: 1_754_000_000_000,
+        tool_call_strict_mode: true, tools: [tool], start_node_id: 'start',
+        nodes: [
+          { id: 'start', type: 'function', tool_id: 'booking_primary', edge: { destination_node_id: 'shared' } },
+          { id: 'shared', type: 'component', component_type: 'shared', component_id: 'shared_hidden_tools' },
+        ],
+      }
+      : providerAgent({ response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 })));
+
+    const result = await probeRetellAgent('agent_pilot', 'prod');
+
+    expect(result).toMatchObject({
+      ok: true,
+      snapshot: { bookToolProbeStatus: 'SUCCEEDED', bookToolSchema: null, bookToolFingerprint: null },
+    });
+  });
+
+  it.each([
+    ['LLM duplicate state names', 'retell-llm', {
+      llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true, starting_state: 'start',
+      states: [
+        { name: 'start', tools: [bookingTool()], edges: [] },
+        { name: 'start', tools: [], edges: [] },
+      ],
+    }],
+    ['LLM missing start state', 'retell-llm', {
+      llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+      starting_state: 'missing', states: [{ name: 'start', tools: [bookingTool()], edges: [] }],
+    }],
+    ['LLM dangling edge', 'retell-llm', {
+      llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+      starting_state: 'start', states: [{ name: 'start', tools: [bookingTool()], edges: [{ destination_state_name: 'missing' }] }],
+    }],
+    ['flow duplicate node ids', 'conversation-flow', {
+      conversation_flow_id: 'flow_pilot', version: 4, tool_call_strict_mode: true, start_node_id: 'start',
+      nodes: [{ id: 'start', type: 'function', tool_id: 'booking' }, { id: 'start', type: 'end' }],
+      tools: [{ ...bookingTool(), tool_id: 'booking' }],
+    }],
+    ['flow duplicate component ids', 'conversation-flow', {
+      conversation_flow_id: 'flow_pilot', version: 4, tool_call_strict_mode: true, start_node_id: 'start',
+      nodes: [{ id: 'start', type: 'component', component_id: 'duplicate' }],
+      components: [
+        { conversation_flow_component_id: 'duplicate', flex_mode: true, tools: [bookingTool()] },
+        { conversation_flow_component_id: 'duplicate', flex_mode: true, tools: [] },
+      ],
+    }],
+    ['flow missing start node', 'conversation-flow', {
+      conversation_flow_id: 'flow_pilot', version: 4, tool_call_strict_mode: true, start_node_id: 'missing',
+      nodes: [{ id: 'start', type: 'function', tools: [bookingTool()] }],
+    }],
+    ['flow dangling official edge', 'conversation-flow', {
+      conversation_flow_id: 'flow_pilot', version: 4, tool_call_strict_mode: true, start_node_id: 'start',
+      nodes: [{ id: 'start', type: 'function', tools: [bookingTool()], always_edge: { destination_node_id: 'missing' } }],
+    }],
+  ] as const)('fails closed for malformed provider graph: %s', async (_name, engineType, engineBody) => {
+    env.RETELL_API_KEY = 'real-key';
+    vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(
+      String(url).includes('/get-retell-llm/') || String(url).includes('/get-conversation-flow/')
+        ? engineBody
+        : providerAgent({ response_engine: engineType === 'retell-llm'
+          ? { type: engineType, llm_id: 'llm_pilot', version: 9 }
+          : { type: engineType, conversation_flow_id: 'flow_pilot', version: 4 } }),
+    ), { status: 200 })));
+
+    const result = await probeRetellAgent('agent_pilot', 'prod');
+
+    expect(result).toMatchObject({
+      ok: true,
+      snapshot: { bookToolProbeStatus: 'SUCCEEDED', bookToolSchema: null, bookToolFingerprint: null },
+    });
   });
 
   it.each([
@@ -194,7 +327,7 @@ describe('Retell agent provider contract', () => {
     expect(result).toMatchObject({ ok: true, snapshot: { version: 0, responseEngineVersion: 0 } });
   });
 
-  it.each(['Prod', 'latest', 'latest_published', 'v2', '1prod', 'tag-that-is-more-than-20-characters'])('rejects undocumented deployment tag %s before provider access', async tag => {
+  it.each(['Prod', 'latest', 'latest_published', 'v2', '1prod', '{{version_tag}}', 'tag-that-is-more-than-20-characters'])('rejects undocumented deployment tag %s before provider access', async tag => {
     env.RETELL_API_KEY = 'real-key';
     const fetchMock = vi.fn<typeof fetch>();
     vi.stubGlobal('fetch', fetchMock);
