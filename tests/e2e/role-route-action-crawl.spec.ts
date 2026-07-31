@@ -5,6 +5,7 @@ import { fixtureDb as db } from '../../server/test/helpers/fixtureDb';
 import { generatePasswordHash } from '../../server/lib/security';
 import { recomputeEntitlements } from '../../server/lib/entitlements';
 import { assertAccessibilityContract } from './accessibility';
+import { ensureE2eSubscriptionPlan } from './subscriptionFixture';
 
 const PASSWORD = 'Route-Crawl-Pw-123!';
 const roles = ['OWNER', 'FRONT_DESK', 'AUDITOR'] as const;
@@ -27,8 +28,8 @@ test.describe('role-aware real-backend route and action crawl', () => {
     const tag = randomUUID().slice(0, 8);
     tenantId = randomUUID();
     await db.tenant.create({ data: { id: tenantId, name: `Route Crawl ${tag}`, slug: `route-crawl-${tag}` } });
-    const plan = await db.subscriptionPlan.findUnique({ where: { key: 'enterprise' } });
-    if (plan) await db.tenantSubscription.create({ data: { tenantId, planId: plan.id, status: 'ACTIVE', startedAt: new Date() } });
+    const plan = await ensureE2eSubscriptionPlan();
+    await db.tenantSubscription.create({ data: { tenantId, planId: plan.id, status: 'ACTIVE', startedAt: new Date() } });
     await recomputeEntitlements(tenantId, db);
     const passwordHash = await generatePasswordHash(PASSWORD);
     emails = Object.fromEntries(await Promise.all(roles.map(async role => {

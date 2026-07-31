@@ -6,6 +6,7 @@ import { fixtureDb as db } from '../../server/test/helpers/fixtureDb';
 import { generatePasswordHash } from '../../server/lib/security';
 import { recomputeEntitlements } from '../../server/lib/entitlements';
 import { assertAccessibilityContract } from './accessibility';
+import { ensureE2eSubscriptionPlan } from './subscriptionFixture';
 
 const API = 'http://127.0.0.1:43201';
 const OUTBOX = '.playwright/portal-outbox.jsonl';
@@ -42,8 +43,8 @@ async function seedGoldenData(projectName: string): Promise<GoldenData> {
   const tenantId = randomUUID();
   const slug = `e2e-${tag}`;
   await db.tenant.create({ data: { id: tenantId, name: `E2E Clinic ${tag}`, slug } });
-  const plan = await db.subscriptionPlan.findUnique({ where: { key: 'enterprise' } });
-  if (plan) await db.tenantSubscription.create({ data: { tenantId, planId: plan.id, status: 'ACTIVE', startedAt: new Date() } });
+  const plan = await ensureE2eSubscriptionPlan();
+  await db.tenantSubscription.create({ data: { tenantId, planId: plan.id, status: 'ACTIVE', startedAt: new Date() } });
   await recomputeEntitlements(tenantId, db);
 
   const branch = await db.branch.create({ data: { tenantId, name: 'Main Clinic', location: 'Validation Suite' } });
