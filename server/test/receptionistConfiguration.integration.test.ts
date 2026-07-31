@@ -318,6 +318,8 @@ describe('AI receptionist trusted configuration', () => {
       `"providerBookToolFingerprint" = '${hashA}'`,
       `"providerToolCallStrictMode" = true`,
       `"providerBookToolSchema" = '{}'::jsonb, "providerBookToolFingerprint" = '${hashA}', "providerToolCallStrictMode" = true, "providerResponseEngineType" = 'retell-llm', "providerResponseEngineId" = 'llm_partial', "providerResponseEngineVersion" = 1`,
+      `"providerBookToolSchema" = '{}'::jsonb, "providerBookToolFingerprint" = '${hashA}', "providerToolCallStrictMode" = true, "providerResponseEngineType" = 'retell-llm', "providerResponseEngineId" = 'llm_partial', "providerResponseEngineVersion" = 1, "providerResponseEngineGraphFingerprint" = '${hashB}'`,
+      `"providerBookToolSchema" = '{}'::jsonb, "providerEffectiveDynamicVariables" = 'null'::jsonb, "providerBookToolFingerprint" = '${hashA}', "providerToolCallStrictMode" = true, "providerResponseEngineType" = 'retell-llm', "providerResponseEngineId" = 'llm_partial', "providerResponseEngineVersion" = 1, "providerResponseEngineGraphFingerprint" = '${hashB}'`,
       `"providerBookToolSchema" = 'null'::jsonb, "providerBookToolFingerprint" = '${hashA}', "providerToolCallStrictMode" = true, "providerResponseEngineType" = 'retell-llm', "providerResponseEngineId" = 'llm_partial', "providerResponseEngineVersion" = 1, "providerResponseEngineGraphFingerprint" = '${hashB}'`,
       `"providerBookToolSchema" = '{}'::jsonb, "providerBookToolFingerprint" = '${hashA}', "providerToolCallStrictMode" = true, "providerResponseEngineId" = 'llm_partial', "providerResponseEngineVersion" = 1, "providerResponseEngineGraphFingerprint" = '${hashB}'`,
     ];
@@ -358,6 +360,7 @@ describe('AI receptionist trusted configuration', () => {
       webhook_events: ['call_started', 'call_ended', 'call_analyzed'],
       data_storage_setting: 'basic_attributes_only', opt_in_signed_url: true,
       response_engine: { type: 'retell-llm', llm_id: 'llm_safe', version: 3 },
+      dynamic_variables: { clinic_name: 'Provider-ready clinic', appointment_type: '' },
       last_modification_timestamp: Date.now(),
     };
     let providerBookingTool = compileIntakeContract({
@@ -396,6 +399,7 @@ describe('AI receptionist trusted configuration', () => {
       expect(stored.providerResponseEngineGraphFingerprint).toMatch(/^[a-f0-9]{64}$/);
       expect(stored.providerBookToolFingerprint).toMatch(/^[a-f0-9]{64}$/);
       expect(stored.providerToolCallStrictMode).toBe(true);
+      expect(stored.providerEffectiveDynamicVariables).toEqual({ clinic_name: 'Provider-ready clinic', appointment_type: '' });
       expect(stored.providerVerifiedRevision).toBe(stored.providerConfigRevision);
       expect(stored.providerVerificationExpiresAt!.getTime()).toBeGreaterThan(stored.providerVerifiedAt!.getTime());
 
@@ -578,6 +582,7 @@ describe('AI receptionist trusted configuration', () => {
         providerWebhookEvents: ['call_started', 'call_ended', 'call_analyzed'], providerDataStorageSetting: 'basic_attributes_only', providerSignedUrl: true,
         providerResponseEngineType: 'retell-llm', providerResponseEngineId: 'llm-original', providerResponseEngineVersion: 2,
         providerResponseEngineGraphFingerprint: 'b'.repeat(64), providerBookToolSchema: { fixture: true },
+        providerEffectiveDynamicVariables: {},
         providerBookToolFingerprint: 'c'.repeat(64), providerToolCallStrictMode: true,
         providerFingerprint: 'a'.repeat(64), providerConfigRevision: 1, providerVerifiedRevision: 1,
         providerVerifiedAt: new Date(), providerVerificationExpiresAt: new Date(Date.now() + 60_000),

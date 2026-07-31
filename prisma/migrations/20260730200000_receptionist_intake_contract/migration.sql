@@ -20,6 +20,7 @@ FROM paused;
 
 ALTER TABLE "ReceptionistAgent"
   ADD COLUMN "providerResponseEngineGraphFingerprint" text,
+  ADD COLUMN "providerEffectiveDynamicVariables" jsonb,
   ADD COLUMN "providerBookToolSchema" jsonb,
   ADD COLUMN "providerBookToolFingerprint" text,
   ADD COLUMN "providerToolCallStrictMode" boolean;
@@ -29,6 +30,7 @@ ALTER TABLE "ReceptionistAgent"
   CHECK (
     (
       "providerBookToolSchema" IS NULL
+      AND "providerEffectiveDynamicVariables" IS NULL
       AND "providerBookToolFingerprint" IS NULL
       AND "providerToolCallStrictMode" IS NULL
       AND (
@@ -42,6 +44,8 @@ ALTER TABLE "ReceptionistAgent"
     OR (
       "providerBookToolSchema" IS NOT NULL
       AND jsonb_typeof("providerBookToolSchema") = 'object'
+      AND "providerEffectiveDynamicVariables" IS NOT NULL
+      AND jsonb_typeof("providerEffectiveDynamicVariables") = 'object'
       AND "providerBookToolFingerprint" IS NOT NULL
       AND "providerBookToolFingerprint" ~ '^[a-f0-9]{64}$'
       AND "providerToolCallStrictMode" IS NOT NULL

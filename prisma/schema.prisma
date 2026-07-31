@@ -1509,6 +1509,9 @@ model ReceptionistAgent {
   providerResponseEngineId      String?
   providerResponseEngineVersion Int?
   providerResponseEngineGraphFingerprint String?
+  // Canonical, sanitized tag/preferred-tag defaults returned by the exact
+  // provider deployment and bound into campaign attestation evidence.
+  providerEffectiveDynamicVariables Json?
   // Sanitized, provider-read book_appointment JSON Schema evidence. It is
   // version-bound to the verified response engine and contains no credentials.
   providerBookToolSchema        Json?

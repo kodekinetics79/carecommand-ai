@@ -129,6 +129,7 @@ export interface RetellAgentSnapshot {
   bookToolSchema: Record<string, unknown> | null;
   bookToolFingerprint: string | null;
   toolCallStrictMode: boolean | null;
+  effectiveDynamicVariables: Record<string, string>;
   lastModifiedAt: Date | null;
   fingerprint: string;
 }
@@ -154,6 +155,37 @@ function providerDate(value: unknown): Date | null {
   const numeric = typeof value === 'number' ? (value < 10_000_000_000 ? value * 1_000 : value) : value;
   const date = new Date(numeric);
   return Number.isNaN(date.getTime()) ? null : date;
+}
+
+const SAFE_NONEMPTY_PROVIDER_VARIABLES = new Set([
+  'agent_name', 'campaign_name', 'clinic_name', 'clinic_phone', 'clinic_timezone',
+  'clinic_website', 'first_name', 'human_fallback_number', 'offer_title',
+]);
+const EMPTY_ONLY_PROVIDER_VARIABLES = new Set([
+  'appointment_type', 'booking_mode', 'consent_text', 'disclosure',
+  'eligible_locations', 'human_handoff', 'required_fields', 'script',
+]);
+
+function providerEffectiveDynamicVariables(value: unknown): Record<string, string> | null {
+  if (value === undefined || value === null) return {};
+  const values = record(value);
+  if (!values || Object.keys(values).length > 64) return null;
+  const normalized: Record<string, string> = {};
+  for (const key of Object.keys(values).sort()) {
+    const item = values[key];
+    if (!/^[a-z][a-z0-9_]{0,63}$/.test(key) || typeof item !== 'string' || item.length > 500) return null;
+    if (!SAFE_NONEMPTY_PROVIDER_VARIABLES.has(key) && !EMPTY_ONLY_PROVIDER_VARIABLES.has(key)) return null;
+    if ([...item].some(character => {
+      const code = character.charCodeAt(0);
+      return code <= 31 || code === 127;
+    }) || /\{\{|\}\}|\$\{/.test(item)) return null;
+    // Empty tag defaults are intentionally safe: the signed call launch owns
+    // those values. Non-empty provider defaults are limited to presentation
+    // fields and cannot override booking, identity, consent, or tool routing.
+    if (item !== '' && !SAFE_NONEMPTY_PROVIDER_VARIABLES.has(key)) return null;
+    normalized[key] = item;
+  }
+  return normalized;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -198,6 +230,8 @@ type ConversationFlowTraversal = {
   toolReferences: Set<string>;
   componentReferences: Set<string>;
   embeddedTools: Record<string, unknown>[];
+  mcpReferences: Array<{ mcpId: string | null; toolName: string | null }>;
+  invalid: boolean;
 };
 
 function addReference(value: unknown, output: Set<string>) {
@@ -211,14 +245,29 @@ function collectNodeReferences(node: Record<string, unknown>, traversal: Convers
   if (Array.isArray(node.tools)) {
     for (const value of node.tools) {
       const tool = record(value);
-      if (tool && nonEmptyString(tool.name)) traversal.embeddedTools.push(tool);
+      if (tool && nonEmptyString(tool.type) === 'mcp') {
+        traversal.mcpReferences.push({ mcpId: nonEmptyString(tool.mcp_id), toolName: nonEmptyString(tool.mcp_tool_name) });
+      } else if (tool && nonEmptyString(tool.name)) traversal.embeddedTools.push(tool);
       else if (tool) addReference(tool.tool_id, traversal.toolReferences);
       else addReference(value, traversal.toolReferences);
     }
   }
+  const embeddedTool = record(node.tool);
+  if (embeddedTool && nonEmptyString(embeddedTool.type) === 'mcp') {
+    traversal.mcpReferences.push({ mcpId: nonEmptyString(embeddedTool.mcp_id), toolName: nonEmptyString(embeddedTool.mcp_tool_name) });
+  } else if (embeddedTool && nonEmptyString(embeddedTool.name)) {
+    traversal.embeddedTools.push(embeddedTool);
+  }
+  if (nonEmptyString(node.type) === 'mcp') {
+    const mcpId = nonEmptyString(node.mcp_id);
+    const toolName = nonEmptyString(node.mcp_tool_name);
+    traversal.mcpReferences.push({ mcpId, toolName });
+    if (!mcpId || !toolName) traversal.invalid = true;
+  }
   addReference(node.component_id, traversal.componentReferences);
   addReference(node.conversation_flow_component_id, traversal.componentReferences);
   if (Array.isArray(node.component_ids)) node.component_ids.forEach(value => addReference(value, traversal.componentReferences));
+  if (nonEmptyString(node.component_type) === 'shared') traversal.invalid = true;
 }
 
 function edgeDestinations(value: unknown): string[] {
@@ -231,7 +280,7 @@ function edgeDestinations(value: unknown): string[] {
   return destinations;
 }
 
-function traverseConversationFlowNodes(nodeValues: unknown, startValue: unknown): ConversationFlowTraversal | null {
+function traverseConversationFlowNodes(nodeValues: unknown, startValue: unknown, allNodes = false): ConversationFlowTraversal | null {
   if (!Array.isArray(nodeValues)) return null;
   const nodes = new Map<string, Record<string, unknown>>();
   for (const item of nodeValues) {
@@ -243,11 +292,12 @@ function traverseConversationFlowNodes(nodeValues: unknown, startValue: unknown)
     }
   }
   const start = nonEmptyString(startValue);
-  if (!start || !nodes.has(start)) return null;
+  if (!allNodes && (!start || !nodes.has(start))) return null;
+  if (start && !nodes.has(start)) return null;
   const traversal: ConversationFlowTraversal = {
-    toolReferences: new Set<string>(), componentReferences: new Set<string>(), embeddedTools: [],
+    toolReferences: new Set<string>(), componentReferences: new Set<string>(), embeddedTools: [], mcpReferences: [], invalid: false,
   };
-  const queue = [start];
+  const queue = allNodes ? [...nodes.keys()] : [start!];
   const visited = new Set<string>();
   while (queue.length) {
     const id = queue.shift()!;
@@ -278,67 +328,102 @@ function referencedRegisteredTools(tools: Record<string, unknown>[], references:
   });
 }
 
-function declaredConversationFlowBookingToolCount(body: Record<string, unknown>, components: Record<string, unknown>[]) {
-  const declarations = [
-    ...registeredTools(body.tools),
-    ...(Array.isArray(body.nodes) ? body.nodes.flatMap(value => registeredTools(record(value)?.tools)) : []),
-    ...components.flatMap(component => [
-      ...registeredTools(component.tools),
-      ...(Array.isArray(component.nodes) ? component.nodes.flatMap(value => registeredTools(record(value)?.tools)) : []),
-    ]),
-  ];
-  return declarations.filter(tool => nonEmptyString(tool.name) === 'book_appointment').length;
+function mcpIds(values: unknown): Set<string> | null {
+  const ids = new Set<string>();
+  const entries = Array.isArray(values)
+    ? values.map(value => ({ id: nonEmptyString(record(value)?.mcp_id) ?? nonEmptyString(record(value)?.name), value }))
+    : record(values) ? Object.entries(values as Record<string, unknown>).map(([id, value]) => ({ id: nonEmptyString(id), value })) : [];
+  for (const entry of entries) {
+    if (!entry.id || !record(entry.value) || ids.has(entry.id)) return null;
+    ids.add(entry.id);
+  }
+  return ids;
 }
 
-function reachableConversationFlowTools(body: Record<string, unknown>): { tools: unknown[]; declaredBookingToolCount: number } | null {
-  const componentValues = (Array.isArray(body.components)
-    ? body.components
-    : record(body.components) ? Object.values(body.components as Record<string, unknown>) : [])
-    .map(record)
-    .filter((value): value is Record<string, unknown> => value !== null);
+function validateMcpReferences(traversal: ConversationFlowTraversal, values: unknown): boolean {
+  if (traversal.invalid) return false;
+  if (!traversal.mcpReferences.length) return true;
+  const registeredIds = mcpIds(values);
+  if (!registeredIds) return false;
+  return traversal.mcpReferences.every(reference => Boolean(
+    reference.mcpId
+    && reference.toolName
+    && registeredIds.has(reference.mcpId)
+    && reference.toolName.toLowerCase().replace(/[^a-z0-9]/g, '') !== 'bookappointment',
+  ));
+}
+
+function reachableConversationFlowTools(body: Record<string, unknown>): { tools: unknown[] } | null {
   const components = new Map<string, Record<string, unknown>>();
-  for (const component of componentValues) {
-    const id = nonEmptyString(component.conversation_flow_component_id)
-      ?? nonEmptyString(component.component_id)
-      ?? nonEmptyString(component.id);
-    if (id) {
-      if (components.has(id)) return null;
-      components.set(id, component);
+  const componentNames = new Map<string, string>();
+  const componentInput = body.components;
+  const componentEntries: Array<[string, Record<string, unknown>]> = [];
+  if (Array.isArray(componentInput)) {
+    for (const value of componentInput) {
+      const component = record(value);
+      // Retell's local-component response is an object map. Array-shaped data
+      // is accepted only when every entry carries the provider's stable shared
+      // component identifier; guessed `id`/`component_id` aliases are unsafe.
+      const id = nonEmptyString(component?.conversation_flow_component_id);
+      if (!component || !id) return null;
+      componentEntries.push([id, component]);
+    }
+  } else if (componentInput !== undefined && componentInput !== null) {
+    const componentMap = record(componentInput);
+    if (!componentMap) return null;
+    for (const [rawId, value] of Object.entries(componentMap)) {
+      const id = nonEmptyString(rawId);
+      const component = record(value);
+      if (!id || !component) return null;
+      componentEntries.push([id, component]);
     }
   }
+  for (const [id, component] of componentEntries) {
+    if (components.has(id)) return null;
+    components.set(id, component);
+    const name = nonEmptyString(component.name);
+    if (record(componentInput)) {
+      if (!name || componentNames.has(name)) return null;
+      componentNames.set(name, id);
+    } else if (name) {
+      if (componentNames.has(name)) return null;
+      componentNames.set(name, id);
+    }
+  }
+  for (const [name, id] of componentNames) {
+    if (components.has(name) && name !== id) return null;
+  }
 
-  const declaredBookingToolCount = declaredConversationFlowBookingToolCount(body, componentValues);
+  const resolveComponent = (reference: string): string | null => {
+    const byId = components.has(reference) ? reference : null;
+    const byName = componentNames.get(reference) ?? null;
+    return byId && byName && byId !== byName ? null : byId ?? byName;
+  };
   const reachableTools: Record<string, unknown>[] = [];
   const componentQueue: string[] = [];
-  if (body.flex_mode === true) {
-    reachableTools.push(...registeredTools(body.tools));
-  } else {
-    const rootTraversal = traverseConversationFlowNodes(body.nodes, body.start_node_id);
-    if (!rootTraversal) return null;
-    reachableTools.push(...rootTraversal.embeddedTools);
-    reachableTools.push(...referencedRegisteredTools(registeredTools(body.tools), rootTraversal.toolReferences, false));
-    componentQueue.push(...rootTraversal.componentReferences);
-  }
+  const rootTraversal = traverseConversationFlowNodes(body.nodes, body.start_node_id, body.flex_mode === true);
+  if (!rootTraversal || !validateMcpReferences(rootTraversal, body.mcps)) return null;
+  reachableTools.push(...rootTraversal.embeddedTools);
+  reachableTools.push(...referencedRegisteredTools(registeredTools(body.tools), rootTraversal.toolReferences, body.flex_mode === true));
+  componentQueue.push(...rootTraversal.componentReferences);
 
   const traversedComponents = new Set<string>();
   while (componentQueue.length) {
-    const componentId = componentQueue.shift()!;
+    const reference = componentQueue.shift()!;
+    const componentId = resolveComponent(reference);
+    if (!componentId) return null;
     if (traversedComponents.has(componentId)) continue;
     traversedComponents.add(componentId);
     const component = components.get(componentId);
     if (!component) return null;
-    if (component.flex_mode === true) {
-      reachableTools.push(...registeredTools(component.tools));
-      continue;
-    }
-    const traversal = traverseConversationFlowNodes(component.nodes, component.start_node_id);
-    if (!traversal) return null;
+    const traversal = traverseConversationFlowNodes(component.nodes, component.start_node_id, component.flex_mode === true);
+    if (!traversal || !validateMcpReferences(traversal, component.mcps)) return null;
     reachableTools.push(...traversal.embeddedTools);
-    reachableTools.push(...referencedRegisteredTools(registeredTools(component.tools), traversal.toolReferences, false));
+    reachableTools.push(...referencedRegisteredTools(registeredTools(component.tools), traversal.toolReferences, component.flex_mode === true));
     componentQueue.push(...traversal.componentReferences);
   }
 
-  return { tools: reachableTools, declaredBookingToolCount };
+  return { tools: reachableTools };
 }
 
 async function probeRetellBookTool(responseEngineType: string, responseEngineId: string, responseEngineVersion: number | null) {
@@ -361,13 +446,12 @@ async function probeRetellBookTool(responseEngineType: string, responseEngineId:
     }
     const graphFingerprint = fingerprintJson(body);
     const discovery = responseEngineType === 'retell-llm'
-      ? { tools: reachableRetellLlmTools(body), declaredBookingToolCount: null }
+      ? { tools: reachableRetellLlmTools(body) }
       : reachableConversationFlowTools(body);
     if (!discovery || !discovery.tools) return { status: 'SUCCEEDED' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint };
     const tools = discovery.tools;
     const bookingTools = tools.filter(tool => tool && typeof tool === 'object' && nonEmptyString((tool as Record<string, unknown>).name) === 'book_appointment') as Array<Record<string, unknown>>;
-    const noConversationFlowShadow = responseEngineType !== 'conversation-flow' || discovery.declaredBookingToolCount === 1;
-    const contract = bookingTools.length === 1 && noConversationFlowShadow ? normalizeBookAppointmentToolContract(bookingTools[0]) : null;
+    const contract = bookingTools.length === 1 ? normalizeBookAppointmentToolContract(bookingTools[0]) : null;
     const strictMode = body.tool_call_strict_mode === true;
     // Retell LLM has its own publication flag. Conversation Flow does not;
     // production publication is enforced on the exact agent tag/version.
@@ -428,6 +512,8 @@ export async function probeRetellAgent(agentId: string, versionTag: string): Pro
     }
     const assignedTags = Array.isArray(body.assigned_tags) ? body.assigned_tags.filter((item): item is string => typeof item === 'string') : [];
     const webhookEvents = Array.isArray(body.webhook_events) ? body.webhook_events.filter((item): item is string => typeof item === 'string') : [];
+    const effectiveDynamicVariables = providerEffectiveDynamicVariables(body.dynamic_variables);
+    if (!effectiveDynamicVariables) return { ok: false, error: 'invalid_response' };
     const responseEngineVersion = nonNegativeInteger(responseEngine?.version);
     const bookTool = await probeRetellBookTool(responseEngineType, responseEngineId, responseEngineVersion);
     const safety = {
@@ -444,6 +530,7 @@ export async function probeRetellAgent(agentId: string, versionTag: string): Pro
       responseEngineType,
       responseEngineId,
       responseEngineVersion,
+      effectiveDynamicVariables,
       lastModifiedAt: providerDate(body.last_modification_timestamp),
     };
     return {

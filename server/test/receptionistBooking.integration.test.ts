@@ -55,6 +55,8 @@ async function makeTenant() {
     tool: contract.snapshot.bookAppointmentToolContract,
     engine: { type: 'retell-llm', id: `llm_${id.replaceAll('-', '')}`, version: 1, graphFingerprint: providerGraphFingerprint },
   });
+  const providerEffectiveDynamicVariables = {};
+  const attestedSnapshot = { ...contract.snapshot, providerEffectiveDynamicVariables };
   const now = new Date();
   const agent = await db.receptionistAgent.create({ data: {
     tenantId: id, clinicId: clinic.id, name: 'Avery', active: true,
@@ -64,6 +66,7 @@ async function makeTenant() {
     providerWebhookEvents: ['call_started', 'call_ended', 'call_analyzed'], providerDataStorageSetting: 'basic_attributes_only', providerSignedUrl: true,
     providerResponseEngineType: 'retell-llm', providerResponseEngineId: `llm_${id.replaceAll('-', '')}`, providerResponseEngineVersion: 1,
     providerResponseEngineGraphFingerprint: providerGraphFingerprint,
+    providerEffectiveDynamicVariables,
     providerBookToolSchema: contract.snapshot.bookAppointmentToolContract as never,
     providerBookToolFingerprint: providerToolFingerprint, providerToolCallStrictMode: true,
     providerConfigRevision: 1, providerVerifiedRevision: 1, providerVerifiedAt: now,
@@ -73,7 +76,7 @@ async function makeTenant() {
     id: campaignId, tenantId: id, clinicId: clinic.id, agentId: agent.id,
     name: 'Attested booking campaign', status: 'ACTIVE', offerTitle: 'Appointment', offerDescription: 'Schedule care',
     offerScript: 'Would you like to schedule?', appointmentType, eligibleLocationIds: [], intakeSchemaRevision: 1,
-    intakeSchemaSnapshot: contract.snapshot as never, intakeSchemaFingerprint: contract.fingerprint,
+    intakeSchemaSnapshot: attestedSnapshot as never, intakeSchemaFingerprint: fingerprintJson(attestedSnapshot),
     intakeToolFingerprint: providerToolFingerprint, intakeSchemaAttestedRevision: 1, intakeSchemaAttestedAt: now,
     intakeSchemaProviderAgentId: providerAgentId, intakeSchemaProviderVersion: providerVersion,
     intakeSchemaResponseEngineId: `llm_${id.replaceAll('-', '')}`, intakeSchemaResponseEngineVersion: 1,

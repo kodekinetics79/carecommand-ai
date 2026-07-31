@@ -104,6 +104,7 @@ function providerSnapshotData(snapshot: RetellAgentSnapshot) {
     providerLastModifiedAt: snapshot.lastModifiedAt,
     providerFingerprint: snapshot.fingerprint,
     providerResponseEngineGraphFingerprint: snapshot.responseEngineGraphFingerprint,
+    providerEffectiveDynamicVariables: snapshot.effectiveDynamicVariables as Prisma.InputJsonValue,
     providerBookToolSchema: snapshot.bookToolSchema as Prisma.InputJsonValue,
     providerBookToolFingerprint: snapshot.bookToolFingerprint,
     providerToolCallStrictMode: snapshot.toolCallStrictMode,
@@ -205,6 +206,7 @@ async function attestCampaignIntakeContract(
     providerBookToolSchema: unknown;
     providerBookToolFingerprint: string | null;
     providerResponseEngineGraphFingerprint: string | null;
+    providerEffectiveDynamicVariables: unknown;
     providerToolCallStrictMode: boolean | null;
     providerAgentId: string | null;
     providerVersion: number | null;
@@ -213,6 +215,7 @@ async function attestCampaignIntakeContract(
   } | null,
 ) {
   if (!agent?.providerBookToolSchema || !agent.providerBookToolFingerprint || !agent.providerResponseEngineGraphFingerprint
+    || !agent.providerEffectiveDynamicVariables || typeof agent.providerEffectiveDynamicVariables !== 'object' || Array.isArray(agent.providerEffectiveDynamicVariables)
     || agent.providerVersion === null || !agent.providerAgentId || !agent.providerResponseEngineId || agent.providerResponseEngineVersion === null) {
     throw new Error('intake_schema_unattested');
   }
@@ -232,9 +235,13 @@ async function attestCampaignIntakeContract(
     select: { id: true },
   });
   if (deploymentConflict) throw new Error('active_provider_deployment_conflict');
+  const attestedSnapshot = {
+    ...contract.snapshot,
+    providerEffectiveDynamicVariables: agent.providerEffectiveDynamicVariables,
+  };
   return {
-    intakeSchemaSnapshot: contract.snapshot as unknown as Prisma.InputJsonValue,
-    intakeSchemaFingerprint: contract.fingerprint,
+    intakeSchemaSnapshot: attestedSnapshot as unknown as Prisma.InputJsonValue,
+    intakeSchemaFingerprint: fingerprintJson(attestedSnapshot),
     intakeToolFingerprint: agent.providerBookToolFingerprint,
     intakeSchemaAttestedRevision: campaign.intakeSchemaRevision,
     intakeSchemaAttestedAt: new Date(),
@@ -715,6 +722,7 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
         providerResponseEngineId: null,
         providerResponseEngineVersion: null,
         providerResponseEngineGraphFingerprint: null,
+        providerEffectiveDynamicVariables: Prisma.DbNull,
         providerBookToolSchema: Prisma.DbNull,
         providerBookToolFingerprint: null,
         providerToolCallStrictMode: null,
