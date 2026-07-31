@@ -1,5 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { env } from '../config/env';
+import {
+  fingerprintJson,
+  normalizeBookAppointmentToolContract,
+} from '../modules/receptionist/intakeContract';
 
 // ===========================================================================
 // Retell outbound dial trigger. Real Retell API when credentials are present;
@@ -120,6 +124,11 @@ export interface RetellAgentSnapshot {
   responseEngineType: string;
   responseEngineId: string;
   responseEngineVersion: number | null;
+  responseEngineGraphFingerprint: string | null;
+  bookToolProbeStatus: 'SUCCEEDED' | 'UNAVAILABLE' | 'UNSUPPORTED';
+  bookToolSchema: Record<string, unknown> | null;
+  bookToolFingerprint: string | null;
+  toolCallStrictMode: boolean | null;
   lastModifiedAt: Date | null;
   fingerprint: string;
 }
@@ -137,7 +146,7 @@ function nonNegativeInteger(value: unknown): number | null {
 }
 
 export function isValidRetellVersionTag(value: string): boolean {
-  return /^[a-z][a-z0-9_-]{0,19}$/.test(value) && value !== 'latest' && !/^v\d+$/.test(value);
+  return /^[a-z][a-z0-9_-]{0,19}$/.test(value) && !['latest', 'latest_published'].includes(value) && !/^v\d+$/.test(value);
 }
 
 function providerDate(value: unknown): Date | null {
@@ -145,6 +154,167 @@ function providerDate(value: unknown): Date | null {
   const numeric = typeof value === 'number' ? (value < 10_000_000_000 ? value * 1_000 : value) : value;
   const date = new Date(numeric);
   return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function referencedStrings(value: unknown, output = new Set<string>()): Set<string> {
+  if (typeof value === 'string') output.add(value);
+  else if (Array.isArray(value)) value.forEach(item => referencedStrings(item, output));
+  else if (record(value)) Object.values(value as Record<string, unknown>).forEach(item => referencedStrings(item, output));
+  return output;
+}
+
+function reachableRetellLlmTools(body: Record<string, unknown>): unknown[] | null {
+  const general = Array.isArray(body.general_tools) ? [...body.general_tools] : [];
+  if (!Array.isArray(body.states) || body.states.length === 0) return general;
+  const states = new Map<string, Record<string, unknown>>();
+  for (const item of body.states) {
+    const state = record(item);
+    const name = nonEmptyString(state?.name);
+    if (state && name) states.set(name, state);
+  }
+  const start = nonEmptyString(body.starting_state);
+  if (!start || !states.has(start)) return null;
+  const queue = [start];
+  const visited = new Set<string>();
+  const tools = [...general];
+  while (queue.length) {
+    const name = queue.shift()!;
+    if (visited.has(name)) continue;
+    visited.add(name);
+    const state = states.get(name);
+    if (!state) return null;
+    if (Array.isArray(state.tools)) tools.push(...state.tools);
+    if (Array.isArray(state.edges)) {
+      for (const edgeValue of state.edges) {
+        const destination = nonEmptyString(record(edgeValue)?.destination_state_name);
+        if (destination && !visited.has(destination)) queue.push(destination);
+      }
+    }
+  }
+  return tools;
+}
+
+function reachableConversationFlowTools(body: Record<string, unknown>): unknown[] | null {
+  const reachableReferences = new Set<string>();
+  const embedded: unknown[] = [];
+  const componentRegistered: unknown[] = [];
+  const traverse = (nodeValues: unknown, startValue: unknown): boolean => {
+    if (!Array.isArray(nodeValues)) return false;
+    const nodes = new Map<string, Record<string, unknown>>();
+    for (const item of nodeValues) {
+      const node = record(item);
+      const id = nonEmptyString(node?.id);
+      if (node && id) nodes.set(id, node);
+    }
+    const start = nonEmptyString(startValue);
+    if (!start || !nodes.has(start)) return false;
+    const queue = [start];
+    const visited = new Set<string>();
+    while (queue.length) {
+      const id = queue.shift()!;
+      if (visited.has(id)) continue;
+      visited.add(id);
+      const node = nodes.get(id);
+      if (!node) return false;
+      referencedStrings(node, reachableReferences);
+      if (Array.isArray(node.tools)) embedded.push(...node.tools);
+      if (Array.isArray(node.edges)) {
+        for (const edgeValue of node.edges) {
+          const destination = nonEmptyString(record(edgeValue)?.destination_node_id);
+          if (destination && !visited.has(destination)) queue.push(destination);
+        }
+      }
+    }
+    return true;
+  };
+
+  if (!traverse(body.nodes, body.start_node_id)) return null;
+
+  // A reachable component/subagent node references its component by id/name.
+  // Traverse only those exact component graphs, including nested components;
+  // unreachable tool registries must never satisfy activation attestation.
+  const componentValues = Array.isArray(body.components)
+    ? body.components
+    : record(body.components) ? Object.values(body.components as Record<string, unknown>) : [];
+  const traversedComponents = new Set<string>();
+  let discovered = true;
+  while (discovered) {
+    discovered = false;
+    for (const value of componentValues) {
+      const component = record(value);
+      const id = nonEmptyString(component?.component_id) ?? nonEmptyString(component?.id) ?? nonEmptyString(component?.name);
+      if (!component || !id || traversedComponents.has(id) || !reachableReferences.has(id)) continue;
+      traversedComponents.add(id);
+      discovered = true;
+      referencedStrings(component, reachableReferences);
+      if (!traverse(component.nodes, component.start_node_id)) return null;
+      if (Array.isArray(component.tools)) {
+        if (component.flex_mode === true) embedded.push(...component.tools);
+        else componentRegistered.push(...component.tools);
+      }
+    }
+  }
+
+  const registered = [
+    ...(Array.isArray(body.tools) ? body.tools : []),
+    ...componentRegistered,
+  ];
+  const globallyReachable = body.flex_mode === true;
+  for (const item of registered) {
+    const tool = record(item);
+    if (!tool) continue;
+    const id = nonEmptyString(tool.tool_id);
+    const name = nonEmptyString(tool.name);
+    if (globallyReachable || (id && reachableReferences.has(id)) || (name && reachableReferences.has(name))) embedded.push(tool);
+  }
+  return embedded;
+}
+
+async function probeRetellBookTool(responseEngineType: string, responseEngineId: string, responseEngineVersion: number | null) {
+  if (!['retell-llm', 'conversation-flow'].includes(responseEngineType) || responseEngineVersion === null) {
+    return { status: 'UNSUPPORTED' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint: null };
+  }
+  try {
+    const endpoint = responseEngineType === 'retell-llm' ? 'get-retell-llm' : 'get-conversation-flow';
+    const response = await fetchWithTimeout(
+      `${env.RETELL_BASE_URL}/${endpoint}/${encodeURIComponent(responseEngineId)}?version=${responseEngineVersion}`,
+      { headers: { Authorization: `Bearer ${env.RETELL_API_KEY}` } },
+    );
+    if (!response.ok) return { status: 'UNAVAILABLE' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint: null };
+    const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+    const resolvedId = responseEngineType === 'retell-llm'
+      ? nonEmptyString(body?.llm_id)
+      : nonEmptyString(body?.conversation_flow_id);
+    if (!body || resolvedId !== responseEngineId || nonNegativeInteger(body.version) !== responseEngineVersion) {
+      return { status: 'UNAVAILABLE' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint: null };
+    }
+    const graphFingerprint = fingerprintJson(body);
+    const tools = responseEngineType === 'retell-llm' ? reachableRetellLlmTools(body) : reachableConversationFlowTools(body);
+    if (!tools) return { status: 'SUCCEEDED' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint };
+    const bookingTools = tools.filter(tool => tool && typeof tool === 'object' && nonEmptyString((tool as Record<string, unknown>).name) === 'book_appointment') as Array<Record<string, unknown>>;
+    const contract = bookingTools.length === 1 ? normalizeBookAppointmentToolContract(bookingTools[0]) : null;
+    const strictMode = body.tool_call_strict_mode === true;
+    const published = body.is_published === true;
+    if (!published || !contract) {
+      return { status: 'SUCCEEDED' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint };
+    }
+    return {
+      status: 'SUCCEEDED' as const,
+      schema: contract,
+      fingerprint: fingerprintJson({
+        tool: contract,
+        engine: { type: responseEngineType, id: responseEngineId, version: responseEngineVersion, graphFingerprint },
+      }),
+      strictMode,
+      graphFingerprint,
+    };
+  } catch {
+    return { status: 'UNAVAILABLE' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint: null };
+  }
 }
 
 /**
@@ -185,6 +355,8 @@ export async function probeRetellAgent(agentId: string, versionTag: string): Pro
     }
     const assignedTags = Array.isArray(body.assigned_tags) ? body.assigned_tags.filter((item): item is string => typeof item === 'string') : [];
     const webhookEvents = Array.isArray(body.webhook_events) ? body.webhook_events.filter((item): item is string => typeof item === 'string') : [];
+    const responseEngineVersion = nonNegativeInteger(responseEngine?.version);
+    const bookTool = await probeRetellBookTool(responseEngineType, responseEngineId, responseEngineVersion);
     const safety = {
       agentId: resolvedAgentId,
       version,
@@ -198,13 +370,18 @@ export async function probeRetellAgent(agentId: string, versionTag: string): Pro
       signedUrl: body.opt_in_signed_url === true,
       responseEngineType,
       responseEngineId,
-      responseEngineVersion: nonNegativeInteger(responseEngine?.version),
+      responseEngineVersion,
       lastModifiedAt: providerDate(body.last_modification_timestamp),
     };
     return {
       ok: true,
       snapshot: {
         ...safety,
+        bookToolProbeStatus: bookTool.status,
+        responseEngineGraphFingerprint: bookTool.graphFingerprint,
+        bookToolSchema: bookTool.schema as unknown as Record<string, unknown> | null,
+        bookToolFingerprint: bookTool.fingerprint,
+        toolCallStrictMode: bookTool.strictMode,
         fingerprint: createHash('sha256').update(JSON.stringify({
           ...safety,
           lastModifiedAt: safety.lastModifiedAt?.toISOString() ?? null,

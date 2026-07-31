@@ -21,6 +21,7 @@ vi.mock('../workers/queues', () => ({
 const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
+const { compileIntakeContract, fingerprintJson } = await import('../modules/receptionist/intakeContract');
 
 let app: FastifyInstance;
 const tenantIds: string[] = [];
@@ -41,27 +42,56 @@ async function makeTenant() {
   await db.providerAvailability.createMany({ data: Array.from({ length: 7 }, (_, dayOfWeek) => ({ tenantId: id, branchId: branch.id, providerProfileId: provider.id, dayOfWeek, startMinute: 540, endMinute: 1020, slotMinutes: 30 })) });
   const patient = await db.patient.create({ data: { tenantId: id, branchId: branch.id, firstName: 'Pat', lastName: 'Roe', lifecycleStage: 'ACTIVE' }, select: { id: true } });
   const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Clinic', phone: phoneFor(id) }, select: { id: true } });
+  const campaignId = randomUUID();
+  const appointmentType = 'Consultation';
+  const contract = compileIntakeContract({
+    campaignId, revision: 1, appointmentType, eligibleLocations: [], fields: [],
+    toolUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell/fn?clinicId=${clinic.id}`,
+  });
+  const providerAgentId = `agent_${id.replaceAll('-', '')}`;
+  const providerVersion = 1;
+  const providerGraphFingerprint = 'a'.repeat(64);
+  const providerToolFingerprint = fingerprintJson({
+    tool: contract.snapshot.bookAppointmentToolContract,
+    engine: { type: 'retell-llm', id: `llm_${id.replaceAll('-', '')}`, version: 1, graphFingerprint: providerGraphFingerprint },
+  });
   const now = new Date();
   const agent = await db.receptionistAgent.create({ data: {
     tenantId: id, clinicId: clinic.id, name: 'Avery', active: true,
-    providerAgentId: `agent_${id.replaceAll('-', '')}`, providerVersionTag: 'prod', providerVersion: 1,
+    providerAgentId, providerVersionTag: 'prod', providerVersion,
     providerStatus: 'VERIFIED', providerPublished: true, providerAssignedTags: ['prod'], providerFingerprint: 'b'.repeat(64),
     providerWebhookUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`,
     providerWebhookEvents: ['call_started', 'call_ended', 'call_analyzed'], providerDataStorageSetting: 'basic_attributes_only', providerSignedUrl: true,
-    providerResponseEngineType: 'retell-llm', providerResponseEngineId: `llm_${id.replaceAll('-', '')}`,
+    providerResponseEngineType: 'retell-llm', providerResponseEngineId: `llm_${id.replaceAll('-', '')}`, providerResponseEngineVersion: 1,
+    providerResponseEngineGraphFingerprint: providerGraphFingerprint,
+    providerBookToolSchema: contract.snapshot.bookAppointmentToolContract as never,
+    providerBookToolFingerprint: providerToolFingerprint, providerToolCallStrictMode: true,
     providerConfigRevision: 1, providerVerifiedRevision: 1, providerVerifiedAt: now,
     providerVerificationExpiresAt: new Date(now.getTime() + 60 * 60 * 1_000),
   }, select: { id: true } });
-  return { id, branchId: branch.id, adminId: admin.id, providerId: provider.id, patientId: patient.id, clinicId: clinic.id, agentId: agent.id };
+  await db.receptionistCampaign.create({ data: {
+    id: campaignId, tenantId: id, clinicId: clinic.id, agentId: agent.id,
+    name: 'Attested booking campaign', status: 'ACTIVE', offerTitle: 'Appointment', offerDescription: 'Schedule care',
+    offerScript: 'Would you like to schedule?', appointmentType, eligibleLocationIds: [], intakeSchemaRevision: 1,
+    intakeSchemaSnapshot: contract.snapshot as never, intakeSchemaFingerprint: contract.fingerprint,
+    intakeToolFingerprint: providerToolFingerprint, intakeSchemaAttestedRevision: 1, intakeSchemaAttestedAt: now,
+    intakeSchemaProviderAgentId: providerAgentId, intakeSchemaProviderVersion: providerVersion,
+    intakeSchemaResponseEngineId: `llm_${id.replaceAll('-', '')}`, intakeSchemaResponseEngineVersion: 1,
+  } });
+  return {
+    id, branchId: branch.id, adminId: admin.id, providerId: provider.id, patientId: patient.id, clinicId: clinic.id, clinicPhone: phoneFor(id),
+    agentId: agent.id, campaignId, providerAgentId, providerVersion,
+    appointmentType, intakeSchemaRevision: 1, intakeSemanticFingerprint: contract.snapshot.semanticFingerprint,
+  };
 }
 type T = Awaited<ReturnType<typeof makeTenant>>;
 const adminAuth = (t: T) => ({ authorization: `Bearer ${app.jwt.sign({ userId: t.adminId, tenantId: t.id, role: 'ADMIN', type: 'access' })}` });
 const futureDate = (days: number) => new Date(Date.now() + days * 86_400_000).toISOString().slice(0, 10);
 
-async function fn(t: Pick<T, 'id' | 'clinicId'>, name: string, args: Record<string, unknown>, callId = `c-${randomUUID()}`, fromNumber?: string) {
+async function fn(t: T, name: string, args: Record<string, unknown>, callId = `c-${randomUUID()}`, fromNumber?: string) {
   const existing = await db.receptionistCallLog.findFirst({ where: { tenantId: t.id, retellCallId: callId }, select: { id: true } });
   if (!existing) await db.receptionistCallLog.create({
-    data: { tenantId: t.id, clinicId: t.clinicId, retellCallId: callId, callerPhone: fromNumber, direction: 'inbound', outcome: 'IN_PROGRESS' },
+    data: { tenantId: t.id, clinicId: t.clinicId, campaignId: t.campaignId, retellCallId: callId, callerPhone: fromNumber, direction: 'inbound', outcome: 'IN_PROGRESS' },
   });
   // Booking is a protected operation. Exercise the same signed consent tool
   // that a live agent must call after the opening disclosure instead of
@@ -70,7 +100,7 @@ async function fn(t: Pick<T, 'id' | 'clinicId'>, name: string, args: Record<stri
     const consentRaw = JSON.stringify({
       name: 'record_recording_preference',
       args: { recording_decision: 'GRANTED', jurisdiction: 'test' },
-      call: { call_id: callId, from_number: fromNumber, direction: 'inbound' },
+      call: { call_id: callId, agent_id: t.providerAgentId, agent_version: t.providerVersion, from_number: fromNumber, direction: 'inbound' },
     });
     const consent = await app.inject({
       method: 'POST',
@@ -81,7 +111,16 @@ async function fn(t: Pick<T, 'id' | 'clinicId'>, name: string, args: Record<stri
     expect(consent.statusCode).toBe(200);
     expect((consent.json() as { recorded?: boolean }).recorded).toBe(true);
   }
-  const raw = JSON.stringify({ name, args, call: { call_id: callId, from_number: fromNumber, direction: 'inbound' } });
+  const trustedArgs = name === 'book_appointment' ? {
+    ...args,
+    service: t.appointmentType,
+    intake_contract_fingerprint: t.intakeSemanticFingerprint,
+    intake_schema_revision: t.intakeSchemaRevision,
+  } : args;
+  const raw = JSON.stringify({
+    name, args: trustedArgs,
+    call: { call_id: callId, agent_id: t.providerAgentId, agent_version: t.providerVersion, from_number: fromNumber, direction: 'inbound' },
+  });
   const res = await app.inject({
     method: 'POST',
     url: `/v1/receptionist/webhooks/retell/fn?clinicId=${t.clinicId}`,
@@ -104,11 +143,51 @@ afterAll(async () => {
 });
 
 describe('receptionist /fn booking — real availability + booking', () => {
+  it('binds a tool-first call from exact signed deployment and rejects selector/deployment drift', async () => {
+    const t = await makeTenant();
+    const inject = (callId: string, name: string, args: Record<string, unknown>, call: Record<string, unknown>, campaignId = t.campaignId) => {
+      const raw = JSON.stringify({ name, args, call });
+      return app.inject({
+        method: 'POST', url: `/v1/receptionist/webhooks/retell/fn?clinicId=${t.clinicId}&campaignId=${campaignId}`,
+        headers: { 'content-type': 'application/json', 'x-retell-signature': signRetell(raw, RETELL_KEY) }, payload: raw,
+      });
+    };
+    const callId = `tool-first-contract-${randomUUID()}`;
+    const signedCall = {
+      call_id: callId, agent_id: t.providerAgentId, agent_version: t.providerVersion,
+      from_number: '+15551235555', to_number: t.clinicPhone, direction: 'inbound',
+    };
+    expect((await inject(callId, 'record_recording_preference', { recording_decision: 'GRANTED' }, signedCall)).json()).toMatchObject({ recorded: true });
+    const exact = await inject(callId, 'book_appointment', {
+      first_name: 'Binding', last_name: 'Probe', appointment_date: 'not-a-date', appointment_time: 'noon',
+      service: t.appointmentType, intake_contract_fingerprint: t.intakeSemanticFingerprint, intake_schema_revision: 1,
+    }, signedCall);
+    expect(exact.statusCode).toBe(200);
+    expect(exact.json()).toMatchObject({ booked: false });
+    expect(await db.receptionistCallLog.findFirstOrThrow({ where: { tenantId: t.id, retellCallId: callId } })).toMatchObject({
+      clinicId: t.clinicId, campaignId: t.campaignId,
+    });
+
+    const selectorDrift = await inject(callId, 'book_appointment', {
+      service: t.appointmentType, intake_contract_fingerprint: t.intakeSemanticFingerprint, intake_schema_revision: 1,
+    }, signedCall, randomUUID());
+    expect(selectorDrift.json()).toMatchObject({ booked: false, needs_human: true });
+
+    const wrongCallId = `wrong-deployment-${randomUUID()}`;
+    const wrongCall = { ...signedCall, call_id: wrongCallId, agent_id: 'agent_wrong' };
+    expect((await inject(wrongCallId, 'record_recording_preference', { recording_decision: 'GRANTED' }, wrongCall)).statusCode).toBe(200);
+    const wrongDeployment = await inject(wrongCallId, 'book_appointment', {
+      service: t.appointmentType, intake_contract_fingerprint: t.intakeSemanticFingerprint, intake_schema_revision: 1,
+    }, wrongCall);
+    expect(wrongDeployment.json()).toMatchObject({ booked: false, needs_human: true });
+    expect((await db.receptionistCallLog.findFirstOrThrow({ where: { tenantId: t.id, retellCallId: wrongCallId } })).campaignId).toBeNull();
+  });
+
   it('uses the branch timezone and canonical catalog duration for offers and booking', async () => {
     const t = await makeTenant();
     await db.branch.update({ where: { id: t.branchId }, data: { timezone: 'America/New_York' } });
     const service = await db.serviceCatalogItem.create({
-      data: { tenantId: t.id, name: 'Extended Consultation', category: 'general', defaultDurationMinutes: 45, active: true },
+      data: { tenantId: t.id, name: t.appointmentType, category: 'general', defaultDurationMinutes: 45, active: true },
     });
     const future = new Date(Date.now() + 7 * 86_400_000);
     const date = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(future);

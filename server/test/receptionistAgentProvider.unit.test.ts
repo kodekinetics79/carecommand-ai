@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { env } from '../config/env';
 import { evaluateRetellAgentReadiness, probeRetellAgent } from '../lib/retell';
+import { compileIntakeContract } from '../modules/receptionist/intakeContract';
 
 const original = { apiKey: env.RETELL_API_KEY, baseUrl: env.RETELL_BASE_URL };
 const webhookUrl = 'https://api.example.test/v1/receptionist/webhooks/retell';
@@ -24,6 +25,12 @@ function providerAgent(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function bookingTool(url = 'https://api.example.test/v1/receptionist/webhooks/retell/fn?clinicId=clinic-1') {
+  return compileIntakeContract({
+    campaignId: 'campaign-1', revision: 1, appointmentType: 'Consultation', eligibleLocations: [], fields: [], toolUrl: url,
+  }).snapshot.bookAppointmentToolContract;
+}
+
 afterEach(() => {
   env.RETELL_API_KEY = original.apiKey;
   env.RETELL_BASE_URL = original.baseUrl;
@@ -35,7 +42,12 @@ describe('Retell agent provider contract', () => {
   it('uses exact tag/auth GET contract and produces a non-secret deterministic safety snapshot', async () => {
     env.RETELL_API_KEY = 'retell-secret-value';
     env.RETELL_BASE_URL = 'https://api.retellai.com';
-    const fetchMock = vi.fn<typeof fetch>(async () => new Response(JSON.stringify(providerAgent()), { status: 200 }));
+    const fetchMock = vi.fn<typeof fetch>(async url => new Response(JSON.stringify(String(url).includes('/get-retell-llm/')
+      ? {
+        llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+        general_tools: [bookingTool()],
+      }
+      : providerAgent()), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
 
     const result = await probeRetellAgent('agent_pilot', 'prod');
@@ -44,11 +56,103 @@ describe('Retell agent provider contract', () => {
       'https://api.retellai.com/get-agent/agent_pilot?version=prod',
       expect.objectContaining({ headers: { Authorization: 'Bearer retell-secret-value' } }),
     );
-    expect(result).toMatchObject({ ok: true, snapshot: { agentId: 'agent_pilot', version: 12, published: true, responseEngineId: 'llm_pilot' } });
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://api.retellai.com/get-retell-llm/llm_pilot?version=9',
+      expect.objectContaining({ headers: { Authorization: 'Bearer retell-secret-value' } }),
+    );
+    expect(result).toMatchObject({
+      ok: true,
+      snapshot: {
+        agentId: 'agent_pilot', version: 12, published: true, responseEngineId: 'llm_pilot',
+        bookToolProbeStatus: 'SUCCEEDED', toolCallStrictMode: true,
+      },
+    });
     if (!result.ok) throw new Error('expected provider snapshot');
     expect(result.snapshot.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(result.snapshot.responseEngineGraphFingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(result.snapshot.bookToolFingerprint).toMatch(/^[a-f0-9]{64}$/);
     expect(JSON.stringify(result)).not.toContain('retell-secret-value');
     expect(evaluateRetellAgentReadiness(result.snapshot, { versionTag: 'prod', webhookUrl })).toBeNull();
+  });
+
+  it('attests one reachable wrapped booking tool in an exact conversation-flow version', async () => {
+    env.RETELL_API_KEY = 'real-key';
+    env.RETELL_BASE_URL = 'https://api.retellai.com';
+    const tool = { ...bookingTool(), tool_id: 'tool_booking' };
+    const fetchMock = vi.fn<typeof fetch>(async url => new Response(JSON.stringify(String(url).includes('/get-conversation-flow/')
+      ? {
+        conversation_flow_id: 'flow_pilot', version: 4, is_published: true, tool_call_strict_mode: true, tools: [tool], start_node_id: 'start',
+        nodes: [{ id: 'start', type: 'function', tool_id: 'tool_booking', edges: [] }],
+      }
+      : providerAgent({ response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } })), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await probeRetellAgent('agent_pilot', 'prod');
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://api.retellai.com/get-conversation-flow/flow_pilot?version=4',
+      expect.objectContaining({ headers: { Authorization: 'Bearer real-key' } }),
+    );
+    expect(result).toMatchObject({
+      ok: true,
+      snapshot: {
+        responseEngineType: 'conversation-flow', responseEngineId: 'flow_pilot', responseEngineVersion: 4,
+        bookToolProbeStatus: 'SUCCEEDED', toolCallStrictMode: true,
+      },
+    });
+  });
+
+  it('changes full deployment evidence when the exact engine prompt graph drifts at the same version', async () => {
+    env.RETELL_API_KEY = 'real-key';
+    let prompt = 'Collect the configured intake questions.';
+    vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(String(url).includes('/get-retell-llm/')
+      ? {
+        llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+        general_prompt: prompt, general_tools: [bookingTool()],
+      }
+      : providerAgent()), { status: 200 })));
+    const first = await probeRetellAgent('agent_pilot', 'prod');
+    prompt = 'Drifted prompt that no longer asks the configured questions.';
+    const second = await probeRetellAgent('agent_pilot', 'prod');
+    if (!first.ok || !second.ok) throw new Error('expected provider snapshots');
+    expect(second.snapshot.responseEngineGraphFingerprint).not.toBe(first.snapshot.responseEngineGraphFingerprint);
+    expect(second.snapshot.bookToolFingerprint).not.toBe(first.snapshot.bookToolFingerprint);
+  });
+
+  it('finds an exact booking tool through reachable LLM states and conversation-flow components only', async () => {
+    env.RETELL_API_KEY = 'real-key';
+    const tool = { ...bookingTool(), tool_id: 'component_booking' };
+    const engines: Record<string, unknown> = {
+      llm: {
+        llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+        starting_state: 'intake',
+        states: [
+          { name: 'intake', edges: [{ destination_state_name: 'booking' }], tools: [] },
+          { name: 'booking', edges: [], tools: [tool] },
+          { name: 'unreachable', edges: [], tools: [{ ...tool, url: 'https://wrong.example.test' }] },
+        ],
+      },
+      flow: {
+        conversation_flow_id: 'flow_pilot', version: 4, is_published: true, tool_call_strict_mode: true,
+        start_node_id: 'start', nodes: [{ id: 'start', type: 'component', component_id: 'booking_component', edges: [] }],
+        components: [{
+          component_id: 'booking_component', start_node_id: 'component_start', tools: [tool],
+          nodes: [{ id: 'component_start', type: 'function', tool_id: 'component_booking', edges: [] }],
+        }],
+      },
+    };
+    let agent = providerAgent();
+    vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(
+      String(url).includes('/get-retell-llm/') ? engines.llm
+        : String(url).includes('/get-conversation-flow/') ? engines.flow
+          : agent,
+    ), { status: 200 })));
+    const llm = await probeRetellAgent('agent_pilot', 'prod');
+    expect(llm).toMatchObject({ ok: true, snapshot: { bookToolProbeStatus: 'SUCCEEDED' } });
+
+    agent = providerAgent({ response_engine: { type: 'conversation-flow', conversation_flow_id: 'flow_pilot', version: 4 } });
+    const flow = await probeRetellAgent('agent_pilot', 'prod');
+    expect(flow).toMatchObject({ ok: true, snapshot: { bookToolProbeStatus: 'SUCCEEDED' } });
   });
 
   it.each([
@@ -90,7 +194,7 @@ describe('Retell agent provider contract', () => {
     expect(result).toMatchObject({ ok: true, snapshot: { version: 0, responseEngineVersion: 0 } });
   });
 
-  it.each(['Prod', 'latest', 'v2', '1prod', 'tag-that-is-more-than-20-characters'])('rejects undocumented deployment tag %s before provider access', async tag => {
+  it.each(['Prod', 'latest', 'latest_published', 'v2', '1prod', 'tag-that-is-more-than-20-characters'])('rejects undocumented deployment tag %s before provider access', async tag => {
     env.RETELL_API_KEY = 'real-key';
     const fetchMock = vi.fn<typeof fetch>();
     vi.stubGlobal('fetch', fetchMock);

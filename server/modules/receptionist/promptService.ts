@@ -1,6 +1,11 @@
 // ===========================================================================
 
 import { renderRecordingDisclosure } from '../../lib/receptionist/privacyLifecycle';
+import {
+  buildBookAppointmentTool,
+  compileIntakeContract,
+  intakeFieldKey,
+} from './intakeContract';
 // AI Receptionist — prompt generation service
 //
 // Pure, dependency-free composition layer. Given a clinic profile, an agent,
@@ -85,9 +90,11 @@ export interface PromptCampaign {
   eligibleLocationIds: string[];
   smsConfirmation: boolean;
   emailConfirmation: boolean;
+  intakeSchemaRevision?: number;
 }
 
 export interface PromptIntakeField {
+  id?: string;
   fieldType: ReceptionistFieldType;
   label: string;
   aiQuestion: string;
@@ -283,6 +290,9 @@ export interface RetellConfig {
   dynamicVariables: Record<string, string>;
   webhookUrl: string;
   bookingFunction: Record<string, unknown>;
+  intakeSchemaRevision: number;
+  intakeSchemaFingerprint: string;
+  intakeToolFingerprint: string;
   /** Live custom-function tools the agent calls DURING the call (real-time). */
   tools: Array<Record<string, unknown>>;
   callOutcomeFields: Array<Record<string, unknown>>;
@@ -309,43 +319,21 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     human_fallback_number: clinic.humanFallbackNumber ?? '',
   };
 
-  // Booking tool — the slots the agent must fill before invoking it.
-  const properties: Record<string, unknown> = {
-    location_id: {
-      type: 'string',
-      description: 'The eligible location the patient chose.',
-      enum: locations.map(location => location.id),
-    },
-    appointment_date: { type: 'string', description: 'Requested date (YYYY-MM-DD).' },
-    appointment_time: { type: 'string', description: 'Requested time (HH:mm, 24h).' },
-  };
-  const required: string[] = ['appointment_date', 'appointment_time'];
-  for (const field of orderedFields(config.intakeFields)) {
-    const key = fieldKey(field);
-    properties[key] = {
-      type: field.fieldType === 'CONSENT' || field.fieldType === 'CUSTOM_YES_NO' ? 'boolean' : 'string',
-      description: field.label,
-      ...(field.options?.length ? { enum: field.options } : {}),
-    };
-    if (field.required) required.push(key);
-  }
-
-  const bookingFunction = {
-    type: 'function',
-    name: 'book_appointment',
-    description: `Book a ${campaign.appointmentType} for ${clinic.name} once all required details are collected and confirmed.`,
-    speak_during_execution: true,
-    speak_after_execution: true,
-    parameters: {
-      type: 'object',
-      properties,
-      required: [...new Set(required)],
-    },
-  };
-
   // Live custom-function tools: Retell calls these URLs DURING the call so the
   // agent checks real availability and books in real time (then texts a confirm).
   const fnUrl = `${options.webhookBaseUrl.replace(/\/$/, '')}/v1/receptionist/webhooks/retell/fn?clinicId=${clinic.id}`;
+  const intakeContract = compileIntakeContract({
+    campaignId: campaign.id,
+    revision: campaign.intakeSchemaRevision ?? 1,
+    appointmentType: campaign.appointmentType,
+    eligibleLocations: locations,
+    fields: config.intakeFields,
+    toolUrl: fnUrl,
+  });
+  // This is the sole executable book_appointment schema. `bookingFunction`
+  // remains a compatibility alias to this exact object for existing export
+  // consumers; it is not independently generated.
+  const bookingFunction = buildBookAppointmentTool({ snapshot: intakeContract.snapshot, clinicName: clinic.name });
   const tools: Array<Record<string, unknown>> = [
     {
       type: 'function',
@@ -461,31 +449,12 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
         type: 'object',
         properties: {
           appointment_date: { type: 'string', description: 'Date to check (YYYY-MM-DD).' },
-          service: { type: 'string', description: `Service to schedule, e.g. ${campaign.appointmentType}.` },
+          service: { type: 'string', const: campaign.appointmentType, description: 'Server-configured appointment service.' },
         },
         required: ['appointment_date', 'service'],
       },
     },
-    {
-      type: 'function',
-      name: 'book_appointment',
-      description: `Book a ${campaign.appointmentType} at ${clinic.name} once the caller chose an available time from check_availability and gave their name. Books in real time and texts a confirmation.`,
-      url: fnUrl,
-      speak_during_execution: true,
-      speak_after_execution: true,
-      parameters: {
-        type: 'object',
-        properties: {
-          first_name: { type: 'string', description: "Caller's first name." },
-          last_name: { type: 'string', description: "Caller's last name." },
-          phone: { type: 'string', description: "Caller's mobile number for the SMS confirmation." },
-          appointment_date: { type: 'string', description: 'Chosen date (YYYY-MM-DD).' },
-          appointment_time: { type: 'string', description: 'Chosen time (HH:mm, 24h).' },
-          service: { type: 'string', description: `The service, e.g. ${campaign.appointmentType}.` },
-        },
-        required: ['first_name', 'last_name', 'appointment_date', 'appointment_time'],
-      },
-    },
+    bookingFunction,
     {
       type: 'function',
       name: 'request_human_handoff',
@@ -574,34 +543,16 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     dynamicVariables,
     webhookUrl: `${options.webhookBaseUrl.replace(/\/$/, '')}/v1/receptionist/webhooks/retell?clinicId=${clinic.id}&campaignId=${campaign.id}`,
     bookingFunction,
+    intakeSchemaRevision: intakeContract.snapshot.revision,
+    intakeSchemaFingerprint: intakeContract.fingerprint,
+    intakeToolFingerprint: intakeContract.snapshot.bookAppointmentToolFingerprint,
     tools,
     callOutcomeFields,
   };
 }
 
 export function fieldKey(field: PromptIntakeField): string {
-  const base: Partial<Record<ReceptionistFieldType, string>> = {
-    FIRST_NAME: 'first_name',
-    LAST_NAME: 'last_name',
-    PHONE: 'phone',
-    EMAIL: 'email',
-    PREFERRED_DATE: 'preferred_date',
-    PREFERRED_TIME: 'preferred_time',
-    PREFERRED_LOCATION: 'preferred_location',
-    PATIENT_STATUS: 'patient_status',
-    INSURANCE_PROVIDER: 'insurance_provider',
-    REASON_FOR_VISIT: 'reason_for_visit',
-    PREFERRED_PROVIDER: 'preferred_provider',
-    LANGUAGE_PREFERENCE: 'language_preference',
-    CONSENT: 'consent',
-  };
-  if (base[field.fieldType]) return base[field.fieldType] as string;
-  return (
-    field.label
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '_')
-      .replace(/^_+|_+$/g, '') || 'custom_field'
-  );
+  return intakeFieldKey(field);
 }
 
 // --- Samples for the preview screen ----------------------------------------

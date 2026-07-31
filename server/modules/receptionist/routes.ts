@@ -43,6 +43,13 @@ import {
   enforceVerifiedRetellRateLimit,
 } from '../../lib/receptionist/providerRateLimit';
 import { retellRateStore } from '../../lib/receptionist/retellRateStore';
+import {
+  bookAppointmentToolFingerprint,
+  compileIntakeContract,
+  fingerprintJson,
+  validateIntakeFieldConfiguration,
+  type IntakeFieldConfiguration,
+} from './intakeContract';
 
 const uuid = z.string().uuid();
 const RECEPTIONIST_CALL_LEASE_MS = 4 * 60 * 60 * 1_000;
@@ -73,7 +80,7 @@ const workingHoursInput = z.object({
 }).strict();
 const providerAgentIdInput = z.string().trim().regex(/^[A-Za-z0-9_-]{1,128}$/).optional().nullable();
 const providerVersionTagInput = z.string().trim().refine(isValidRetellVersionTag, {
-  message: 'Deployment tag must start lowercase, use at most 20 lowercase letters, digits, hyphens or underscores, and cannot be latest or v<number>.',
+  message: 'Deployment tag must start lowercase, use at most 20 lowercase letters, digits, hyphens or underscores, and cannot be latest, latest_published, or v<number>.',
 }).optional();
 
 function expectedRetellAgentWebhookUrl() {
@@ -96,6 +103,14 @@ function providerSnapshotData(snapshot: RetellAgentSnapshot) {
     providerResponseEngineVersion: snapshot.responseEngineVersion,
     providerLastModifiedAt: snapshot.lastModifiedAt,
     providerFingerprint: snapshot.fingerprint,
+    ...(snapshot.bookToolProbeStatus !== 'UNAVAILABLE' ? {
+      providerResponseEngineGraphFingerprint: snapshot.responseEngineGraphFingerprint,
+      providerBookToolSchema: snapshot.bookToolSchema
+        ? snapshot.bookToolSchema as Prisma.InputJsonValue
+        : Prisma.DbNull,
+      providerBookToolFingerprint: snapshot.bookToolFingerprint,
+      providerToolCallStrictMode: snapshot.toolCallStrictMode,
+    } : {}),
   };
 }
 
@@ -134,9 +149,83 @@ async function assertCampaignLocations(
 
 function campaignAssignmentError(error: unknown) {
   const code = error instanceof Error ? error.message : '';
-  return ['agent_unlinked', 'agent_scope_mismatch', 'agent_inactive', 'agent_unverified', 'agent_configuration_changed', 'agent_verification_stale', 'location_scope_mismatch'].includes(code)
+  if (code.includes('active_intake_contract_immutable')) return 'active_intake_contract_immutable';
+  return ['agent_unlinked', 'agent_scope_mismatch', 'agent_inactive', 'agent_unverified', 'agent_configuration_changed', 'agent_verification_stale', 'location_scope_mismatch', 'intake_schema_unattested', 'intake_schema_mismatch', 'intake_schema_not_strict', 'active_intake_contract_immutable'].includes(code)
     ? code
     : null;
+}
+
+function intakeConfigurationError(error: unknown): string | null {
+  const message = error instanceof Error ? error.message : '';
+  return message.startsWith('invalid_intake_configuration:') ? message.slice('invalid_intake_configuration:'.length) : null;
+}
+
+function isActiveIntakeContractError(error: unknown): boolean {
+  return error instanceof Error && error.message.includes('active_intake_contract_immutable');
+}
+
+async function compileCampaignIntakeContract(
+  tx: Prisma.TransactionClient,
+  campaign: { id: string; tenantId: string; clinicId: string; appointmentType: string; eligibleLocationIds: string[]; intakeSchemaRevision: number },
+) {
+  const [fields, locations] = await Promise.all([
+    tx.receptionistIntakeField.findMany({ where: { tenantId: campaign.tenantId, campaignId: campaign.id }, orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] }),
+    tx.receptionistLocation.findMany({
+      where: {
+        tenantId: campaign.tenantId,
+        clinicId: campaign.clinicId,
+        active: true,
+        branchId: { not: null },
+        ...(campaign.eligibleLocationIds.length ? { id: { in: campaign.eligibleLocationIds } } : {}),
+      },
+      orderBy: { id: 'asc' },
+      select: { id: true, name: true },
+    }),
+  ]);
+  return compileIntakeContract({
+    campaignId: campaign.id,
+    revision: campaign.intakeSchemaRevision,
+    appointmentType: campaign.appointmentType,
+    eligibleLocations: locations,
+    fields,
+    toolUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell/fn?clinicId=${campaign.clinicId}`,
+  });
+}
+
+async function attestCampaignIntakeContract(
+  tx: Prisma.TransactionClient,
+  campaign: { id: string; tenantId: string; clinicId: string; appointmentType: string; eligibleLocationIds: string[]; intakeSchemaRevision: number },
+  agent: {
+    providerBookToolSchema: unknown;
+    providerBookToolFingerprint: string | null;
+    providerResponseEngineGraphFingerprint: string | null;
+    providerToolCallStrictMode: boolean | null;
+    providerAgentId: string | null;
+    providerVersion: number | null;
+    providerResponseEngineId: string | null;
+    providerResponseEngineVersion: number | null;
+  } | null,
+) {
+  if (!agent?.providerBookToolSchema || !agent.providerBookToolFingerprint || !agent.providerResponseEngineGraphFingerprint
+    || agent.providerVersion === null || !agent.providerAgentId || !agent.providerResponseEngineId || agent.providerResponseEngineVersion === null) {
+    throw new Error('intake_schema_unattested');
+  }
+  if (agent.providerToolCallStrictMode !== true) throw new Error('intake_schema_not_strict');
+  const contract = await compileCampaignIntakeContract(tx, campaign);
+  if (bookAppointmentToolFingerprint(agent.providerBookToolSchema) !== contract.snapshot.bookAppointmentToolFingerprint) {
+    throw new Error('intake_schema_mismatch');
+  }
+  return {
+    intakeSchemaSnapshot: contract.snapshot as unknown as Prisma.InputJsonValue,
+    intakeSchemaFingerprint: contract.fingerprint,
+    intakeToolFingerprint: agent.providerBookToolFingerprint,
+    intakeSchemaAttestedRevision: campaign.intakeSchemaRevision,
+    intakeSchemaAttestedAt: new Date(),
+    intakeSchemaProviderAgentId: agent.providerAgentId,
+    intakeSchemaProviderVersion: agent.providerVersion,
+    intakeSchemaResponseEngineId: agent.providerResponseEngineId,
+    intakeSchemaResponseEngineVersion: agent.providerResponseEngineVersion,
+  };
 }
 
 function isReceptionistDestinationConflict(error: unknown) {
@@ -204,6 +293,7 @@ type CampaignWithRelations = {
   eligibleLocationIds: string[];
   smsConfirmation: boolean;
   emailConfirmation: boolean;
+  intakeSchemaRevision: number;
   clinicId: string;
   agentId: string | null;
   clinic: {
@@ -255,6 +345,7 @@ function toPromptConfig(campaign: CampaignWithRelations): PromptConfig {
       eligibleLocationIds: campaign.eligibleLocationIds,
       smsConfirmation: campaign.smsConfirmation,
       emailConfirmation: campaign.emailConfirmation,
+      intakeSchemaRevision: campaign.intakeSchemaRevision,
     },
     locations: campaign.clinic.locations,
     intakeFields: campaign.intakeFields as PromptIntakeField[],
@@ -446,7 +537,8 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
 
   app.post('/locations', { preHandler: writeRoles }, async (request, reply) => {
     const input = locationCreate.parse(request.body);
-    const row = await runWithTenantContext(request.auth.tenantId, async tx => {
+    try {
+      const row = await runWithTenantContext(request.auth.tenantId, async tx => {
       await lockReceptionistConfiguration(tx, request.auth.tenantId);
       const clinic = await tx.receptionistClinic.findFirst({ where: { id: input.clinicId, tenantId: request.auth.tenantId, active: true } });
       if (!clinic) throw app.httpErrors.badRequest('Location must belong to an active receptionist clinic in this tenant.');
@@ -459,14 +551,19 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
       });
       await auditReceptionistMutation(tx, request, { action: 'receptionistLocation.created', resource: 'receptionistLocation', resourceId: created.id, metadata: { clinicId: created.clinicId, active: created.active } });
       return created;
-    });
-    return reply.code(201).send(row);
+      });
+      return reply.code(201).send(row);
+    } catch (error) {
+      if (isActiveIntakeContractError(error)) throw app.httpErrors.conflict('Pause active campaigns before changing their attested location configuration.');
+      throw error;
+    }
   });
 
   app.patch('/locations/:id', { preHandler: writeRoles }, async request => {
     const { id } = idParam.parse(request.params);
     const input = locationUpdate.parse(request.body);
-    return runWithTenantContext(request.auth.tenantId, async tx => {
+    try {
+      return await runWithTenantContext(request.auth.tenantId, async tx => {
       await lockReceptionistConfiguration(tx, request.auth.tenantId);
       const existing = await tx.receptionistLocation.findFirst({ where: { id, tenantId: request.auth.tenantId } });
       if (!existing) throw app.httpErrors.notFound('Location not found');
@@ -490,12 +587,17 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
       });
       await auditReceptionistMutation(tx, request, { action: 'receptionistLocation.updated', resource: 'receptionistLocation', resourceId: id, metadata: { clinicId: row.clinicId, active: row.active } });
       return row;
-    });
+      });
+    } catch (error) {
+      if (isActiveIntakeContractError(error)) throw app.httpErrors.conflict('Pause active campaigns before changing their attested location configuration.');
+      throw error;
+    }
   });
 
   app.delete('/locations/:id', { preHandler: writeRoles }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
-    await runWithTenantContext(request.auth.tenantId, async tx => {
+    try {
+      await runWithTenantContext(request.auth.tenantId, async tx => {
       await lockReceptionistConfiguration(tx, request.auth.tenantId);
       const existing = await tx.receptionistLocation.findFirst({ where: { id, tenantId: request.auth.tenantId } });
       if (!existing) throw app.httpErrors.notFound('Location not found');
@@ -503,8 +605,12 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
       if (campaign) throw app.httpErrors.conflict('Remove this location from receptionist campaigns before deleting it.');
       await tx.receptionistLocation.delete({ where: { id } });
       await auditReceptionistMutation(tx, request, { action: 'receptionistLocation.deleted', resource: 'receptionistLocation', resourceId: id, metadata: { clinicId: existing.clinicId } });
-    });
-    return reply.code(204).send();
+      });
+      return reply.code(204).send();
+    } catch (error) {
+      if (isActiveIntakeContractError(error)) throw app.httpErrors.conflict('Pause active campaigns before changing their attested location configuration.');
+      throw error;
+    }
   });
 
   // ===== Agents ===========================================================
@@ -591,6 +697,10 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
         providerResponseEngineType: null,
         providerResponseEngineId: null,
         providerResponseEngineVersion: null,
+        providerResponseEngineGraphFingerprint: null,
+        providerBookToolSchema: Prisma.DbNull,
+        providerBookToolFingerprint: null,
+        providerToolCallStrictMode: null,
         providerLastModifiedAt: null,
         providerFingerprint: null,
         providerConfigRevision: { increment: 1 },
@@ -641,7 +751,13 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
 
         const success = probe.ok && !readinessFailure;
         const deploymentChanged = success && current.providerStatus === 'VERIFIED'
-          && (current.providerVersion !== probe.snapshot.version || current.providerFingerprint !== probe.snapshot.fingerprint);
+          && (
+            current.providerVersion !== probe.snapshot.version
+            || current.providerFingerprint !== probe.snapshot.fingerprint
+            || (probe.snapshot.bookToolProbeStatus === 'SUCCEEDED'
+              && (current.providerResponseEngineGraphFingerprint !== probe.snapshot.responseEngineGraphFingerprint
+                || current.providerBookToolFingerprint !== probe.snapshot.bookToolFingerprint))
+          );
         if (deploymentChanged) {
           const [studioReference, outboundReference] = await Promise.all([
             tx.receptionistCampaign.findFirst({ where: { tenantId: request.auth.tenantId, agentId: id, status: 'ACTIVE' }, select: { id: true } }),
@@ -784,20 +900,25 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
         await lockReceptionistConfiguration(tx, request.auth.tenantId);
         const clinic = await tx.receptionistClinic.findFirst({ where: { id: input.clinicId, tenantId: request.auth.tenantId, active: true }, select: { id: true } });
         if (!clinic) throw app.httpErrors.badRequest('An active tenant-owned clinic is required.');
-        await assertCampaignAgent(tx, {
+        const agent = await assertCampaignAgent(tx, {
           tenantId: request.auth.tenantId, clinicId: input.clinicId, agentId: input.agentId,
           requireReady: input.status === 'ACTIVE',
         });
         await assertCampaignLocations(tx, { tenantId: request.auth.tenantId, clinicId: input.clinicId, locationIds: input.eligibleLocationIds ?? [] });
-        const { bookingRules, eligibleLocationIds, ...rest } = input;
-        const created = await tx.receptionistCampaign.create({
+        const { bookingRules, eligibleLocationIds, status, ...rest } = input;
+        let created = await tx.receptionistCampaign.create({
           data: {
             tenantId: request.auth.tenantId,
             ...rest,
+            status: status === 'ACTIVE' ? 'DRAFT' : status,
             eligibleLocationIds: eligibleLocationIds ?? [],
             bookingRules: bookingRules ?? undefined,
           },
         });
+        if (status === 'ACTIVE') {
+          const attestation = await attestCampaignIntakeContract(tx, created, agent);
+          created = await tx.receptionistCampaign.update({ where: { id: created.id }, data: { ...attestation, status: 'ACTIVE' } });
+        }
         await auditReceptionistMutation(tx, request, {
           action: 'receptionistCampaign.created', resource: 'receptionistCampaign', resourceId: created.id,
           metadata: { clinicId: created.clinicId, agentId: created.agentId, status: created.status },
@@ -806,6 +927,8 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
       });
       return reply.code(201).send(row);
     } catch (error) {
+      const invalid = intakeConfigurationError(error);
+      if (invalid) throw app.httpErrors.badRequest(invalid);
       const reason = campaignAssignmentError(error);
       if (reason) throw app.httpErrors.conflict(`Campaign configuration is not deployable: ${reason}.`);
       throw error;
@@ -823,16 +946,28 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
         const nextAgentId = input.agentId === undefined ? existing.agentId : input.agentId;
         const nextStatus = input.status ?? existing.status;
         const nextLocations = input.eligibleLocationIds ?? existing.eligibleLocationIds;
-        await assertCampaignAgent(tx, {
+        const schemaRelevantChange = (input.agentId !== undefined && input.agentId !== existing.agentId)
+          || (input.appointmentType !== undefined && input.appointmentType !== existing.appointmentType)
+          || (input.eligibleLocationIds !== undefined && JSON.stringify(input.eligibleLocationIds) !== JSON.stringify(existing.eligibleLocationIds));
+        if (existing.status === 'ACTIVE' && nextStatus === 'ACTIVE' && schemaRelevantChange) throw new Error('active_intake_contract_immutable');
+        const agent = await assertCampaignAgent(tx, {
           tenantId: request.auth.tenantId, clinicId: existing.clinicId, agentId: nextAgentId,
           requireReady: nextStatus === 'ACTIVE',
         });
         await assertCampaignLocations(tx, { tenantId: request.auth.tenantId, clinicId: existing.clinicId, locationIds: nextLocations });
-        const { bookingRules, ...rest } = input;
-        const row = await tx.receptionistCampaign.update({
+        const { bookingRules, status, ...rest } = input;
+        let row = await tx.receptionistCampaign.update({
           where: { id },
-          data: { ...rest, ...(bookingRules !== undefined ? { bookingRules: bookingRules ?? undefined } : {}) },
+          data: {
+            ...rest,
+            ...(status !== undefined && !(status === 'ACTIVE' && existing.status !== 'ACTIVE') ? { status } : {}),
+            ...(bookingRules !== undefined ? { bookingRules: bookingRules ?? undefined } : {}),
+          },
         });
+        if (nextStatus === 'ACTIVE' && existing.status !== 'ACTIVE') {
+          const attestation = await attestCampaignIntakeContract(tx, row, agent);
+          row = await tx.receptionistCampaign.update({ where: { id }, data: { ...attestation, status: 'ACTIVE' } });
+        }
         await auditReceptionistMutation(tx, request, {
           action: 'receptionistCampaign.updated', resource: 'receptionistCampaign', resourceId: id,
           metadata: { agentId: row.agentId, status: row.status },
@@ -840,6 +975,8 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
         return row;
       });
     } catch (error) {
+      const invalid = intakeConfigurationError(error);
+      if (invalid) throw app.httpErrors.badRequest(invalid);
       const reason = campaignAssignmentError(error);
       if (reason) throw app.httpErrors.conflict(`Campaign configuration is not deployable: ${reason}.`);
       throw error;
@@ -863,11 +1000,11 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
     aiQuestion: z.string().trim().min(2).max(500),
     validationRule: z.string().trim().max(200).optional().nullable(),
     placeholder: z.string().trim().max(200).optional().nullable(),
-    options: z.array(z.string().trim().min(1).max(120)).optional(),
+    options: z.array(z.string().trim().min(1).max(120)).max(20).optional(),
     required: z.boolean().optional(),
     confirmationRequired: z.boolean().optional(),
     sortOrder: z.number().int().min(0).optional(),
-  });
+  }).strict();
   const intakeFieldUpdate = intakeFieldCreate.partial().omit({ campaignId: true });
 
   app.get('/intake-fields', { preHandler: writeRoles }, async request => {
@@ -880,57 +1017,115 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
 
   app.post('/intake-fields', { preHandler: writeRoles }, async (request, reply) => {
     const input = intakeFieldCreate.parse(request.body);
-    const campaign = await db.receptionistCampaign.findFirst({ where: { id: input.campaignId, tenantId: request.auth.tenantId } });
-    if (!campaign) throw app.httpErrors.notFound('Campaign not found');
-    const count = await db.receptionistIntakeField.count({ where: { campaignId: input.campaignId } });
-    const row = await db.receptionistIntakeField.create({
-      data: {
-        tenantId: request.auth.tenantId,
-        ...input,
-        options: input.options ?? [],
-        sortOrder: input.sortOrder ?? count,
-      },
-    });
-    await audit(request, { action: 'receptionistIntakeField.created', resource: 'receptionistIntakeField', resourceId: row.id });
-    return reply.code(201).send(row);
+    try {
+      const row = await runWithTenantContext(request.auth.tenantId, async tx => {
+        await lockReceptionistConfiguration(tx, request.auth.tenantId);
+        const campaign = await tx.receptionistCampaign.findFirst({ where: { id: input.campaignId, tenantId: request.auth.tenantId } });
+        if (!campaign) throw app.httpErrors.notFound('Campaign not found');
+        if (campaign.status === 'ACTIVE') throw new Error('active_intake_contract_immutable');
+        const existing = await tx.receptionistIntakeField.findMany({ where: { tenantId: request.auth.tenantId, campaignId: input.campaignId }, orderBy: { sortOrder: 'asc' } });
+        const sortOrder = input.sortOrder ?? (existing.length ? Math.max(...existing.map(field => field.sortOrder)) + 1 : 0);
+        const candidate: IntakeFieldConfiguration = {
+          ...input,
+          options: input.options ?? [],
+          required: input.required ?? true,
+          confirmationRequired: input.confirmationRequired ?? false,
+          sortOrder,
+        };
+        const issues = validateIntakeFieldConfiguration([...existing, candidate]);
+        if (issues.length) throw new Error(`invalid_intake_configuration:${issues.join('|')}`);
+        const created = await tx.receptionistIntakeField.create({ data: { tenantId: request.auth.tenantId, ...candidate, campaignId: input.campaignId } });
+        // Compile inside the same transaction so location-dependent schema
+        // invariants fail atomically with the field mutation.
+        await compileCampaignIntakeContract(tx, await tx.receptionistCampaign.findUniqueOrThrow({ where: { id: campaign.id } }));
+        await auditReceptionistMutation(tx, request, { action: 'receptionistIntakeField.created', resource: 'receptionistIntakeField', resourceId: created.id, metadata: { campaignId: input.campaignId } });
+        return created;
+      });
+      return reply.code(201).send(row);
+    } catch (error) {
+      const invalid = intakeConfigurationError(error);
+      if (invalid) throw app.httpErrors.badRequest(invalid);
+      if (isActiveIntakeContractError(error)) throw app.httpErrors.conflict('Pause the active campaign before changing its attested intake contract.');
+      throw error;
+    }
   });
 
   app.patch('/intake-fields/:id', { preHandler: writeRoles }, async request => {
     const { id } = idParam.parse(request.params);
     const input = intakeFieldUpdate.parse(request.body);
-    const existing = await db.receptionistIntakeField.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Intake field not found');
-    const row = await db.receptionistIntakeField.update({ where: { id }, data: input });
-    await audit(request, { action: 'receptionistIntakeField.updated', resource: 'receptionistIntakeField', resourceId: id });
-    return row;
+    try {
+      return await runWithTenantContext(request.auth.tenantId, async tx => {
+        await lockReceptionistConfiguration(tx, request.auth.tenantId);
+        const existing = await tx.receptionistIntakeField.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+        if (!existing) throw app.httpErrors.notFound('Intake field not found');
+        const campaign = await tx.receptionistCampaign.findFirst({ where: { id: existing.campaignId, tenantId: request.auth.tenantId }, select: { status: true } });
+        if (campaign?.status === 'ACTIVE') throw new Error('active_intake_contract_immutable');
+        const fields = await tx.receptionistIntakeField.findMany({ where: { tenantId: request.auth.tenantId, campaignId: existing.campaignId } });
+        const candidate = { ...existing, ...input } as IntakeFieldConfiguration;
+        const issues = validateIntakeFieldConfiguration(fields.map(field => field.id === id ? candidate : field));
+        if (issues.length) throw new Error(`invalid_intake_configuration:${issues.join('|')}`);
+        const row = await tx.receptionistIntakeField.update({ where: { id }, data: input });
+        const currentCampaign = await tx.receptionistCampaign.findUniqueOrThrow({ where: { id: existing.campaignId } });
+        await compileCampaignIntakeContract(tx, currentCampaign);
+        await auditReceptionistMutation(tx, request, { action: 'receptionistIntakeField.updated', resource: 'receptionistIntakeField', resourceId: id, metadata: { campaignId: existing.campaignId } });
+        return row;
+      });
+    } catch (error) {
+      const invalid = intakeConfigurationError(error);
+      if (invalid) throw app.httpErrors.badRequest(invalid);
+      if (isActiveIntakeContractError(error)) throw app.httpErrors.conflict('Pause the active campaign before changing its attested intake contract.');
+      throw error;
+    }
   });
 
   app.delete('/intake-fields/:id', { preHandler: writeRoles }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
-    const existing = await db.receptionistIntakeField.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Intake field not found');
-    await db.receptionistIntakeField.delete({ where: { id } });
-    await audit(request, { action: 'receptionistIntakeField.deleted', resource: 'receptionistIntakeField', resourceId: id });
-    return reply.code(204).send();
+    try {
+      await runWithTenantContext(request.auth.tenantId, async tx => {
+        await lockReceptionistConfiguration(tx, request.auth.tenantId);
+        const existing = await tx.receptionistIntakeField.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+        if (!existing) throw app.httpErrors.notFound('Intake field not found');
+        const campaign = await tx.receptionistCampaign.findFirst({ where: { id: existing.campaignId, tenantId: request.auth.tenantId }, select: { status: true } });
+        if (campaign?.status === 'ACTIVE') throw new Error('active_intake_contract_immutable');
+        await tx.receptionistIntakeField.delete({ where: { id } });
+        await auditReceptionistMutation(tx, request, { action: 'receptionistIntakeField.deleted', resource: 'receptionistIntakeField', resourceId: id, metadata: { campaignId: existing.campaignId } });
+      });
+      return reply.code(204).send();
+    } catch (error) {
+      if (isActiveIntakeContractError(error)) throw app.httpErrors.conflict('Pause the active campaign before changing its attested intake contract.');
+      throw error;
+    }
   });
 
   app.post('/intake-fields/reorder', { preHandler: writeRoles }, async request => {
-    const input = z.object({ campaignId: uuid, orderedIds: z.array(uuid) }).parse(request.body);
-    const campaign = await db.receptionistCampaign.findFirst({ where: { id: input.campaignId, tenantId: request.auth.tenantId } });
-    if (!campaign) throw app.httpErrors.notFound('Campaign not found');
-    await db.$transaction(
-      input.orderedIds.map((fieldId, index) =>
-        db.receptionistIntakeField.updateMany({
-          where: { id: fieldId, tenantId: request.auth.tenantId, campaignId: input.campaignId },
-          data: { sortOrder: index },
-        }),
-      ),
-    );
-    await audit(request, { action: 'receptionistIntakeField.reordered', resource: 'receptionistCampaign', resourceId: input.campaignId });
-    return db.receptionistIntakeField.findMany({
-      where: { tenantId: request.auth.tenantId, campaignId: input.campaignId },
-      orderBy: { sortOrder: 'asc' },
-    });
+    const input = z.object({ campaignId: uuid, orderedIds: z.array(uuid).max(24) }).strict().parse(request.body);
+    try {
+      return await runWithTenantContext(request.auth.tenantId, async tx => {
+        await lockReceptionistConfiguration(tx, request.auth.tenantId);
+        const campaign = await tx.receptionistCampaign.findFirst({ where: { id: input.campaignId, tenantId: request.auth.tenantId } });
+        if (!campaign) throw app.httpErrors.notFound('Campaign not found');
+        if (campaign.status === 'ACTIVE') throw new Error('active_intake_contract_immutable');
+        const fields = await tx.receptionistIntakeField.findMany({ where: { tenantId: request.auth.tenantId, campaignId: input.campaignId } });
+        if (new Set(input.orderedIds).size !== input.orderedIds.length
+          || fields.length !== input.orderedIds.length
+          || fields.some(field => !input.orderedIds.includes(field.id))) {
+          throw new Error('invalid_intake_configuration:Reorder must contain every campaign field exactly once.');
+        }
+        const future = fields.map(field => ({ ...field, sortOrder: input.orderedIds.indexOf(field.id) }));
+        const issues = validateIntakeFieldConfiguration(future);
+        if (issues.length) throw new Error(`invalid_intake_configuration:${issues.join('|')}`);
+        for (const [index, fieldId] of input.orderedIds.entries()) {
+          await tx.receptionistIntakeField.update({ where: { id: fieldId }, data: { sortOrder: index } });
+        }
+        await auditReceptionistMutation(tx, request, { action: 'receptionistIntakeField.reordered', resource: 'receptionistCampaign', resourceId: input.campaignId });
+        return tx.receptionistIntakeField.findMany({ where: { tenantId: request.auth.tenantId, campaignId: input.campaignId }, orderBy: { sortOrder: 'asc' } });
+      });
+    } catch (error) {
+      const invalid = intakeConfigurationError(error);
+      if (invalid) throw app.httpErrors.badRequest(invalid);
+      if (isActiveIntakeContractError(error)) throw app.httpErrors.conflict('Pause the active campaign before changing its attested intake contract.');
+      throw error;
+    }
   });
 
   // ===== Prompt generation + RetellAI export ==============================
@@ -1607,6 +1802,8 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       phone: z.string().max(40).optional(),
       email: z.string().max(160).optional(),
       service: z.string().max(120).optional(),
+      intake_contract_fingerprint: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+      intake_schema_revision: z.number().int().positive().optional(),
       caller_name: z.string().max(80).optional(),
       callback_phone: z.string().max(40).optional(),
       reason_category: z.string().max(40).optional(),
@@ -1620,6 +1817,8 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       args: fnArgs.default({}),
       call: z.object({
         call_id: z.string().max(128).optional(),
+        agent_id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/).optional(),
+        agent_version: z.number().int().nonnegative().optional(),
         from_number: z.string().max(40).optional(),
         to_number: z.string().max(40).optional(),
         direction: z.enum(['inbound', 'outbound']).optional(),
@@ -1675,14 +1874,17 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     const tenantId = resolved.tenantId;
     enterTenantContext({ tenantId, actorId: `webhook:retell-tool:${resolved.resourceId}`, actorRole: 'WEBHOOK', source: 'webhook', requestId: request.id });
     let trustedClinicId: string | undefined = resolvedByDestination ? resolved.resourceId : undefined;
-    if (query.campaignId) {
+    // Query selectors are routing hints only. A booking is instead bound below
+    // from the signed call's exact provider deployment to one persisted active
+    // attested campaign; query values can only cross-check that authority.
+    if (body.name !== 'book_appointment' && query.campaignId) {
       const campaign = await db.receptionistCampaign.findFirst({ where: { id: query.campaignId, tenantId }, select: { clinicId: true } });
       if (!campaign || (trustedClinicId && campaign.clinicId !== trustedClinicId) || (query.clinicId && campaign.clinicId !== query.clinicId)) {
         await flagRetellIngressReview(tenantId, providerCallId, 'Signed Retell tool selectors did not match the trusted clinic mapping');
         return reply.code(202).send({ message: "I'm sorry, I can't access this clinic right now." });
       }
       trustedClinicId = campaign.clinicId;
-    } else if (query.clinicId) {
+    } else if (body.name !== 'book_appointment' && query.clinicId) {
       const clinic = await db.receptionistClinic.findFirst({ where: { id: query.clinicId, tenantId }, select: { id: true } });
       if (!clinic || (trustedClinicId && clinic.id !== trustedClinicId)) {
         await flagRetellIngressReview(tenantId, providerCallId, 'Signed Retell tool clinic selector did not match the trusted clinic mapping');
@@ -1705,13 +1907,40 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     const activeCall = await db.$transaction(async tx => {
       const lifecycleKey = `receptionist-call-lifecycle:${tenantId}:${providerCallId}`;
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lifecycleKey})::bigint)`;
-      const existing = await tx.receptionistCallLog.findFirst({ where: { tenantId, retellCallId: providerCallId } });
+      let existing = await tx.receptionistCallLog.findFirst({ where: { tenantId, retellCallId: providerCallId } });
       trustedClinicId ??= existing?.clinicId ?? undefined;
+      let trustedCampaignId = existing?.campaignId ?? undefined;
+      if (body.name === 'book_appointment' && body.call?.agent_id && body.call.agent_version !== undefined) {
+        const candidates = await tx.receptionistCampaign.findMany({
+          where: {
+            tenantId,
+            status: 'ACTIVE',
+            intakeSchemaProviderAgentId: body.call.agent_id,
+            intakeSchemaProviderVersion: body.call.agent_version,
+            intakeSchemaAttestedRevision: { not: null },
+            ...(trustedClinicId ? { clinicId: trustedClinicId } : {}),
+            ...(trustedCampaignId ? { id: trustedCampaignId } : {}),
+          },
+          select: { id: true, clinicId: true },
+          take: 2,
+        });
+        if (candidates.length === 1) {
+          trustedCampaignId = candidates[0].id;
+          trustedClinicId = candidates[0].clinicId;
+          if (existing && (!existing.campaignId || !existing.clinicId)) {
+            existing = await tx.receptionistCallLog.update({
+              where: { id: existing.id },
+              data: { campaignId: trustedCampaignId, clinicId: trustedClinicId },
+            });
+          }
+        }
+      }
       if (!existing) {
         return tx.receptionistCallLog.create({
           data: {
             tenantId,
             clinicId: trustedClinicId,
+            campaignId: trustedCampaignId,
             retellCallId: providerCallId,
             callerPhone: body.call?.from_number,
             direction: body.call?.direction ?? 'inbound',
@@ -1721,6 +1950,18 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       }
       return existing;
     });
+
+    if (body.name === 'book_appointment') {
+      const selectorMismatch = !activeCall.campaignId
+        || !activeCall.clinicId
+        || (query.campaignId !== undefined && query.campaignId !== activeCall.campaignId)
+        || (query.clinicId !== undefined && query.clinicId !== activeCall.clinicId);
+      if (selectorMismatch) {
+        await flagRetellIngressReview(tenantId, providerCallId, 'Book tool could not resolve one trusted campaign or a query selector disagreed with persisted call authority');
+        return reply.code(200).send({ booked: false, needs_human: true, message: 'I cannot safely select the booking campaign. I recorded a staff review request.' });
+      }
+      trustedClinicId = activeCall.clinicId ?? undefined;
+    }
 
     const activeSince = activeCall.startedAt ?? activeCall.createdAt;
     if (activeCall.endedAt || activeCall.outcome !== 'IN_PROGRESS' || activeSince.getTime() < Date.now() - RECEPTIONIST_CALL_LEASE_MS) {
@@ -1780,6 +2021,52 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       }
     }
 
+    let trustedToolArgs: Record<string, unknown> = body.args;
+    if (body.name === 'book_appointment') {
+      const campaign = activeCall.campaignId
+        ? await db.receptionistCampaign.findFirst({
+          where: { id: activeCall.campaignId, tenantId, status: 'ACTIVE' },
+          select: {
+            appointmentType: true,
+            intakeSchemaRevision: true,
+            intakeSchemaAttestedRevision: true,
+            intakeSchemaSnapshot: true,
+            intakeSchemaFingerprint: true,
+            intakeSchemaProviderAgentId: true,
+            intakeSchemaProviderVersion: true,
+          },
+        })
+        : null;
+      const snapshot = campaign?.intakeSchemaSnapshot && typeof campaign.intakeSchemaSnapshot === 'object' && !Array.isArray(campaign.intakeSchemaSnapshot)
+        ? campaign.intakeSchemaSnapshot as Record<string, unknown>
+        : null;
+      const semanticFingerprint = typeof snapshot?.semanticFingerprint === 'string' ? snapshot.semanticFingerprint : null;
+      const deploymentMatches = Boolean(
+        campaign
+        && snapshot
+        && campaign.intakeSchemaAttestedRevision === campaign.intakeSchemaRevision
+        && campaign.intakeSchemaFingerprint === fingerprintJson(snapshot)
+        && semanticFingerprint
+        && body.args.intake_contract_fingerprint === semanticFingerprint
+        && body.args.intake_schema_revision === campaign.intakeSchemaRevision
+        && body.args.service === campaign.appointmentType
+        && body.call?.agent_id === campaign?.intakeSchemaProviderAgentId
+        && body.call?.agent_version === campaign?.intakeSchemaProviderVersion,
+      );
+      if (!deploymentMatches) {
+        await flagRetellIngressReview(tenantId, providerCallId, 'Book tool intake contract did not match the persisted active campaign attestation');
+        return reply.code(200).send({
+          booked: false,
+          needs_human: true,
+          message: 'I cannot safely complete this booking because the active intake configuration changed. I recorded a staff review request.',
+        });
+      }
+      // Persisted call/campaign state is authoritative. Provider-applied consts
+      // are cross-checks only, and model-supplied phone data is never forwarded.
+      trustedToolArgs = { ...body.args, service: campaign!.appointmentType };
+      delete trustedToolArgs.phone;
+    }
+
     const result = await handleAgentTool(
       {
         tenantId,
@@ -1787,7 +2074,7 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         callerPhone: (body.call?.direction === 'outbound' ? body.call.to_number : body.call?.from_number) ?? null,
       },
       body.name,
-      body.args,
+      trustedToolArgs,
     );
     return reply.code(200).send(result);
   });

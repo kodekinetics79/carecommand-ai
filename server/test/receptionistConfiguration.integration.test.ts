@@ -18,6 +18,7 @@ vi.mock('../workers/queues', () => ({
 const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
+const { compileIntakeContract } = await import('../modules/receptionist/intakeContract');
 
 type Role = 'OWNER' | 'MANAGER' | 'BILLING';
 type TenantFixture = { id: string; users: Record<Role, string>; branchId: string };
@@ -27,6 +28,8 @@ const originalRetell = { apiKey: env.RETELL_API_KEY, baseUrl: env.RETELL_BASE_UR
 const migrationSql = readFileSync(new URL('../../prisma/migrations/20260730143000_receptionist_configuration_integrity/migration.sql', import.meta.url), 'utf8');
 const migrationPreflight = migrationSql.match(/DO \$preflight\$[\s\S]*?\$preflight\$;/)?.[0];
 const migrationCanonicalization = migrationSql.match(/UPDATE "ReceptionistClinic" c[\s\S]*?;(?=\n\nALTER TABLE "ReceptionistClinic")/)?.[0];
+const intakeMigrationSql = readFileSync(new URL('../../prisma/migrations/20260730200000_receptionist_intake_contract/migration.sql', import.meta.url), 'utf8');
+const intakeLegacyPause = intakeMigrationSql.match(/WITH paused AS \([\s\S]*?FROM paused;/)?.[0];
 
 const phone = () => `+1${(BigInt(`0x${randomUUID().replace(/-/g, '').slice(0, 14)}`) % 10_000_000_000n).toString().padStart(10, '0')}`;
 
@@ -243,6 +246,58 @@ describe('AI receptionist trusted configuration', () => {
     expect(await db.receptionistClinic.count({ where: { id: clinicId } })).toBe(1);
   });
 
+  it('invalidates draft location semantics and blocks active location or intake-parent drift', async () => {
+    const t = await tenant();
+    const clinicId = (await createClinic(t, { name: 'Location-bound clinic' })).json().id as string;
+    const draft = await app.inject({
+      method: 'POST', url: '/v1/receptionist/campaigns', headers: auth(t, 'OWNER'),
+      payload: {
+        clinicId, name: 'Location-bound campaign', status: 'DRAFT', offerTitle: 'Appointment',
+        offerDescription: 'Schedule care', offerScript: 'Schedule now', appointmentType: 'Consultation',
+      },
+    });
+    expect(draft.statusCode).toBe(201);
+    const location = await app.inject({
+      method: 'POST', url: '/v1/receptionist/locations', headers: auth(t, 'OWNER'),
+      payload: { clinicId, branchId: t.branchId, name: 'North office', address: '10 North Street' },
+    });
+    expect(location.statusCode).toBe(201);
+    expect((await db.receptionistCampaign.findUniqueOrThrow({ where: { id: draft.json().id } })).intakeSchemaRevision).toBe(2);
+
+    const field = await app.inject({
+      method: 'POST', url: '/v1/receptionist/intake-fields', headers: auth(t, 'OWNER'),
+      payload: {
+        campaignId: draft.json().id, fieldType: 'CUSTOM_TEXT', label: 'Accessibility',
+        aiQuestion: 'Do you need an accessibility accommodation?', required: false,
+      },
+    });
+    expect(field.statusCode).toBe(201);
+    const otherDraft = await app.inject({
+      method: 'POST', url: '/v1/receptionist/campaigns', headers: auth(t, 'OWNER'),
+      payload: {
+        clinicId, name: 'Other draft', status: 'DRAFT', offerTitle: 'Appointment', offerDescription: 'Schedule care',
+        offerScript: 'Schedule now', appointmentType: 'Consultation',
+      },
+    });
+    await expect(db.$executeRaw`UPDATE "ReceptionistIntakeField" SET "campaignId" = ${otherDraft.json().id}::uuid WHERE id = ${field.json().id}::uuid`)
+      .rejects.toThrow(/receptionist_intake_field_parent_immutable/);
+
+    const current = await db.receptionistCampaign.findUniqueOrThrow({ where: { id: draft.json().id } });
+    await db.receptionistCampaign.update({ where: { id: current.id }, data: {
+      status: 'ACTIVE', intakeSchemaSnapshot: { testFixture: true }, intakeSchemaFingerprint: 'a'.repeat(64),
+      intakeToolFingerprint: 'b'.repeat(64), intakeSchemaAttestedRevision: current.intakeSchemaRevision,
+      intakeSchemaAttestedAt: new Date(), intakeSchemaProviderAgentId: 'agent_location_fixture', intakeSchemaProviderVersion: 1,
+      intakeSchemaResponseEngineId: 'llm_location_fixture', intakeSchemaResponseEngineVersion: 1,
+    } });
+    const activeLocationDrift = await app.inject({
+      method: 'PATCH', url: `/v1/receptionist/locations/${location.json().id}`, headers: auth(t, 'OWNER'),
+      payload: { name: 'Renamed active office' },
+    });
+    expect(activeLocationDrift.statusCode).toBe(409);
+    expect(activeLocationDrift.json().message).toMatch(/Pause active campaigns/i);
+    expect((await db.receptionistLocation.findUniqueOrThrow({ where: { id: location.json().id } })).name).toBe('North office');
+  });
+
   it('links and verifies one exact published provider deployment with durable safety evidence', async () => {
     const [owner, foreign] = await Promise.all([tenant(), tenant()]);
     const ownerClinic = (await createClinic(owner, { name: 'Provider-ready clinic' })).json().id as string;
@@ -258,7 +313,16 @@ describe('AI receptionist trusted configuration', () => {
       response_engine: { type: 'retell-llm', llm_id: 'llm_safe', version: 3 },
       last_modification_timestamp: Date.now(),
     };
-    const fetchMock = vi.fn<typeof fetch>(async () => new Response(JSON.stringify(providerPayload), { status: 200 }));
+    let providerBookingTool = compileIntakeContract({
+      campaignId: 'provider-contract', revision: 1, appointmentType: 'Consultation', eligibleLocations: [], fields: [],
+      toolUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell/fn?clinicId=${ownerClinic}`,
+    }).snapshot.bookAppointmentToolContract;
+    const fetchMock = vi.fn<typeof fetch>(async url => new Response(JSON.stringify(String(url).includes('/get-retell-llm/')
+      ? {
+        llm_id: 'llm_safe', version: 3, is_published: true, tool_call_strict_mode: true,
+        general_tools: [providerBookingTool],
+      }
+      : providerPayload), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
 
     try {
@@ -282,6 +346,9 @@ describe('AI receptionist trusted configuration', () => {
       );
       const stored = await db.receptionistAgent.findUniqueOrThrow({ where: { id: agentId } });
       expect(stored.providerFingerprint).toMatch(/^[a-f0-9]{64}$/);
+      expect(stored.providerResponseEngineGraphFingerprint).toMatch(/^[a-f0-9]{64}$/);
+      expect(stored.providerBookToolFingerprint).toMatch(/^[a-f0-9]{64}$/);
+      expect(stored.providerToolCallStrictMode).toBe(true);
       expect(stored.providerVerifiedRevision).toBe(stored.providerConfigRevision);
       expect(stored.providerVerificationExpiresAt!.getTime()).toBeGreaterThan(stored.providerVerifiedAt!.getTime());
 
@@ -318,20 +385,67 @@ describe('AI receptionist trusted configuration', () => {
         },
       })).rejects.toMatchObject({ code: 'P2003' });
 
-      const activeCampaign = await app.inject({
+      const campaignDraft = await app.inject({
         method: 'POST', url: '/v1/receptionist/campaigns', headers: auth(owner, 'OWNER'),
         payload: {
-          clinicId: ownerClinic, agentId, name: 'Verified deployment campaign', status: 'ACTIVE',
+          clinicId: ownerClinic, agentId, name: 'Verified deployment campaign', status: 'DRAFT',
           offerTitle: 'Appointment', offerDescription: 'Schedule care', offerScript: 'Would you like an appointment?', appointmentType: 'Consultation',
         },
       });
-      expect(activeCampaign.statusCode).toBe(201);
+      expect(campaignDraft.statusCode).toBe(201);
+      await expect(db.$executeRaw`UPDATE "ReceptionistCampaign" SET status = 'ACTIVE' WHERE id = ${campaignDraft.json().id}::uuid`)
+        .rejects.toThrow(/ReceptionistCampaign_active_intake_attestation_check/);
+      providerBookingTool = compileIntakeContract({
+        campaignId: campaignDraft.json().id, revision: campaignDraft.json().intakeSchemaRevision,
+        appointmentType: 'Consultation', eligibleLocations: [], fields: [],
+        toolUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell/fn?clinicId=${ownerClinic}`,
+      }).snapshot.bookAppointmentToolContract;
+      const schemaVerified = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agentId}/verify-provider`, headers: auth(owner, 'OWNER') });
+      expect(schemaVerified.statusCode).toBe(200);
+      const activeCampaign = await app.inject({
+        method: 'PATCH', url: `/v1/receptionist/campaigns/${campaignDraft.json().id}`, headers: auth(owner, 'OWNER'), payload: { status: 'ACTIVE' },
+      });
+      expect(activeCampaign.statusCode).toBe(200);
+      expect(activeCampaign.json()).toMatchObject({
+        status: 'ACTIVE', intakeSchemaAttestedRevision: campaignDraft.json().intakeSchemaRevision,
+        intakeSchemaProviderAgentId: 'agent_pilot_exact', intakeSchemaProviderVersion: 17,
+      });
+      expect(activeCampaign.json().intakeSchemaFingerprint).toMatch(/^[a-f0-9]{64}$/);
+      expect(intakeLegacyPause).toBeTruthy();
+      await expect(db.$transaction(async tx => {
+        await tx.$executeRawUnsafe(intakeLegacyPause!);
+        expect(await tx.receptionistCampaign.findUniqueOrThrow({ where: { id: activeCampaign.json().id } })).toMatchObject({ status: 'PAUSED' });
+        expect(await tx.auditEvent.count({
+          where: { tenantId: owner.id, resourceId: activeCampaign.json().id, action: 'receptionistCampaign.intakeAttestationMigrationPaused' },
+        })).toBe(1);
+        throw new Error('ROLLBACK_INTAKE_LEGACY_PAUSE_PROBE');
+      })).rejects.toThrow('ROLLBACK_INTAKE_LEGACY_PAUSE_PROBE');
+
+      const activeFieldMutation = await app.inject({
+        method: 'POST', url: '/v1/receptionist/intake-fields', headers: auth(owner, 'OWNER'),
+        payload: {
+          campaignId: activeCampaign.json().id, fieldType: 'CUSTOM_TEXT', label: 'Accessibility',
+          aiQuestion: 'Do you need an accessibility accommodation?', required: false,
+        },
+      });
+      expect(activeFieldMutation.statusCode).toBe(409);
       const deactivateReferenced = await app.inject({
         method: 'PATCH', url: `/v1/receptionist/agents/${agentId}`, headers: auth(owner, 'OWNER'), payload: { active: false },
       });
       expect(deactivateReferenced.statusCode).toBe(409);
       const deleteReferenced = await app.inject({ method: 'DELETE', url: `/v1/receptionist/agents/${agentId}`, headers: auth(owner, 'OWNER') });
       expect(deleteReferenced.statusCode).toBe(409);
+
+      const attestedProviderBookingTool = providerBookingTool;
+      providerBookingTool = compileIntakeContract({
+        campaignId: campaignDraft.json().id, revision: campaignDraft.json().intakeSchemaRevision,
+        appointmentType: 'Drifted provider service', eligibleLocations: [], fields: [],
+        toolUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell/fn?clinicId=${ownerClinic}`,
+      }).snapshot.bookAppointmentToolContract;
+      const graphDriftBlocked = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agentId}/verify-provider`, headers: auth(owner, 'OWNER') });
+      expect(graphDriftBlocked.statusCode).toBe(409);
+      expect(graphDriftBlocked.json().message).toContain('drift');
+      providerBookingTool = attestedProviderBookingTool;
 
       providerPayload.version = 18;
       const driftBlocked = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agentId}/verify-provider`, headers: auth(owner, 'OWNER') });
@@ -345,16 +459,41 @@ describe('AI receptionist trusted configuration', () => {
       });
       expect(await db.auditEvent.count({
         where: { tenantId: owner.id, resourceId: agentId, action: 'receptionistAgent.providerDeploymentDriftDetected' },
-      })).toBe(1);
+      })).toBe(2);
 
       const paused = await app.inject({
         method: 'PATCH', url: `/v1/receptionist/campaigns/${activeCampaign.json().id}`, headers: auth(owner, 'OWNER'), payload: { status: 'PAUSED' },
       });
       expect(paused.statusCode).toBe(200);
+      const impossibleLocation = await app.inject({
+        method: 'POST', url: '/v1/receptionist/intake-fields', headers: auth(owner, 'OWNER'),
+        payload: {
+          campaignId: activeCampaign.json().id, fieldType: 'PREFERRED_LOCATION', label: 'Preferred clinic',
+          aiQuestion: 'Which clinic location do you prefer?', required: true,
+        },
+      });
+      expect(impossibleLocation.statusCode).toBe(400);
+      expect(impossibleLocation.json().message).toMatch(/eligible active mapped location/i);
+      const semanticChange = await app.inject({
+        method: 'POST', url: '/v1/receptionist/intake-fields', headers: auth(owner, 'OWNER'),
+        payload: {
+          campaignId: activeCampaign.json().id, fieldType: 'CUSTOM_TEXT', label: 'Accessibility',
+          aiQuestion: 'Do you need an accessibility accommodation?', validationRule: 'brief', required: false,
+        },
+      });
+      expect(semanticChange.statusCode).toBe(201);
+      const invalidated = await db.receptionistCampaign.findUniqueOrThrow({ where: { id: activeCampaign.json().id } });
+      expect(invalidated.intakeSchemaRevision).toBeGreaterThan(activeCampaign.json().intakeSchemaRevision);
+      expect(invalidated).toMatchObject({ intakeSchemaSnapshot: null, intakeSchemaFingerprint: null, intakeSchemaAttestedRevision: null });
+      const staleSchemaActivation = await app.inject({
+        method: 'PATCH', url: `/v1/receptionist/campaigns/${activeCampaign.json().id}`, headers: auth(owner, 'OWNER'), payload: { status: 'ACTIVE' },
+      });
+      expect(staleSchemaActivation.statusCode).toBe(409);
+      expect(staleSchemaActivation.json().message).toContain('intake_schema_mismatch');
       const approvedUpdate = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agentId}/verify-provider`, headers: auth(owner, 'OWNER') });
       expect(approvedUpdate.statusCode).toBe(200);
       expect(approvedUpdate.json()).toMatchObject({ providerVersion: 18, providerStatus: 'VERIFIED' });
-      expect(await db.auditEvent.count({ where: { tenantId: owner.id, resourceId: agentId, action: 'receptionistAgent.providerDeploymentUpdated' } })).toBe(1);
+      expect(await db.auditEvent.count({ where: { tenantId: owner.id, resourceId: agentId, action: 'receptionistAgent.providerDeploymentUpdated' } })).toBe(2);
     } finally {
       vi.unstubAllGlobals();
       env.RETELL_API_KEY = originalRetell.apiKey;
@@ -458,6 +597,20 @@ describe('AI receptionist trusted configuration', () => {
     });
     expect(staleRun.statusCode).toBe(409);
     expect(staleRun.json().message).toContain('agent_verification_stale');
+
+    await db.receptionistAgent.update({ where: { id: unverified.id }, data: {
+      providerVerifiedAt: new Date(), providerVerificationExpiresAt: new Date(Date.now() + 60_000),
+      providerResponseEngineVersion: 1,
+    } });
+    const unattestedStudio = await app.inject({
+      method: 'POST', url: '/v1/receptionist/campaigns', headers: auth(t, 'OWNER'),
+      payload: {
+        clinicId, agentId: unverified.id, name: 'Legacy verified Studio activation', status: 'ACTIVE',
+        offerTitle: 'Appointment', offerDescription: 'Schedule care', offerScript: 'Schedule now', appointmentType: 'Consultation',
+      },
+    });
+    expect(unattestedStudio.statusCode).toBe(409);
+    expect(unattestedStudio.json().message).toContain('intake_schema_unattested');
   });
 
   it('rolls provider verification state back when its mandatory audit insert fails', async () => {

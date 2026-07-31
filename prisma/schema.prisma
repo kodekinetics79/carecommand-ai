@@ -1508,6 +1508,12 @@ model ReceptionistAgent {
   providerResponseEngineType    String?
   providerResponseEngineId      String?
   providerResponseEngineVersion Int?
+  providerResponseEngineGraphFingerprint String?
+  // Sanitized, provider-read book_appointment JSON Schema evidence. It is
+  // version-bound to the verified response engine and contains no credentials.
+  providerBookToolSchema        Json?
+  providerBookToolFingerprint   String?
+  providerToolCallStrictMode    Boolean?
   providerLastModifiedAt        DateTime?
   providerFingerprint           String?
   providerConfigRevision        Int                             @default(1)
@@ -1545,6 +1551,18 @@ model ReceptionistCampaign {
   eligibleLocationIds String[]                         @db.Uuid
   smsConfirmation     Boolean                          @default(true)
   emailConfirmation   Boolean                          @default(false)
+  // Monotonic configuration revision plus immutable activation snapshot. Any
+  // intake/location/tool mutation invalidates the attestation before reuse.
+  intakeSchemaRevision              Int       @default(1)
+  intakeSchemaSnapshot              Json?
+  intakeSchemaFingerprint           String?
+  intakeToolFingerprint             String?
+  intakeSchemaAttestedRevision      Int?
+  intakeSchemaAttestedAt            DateTime?
+  intakeSchemaProviderAgentId       String?
+  intakeSchemaProviderVersion       Int?
+  intakeSchemaResponseEngineId      String?
+  intakeSchemaResponseEngineVersion Int?
   createdAt           DateTime                         @default(now())
   updatedAt           DateTime                         @updatedAt
   tenant              Tenant                           @relation(fields: [tenantId], references: [id], onDelete: Cascade)

@@ -329,7 +329,7 @@ describe('Retell authorization ordering and fail-closed store', () => {
     setEnv({ NODE_ENV: 'production', RETELL_API_KEY: key });
     const redis = rateStoreState.client as FakeRateRedis;
     redis.nextVerifiedCounts = [1, 121];
-    const response = await signedPost(fnUrl(tenant.clinicId), toolBody(callId, 'book_appointment'), key);
+    const response = await signedPost(fnUrl(tenant.clinicId), toolBody(callId, 'verify_patient_identity'), key);
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ allowed: false, needs_human: true, reason: 'call_limit', handoff_recorded: true });
     expect(await db.staffTask.count({ where: { tenantId: tenant.id } })).toBe(1);

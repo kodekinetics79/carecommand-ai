@@ -237,6 +237,10 @@ describe('AI receptionist outbound targets', () => {
         data: {
           tenantId: tenant.id, clinicId: tenant.clinicId, agentId: tenant.agentId, name: 'Related active Studio', status: 'ACTIVE',
           offerTitle: 'Appointment', offerDescription: 'Schedule care', offerScript: 'Schedule now', appointmentType: 'Consultation', eligibleLocationIds: [],
+          intakeSchemaSnapshot: { testFixture: true }, intakeSchemaFingerprint: 'd'.repeat(64), intakeToolFingerprint: 'e'.repeat(64),
+          intakeSchemaAttestedRevision: 1, intakeSchemaAttestedAt: new Date(),
+          intakeSchemaProviderAgentId: `agent_${tenant.id.replaceAll('-', '')}`, intakeSchemaProviderVersion: 1,
+          intakeSchemaResponseEngineId: `llm_${tenant.id.replaceAll('-', '')}`, intakeSchemaResponseEngineVersion: 1,
         },
       });
       const relatedStudioPaused = await db.receptionistCampaign.create({
