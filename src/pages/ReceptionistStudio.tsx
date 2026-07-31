@@ -13,7 +13,8 @@ import { useSession } from '../hooks/useSession';
 import {
   receptionistApi as api,
   FIELD_CATALOG, VOICE_OPTIONS, TONE_OPTIONS, LANGUAGE_OPTIONS, CAMPAIGN_TYPES, TIMEZONE_OPTIONS,
-  OUTBOUND_REQUIRED_FIELDS, OUTBOUND_RECONCILIATION_WARNING, mergeReconciliationRefresh, presentLaunchResult, validateOutboundQuietHours,
+  OUTBOUND_REQUIRED_FIELDS, OUTBOUND_RECONCILIATION_WARNING, launchControlsBlocked, mergeReconciliationRefresh, presentLaunchResult, validateOutboundQuietHours,
+  clearTransportAmbiguityToken, readTransportAmbiguityToken, transportAmbiguityStorageKey, writeTransportAmbiguityToken,
   type Clinic, type Campaign, type IntakeField, type Agent, type FieldType,
   type PromptResult, type RetellConfig, type CallLog, type AppointmentRequest, type OptOut, type Overview,
   type RetellStatus, type OutboundCampaign, type OutboundRequiredField, type OutboundBookingMode,
@@ -373,7 +374,7 @@ function ClinicPanel({ clinic, onChanged }: { clinic: Clinic; onChanged: () => P
             </Select>
           </Field>
         </div>
-        <Field label="Compliance disclosure" hint="Spoken at the very start of every call — must identify the agent as AI." required>
+        <Field label="Approved opening disclosure" hint="Paste the exact clinic- and counsel-approved jurisdictional wording. It must identify the assistant as AI; text alone is not consent evidence." required>
           <TextArea rows={2} value={draft.complianceDisclosure} onChange={e => set('complianceDisclosure', e.target.value)} />
         </Field>
         <Field label="Do-not-contact policy" hint="How the agent handles a request to stop being contacted.">
@@ -1452,8 +1453,8 @@ function CampaignFormFields({ form, set, bookingAuthorities, locations }: { form
           ? <p className="text-xs text-t3">Controlled by the linked attested booking campaign.</p>
           : <RequiredFieldPicker value={form.requiredFields ?? []} onChange={v => set({ requiredFields: v })} />}
       </Field>
-      <Field label="Consent / disclaimer text" hint="Spoken disclosure the agent reads at the start of the call.">
-        <TextArea rows={2} value={form.consentText ?? ''} onChange={e => set({ consentText: e.target.value })} placeholder="This call may be recorded. You can opt out at any time." />
+      <Field label="Campaign consent / disclaimer text" hint="Paste clinic- and counsel-approved jurisdictional wording. A saved script is not proof of consent.">
+        <TextArea rows={2} value={form.consentText ?? ''} onChange={e => set({ consentText: e.target.value })} placeholder="Approved campaign-specific disclosure" />
       </Field>
       <Field label="Human handoff instruction" hint="When the agent should transfer to a human.">
         <TextInput value={form.humanHandoffInstruction ?? ''} onChange={e => set({ humanHandoffInstruction: e.target.value })} placeholder="Transfer if the caller asks clinical questions." />
@@ -1572,6 +1573,7 @@ function CampaignBuilder({ clinicId, bookingAuthorities, locations, timezone, on
 }
 
 function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { campaign: OutboundCampaign; status: RetellStatus | null; outboundStopped: boolean; onChanged: () => void }) {
+  const transportAmbiguityKey = transportAmbiguityStorageKey(campaign.id);
   const [targets, setTargets] = useState<CallTarget[]>([]);
   const [logs, setLogs] = useState<CallLog[]>([]);
   const [reconciliations, setReconciliations] = useState<OutboundReconciliationEvidence[]>([]);
@@ -1579,6 +1581,7 @@ function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { camp
   const [phone, setPhone] = useState('');
   const [firstName, setFirstName] = useState('');
   const [launchMsg, setLaunchMsg] = useState<{ kind: 'ok' | 'warn' | 'err'; text: string } | null>(null);
+  const [transportAmbiguityToken, setTransportAmbiguityToken] = useState<string | null>(() => readTransportAmbiguityToken(window.localStorage, transportAmbiguityKey));
   const [launching, setLaunching] = useState(false);
   const [campaignActionPending, setCampaignActionPending] = useState(false);
   const [detailErrors, setDetailErrors] = useState<string[]>([]);
@@ -1604,7 +1607,39 @@ function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { camp
 
   useEffect(() => {
     void (async () => { await reloadDetail(); })();
-  }, [reloadDetail]);
+  }, [reloadDetail, transportAmbiguityKey]);
+
+  const persistTransportAmbiguity = (token: string) => {
+    setTransportAmbiguityToken(token);
+    writeTransportAmbiguityToken(window.localStorage, transportAmbiguityKey, token);
+  };
+
+  async function verifyAndClearTransportAmbiguity() {
+    setLaunching(true);
+    try {
+      if (!transportAmbiguityToken) return;
+      const [attempt, durableRows] = await Promise.all([
+        api.verifyClearLaunchAttempt(campaign.id, transportAmbiguityToken),
+        api.listOutboundReconciliations(campaign.id),
+        api.listOutboundCallLogs(campaign.id),
+        api.listTargets(campaign.id),
+      ]);
+      setReconciliations(durableRows);
+      setReconciliationVerified(true);
+      if (!attempt.cleared || durableRows.length > 0) {
+        setLaunchMsg({ kind: 'err', text: `${OUTBOUND_RECONCILIATION_WARNING}. Server attempt proof is ${attempt.proof}; resolve durable evidence before clearing this block.` });
+        return;
+      }
+      clearTransportAmbiguityToken(window.localStorage, transportAmbiguityKey);
+      setTransportAmbiguityToken(null);
+      setLaunchMsg({ kind: 'warn', text: `Server-fenced attempt proof (${attempt.proof}) and durable call evidence were verified. The transport block was explicitly cleared.` });
+    } catch {
+      setReconciliationVerified(false);
+      setLaunchMsg({ kind: 'err', text: `${OUTBOUND_RECONCILIATION_WARNING}. Durable evidence refresh failed, so the launch block remains.` });
+    } finally {
+      setLaunching(false);
+    }
+  }
 
   async function launch(targetId?: string, toPhone?: string) {
     const dial = toPhone ?? phone;
@@ -1614,6 +1649,7 @@ function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { camp
       const res = await api.launchCall(campaign.id, { phone: dial, firstName: firstName || undefined, targetId });
       const presentation = presentLaunchResult(res);
       setLaunchMsg({ kind: presentation.kind, text: presentation.text });
+      if (res.status === 'transport_ambiguous') persistTransportAmbiguity(res.clientAttemptToken);
       if (res.status === 'launched' && !res.trackingDegraded) {
         setPhone('');
       }
@@ -1621,15 +1657,18 @@ function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { camp
         await reloadDetail();
         onChanged();
       }
-    } catch (e) {
-      setLaunchMsg({ kind: 'err', text: e instanceof Error ? e.message : 'Call failed to launch.' });
+    } catch {
+      setReconciliationVerified(false);
+      setLaunchMsg({ kind: 'err', text: `The launch response was lost. ${OUTBOUND_RECONCILIATION_WARNING}. Refresh durable evidence and verify provider state before any retry.` });
+      await reloadDetail();
     } finally {
       setLaunching(false);
     }
   }
 
+  const transportAmbiguous = transportAmbiguityToken !== null;
   const configured = status?.configured ?? false;
-  const reconciliationBlocksLaunch = !reconciliationVerified || reconciliations.length > 0;
+  const reconciliationBlocksLaunch = launchControlsBlocked({ transportAmbiguous, reconciliationVerified, reconciliations });
 
   async function approveAndRun() {
     if (!window.confirm(`Approve policy ${campaign.policyVersion ?? '(missing)'} and start this outbound campaign?`)) return;
@@ -1660,6 +1699,13 @@ function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { camp
         <div role="alert" className="rounded-xl border border-red-v/40 bg-[var(--red-soft)] p-3 flex items-center justify-between gap-3">
           <p className="text-xs text-red-v">{detailErrors.join(' ')} Existing rows remain visible; retry before acting.</p>
           <button type="button" onClick={() => void reloadDetail()} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-xs font-semibold text-t2">Retry</button>
+        </div>
+      )}
+      {transportAmbiguous && (
+        <div role="alert" aria-live="assertive" className="cc-card border-l-4 border-l-red-v p-4">
+          <p className="text-sm font-bold text-red-v">{OUTBOUND_RECONCILIATION_WARNING}</p>
+          <p className="mt-1 text-xs text-t2">The launch transport failed after submission. Launch controls remain blocked until provider and durable call evidence are independently reconciled.</p>
+          <button type="button" disabled={launching} onClick={() => void verifyAndClearTransportAmbiguity()} className="mt-2 rounded-lg border border-red-v/40 px-3 py-1.5 text-xs font-semibold text-red-v disabled:opacity-50">Refresh all durable evidence and clear only if no reconciliation remains</button>
         </div>
       )}
       {reconciliations.length > 0 && (
@@ -1713,10 +1759,12 @@ function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { camp
         )}
         {status?.adhocTestCallsAllowed ? (
           <div className="grid grid-cols-[1fr_1fr_auto] gap-2 items-end">
-            <Field label="Sandbox phone number"><TextInput value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 010 0000" /></Field>
+            <Field label="Test-call phone number" hint="When a provider is configured, this action may place a real call."><TextInput value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 010 0000" /></Field>
             <Field label="First name (optional)"><TextInput value={firstName} onChange={e => setFirstName(e.target.value)} placeholder="Jordan" /></Field>
-            <button type="button" disabled={launching || outboundStopped || reconciliationBlocksLaunch || !phone || campaign.status !== 'RUNNING' || !configured} onClick={() => launch()} className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50 h-[38px]">
-              {launching ? <Loader2 className="w-4 h-4 animate-spin" /> : <PhoneOutgoing className="w-4 h-4" />} Sandbox call
+            <button type="button" disabled={launching || outboundStopped || reconciliationBlocksLaunch || !phone || campaign.status !== 'RUNNING' || !configured} onClick={() => {
+              if (window.confirm('Place this test call now? A configured provider may dial the entered phone number.')) void launch();
+            }} className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50 h-[38px]">
+              {launching ? <Loader2 className="w-4 h-4 animate-spin" /> : <PhoneOutgoing className="w-4 h-4" />} Place test call
             </button>
           </div>
         ) : <p className="text-xs text-t3">Production calls must use an authorized patient or lead target below.</p>}
@@ -1850,13 +1898,38 @@ function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign:
   );
 }
 
-function BookingRequestQueue({ requests, onChanged }: { requests: BookingRequest[]; onChanged: () => void }) {
+type CanonicalBookingDisplay = {
+  service: string;
+  startsAt: string;
+  timezone: string;
+  locationName: string;
+  locationAddress: string | null;
+  providerName: string | null;
+};
+
+function BookingRequestQueue({ requests, onChanged }: { requests: BookingRequest[]; onChanged: () => void | Promise<void> }) {
   const [reconcilingId, setReconcilingId] = useState<string | null>(null);
   const [appointmentId, setAppointmentId] = useState('');
   const [reason, setReason] = useState('');
   const [acknowledged, setAcknowledged] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [reconciledCanonicalByRequest, setReconciledCanonicalByRequest] = useState<Record<string, CanonicalBookingDisplay>>({});
+  const canonicalByRequest = useMemo(() => {
+    const canonical: Record<string, CanonicalBookingDisplay> = {};
+    for (const request of requests) {
+      if (!request.bookedAppointment) continue;
+      canonical[request.id] = {
+        service: request.bookedAppointment.service,
+        startsAt: request.bookedAppointment.startsAt,
+        timezone: request.bookedAppointment.branch.timezone,
+        locationName: request.bookedAppointment.branch.name,
+        locationAddress: request.bookedAppointment.branch.location.trim() || null,
+        providerName: request.bookedAppointment.providerProfile?.user.displayName ?? null,
+      };
+    }
+    return { ...canonical, ...reconciledCanonicalByRequest };
+  }, [requests, reconciledCanonicalByRequest]);
 
   async function reject(id: string) {
     const outcomeReason = window.prompt('Rejection reason (recorded in the audit trail):')?.trim();
@@ -1864,7 +1937,7 @@ function BookingRequestQueue({ requests, onChanged }: { requests: BookingRequest
     setBusy(true); setError(null);
     try {
       await api.updateBookingRequest(id, { status: 'REJECTED', outcomeReason });
-      onChanged();
+      await onChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'The rejection was not recorded.');
     } finally { setBusy(false); }
@@ -1873,11 +1946,12 @@ function BookingRequestQueue({ requests, onChanged }: { requests: BookingRequest
   async function reconcile(id: string) {
     setBusy(true); setError(null);
     try {
-      await api.reconcileBookingRequest(id, {
+      const result = await api.reconcileBookingRequest(id, {
         appointmentId: appointmentId.trim(), outcomeReason: reason.trim(), acknowledgeRequestDifferences: true,
       });
+      setReconciledCanonicalByRequest(current => ({ ...current, [id]: result.appointment }));
       setReconcilingId(null); setAppointmentId(''); setReason(''); setAcknowledged(false);
-      onChanged();
+      await onChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'The appointment link was not recorded.');
     } finally { setBusy(false); }
@@ -1887,13 +1961,15 @@ function BookingRequestQueue({ requests, onChanged }: { requests: BookingRequest
       <h3 className="text-sm font-bold text-t1 mb-3 flex items-center gap-2"><CalendarClock className="w-4 h-4 text-indigo" /> Appointment requests ({requests.length})</h3>
       {requests.length === 0 ? <p className="text-xs text-t3">No appointment requests collected yet. They appear here after calls complete.</p> : (
         <div className="space-y-2">
-          {requests.map(r => (
+          {requests.map(r => {
+            const canonical = canonicalByRequest[r.id];
+            return (
             <div key={r.id} className="rounded-lg border border-[var(--b1)] px-3 py-2.5">
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2 min-w-0">
                   <span className={requestBadge[r.status]}>{r.status.replace('_', ' ')}</span>
                   <span className="text-sm text-t1 font-semibold truncate">{r.collectedName || r.collectedPhone || 'Unknown contact'}</span>
-                  {r.requestedService && <span className="text-xs text-t3 truncate">· {r.requestedService}</span>}
+                  {r.status !== 'BOOKED' && r.requestedService && <span className="text-xs text-t3 truncate">· Requested: {r.requestedService}</span>}
                 </div>
                 <div className="flex items-center gap-1.5 shrink-0">
                   {['PENDING_REVIEW', 'MISSING_INFO'].includes(r.status) && (
@@ -1906,7 +1982,15 @@ function BookingRequestQueue({ requests, onChanged }: { requests: BookingRequest
                 </div>
               </div>
               <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-t3">
-                {r.requestedDateTime && <span>{new Date(r.requestedDateTime).toLocaleString()}</span>}
+                {r.status === 'BOOKED' && canonical ? (
+                  <span className="font-semibold text-emerald-v">
+                    Booked: {canonical.service} · {new Date(canonical.startsAt).toLocaleString('en-US', { timeZone: canonical.timezone })} {canonical.timezone}
+                    {' · '}{[canonical.locationName, canonical.locationAddress].filter(Boolean).join(', ')}
+                    {canonical.providerName ? ` · ${canonical.providerName}` : ''}
+                  </span>
+                ) : r.status === 'BOOKED' ? (
+                  <span className="font-semibold text-red-v">Canonical appointment details unavailable—refresh before relying on this booking.</span>
+                ) : r.requestedDateTime ? <span>Requested: {new Date(r.requestedDateTime).toLocaleString()}</span> : null}
                 {r.collectedPhone && <span>{r.collectedPhone}</span>}
                 {r.missingFields.length > 0 && <span className="text-amber-v">Missing: {r.missingFields.join(', ')}</span>}
                 {r.outcomeReason && <span className="italic">{r.outcomeReason}</span>}
@@ -1928,7 +2012,8 @@ function BookingRequestQueue({ requests, onChanged }: { requests: BookingRequest
                 </div>
               )}
             </div>
-          ))}
+            );
+          })}
           {error && <p role="alert" className="text-xs font-semibold text-red-v">{error} Refresh before taking another action.</p>}
         </div>
       )}

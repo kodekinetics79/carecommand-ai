@@ -3,7 +3,9 @@ import { ApiError, apiRequest } from '../../src/lib/api';
 import { clearSession, setAccessTokenOnly } from '../../src/lib/session';
 import {
   OUTBOUND_RECONCILIATION_WARNING, launchResultFromError, mergeReconciliationRefresh,
-  parseLaunchResult, presentLaunchResult, validateOutboundQuietHours,
+  launchControlsBlocked, parseLaunchResult, presentLaunchResult, receptionistApi, validateOutboundQuietHours,
+  clearTransportAmbiguityToken, readTransportAmbiguityToken, transportAmbiguityStorageKey,
+  TRANSPORT_AMBIGUITY_STORAGE_UNAVAILABLE, writeTransportAmbiguityToken,
   type OutboundReconciliationEvidence,
 } from '../../src/lib/receptionist';
 
@@ -54,6 +56,25 @@ describe('front-desk launch response contract', () => {
     },
   );
 
+  it('turns a rejected fetch after launch submission into a red do-not-retry reconciliation state', async () => {
+    vi.stubGlobal('window', { dispatchEvent: vi.fn() });
+    setAccessTokenOnly('unit-token');
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: 'registered' }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      }))
+      .mockRejectedValueOnce(new TypeError('network response lost'));
+    globalThis.fetch = fetchMock;
+    const result = await receptionistApi.launchCall('campaign-1', { phone: '+12125550199' });
+    expect(result).toMatchObject({ status: 'transport_ambiguous', clientAttemptToken: expect.any(String) });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0]?.[0]).toContain('/launch-attempts');
+    expect(fetchMock.mock.calls[1]?.[1]?.body).toContain((result as { clientAttemptToken: string }).clientAttemptToken);
+    expect(presentLaunchResult(result)).toMatchObject({ kind: 'err', refresh: true });
+    expect(presentLaunchResult(result).text).toContain(OUTBOUND_RECONCILIATION_WARNING);
+    expect(launchControlsBlocked({ transportAmbiguous: true, reconciliationVerified: true, reconciliations: [] })).toBe(true);
+  });
+
   it('renders every launch state truthfully, including amber accepted-but-degraded and red reconciliation', () => {
     const cases = [
       { status: 'launched', callId: 'c1', callLogId: 'l1', mock: false, trackingDegraded: false },
@@ -95,6 +116,40 @@ describe('persistent outbound reconciliation refresh state', () => {
 
   it('removes the persistent warning only after a successful refresh returns durable resolution', () => {
     expect(mergeReconciliationRefresh([durableRow], { ok: true, rows: [] })).toEqual([]);
+  });
+
+  it('keeps controls fail-closed across a failed durable refresh and opens only after explicit ambiguity clearance', () => {
+    const afterFailedRefresh = mergeReconciliationRefresh([durableRow], { ok: false });
+    expect(launchControlsBlocked({
+      transportAmbiguous: true,
+      reconciliationVerified: false,
+      reconciliations: afterFailedRefresh,
+    })).toBe(true);
+    expect(launchControlsBlocked({
+      transportAmbiguous: false,
+      reconciliationVerified: true,
+      reconciliations: [],
+    })).toBe(false);
+  });
+
+  it('persists the attempt token across a remount and fails closed when storage is unavailable', () => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => { values.set(key, value); },
+      removeItem: (key: string) => { values.delete(key); },
+    };
+    const key = transportAmbiguityStorageKey('campaign-1');
+    expect(writeTransportAmbiguityToken(storage, key, 'attempt-token')).toBe(true);
+    expect(readTransportAmbiguityToken(storage, key)).toBe('attempt-token');
+    expect(clearTransportAmbiguityToken(storage, key)).toBe(true);
+    expect(readTransportAmbiguityToken(storage, key)).toBeNull();
+
+    const unavailable = { getItem: () => { throw new Error('blocked'); } };
+    expect(readTransportAmbiguityToken(unavailable, key)).toBe(TRANSPORT_AMBIGUITY_STORAGE_UNAVAILABLE);
+    expect(launchControlsBlocked({
+      transportAmbiguous: true, reconciliationVerified: true, reconciliations: [],
+    })).toBe(true);
   });
 });
 

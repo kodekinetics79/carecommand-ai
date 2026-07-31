@@ -1,4 +1,5 @@
 import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
@@ -20,10 +21,15 @@ import {
   compatibleVoiceConsentEventTx,
   isChannelSuppressedTx,
 } from '../../lib/receptionist/dncFence';
+import {
+  issueProviderIntentCorrelation,
+  providerIntentMetadataForRetell,
+} from '../../lib/receptionist/providerIntentCorrelation';
 
 const uuid = z.string().uuid();
 const idParam = z.object({ id: uuid });
 const writeRoles = requireReceptionistPermission(RECEPTIONIST_PERMISSIONS.MANAGE);
+const bookingReviewRoles = requireReceptionistPermission(RECEPTIONIST_PERMISSIONS.BOOKING_REVIEW);
 const callArtifactRead = requireReceptionistPermission(RECEPTIONIST_PERMISSIONS.CALL_ARTIFACTS_READ);
 const ownerAdminRoles = requireRoles('OWNER', 'ADMIN');
 const REQUIRED_FIELD_KEYS = ['firstName', 'lastName', 'phone', 'email', 'preferredBranch', 'preferredService', 'preferredDateTime'] as const;
@@ -32,6 +38,7 @@ const DIALABLE_TARGET_STATUS = 'PENDING';
 const OUTBOUND_PURPOSES = ['CARE_COORDINATION', 'APPOINTMENT_REMINDER', 'PATIENT_REACTIVATION'] as const;
 const OUTBOUND_LEGAL_BASES = ['EXPLICIT_CONSENT', 'TREATMENT_OPERATIONS'] as const;
 const STRICT_HH_MM = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+const CLIENT_LAUNCH_ATTEMPT_SCOPE = 'receptionist.outbound-client-attempt';
 export const MAX_TENANT_ACTIVE_CALLS = 3;
 export const DEFAULT_VOICE_MINUTES_LIMIT = 500;
 
@@ -937,6 +944,109 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
   });
 
   // ----- Launch a single outbound call (test call or to a target) ---------
+  app.post('/outbound-campaigns/:id/launch-attempts', { preHandler: writeRoles }, async request => {
+    const { id } = idParam.parse(request.params);
+    const { token } = z.object({ token: uuid }).strict().parse(request.body);
+    const campaign = await db.receptionistOutboundCampaign.findFirst({ where: { id, tenantId: request.auth.tenantId }, select: { id: true } });
+    if (!campaign) throw app.httpErrors.notFound('Campaign not found');
+    const key = `${request.auth.tenantId}:${id}:${token}`;
+    await db.$transaction(async tx => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`receptionist-client-attempt:${key}`}::text, 0))::text AS locked`;
+      await tx.idempotencyKey.upsert({
+        where: { scope_key: { scope: CLIENT_LAUNCH_ATTEMPT_SCOPE, key } },
+        update: { tenantId: request.auth.tenantId },
+        create: { tenantId: request.auth.tenantId, scope: CLIENT_LAUNCH_ATTEMPT_SCOPE, key },
+      });
+    });
+    return { status: 'registered' as const, token };
+  });
+
+  app.post('/outbound-campaigns/:id/launch-attempts/:token/verify-clear', { preHandler: writeRoles }, async request => {
+    const { id, token } = z.object({ id: uuid, token: uuid }).parse(request.params);
+    const key = `${request.auth.tenantId}:${id}:${token}`;
+    return runWithTenantContext(request.auth.tenantId, async tx => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`receptionist-client-attempt:${key}`}::text, 0))::text AS locked`;
+      const attempt = await tx.idempotencyKey.findUnique({ where: { scope_key: { scope: CLIENT_LAUNCH_ATTEMPT_SCOPE, key } } });
+      if (!attempt || attempt.tenantId !== request.auth.tenantId) throw app.httpErrors.notFound('Launch attempt not found');
+      if (attempt.resultId === null) {
+        await tx.idempotencyKey.update({ where: { id: attempt.id }, data: { resultId: 'cancelled_before_dispatch' } });
+        await tx.auditEvent.create({ data: {
+          tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+          action: 'receptionist.outbound.clientAttempt.cancelledBeforeDispatch',
+          resource: 'receptionistOutboundCampaign', resourceId: id,
+          requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
+          metadata: { clientAttemptToken: token },
+        } });
+        return { cleared: true as const, proof: 'non_submission_fenced' as const };
+      }
+      if (attempt.resultId === 'cancelled_before_dispatch' || attempt.resultId.startsWith('blocked:') || attempt.resultId.startsWith('reconciled:')) {
+        return { cleared: true as const, proof: attempt.resultId };
+      }
+      if (attempt.resultId === 'dispatching') return { cleared: false as const, proof: 'dispatch_in_progress' as const };
+      const call = uuid.safeParse(attempt.resultId).success
+        ? await tx.receptionistCallLog.findFirst({
+          where: { id: attempt.resultId, tenantId: request.auth.tenantId, outboundCampaignId: id },
+          include: { target: { select: { status: true } }, outboundProviderIntent: { select: { id: true } } },
+        })
+        : null;
+      if (!call) return { cleared: false as const, proof: 'durable_call_status_unresolved' as const };
+      const terminal = call.outcome !== 'IN_PROGRESS' && call.endedAt !== null;
+      const targetReleased = !call.target || call.target.status !== 'CALLING';
+      const unboundUncertainIntent = Boolean(call.outboundProviderIntent && !call.retellCallId && call.outcome === 'ESCALATED');
+      const reconciliationResolved = unboundUncertainIntent ? await (async () => {
+        const [signals, tasks] = await Promise.all([
+          tx.operationalSignal.findMany({
+            where: {
+              tenantId: request.auth.tenantId, entityType: 'receptionistCallLog', entityId: call.id,
+              signalType: { in: [
+                'receptionist_outbound_stop_unconfirmed_after_acceptance',
+                'receptionist_outbound_provider_acceptance_unknown',
+                'receptionist_outbound_local_binding_failed',
+                'receptionist_provider_deployment_mismatch',
+                'receptionist_outbound_provider_intent_recovery',
+              ] },
+            },
+            select: { status: true },
+          }),
+          tx.staffTask.findMany({
+            where: {
+              tenantId: request.auth.tenantId,
+              metadata: { path: ['callLogId'], equals: call.id },
+            },
+            select: { status: true, metadata: true },
+          }),
+        ]);
+        const reconciliationTasks = tasks.filter(task => {
+          const metadata = task.metadata && typeof task.metadata === 'object' && !Array.isArray(task.metadata)
+            ? task.metadata as Prisma.JsonObject
+            : null;
+          const workflow = typeof metadata?.workflow === 'string' ? metadata.workflow : '';
+          return workflow.startsWith('receptionist_') && workflow.includes('reconcil');
+        });
+        const signalsResolved = signals.length > 0 && signals.every(signal => signal.status === 'resolved');
+        const tasksResolved = reconciliationTasks.length > 0 && reconciliationTasks.every(task => task.status === 'COMPLETED');
+        return signals.length > 0
+          ? signalsResolved && (reconciliationTasks.length === 0 || tasksResolved)
+          : tasksResolved;
+      })() : true;
+      if (!terminal || !targetReleased || (unboundUncertainIntent && !reconciliationResolved)) {
+        return {
+          cleared: false as const, proof: unboundUncertainIntent ? 'unbound_provider_intent' as const : 'call_not_terminal' as const,
+          callLogId: call.id, providerCallId: call.retellCallId,
+        };
+      }
+      await tx.idempotencyKey.update({ where: { id: attempt.id }, data: { resultId: `reconciled:${call.id}` } });
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+        action: 'receptionist.outbound.clientAttempt.reconciled',
+        resource: 'receptionistCallLog', resourceId: call.id,
+        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
+        metadata: { clientAttemptToken: token, outcome: call.outcome, targetReleased },
+      } });
+      return { cleared: true as const, proof: 'durable_terminal_reconciliation' as const, callLogId: call.id, providerCallId: call.retellCallId };
+    });
+  });
+
   app.post('/outbound-campaigns/:id/call', { preHandler: writeRoles }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
     const body = z.object({
@@ -945,6 +1055,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       lastName: z.string().trim().max(120).optional(),
       email: z.string().trim().max(160).optional(),
       targetId: uuid.optional(),
+      clientAttemptToken: uuid.optional(),
     }).parse(request.body);
 
     const campaign = await db.receptionistOutboundCampaign.findFirst({
@@ -1109,6 +1220,27 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       startedAt: new Date(),
     };
     const reservation = await db.$transaction(async tx => {
+          const clientAttemptKey = body.clientAttemptToken
+            ? `${request.auth.tenantId}:${campaign.id}:${body.clientAttemptToken}`
+            : null;
+          const finishClientAttempt = async (resultId: string) => {
+            if (!clientAttemptKey) return;
+            await tx.idempotencyKey.update({
+              where: { scope_key: { scope: CLIENT_LAUNCH_ATTEMPT_SCOPE, key: clientAttemptKey } },
+              data: { resultId },
+            });
+          };
+          if (clientAttemptKey) {
+            await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`receptionist-client-attempt:${clientAttemptKey}`}::text, 0))::text AS locked`;
+            const attempt = await tx.idempotencyKey.findUnique({
+              where: { scope_key: { scope: CLIENT_LAUNCH_ATTEMPT_SCOPE, key: clientAttemptKey } },
+              select: { tenantId: true, resultId: true },
+            });
+            if (!attempt || attempt.tenantId !== request.auth.tenantId || attempt.resultId !== null) {
+              return { blocked: 'client_attempt_not_claimable' as const };
+            }
+            await finishClientAttempt('dispatching');
+          }
           await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-capacity:${request.auth.tenantId}`})::bigint)`;
           const aiUsage = await tx.tenantAiUsage.upsert({
             where: { tenantId: request.auth.tenantId },
@@ -1130,11 +1262,15 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
           const activeCalls = await tx.receptionistCallLog.count({
             where: { tenantId: request.auth.tenantId, outcome: 'IN_PROGRESS', endedAt: null },
           });
-          if (activeCalls >= MAX_TENANT_ACTIVE_CALLS) return { blocked: 'concurrency_limit_reached' as const };
+          if (activeCalls >= MAX_TENANT_ACTIVE_CALLS) {
+            await finishClientAttempt('blocked:concurrency_limit_reached');
+            return { blocked: 'concurrency_limit_reached' as const };
+          }
           const usedMinutes = Math.max(voiceUsage.used, aiUsage.receptionistMinutes);
           // Each in-progress call reserves at least one billable minute. This
           // prevents parallel launches from consuming the final minute twice.
           if (!aiUsage.overageAllowed && voiceUsage.limitValue !== null && usedMinutes + activeCalls >= voiceUsage.limitValue) {
+            await finishClientAttempt('blocked:voice_minutes_limit_reached');
             return { blocked: 'voice_minutes_limit_reached' as const };
           }
           if (target) {
@@ -1151,9 +1287,14 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
             },
             data: { status: 'CALLING', attempts: { increment: 1 } },
           });
-            if (claim.count !== 1) return { blocked: 'target_not_dialable' as const };
+            if (claim.count !== 1) {
+              await finishClientAttempt('blocked:target_not_dialable');
+              return { blocked: 'target_not_dialable' as const };
+            }
           }
-          return { callLog: await tx.receptionistCallLog.create({ data: callLogData }) };
+          const reservedCall = await tx.receptionistCallLog.create({ data: callLogData });
+          await finishClientAttempt(reservedCall.id);
+          return { callLog: reservedCall };
         });
 
     if ('blocked' in reservation) {
@@ -1267,6 +1408,16 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     }
 
     await providerBoundaryTestHook?.('before_suppression_fence');
+    const providerIntentId = randomUUID();
+    const providerCorrelation = issueProviderIntentCorrelation({
+      tenantId: request.auth.tenantId,
+      intentId: providerIntentId,
+      callLogId: callLog.id,
+      outboundCampaignId: campaign.id,
+      targetId: target?.id ?? null,
+      purpose: campaign.purpose!,
+      policyVersion: campaign.policyVersion!,
+    });
     const providerIntentAttempt = await db.$transaction(async tx => {
       // Canonical multi-domain lock order is configuration then suppression.
       // Studio pause/configuration writes take the same configuration lock, so
@@ -1332,6 +1483,8 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         || finalTarget.status !== 'CALLING')) return { blocked: 'target_identity_changed' as const };
 
       const durableIntent = await authorizeOutboundProviderIntentTx(tx, {
+        id: providerIntentId,
+        correlationNonceHash: providerCorrelation.nonceHash,
         tenantId: request.auth.tenantId,
         callLogId: callLog.id,
         outboundCampaignId: finalCampaign.id,
@@ -1458,6 +1611,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         tenantId: request.auth.tenantId, outboundCampaignId: campaign.id,
         receptionistCampaignId: campaign.receptionistCampaignId,
         callLogId: callLog.id, targetId: body.targetId ?? null,
+        ...providerIntentMetadataForRetell(providerCorrelation),
       },
       // No verified prior recording consent is attached to this launch. Retell
       // must retain metadata only; an in-call grant cannot upgrade this setting.
@@ -1603,6 +1757,14 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       // A broken task/signal/audit dependency must never roll a mismatched
       // deployment back to VERIFIED or make its campaigns runnable again.
       const safetyState = await runWithTenantContext(request.auth.tenantId, async tx => {
+        // Deployment safety mutations share the same canonical configuration
+        // lock as Studio/outbound edits and provider-intent authorization. A
+        // concurrent re-verification or campaign activation must therefore be
+        // ordered either before this circuit trip (and then be invalidated) or
+        // after it (and observe INVALID/PAUSED state).
+        if (result.error === 'retell_deployment_mismatch') {
+          await lockOutboundConfiguration(tx, request.auth.tenantId);
+        }
         await tx.receptionistCallLog.update({
           where: { id: callLog.id },
           data: { outcome: acceptanceUnknown ? 'ESCALATED' : 'FAILED', endedAt: new Date(), ...(result.callId ? { retellCallId: result.callId } : {}) },
@@ -1792,6 +1954,14 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
           || !latestCall || latestCall.outcome !== 'IN_PROGRESS' || latestCall.endedAt) {
           return { cancelled: true as const };
         }
+        // A signed provider callback may recover and bind the exact call while
+        // this request is resuming after provider acceptance. Treat that as
+        // the same successful linearized binding; a different id is never
+        // interchangeable and falls into the fail-closed reconciliation path.
+        if (latestCall.retellCallId === result.callId) {
+          return { cancelled: false as const, bound: 1, recoveredByCallback: true as const };
+        }
+        if (latestCall.retellCallId !== null) throw new Error('provider_call_binding_collision');
         const bound = await tx.receptionistCallLog.updateMany({
           where: { id: callLog.id, tenantId: request.auth.tenantId, retellCallId: null, outcome: 'IN_PROGRESS', endedAt: null },
           data: { retellCallId: result.callId },
@@ -1883,10 +2053,19 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       where: { tenantId: request.auth.tenantId, ...(query.status ? { status: query.status } : {}) },
       orderBy: { createdAt: 'desc' },
       take: 200,
+      include: {
+        bookedAppointment: {
+          select: {
+            id: true, service: true, startsAt: true,
+            branch: { select: { timezone: true, name: true, location: true } },
+            providerProfile: { select: { user: { select: { displayName: true } } } },
+          },
+        },
+      },
     });
   });
 
-  app.patch('/booking-requests/:id', { preHandler: writeRoles }, async request => {
+  app.patch('/booking-requests/:id', { preHandler: bookingReviewRoles }, async request => {
     const { id } = idParam.parse(request.params);
     // A staff status patch is review workflow only. BOOKED can be asserted only
     // by the canonical atomic booking service with an actual Appointment FK.

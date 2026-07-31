@@ -885,6 +885,21 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
       return { kind: 'rejected', message: 'This call already has a different terminal outcome. A staff member must review it.' };
     }
 
+    // Bind review requests to a patient only when this exact provider call has
+    // durable identity-verification evidence. Phone/name similarity is useful
+    // intake data, but never authority to link an unrelated appointment later.
+    const existingPatients = phone ? await patientsByCanonicalPhone(ctx.tenantId, phone, tx) : [];
+    let verifiedExistingPatientId: string | null = null;
+    if (existingPatients.length) {
+      const proof = await tx.idempotencyKey.findUnique({
+        where: { scope_key: { scope: 'receptionist.voice-identity', key: `${ctx.tenantId}:${ctx.callId}` } },
+        select: { resultId: true },
+      });
+      if (proof?.resultId && existingPatients.some(patient => patient.id === proof.resultId)) {
+        verifiedExistingPatientId = proof.resultId;
+      }
+    }
+
     let locationValid = false;
     if (trusted.locationId && trusted.branchId && trusted.branchTimezone) {
       const eligible = trusted.intakeSnapshot.eligibleLocationIds;
@@ -910,6 +925,7 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
           where: { id: existingRequest.id },
           data: {
             branchId: trusted.branchId, campaignId: trusted.campaignId, requestedService: service,
+            ...(verifiedExistingPatientId ? { patientId: verifiedExistingPatientId } : {}),
             collectedName: firstName && lastName ? `${firstName} ${lastName}` : null,
             collectedPhone: phone, collectedEmail: email, rawCollectedFields: rawAnswers,
             requestedDateTime: startsAt, status: 'MISSING_INFO', missingFields, outcomeReason: reason,
@@ -919,6 +935,7 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
         : await tx.appointmentRequest.create({
           data: {
             tenantId: ctx.tenantId, branchId: trusted.branchId, campaignId: trusted.campaignId,
+            patientId: verifiedExistingPatientId,
             callLogId: trusted.callLogId, requestedService: service,
             collectedName: firstName && lastName ? `${firstName} ${lastName}` : null,
             collectedPhone: phone, collectedEmail: email, rawCollectedFields: rawAnswers,
@@ -971,17 +988,8 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
       return review(providers.length !== 1 ? 'Provider selection is ambiguous' : 'Configured service is not canonical', [providers.length !== 1 ? 'preferredProvider' : 'preferredService'], 'A team member needs to confirm the provider or service before booking.');
     }
     const providerProfileId = providers[0].id;
-    const existingPatients = phone ? await patientsByCanonicalPhone(ctx.tenantId, phone, tx) : [];
-    let verifiedExistingPatientId: string | null = null;
-    if (existingPatients.length) {
-      const proof = await tx.idempotencyKey.findUnique({
-        where: { scope_key: { scope: 'receptionist.voice-identity', key: `${ctx.tenantId}:${ctx.callId}` } },
-        select: { resultId: true },
-      });
-      if (!proof?.resultId || !existingPatients.some(patient => patient.id === proof.resultId)) {
-        return review(existingPatients.length > 1 ? 'Patient identity is ambiguous' : 'Existing patient identity was not verified for this call', ['identityVerification'], 'I need identity verification or front desk assistance before linking this booking.');
-      }
-      verifiedExistingPatientId = proof.resultId;
+    if (existingPatients.length && !verifiedExistingPatientId) {
+      return review(existingPatients.length > 1 ? 'Patient identity is ambiguous' : 'Existing patient identity was not verified for this call', ['identityVerification'], 'I need identity verification or front desk assistance before linking this booking.');
     }
     if ((policy.requireEligibilityForSelfBook || policy.requireIntakeForSelfBook) && !verifiedExistingPatientId) {
       return review('Canonical pre-visit policy requires an existing verified patient', ['preVisitRequirements'], 'A team member must review eligibility or intake requirements before booking.');

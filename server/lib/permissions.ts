@@ -54,6 +54,9 @@ export const PERMISSIONS = [
   'receptionist:recordings:read',
   // Configure receptionist clinics/agents/campaigns and mutate their workflow.
   'receptionist:manage',
+  // Narrow front-desk operation: decide or reconcile an AI appointment request
+  // against an already-created canonical scheduler appointment.
+  'receptionist:booking-review',
   // Tenant administration: manage users, roles, sessions, security posture.
   'admin:manage',
 ] as const;
@@ -80,13 +83,14 @@ export const ROLE_PERMISSIONS: Record<UserRole, Permission[]> = {
     'billing:read',
     'staff:read', 'staff:write', 'staff:task-status',
     'settings:read', 'settings:write',
-    'receptionist:call-artifacts:read', 'receptionist:manage',
+    'receptionist:call-artifacts:read', 'receptionist:manage', 'receptionist:booking-review',
   ],
   BILLING: ['billing:read', 'billing:write', 'settings:read', 'patient:read', 'intake:read', 'intake:write'],
   PROVIDER: ['patient:read', 'intake:read', 'appointment:read', 'appointment:write', 'schedule:manage', 'staff:read', 'settings:read'],
   FRONT_DESK: [
     'patient:read', 'patient:write', 'intake:read', 'intake:write', 'appointment:read', 'appointment:write', 'billing:read', 'staff:read', 'staff:task-status',
     'receptionist:call-artifacts:read',
+    'receptionist:booking-review',
   ],
   ANALYST: ['patient:read', 'appointment:read', 'billing:read', 'staff:read', 'settings:read', 'audit:read'],
   COMPLIANCE_OFFICER: [

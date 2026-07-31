@@ -43,6 +43,7 @@ import {
   enforceInvalidRetellSignatureRateLimit,
   enforceVerifiedRetellRateLimit,
 } from '../../lib/receptionist/providerRateLimit';
+import { recoverOutboundProviderIntent } from '../../lib/receptionist/providerIntentRecovery';
 import { retellRateStore } from '../../lib/receptionist/retellRateStore';
 import {
   bookAppointmentToolFingerprint,
@@ -57,6 +58,7 @@ const uuid = z.string().uuid();
 const RECEPTIONIST_CALL_LEASE_MS = 4 * 60 * 60 * 1_000;
 const idParam = z.object({ id: uuid });
 const writeRoles = requireReceptionistPermission(RECEPTIONIST_PERMISSIONS.MANAGE);
+const bookingReviewRoles = requireReceptionistPermission(RECEPTIONIST_PERMISSIONS.BOOKING_REVIEW);
 const callArtifactRead = requireReceptionistPermission(RECEPTIONIST_PERMISSIONS.CALL_ARTIFACTS_READ);
 const ownerAdminRoles = requireRoles('OWNER', 'ADMIN');
 const e164Phone = z.string().trim().max(40)
@@ -1237,16 +1239,18 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
       'receptionist_outbound_provider_acceptance_unknown',
       'receptionist_outbound_local_binding_failed',
       'receptionist_provider_deployment_mismatch',
+      'receptionist_outbound_provider_intent_recovery',
     ];
     const reconciliationTaskWorkflows = [
       'receptionist_outbound_reconciliation',
       'receptionist_outbound_stop_reconciliation',
+      'receptionist_provider_intent_recovery',
     ];
     // Candidate discovery is driven by durable reconciliation evidence, not
     // the generic ESCALATED outcome (which is also used for ordinary handoffs
     // and incomplete booking payloads). Target lastCallLogIds are fetched
     // exactly, so a critical older row cannot fall out of a recent-log window.
-    const [targets, signals, taskRows] = await Promise.all([
+    const [targets, signals, taskRows, unboundIntents] = await Promise.all([
       db.receptionistCallTarget.findMany({
         where: { tenantId: request.auth.tenantId, campaignId: id, lastOutcome: 'RECONCILIATION_REQUIRED', lastCallLogId: { not: null } },
         select: { id: true, lastCallLogId: true },
@@ -1266,6 +1270,14 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
         select: { id: true, status: true, metadata: true },
         orderBy: { createdAt: 'asc' },
       }),
+      db.receptionistOutboundProviderIntent.findMany({
+        where: {
+          tenantId: request.auth.tenantId,
+          outboundCampaignId: id,
+          callLog: { retellCallId: null, outcome: { in: ['IN_PROGRESS', 'ESCALATED'] } },
+        },
+        select: { callLogId: true },
+      }),
     ]);
     const tasks = taskRows.flatMap(task => {
       const metadata = task.metadata && typeof task.metadata === 'object' && !Array.isArray(task.metadata)
@@ -1273,7 +1285,7 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
         : null;
       const workflow = typeof metadata?.workflow === 'string' ? metadata.workflow : '';
       const callLogId = typeof metadata?.callLogId === 'string' ? metadata.callLogId : null;
-      return callLogId && workflow.startsWith('receptionist_outbound') && workflow.includes('reconcil')
+      return callLogId && workflow.startsWith('receptionist_') && workflow.includes('reconcil')
         ? [{ id: task.id, status: task.status, callLogId }]
         : [];
     });
@@ -1282,6 +1294,7 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
       ...targets.map(target => target.lastCallLogId).filter(isUuid),
       ...signals.map(signal => signal.entityId).filter(isUuid),
       ...tasks.map(task => task.callLogId).filter(isUuid),
+      ...unboundIntents.map(intent => intent.callLogId),
     ])];
     const candidateLogs = candidateCallLogIds.length === 0 ? [] : await db.receptionistCallLog.findMany({
       where: {
@@ -1292,6 +1305,7 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
       select: { id: true, retellCallId: true, targetId: true, outcome: true, createdAt: true },
     });
     const targetByCall = new Map(targets.map(target => [target.lastCallLogId!, target.id]));
+    const unboundIntentCalls = new Set(unboundIntents.map(intent => intent.callLogId));
     const active = candidateLogs.flatMap(log => {
       const callSignals = signals.filter(signal => signal.entityId === log.id);
       const callTasks = tasks.filter(task => task.callLogId === log.id);
@@ -1300,6 +1314,9 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
       const durableResolution = callSignals.length > 0
         ? signalsResolved && (callTasks.length === 0 || tasksResolved)
         : tasksResolved;
+      // A terminal unbound intent remains visible until the dedicated signal
+      // and task evidence prove that staff reconciled provider state. The
+      // immutable intent itself is retained for audit and is never deleted.
       if (durableResolution) return [];
       return [{
         localCallLogId: log.id,
@@ -1309,6 +1326,7 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
           ...(targetByCall.has(log.id) ? ['RECONCILIATION_REQUIRED' as const] : []),
           ...(callSignals.length > 0 ? ['RECONCILIATION_SIGNAL' as const] : []),
           ...(callTasks.length > 0 ? ['RECONCILIATION_TASK' as const] : []),
+          ...(unboundIntentCalls.has(log.id) ? ['UNBOUND_PROVIDER_INTENT' as const] : []),
         ],
         signalIds: callSignals.map(signal => signal.id),
         signalStatuses: callSignals.map(signal => signal.status),
@@ -1328,7 +1346,7 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
   // through the canonical scheduler, then bind that exact provider-backed
   // appointment here. The request, source-call link, and audit evidence commit
   // atomically so the queue cannot claim success without an Appointment FK.
-  app.post('/booking-requests/:id/reconcile', { preHandler: writeRoles }, async request => {
+  app.post('/booking-requests/:id/reconcile', { preHandler: bookingReviewRoles }, async request => {
     const { id } = idParam.parse(request.params);
     const input = z.object({
       appointmentId: uuid,
@@ -1338,7 +1356,10 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
 
     return runWithTenantContext(request.auth.tenantId, async tx => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-request-reconcile:${request.auth.tenantId}:${id}`})::bigint)`;
-      const existing = await tx.appointmentRequest.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+      const existing = await tx.appointmentRequest.findFirst({
+        where: { id, tenantId: request.auth.tenantId },
+        include: { callLog: { select: { retellCallId: true } } },
+      });
       if (!existing) throw app.httpErrors.notFound('Request not found');
       if (existing.status === 'BOOKED') {
         if (existing.bookedAppointmentId !== input.appointmentId) {
@@ -1348,7 +1369,7 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
           where: { id: input.appointmentId, tenantId: request.auth.tenantId, deletedAt: null },
           select: {
             id: true, service: true, startsAt: true,
-            branch: { select: { timezone: true, name: true } },
+            branch: { select: { timezone: true, name: true, location: true } },
             providerProfile: { select: { user: { select: { displayName: true } } } },
           },
         });
@@ -1357,7 +1378,8 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
           status: 'BOOKED' as const, requestId: existing.id, appointmentId: replay.id, duplicate: true,
           appointment: {
             service: replay.service, startsAt: replay.startsAt, timezone: replay.branch.timezone,
-            locationName: replay.branch.name, providerName: replay.providerProfile?.user.displayName ?? null,
+            locationName: replay.branch.name, locationAddress: replay.branch.location.trim() || null,
+            providerName: replay.providerProfile?.user.displayName ?? null,
           },
         };
       }
@@ -1376,7 +1398,7 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
         select: {
           id: true, branchId: true, patientId: true, providerProfileId: true,
           receptionistCallLogId: true, service: true, startsAt: true,
-          branch: { select: { timezone: true, name: true } },
+          branch: { select: { timezone: true, name: true, location: true } },
           providerProfile: { select: { user: { select: { displayName: true } } } },
         },
       });
@@ -1384,11 +1406,29 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
       if (!appointment.providerProfileId || !appointment.providerProfile?.user.displayName) {
         throw app.httpErrors.conflict('The appointment has no canonical provider and cannot reconcile this request.');
       }
+      let identityProof: 'request_patient' | 'verified_call_identity' | 'appointment_source_call' | null = null;
+      if (existing.patientId) {
+        if (appointment.patientId !== existing.patientId) {
+          throw app.httpErrors.conflict('The appointment belongs to a different patient than the request.');
+        }
+        identityProof = 'request_patient';
+      } else if (existing.callLogId && appointment.receptionistCallLogId === existing.callLogId) {
+        identityProof = 'appointment_source_call';
+      } else if (existing.callLogId && existing.callLog?.retellCallId) {
+        const verifiedIdentity = await tx.idempotencyKey.findUnique({
+          where: { scope_key: {
+            scope: 'receptionist.voice-identity',
+            key: `${request.auth.tenantId}:${existing.callLog.retellCallId}`,
+          } },
+          select: { resultId: true },
+        });
+        if (verifiedIdentity?.resultId === appointment.patientId) identityProof = 'verified_call_identity';
+      }
+      if (!identityProof) {
+        throw app.httpErrors.conflict('This request has no durable patient identity proof for the selected appointment. Verify identity or bind the canonical appointment to the exact source call before reconciling.');
+      }
       if (existing.branchId && appointment.branchId !== existing.branchId) {
         throw app.httpErrors.conflict('The appointment belongs to a different branch than the request.');
-      }
-      if (existing.patientId && appointment.patientId !== existing.patientId) {
-        throw app.httpErrors.conflict('The appointment belongs to a different patient than the request.');
       }
       if (appointment.receptionistCallLogId && appointment.receptionistCallLogId !== existing.callLogId) {
         throw app.httpErrors.conflict('The appointment is already bound to another receptionist call.');
@@ -1425,18 +1465,19 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
         action: 'receptionist.appointmentRequest.reconciledToCanonicalAppointment',
         resource: 'appointmentRequest', resourceId: existing.id,
         requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
-        metadata: { appointmentId: appointment.id, differences, reasonRecorded: true, requestDifferencesAcknowledged: true },
+        metadata: { appointmentId: appointment.id, differences, identityProof, reasonRecorded: true, requestDifferencesAcknowledged: true },
       } });
       await tx.businessEvent.create({ data: {
         tenantId: request.auth.tenantId, eventType: 'receptionist.appointmentRequest.reconciled',
         entityType: 'appointmentRequest', entityId: existing.id, sourceModule: 'receptionist',
-        payload: { appointmentId: appointment.id, differences },
+        payload: { appointmentId: appointment.id, differences, identityProof },
       } });
       return {
         status: 'BOOKED' as const, requestId: updated.id, appointmentId: appointment.id, duplicate: false,
         appointment: {
           service: appointment.service, startsAt: appointment.startsAt, timezone: appointment.branch.timezone,
-          locationName: appointment.branch.name, providerName: appointment.providerProfile.user.displayName,
+          locationName: appointment.branch.name, locationAddress: appointment.branch.location.trim() || null,
+          providerName: appointment.providerProfile.user.displayName,
         },
       };
     });
@@ -1716,6 +1757,86 @@ async function flagUnresolvedRetellIngress(callId: string | undefined, destinati
   });
 }
 
+async function persistProviderIntentRecoveryReview(input: {
+  tenantId: string;
+  callLogId: string;
+  providerCallId: string;
+  reason: string;
+  providerStopApplied: boolean;
+}) {
+  let signalId: string | null = null;
+  let reviewTaskId: string | null = null;
+  try {
+    signalId = await runWithTenantContext(input.tenantId, async tx => {
+      const signal = await tx.operationalSignal.upsert({
+        where: { tenantId_signalType_entityType_entityId: {
+          tenantId: input.tenantId,
+          signalType: 'receptionist_outbound_provider_intent_recovery',
+          entityType: 'receptionistCallLog',
+          entityId: input.callLogId,
+        } },
+        update: {
+          severity: 'critical', score: 100, status: 'open',
+          reason: `Provider-intent recovery requires staff reconciliation (${input.reason}); provider stop confirmed=${input.providerStopApplied}.`,
+        },
+        create: {
+          tenantId: input.tenantId,
+          signalType: 'receptionist_outbound_provider_intent_recovery',
+          entityType: 'receptionistCallLog',
+          entityId: input.callLogId,
+          severity: 'critical', score: 100, status: 'open',
+          reason: `Provider-intent recovery requires staff reconciliation (${input.reason}); provider stop confirmed=${input.providerStopApplied}.`,
+        },
+      });
+      return signal.id;
+    });
+  } catch {
+    // The task below is an independent recovery-evidence path.
+  }
+  try {
+    reviewTaskId = await runWithTenantContext(input.tenantId, async tx => {
+      const prior = await tx.staffTask.findFirst({
+        where: {
+          tenantId: input.tenantId,
+          status: { in: ['OPEN', 'IN_PROGRESS'] },
+          AND: [
+            { metadata: { path: ['workflow'], equals: 'receptionist_provider_intent_recovery' } },
+            { metadata: { path: ['callLogId'], equals: input.callLogId } },
+          ],
+        },
+        select: { id: true },
+      });
+      if (prior) return prior.id;
+      const call = await tx.receptionistCallLog.findFirst({
+        where: { id: input.callLogId, tenantId: input.tenantId },
+        select: { outboundCampaign: { select: { defaultBranchId: true } } },
+      });
+      const task = await tx.staffTask.create({ data: {
+        tenantId: input.tenantId,
+        branchId: call?.outboundCampaign?.defaultBranchId,
+        title: 'Urgent: reconcile recovered outbound provider call',
+        priority: 'CRITICAL',
+        metadata: {
+          workflow: 'receptionist_provider_intent_recovery',
+          callLogId: input.callLogId,
+          providerCallId: input.providerCallId,
+          reason: input.reason,
+          providerStopApplied: input.providerStopApplied,
+        },
+      } });
+      return task.id;
+    });
+  } catch {
+    // Return both evidence flags so callers can surface degraded tracking.
+  }
+  return {
+    signalId,
+    reviewTaskId,
+    signalRecorded: signalId !== null,
+    reviewRecorded: reviewTaskId !== null,
+  };
+}
+
 async function admitInboundReceptionist(tenantId: string, providerCallId: string, reservation: {
   clinicId?: string; campaignId?: string; callerPhone?: string; direction?: string; enforceAdmission?: boolean;
 } = {}) {
@@ -1739,6 +1860,10 @@ async function admitInboundReceptionist(tenantId: string, providerCallId: string
         tenantId,
         outcome: 'IN_PROGRESS',
         endedAt: null,
+        // A committed provider intent with no local provider id may represent
+        // acceptance immediately before a process crash. Only signed recovery
+        // or explicit operator reconciliation may close that uncertainty.
+        outboundProviderIntent: { is: null },
         OR: [
           { startedAt: { lt: leaseCutoff } },
           { startedAt: null, createdAt: { lt: leaseCutoff } },
@@ -1806,9 +1931,12 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       event: z.string().optional(),
       call: z.object({
         call_id: z.string().optional(),
+        agent_id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/).optional(),
+        agent_version: z.number().int().nonnegative().optional(),
         from_number: z.string().optional(),
         to_number: z.string().optional(),
         direction: z.string().optional(),
+        metadata: z.record(z.string(), z.unknown()).optional(),
         recording_url: z.string().optional(),
         call_analysis: z.object({
           call_summary: z.string().optional(),
@@ -1852,16 +1980,29 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     // tenant when it maps to exactly one active clinic. Outbound `to_number` is
     // the patient destination and is therefore never tenant authority.
     const providerCallId = call.call_id?.trim();
+    const endedEvent = body.event === 'call_ended' || body.event === 'call_analyzed';
     const callResolution = providerCallId
       ? await resolveIngressTenant('retell_call_id', providerCallId)
+      : null;
+    const intentRecovery = !callResolution && providerCallId
+      ? await recoverOutboundProviderIntent({
+        metadata: call.metadata,
+        providerCallId,
+        providerAgentId: call.agent_id,
+        providerAgentVersion: call.agent_version,
+        terminalEvent: endedEvent,
+      })
+      : null;
+    const recoveredResolution = intentRecovery?.recognized
+      ? { tenantId: intentRecovery.tenantId, resourceId: intentRecovery.callLogId }
       : null;
     const signedDestination = call.direction === 'inbound'
       ? canonicalRetellDestination(call.to_number)
       : null;
-    const destinationResolution = !callResolution && providerCallId && signedDestination
+    const destinationResolution = !callResolution && !recoveredResolution && providerCallId && signedDestination
       ? await resolveIngressTenant('retell_destination_phone', signedDestination)
       : null;
-    const resolved = callResolution ?? destinationResolution;
+    const resolved = callResolution ?? recoveredResolution ?? destinationResolution;
     const resolvedByDestination = Boolean(destinationResolution);
     if (!resolved || !providerCallId) {
       request.log.warn({
@@ -1874,6 +2015,32 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     }
     const tenantId = resolved.tenantId;
     enterTenantContext({ tenantId, actorId: `webhook:retell:${resolved.resourceId}`, actorRole: 'WEBHOOK', source: 'webhook', requestId: request.id });
+    if (intentRecovery?.recognized && intentRecovery.quarantined) {
+      const stopped = intentRecovery.stopRequired
+        ? await stopPhoneCall(providerCallId)
+        : { applied: false as const };
+      await flagRetellIngressReview(
+        tenantId,
+        providerCallId,
+        `Recovered outbound provider intent was quarantined: ${intentRecovery.reason}; provider_stop_applied=${stopped.applied}`,
+      ).catch(() => undefined);
+      const review = await persistProviderIntentRecoveryReview({
+        tenantId,
+        callLogId: intentRecovery.callLogId,
+        providerCallId,
+        reason: intentRecovery.reason,
+        providerStopApplied: stopped.applied,
+      });
+      if (intentRecovery.stopRequired) {
+        return reply.code(202).send({
+          ok: true,
+          ignored: true,
+          reason: 'provider_intent_quarantined',
+          providerStopApplied: stopped.applied,
+          ...review,
+        });
+      }
+    }
     let trustedClinicId: string | undefined = resolvedByDestination ? resolved.resourceId : undefined;
     let trustedCampaignId: string | undefined;
     if (query.campaignId) {
@@ -1893,7 +2060,6 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       trustedClinicId = clinic.id;
     }
 
-    const endedEvent = body.event === 'call_ended' || body.event === 'call_analyzed';
     // Query selectors are not covered by Retell's body signature, so validate
     // them before counting. Never discard terminal lifecycle/usage
     // reconciliation: it is signed, mapped, serialized, and delta-idempotent.
@@ -2200,6 +2366,7 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         from_number: z.string().max(40).optional(),
         to_number: z.string().max(40).optional(),
         direction: z.enum(['inbound', 'outbound']).optional(),
+        metadata: z.record(z.string(), z.unknown()).optional(),
       }).optional(),
     }).parse(request.body);
 
@@ -2232,13 +2399,25 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     const callResolution = providerCallId
       ? await resolveIngressTenant('retell_call_id', providerCallId)
       : null;
+    const intentRecovery = !callResolution && providerCallId
+      ? await recoverOutboundProviderIntent({
+        metadata: body.call?.metadata,
+        providerCallId,
+        providerAgentId: body.call?.agent_id,
+        providerAgentVersion: body.call?.agent_version,
+        terminalEvent: false,
+      })
+      : null;
+    const recoveredResolution = intentRecovery?.recognized
+      ? { tenantId: intentRecovery.tenantId, resourceId: intentRecovery.callLogId }
+      : null;
     const signedDestination = body.call?.direction === 'inbound'
       ? canonicalRetellDestination(body.call.to_number)
       : null;
-    const destinationResolution = !callResolution && providerCallId && signedDestination
+    const destinationResolution = !callResolution && !recoveredResolution && providerCallId && signedDestination
       ? await resolveIngressTenant('retell_destination_phone', signedDestination)
       : null;
-    const resolved = callResolution ?? destinationResolution;
+    const resolved = callResolution ?? recoveredResolution ?? destinationResolution;
     const resolvedByDestination = Boolean(destinationResolution);
     if (!resolved || !providerCallId) {
       request.log.warn({
@@ -2251,6 +2430,26 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     }
     const tenantId = resolved.tenantId;
     enterTenantContext({ tenantId, actorId: `webhook:retell-tool:${resolved.resourceId}`, actorRole: 'WEBHOOK', source: 'webhook', requestId: request.id });
+    if (intentRecovery?.recognized && intentRecovery.quarantined) {
+      const stopped = await stopPhoneCall(providerCallId);
+      await flagRetellIngressReview(
+        tenantId,
+        providerCallId,
+        `Recovered outbound provider intent was quarantined: ${intentRecovery.reason}; provider_stop_applied=${stopped.applied}`,
+      ).catch(() => undefined);
+      const review = await persistProviderIntentRecoveryReview({
+        tenantId,
+        callLogId: intentRecovery.callLogId,
+        providerCallId,
+        reason: intentRecovery.reason,
+        providerStopApplied: stopped.applied,
+      });
+      return reply.code(202).send({
+        message: "I'm sorry, this call requires staff reconciliation and cannot continue.",
+        providerStopApplied: stopped.applied,
+        ...review,
+      });
+    }
     let trustedClinicId: string | undefined = resolvedByDestination ? resolved.resourceId : undefined;
     // Query selectors are routing hints only. A booking is instead bound below
     // from the signed call's exact provider deployment to one persisted active

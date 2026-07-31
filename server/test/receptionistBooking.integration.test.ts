@@ -86,7 +86,7 @@ async function makeTenant() {
     intakeSchemaResponseEngineId: `llm_${id.replaceAll('-', '')}`, intakeSchemaResponseEngineVersion: 1,
   } });
   return {
-    id, branchId: branch.id, adminId: admin.id, providerId: provider.id, patientId: patient.id, clinicId: clinic.id, clinicPhone: phoneFor(id),
+    id, branchId: branch.id, adminId: admin.id, providerUserId: provUser.id, providerId: provider.id, patientId: patient.id, clinicId: clinic.id, clinicPhone: phoneFor(id),
     agentId: agent.id, campaignId, providerAgentId, providerVersion, locationId: location.id, locationName: location.name,
     appointmentType, intakeSchemaRevision: 1, intakeSemanticFingerprint: contract.snapshot.semanticFingerprint,
   };
@@ -431,6 +431,24 @@ describe('receptionist /fn booking — real availability + booking', () => {
       first_name: 'Staff', last_name: 'Review', appointment_date: 'invalid', appointment_time: 'later',
     }, callId, '+15551113333');
     const requestId = (reviewResponse.json() as { appointment_request_id: string }).appointment_request_id;
+    const reviewUsers = await Promise.all((['FRONT_DESK', 'BILLING', 'AUDITOR'] as const).map(role => db.user.create({ data: {
+      tenantId: t.id, role, active: true,
+      email: `reject-${role.toLowerCase()}-${t.id.slice(0, 8)}@bk.test`, displayName: role,
+    } })));
+    const reviewAuth = (index: number) => ({ authorization: `Bearer ${app.jwt.sign({
+      userId: reviewUsers[index].id, tenantId: t.id, role: reviewUsers[index].role, type: 'access',
+    })}` });
+    const providerAuth = { authorization: `Bearer ${app.jwt.sign({
+      userId: t.providerUserId, tenantId: t.id, role: 'PROVIDER', type: 'access',
+    })}` };
+    for (const headers of [providerAuth, reviewAuth(1), reviewAuth(2)]) {
+      const denied = await app.inject({
+        method: 'PATCH', url: `/v1/receptionist/booking-requests/${requestId}`, headers,
+        payload: { status: 'REJECTED', outcomeReason: 'Caller requested cancellation' },
+      });
+      expect(denied.statusCode).toBe(403);
+      expect(denied.json()).toMatchObject({ permission: 'receptionist:booking-review' });
+    }
     const reasonOnly = await app.inject({
       method: 'PATCH', url: `/v1/receptionist/booking-requests/${requestId}`, headers: adminAuth(t),
       payload: { outcomeReason: 'Caller requested cancellation' },
@@ -438,7 +456,7 @@ describe('receptionist /fn booking — real availability + booking', () => {
     expect(reasonOnly.statusCode).toBe(400);
 
     const reject = () => app.inject({
-      method: 'PATCH', url: `/v1/receptionist/booking-requests/${requestId}`, headers: adminAuth(t),
+      method: 'PATCH', url: `/v1/receptionist/booking-requests/${requestId}`, headers: reviewAuth(0),
       payload: { status: 'REJECTED', outcomeReason: 'Caller requested cancellation' },
     });
     const [first, replay] = await Promise.all([reject(), reject()]);
@@ -472,6 +490,47 @@ describe('receptionist /fn booking — real availability + booking', () => {
     expect(terminalReconcile.statusCode).toBe(409);
   });
 
+  it.each(['appointment_source_call', 'verified_call_identity'] as const)(
+    'accepts the narrow %s durable identity proof for an otherwise unbound review request',
+    async proof => {
+      const t = await makeTenant();
+      const callId = `${proof}-${randomUUID()}`;
+      const review = await fn(t, 'book_appointment', {
+        first_name: 'Identity', last_name: 'Proof', appointment_date: 'invalid', appointment_time: 'later',
+      }, callId, '+15551116666');
+      const requestId = (review.json() as { appointment_request_id: string }).appointment_request_id;
+      const request = await db.appointmentRequest.findUniqueOrThrow({ where: { id: requestId } });
+      expect(request.patientId).toBeNull();
+      expect(request.callLogId).toBeTruthy();
+      const startsAt = new Date(`${futureDate(12)}T15:00:00.000Z`);
+      const appointment = await db.appointment.create({ data: {
+        tenantId: t.id, branchId: t.branchId, patientId: t.patientId,
+        providerProfileId: t.providerId, providerRef: t.providerId, service: t.appointmentType,
+        startsAt, endsAt: new Date(startsAt.getTime() + 30 * 60_000), status: 'CONFIRMED', channel: 'EMAIL',
+        ...(proof === 'appointment_source_call' ? { receptionistCallLogId: request.callLogId } : {}),
+      } });
+      if (proof === 'verified_call_identity') {
+        await db.idempotencyKey.create({ data: {
+          tenantId: t.id, scope: 'receptionist.voice-identity', key: `${t.id}:${callId}`, resultId: t.patientId,
+        } });
+      }
+      const response = await app.inject({
+        method: 'POST', url: `/v1/receptionist/booking-requests/${requestId}/reconcile`, headers: adminAuth(t),
+        payload: {
+          appointmentId: appointment.id,
+          outcomeReason: `Front desk used ${proof} evidence after reviewing the caller request.`,
+          acknowledgeRequestDifferences: true,
+        },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({ status: 'BOOKED', appointmentId: appointment.id });
+      const audit = await db.auditEvent.findFirstOrThrow({
+        where: { tenantId: t.id, action: 'receptionist.appointmentRequest.reconciledToCanonicalAppointment', resourceId: requestId },
+      });
+      expect(audit.metadata).toMatchObject({ identityProof: proof });
+    },
+  );
+
   it('reconciles a review only to one exact canonical provider-backed appointment with atomic audit evidence', async () => {
     const t = await makeTenant();
     const other = await makeTenant();
@@ -499,7 +558,21 @@ describe('receptionist /fn booking — real availability + booking', () => {
       providerProfileId: t.providerId, providerRef: t.providerId, service: t.appointmentType,
       startsAt: new Date(startsAt.getTime() + 60 * 60_000), endsAt: new Date(startsAt.getTime() + 90 * 60_000), status: 'CONFIRMED', channel: 'EMAIL',
     } });
-    await db.appointmentRequest.update({ where: { id: requestId }, data: { patientId: t.patientId } });
+    const unboundUnrelated = await app.inject({
+      method: 'POST', url: `/v1/receptionist/booking-requests/${requestId}/reconcile`, headers: adminAuth(t),
+      payload: {
+        appointmentId: patientMismatch.id,
+        outcomeReason: 'Attempted same-tenant same-branch unrelated patient reconciliation.',
+        acknowledgeRequestDifferences: true,
+      },
+    });
+    expect(unboundUnrelated.statusCode).toBe(409);
+    expect(unboundUnrelated.json().message).toMatch(/durable patient identity proof/i);
+    const requestedDateTime = new Date(startsAt.getTime() - 24 * 60 * 60_000);
+    await db.appointmentRequest.update({
+      where: { id: requestId },
+      data: { patientId: t.patientId, requestedService: 'Requested intake service', requestedDateTime },
+    });
     const secondBranch = await db.branch.create({ data: { tenantId: t.id, name: 'Other branch', location: 'Y', timezone: 'UTC', active: true } });
     const secondProviderUser = await db.user.create({ data: {
       tenantId: t.id, role: 'PROVIDER', active: true, email: `other-provider-${t.id.slice(0, 8)}@bk.test`, displayName: 'Dr Other',
@@ -538,15 +611,48 @@ describe('receptionist /fn booking — real availability + booking', () => {
       expect(mismatch.statusCode).toBe(409);
     }
 
-    const reconcile = () => app.inject({
+    const roleUsers = await Promise.all((['FRONT_DESK', 'BILLING', 'AUDITOR'] as const).map(role => db.user.create({ data: {
+      tenantId: t.id, role, active: true,
+      email: `${role.toLowerCase()}-${t.id.slice(0, 8)}@bk.test`, displayName: role,
+    } })));
+    const roleAuth = (index: number) => ({ authorization: `Bearer ${app.jwt.sign({
+      userId: roleUsers[index].id, tenantId: t.id, role: roleUsers[index].role, type: 'access',
+    })}` });
+    // Provider and unrelated operational/compliance roles do not inherit the
+    // narrow front-desk booking-review grant.
+    const providerAuth = { authorization: `Bearer ${app.jwt.sign({ userId: t.providerUserId, tenantId: t.id, role: 'PROVIDER', type: 'access' })}` };
+    for (const headers of [providerAuth, roleAuth(1), roleAuth(2)]) {
+      const denied = await app.inject({ method: 'POST', url: `/v1/receptionist/booking-requests/${requestId}/reconcile`, headers, payload });
+      expect(denied.statusCode).toBe(403);
+      expect(denied.json()).toMatchObject({ permission: 'receptionist:booking-review' });
+    }
+    const first = await app.inject({
+      method: 'POST', url: `/v1/receptionist/booking-requests/${requestId}/reconcile`, headers: roleAuth(0), payload,
+    });
+    const replay = await app.inject({
       method: 'POST', url: `/v1/receptionist/booking-requests/${requestId}/reconcile`, headers: adminAuth(t), payload,
     });
-    const [first, replay] = await Promise.all([reconcile(), reconcile()]);
     expect([first.statusCode, replay.statusCode]).toEqual([200, 200]);
-    expect([first.json(), replay.json()]).toEqual(expect.arrayContaining([
-      expect.objectContaining({ status: 'BOOKED', appointmentId: appointment.id, duplicate: false }),
-      expect.objectContaining({ status: 'BOOKED', appointmentId: appointment.id, duplicate: true }),
-    ]));
+    expect(first.json()).toMatchObject({
+      status: 'BOOKED', appointmentId: appointment.id, duplicate: false,
+      appointment: {
+        service: t.appointmentType,
+        startsAt: startsAt.toISOString(),
+        timezone: 'UTC', locationName: 'Main', locationAddress: 'X', providerName: 'Dr',
+      },
+    });
+    expect(first.json().appointment.service).not.toBe('Requested intake service');
+    expect(first.json().appointment.startsAt).not.toBe(requestedDateTime.toISOString());
+    expect(replay.json()).toMatchObject({ status: 'BOOKED', appointmentId: appointment.id, duplicate: true });
+    const listed = await app.inject({ method: 'GET', url: '/v1/receptionist/booking-requests', headers: roleAuth(0) });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json()).toContainEqual(expect.objectContaining({
+      id: requestId,
+      bookedAppointment: expect.objectContaining({
+        id: appointment.id, service: t.appointmentType, startsAt: startsAt.toISOString(),
+        branch: expect.objectContaining({ timezone: 'UTC', name: 'Main', location: 'X' }),
+      }),
+    }));
     expect(await db.appointmentRequest.findUniqueOrThrow({ where: { id: requestId } })).toMatchObject({
       status: 'BOOKED', bookedAppointmentId: appointment.id, patientId: t.patientId, branchId: t.branchId,
     });
@@ -573,6 +679,7 @@ describe('receptionist /fn booking — real availability + booking', () => {
     }, callId, '+15551115555');
     const requestId = (review.json() as { appointment_request_id: string }).appointment_request_id;
     const requestBefore = await db.appointmentRequest.findUniqueOrThrow({ where: { id: requestId } });
+    await db.appointmentRequest.update({ where: { id: requestId }, data: { patientId: t.patientId } });
     const startsAt = new Date(`${futureDate(11)}T15:00:00.000Z`);
     const appointment = await db.appointment.create({ data: {
       tenantId: t.id, branchId: t.branchId, patientId: t.patientId,

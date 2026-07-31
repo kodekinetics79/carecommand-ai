@@ -18,6 +18,7 @@ export type IngressTenantLookupKind =
   | 'pilot_share_hash'
   | 'stripe_provider_reference'
   | 'retell_call_id'
+  | 'retell_provider_intent'
   | 'retell_destination_phone'
   | 'campaign_provider_message';
 

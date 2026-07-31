@@ -280,7 +280,7 @@ export interface OutboundReconciliationEvidence {
   localCallLogId: string;
   providerCallId: string | null;
   targetId: string | null;
-  triggerSources: Array<'RECONCILIATION_REQUIRED' | 'RECONCILIATION_SIGNAL' | 'RECONCILIATION_TASK'>;
+  triggerSources: Array<'RECONCILIATION_REQUIRED' | 'RECONCILIATION_SIGNAL' | 'RECONCILIATION_TASK' | 'UNBOUND_PROVIDER_INTENT'>;
   signalIds: string[];
   signalStatuses: string[];
   reviewTaskIds: string[];
@@ -296,6 +296,14 @@ export function mergeReconciliationRefresh(
   refresh: { ok: true; rows: OutboundReconciliationEvidence[] } | { ok: false },
 ): OutboundReconciliationEvidence[] {
   return refresh.ok ? refresh.rows : current;
+}
+
+export function launchControlsBlocked(input: {
+  transportAmbiguous: boolean;
+  reconciliationVerified: boolean;
+  reconciliations: OutboundReconciliationEvidence[];
+}): boolean {
+  return input.transportAmbiguous || !input.reconciliationVerified || input.reconciliations.length > 0;
 }
 
 export interface OutboundTargetCandidate {
@@ -324,6 +332,13 @@ export interface BookingRequest {
   missingFields: string[];
   outcomeReason: string | null;
   bookedAppointmentId: string | null;
+  bookedAppointment: {
+    id: string;
+    service: string;
+    startsAt: string;
+    branch: { timezone: string; name: string; location: string };
+    providerProfile: { user: { displayName: string } } | null;
+  } | null;
   createdAt: string;
 }
 
@@ -366,7 +381,7 @@ export type LaunchBlockReason =
   | 'clinic_inactive_or_foreign' | 'branch_inactive_or_foreign' | 'branch_not_mapped_to_clinic'
   | 'agent_scope_mismatch' | 'direct_booking_authority_inactive_or_foreign'
   | 'quiet_hours_missing' | 'quiet_hours_incomplete' | 'quiet_hours_invalid'
-  | 'quiet_hours_equal' | 'quiet_hours_timezone_invalid';
+  | 'quiet_hours_equal' | 'quiet_hours_timezone_invalid' | 'client_attempt_not_claimable';
 
 type LaunchEvidence = {
   callId?: string;
@@ -388,6 +403,7 @@ export type LaunchCallResult =
   | ({ status: 'cancelled'; reason: 'outbound_stopped' | 'provider_intent_cancelled' } & LaunchEvidence)
   | ({ status: 'reconciliation_required'; reason?: string; error?: string } & LaunchEvidence)
   | ({ status: 'failed'; error: string } & LaunchEvidence)
+  | { status: 'transport_ambiguous'; clientAttemptToken: string }
   | { status: 'unknown_response'; receivedStatus?: string };
 
 const LAUNCH_RESULT_STATUSES = new Set([
@@ -410,8 +426,41 @@ const LAUNCH_BLOCK_REASONS = new Set<LaunchBlockReason>([
   'branch_inactive_or_foreign', 'branch_not_mapped_to_clinic', 'agent_scope_mismatch',
   'direct_booking_authority_inactive_or_foreign', 'quiet_hours_missing',
   'quiet_hours_incomplete', 'quiet_hours_invalid', 'quiet_hours_equal',
-  'quiet_hours_timezone_invalid',
+  'quiet_hours_timezone_invalid', 'client_attempt_not_claimable',
 ]);
+
+export const TRANSPORT_AMBIGUITY_STORAGE_UNAVAILABLE = 'storage-unavailable';
+
+export function transportAmbiguityStorageKey(campaignId: string): string {
+  return `carecommand:receptionist:transport-ambiguity:${campaignId}`;
+}
+
+export function readTransportAmbiguityToken(storage: Pick<Storage, 'getItem'>, key: string): string | null {
+  try {
+    return storage.getItem(key);
+  } catch {
+    // If durable browser state cannot be inspected, launch must remain blocked.
+    return TRANSPORT_AMBIGUITY_STORAGE_UNAVAILABLE;
+  }
+}
+
+export function writeTransportAmbiguityToken(storage: Pick<Storage, 'setItem'>, key: string, token: string): boolean {
+  try {
+    storage.setItem(key, token);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function clearTransportAmbiguityToken(storage: Pick<Storage, 'removeItem'>, key: string): boolean {
+  try {
+    storage.removeItem(key);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -482,6 +531,8 @@ export function presentLaunchResult(result: LaunchCallResult): LaunchPresentatio
       const degraded = [result.reviewRecorded === false ? 'review task' : null, result.signalRecorded === false ? 'operational signal' : null].filter(Boolean).join(' and ');
       return { kind: 'err', text: `Provider rejected the launch: ${launchWords(result.error)}. No successful call is claimed.${degraded ? ` The ${degraded} could not be recorded.` : ''}`, refresh: true };
     }
+    case 'transport_ambiguous':
+      return { kind: 'err', text: `The launch response was lost. ${OUTBOUND_RECONCILIATION_WARNING}. Refresh durable evidence and verify provider state before any further launch.`, refresh: true };
     case 'unknown_response':
       return { kind: 'err', text: `Unknown or malformed launch response (${result.receivedStatus || 'missing status'}). Do not retry; reconcile provider and local call evidence.`, refresh: true };
   }
@@ -535,6 +586,7 @@ export interface BookingReconciliationResult {
     startsAt: string;
     timezone: string;
     locationName: string;
+    locationAddress: string | null;
     providerName: string | null;
   };
 }
@@ -678,15 +730,26 @@ export const receptionistApi = {
   deleteTarget: (campaignId: string, id: string) =>
     apiRequest<void>(`${base}/outbound-campaigns/${campaignId}/targets/${id}`, { method: 'DELETE' }),
   launchCall: async (campaignId: string, body: { phone: string; firstName?: string; lastName?: string; email?: string; targetId?: string }) => {
+    const clientAttemptToken = crypto.randomUUID();
+    await apiRequest(`${base}/outbound-campaigns/${campaignId}/launch-attempts`, {
+      method: 'POST', body: JSON.stringify({ token: clientAttemptToken }),
+    });
     try {
-      const result = await apiRequest<unknown>(`${base}/outbound-campaigns/${campaignId}/call`, { method: 'POST', body: JSON.stringify(body) });
+      const result = await apiRequest<unknown>(`${base}/outbound-campaigns/${campaignId}/call`, {
+        method: 'POST', body: JSON.stringify({ ...body, clientAttemptToken }),
+      });
       return parseLaunchResult(result);
     } catch (error) {
       const decision = launchResultFromError(error);
       if (decision) return decision;
-      throw error;
+      // Submission may already have crossed the provider boundary even though
+      // the HTTP response was lost. Never surface that as an ordinary retry.
+      return { status: 'transport_ambiguous' as const, clientAttemptToken };
     }
   },
+  verifyClearLaunchAttempt: (campaignId: string, token: string) => apiRequest<{
+    cleared: boolean; proof: string; callLogId?: string; providerCallId?: string | null;
+  }>(`${base}/outbound-campaigns/${campaignId}/launch-attempts/${token}/verify-clear`, { method: 'POST' }),
   outboundControl: () => apiRequest<OutboundControlStatus>(`${base}/outbound-control`),
   stopOutbound: (reason: string) => apiRequest<OutboundStopResult>(`${base}/outbound-control`, {
     method: 'POST', body: JSON.stringify({ stopped: true, reason }),

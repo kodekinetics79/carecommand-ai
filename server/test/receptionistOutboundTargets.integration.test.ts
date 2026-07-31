@@ -645,6 +645,178 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
     expect(optOut.occurredAt.getTime()).toBeGreaterThanOrEqual(intent.occurredAt.getTime());
   }, 30_000);
 
+  it('recovers the provider-acceptance crash window from signed intent metadata and rejects cross-call replay', async () => {
+    const tenant = await makeTenant();
+    const campaignId = await createCampaign(tenant, { status: 'RUNNING' });
+    const target = await addPatientTarget(tenant, campaignId, 722);
+    const beforeBinding = deferred();
+    const releaseBinding = deferred();
+    setProviderBoundaryTestHookForTests(async stage => {
+      if (stage === 'before_provider_binding_lock') {
+        beforeBinding.resolve();
+        await releaseBinding.promise;
+      }
+    });
+    const providerCallId = `retell_recovered_${randomUUID()}`;
+    let providerMetadata: Record<string, unknown> | null = null;
+    const providerFetch = vi.fn<typeof fetch>(async (_url, init) => {
+      if (init?.method === 'POST' && typeof init.body === 'string' && init.body.includes('retell_llm_dynamic_variables')) {
+        providerMetadata = (JSON.parse(init.body) as { metadata: Record<string, unknown> }).metadata;
+        return new Response(JSON.stringify({
+          call_id: providerCallId,
+          agent_id: tenant.providerAgentId,
+          agent_version: 1,
+        }), { status: 201, headers: { 'content-type': 'application/json' } });
+      }
+      if (String(_url).includes('/v2/stop-call/')) return new Response(null, { status: 204 });
+      return new Response(null, { status: 404 });
+    });
+    vi.stubGlobal('fetch', providerFetch);
+
+    const launch = app.inject({
+      method: 'POST',
+      url: `/v1/receptionist/outbound-campaigns/${campaignId}/call`,
+      headers: auth(tenant),
+      payload: { targetId: target.id, phone: target.phone },
+    });
+    await beforeBinding.promise;
+    expect(providerMetadata).not.toBeNull();
+    const rawStarted = JSON.stringify({
+      event: 'call_started',
+      call: {
+        call_id: providerCallId,
+        agent_id: tenant.providerAgentId,
+        agent_version: 1,
+        direction: 'outbound',
+        to_number: target.phone,
+        metadata: providerMetadata,
+      },
+    });
+    const recovered = await app.inject({
+      method: 'POST',
+      url: '/v1/receptionist/webhooks/retell',
+      headers: {
+        'content-type': 'application/json',
+        'x-retell-signature': signRetell(rawStarted, env.RETELL_API_KEY!),
+      },
+      payload: rawStarted,
+    });
+    expect(recovered.statusCode, recovered.body).toBe(200);
+    const recoveredCall = await db.receptionistCallLog.findFirstOrThrow({
+      where: { tenantId: tenant.id, retellCallId: providerCallId },
+    });
+    expect(recoveredCall).toMatchObject({ outcome: 'IN_PROGRESS', targetId: target.id });
+
+    releaseBinding.resolve();
+    const launchResponse = await launch;
+    expect(launchResponse.statusCode, launchResponse.body).toBe(201);
+    expect(launchResponse.json()).toMatchObject({ status: 'launched', callId: providerCallId, callLogId: recoveredCall.id });
+
+    const replayCallId = `retell_replay_${randomUUID()}`;
+    const rawReplay = JSON.stringify({
+      event: 'call_started',
+      call: {
+        call_id: replayCallId,
+        agent_id: tenant.providerAgentId,
+        agent_version: 1,
+        direction: 'outbound',
+        to_number: target.phone,
+        metadata: providerMetadata,
+      },
+    });
+    const replay = await app.inject({
+      method: 'POST',
+      url: '/v1/receptionist/webhooks/retell',
+      headers: {
+        'content-type': 'application/json',
+        'x-retell-signature': signRetell(rawReplay, env.RETELL_API_KEY!),
+      },
+      payload: rawReplay,
+    });
+    expect(replay.statusCode, replay.body).toBe(202);
+    expect(replay.json()).toMatchObject({
+      reason: 'provider_intent_quarantined',
+      providerStopApplied: true,
+    });
+    expect(await db.receptionistCallLog.count({ where: { tenantId: tenant.id, retellCallId: replayCallId } })).toBe(0);
+    expect(await db.receptionistCallLog.findUniqueOrThrow({ where: { id: recoveredCall.id } })).toMatchObject({
+      retellCallId: providerCallId,
+      outcome: 'IN_PROGRESS',
+    });
+  }, 30_000);
+
+  it.each([
+    ['missing agent id', { agent_version: 1 }],
+    ['missing agent version', { agent_id: 'expected' }],
+  ])('quarantines crash recovery with %s instead of admitting an unattested deployment', async (_label, attestation) => {
+    const tenant = await makeTenant();
+    const campaignId = await createCampaign(tenant, { status: 'RUNNING' });
+    const target = await addPatientTarget(tenant, campaignId, 'agent_id' in attestation ? 724 : 723);
+    const beforeBinding = deferred();
+    const releaseBinding = deferred();
+    setProviderBoundaryTestHookForTests(async stage => {
+      if (stage === 'before_provider_binding_lock') {
+        beforeBinding.resolve();
+        await releaseBinding.promise;
+      }
+    });
+    const providerCallId = `retell_unattested_${randomUUID()}`;
+    let providerMetadata: Record<string, unknown> | null = null;
+    const providerFetch = vi.fn<typeof fetch>(async (url, init) => {
+      if (init?.method === 'POST' && typeof init.body === 'string' && init.body.includes('retell_llm_dynamic_variables')) {
+        providerMetadata = (JSON.parse(init.body) as { metadata: Record<string, unknown> }).metadata;
+        return new Response(JSON.stringify({
+          call_id: providerCallId,
+          agent_id: tenant.providerAgentId,
+          agent_version: 1,
+        }), { status: 201, headers: { 'content-type': 'application/json' } });
+      }
+      if (String(url).includes('/v2/stop-call/')) return new Response(null, { status: 204 });
+      return new Response(null, { status: 404 });
+    });
+    vi.stubGlobal('fetch', providerFetch);
+
+    const launch = app.inject({
+      method: 'POST',
+      url: `/v1/receptionist/outbound-campaigns/${campaignId}/call`,
+      headers: auth(tenant),
+      payload: { targetId: target.id, phone: target.phone },
+    });
+    await beforeBinding.promise;
+    const raw = JSON.stringify({
+      event: 'call_started',
+      call: {
+        call_id: providerCallId,
+        direction: 'outbound',
+        to_number: target.phone,
+        metadata: providerMetadata,
+        ...('agent_id' in attestation
+          ? { agent_id: tenant.providerAgentId }
+          : { agent_version: attestation.agent_version }),
+      },
+    });
+    const callback = await app.inject({
+      method: 'POST',
+      url: '/v1/receptionist/webhooks/retell',
+      headers: {
+        'content-type': 'application/json',
+        'x-retell-signature': signRetell(raw, env.RETELL_API_KEY!),
+      },
+      payload: raw,
+    });
+    expect(callback.statusCode, callback.body).toBe(202);
+    expect(callback.json()).toMatchObject({
+      reason: 'provider_intent_quarantined',
+      providerStopApplied: true,
+    });
+    expect(await db.receptionistCallLog.findFirstOrThrow({
+      where: { tenantId: tenant.id, retellCallId: providerCallId },
+    })).toMatchObject({ outcome: 'ESCALATED' });
+
+    releaseBinding.resolve();
+    await launch;
+  }, 30_000);
+
   it('launches explicit reactivation only with exact immutable grant evidence bound to provider intent', async () => {
     const tenant = await makeTenant();
     const campaignId = await createCampaign(tenant, {
@@ -1427,7 +1599,6 @@ describe('AI receptionist outbound authority and target integrity', () => {
       captureMethod: 'written',
       source: 'patient_written',
       jurisdiction: 'NY',
-      occurredAt: new Date(Date.now() + 1_000),
     } });
     const revoked = await getCandidates();
     expect(revoked.json()).toEqual([expect.objectContaining({
@@ -1543,6 +1714,92 @@ describe('AI receptionist outbound authority and target integrity', () => {
 });
 
 describe('AI receptionist outbound provider acceptance safety', () => {
+  it('fences a cleared client attempt before dispatch and rejects every late submission', async () => {
+    const tenant = await makeTenant();
+    const campaignId = await createCampaign(tenant, { status: 'RUNNING' });
+    const target = await addPatientTarget(tenant, campaignId, 680);
+    const token = randomUUID();
+    const registered = await app.inject({
+      method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaignId}/launch-attempts`,
+      headers: auth(tenant), payload: { token },
+    });
+    expect(registered.statusCode).toBe(200);
+    const cleared = await app.inject({
+      method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaignId}/launch-attempts/${token}/verify-clear`,
+      headers: auth(tenant),
+    });
+    expect(cleared.statusCode).toBe(200);
+    expect(cleared.json()).toMatchObject({ cleared: true, proof: 'non_submission_fenced' });
+
+    const providerFetch = vi.fn<typeof fetch>();
+    vi.stubGlobal('fetch', providerFetch);
+    const late = await app.inject({
+      method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaignId}/call`, headers: auth(tenant),
+      payload: { targetId: target.id, phone: target.phone, clientAttemptToken: token },
+    });
+    expect(late.statusCode).toBe(409);
+    expect(late.json()).toMatchObject({ status: 'blocked', reason: 'client_attempt_not_claimable' });
+    expect(providerFetch).not.toHaveBeenCalled();
+    expect(await db.receptionistCallLog.count({ where: { tenantId: tenant.id, outboundCampaignId: campaignId } })).toBe(0);
+    expect(await db.receptionistCallTarget.findUniqueOrThrow({ where: { id: target.id } })).toMatchObject({ status: 'PENDING', attempts: 0 });
+  });
+
+  it('keeps verify-clear blocked when dispatch claims the attempt first, then clears a definitive rejection', async () => {
+    const tenant = await makeTenant();
+    const campaignId = await createCampaign(tenant, { status: 'RUNNING' });
+    const target = await addPatientTarget(tenant, campaignId, 681);
+    const token = randomUUID();
+    expect((await app.inject({
+      method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaignId}/launch-attempts`,
+      headers: auth(tenant), payload: { token },
+    })).statusCode).toBe(200);
+
+    const intentCommitted = deferred();
+    const release = deferred();
+    setProviderBoundaryTestHookForTests(async stage => {
+      if (stage === 'provider_intent_committed') {
+        intentCommitted.resolve();
+        await release.promise;
+      }
+    });
+    const providerFetch = vi.fn<typeof fetch>(async () => new Response(
+      JSON.stringify({ message: 'definitive validation rejection' }),
+      { status: 422, headers: { 'content-type': 'application/json' } },
+    ));
+    vi.stubGlobal('fetch', providerFetch);
+    const call = app.inject({
+      method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaignId}/call`, headers: auth(tenant),
+      payload: { targetId: target.id, phone: target.phone, clientAttemptToken: token },
+    });
+    await intentCommitted.promise;
+    const inFlight = await app.inject({
+      method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaignId}/launch-attempts/${token}/verify-clear`,
+      headers: auth(tenant),
+    });
+    expect(inFlight.statusCode).toBe(200);
+    expect(inFlight.json()).toMatchObject({ cleared: false, proof: 'call_not_terminal', callLogId: expect.any(String) });
+
+    release.resolve();
+    const response = await call;
+    expect(response.statusCode).toBe(502);
+    expect(response.json()).toMatchObject({ status: 'failed', error: 'retell_error_422' });
+    expect(providerFetch).toHaveBeenCalledTimes(1);
+    const afterDefinitiveRejection = await app.inject({
+      method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaignId}/launch-attempts/${token}/verify-clear`,
+      headers: auth(tenant),
+    });
+    expect(afterDefinitiveRejection.statusCode).toBe(200);
+    expect(afterDefinitiveRejection.json()).toMatchObject({
+      cleared: true, proof: 'durable_terminal_reconciliation', callLogId: expect.any(String),
+    });
+    const reconciliation = await app.inject({
+      method: 'GET', url: `/v1/receptionist/outbound-campaigns/${campaignId}/reconciliations`,
+      headers: auth(tenant),
+    });
+    expect(reconciliation.statusCode).toBe(200);
+    expect(reconciliation.json()).toEqual([]);
+  }, 30_000);
+
   it.each([408, 409, 425, 429, 500, 503])(
     'treats provider HTTP %i as ambiguous, requires reconciliation, and makes the target non-dialable',
     async statusCode => {
