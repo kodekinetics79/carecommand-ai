@@ -2,11 +2,17 @@ import { db } from '../db';
 import { createHash, randomUUID } from 'node:crypto';
 import type { Prisma } from '../../generated/prisma/client';
 import { sendMessage } from '../commsProvider';
-import { recordWorkflowEvent } from '../intelligence';
 import { toE164, isValidE164 } from '../campaigns';
-import { getOpenSlots, isSlotOpen, parseSlot, speakTime, SLOT_MIN } from './availability';
-import { findSlotConflict, getSchedulingPolicy, isDoubleBookConflictError, resolveSchedulingService } from '../scheduling';
+import { getOpenSlots, parseSlot, speakTime, SLOT_MIN } from './availability';
+import { findSlotConflict, getSchedulingPolicy, isDoubleBookConflictError, resolveSchedulingService, unmetPreVisitRequirements } from '../scheduling';
 import { evaluateDepositForAppointment } from '../deposits';
+import {
+  bookAppointmentToolFingerprint,
+  fingerprintJson,
+  MAX_INTAKE_FIELDS,
+  normalizeBookAppointmentToolContract,
+  type IntakeContractSnapshot,
+} from '../../modules/receptionist/intakeContract';
 import {
   disclosureEvidenceHash,
   recordRecordingConsent,
@@ -25,16 +31,36 @@ import { restrictCallToBasicAttributes } from '../retell';
 // call number (never an arbitrary args phone). Bookings run inside a slot-scoped
 // advisory-locked transaction so two concurrent callers can never take one slot.
 
-export interface ToolContext { tenantId: string; callId: string | null; callerPhone?: string | null }
+export interface TrustedBookingContext {
+  callLogId: string;
+  campaignId: string;
+  clinicId: string;
+  locationId: string | null;
+  branchId: string | null;
+  branchTimezone: string | null;
+  observedPhone: string | null;
+  providerAgentId: string;
+  providerAgentVersion: number;
+  intakeSnapshot: IntakeContractSnapshot;
+}
+
+export interface ToolContext {
+  tenantId: string;
+  callId: string | null;
+  callerPhone?: string | null;
+  trustedBooking?: TrustedBookingContext;
+}
 
 // Bounded caps for caller-supplied free text.
 const MAX_NAME = 80;
-const MAX_SERVICE = 120;
 const MAX_SHORT = 40;
 const MAX_MESSAGE = 500;
 const MAX_IDENTITY_ATTEMPTS = 3;
 const IDENTITY_LOCK_MINUTES = 15;
 const CHANGE_CONFIRMATION_TTL_MS = 5 * 60_000;
+const RECEPTIONIST_CALL_LEASE_MS = 4 * 60 * 60_000;
+const MAX_CANONICAL_ANSWER_BYTES = 16 * 1024;
+const MAX_BOOKING_SCHEMA_PROPERTIES = 57;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const VOICE_MUTABLE_STATUSES = ['CONFIRMED', 'RISKY', 'WAITLIST'] as const;
 
@@ -89,8 +115,12 @@ async function resolveSoleProvider(tenantId: string, branchId: string): Promise<
   return providers.length === 1 ? providers[0].id : null;
 }
 
-async function patientsByCanonicalPhone(tenantId: string, phone: string): Promise<Array<{ id: string; dateOfBirth: Date | null }>> {
-  return db.$queryRaw<Array<{ id: string; dateOfBirth: Date | null }>>`
+async function patientsByCanonicalPhone(
+  tenantId: string,
+  phone: string,
+  client: typeof db | Prisma.TransactionClient = db,
+): Promise<Array<{ id: string; dateOfBirth: Date | null }>> {
+  return client.$queryRaw<Array<{ id: string; dateOfBirth: Date | null }>>`
     SELECT id, "dateOfBirth"
     FROM "Patient"
     WHERE "tenantId" = ${tenantId}::uuid
@@ -111,31 +141,127 @@ function speakList(times: string[]): string {
   return `${labels.slice(0, -1).join(', ')}, or ${labels.slice(-1)}`;
 }
 
-// Persist an appointment request that a human must review (never books). Used
-// when the live agent collected something usable but the booking cannot be made
-// safely (unparseable date/time, unknown service) — degrade, never crash.
-async function routeToReview(
-  ctx: ToolContext,
-  branchId: string,
-  opts: { firstName: string | null; lastName: string | null; phone: string | null; service: string | null; args: Prisma.InputJsonValue; missingFields: string[]; reason: string; speak: string },
-) {
-  const req = await db.$transaction(async tx => {
-    const req = await tx.appointmentRequest.create({
-      data: {
-        tenantId: ctx.tenantId, branchId,
-        requestedService: opts.service ?? null,
-        collectedName: [opts.firstName, opts.lastName].filter(Boolean).join(' ') || null,
-        collectedPhone: opts.phone ?? null,
-        rawCollectedFields: opts.args, source: 'ai_receptionist', status: 'MISSING_INFO',
-        missingFields: opts.missingFields, outcomeReason: opts.reason,
-      },
-      select: { id: true },
-    });
-    await auditLive(ctx.tenantId, 'receptionist.appointmentRequest.needsReview', req.id, { reason: opts.reason, via: 'live_call' }, tx);
-    return req;
-  });
-  await recordWorkflowEvent(ctx.tenantId, { eventType: 'receptionist.appointmentRequest.created', entityType: 'appointmentRequest', entityId: req.id, sourceModule: 'receptionist', payload: { status: 'MISSING_INFO', live: true } }).catch(() => {});
-  return { booked: false, needs_review: true, appointment_request_id: req.id, message: opts.speak };
+type ContractValidation =
+  | { ok: true; answers: Prisma.InputJsonObject }
+  | { ok: false; answers: Prisma.InputJsonObject | null; issues: string[] };
+
+function jsonScalarEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function stringFormatValid(format: unknown, value: string): boolean {
+  if (format === undefined) return true;
+  if (format === 'email') return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+  if (format === 'date') {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    if (!match) return false;
+    const probe = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+    return probe.toISOString().slice(0, 10) === value;
+  }
+  if (format === 'time') return /^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?$/.test(value);
+  if (format === 'date-time') return !Number.isNaN(new Date(value).getTime());
+  return false;
+}
+
+const COMPILER_OWNED_BOOKING_PATTERNS = new Set([
+  '^\\+[1-9]\\d{7,14}$',
+  '^\\d{4}-\\d{2}-\\d{2}$',
+  '^(?:[01]\\d|2[0-3]):[0-5]\\d$',
+]);
+
+function validateContractProperty(key: string, value: unknown, schemaValue: unknown): string[] {
+  if (!schemaValue || typeof schemaValue !== 'object' || Array.isArray(schemaValue)) return [`${key}:invalid_schema`];
+  const schema = schemaValue as Record<string, unknown>;
+  const issues: string[] = [];
+  const allowedKeywords = new Set(['type', 'description', 'minLength', 'maxLength', 'pattern', 'readOnly', 'format', 'enum', 'const', 'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum']);
+  if (Object.keys(schema).some(keyword => !allowedKeywords.has(keyword))) issues.push(`${key}:unsupported_schema_keyword`);
+  const type = schema.type;
+  const typeMatches = type === 'string' ? typeof value === 'string'
+    : type === 'boolean' ? typeof value === 'boolean'
+      : type === 'integer' ? typeof value === 'number' && Number.isSafeInteger(value)
+        : type === 'number' ? typeof value === 'number' && Number.isFinite(value)
+          : type === 'null' ? value === null
+            : false;
+  if (!typeMatches) return [`${key}:wrong_type`];
+  if ('const' in schema && !jsonScalarEqual(value, schema.const)) issues.push(`${key}:const`);
+  if (Array.isArray(schema.enum) && !schema.enum.some(item => jsonScalarEqual(item, value))) issues.push(`${key}:enum`);
+  if (typeof value === 'string') {
+    const length = [...value].length;
+    if (typeof schema.minLength === 'number' && length < schema.minLength) issues.push(`${key}:minLength`);
+    if (typeof schema.maxLength === 'number' && length > schema.maxLength) issues.push(`${key}:maxLength`);
+    if (schema.pattern !== undefined) {
+      if (typeof schema.pattern !== 'string' || !COMPILER_OWNED_BOOKING_PATTERNS.has(schema.pattern)) issues.push(`${key}:invalid_pattern`);
+      else {
+        try { if (!new RegExp(schema.pattern, 'u').test(value)) issues.push(`${key}:pattern`); }
+        catch { issues.push(`${key}:invalid_pattern`); }
+      }
+    }
+    if (!stringFormatValid(schema.format, value)) issues.push(`${key}:format`);
+  }
+  if (typeof value === 'number') {
+    if (typeof schema.minimum === 'number' && value < schema.minimum) issues.push(`${key}:minimum`);
+    if (typeof schema.maximum === 'number' && value > schema.maximum) issues.push(`${key}:maximum`);
+    if (typeof schema.exclusiveMinimum === 'number' && value <= schema.exclusiveMinimum) issues.push(`${key}:exclusiveMinimum`);
+    if (typeof schema.exclusiveMaximum === 'number' && value >= schema.exclusiveMaximum) issues.push(`${key}:exclusiveMaximum`);
+  }
+  return issues;
+}
+
+function boundedCanonicalObject(value: Record<string, unknown>): Prisma.InputJsonObject | null {
+  const entries = Object.entries(value).sort(([left], [right]) => left.localeCompare(right));
+  const canonical = Object.fromEntries(entries) as Prisma.InputJsonObject;
+  try {
+    return Buffer.byteLength(JSON.stringify(canonical), 'utf8') <= MAX_CANONICAL_ANSWER_BYTES ? canonical : null;
+  } catch {
+    return null;
+  }
+}
+
+function validateAttestedBookingArgs(snapshot: IntakeContractSnapshot, args: Record<string, unknown>): ContractValidation {
+  const issues: string[] = [];
+  if (!Array.isArray(snapshot.fields) || snapshot.fields.length > MAX_INTAKE_FIELDS) issues.push('contract:configured_field_limit');
+  const normalizedTool = normalizeBookAppointmentToolContract(snapshot.bookAppointmentToolContract);
+  if (!normalizedTool || bookAppointmentToolFingerprint(normalizedTool) !== snapshot.bookAppointmentToolFingerprint) {
+    issues.push('contract:fingerprint');
+  }
+  const parameters = normalizedTool?.parameters as Record<string, unknown> | undefined;
+  const properties = parameters?.properties && typeof parameters.properties === 'object' && !Array.isArray(parameters.properties)
+    ? parameters.properties as Record<string, unknown>
+    : null;
+  if (!properties || parameters?.type !== 'object' || parameters.additionalProperties !== false) issues.push('contract:root_schema');
+  if (parameters && Object.keys(parameters).some(keyword => !['type', 'additionalProperties', 'properties', 'required'].includes(keyword))) issues.push('contract:unsupported_root_keyword');
+  if (properties && Object.keys(properties).length > MAX_BOOKING_SCHEMA_PROPERTIES) issues.push('contract:property_limit');
+  const required = Array.isArray(parameters?.required) && parameters.required.every(item => typeof item === 'string')
+    ? parameters.required as string[]
+    : null;
+  if (!required) issues.push('contract:required_schema');
+
+  const recognizedValid: Record<string, unknown> = {};
+  if (properties && required) {
+    const allowed = new Set(Object.keys(properties));
+    for (const key of Object.keys(args)) if (!allowed.has(key)) issues.push(`${key}:unknown`);
+    for (const key of required) if (!(key in args)) issues.push(`${key}:missing`);
+    for (const [key, value] of Object.entries(args)) {
+      if (allowed.has(key)) {
+        const propertyIssues = validateContractProperty(key, value, properties[key]);
+        issues.push(...propertyIssues);
+        if (!propertyIssues.length && (value === null || ['string', 'number', 'boolean'].includes(typeof value))) recognizedValid[key] = value;
+      }
+    }
+    if (!required.includes('booking_confirmed') || args.booking_confirmed !== true) issues.push('booking_confirmed:required');
+    for (const field of snapshot.fields ?? []) {
+      if (field.fieldType !== 'PHONE' && !allowed.has(field.key)) issues.push(`${field.key}:missing_schema`);
+      if (field.confirmationRequired) {
+        const confirmationKey = `${field.key}_confirmed`;
+        if (!allowed.has(confirmationKey) || !required.includes(confirmationKey) || args[confirmationKey] !== true) {
+          issues.push(`${confirmationKey}:required`);
+        }
+      }
+    }
+  }
+  const answers = boundedCanonicalObject(recognizedValid);
+  if (!answers) issues.push('answers:maximum_bytes');
+  return issues.length ? { ok: false, answers, issues: [...new Set(issues)].sort() } : { ok: true, answers: answers! };
 }
 
 type SafetyWorkflow = 'human_handoff' | 'message' | 'emergency';
@@ -555,18 +681,38 @@ export async function recordDoNotCall(ctx: ToolContext, args: Record<string, unk
 
 /** check_availability(appointment_date) → real open slots for the branch. */
 export async function checkAvailability(ctx: ToolContext, args: Record<string, unknown>) {
-  const branch = await resolveBranch(ctx.tenantId);
+  const trusted = ctx.trustedBooking;
   const date = str(args.appointment_date) ?? '';
-  if (!branch) return { available: false, needs_review: true, slots: [], message: "I need a team member to confirm which clinic location you want before I offer a time." };
-  const providerProfileId = await resolveSoleProvider(ctx.tenantId, branch.id);
-  const requestedService = sanitizeText(args.service, MAX_SERVICE) ?? 'Consultation';
+  if (!trusted?.locationId || !trusted.branchId || !trusted.branchTimezone) {
+    return { available: false, needs_review: true, slots: [], message: "I need a team member to confirm which attested clinic location you want before I offer a time." };
+  }
+  const authority = await db.receptionistLocation.findFirst({
+    where: {
+      id: trusted.locationId, tenantId: ctx.tenantId, clinicId: trusted.clinicId,
+      branchId: trusted.branchId, active: true, branch: { active: true, timezone: trusted.branchTimezone },
+      clinic: { campaigns: { some: { id: trusted.campaignId, status: 'ACTIVE' } } },
+    },
+    select: { id: true },
+  });
+  if (!authority || !trusted.intakeSnapshot.eligibleLocationIds.includes(trusted.locationId)) {
+    return { available: false, needs_review: true, slots: [], message: "I cannot verify this location against the active booking campaign." };
+  }
+  const providerProfileId = await resolveSoleProvider(ctx.tenantId, trusted.branchId);
+  const requestedService = trusted.intakeSnapshot.appointmentType;
   const service = await resolveSchedulingService({ tenantId: ctx.tenantId, service: requestedService, fallbackDurationMin: SLOT_MIN });
   if (!providerProfileId || !service) {
-    await auditLive(ctx.tenantId, 'receptionist.availability.needsReview', branch.id, { reason: !providerProfileId ? 'provider_ambiguous' : 'service_ambiguous' });
+    await auditLive(ctx.tenantId, 'receptionist.availability.needsReview', trusted.branchId, { reason: !providerProfileId ? 'provider_ambiguous' : 'service_ambiguous' });
     return { available: false, needs_review: true, slots: [], message: "I need a team member to confirm the provider or service before I offer a time." };
   }
-  const slots = await getOpenSlots(ctx.tenantId, branch.id, date, service.durationMin, 6, providerProfileId);
-  await auditLive(ctx.tenantId, 'receptionist.availability.checked', branch.id, { date, count: slots.length });
+  const policy = await getSchedulingPolicy(ctx.tenantId);
+  if (!policy.selfBookEnabled) return { available: false, needs_review: true, slots: [], message: 'This clinic requires staff review before offering self-booking times.' };
+  const slots = (await getOpenSlots(ctx.tenantId, trusted.branchId, date, service.durationMin, 6, providerProfileId))
+    .filter(slot => {
+      const startsAt = parseSlot(date, slot.time, trusted.branchTimezone!);
+      return startsAt && startsAt.getTime() >= Date.now() + policy.minNoticeHours * 3_600_000
+        && startsAt.getTime() <= Date.now() + policy.maxHorizonDays * 86_400_000;
+    });
+  await auditLive(ctx.tenantId, 'receptionist.availability.checked', trusted.branchId, { date, count: slots.length, campaignId: trusted.campaignId });
   if (slots.length === 0) return { available: false, slots: [], message: `I don't see any openings on ${date}. Would a different day work?` };
   return {
     available: true,
@@ -575,201 +721,303 @@ export async function checkAvailability(ctx: ToolContext, args: Record<string, u
   };
 }
 
-/** book_appointment(...) → verify slot, find/create patient, book, text confirmation. */
-export async function bookAppointment(ctx: ToolContext, args: Record<string, unknown>) {
-  const branch = await resolveBranch(ctx.tenantId);
-  if (!branch) return { booked: false, message: "I'm sorry, I can't book right now — let me have a team member follow up." };
+type BookingTransactionResult =
+  | { kind: 'booked'; appointmentId: string; requestId: string; patientId: string; firstName: string; email: string | null; phone: string | null; service: string; startsAt: Date; timezone: string; smsEnabled: boolean; emailEnabled: boolean; duplicate: boolean }
+  | { kind: 'review'; requestId: string; duplicate: boolean; message: string }
+  | { kind: 'rejected'; message: string };
 
-  const date = str(args.appointment_date) ?? '';
-  const time = str(args.appointment_time) ?? '';
-  const startsAt = parseSlot(date, time, branch.timezone);
+/** book_appointment(...) → exact attestation validation + one call-scoped outcome. */
+export async function bookAppointment(ctx: ToolContext, args: Record<string, unknown>) {
+  const trusted = ctx.trustedBooking;
+  if (!trusted || !ctx.callId || trusted.callLogId.length === 0) {
+    return { booked: false, needs_human: true, message: 'I cannot bind this request to the exact active call and booking configuration. Please contact the front desk.' };
+  }
+  const validation = validateAttestedBookingArgs(trusted.intakeSnapshot, args);
   const firstName = sanitizeText(args.first_name, MAX_NAME);
   const lastName = sanitizeText(args.last_name, MAX_NAME);
-  const service = sanitizeText(args.service, MAX_SERVICE) ?? 'Consultation';
-  // Bind everything to the VERIFIED call number when we have it; only fall back
-  // to a caller-provided phone. An arbitrary args.phone can never override the
-  // real caller — this is what stops attacker-directed confirmation SMS.
-  const phone = validPhone(ctx.callerPhone) ?? validPhone(args.phone);
+  const email = typeof args.email === 'string' ? args.email.trim() : null;
+  const service = trusted.intakeSnapshot.appointmentType;
+  const phone = validPhone(trusted.observedPhone);
+  const persistedAnswers = validation.answers
+    ? boundedCanonicalObject({ ...validation.answers, observed_phone: phone })
+    : null;
+  const answerIssues = persistedAnswers ? [] : ['answers:maximum_bytes_with_provenance'];
+  const rawAnswers: Prisma.InputJsonValue = persistedAnswers
+    ?? { observed_phone: phone, unpersisted: true, reason: 'invalid_or_oversized_contract_answers' };
+  const date = typeof args.appointment_date === 'string' ? args.appointment_date : '';
+  const time = typeof args.appointment_time === 'string' ? args.appointment_time : '';
+  const startsAt = trusted.branchTimezone ? parseSlot(date, time, trusted.branchTimezone) : null;
+  const idempotencyKey = `${ctx.tenantId}:${trusted.callLogId}`;
 
-  // A bounded, sanitized snapshot of what we collected (persisted, never raw).
-  const cleanArgs: Prisma.InputJsonValue = {
-    appointment_date: date, appointment_time: time,
-    first_name: firstName, last_name: lastName, service, phone,
-  };
-
-  // Linking an appointment to an existing chart is a protected patient-specific
-  // action. Require server-side verification for this exact provider call;
-  // proxy/minor and ambiguous-record cases always go to a human workflow.
-  const existingPatients = phone ? await patientsByCanonicalPhone(ctx.tenantId, phone) : [];
-  let verifiedExistingPatientId: string | null = null;
-  if (existingPatients.length > 0) {
-    const callId = sanitizeText(ctx.callId, 128);
-    const proof = callId
-      ? await db.idempotencyKey.findUnique({ where: { scope_key: { scope: 'receptionist.voice-identity', key: `${ctx.tenantId}:${callId}` } }, select: { resultId: true } })
+  const execute = async (forcedReviewReason?: string): Promise<BookingTransactionResult> => db.$transaction(async tx => {
+    // Lock ordering is an invariant: the source call always precedes any slot.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-call-lifecycle:${ctx.tenantId}:${ctx.callId}`})::bigint)`;
+    const call = await tx.receptionistCallLog.findFirst({
+      where: { id: trusted.callLogId, tenantId: ctx.tenantId },
+      select: {
+        id: true, retellCallId: true, campaignId: true, clinicId: true, callerPhone: true,
+        outcome: true, recordingConsentStatus: true, startedAt: true, createdAt: true, endedAt: true,
+      },
+    });
+    const campaign = await tx.receptionistCampaign.findFirst({
+      where: { id: trusted.campaignId, tenantId: ctx.tenantId, clinicId: trusted.clinicId, status: 'ACTIVE' },
+      select: {
+        id: true, clinicId: true, appointmentType: true, smsConfirmation: true, emailConfirmation: true,
+        intakeSchemaRevision: true, intakeSchemaSnapshot: true, intakeSchemaFingerprint: true,
+        intakeSchemaAttestedRevision: true, intakeSchemaProviderAgentId: true, intakeSchemaProviderVersion: true,
+      },
+    });
+    const dbSnapshot = campaign?.intakeSchemaSnapshot && typeof campaign.intakeSchemaSnapshot === 'object' && !Array.isArray(campaign.intakeSchemaSnapshot)
+      ? campaign.intakeSchemaSnapshot as unknown as IntakeContractSnapshot
       : null;
-    if (!proof?.resultId || !existingPatients.some(patient => patient.id === proof.resultId)) {
-      return routeToReview(ctx, branch.id, {
-        firstName, lastName, phone, service, args: cleanArgs, missingFields: ['identityVerification'],
-        reason: existingPatients.length > 1 ? 'Patient identity is ambiguous' : 'Existing patient identity was not verified for this call',
-        speak: 'Before I make a change linked to an existing patient record, I need to verify identity or have the front desk help.',
-      });
+    const observedPhone = validPhone(call?.callerPhone);
+    const activeSince = call?.startedAt ?? call?.createdAt;
+    const authorityValid = Boolean(
+      call && campaign && dbSnapshot
+      && call.retellCallId === ctx.callId
+      && call.campaignId === trusted.campaignId
+      && call.clinicId === trusted.clinicId
+      && call.recordingConsentStatus === 'GRANTED'
+      && !call.endedAt
+      && activeSince && activeSince.getTime() >= Date.now() - RECEPTIONIST_CALL_LEASE_MS
+      && observedPhone === phone
+      && campaign.appointmentType === trusted.intakeSnapshot.appointmentType
+      && campaign.intakeSchemaAttestedRevision === campaign.intakeSchemaRevision
+      && campaign.intakeSchemaFingerprint === fingerprintJson(dbSnapshot)
+      && fingerprintJson(dbSnapshot) === fingerprintJson(trusted.intakeSnapshot)
+      && campaign.intakeSchemaProviderAgentId === trusted.providerAgentId
+      && campaign.intakeSchemaProviderVersion === trusted.providerAgentVersion,
+    );
+    if (!authorityValid || !call || !campaign || !dbSnapshot) {
+      return { kind: 'rejected', message: 'I cannot revalidate the active call and booking configuration. Please contact the front desk.' };
     }
-    verifiedExistingPatientId = proof.resultId;
-  }
 
-  if (!startsAt) {
-    // Malformed date/time → never crash, never book nonsense. Route to review
-    // when we have something to follow up on (a name or a phone).
-    if (phone || (firstName && lastName)) {
-      return routeToReview(ctx, branch.id, {
-        firstName, lastName, phone, service, args: cleanArgs, missingFields: ['preferredDateTime'],
-        reason: 'Could not parse a valid date/time from the live call',
-        speak: "I didn't quite catch the date and time — let me have a team member follow up to lock that in.",
-      });
-    }
-    return { booked: false, message: "I didn't quite catch the date and time — could you say that again?" };
-  }
-  if (!firstName || !lastName) return { booked: false, message: 'I just need your first and last name to confirm the booking.' };
-
-  const providerProfileId = await resolveSoleProvider(ctx.tenantId, branch.id);
-  const schedulingService = await resolveSchedulingService({ tenantId: ctx.tenantId, service, fallbackDurationMin: SLOT_MIN });
-  if (!providerProfileId || !schedulingService) {
-    return routeToReview(ctx, branch.id, {
-      firstName, lastName, phone, service, args: cleanArgs, missingFields: [!providerProfileId ? 'preferredProvider' : 'preferredService'],
-      reason: !providerProfileId ? 'Provider selection is ambiguous' : `Requested service is not in the clinic catalog: ${service}`,
-      speak: `Let me have someone confirm the provider and availability for ${service} and call you right back.`,
+    const existingRequest = await tx.appointmentRequest.findFirst({
+      where: { tenantId: ctx.tenantId, callLogId: trusted.callLogId },
     });
-  }
+    const existingAppointment = await tx.appointment.findFirst({
+      where: { tenantId: ctx.tenantId, receptionistCallLogId: trusted.callLogId, deletedAt: null },
+      select: { id: true, patientId: true, service: true, startsAt: true, branch: { select: { timezone: true } }, patient: { select: { firstName: true, email: true, phone: true } } },
+    });
+    if (existingAppointment) {
+      if (!existingRequest?.bookedAppointmentId || existingRequest.bookedAppointmentId !== existingAppointment.id || existingRequest.status !== 'BOOKED') {
+        return { kind: 'rejected', message: 'The existing booking evidence is inconsistent. A staff member must review it.' };
+      }
+      return {
+        kind: 'booked', appointmentId: existingAppointment.id, requestId: existingRequest.id,
+        patientId: existingAppointment.patientId, firstName: existingAppointment.patient.firstName,
+        email: existingAppointment.patient.email, phone: validPhone(existingAppointment.patient.phone),
+        service: existingAppointment.service, startsAt: existingAppointment.startsAt,
+        timezone: existingAppointment.branch.timezone, smsEnabled: campaign.smsConfirmation,
+        emailEnabled: campaign.emailConfirmation, duplicate: true,
+      };
+    }
+    if (call.outcome === 'BOOKED') return { kind: 'rejected', message: 'The call is marked booked without canonical appointment evidence. A staff member must review it.' };
+    if (call.outcome !== 'IN_PROGRESS') {
+      return { kind: 'rejected', message: 'This call already has a different terminal outcome. A staff member must review it.' };
+    }
 
-  // Same-call idempotency — the same call booking the same slot only books once.
-  // The claim is written in the SAME transaction as the canonical Appointment
-  // and stores its id. A replay may only report success after re-reading that
-  // Appointment; a stale/failed claim can never produce a false confirmation.
-  const idemKey = `${ctx.callId ?? 'nocall'}:${branch.id}:${startsAt.toISOString()}`;
-
-  // Slot-check + create inside ONE transaction, serialized by a slot-scoped
-  // advisory lock so two concurrent callers can never both take the same slot.
-  // The in-transaction isSlotOpen reads the shared Appointment table (branch +
-  // BLOCKING status), so an appointment booked by ANY path (scheduling, portal,
-  // staff) blocks the live agent from the same slot too.
-  // Unambiguous single-provider branch → link the provider so this booking joins
-  // the cross-path exclusion-constraint guard (defense in depth over the
-  // branch-level advisory lock below).
-  const lockKey = `receptionist-book:${ctx.tenantId}:${branch.id}:${startsAt.toISOString()}`;
-  let booked: { apptId: string; patientId: string; reqId: string; duplicate?: boolean } | null;
-  try {
-    booked = await db.$transaction(async tx => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey})::bigint)`;
-
-      const priorClaim = await tx.idempotencyKey.findUnique({
-        where: { scope_key: { scope: 'receptionist.live-booking', key: idemKey } },
-        select: { id: true, resultId: true },
+    let locationValid = false;
+    if (trusted.locationId && trusted.branchId && trusted.branchTimezone) {
+      const eligible = trusted.intakeSnapshot.eligibleLocationIds;
+      const location = await tx.receptionistLocation.findFirst({
+        where: {
+          id: trusted.locationId, tenantId: ctx.tenantId, clinicId: trusted.clinicId,
+          branchId: trusted.branchId, active: true, branch: { active: true, timezone: trusted.branchTimezone },
+        },
+        select: { id: true },
       });
-      if (priorClaim?.resultId) {
-        const priorAppointment = await tx.appointment.findFirst({
-          where: {
-            id: priorClaim.resultId,
-            tenantId: ctx.tenantId,
-            branchId: branch.id,
-            deletedAt: null,
-            status: { in: ['CONFIRMED', 'RISKY', 'ARRIVED', 'COMPLETED', 'WAITLIST'] },
+      locationValid = Boolean(location && (!eligible.length || eligible.includes(trusted.locationId)));
+    }
+
+    const review = async (reason: string, missingFields: string[], message: string): Promise<BookingTransactionResult> => {
+      const sameReview = existingRequest
+        && existingRequest.status !== 'BOOKED'
+        && existingRequest.outcomeReason === reason
+        && fingerprintJson(existingRequest.rawCollectedFields) === fingerprintJson(rawAnswers);
+      if (sameReview) return { kind: 'review', requestId: existingRequest.id, duplicate: true, message };
+      if (existingRequest?.status === 'REJECTED') return { kind: 'review', requestId: existingRequest.id, duplicate: true, message: 'The front desk has already reviewed this request. Please contact them for assistance.' };
+      const request = existingRequest
+        ? await tx.appointmentRequest.update({
+          where: { id: existingRequest.id },
+          data: {
+            branchId: trusted.branchId, campaignId: trusted.campaignId, requestedService: service,
+            collectedName: [firstName, lastName].filter(Boolean).join(' ') || null,
+            collectedPhone: phone, collectedEmail: email, rawCollectedFields: rawAnswers,
+            requestedDateTime: startsAt, status: 'MISSING_INFO', missingFields, outcomeReason: reason,
           },
-          select: { id: true, patientId: true },
+          select: { id: true },
+        })
+        : await tx.appointmentRequest.create({
+          data: {
+            tenantId: ctx.tenantId, branchId: trusted.branchId, campaignId: trusted.campaignId,
+            callLogId: trusted.callLogId, requestedService: service,
+            collectedName: [firstName, lastName].filter(Boolean).join(' ') || null,
+            collectedPhone: phone, collectedEmail: email, rawCollectedFields: rawAnswers,
+            requestedDateTime: startsAt, source: 'ai_receptionist', status: 'MISSING_INFO',
+            missingFields, outcomeReason: reason,
+          },
+          select: { id: true },
         });
-        if (priorAppointment) {
-          const priorRequest = await tx.appointmentRequest.findFirst({
-            where: { tenantId: ctx.tenantId, bookedAppointmentId: priorAppointment.id },
-            select: { id: true },
-          });
-          return {
-            apptId: priorAppointment.id,
-            patientId: priorAppointment.patientId,
-            reqId: priorRequest?.id ?? '',
-            duplicate: true,
-          };
-        }
-      }
-      // Clean up a legacy or rolled-forward claim that has no live canonical
-      // Appointment. This is safe under the slot lock and lets a real retry run.
-      if (priorClaim) await tx.idempotencyKey.delete({ where: { id: priorClaim.id } });
+      await tx.idempotencyKey.upsert({
+        where: { scope_key: { scope: 'receptionist.live-booking', key: idempotencyKey } },
+        update: { tenantId: ctx.tenantId, resultId: request.id },
+        create: { tenantId: ctx.tenantId, scope: 'receptionist.live-booking', key: idempotencyKey, resultId: request.id },
+      });
+      await auditLive(ctx.tenantId, existingRequest ? 'receptionist.appointmentRequest.corrected' : 'receptionist.appointmentRequest.needsReview', request.id, {
+        reason, via: 'live_call', callLogId: trusted.callLogId,
+      }, tx);
+      await tx.businessEvent.create({ data: {
+        tenantId: ctx.tenantId, eventType: existingRequest ? 'receptionist.appointmentRequest.corrected' : 'receptionist.appointmentRequest.created',
+        entityType: 'appointmentRequest', entityId: request.id, sourceModule: 'receptionist',
+        payload: { status: 'MISSING_INFO', live: true, callLogId: trusted.callLogId },
+      } });
+      return { kind: 'review', requestId: request.id, duplicate: false, message };
+    };
 
-      if (!(await isSlotOpen(ctx.tenantId, branch.id, startsAt, schedulingService.durationMin, tx, providerProfileId))) return null;
+    if (forcedReviewReason) return review(forcedReviewReason, ['preferredDateTime'], `I'm sorry — that time was just taken. I recorded the same request for staff review.`);
+    if (!validation.ok || answerIssues.length) {
+      const issues = [...(!validation.ok ? validation.issues : []), ...answerIssues];
+      return review(`Attested booking arguments failed validation: ${issues.join(', ')}`, issues, 'I need a team member to review the information before booking.');
+    }
+    if (!locationValid) return review('Campaign location did not resolve to one active mapped branch', ['preferredLocation'], 'I need a team member to confirm the clinic location before booking.');
+    if (!startsAt || !firstName || !lastName) return review('Required booking identity or date/time could not be parsed', ['preferredDateTime'], 'I need a team member to confirm the date, time, and patient name before booking.');
 
-      let patient = verifiedExistingPatientId
-        ? await tx.patient.findFirst({ where: { id: verifiedExistingPatientId, tenantId: ctx.tenantId, deletedAt: null }, select: { id: true } })
-        : null;
-      if (!patient) {
-        patient = await tx.patient.create({ data: { tenantId: ctx.tenantId, branchId: branch.id, firstName, lastName, phone, lifecycleStage: 'NEW' }, select: { id: true } });
-      }
-      const endsAt = new Date(startsAt.getTime() + schedulingService.durationMin * 60_000);
-      const appt = await tx.appointment.create({
-        data: { tenantId: ctx.tenantId, branchId: branch.id, patientId: patient.id, providerProfileId, providerRef: providerProfileId, service: schedulingService.name, serviceCatalogItemId: schedulingService.id, startsAt, endsAt, status: 'CONFIRMED', channel: 'CALL' },
-        select: { id: true },
-      });
-      const reqRow = await tx.appointmentRequest.create({
-        data: {
-          tenantId: ctx.tenantId, branchId: branch.id, patientId: patient.id, requestedService: service,
-          collectedName: `${firstName} ${lastName}`, collectedPhone: phone, status: 'BOOKED', source: 'ai_receptionist',
-          rawCollectedFields: cleanArgs, missingFields: [], bookedAppointmentId: appt.id,
-          outcomeReason: 'Booked live by AI receptionist', requestedDateTime: startsAt,
-        },
-        select: { id: true },
-      });
-      await tx.idempotencyKey.create({
-        data: { tenantId: ctx.tenantId, scope: 'receptionist.live-booking', key: idemKey, resultId: appt.id },
-      });
-      await tx.auditEvent.create({
-        data: {
-          tenantId: ctx.tenantId,
-          actorUserId: null,
-          action: 'receptionist.appointment.booked',
-          resource: 'appointment',
-          resourceId: appt.id,
-          userAgent: 'retell-webhook',
-          metadata: { branchId: branch.id, appointmentRequestId: reqRow.id, via: 'live_call' },
-        },
-      });
-      await tx.businessEvent.create({
-        data: {
-          tenantId: ctx.tenantId,
-          eventType: 'receptionist.appointmentRequest.created',
-          entityType: 'appointmentRequest',
-          entityId: reqRow.id,
-          sourceModule: 'receptionist',
-          payload: { status: 'BOOKED', live: true },
-        },
-      });
-      return { apptId: appt.id, patientId: patient.id, reqId: reqRow.id };
+    const policy = await getSchedulingPolicy(ctx.tenantId, tx);
+    const now = new Date();
+    const earliest = new Date(now.getTime() + policy.minNoticeHours * 3_600_000);
+    const latest = new Date(now.getTime() + policy.maxHorizonDays * 86_400_000);
+    if (!policy.selfBookEnabled || startsAt < earliest || startsAt > latest) {
+      return review('Canonical self-booking policy does not permit the requested time', ['schedulingPolicy'], 'A team member needs to review this appointment request.');
+    }
+    const providers = await tx.providerProfile.findMany({
+      where: { tenantId: ctx.tenantId, branchId: trusted.branchId!, user: { active: true } },
+      select: { id: true }, take: 2,
     });
-  } catch (error) {
-    // A concurrent booking on another path took this provider's slot and the DB
-    // exclusion constraint fired — treat as "just taken", never crash the call.
-    if (isDoubleBookConflictError(error)) return { booked: false, message: `I'm sorry — ${speakTime(time)} was just taken. Would you like another time?` };
-    throw error;
-  }
+    const schedulingService = await resolveSchedulingService({ tenantId: ctx.tenantId, service, fallbackDurationMin: SLOT_MIN }, tx);
+    if (providers.length !== 1 || !schedulingService) {
+      return review(providers.length !== 1 ? 'Provider selection is ambiguous' : 'Configured service is not canonical', [providers.length !== 1 ? 'preferredProvider' : 'preferredService'], 'A team member needs to confirm the provider or service before booking.');
+    }
+    const providerProfileId = providers[0].id;
+    const existingPatients = phone ? await patientsByCanonicalPhone(ctx.tenantId, phone, tx) : [];
+    let verifiedExistingPatientId: string | null = null;
+    if (existingPatients.length) {
+      const proof = await tx.idempotencyKey.findUnique({
+        where: { scope_key: { scope: 'receptionist.voice-identity', key: `${ctx.tenantId}:${ctx.callId}` } },
+        select: { resultId: true },
+      });
+      if (!proof?.resultId || !existingPatients.some(patient => patient.id === proof.resultId)) {
+        return review(existingPatients.length > 1 ? 'Patient identity is ambiguous' : 'Existing patient identity was not verified for this call', ['identityVerification'], 'I need identity verification or front desk assistance before linking this booking.');
+      }
+      verifiedExistingPatientId = proof.resultId;
+    }
+    if ((policy.requireEligibilityForSelfBook || policy.requireIntakeForSelfBook) && !verifiedExistingPatientId) {
+      return review('Canonical pre-visit policy requires an existing verified patient', ['preVisitRequirements'], 'A team member must review eligibility or intake requirements before booking.');
+    }
+    if (verifiedExistingPatientId) {
+      const unmet = await unmetPreVisitRequirements(ctx.tenantId, verifiedExistingPatientId, policy, tx);
+      if (unmet.length) return review(`Canonical pre-visit requirements are incomplete: ${unmet.join(', ')}`, unmet, 'A team member must review eligibility or intake requirements before booking.');
+    }
 
-  if (!booked) return { booked: false, message: `I'm sorry — ${speakTime(time)} was just taken. Would you like another time?` };
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-book-slot:${ctx.tenantId}:${providerProfileId}:${startsAt.toISOString()}`})::bigint)`;
+    const slotConflict = await findSlotConflict({ tenantId: ctx.tenantId, providerProfileId, startsAt, durationMin: schedulingService.durationMin }, tx);
+    if (slotConflict) return review(`Canonical scheduler rejected the slot: ${slotConflict}`, ['preferredDateTime'], `I'm sorry — that time is unavailable. I recorded the same request for staff review.`);
 
-  if (booked.duplicate) {
+    let patient = verifiedExistingPatientId
+      ? await tx.patient.findFirst({ where: { id: verifiedExistingPatientId, tenantId: ctx.tenantId, deletedAt: null }, select: { id: true } })
+      : null;
+    if (!patient) {
+      patient = await tx.patient.create({
+        data: { tenantId: ctx.tenantId, branchId: trusted.branchId!, firstName, lastName, phone, email, lifecycleStage: 'NEW' },
+        select: { id: true },
+      });
+    }
+    const endsAt = new Date(startsAt.getTime() + schedulingService.durationMin * 60_000);
+    const appointment = await tx.appointment.create({
+      data: {
+        tenantId: ctx.tenantId, branchId: trusted.branchId!, patientId: patient.id,
+        providerProfileId, providerRef: providerProfileId, service: schedulingService.name,
+        serviceCatalogItemId: schedulingService.id, receptionistCallLogId: trusted.callLogId,
+        startsAt, endsAt, status: 'CONFIRMED', channel: 'CALL',
+      },
+      select: { id: true },
+    });
+    const request = existingRequest
+      ? await tx.appointmentRequest.update({
+        where: { id: existingRequest.id },
+        data: {
+          branchId: trusted.branchId, patientId: patient.id, campaignId: trusted.campaignId,
+          requestedService: service, requestedDateTime: startsAt,
+          collectedName: `${firstName} ${lastName}`, collectedPhone: phone, collectedEmail: email,
+          rawCollectedFields: rawAnswers, status: 'BOOKED', missingFields: [],
+          bookedAppointmentId: appointment.id, outcomeReason: 'Booked live by AI receptionist',
+        },
+        select: { id: true },
+      })
+      : await tx.appointmentRequest.create({
+        data: {
+          tenantId: ctx.tenantId, branchId: trusted.branchId, patientId: patient.id,
+          campaignId: trusted.campaignId, callLogId: trusted.callLogId,
+          requestedService: service, requestedDateTime: startsAt,
+          collectedName: `${firstName} ${lastName}`, collectedPhone: phone, collectedEmail: email,
+          rawCollectedFields: rawAnswers, source: 'ai_receptionist', status: 'BOOKED',
+          missingFields: [], bookedAppointmentId: appointment.id, outcomeReason: 'Booked live by AI receptionist',
+        },
+        select: { id: true },
+      });
+    await tx.idempotencyKey.upsert({
+      where: { scope_key: { scope: 'receptionist.live-booking', key: idempotencyKey } },
+      update: { tenantId: ctx.tenantId, resultId: request.id },
+      create: { tenantId: ctx.tenantId, scope: 'receptionist.live-booking', key: idempotencyKey, resultId: request.id },
+    });
+    await auditLive(ctx.tenantId, 'receptionist.appointment.booked', appointment.id, {
+      branchId: trusted.branchId, appointmentRequestId: request.id, callLogId: trusted.callLogId, via: 'live_call',
+    }, tx);
+    await tx.businessEvent.create({ data: {
+      tenantId: ctx.tenantId, eventType: 'receptionist.appointment.booked', entityType: 'appointment',
+      entityId: appointment.id, sourceModule: 'receptionist',
+      payload: { appointmentRequestId: request.id, callLogId: trusted.callLogId, live: true },
+    } });
+    await tx.receptionistCallLog.update({ where: { id: trusted.callLogId }, data: { outcome: 'BOOKED' } });
     return {
-      booked: true,
-      duplicate: true,
-      appointment_id: booked.apptId,
-      message: `You're already set for ${speakTime(time)} on ${date}.`,
+      kind: 'booked', appointmentId: appointment.id, requestId: request.id, patientId: patient.id,
+      firstName, email, phone, service: schedulingService.name, startsAt, timezone: trusted.branchTimezone!,
+      smsEnabled: campaign.smsConfirmation, emailEnabled: campaign.emailConfirmation, duplicate: false,
+    };
+  });
+
+  let result: BookingTransactionResult;
+  try {
+    result = await execute();
+  } catch (error) {
+    if (!isDoubleBookConflictError(error)) throw error;
+    result = await execute('The canonical appointment constraint reported that the selected slot was taken concurrently');
+  }
+  if (result.kind === 'rejected') return { booked: false, needs_human: true, message: result.message };
+  if (result.kind === 'review') return { booked: false, needs_review: true, duplicate: result.duplicate, appointment_request_id: result.requestId, message: result.message };
+
+  const localLabel = localAppointmentLabel(result.startsAt, result.timezone);
+  if (result.duplicate) {
+    return {
+      booked: true, duplicate: true, appointment_id: result.appointmentId,
+      sms_sent: false, sms_status: 'not_sent_replay', email_sent: false, email_status: 'not_sent_replay',
+      message: `You're already booked for ${result.service} on ${localLabel}. No duplicate confirmation was sent.`,
     };
   }
-
-  // Best-effort SMS confirmation to the VERIFIED caller (no-op if Twilio isn't
-  // configured, suppressed if the number opted out — the gate lives in
-  // sendMessage). firstName/service are already sanitized above.
-  let smsSent = false;
-  if (phone) {
-    const res = await sendMessage('sms', phone, 'Appointment confirmed', `Hi ${firstName}, your ${service} is confirmed for ${date} at ${speakTime(time)}. Reply STOP to opt out.`, `appt-confirm-${booked.apptId}`, { tenantId: ctx.tenantId, patientId: booked.patientId }).catch(() => null);
-    smsSent = !!res?.ok;
-  }
+  const confirmationBody = `Hi ${result.firstName}, your ${result.service} is confirmed for ${localLabel}.`;
+  const sms = result.smsEnabled && result.phone
+    ? await sendMessage('sms', result.phone, 'Appointment confirmed', `${confirmationBody} Reply STOP to opt out.`, `appt-confirm-sms-${result.appointmentId}`, { tenantId: ctx.tenantId, patientId: result.patientId }).catch(() => null)
+    : null;
+  const emailResult = result.emailEnabled && result.email
+    ? await sendMessage('email', result.email, 'Appointment confirmed', confirmationBody, `appt-confirm-email-${result.appointmentId}`, { tenantId: ctx.tenantId, patientId: result.patientId }).catch(() => null)
+    : null;
+  const smsSent = sms?.status === 'sent';
+  const emailSent = emailResult?.status === 'sent';
   return {
-    booked: true, appointment_id: booked.apptId, sms_sent: smsSent,
-    message: `Perfect, ${firstName} — you're booked for ${speakTime(time)} on ${date}.${smsSent ? " I've just texted you a confirmation." : ''}`,
+    booked: true, appointment_id: result.appointmentId,
+    sms_sent: smsSent, sms_status: sms?.status ?? (result.smsEnabled ? 'destination_unavailable' : 'disabled'),
+    email_sent: emailSent, email_status: emailResult?.status ?? (result.emailEnabled ? 'destination_unavailable' : 'disabled'),
+    message: `Perfect, ${result.firstName} — you're booked for ${result.service} on ${localLabel}.${smsSent || emailSent ? ' A confirmation was sent.' : ''}`,
   };
 }
 

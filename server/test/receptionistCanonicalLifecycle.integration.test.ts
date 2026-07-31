@@ -53,23 +53,21 @@ describe('receptionist canonical booking lifecycle', () => {
     const first = await runWithWebhookTenantContext(tenantId, () => bookAppointment(
       { tenantId, callId },
       { first_name: 'Jordan', last_name: 'Lee', appointment_date: date, appointment_time: time },
-    ), 'webhook:test-retell-booking') as { booked: boolean; duplicate?: boolean; appointment_id?: string };
+    ), 'webhook:test-retell-booking') as { booked: boolean; needs_human?: boolean };
 
-    expect(first.booked).toBe(true);
-    expect(first.duplicate).not.toBe(true);
-    expect(first.appointment_id).toBeTruthy();
-    expect(await db.appointment.count({ where: { tenantId } })).toBe(1);
+    expect(first).toMatchObject({ booked: false, needs_human: true });
+    expect(await db.appointment.count({ where: { tenantId } })).toBe(0);
     expect(await db.idempotencyKey.findUnique({
       where: { scope_key: { scope: 'receptionist.live-booking', key } },
       select: { resultId: true },
-    })).toEqual({ resultId: first.appointment_id });
+    })).toEqual({ resultId: null });
 
     const replay = await runWithWebhookTenantContext(tenantId, () => bookAppointment(
       { tenantId, callId },
       { first_name: 'Jordan', last_name: 'Lee', appointment_date: date, appointment_time: time },
-    ), 'webhook:test-retell-booking') as { booked: boolean; duplicate?: boolean; appointment_id?: string };
+    ), 'webhook:test-retell-booking') as { booked: boolean; needs_human?: boolean };
 
-    expect(replay).toMatchObject({ booked: true, duplicate: true, appointment_id: first.appointment_id });
-    expect(await db.appointment.count({ where: { tenantId } })).toBe(1);
+    expect(replay).toMatchObject({ booked: false, needs_human: true });
+    expect(await db.appointment.count({ where: { tenantId } })).toBe(0);
   });
 });

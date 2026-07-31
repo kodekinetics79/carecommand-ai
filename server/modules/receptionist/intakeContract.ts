@@ -294,11 +294,16 @@ export function compileIntakeContract(input: IntakeContractInput): { snapshot: I
     service: { type: 'string', const: input.appointmentType, description: 'Server-configured appointment service.' },
     intake_contract_fingerprint: { type: 'string', const: semanticFingerprint, description: 'Provider-deployed immutable intake contract fingerprint.' },
     intake_schema_revision: { type: 'integer', const: input.revision, description: 'Provider-deployed immutable intake schema revision.' },
+    booking_confirmed: {
+      type: 'boolean',
+      const: true,
+      description: 'Provider-reported final caller confirmation of the complete appointment selection.',
+    },
   };
   if (locationIds.length) properties.location_id = stringProperty('Chosen eligible clinic location.', 36, { enum: locationIds });
   const required = new Set([
     'first_name', 'last_name', 'appointment_date', 'appointment_time', 'service',
-    'intake_contract_fingerprint', 'intake_schema_revision',
+    'intake_contract_fingerprint', 'intake_schema_revision', 'booking_confirmed',
   ]);
   for (const field of fields) {
     const key = intakeFieldKey(field);
@@ -308,7 +313,7 @@ export function compileIntakeContract(input: IntakeContractInput): { snapshot: I
       properties[key] = propertyFor(field, locationIds);
       if (field.required) required.add(key);
     }
-    if (field.confirmationRequired && field.fieldType !== 'PHONE') {
+    if (field.confirmationRequired) {
       const confirmationKey = `${key}_confirmed`;
       properties[confirmationKey] = {
         type: 'boolean',

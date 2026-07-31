@@ -368,6 +368,9 @@ model Appointment {
   providerRef                    String?
   service                        String
   serviceCatalogItemId           String?                         @db.Uuid
+  // Trusted source call for an autonomous receptionist booking. Nullable for
+  // legacy/staff-created appointments; unique per tenant whenever present.
+  receptionistCallLogId          String?                         @db.Uuid
   startsAt                       DateTime
   endsAt                         DateTime
   status                         AppointmentStatus               @default(CONFIRMED)
@@ -392,7 +395,11 @@ model Appointment {
   revenueProtectionAlerts        RevenueProtectionAlert[]
   serviceCatalogItem             ServiceCatalogItem?             @relation(fields: [serviceCatalogItemId], references: [id], onDelete: SetNull)
   providerProfile                ProviderProfile?                @relation(fields: [providerProfileId], references: [id], onDelete: SetNull)
+  sourceCallLog                  ReceptionistCallLog?             @relation("AppointmentSourceCall", fields: [tenantId, receptionistCallLogId], references: [tenantId, id], onDelete: Restrict)
+  appointmentRequests            AppointmentRequest[]             @relation("AppointmentRequestBookedAppointment")
 
+  @@unique([tenantId, id])
+  @@unique([tenantId, receptionistCallLogId])
   @@index([tenantId, branchId, startsAt])
   @@index([tenantId, patientId, startsAt])
   @@index([tenantId, status, startsAt])
@@ -1631,7 +1638,7 @@ model ReceptionistCallLog {
   tenantId                     String                               @db.Uuid
   clinicId                     String?                              @db.Uuid
   campaignId                   String?                              @db.Uuid
-  retellCallId                 String?
+  retellCallId                 String?                              @unique
   callerName                   String?
   callerPhone                  String?
   direction                    String                               @default("outbound")
@@ -1660,7 +1667,10 @@ model ReceptionistCallLog {
   recordingConsentEvents       ReceptionistRecordingConsentEvent[]
   artifactLifecycleEvents      ReceptionistArtifactLifecycleEvent[]
   legalHolds                   ReceptionistCallLegalHold[]
+  appointmentRequests          AppointmentRequest[]               @relation("AppointmentRequestSourceCall")
+  appointments                 Appointment[]                      @relation("AppointmentSourceCall")
 
+  @@unique([tenantId, id])
   @@index([tenantId, outcome, createdAt])
   @@index([outboundCampaignId])
   @@index([tenantId, recordingRetentionExpiresAt])
@@ -2351,9 +2361,12 @@ model AppointmentRequest {
   branch              Branch?                  @relation(fields: [branchId], references: [id], onDelete: SetNull)
   patient             Patient?                 @relation(fields: [patientId], references: [id], onDelete: SetNull)
   lead                Lead?                    @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  callLog             ReceptionistCallLog?     @relation("AppointmentRequestSourceCall", fields: [tenantId, callLogId], references: [tenantId, id], onDelete: Restrict)
+  bookedAppointment   Appointment?             @relation("AppointmentRequestBookedAppointment", fields: [tenantId, bookedAppointmentId], references: [tenantId, id], onDelete: Restrict)
 
   @@index([tenantId, status, createdAt])
-  @@index([tenantId, callLogId])
+  @@unique([tenantId, callLogId])
+  @@unique([tenantId, bookedAppointmentId])
 }
 
 // ===========================================================================

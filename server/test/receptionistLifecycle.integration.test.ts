@@ -120,17 +120,19 @@ describe('receptionist inbound-call lifecycle (event webhook)', () => {
     expect(logs[0].recordingUrl).toBe('https://recordings.test/abc');
     expect(logs[0].endedAt).not.toBeNull();
 
-    const requests = await db.receptionistAppointmentRequest.findMany({ where: { tenantId: t.id } });
+    const requests = await db.appointmentRequest.findMany({ where: { tenantId: t.id } });
     expect(requests).toHaveLength(1);
-    expect(requests[0].status).toBe('PENDING');
-    expect((requests[0].collectedData as Record<string, unknown>).outcome).toBe('BOOKED');
-    expect(requests[0].contactName).toBe('Jane');
+    expect(requests[0].status).toBe('PENDING_REVIEW');
+    expect(requests[0].source).toBe('retell_analysis_review_only');
+    expect((requests[0].rawCollectedFields as Record<string, unknown>).first_name).toBe('Jane');
+    expect(requests[0].collectedName).toBe('Jane');
+    expect(requests[0].callLogId).toBe(logs[0].id);
     expect(await db.appointment.count({ where: { tenantId: t.id } })).toBe(0);
 
     // 3. Redelivery of the SAME analyzed webhook → no dupes anywhere.
     expect((await webhook(t.clinicId, analyzed)).statusCode).toBe(200);
     expect(await db.receptionistCallLog.count({ where: { tenantId: t.id, retellCallId: callId } })).toBe(1);
-    expect(await db.receptionistAppointmentRequest.count({ where: { tenantId: t.id } })).toBe(1);
+    expect(await db.appointmentRequest.count({ where: { tenantId: t.id } })).toBe(1);
 
     // 4. Retrievable via the authenticated call-logs API (client responses recorded).
     const res = await app.inject({ method: 'GET', url: '/v1/receptionist/call-logs', headers: authFor(t) });
@@ -171,16 +173,16 @@ describe('receptionist inbound-call lifecycle (event webhook)', () => {
     await registerCall(a, callId, '+15558887777');
     await webhook(a.clinicId, { event: 'call_analyzed', call: { call_id: callId, from_number: '+15558887777', direction: 'inbound', call_analysis: { custom_analysis_data: { outcome: 'BOOKED', first_name: 'Cross', appointment_date: '2030-03-03', appointment_time: '11:00' } } } });
     // The stored opaque call mapping establishes A; the URL is only a selector.
-    expect(await db.receptionistAppointmentRequest.count({ where: { tenantId: a.id } })).toBe(1);
-    expect(await db.receptionistAppointmentRequest.count({ where: { tenantId: b.id } })).toBe(0);
+    expect(await db.appointmentRequest.count({ where: { tenantId: a.id } })).toBe(1);
+    expect(await db.appointmentRequest.count({ where: { tenantId: b.id } })).toBe(0);
     expect(await db.receptionistCallLog.count({ where: { tenantId: b.id } })).toBe(0);
 
     const redirectedCall = `call-${randomUUID()}`;
     await registerCall(a, redirectedCall, '+15558887778');
     const redirected = await webhook(b.clinicId, { event: 'call_analyzed', call: { call_id: redirectedCall, call_analysis: { custom_analysis_data: { outcome: 'BOOKED' } } } });
     expect(redirected.statusCode).toBe(202);
-    expect(await db.receptionistAppointmentRequest.count({ where: { tenantId: a.id } })).toBe(1);
-    expect(await db.receptionistAppointmentRequest.count({ where: { tenantId: b.id } })).toBe(0);
+    expect(await db.appointmentRequest.count({ where: { tenantId: a.id } })).toBe(1);
+    expect(await db.appointmentRequest.count({ where: { tenantId: b.id } })).toBe(0);
 
     // Even a valid clinic selector cannot authorize an unknown provider call.
     const unknown = await webhook(a.clinicId, { event: 'call_analyzed', call: { call_id: `unknown-${randomUUID()}`, call_analysis: { custom_analysis_data: { outcome: 'BOOKED' } } } });

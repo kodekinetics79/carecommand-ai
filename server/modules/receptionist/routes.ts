@@ -19,8 +19,7 @@ import {
   type PromptBookingRules,
 } from './promptService';
 import { outboundRoutes, targetStatusAfterOutcome } from './outbound';
-import { runBookingHandoff } from './handoff';
-import { handleAgentTool, requestHumanHandoff } from '../../lib/receptionist/liveTools';
+import { handleAgentTool, requestHumanHandoff, type TrustedBookingContext } from '../../lib/receptionist/liveTools';
 import { ingestCallArtifacts } from '../../lib/receptionist/privacyLifecycle';
 import { enterTenantContext, runWithTenantContext } from '../../lib/tenantContext';
 import { resolveIngressTenant } from '../../lib/tenantIngressResolvers';
@@ -48,6 +47,7 @@ import {
   compileIntakeContract,
   fingerprintJson,
   validateIntakeFieldConfiguration,
+  type IntakeContractSnapshot,
   type IntakeFieldConfiguration,
 } from './intakeContract';
 
@@ -1664,19 +1664,21 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     const ended = endedEvent;
     const existingCall = await db.receptionistCallLog.findFirst({ where: { retellCallId: providerCallId, tenantId } });
     trustedClinicId ??= existingCall?.clinicId ?? undefined;
-    const isOutbound = Boolean(existingCall?.outboundCampaignId);
-    const bookingClaim = outcomeRaw === 'BOOKED' && !isOutbound
-      ? await db.idempotencyKey.findFirst({
-        where: { tenantId, scope: 'receptionist.live-booking', key: { startsWith: `${providerCallId}:` }, resultId: { not: null } },
-        select: { resultId: true },
+    const canonicalBookingRequest = existingCall
+      ? await db.appointmentRequest.findFirst({
+        where: { tenantId, callLogId: existingCall.id, status: 'BOOKED', bookedAppointmentId: { not: null } },
+        select: { bookedAppointmentId: true },
       })
       : null;
-    const canonicalBooking = bookingClaim?.resultId
-      ? await db.appointment.findFirst({ where: { id: bookingClaim.resultId, tenantId, deletedAt: null }, select: { id: true } })
+    const canonicalBooking = canonicalBookingRequest?.bookedAppointmentId
+      ? await db.appointment.findFirst({
+        where: { id: canonicalBookingRequest.bookedAppointmentId, tenantId, receptionistCallLogId: existingCall!.id, deletedAt: null },
+        select: { id: true },
+      })
       : null;
     // Provider/LLM analysis alone is not proof of a booking. Without the
     // canonical Appointment created by the signed live tool, route to review.
-    const normalizedOutcomeRaw = outcomeRaw === 'BOOKED' && !isOutbound && !canonicalBooking ? 'ESCALATED' : outcomeRaw;
+    const normalizedOutcomeRaw = outcomeRaw === 'BOOKED' && !canonicalBooking ? 'ESCALATED' : outcomeRaw;
     const outcome: CallOutcome = validOutcomes.includes(normalizedOutcomeRaw as Exclude<CallOutcome, 'IN_PROGRESS'>)
       ? normalizedOutcomeRaw as Exclude<CallOutcome, 'IN_PROGRESS'>
       : 'IN_PROGRESS';
@@ -1689,9 +1691,13 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       const lifecycleKey = `receptionist-call-lifecycle:${tenantId}:${providerCallId}`;
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lifecycleKey})::bigint)`;
       const current = await tx.receptionistCallLog.findFirst({ where: { retellCallId: providerCallId, tenantId } });
-      const persistedOutcome: CallOutcome = current && outcome === 'IN_PROGRESS' && current.outcome !== 'IN_PROGRESS'
-        ? current.outcome
-        : outcome;
+      // Canonical booking evidence wins. Otherwise the first terminal outcome
+      // is immutable under later provider analysis/redelivery.
+      const persistedOutcome: CallOutcome = canonicalBooking
+        ? 'BOOKED'
+        : current && current.outcome !== 'IN_PROGRESS'
+          ? current.outcome
+          : outcome;
       const row = current
         ? await tx.receptionistCallLog.update({
           where: { id: current.id },
@@ -1780,38 +1786,57 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       }
     }
 
-    if (outcomeRaw === 'BOOKED' && !isOutbound && !canonicalBooking) {
-      if (await claimWebhookIdempotency('retell.booking', `${tenantId}:${idempotencyAnchor}`, tenantId)) {
-        await db.receptionistAppointmentRequest.create({
+    if (outcomeRaw === 'BOOKED' && !canonicalBooking) {
+      const boundedText = (value: unknown, max: number) => typeof value === 'string' && value.trim() && value.length <= max ? value.trim() : null;
+      const analysisAnswers = Object.fromEntries(Object.entries({
+        first_name: boundedText(custom.first_name, 80),
+        last_name: boundedText(custom.last_name, 80),
+        appointment_date: boundedText(custom.appointment_date ?? custom.preferred_date, 10),
+        appointment_time: boundedText(custom.appointment_time ?? custom.preferred_time, 8),
+        preferred_service: boundedText(custom.preferred_service, 120),
+        email: boundedText(custom.email, 160),
+        observed_phone: canonicalRetellDestination(persistedCall.callerPhone ?? undefined),
+      }).filter(([, value]) => value !== null));
+      await db.$transaction(async tx => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-call-lifecycle:${tenantId}:${providerCallId}`})::bigint)`;
+        const existing = await tx.appointmentRequest.findFirst({ where: { tenantId, callLogId: persistedCall.id }, select: { id: true } });
+        if (existing) return existing;
+        const requestRow = await tx.appointmentRequest.create({
           data: {
-            tenantId,
-            clinicId: trustedClinicId,
-            campaignId: trustedCampaignId,
-            contactPhone: call.from_number,
-            contactName: typeof custom.first_name === 'string' ? custom.first_name : undefined,
-            requestedDate: typeof custom.appointment_date === 'string' ? custom.appointment_date : undefined,
-            requestedTime: typeof custom.appointment_time === 'string' ? custom.appointment_time : undefined,
-            status: 'PENDING',
-            collectedData: custom as never,
-            source: 'retell',
+            tenantId, callLogId: persistedCall.id,
+            campaignId: persistedCall.outboundCampaignId ?? persistedCall.campaignId,
+            requestedService: boundedText(custom.preferred_service, 120),
+            collectedName: [boundedText(custom.first_name, 80), boundedText(custom.last_name, 80)].filter(Boolean).join(' ') || null,
+            collectedPhone: canonicalRetellDestination(persistedCall.callerPhone ?? undefined),
+            collectedEmail: boundedText(custom.email, 160),
+            rawCollectedFields: analysisAnswers,
+            source: 'retell_analysis_review_only', status: 'PENDING_REVIEW', missingFields: [],
+            outcomeReason: 'Provider analysis claimed booking without canonical signed-tool appointment evidence',
           },
+          select: { id: true },
         });
-      }
+        await tx.idempotencyKey.upsert({
+          where: { scope_key: { scope: 'receptionist.live-booking', key: `${tenantId}:${persistedCall.id}` } },
+          update: { tenantId, resultId: requestRow.id },
+          create: { tenantId, scope: 'receptionist.live-booking', key: `${tenantId}:${persistedCall.id}`, resultId: requestRow.id },
+        });
+        await tx.auditEvent.create({ data: {
+          tenantId, action: 'receptionist.appointmentRequest.analysisReviewCreated', resource: 'appointmentRequest',
+          resourceId: requestRow.id, userAgent: 'retell-webhook', metadata: { callLogId: persistedCall.id, bookingAuthority: false },
+        } });
+        await tx.businessEvent.create({ data: {
+          tenantId, eventType: 'receptionist.appointmentRequest.created', entityType: 'appointmentRequest',
+          entityId: requestRow.id, sourceModule: 'receptionist', payload: { status: 'PENDING_REVIEW', analysisOnly: true },
+        } });
+        return requestRow;
+      });
     }
 
-    // Outbound campaign calls run the booking handoff: link/create patient or
-    // lead, create an AppointmentRequest, and book only when safe. The handoff
-    // is a no-op for studio (non-outbound) calls and is idempotent on call id.
-    if (ended) {
-      try {
-        const result = await runBookingHandoff(providerCallId, custom);
-        if (result.handled && result.reason !== 'duplicate_webhook') {
-          request.log.info({ status: result.status }, 'Receptionist booking handoff completed');
-        }
-      } catch (error) {
-        request.log.error({ err: error }, 'Receptionist booking handoff failed');
-      }
-    }
+    // Provider analysis is not an autonomous booking authority. The legacy
+    // post-call handoff path was intentionally disabled because it accepted
+    // model phone data, split its writes, and could create provider-null
+    // appointments outside canonical scheduler protection. Direct booking is
+    // owned exclusively by the signed, attested in-call tool transaction.
 
     return reply.code(200).send({ ok: true });
   });
@@ -1948,7 +1973,7 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       let existing = await tx.receptionistCallLog.findFirst({ where: { tenantId, retellCallId: providerCallId } });
       trustedClinicId ??= existing?.clinicId ?? undefined;
       let trustedCampaignId = existing?.campaignId ?? undefined;
-      if (body.name === 'book_appointment' && body.call?.agent_id && body.call.agent_version !== undefined) {
+      if (['book_appointment', 'check_availability'].includes(body.name) && body.call?.agent_id && body.call.agent_version !== undefined) {
         const candidates = await tx.receptionistCampaign.findMany({
           where: {
             tenantId,
@@ -1989,20 +2014,19 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       return existing;
     });
 
-    if (body.name === 'book_appointment') {
-      const selectorMismatch = !activeCall.campaignId
-        || !activeCall.clinicId
-        || (query.campaignId !== undefined && query.campaignId !== activeCall.campaignId)
+    if (['book_appointment', 'check_availability'].includes(body.name)) {
+      const selectorMismatch = (query.campaignId !== undefined && query.campaignId !== activeCall.campaignId)
         || (query.clinicId !== undefined && query.clinicId !== activeCall.clinicId);
       if (selectorMismatch) {
-        await flagRetellIngressReview(tenantId, providerCallId, 'Book tool could not resolve one trusted campaign or a query selector disagreed with persisted call authority');
-        return reply.code(200).send({ booked: false, needs_human: true, message: 'I cannot safely select the booking campaign. I recorded a staff review request.' });
+        await flagRetellIngressReview(tenantId, providerCallId, 'Book tool query selector disagreed with persisted call authority');
+        return reply.code(202).send({ booked: false, needs_human: true, message: "I'm sorry, I can't access this clinic right now." });
       }
       trustedClinicId = activeCall.clinicId ?? undefined;
     }
 
     const activeSince = activeCall.startedAt ?? activeCall.createdAt;
-    if (activeCall.endedAt || activeCall.outcome !== 'IN_PROGRESS' || activeSince.getTime() < Date.now() - RECEPTIONIST_CALL_LEASE_MS) {
+    const canonicalBookingReplay = body.name === 'book_appointment' && activeCall.outcome === 'BOOKED';
+    if (activeCall.endedAt || (!canonicalBookingReplay && activeCall.outcome !== 'IN_PROGRESS') || activeSince.getTime() < Date.now() - RECEPTIONIST_CALL_LEASE_MS) {
       await flagRetellIngressReview(tenantId, providerCallId, 'Signed Retell tool rejected because the call is ended, terminal, or outside its active lease');
       return reply.code(200).send({ allowed: false, needs_human: true, message: 'This call is no longer active. I cannot access or change patient information.' });
     }
@@ -2051,6 +2075,15 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       }
     }
 
+    // Missing booking deployment authority is evaluated only after the
+    // verified, active call's safety quota. This preserves bounded fail-closed
+    // behavior during rate-store outages while still rejecting unsigned query
+    // selector mismatches before they can consume a trusted call's quota.
+    if (['book_appointment', 'check_availability'].includes(body.name) && (!activeCall.campaignId || !activeCall.clinicId)) {
+      await flagRetellIngressReview(tenantId, providerCallId, 'Book tool could not resolve one trusted campaign from persisted call authority');
+      return reply.code(200).send({ booked: false, needs_human: true, message: 'I cannot safely select the booking campaign. I recorded a staff review request.' });
+    }
+
     const SAFE_WITHOUT_RECORDING_GRANT = new Set(['record_recording_preference', 'record_do_not_call', 'request_human_handoff', 'take_message', 'report_emergency', 'check_availability']);
     if (!SAFE_WITHOUT_RECORDING_GRANT.has(body.name)) {
       const callState = await db.receptionistCallLog.findFirst({ where: { tenantId, retellCallId: providerCallId }, select: { recordingConsentStatus: true } });
@@ -2060,7 +2093,9 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     }
 
     let trustedToolArgs: Record<string, unknown> = body.args;
-    if (body.name === 'book_appointment') {
+    let trustedBooking: TrustedBookingContext | undefined;
+    if (['book_appointment', 'check_availability'].includes(body.name)) {
+      const isBookingMutation = body.name === 'book_appointment';
       const campaign = activeCall.campaignId
         ? await db.receptionistCampaign.findFirst({
           where: { id: activeCall.campaignId, tenantId, status: 'ACTIVE' },
@@ -2076,7 +2111,7 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         })
         : null;
       const snapshot = campaign?.intakeSchemaSnapshot && typeof campaign.intakeSchemaSnapshot === 'object' && !Array.isArray(campaign.intakeSchemaSnapshot)
-        ? campaign.intakeSchemaSnapshot as Record<string, unknown>
+        ? campaign.intakeSchemaSnapshot as unknown as IntakeContractSnapshot
         : null;
       const semanticFingerprint = typeof snapshot?.semanticFingerprint === 'string' ? snapshot.semanticFingerprint : null;
       const persistedCallerPhone = canonicalRetellDestination(activeCall.callerPhone ?? undefined);
@@ -2094,9 +2129,9 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         && campaign.intakeSchemaAttestedRevision === campaign.intakeSchemaRevision
         && campaign.intakeSchemaFingerprint === fingerprintJson(snapshot)
         && semanticFingerprint
-        && body.args.intake_contract_fingerprint === semanticFingerprint
-        && body.args.intake_schema_revision === campaign.intakeSchemaRevision
-        && body.args.service === campaign.appointmentType
+        && (!isBookingMutation || body.args.intake_contract_fingerprint === semanticFingerprint)
+        && (!isBookingMutation || body.args.intake_schema_revision === campaign.intakeSchemaRevision)
+        && (!isBookingMutation || body.args.service === campaign.appointmentType)
         && body.call?.agent_id === campaign?.intakeSchemaProviderAgentId
         && body.call?.agent_version === campaign?.intakeSchemaProviderVersion,
       );
@@ -2108,7 +2143,7 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
           message: 'I cannot safely complete this booking because the active intake configuration changed. I recorded a staff review request.',
         });
       }
-      if (requiredPhone && !persistedCallerPhone) {
+      if (isBookingMutation && requiredPhone && !persistedCallerPhone) {
         await flagRetellIngressReview(tenantId, providerCallId, 'Required phone intake identity was unavailable from the persisted signed call context');
         return reply.code(200).send({
           booked: false,
@@ -2120,6 +2155,38 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       // are cross-checks only, and model-supplied phone data is never forwarded.
       trustedToolArgs = { ...body.args, service: campaign!.appointmentType };
       delete trustedToolArgs.phone;
+
+      const eligibleLocationIds = Array.isArray(snapshot!.eligibleLocationIds)
+        ? snapshot!.eligibleLocationIds.filter((value): value is string => typeof value === 'string')
+        : [];
+      const requestedLocationId = typeof body.args.location_id === 'string' ? body.args.location_id : null;
+      const locationSelector = requestedLocationId
+        ? (eligibleLocationIds.includes(requestedLocationId) ? [requestedLocationId] : [])
+        : eligibleLocationIds.length === 1 ? eligibleLocationIds : [];
+      const locations = locationSelector?.length === 0
+        ? []
+        : await db.receptionistLocation.findMany({
+          where: {
+            tenantId, clinicId: activeCall.clinicId!, active: true, branchId: { not: null },
+            branch: { active: true },
+            ...(locationSelector ? { id: { in: locationSelector } } : {}),
+          },
+          select: { id: true, branchId: true, branch: { select: { id: true, timezone: true } } },
+          take: 2,
+        });
+      const location = locations.length === 1 ? locations[0] : null;
+      trustedBooking = {
+        callLogId: activeCall.id,
+        campaignId: activeCall.campaignId!,
+        clinicId: activeCall.clinicId!,
+        locationId: location?.id ?? null,
+        branchId: location?.branchId ?? null,
+        branchTimezone: location?.branch?.timezone ?? null,
+        observedPhone: persistedCallerPhone,
+        providerAgentId: campaign!.intakeSchemaProviderAgentId!,
+        providerAgentVersion: campaign!.intakeSchemaProviderVersion!,
+        intakeSnapshot: snapshot!,
+      };
     }
 
     const result = await handleAgentTool(
@@ -2127,6 +2194,7 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         tenantId,
         callId: providerCallId,
         callerPhone: activeCall.callerPhone,
+        trustedBooking,
       },
       body.name,
       trustedToolArgs,

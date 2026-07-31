@@ -271,6 +271,6 @@ describe('Retell first-ever inbound trusted destination bootstrap', () => {
     })).statusCode).toBe(200);
     expect((await db.receptionistCallLog.findFirstOrThrow({ where: { tenantId: t.id, retellCallId: callId } })).outcome).toBe('ESCALATED');
     expect(await db.appointment.count({ where: { tenantId: t.id } })).toBe(0);
-    expect(await db.receptionistAppointmentRequest.count({ where: { tenantId: t.id, status: 'PENDING' } })).toBe(1);
+    expect(await db.appointmentRequest.count({ where: { tenantId: t.id, status: 'PENDING_REVIEW', source: 'retell_analysis_review_only' } })).toBe(1);
   });
 });

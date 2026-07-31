@@ -10,10 +10,10 @@ export const TENANT_INTEGRITY_MANIFEST = Object.freeze({
   childSupportingIndexes: 121,
   parentUniqueIndexes: 29,
   totalManagedIndexes: 150,
-  // Seven managed indexes are structurally represented by ordinary Prisma
+  // Nine managed indexes are structurally represented by ordinary Prisma
   // indexes. Prisma therefore preserves them even though their physical names
   // use the migration-owned prefixes; only the remainder appears in diff SQL.
-  prismaDiffManagedIndexes: 143,
+  prismaDiffManagedIndexes: 141,
   foreignKeyPrefix: 'rls_fk_',
   childIndexPrefix: 'rls_ix_',
   parentIndexPrefix: 'rls_uq_',

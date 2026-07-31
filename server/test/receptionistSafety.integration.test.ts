@@ -119,9 +119,8 @@ describe('AI receptionist safety workflows', () => {
     const unverifiedCtx = { tenantId: tenant.id, callId: `call-${randomUUID()}`, callerPhone: '+12125550144' };
     await expect(trustedTool(unverifiedCtx, 'book_appointment', {
       first_name: 'Verified', last_name: 'Patient', appointment_date: 'invalid', appointment_time: '10:00', service: 'Consultation',
-    })).resolves.toMatchObject({ booked: false, needs_review: true });
-    const identityReview = await db.appointmentRequest.findFirstOrThrow({ where: { tenantId: tenant.id, callLogId: null }, orderBy: { createdAt: 'desc' } });
-    expect(identityReview.missingFields).toContain('identityVerification');
+    })).resolves.toMatchObject({ booked: false, needs_human: true });
+    expect(await db.appointmentRequest.count({ where: { tenantId: tenant.id } })).toBe(0);
 
     const goodCtx = { tenantId: tenant.id, callId: `call-${randomUUID()}`, callerPhone: '+12125550144' };
     await expect(trustedTool(goodCtx, 'verify_patient_identity', { date_of_birth: '1985-04-03' })).resolves.toMatchObject({ verified: true });

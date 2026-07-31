@@ -779,11 +779,38 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
 
   app.patch('/booking-requests/:id', { preHandler: writeRoles }, async request => {
     const { id } = idParam.parse(request.params);
-    const input = z.object({ status: z.enum(['PENDING_REVIEW', 'BOOKED', 'REJECTED', 'MISSING_INFO', 'DUPLICATE']).optional(), outcomeReason: z.string().max(1000).optional() }).parse(request.body);
-    const existing = await db.appointmentRequest.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Request not found');
-    const row = await db.appointmentRequest.update({ where: { id }, data: input });
-    await audit(request, { action: 'receptionist.appointmentRequest.updated', resource: 'appointmentRequest', resourceId: id, metadata: { status: input.status } });
+    // A staff status patch is review workflow only. BOOKED can be asserted only
+    // by the canonical atomic booking service with an actual Appointment FK.
+    const input = z.object({ status: z.literal('REJECTED').optional(), outcomeReason: z.string().max(1000).optional() }).parse(request.body);
+    const source = await db.appointmentRequest.findFirst({
+      where: { id, tenantId: request.auth.tenantId },
+      select: { callLogId: true, callLog: { select: { retellCallId: true } } },
+    });
+    if (!source) throw app.httpErrors.notFound('Request not found');
+    const lockKey = source.callLogId && source.callLog?.retellCallId
+      ? `receptionist-call-lifecycle:${request.auth.tenantId}:${source.callLog.retellCallId}`
+      : `receptionist-appointment-request:${request.auth.tenantId}:${id}`;
+    const row = await db.$transaction(async tx => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey})::bigint)`;
+      const existing = await tx.appointmentRequest.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+      if (!existing) throw app.httpErrors.notFound('Request not found');
+      if (existing.status === 'REJECTED' && (!input.status || input.status === 'REJECTED')) return existing;
+      if (!['PENDING_REVIEW', 'MISSING_INFO'].includes(existing.status)) {
+        throw app.httpErrors.conflict('A terminal appointment request cannot be reopened or changed through the review endpoint');
+      }
+      const updated = await tx.appointmentRequest.update({ where: { id }, data: input });
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+        action: 'receptionist.appointmentRequest.reviewTransitioned', resource: 'appointmentRequest', resourceId: id,
+        metadata: { fromStatus: existing.status, toStatus: updated.status },
+      } });
+      await tx.businessEvent.create({ data: {
+        tenantId: request.auth.tenantId, eventType: 'receptionist.appointmentRequest.reviewTransitioned',
+        entityType: 'appointmentRequest', entityId: id, sourceModule: 'receptionist',
+        payload: { fromStatus: existing.status, toStatus: updated.status },
+      } });
+      return updated;
+    });
     return row;
   });
 };
