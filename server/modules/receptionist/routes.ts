@@ -83,6 +83,20 @@ const workingHoursInput = z.object({
   wednesday: hoursWindow.optional(), thursday: hoursWindow.optional(), friday: hoursWindow.optional(),
   saturday: hoursWindow.optional(),
 }).strict();
+const operationalNotesInput = z.object({
+  summary: z.string().trim().max(2_000).optional().nullable(),
+  correction: z.string().trim().max(2_000).optional().nullable(),
+  callerIntent: z.string().trim().max(500).optional().nullable(),
+  actionsTaken: z.array(z.string().trim().min(1).max(300)).max(20).default([]),
+  followUpNotes: z.string().trim().max(1_000).optional().nullable(),
+}).strict();
+const callReviewInput = z.object({
+  operation: z.enum(['SAVE_DRAFT', 'MARK_REVIEWED', 'SIGN_OFF']),
+  expectedRevision: z.number().int().min(0),
+  operationalNotes: operationalNotesInput,
+  unresolvedActionItems: z.array(z.string().trim().min(1).max(300)).max(20).default([]),
+  acknowledgeUnresolvedActions: z.literal(true).optional(),
+}).strict();
 const providerAgentIdInput = z.string().trim().regex(/^[A-Za-z0-9_-]{1,128}$/).optional().nullable();
 const providerVersionTagInput = z.string().trim().refine(isValidRetellVersionTag, {
   message: 'Deployment tag must start lowercase, use at most 20 lowercase letters, digits, hyphens or underscores, and cannot be latest, latest_published, or v<number>.',
@@ -1549,10 +1563,37 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
     const { id } = idParam.parse(request.params);
     const row = await db.receptionistCallLog.findFirst({
       where: { id, tenantId: request.auth.tenantId },
-      include: { campaign: { select: { id: true, name: true } } },
+      include: {
+        campaign: { select: { id: true, name: true } },
+        reviewedBy: { select: { id: true, displayName: true } },
+        signedOffBy: { select: { id: true, displayName: true } },
+        appointments: { select: { id: true, service: true, startsAt: true, status: true }, orderBy: { createdAt: 'desc' } },
+        appointmentRequests: {
+          select: { id: true, requestedService: true, requestedDateTime: true, status: true, bookedAppointmentId: true },
+          orderBy: { createdAt: 'desc' },
+        },
+      },
     });
     if (!row) throw app.httpErrors.notFound('Call log not found');
     const canReadRecording = await hasReceptionistPermission(request, RECEPTIONIST_PERMISSIONS.RECORDINGS_READ);
+    const canSignOffReview = await hasReceptionistPermission(request, RECEPTIONIST_PERMISSIONS.MANAGE);
+    const usableRecordingUrl = typeof row.recordingUrl === 'string' && /^https:\/\//i.test(row.recordingUrl)
+      ? row.recordingUrl
+      : null;
+    const handoffReferences = await db.staffTask.findMany({
+      where: {
+        tenantId: request.auth.tenantId,
+        AND: [
+          { metadata: { path: ['workflow'], equals: 'receptionist_safety' } },
+          { OR: [
+            { metadata: { path: ['callLogId'], equals: row.id } },
+            ...(row.retellCallId ? [{ metadata: { path: ['callId'], equals: row.retellCallId } }] : []),
+          ] },
+        ],
+      },
+      select: { id: true, title: true, status: true, priority: true, dueAt: true, createdAt: true },
+      orderBy: { createdAt: 'desc' },
+    });
     await audit(request, {
       action: 'receptionistCallLog.read',
       resource: 'receptionistCallLog',
@@ -1561,9 +1602,131 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
     });
     return {
       ...row,
-      recordingAvailable: Boolean(row.recordingUrl),
-      recordingUrl: canReadRecording ? row.recordingUrl : null,
+      providerSummary: row.transcriptSummary ? {
+        text: row.transcriptSummary,
+        source: 'PROVIDER_CALL_ANALYSIS',
+        sourceCallId: row.retellCallId,
+      } : null,
+      recordingAvailable: Boolean(usableRecordingUrl),
+      recordingAccess: row.recordingPurgedAt
+        ? 'purged'
+        : !usableRecordingUrl
+          ? 'not_available'
+          : canReadRecording ? 'available' : 'restricted',
+      recordingUrl: canReadRecording ? usableRecordingUrl : null,
+      reviewCapabilities: { canEdit: true, canSignOff: canSignOffReview },
+      handoffReferences,
     };
+  });
+
+  app.patch('/call-logs/:id/operator-review', { preHandler: bookingReviewRoles }, async (request, reply) => {
+    const { id } = idParam.parse(request.params);
+    const input = callReviewInput.parse(request.body);
+    const canSignOff = await hasReceptionistPermission(request, RECEPTIONIST_PERMISSIONS.MANAGE);
+    if (input.operation === 'SIGN_OFF' && !canSignOff) {
+      return reply.code(403).send({
+        error: 'insufficient_permission',
+        permission: RECEPTIONIST_PERMISSIONS.MANAGE,
+        message: 'Manager sign-off requires receptionist:manage.',
+      });
+    }
+    const now = new Date();
+    const status = input.operation === 'SAVE_DRAFT'
+      ? 'DRAFT' as const
+      : input.operation === 'MARK_REVIEWED' ? 'REVIEWED' as const : 'SIGNED_OFF' as const;
+    const normalizedNotes = {
+      source: 'STAFF_ENTERED',
+      actorUserId: request.auth.userId,
+      recordedAt: now.toISOString(),
+      summary: input.operationalNotes.summary || null,
+      correction: input.operationalNotes.correction || null,
+      callerIntent: input.operationalNotes.callerIntent || null,
+      actionsTaken: input.operationalNotes.actionsTaken,
+      followUpNotes: input.operationalNotes.followUpNotes || null,
+    } satisfies Prisma.InputJsonObject;
+    const submittedReviewContent = {
+      summary: input.operationalNotes.summary || null,
+      correction: input.operationalNotes.correction || null,
+      callerIntent: input.operationalNotes.callerIntent || null,
+      actionsTaken: input.operationalNotes.actionsTaken,
+      followUpNotes: input.operationalNotes.followUpNotes || null,
+    };
+
+    const updated = await runWithTenantContext(request.auth.tenantId, async tx => {
+      const current = await tx.receptionistCallLog.findFirst({
+        where: { id, tenantId: request.auth.tenantId },
+        select: { id: true, reviewRevision: true, reviewStatus: true, operationalNotes: true, unresolvedActionItems: true },
+      });
+      if (!current) throw app.httpErrors.notFound('Call log not found');
+      if (current.reviewRevision !== input.expectedRevision) {
+        throw app.httpErrors.conflict('This call review changed. Reload it before saving.');
+      }
+      if (current.reviewStatus === 'SIGNED_OFF') {
+        throw app.httpErrors.conflict('A signed-off call review is final and cannot be overwritten.');
+      }
+      if (input.operation === 'SIGN_OFF' && current.reviewStatus !== 'REVIEWED') {
+        throw app.httpErrors.conflict('A call review must be marked reviewed before manager sign-off.');
+      }
+      if (input.operation === 'SIGN_OFF') {
+        const stored = current.operationalNotes && typeof current.operationalNotes === 'object' && !Array.isArray(current.operationalNotes)
+          ? current.operationalNotes as Record<string, unknown>
+          : {};
+        const storedReviewContent = {
+          summary: typeof stored.summary === 'string' ? stored.summary : null,
+          correction: typeof stored.correction === 'string' ? stored.correction : null,
+          callerIntent: typeof stored.callerIntent === 'string' ? stored.callerIntent : null,
+          actionsTaken: Array.isArray(stored.actionsTaken) ? stored.actionsTaken : [],
+          followUpNotes: typeof stored.followUpNotes === 'string' ? stored.followUpNotes : null,
+        };
+        if (JSON.stringify(storedReviewContent) !== JSON.stringify(submittedReviewContent)
+          || JSON.stringify(current.unresolvedActionItems) !== JSON.stringify(input.unresolvedActionItems)) {
+          throw app.httpErrors.conflict('The submitted sign-off content differs from the reviewed revision. Reload before signing.');
+        }
+      }
+      if (input.operation === 'SIGN_OFF' && current.unresolvedActionItems.length > 0 && input.acknowledgeUnresolvedActions !== true) {
+        throw app.httpErrors.badRequest('Sign-off with unresolved actions requires explicit acknowledgement.');
+      }
+
+      const result = await tx.receptionistCallLog.update({
+        where: { id },
+        data: {
+          ...(input.operation === 'SIGN_OFF' ? {} : {
+            operationalNotes: normalizedNotes,
+            unresolvedActionItems: input.unresolvedActionItems,
+          }),
+          reviewStatus: status,
+          reviewRevision: { increment: 1 },
+          ...(input.operation === 'SAVE_DRAFT' ? { reviewedByUserId: null, reviewedAt: null }
+            : input.operation === 'MARK_REVIEWED' ? { reviewedByUserId: request.auth.userId, reviewedAt: now }
+              : {}),
+          signedOffByUserId: input.operation === 'SIGN_OFF' ? request.auth.userId : null,
+          signedOffAt: input.operation === 'SIGN_OFF' ? now : null,
+        },
+        include: {
+          reviewedBy: { select: { id: true, displayName: true } },
+          signedOffBy: { select: { id: true, displayName: true } },
+        },
+      });
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId,
+        actorUserId: request.auth.userId,
+        action: `receptionistCallLog.operatorReview.${input.operation.toLowerCase()}`,
+        resource: 'receptionistCallLog',
+        resourceId: id,
+        requestId: request.id,
+        ipAddress: request.ip,
+        userAgent: request.headers['user-agent'],
+        metadata: {
+          fromStatus: current.reviewStatus,
+          toStatus: status,
+          revision: current.reviewRevision + 1,
+          unresolvedActionCount: input.operation === 'SIGN_OFF' ? current.unresolvedActionItems.length : input.unresolvedActionItems.length,
+          source: 'staff_entered',
+        },
+      } });
+      return result;
+    });
+    return updated;
   });
 
   // ===== Opt-outs =========================================================
@@ -1726,6 +1889,97 @@ function canonicalRetellDestination(value: string | undefined): string | null {
   if (!value) return null;
   const normalized = value.trim().replace(/[().\s-]/g, '');
   return /^\+[1-9]\d{7,14}$/.test(normalized) ? normalized : null;
+}
+
+const INBOUND_DEPLOYMENT_BOUND_TOOLS = new Set([
+  'record_recording_preference',
+  'verify_patient_identity',
+  'list_upcoming_appointments',
+  'prepare_appointment_change',
+  'cancel_appointment',
+  'reschedule_appointment',
+  'book_appointment',
+  'take_message',
+]);
+
+type VerifiedInboundDeployment = {
+  localAgentId: string;
+  providerAgentId: string;
+  providerAgentVersion: number;
+  providerConfigRevision: number;
+  providerFingerprint: string;
+};
+
+async function resolveVerifiedInboundDeployment(input: {
+  tenantId: string;
+  clinicId: string | undefined;
+  providerAgentId: string | undefined;
+  providerAgentVersion: number | undefined;
+}): Promise<{ deployment: VerifiedInboundDeployment | null; reason: string | null }> {
+  if (!input.clinicId) return { deployment: null, reason: 'clinic_binding_missing' };
+  if (!input.providerAgentId || input.providerAgentVersion === undefined) {
+    return { deployment: null, reason: 'provider_deployment_evidence_missing' };
+  }
+  const candidates = await db.receptionistAgent.findMany({
+    where: {
+      tenantId: input.tenantId,
+      clinicId: input.clinicId,
+      providerAgentId: input.providerAgentId,
+      providerVersion: input.providerAgentVersion,
+    },
+    select: {
+      id: true,
+      active: true,
+      providerAgentId: true,
+      providerVersion: true,
+      providerStatus: true,
+      providerConfigRevision: true,
+      providerVerifiedRevision: true,
+      providerVerifiedAt: true,
+      providerVerificationExpiresAt: true,
+      providerFingerprint: true,
+    },
+    take: 2,
+  });
+  const ready = candidates.filter(candidate => agentReadinessReason(candidate) === null && Boolean(candidate.providerFingerprint));
+  if (ready.length !== 1) {
+    return { deployment: null, reason: candidates.length > 1 ? 'provider_deployment_ambiguous' : 'provider_deployment_unverified_or_stale' };
+  }
+  const deployment = ready[0];
+  return {
+    deployment: {
+      localAgentId: deployment.id,
+      providerAgentId: deployment.providerAgentId!,
+      providerAgentVersion: deployment.providerVersion!,
+      providerConfigRevision: deployment.providerConfigRevision,
+      providerFingerprint: deployment.providerFingerprint!,
+    },
+    reason: null,
+  };
+}
+
+function callMatchesInboundDeployment(
+  call: {
+    boundProviderAgentId: string | null;
+    boundProviderAgentVersion: number | null;
+    boundProviderConfigRevision: number | null;
+    boundProviderFingerprint: string | null;
+  },
+  deployment: VerifiedInboundDeployment,
+) {
+  const values = [
+    call.boundProviderAgentId,
+    call.boundProviderAgentVersion,
+    call.boundProviderConfigRevision,
+    call.boundProviderFingerprint,
+  ];
+  const unbound = values.every(value => value === null);
+  if (unbound) return 'unbound' as const;
+  const matches = call.boundProviderAgentId === deployment.providerAgentId
+    && call.boundProviderAgentVersion === deployment.providerAgentVersion
+    && call.boundProviderConfigRevision === deployment.providerConfigRevision
+    && call.boundProviderFingerprint === deployment.providerFingerprint;
+  return matches ? 'matched' as const : 'mismatched' as const;
 }
 
 function opaqueIngressReference(value: string | undefined): string {
@@ -2470,7 +2724,44 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       trustedClinicId = clinic.id;
     }
 
-    if (body.call?.direction === 'inbound' || resolvedByDestination) {
+    const inboundTool = body.call?.direction === 'inbound' || resolvedByDestination;
+    const deploymentBoundTool = inboundTool && INBOUND_DEPLOYMENT_BOUND_TOOLS.has(body.name);
+    let trustedInboundDeployment: VerifiedInboundDeployment | undefined;
+    if (deploymentBoundTool) {
+      // An already-mapped call may not carry a URL selector. Recover only the
+      // persisted clinic id; provider agent fields always come from the signed
+      // body and must match one currently verified clinic deployment.
+      if (!trustedClinicId) {
+        const mappedCall = await db.receptionistCallLog.findFirst({
+          where: { tenantId, retellCallId: providerCallId },
+          select: { clinicId: true },
+        });
+        trustedClinicId = mappedCall?.clinicId ?? undefined;
+      }
+      const deploymentResult = await resolveVerifiedInboundDeployment({
+        tenantId,
+        clinicId: trustedClinicId,
+        providerAgentId: body.call?.agent_id,
+        providerAgentVersion: body.call?.agent_version,
+      });
+      if (!deploymentResult.deployment) {
+        const stopped = await stopPhoneCall(providerCallId);
+        await flagRetellIngressReview(
+          tenantId,
+          providerCallId,
+          `Inbound patient-data tool rejected: ${deploymentResult.reason}; provider_stop_applied=${stopped.applied}`,
+        );
+        return reply.code(202).send({
+          allowed: false,
+          needs_human: true,
+          message: "I'm sorry, this call is not using the clinic's verified receptionist configuration. I cannot access or change patient information.",
+          providerStopApplied: stopped.applied,
+        });
+      }
+      trustedInboundDeployment = deploymentResult.deployment;
+    }
+
+    if (inboundTool) {
       const admission = await admitInboundReceptionist(tenantId, providerCallId, { clinicId: trustedClinicId, callerPhone: body.call?.from_number, direction: 'inbound' });
       if (!admission.allowed) {
         const stopped = await stopPhoneCall(providerCallId);
@@ -2487,6 +2778,21 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       let existing = await tx.receptionistCallLog.findFirst({ where: { tenantId, retellCallId: providerCallId } });
       trustedClinicId ??= existing?.clinicId ?? undefined;
       let trustedCampaignId = existing?.campaignId ?? undefined;
+      if (trustedInboundDeployment && existing) {
+        const bindingState = callMatchesInboundDeployment(existing, trustedInboundDeployment);
+        if (bindingState === 'mismatched') return null;
+        if (bindingState === 'unbound') {
+          existing = await tx.receptionistCallLog.update({
+            where: { id: existing.id },
+            data: {
+              boundProviderAgentId: trustedInboundDeployment.providerAgentId,
+              boundProviderAgentVersion: trustedInboundDeployment.providerAgentVersion,
+              boundProviderConfigRevision: trustedInboundDeployment.providerConfigRevision,
+              boundProviderFingerprint: trustedInboundDeployment.providerFingerprint,
+            },
+          });
+        }
+      }
       if (['book_appointment', 'check_availability'].includes(body.name) && body.call?.agent_id && body.call.agent_version !== undefined) {
         const candidates = await tx.receptionistCampaign.findMany({
           where: {
@@ -2522,11 +2828,28 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
             callerPhone: body.call?.direction === 'outbound' ? body.call.to_number : body.call?.from_number,
             direction: body.call?.direction ?? 'inbound',
             startedAt: new Date(),
+            ...(trustedInboundDeployment ? {
+              boundProviderAgentId: trustedInboundDeployment.providerAgentId,
+              boundProviderAgentVersion: trustedInboundDeployment.providerAgentVersion,
+              boundProviderConfigRevision: trustedInboundDeployment.providerConfigRevision,
+              boundProviderFingerprint: trustedInboundDeployment.providerFingerprint,
+            } : {}),
           },
         });
       }
       return existing;
     });
+
+    if (!activeCall) {
+      const stopped = await stopPhoneCall(providerCallId);
+      await flagRetellIngressReview(tenantId, providerCallId, `Inbound patient-data tool rejected: persisted provider deployment binding mismatch; provider_stop_applied=${stopped.applied}`);
+      return reply.code(202).send({
+        allowed: false,
+        needs_human: true,
+        message: "I'm sorry, the verified receptionist configuration changed for this call. I cannot access or change patient information.",
+        providerStopApplied: stopped.applied,
+      });
+    }
 
     if (['book_appointment', 'check_availability'].includes(body.name)) {
       const selectorMismatch = (query.campaignId !== undefined && query.campaignId !== activeCall.campaignId)
@@ -2703,12 +3026,39 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       };
     }
 
+    if (trustedInboundDeployment) {
+      // Re-read readiness at the final dispatch boundary. Verification expiry,
+      // relinking, revision changes, or provider fingerprint drift after the
+      // initial bind must fail closed before the live tool sees patient data.
+      const finalDeployment = await resolveVerifiedInboundDeployment({
+        tenantId,
+        clinicId: activeCall.clinicId ?? undefined,
+        providerAgentId: body.call?.agent_id,
+        providerAgentVersion: body.call?.agent_version,
+      });
+      if (!finalDeployment.deployment || callMatchesInboundDeployment(activeCall, finalDeployment.deployment) !== 'matched') {
+        const stopped = await stopPhoneCall(providerCallId);
+        await flagRetellIngressReview(
+          tenantId,
+          providerCallId,
+          `Inbound patient-data tool rejected at dispatch boundary: ${finalDeployment.reason ?? 'provider_deployment_drift'}; provider_stop_applied=${stopped.applied}`,
+        );
+        return reply.code(202).send({
+          allowed: false,
+          needs_human: true,
+          message: "I'm sorry, the clinic's verified receptionist configuration is no longer valid for this call. I cannot access or change patient information.",
+          providerStopApplied: stopped.applied,
+        });
+      }
+    }
+
     const result = await handleAgentTool(
       {
         tenantId,
         callId: providerCallId,
         callerPhone: activeCall.callerPhone,
         trustedBooking,
+        trustedProviderAgentId: trustedInboundDeployment?.localAgentId,
       },
       body.name,
       trustedToolArgs,

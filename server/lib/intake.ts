@@ -23,11 +23,6 @@ export type SectionType = typeof SECTION_TYPES[number];
 // only the exact identifier returned in publicView; arbitrary text or a missing
 // checkbox can never be interpreted as acceptance.
 export const INTAKE_ACKNOWLEDGEMENTS = {
-  payment_policy: {
-    id: 'payment_policy:v1',
-    version: 'v1',
-    text: 'I have reviewed and accept the clinic payment and deposit policy presented for this intake.',
-  },
   estimate_acknowledgement: {
     id: 'estimate_acknowledgement:v1',
     version: 'v1',
@@ -204,11 +199,11 @@ export async function publicView(tenantId: string, packet: { id: string; status:
 
 const SECTION_PROMPT: Record<string, string> = {
   demographics: 'Confirm your contact details.',
-  communication_consent: 'Choose how we may contact you (SMS, email, voice). You can opt out anytime.',
+  communication_consent: 'Record any communication channels you do not want the clinic to use. This intake cannot grant outbound contact authority.',
   insurance: 'Add or update your insurance information.',
   insurance_card: 'Provide your insurance card details (metadata only — no image is stored).',
   photo_id: 'Provide your photo ID details (metadata only — no image is stored).',
-  payment_policy: 'Review and acknowledge the clinic payment policy.',
+  payment_policy: 'Payment-policy acknowledgment is unavailable until the clinic publishes exact versioned policy text.',
   estimate_acknowledgement: 'Review your estimated patient responsibility. This is an estimate, not a guarantee.',
   pre_visit_checklist: 'Confirm the pre-visit checklist.',
   consent_forms: 'Review and accept the consent forms.',
@@ -242,6 +237,7 @@ export async function submitSectionMutation(
   if (!packet) throw new Error('packet_not_found');
   const section = await tx.patientIntakeSection.findFirst({ where: { packetId, sectionType } });
   if (!section) throw new Error('section_not_found');
+  if (sectionType === 'payment_policy') throw new Error('payment_policy_unavailable');
 
   const acknowledgement = approvedAcknowledgement(sectionType);
   if (acknowledgement) {
@@ -315,14 +311,16 @@ const CHANNEL_CONSENT_TYPE: Record<string, string> = { sms: 'communication_sms',
 
 async function applyCommunicationConsent(tx: Prisma.TransactionClient, tenantId: string, packet: { id: string; patientId: string | null; leadId: string | null }, data: Record<string, unknown>, ctx: SectionSubmitContext, actorUserId: string | null | undefined, consentEvents: SectionSubmissionOutcome['consentEvents']) {
   for (const channel of ['sms', 'email', 'voice'] as const) {
-    if (!(channel in data)) continue; // only act on explicitly provided choices
-    const optedIn = data[channel] === true;
-    const status = optedIn ? 'opted_in' : 'opted_out';
-    // Update the campaign source of truth (idempotent on the unique key).
+    // The generic intake disclosure is not a purpose/channel-specific grant.
+    // It can preserve a patient's restrictive choice, but never create or
+    // restore outbound authority from a checked box.
+    if (data[channel] !== false) continue;
+    const optedIn = false;
+    const status = 'opted_out';
     const existing = await tx.communicationConsent.findFirst({ where: { tenantId, patientId: packet.patientId ?? null, leadId: packet.leadId ?? null, channel } });
     if (existing) await tx.communicationConsent.update({ where: { id: existing.id }, data: { status, source: 'intake', capturedAt: new Date(), revokedAt: optedIn ? null : new Date() } });
     else await tx.communicationConsent.create({ data: { tenantId, patientId: packet.patientId, leadId: packet.leadId, channel, status, source: 'intake', revokedAt: optedIn ? null : new Date() } });
-    await recordConsent(tx, tenantId, packet, CHANNEL_CONSENT_TYPE[channel], { accepted: optedIn }, ctx, actorUserId, consentEvents, optedIn ? 'intake.consent.accepted' : 'intake.consent.declined');
+    await recordConsent(tx, tenantId, packet, CHANNEL_CONSENT_TYPE[channel], { accepted: optedIn }, ctx, actorUserId, consentEvents, 'intake.consent.declined');
   }
 }
 

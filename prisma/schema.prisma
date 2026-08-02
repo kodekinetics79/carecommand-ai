@@ -125,6 +125,7 @@ model Tenant {
   staffTasks                          StaffTask[]
   revenueSnapshots                    RevenueSnapshot[]
   conversations                       Conversation[]
+  conversationReplyAttempts           ConversationReplyAttempt[]
   revenueLeaks                        RevenueLeak[]
   opportunities                       Opportunity[]
   insurancePayers                     InsurancePayer[]
@@ -255,6 +256,9 @@ model User {
   approvedOutboundCampaigns ReceptionistOutboundCampaign[] @relation("OutboundAuthorityApprover")
   receptionistOptOutRevocations ReceptionistOptOut[] @relation("ReceptionistOptOutRevoker")
   receptionistVoiceConsentEvents ReceptionistVoiceConsentEvent[] @relation("ReceptionistVoiceConsentActor")
+  receptionistCallsReviewed ReceptionistCallLog[] @relation("ReceptionistCallReviewer")
+  receptionistCallsSignedOff ReceptionistCallLog[] @relation("ReceptionistCallSignoff")
+  conversationReplyAttempts ConversationReplyAttempt[]
 
   @@unique([tenantId, email])
   @@unique([tenantId, id])
@@ -548,12 +552,21 @@ model Campaign {
   scheduledAt      DateTime?
   quietHours       Json?
   createdByUserId  String?            @db.Uuid
+  // Soft archive preserves delivery and audit evidence. Archived campaigns are
+  // omitted from the active worklist but remain addressable for evidence review.
+  archivedAt       DateTime?
+  // Durable operator authority for one exact server preview. The scheduler
+  // must recompute the preview and match this fingerprint before dispatch.
+  dispatchAuthorizationFingerprint String?
+  dispatchAuthorizedByUserId        String?   @db.Uuid
+  dispatchAuthorizedAt              DateTime?
   createdAt        DateTime           @default(now())
   updatedAt        DateTime           @updatedAt
   tenant           Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   deliveries       CampaignDelivery[]
 
   @@index([tenantId, status, createdAt])
+  @@index([tenantId, archivedAt, createdAt])
 }
 
 model Review {
@@ -798,8 +811,37 @@ model Conversation {
   tenant             Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   branch             Branch?   @relation(fields: [branchId], references: [id], onDelete: SetNull)
   patient            Patient?  @relation(fields: [patientId], references: [id], onDelete: SetNull)
+  replyAttempts      ConversationReplyAttempt[]
 
+  @@unique([tenantId, id])
   @@index([tenantId, status, updatedAt])
+}
+
+model ConversationReplyAttempt {
+  id                 String       @id @default(uuid()) @db.Uuid
+  tenantId           String       @db.Uuid
+  conversationId     String       @db.Uuid
+  actorUserId        String       @db.Uuid
+  clientAttemptKey   String       @db.Uuid
+  phase              String
+  status             String
+  channel            String
+  destinationMasked  String
+  messageHash        String
+  subjectHash        String
+  senderIdentityHash String
+  providerMode       String?
+  providerMessageId  String?
+  failureCode        String?
+  completedAt        DateTime?
+  createdAt          DateTime     @default(now())
+  tenant             Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade, map: "ConversationReplyAttempt_tenant_fkey")
+  conversation       Conversation @relation(fields: [tenantId, conversationId], references: [tenantId, id], onDelete: Restrict, map: "ConversationReplyAttempt_conversation_scope_fkey")
+  actorUser           User         @relation(fields: [tenantId, actorUserId], references: [tenantId, id], onDelete: Restrict, map: "ConversationReplyAttempt_actor_scope_fkey")
+
+  @@unique([tenantId, conversationId, clientAttemptKey, phase], map: "ConversationReplyAttempt_tenant_conversation_key_phase_key")
+  @@index([tenantId, conversationId, createdAt], map: "ConversationReplyAttempt_tenant_conversation_created_idx")
+  @@index([tenantId, status, createdAt], map: "ConversationReplyAttempt_tenant_status_created_idx")
 }
 
 model RevenueLeak {
@@ -1325,7 +1367,7 @@ model RoleDefinition {
   accent      String   @default("blue")
   sortOrder   Int      @default(0)
   // Optional per-tenant action-permission override (string[] of permission keys
-  // from server/lib/permissions.ts). NULL/empty → the code default matrix applies.
+  // from server/lib/permissions.ts). NULL → code defaults; [] → deny all.
   // When set, it REPLACES the defaults for this role in this tenant and is
   // enforced server-side by requirePermission().
   permissions Json?
@@ -1408,6 +1450,13 @@ enum ReceptionistCallOutcome {
   ESCALATED
   OPTED_OUT
   FAILED
+}
+
+enum ReceptionistCallReviewStatus {
+  UNREVIEWED
+  DRAFT
+  REVIEWED
+  SIGNED_OFF
 }
 
 enum ReceptionistRequestStatus {
@@ -1663,6 +1712,14 @@ model ReceptionistCallLog {
   clinicId                     String?                              @db.Uuid
   campaignId                   String?                              @db.Uuid
   retellCallId                 String?                              @unique
+  // Inbound patient-data tools bind the signed provider envelope to one exact,
+  // currently verified clinic deployment before any tool is dispatched. These
+  // fields are immutable call authority; null is retained for legacy and
+  // outbound rows that predate or do not use inbound tool execution.
+  boundProviderAgentId         String?
+  boundProviderAgentVersion    Int?
+  boundProviderConfigRevision  Int?
+  boundProviderFingerprint     String?
   callerName                   String?
   callerPhone                  String?
   direction                    String                               @default("outbound")
@@ -1670,6 +1727,17 @@ model ReceptionistCallLog {
   durationSeconds              Int                                  @default(0)
   recordingUrl                 String?
   transcriptSummary            String?
+  // Human-authored operational review is kept separate from provider-derived
+  // call analysis. The JSON shape is server-controlled and includes explicit
+  // STAFF_ENTERED attribution for each structured field.
+  operationalNotes             Json?
+  unresolvedActionItems        String[]                             @default([])
+  reviewStatus                 ReceptionistCallReviewStatus         @default(UNREVIEWED)
+  reviewRevision               Int                                  @default(0)
+  reviewedByUserId             String?                              @db.Uuid
+  reviewedAt                   DateTime?
+  signedOffByUserId            String?                              @db.Uuid
+  signedOffAt                  DateTime?
   recordingConsentStatus       ReceptionistRecordingConsentStatus   @default(UNDETERMINED)
   recordingConsentAt           DateTime?
   recordingRetentionExpiresAt  DateTime?
@@ -1694,6 +1762,8 @@ model ReceptionistCallLog {
   recordingConsentEvents       ReceptionistRecordingConsentEvent[]
   artifactLifecycleEvents      ReceptionistArtifactLifecycleEvent[]
   legalHolds                   ReceptionistCallLegalHold[]
+  reviewedBy                   User?                                @relation("ReceptionistCallReviewer", fields: [tenantId, reviewedByUserId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallLog_reviewer_scope_fkey")
+  signedOffBy                  User?                                @relation("ReceptionistCallSignoff", fields: [tenantId, signedOffByUserId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallLog_signoff_scope_fkey")
   appointmentRequests          AppointmentRequest[]               @relation("AppointmentRequestSourceCall")
   appointments                 Appointment[]                      @relation("AppointmentSourceCall")
 
@@ -1703,6 +1773,8 @@ model ReceptionistCallLog {
   @@index([outboundCampaignId])
   @@index([tenantId, recordingRetentionExpiresAt])
   @@index([tenantId, transcriptRetentionExpiresAt])
+  @@index([tenantId, reviewStatus, updatedAt])
+  @@index([tenantId, boundProviderAgentId, boundProviderAgentVersion])
 }
 
 // Append-only recording decisions. Database triggers reject UPDATE and DELETE.
@@ -2636,7 +2708,13 @@ model CampaignDelivery {
   providerMessageId String?
   idempotencyKey    String?
   failureReason     String?
+  // A provider 2xx response is acceptance, not proof of delivery. `sentAt` is
+  // retained for backward compatibility; new code records the truthful
+  // acceptance/delivery milestones below.
   sentAt            DateTime?
+  providerAcceptedAt DateTime?
+  deliveredAt       DateTime?
+  statusUpdatedAt   DateTime  @default(now())
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
   tenant            Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
@@ -2644,6 +2722,7 @@ model CampaignDelivery {
 
   @@unique([campaignId, patientId, leadId, channel])
   @@index([tenantId, status, createdAt])
+  @@index([tenantId, providerMessageId])
 }
 
 // ===========================================================================
@@ -3088,6 +3167,11 @@ model DeviceReading {
   receivedAt       DateTime @default(now())
   source           String   @default("device") // device | webhook | manual | import
   validationStatus String   @default("valid") // valid | suspect | invalid
+  // Set only after a signed automated provider event resolves to one exact RPM
+  // enrollment. Legacy, manual, imported, and ambiguous readings remain null and
+  // cannot qualify as RPM device-day evidence.
+  sourceProviderKey  String?
+  sourceEnrollmentId String? @db.Uuid
   // Idempotency key for provider-sourced readings (webhook redeliveries collapse
   // to one row). Null for manual/keyless readings — Postgres treats NULLs as
   // distinct, so the unique index never blocks legitimate manual entries.
@@ -3095,10 +3179,12 @@ model DeviceReading {
   rawPayload       Json?
   createdAt        DateTime @default(now())
   tenant           Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  sourceEnrollment PatientDeviceEnrollment? @relation("DeviceReadingSourceEnrollment", fields: [tenantId, sourceEnrollmentId], references: [tenantId, id], onDelete: Restrict, map: "DeviceReading_source_enrollment_scope_fkey")
 
   @@unique([tenantId, dedupeKey])
   @@index([tenantId, capturedAt])
   @@index([tenantId, patientId, readingType, capturedAt])
+  @@index([tenantId, sourceEnrollmentId, capturedAt])
 }
 
 // Backend-generated alerts (severity/type decided server-side).
@@ -3273,8 +3359,10 @@ model PatientDeviceEnrollment {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
   tenant      Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  sourcedReadings DeviceReading[] @relation("DeviceReadingSourceEnrollment")
 
   @@unique([tenantId, patientId, providerKey])
+  @@unique([tenantId, id])
   @@index([tenantId, status])
 }
 
@@ -3334,6 +3422,7 @@ model RPMBillingReadiness {
   // A signoff is valid only for the exact canonical evidence snapshot reviewed.
   providerSignoffEvidenceVersion String?
   providerSignoffEvidenceHash    String?
+  providerSignoffAttestationRevision String?
   status                String    @default("MISSING_REQUIREMENTS") // READY | NEEDS_REVIEW | MISSING_REQUIREMENTS
   missingRequirements   Json?
   updatedAt             DateTime  @updatedAt

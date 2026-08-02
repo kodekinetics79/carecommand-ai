@@ -17,6 +17,7 @@ import {
   buildRpmEvidenceSnapshot,
   invalidateRpmProviderSignoff,
   lockRpmEvidence,
+  RPM_SIGNOFF_ATTESTATION_REVISION,
   rpmPeriodBounds,
 } from '../../lib/connectedCare/rpmEvidence';
 import { computeAndStoreRpmReadiness } from '../../lib/connectedCare/rpmReadinessService';
@@ -217,8 +218,18 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
     const patientIds = [...new Set(enrollments.map(e => e.patientId))];
     const names = await patientNames(tenantId, patientIds);
     const rows = await Promise.all(patientIds.map(async pid => {
-      const { row, result, readingDays } = await computeAndStoreRpmReadiness(tenantId, pid);
-      return { patientId: pid, patientName: names.get(pid) ?? 'Unknown', status: result.status, missing: result.missing, requirements: result.requirements, readingDays, reviewMinutes: row.reviewMinutes, communicationFlag: row.communicationFlag, providerSignoffAt: row.providerSignoffAt, minReadingDays: RPM_MIN_READING_DAYS };
+      const { row, result, readingDays, evidence } = await computeAndStoreRpmReadiness(tenantId, pid);
+      return {
+        patientId: pid, patientName: names.get(pid) ?? 'Unknown', status: result.status,
+        missing: result.missing, requirements: result.requirements, readingDays,
+        reviewMinutes: row.reviewMinutes, communicationFlag: row.communicationFlag,
+        providerSignoffAt: row.providerSignoffAt, minReadingDays: RPM_MIN_READING_DAYS,
+        evidenceVersion: evidence.version, evidenceHash: evidence.hash,
+        signoffAttestationRevision: RPM_SIGNOFF_ATTESTATION_REVISION,
+        qualifyingReadingCount: evidence.qualifyingReadingCount,
+        excludedReadingCount: evidence.excludedReadingCount,
+        deviceExceptions: evidence.deviceExceptions,
+      };
     }));
     await audit(request, { action: 'connectedcare.rpm_readiness.read', resource: 'rpmBillingReadiness', metadata: { patientCount: rows.length } });
     return rows.sort((a, b) => (a.status === 'READY' ? 1 : 0) - (b.status === 'READY' ? 1 : 0));
@@ -274,6 +285,11 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
   // Provider signoff. Never auto-submits a claim.
   app.post('/rpm-readiness/:patientId/signoff', { preHandler: providerRole }, async request => {
     const { patientId } = z.object({ patientId: uuid }).parse(request.params);
+    const input = z.object({
+      expectedEvidenceVersion: z.string().trim().min(1).max(80),
+      expectedEvidenceHash: z.string().regex(/^[a-f0-9]{64}$/),
+      attestationRevision: z.string().trim().min(1).max(80),
+    }).parse(request.body ?? {});
     const tenantId = request.auth.tenantId;
     const period = rpmPeriodBounds();
     const { patient } = await assertPatientEnrollmentAccess(request, patientId, true);
@@ -286,6 +302,12 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
     return db.$transaction(async tx => {
       await lockRpmEvidence(tx, tenantId, patientId, period.start);
       const evidence = await buildRpmEvidenceSnapshot(tx, tenantId, patientId, period);
+      if (input.expectedEvidenceVersion !== evidence.version || input.expectedEvidenceHash !== evidence.hash) {
+        throw app.httpErrors.conflict('RPM evidence changed after review; refresh the preview and review the current evidence before signing');
+      }
+      if (input.attestationRevision !== RPM_SIGNOFF_ATTESTATION_REVISION) {
+        throw app.httpErrors.conflict('RPM provider attestation revision is stale; refresh and review the current attestation');
+      }
       const withoutSignoff = computeRpmReadiness({
         consentGranted: evidence.consentGranted,
         enrollmentActive: evidence.enrollmentActive,
@@ -315,13 +337,16 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
           providerSignoffUserId: request.auth.userId, providerSignoffAt: signoffAt,
           providerSignoffEvidenceVersion: evidence.version,
           providerSignoffEvidenceHash: evidence.hash,
+          providerSignoffAttestationRevision: input.attestationRevision,
           status: result.status, missingRequirements: result.missing,
         },
         update: {
-          readingDays: evidence.readingDays, periodEnd: period.end,
+          readingDays: evidence.readingDays, reviewMinutes: evidence.reviewMinutes,
+          communicationFlag: evidence.communicationFlag, periodEnd: period.end,
           providerSignoffUserId: request.auth.userId, providerSignoffAt: signoffAt,
           providerSignoffEvidenceVersion: evidence.version,
           providerSignoffEvidenceHash: evidence.hash,
+          providerSignoffAttestationRevision: input.attestationRevision,
           status: result.status, missingRequirements: result.missing,
         },
       });
@@ -339,6 +364,7 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
             providerProfileId, signedAt: signoffAt.toISOString(),
             evidenceModel: 'canonical_versioned_snapshot',
             evidenceVersion: evidence.version, evidenceHash: evidence.hash,
+            attestationRevision: input.attestationRevision,
           },
         },
       });
@@ -392,27 +418,33 @@ export const connectedCareWebhookRoutes: FastifyPluginAsync = async app => {
       if (!isPlausibleNormalizedReading(r)) { invalid++; continue; }
       let patientId = r.patientId ?? null;
       let branchId: string | null = null;
+      let sourceEnrollment: { id: string; patientId: string; branchId: string | null; deviceId: string | null } | null = null;
       if (patientId) {
         const [patient, enrollment] = await Promise.all([
           db.patient.findFirst({ where: { id: patientId, tenantId, deletedAt: null }, select: { id: true } }),
           db.patientDeviceEnrollment.findFirst({
             where: { tenantId, patientId, providerKey: key, status: 'active' },
-            select: { patientId: true, branchId: true },
+            select: { id: true, patientId: true, branchId: true, deviceId: true },
           }),
         ]);
         if (!patient || !enrollment) { invalid++; continue; }
         patientId = enrollment.patientId;
         branchId = enrollment.branchId;
+        sourceEnrollment = enrollment;
       }
       if (!patientId && r.patientExternalRef) {
         const enrollments = await db.patientDeviceEnrollment.findMany({
           where: { tenantId, providerKey: key, externalRef: r.patientExternalRef, status: 'active' },
-          select: { patientId: true, branchId: true },
+          select: { id: true, patientId: true, branchId: true, deviceId: true },
           take: 2,
         });
-        if (enrollments.length === 1) { patientId = enrollments[0]!.patientId; branchId = enrollments[0]!.branchId; }
+        if (enrollments.length === 1) {
+          sourceEnrollment = enrollments[0]!;
+          patientId = sourceEnrollment.patientId;
+          branchId = sourceEnrollment.branchId;
+        }
       }
-      if (!patientId) { invalid++; continue; }
+      if (!patientId || !sourceEnrollment || !branchId) { invalid++; continue; }
 
       const dedupeKey = readingDedupeKey({
         providerKey: key,
@@ -444,7 +476,16 @@ export const connectedCareWebhookRoutes: FastifyPluginAsync = async app => {
           const duplicate = await tx.deviceReading.findFirst({ where: { tenantId, dedupeKey }, select: { id: true } });
           if (duplicate) return { duplicate: true, alert: false };
           const reading = await tx.deviceReading.create({
-            data: { tenantId, patientId, branchId, readingType: r.readingType, value: r.value, numericValue: r.numericValue ?? null, valueSecondary: r.valueSecondary ?? null, unit: r.unit ?? null, capturedAt: r.capturedAt, source: 'webhook', validationStatus: 'valid', dedupeKey, rawPayload: r as unknown as object },
+            data: {
+              tenantId, patientId, branchId, deviceId: sourceEnrollment.deviceId,
+              readingType: r.readingType, value: r.value,
+              numericValue: r.numericValue ?? null, valueSecondary: r.valueSecondary ?? null,
+              unit: r.unit ?? null, capturedAt: r.capturedAt, source: 'webhook',
+              validationStatus: 'valid', dedupeKey,
+              sourceProviderKey: sourceEnrollment.deviceId ? key : null,
+              sourceEnrollmentId: sourceEnrollment.deviceId ? sourceEnrollment.id : null,
+              rawPayload: r as unknown as object,
+            },
             select: { id: true },
           });
           let alertId: string | null = null;

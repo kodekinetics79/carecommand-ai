@@ -1,9 +1,11 @@
 # Test Execution Evidence
 
-Date: 2026-07-30  
+Date: 2026-07-31
 Environment: local macOS workspace; Node 24; PostgreSQL 17 and Redis 7 in local containers; synthetic data only. No production system or real PHI was accessed.
 
-This file supersedes earlier same-day test-count snapshots. All results below are local synthetic evidence and are reproduced from the committed release-candidate state before the annotated local tag.
+The 2026-07-31 table below supersedes earlier test-count snapshots. All results
+are local synthetic evidence. No production system or real PHI was accessed,
+and no tag, push, or deployment is represented here.
 
 ## Current completed checkpoints
 
@@ -11,16 +13,18 @@ This file supersedes earlier same-day test-count snapshots. All results below ar
 |---|---|
 | `npm run check` | PASS: Prisma validation, API TypeScript, ESLint, application TypeScript, and Vite production build |
 | `npm run verify:no-production-demo-artifacts` | PASS: production source/configuration/server/Prisma/build scan |
-| `npm audit --omit=dev --audit-level=high` | PASS: zero vulnerabilities |
-| `npm audit signatures` | PASS: 576 package signatures and 194 attestations |
-| `npm run verify:prisma-drift` | PASS at the 71-migration M09-F02 checkpoint: no unexpected destructive drift; 121 migration-owned composite FKs and 143 migration-owned indexes recognized |
-| `npm run rls:verify` | PASS at the 71-migration M09-F02 checkpoint: 127 application tables, 119 protected, 8 exemptions, 522 policies, ENABLE/FORCE 119/119; safe runtime role |
-| `RLS_DISPOSABLE_DB_ACK=CREATE_AND_DROP_LOCAL_RLS_TEST_DATABASE npm run test:rls:behavior` | PASS at the 71-migration M09-F02 checkpoint: 1 file, 962/962 assertions; E.164 fixture generation corrected so the suite executes rather than skips at setup |
-| M09-F02 immutable provider-agent readiness | INDEPENDENT PASS at exact `499809aa3fbf0b55a7e51e73d70648be89550726`: detached fresh 71-migration database and 47/47 focused tests; pod 117/117 receptionist and 962/962 RLS. Exact Retell GET/auth/tag and outbound request/response ID/version contract, stop success/failure, durable INVALID/PAUSED/FAILED circuit, isolated and simultaneous OperationalSignal/StaffTask/AuditEvent outage truthfulness, all same-agent runnable campaign pause, visible retry error, no second dial, V0, tenant/clinic/branch scope, drift attempt/audit, activation/dial freshness and concurrency pass; typecheck, targeted lint, production build and diff check pass |
-| `NODE_ENV=test RELEASE_DB_LIFECYCLE_ACK=CREATE_DROP_LOCAL_RELEASE_TEST_DATABASES npm run verify:db-lifecycle` | PASS at current 69-migration checkpoint: deterministic seed; 2 tenants, 3 clinics, 12 users, 24 patients, 48 appointments, 16 calls, 12 payments, 12 documents, 24 notifications, 48 audits; 119 forced-RLS tables; 120 tenant FKs |
-| `npm test` repeated twice | PASS: 78 files, 469/469 tests on each consecutive final-tree run |
+| `npm audit --omit=dev --audit-level=moderate` | PASS: zero vulnerabilities |
+| `npm audit signatures` | PASS: 575 package signatures and 194 attestations |
+| Fresh-database `npm run verify:prisma-drift` | PASS: only 123 migration-owned composite FKs and 138 migration-owned indexes differ |
+| `npm run rls:verify` | PASS: 131 application tables, 123 protected, 8 exemptions, 522 policies, ENABLE/FORCE 123/123; safe runtime role |
+| `RLS_DISPOSABLE_DB_ACK=CREATE_AND_DROP_LOCAL_RLS_TEST_DATABASE npm run test:rls:behavior` | PASS: 1 file, 994/994 assertions |
+| `NODE_ENV=test RELEASE_DB_LIFECYCLE_ACK=CREATE_DROP_LOCAL_RELEASE_TEST_DATABASES npm run verify:db-lifecycle` | PASS: all 86 migrations; deterministic seed and backup/restore parity; 123 forced-RLS tables and 123 tenant FKs |
+| Full disposable `npm test` | PASS: 106 files, 1,878/1,878 tests |
 | `npm run test:e2e` | PASS: 10/10 real-backend Chromium tests across desktop and Pixel 7 |
-| Independent QA focused challenge | PASS runtime review: 22 files, 145/145 tests; API typecheck, lint, production audit, and diff check pass |
+| Content SME and independent QA challenge | PASS: regulated content, autonomy, consent, revenue, eligibility, security-claim, localization and accessible-dialog findings closed; focused content suite 48/48 |
+| Authentication security challenge | PASS: focused disposable auth suite 12/12, including reset atomicity, revocation, timing and concurrent lockout cases |
+| Production engineering | PASS: 2 files, 32/32 tests; production artifact verifier passed |
+| SBOM | CycloneDX 1.5, 629 components, generated at `/tmp/carecommand-ai-sbom.json` |
 | Final RPM focused implementation/independent challenge | PASS: 7 files, 82/82 tests; server typecheck, focused lint, Prisma validate/drift, and independent QA acceptance pass |
 | Final platform-auth independent challenge | PASS: 4 files, 19/19 tests; generic response/work and fail-closed store behavior accepted with zero P0/P1 |
 | Mandatory audit durability | PASS: independent challenge accepts platform/auth/pilot, production role planes, payment terminal/concurrency/reconciliation, receptionist, and intake paths with P0=0/P1=0 |

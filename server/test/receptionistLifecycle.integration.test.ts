@@ -38,8 +38,22 @@ async function makeTenant() {
   await db.tenantFeatureEntitlement.create({ data: { tenantId: id, featureKey: 'ai_receptionist', enabled: true, source: 'test' } });
   const user = await db.user.create({ data: { tenantId: id, role: 'OWNER', active: true, email: `owner-${id.slice(0, 8)}@life.test`, displayName: 'Owner' } });
   const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Main clinic', phone: phoneFor(id) }, select: { id: true } });
-  await db.receptionistAgent.create({ data: { tenantId: id, clinicId: clinic.id, name: 'Avery', active: true } });
-  return { id, userId: user.id, clinicId: clinic.id };
+  const providerAgentId = `agent_${id.replaceAll('-', '')}`;
+  const providerAgentVersion = 2;
+  const verifiedAt = new Date();
+  await db.receptionistAgent.create({ data: {
+    tenantId: id, clinicId: clinic.id, name: 'Avery', active: true,
+    providerAgentId, providerVersionTag: 'prod', providerVersion: providerAgentVersion, providerStatus: 'VERIFIED',
+    providerPublished: true, providerAssignedTags: ['prod'],
+    providerWebhookUrl: 'https://api.example.test/v1/receptionist/webhooks/retell',
+    providerWebhookEvents: ['call_started', 'call_ended', 'call_analyzed'],
+    providerDataStorageSetting: 'basic_attributes_only', providerSignedUrl: true,
+    providerResponseEngineType: 'retell-llm', providerResponseEngineId: `llm_${id.replaceAll('-', '')}`,
+    providerResponseEngineVersion: 1,
+    providerFingerprint: 'c'.repeat(64), providerConfigRevision: 1, providerVerifiedRevision: 1,
+    providerVerifiedAt: verifiedAt, providerVerificationExpiresAt: new Date(verifiedAt.getTime() + 60 * 60_000),
+  } });
+  return { id, userId: user.id, clinicId: clinic.id, providerAgentId, providerAgentVersion };
 }
 const authFor = (t: { id: string; userId: string }) => ({ authorization: `Bearer ${app.jwt.sign({ userId: t.userId, tenantId: t.id, role: 'OWNER', type: 'access' })}` });
 
@@ -97,7 +111,7 @@ describe('receptionist inbound-call lifecycle (event webhook)', () => {
     expect((await webhookTool(t.clinicId, {
       name: 'record_recording_preference',
       args: { recording_decision: 'GRANTED', jurisdiction: 'US-NY' },
-      call: { call_id: callId, from_number: caller, direction: 'inbound' },
+      call: { call_id: callId, agent_id: t.providerAgentId, agent_version: t.providerAgentVersion, from_number: caller, direction: 'inbound' },
     })).statusCode).toBe(200);
 
     // 2. call_analyzed → updates the same log and creates one pending review;

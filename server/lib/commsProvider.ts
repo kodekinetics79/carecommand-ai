@@ -1,6 +1,9 @@
 import { env } from '../config/env';
 import { db } from './db';
-import { channelStatus, isSuppressed, toE164, isValidE164, isValidEmail, type CommChannel } from './campaigns';
+import {
+  channelStatus, hasAffirmativeNonVoiceOutreachAuthority, isSuppressed,
+  toE164, isValidE164, isValidEmail, type CommChannel,
+} from './campaigns';
 
 // ===========================================================================
 // Real communications send abstraction. Dependency-free (raw HTTP, matching the
@@ -22,7 +25,12 @@ export interface SendResult { ok: boolean; status: 'sent' | 'pending' | 'failed'
 // Who a message is for, so the send-time gate can resolve suppression. tenantId
 // is required — a send with no tenant can never be safely consent-checked, and
 // making it required forces every call site to be explicit (fail-closed).
-export interface SendContext { tenantId: string; patientId?: string | null; leadId?: string | null }
+export interface SendContext {
+  tenantId: string;
+  patientId?: string | null;
+  leadId?: string | null;
+  regulatedOutreach?: { purpose: string };
+}
 
 type ConfirmationAuthorization = {
   tenantId: string;
@@ -48,7 +56,7 @@ async function sendTwilio(toNumber: string, body: string): Promise<SendResult> {
     if (!res.ok || !payload?.sid) return { ok: false, status: 'failed', mode: 'live', failureReason: payload?.message ?? `twilio_error_${res.status}` };
     return { ok: true, status: 'sent', providerMessageId: payload.sid, mode: 'live' };
   } catch (error) {
-    return { ok: false, status: 'failed', mode: 'live', failureReason: error instanceof Error ? error.message : 'twilio_request_failed' };
+    return { ok: false, status: 'failed', mode: 'live', failureReason: `transport_ambiguous:${error instanceof Error ? error.message : 'twilio_request_failed'}` };
   }
 }
 
@@ -64,7 +72,7 @@ async function sendEmailHttp(to: string, subject: string, body: string): Promise
     if (!res.ok || !id) return { ok: false, status: 'failed', mode: 'live', failureReason: payload?.message ?? `email_error_${res.status}` };
     return { ok: true, status: 'sent', providerMessageId: id, mode: 'live' };
   } catch (error) {
-    return { ok: false, status: 'failed', mode: 'live', failureReason: error instanceof Error ? error.message : 'email_request_failed' };
+    return { ok: false, status: 'failed', mode: 'live', failureReason: `transport_ambiguous:${error instanceof Error ? error.message : 'email_request_failed'}` };
   }
 }
 
@@ -86,6 +94,26 @@ export async function sendMessage(channel: CommChannel, destination: string, sub
     return { ok: false, status: 'suppressed', mode: 'suppressed', failureReason: 'suppressed_or_opted_out' };
   }
 
+  // Dev/test mock delivery stays available for synthetic pilots. A real
+  // non-voice campaign boundary is stricter: it requires exact versioned
+  // authority, and remains conservatively disabled until consent capture and
+  // the provider submission claim can be linearized under one durable fence.
+  // This prevents an opt-out racing the last application check before provider
+  // I/O and makes unsafe live activation fail closed.
+  const syntheticMock = status.mock && env.NODE_ENV !== 'production';
+  if (context.regulatedOutreach && !syntheticMock && (channel === 'sms' || channel === 'email' || channel === 'whatsapp')) {
+    const authorized = await hasAffirmativeNonVoiceOutreachAuthority(
+      context.tenantId,
+      { patientId: context.patientId, leadId: context.leadId },
+      channel,
+      context.regulatedOutreach.purpose,
+    );
+    if (!authorized) {
+      return { ok: false, status: 'failed', mode: 'live', failureReason: 'affirmative_outreach_authority_required' };
+    }
+    return { ok: false, status: 'failed', mode: 'live', failureReason: 'live_outreach_atomic_boundary_not_activated' };
+  }
+
   return sendToConfiguredProvider(channel, destination, subject, body, idempotencyKey, status);
 }
 
@@ -104,31 +132,49 @@ export async function sendAuthorizedAppointmentConfirmation(
   idempotencyKey: string,
   authorization: ConfirmationAuthorization,
 ): Promise<SendResult> {
-  const intent = await db.notificationDeliveryAttempt.findUnique({
-    where: { tenantId_notificationEventId_attemptNumber_phase: {
+  // Claim submission exactly once under the same event advisory lock used by
+  // the outbox state machine. The provider request stays outside the database
+  // transaction, but no concurrent worker can pass this boundary twice.
+  const claimed = await db.$transaction(async tx => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-confirmation:${authorization.tenantId}:${authorization.eventId}`})::bigint)`;
+    const intent = await tx.notificationDeliveryAttempt.findUnique({
+      where: { tenantId_notificationEventId_attemptNumber_phase: {
+        tenantId: authorization.tenantId,
+        notificationEventId: authorization.eventId,
+        attemptNumber: authorization.attemptNumber,
+        phase: 'PROVIDER_INTENT',
+      } },
+      include: { notificationEvent: { include: {
+        appointment: { select: { patient: { select: { phone: true, email: true } } } },
+        deliveryAttempts: {
+          where: { attemptNumber: authorization.attemptNumber, phase: { in: ['SUBMISSION_CLAIM', 'RESULT', 'RECEIPT'] } },
+          select: { id: true },
+        },
+      } } },
+    });
+    const event = intent?.notificationEvent;
+    const expectedDestination = channel === 'sms' ? event?.appointment?.patient.phone : event?.appointment?.patient.email;
+    const destinationMatches = channel === 'sms'
+      ? toE164(expectedDestination ?? '') === toE164(destination)
+      : (expectedDestination ?? '').trim().toLowerCase() === destination.trim().toLowerCase();
+    if (!intent || intent.status !== 'provider_intent_committed' || !intent.completedAt
+      || event?.source !== 'receptionist.appointment_confirmation'
+      || event.status !== 'retrying' || event.attempts !== authorization.attemptNumber
+      || event.deliveryAttempts.length !== 0
+      || event.channel !== channel || event.idempotencyKey !== idempotencyKey || !destinationMatches) {
+      return false;
+    }
+    await tx.notificationDeliveryAttempt.create({ data: {
       tenantId: authorization.tenantId,
       notificationEventId: authorization.eventId,
       attemptNumber: authorization.attemptNumber,
-      phase: 'PROVIDER_INTENT',
-    } },
-    include: { notificationEvent: { include: {
-      appointment: { select: { patient: { select: { phone: true, email: true } } } },
-      deliveryAttempts: {
-        where: { attemptNumber: authorization.attemptNumber, phase: { in: ['RESULT', 'RECEIPT'] } },
-        select: { id: true },
-      },
-    } } },
+      phase: 'SUBMISSION_CLAIM',
+      status: 'submission_claimed',
+      completedAt: new Date(),
+    } });
+    return true;
   });
-  const event = intent?.notificationEvent;
-  const expectedDestination = channel === 'sms' ? event?.appointment?.patient.phone : event?.appointment?.patient.email;
-  const destinationMatches = channel === 'sms'
-    ? toE164(expectedDestination ?? '') === toE164(destination)
-    : (expectedDestination ?? '').trim().toLowerCase() === destination.trim().toLowerCase();
-  if (!intent || intent.status !== 'provider_intent_committed' || !intent.completedAt
-    || event?.source !== 'receptionist.appointment_confirmation'
-    || event.status !== 'retrying' || event.attempts !== authorization.attemptNumber
-    || event?.deliveryAttempts.length !== 0
-    || event.channel !== channel || event.idempotencyKey !== idempotencyKey || !destinationMatches) {
+  if (!claimed) {
     return { ok: false, status: 'failed', mode: 'configured_pending_provider', failureReason: 'durable_authorization_invalid' };
   }
   const status = channelStatus(channel);

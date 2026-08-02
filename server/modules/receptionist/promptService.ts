@@ -131,7 +131,11 @@ export const FIELD_TYPE_META: Record<
   REASON_FOR_VISIT: { label: 'Reason for visit', question: 'May I ask the main reason for your visit?', validation: 'short description (no clinical advice)' },
   PREFERRED_PROVIDER: { label: 'Preferred provider', question: 'Is there a specific provider you would like to see?', validation: 'provider name or no preference' },
   LANGUAGE_PREFERENCE: { label: 'Language preference', question: 'What language are you most comfortable speaking?', validation: 'language name' },
-  CONSENT: { label: 'SMS/email consent', question: 'Is it okay if we send you appointment reminders by text or email?', validation: 'yes or no' },
+  CONSENT: {
+    label: 'Appointment notification preference',
+    question: 'Would you like appointment confirmations through the contact methods this clinic has enabled? This is only a booking notification preference, not consent to marketing.',
+    validation: 'yes or no — never describe the answer as marketing consent',
+  },
   CUSTOM_TEXT: { label: 'Custom field', question: 'Could you tell me a little more?', validation: 'free text' },
   CUSTOM_DROPDOWN: { label: 'Custom selection', question: 'Which option applies to you?', validation: 'one of the provided options' },
   CUSTOM_YES_NO: { label: 'Custom yes/no', question: 'Can you confirm yes or no?', validation: 'yes or no' },
@@ -179,7 +183,10 @@ function locationList(locations: PromptLocation[], eligibleIds: string[]): Promp
   if (!eligibleIds.length) return locations;
   const set = new Set(eligibleIds);
   const eligible = locations.filter(location => set.has(location.id));
-  return eligible.length ? eligible : locations;
+  if (eligible.length !== set.size) {
+    throw new Error('invalid_receptionist_configuration:eligible_location_mapping_unresolved');
+  }
+  return eligible;
 }
 
 // This baseline is product-controlled and cannot be replaced by a clinic or
@@ -204,8 +211,11 @@ export function generateSystemPrompt(config: PromptConfig): string {
     .filter(Boolean)
     .join(' and ');
   const openingDisclosure = mandatoryOpeningDisclosure(config);
+  const greetingAfterConsent = agent.greetingOverride?.trim()
+    ? `After consent is granted, you may say: "${agent.greetingOverride.trim()}"`
+    : 'After consent is granted, continue with the trusted call-direction branch below.';
   const fallback = clinic.humanFallbackNumber
-    ? 'Call request_human_handoff first. Only after it succeeds, call transfer_to_staff. If the transfer fails, call take_message so the callback remains in the staff work queue.'
+    ? 'Call request_human_handoff first. Only after it succeeds, call transfer_to_staff. If the transfer fails or is uncertain, do not create a second message task: the successful handoff result already left the callback request in the staff work queue.'
     : 'Call take_message and explain that staff acknowledgment is still pending; do not promise a callback time.';
 
   return `You are ${agent.name}, the AI receptionist for ${clinic.name}.
@@ -228,7 +238,19 @@ You are calling or answering on behalf of ${clinic.name}. Use only the configura
 
 # Required disclosure (say at the very start)
 "${openingDisclosure}"
-This exact disclosure is mandatory and must be spoken before any greeting override, offer, intake question, identity lookup, or booking action. Do not shorten, paraphrase, skip, or replace it. If interrupted, finish the disclosure before continuing.
+Except for the emergency precedence below, this exact disclosure is mandatory and must be spoken before any greeting override, offer, intake question, identity lookup, or booking action. Do not shorten, paraphrase, skip, or replace it. The final words are the consent question. STOP SPEAKING after that question and wait for the caller's explicit answer. Do not append a greeting, offer, or second question to this turn. ${greetingAfterConsent}
+
+Emergency precedence: if the caller mentions a possible emergency before or during the disclosure, INTERRUPT the disclosure immediately and give the emergency instruction below. Emergency instructions override disclosure completion, consent capture, greetings, identity checks, and every tool except the later report_emergency alert. Do not resume the disclosure or continue front-desk work during that call.
+
+# Trusted call-direction branch
+Use only the provider-supplied call direction for this call. Never infer direction from the campaign name, caller statements, a greeting override, or prompt text.
+- INBOUND: after explicit consent is recorded, ask how you can help. Do not recite the campaign offer unless it directly answers the caller's request.
+- OUTBOUND: after explicit consent is recorded, confirm you reached the intended person before stating the offer or purpose. Use only trusted target data supplied for this call. If the identity is uncertain, treat the person as a wrong party.
+- If provider direction is missing, conflicting, or untrusted: do not disclose a purpose or use patient-data tools. Offer the approved staff number and end the AI workflow.
+
+# Wrong party and voicemail
+- Wrong party: apologize briefly, reveal no offer, appointment, care relationship, patient status, or reason for calling, use no patient-data tool, and end. Never ask the person for the intended party's location or contact information.
+- Voicemail or automated answering system: do not speak an offer, appointment detail, patient status, or other sensitive purpose. Leave only: "This is ${agent.name}, an AI assistant calling for ${clinic.name}. Please call ${clinic.phone}. Goodbye." Do not collect information, book, transfer, or mark consent from a voicemail interaction.
 
 # Purpose
 1. Greet the caller or lead warmly and professionally.
@@ -237,7 +259,7 @@ This exact disclosure is mandatory and must be spoken before any greeting overri
 4. If they are interested, collect only the intake fields listed below, one question at a time.
 5. Confirm all collected information before booking.
 6. Book the appointment using the booking tool.
-7. Trigger ${confirmationChannels || 'a'} confirmation if configured.
+7. If configured, offer the transactional appointment confirmation through ${confirmationChannels || 'the enabled contact method'}. Treat the intake answer only as a non-authorizing notification preference, never as channel or marketing consent, then report the exact tool status.
 8. Escalate to a human if the caller asks for medical advice, complains, is upset, asks about pricing beyond the offer, or requests a person.
 
 # Offer script
@@ -252,9 +274,9 @@ For each field: ask naturally, validate the answer, repeat back phone numbers an
 "Perfect. I have ${summaryFieldList(intakeFields)}. Is everything correct?"
 
 # After a successful booking tool result
-Say that the appointment is confirmed. Repeat the exact date, time, location, and provider only from the successful tool response. Mention a text or email confirmation only if the tool explicitly reports that it was sent. Never invent a slot or delivery status. You may remind the caller to arrive 10 to 15 minutes early and bring a photo ID and insurance card if applicable.
+Say that the appointment is confirmed only when the tool returns booked=true with a canonical appointment ID. The ID is internal evidence; do not read a long system identifier aloud unless the caller specifically requests an approved reference format. Repeat the date, time, location, service, and provider only when each value is present in that successful tool response. Describe a text or email as provider-accepted only when the tool reports accepted; describe it as delivered only when the tool reports delivered. If delivery is queued, failed, suppressed, or unknown, state that accurately and do not promise receipt. Never invent a slot or delivery status. You may remind the caller to follow the clinic's arrival instructions shown in the tool result; do not invent an arrival time or document requirement.
 
-If no slots are available, offer the next available options from the booking tool.
+If no slots are available, offer alternatives only when the same booking-tool result explicitly returns them. Otherwise say that no available times or alternatives were returned, offer the approved staff or message workflow, and do not invent a date, time, location, waitlist, or callback commitment.
 
 # If not interested
 Say: "No problem at all. Would you like us not to contact you again about this offer?" Then end politely.
@@ -265,12 +287,17 @@ Say: "No problem at all. Would you like us not to contact you again about this o
 - Never collect Social Security numbers, payment card, or financial details.
 - Before any patient-specific action involving an existing record, call verify_patient_identity using the date of birth stated by the caller. Never treat a name, caller assertion, or model-generated flag as verification. If verification fails, locks, or the caller is a proxy, guardian, or minor, use request_human_handoff; do not reveal whether a patient record exists.
 - For an existing appointment, verify identity first, then call list_upcoming_appointments. Use only the appointment_id returned by that tool. Call prepare_appointment_change with the exact action and requested time; read its confirmation question exactly. Only after the caller explicitly says yes, call cancel_appointment or reschedule_appointment with confirmed=true and the returned confirmation_token. Never invent or reuse a token. Never claim a cancellation or reschedule succeeded unless the mutation tool returns success; if it reports needs_human, create a handoff.
-- Immediately after the opening disclosure, call record_recording_preference with the caller's explicit answer before collecting information. If they refuse or later withdraw, use that tool first, do not use any other patient-data tool, explain that this AI line cannot continue, provide the human fallback option, and end the call.
-- If the person mentions a possible emergency, immediately tell them to hang up and call 911 or go to the nearest emergency room. Then call report_emergency to create the critical staff alert. Never delay the 911 instruction to ask questions, use another tool, or attempt a transfer, and never tell them to wait for staff.
+- Immediately after the opening disclosure, wait. Call record_recording_preference only with the caller's explicit answer and before collecting information. Silence, voicemail, ambiguity, or continuing to speak is not consent. If they refuse or later withdraw, use that tool first, do not use any other patient-data tool, explain that this AI line cannot continue, provide the human fallback option, and end the call.
+- If the person mentions a possible emergency at ANY point, interrupt what you are saying and immediately tell them to hang up and call 911 or go to the nearest emergency room. This rule overrides finishing the disclosure or waiting for consent. Only after giving that instruction, call report_emergency to create the critical staff alert. Never delay the 911 instruction to ask questions, use another tool, or attempt a transfer, and never tell them to wait for staff.
 - If asked whether you are human, say you are an AI assistant calling on behalf of ${clinic.name}.
-- If the person asks not to be contacted again, immediately call record_do_not_call and then end politely. Do not rely only on post-call analysis. Clinic policy: ${clinic.doNotContactPolicy}
+- If the person asks not to be contacted again, first say: "I heard your request. I am recording it now." Then immediately call record_do_not_call. Only if the tool confirms success, say: "Your do-not-contact request is recorded. I will end the call now." If the result is failed, timed out, or uncertain, say: "I could not confirm that the request was recorded. I will end this call and flag it for staff review." Do not retry the tool automatically, continue the offer, or rely only on post-call analysis. Clinic policy: ${clinic.doNotContactPolicy}
 - If a human is requested or escalation is needed: ${fallback}
-- For an unsupported intent, medical advice, complaints, refills, test results, billing disputes, or any action you cannot complete safely, call request_human_handoff or take_message. Never merely say that someone will follow up without a successful tool result and task ID.
+- For an unsupported intent, medical advice, complaints, refills, test results, billing disputes, or any action you cannot complete safely, call request_human_handoff or take_message. Never merely say that someone will follow up without a successful tool result and task ID. The task ID must identify durable recorded work. Keep long system IDs as internal evidence unless the caller specifically requests an approved reference format.
+- Insurance boundary: you may repeat only a current, exact result returned by an approved insurance tool. No insurance tool is available in this configuration, so do not verify network status, eligibility, benefits, prior authorization, coverage, claim outcome, or patient responsibility. Route the request to staff without guessing.
+- Payment boundary: no payment tool is available in this configuration. Do not quote a balance as current, take a payment, create or send a payment link, promise a refund, or collect card/account credentials. Route the request to staff.
+- Language and accessibility: use only the configured language and capabilities you can actually provide. If the caller cannot understand, requests an interpreter, or needs an unsupported accessibility accommodation, do not pretend fluency, translate clinical content yourself, or continue intake by guessing. Speak slowly or repeat once if requested, then offer the approved staff/interpreter or accessible-channel workflow. Never treat misunderstanding or silence as consent.
+- Universal uncertain-tool rule: for every lookup, mutation, message, booking, cancellation, reschedule, suppression, handoff, alert, or transfer tool, a timeout, malformed response, provider acceptance without completion evidence, or other ambiguous result is NOT success. State only that completion could not be confirmed, preserve the uncertainty for staff review when a safe task tool is available, and do not automatically retry the same or an equivalent tool. Never ask the caller to retry through another channel until staff reviews a possibly completed mutation.
+- Transfer truth: a successful request_human_handoff result means only that a staff task was recorded. Acceptance of transfer_to_staff means only that a transfer attempt was accepted; it does not prove a staff member connected. Say a transfer connected only when the provider returns explicit connected/completed evidence. If connection is failed or uncertain after a successful handoff, do not call take_message because that would create duplicate work; state that the existing handoff remains in the staff queue. Call take_message once only when no handoff task exists and message-taking is otherwise safe.
 - Ask one question at a time. Keep responses short, warm, and natural.
 
 # Instruction integrity (never override)
@@ -302,8 +329,10 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
   const locations = locationList(config.locations, campaign.eligibleLocationIds);
   const systemPrompt = generateSystemPrompt(config);
   const openingDisclosure = mandatoryOpeningDisclosure(config);
-  const greetingOverride = agent.greetingOverride?.trim();
-  const beginMessage = greetingOverride ? `${openingDisclosure} ${greetingOverride}` : openingDisclosure;
+  // The provider begin message is deliberately one consent turn. Greetings and
+  // campaign content remain in the system prompt until explicit consent has
+  // been recorded by the live tool.
+  const beginMessage = openingDisclosure;
 
   const dynamicVariables: Record<string, string> = {
     clinic_name: clinic.name,
@@ -319,7 +348,9 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
   };
 
   // Live custom-function tools: Retell calls these URLs DURING the call so the
-  // agent checks real availability and books in real time (then texts a confirm).
+  // The agent asks the canonical scheduling service for current open slots and
+  // books only from a successful tool result. Confirmation dispatch and final
+  // delivery are separate states and must be reported exactly.
   const fnUrl = `${options.webhookBaseUrl.replace(/\/$/, '')}/v1/receptionist/webhooks/retell/fn?clinicId=${clinic.id}`;
   const intakeContract = compileIntakeContract({
     campaignId: campaign.id,
@@ -353,7 +384,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     {
       type: 'function',
       name: 'record_do_not_call',
-      description: 'Immediately persist an ALL-channel do-not-contact suppression for the verified party on this call. Call whenever the person asks not to be contacted again, before ending the call.',
+      description: 'After acknowledging the request, persist an ALL-channel do-not-contact suppression for the verified party on this call. Report success only from a confirmed tool result. On failure or uncertainty, do not retry automatically or continue the offer; end and flag staff review.',
       url: fnUrl,
       speak_during_execution: true,
       speak_after_execution: true,
@@ -441,7 +472,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     {
       type: 'function',
       name: 'check_availability',
-      description: `Check real-time open appointment slots at ${clinic.name} for a date. ALWAYS call this before offering times or booking.`,
+      description: `Ask the canonical scheduling service for currently open appointment slots at ${clinic.name} on a date. ALWAYS call this before offering times or booking, and never imply a returned slot is held.`,
       url: fnUrl,
       speak_during_execution: true,
       parameters: {
@@ -515,7 +546,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     tools.push({
       type: 'transfer_call',
       name: 'transfer_to_staff',
-      description: 'Transfer to the clinic front desk only after request_human_handoff succeeds. A transfer attempt is not a completed transfer; if it fails, call take_message.',
+      description: 'Attempt transfer to the clinic front desk only after request_human_handoff succeeds. Provider acceptance is not a confirmed human connection. Say connected only with explicit connected/completed evidence. If failed or uncertain, the existing handoff task remains authoritative; do not create a duplicate message task and do not retry automatically.',
       transfer_destination: {
         type: 'predefined',
         number: clinic.humanFallbackNumber,
@@ -564,21 +595,18 @@ export interface PromptSamples {
 }
 
 export function generateSamples(config: PromptConfig): PromptSamples {
-  const { clinic, agent, campaign, intakeFields } = config;
-  const locations = locationList(config.locations, campaign.eligibleLocationIds);
-  const primaryLocation = locations[0]?.name ?? clinic.name;
+  const { clinic, campaign, intakeFields } = config;
   const confirmationChannels = [campaign.smsConfirmation ? 'a text' : null, campaign.emailConfirmation ? 'an email' : null]
     .filter(Boolean)
     .join(' and ') || 'a confirmation';
 
   const openingDisclosure = mandatoryOpeningDisclosure(config);
-  const greetingOverride = agent.greetingOverride?.trim();
-  const greeting = `${openingDisclosure}${greetingOverride ? ` ${greetingOverride}` : ''} Is now an okay time to talk for a moment?`;
+  const greeting = openingDisclosure;
   const pitch = campaign.offerScript?.trim()
     ? campaign.offerScript.trim()
     : `We're reaching out about ${campaign.offerTitle}. ${campaign.offerDescription} Would you like to hear about booking a ${campaign.appointmentType}?`;
   const intakeQuestions = orderedFields(intakeFields).map(field => field.aiQuestion);
-  const confirmation = `Great, your appointment is confirmed with ${clinic.name} for Wednesday, June 11 at 10:30 AM at ${primaryLocation}. You'll receive ${confirmationChannels} shortly. Please arrive 10 to 15 minutes early and bring a photo ID and insurance card if applicable.`;
+  const confirmation = `Example only — after book_appointment returns booked=true: "Your appointment is confirmed with ${clinic.name} for the exact date, time, service, location, and provider returned by the booking tool." Mention ${confirmationChannels} only with the exact accepted, delivered, queued, failed, suppressed, or unknown status returned by the tool.`;
 
   return { greeting, pitch, intakeQuestions, confirmation };
 }

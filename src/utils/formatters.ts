@@ -1,4 +1,4 @@
-import { getCurrency, getCurrencyLocale } from '../lib/preferences';
+import { getCurrency, getCurrencyLocale, getLocale } from '../lib/preferences';
 
 export const formatCurrency = (value: number): string => {
   return new Intl.NumberFormat(getCurrencyLocale(), {
@@ -20,15 +20,18 @@ export const formatCurrencyCompact = (value: number): string => {
 };
 
 export const formatNumber = (value: number): string => {
-  return new Intl.NumberFormat('en-US').format(value);
+  return new Intl.NumberFormat(getLocale()).format(value);
 };
 
 export const formatPercent = (value: number, decimals = 1): string => {
-  return `${value.toFixed(decimals)}%`;
+  return `${new Intl.NumberFormat(getLocale(), {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  }).format(value)}%`;
 };
 
 export const formatDate = (isoDate: string): string => {
-  return new Date(isoDate).toLocaleDateString('en-US', {
+  return new Date(isoDate).toLocaleDateString(getLocale(), {
     month: 'short',
     day: 'numeric',
     year: 'numeric',

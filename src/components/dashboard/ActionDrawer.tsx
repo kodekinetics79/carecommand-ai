@@ -37,7 +37,6 @@ export default function ActionDrawer({ action, onClose, onNavigate }: { action: 
 
           <div className="grid grid-cols-2 gap-3">
             <Detail label="Revenue impact" value={action.revenueImpact != null ? formatCurrency(action.revenueImpact) : '—'} />
-            <Detail label="AI confidence" value={`${action.aiConfidence}%`} />
             <Detail label="Owner" value={action.owner} />
             <Detail label="Due" value={action.dueDate ? new Date(action.dueDate).toLocaleDateString() : 'No due date'} />
           </div>

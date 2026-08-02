@@ -40,7 +40,7 @@ export default function Patients() {
   const navigate = useNavigate();
   const [query, setQuery] = useState('');
   const [activeLifecycle, setActiveLifecycle] = useState<string>('all');
-  const { data: customerRecords, error, reload } = useApiResource<ApiPatient, ReturnType<typeof mapPatient>>('/v1/patients?limit=100', [], mapPatient);
+  const { data: patientRecords, error, reload } = useApiResource<ApiPatient, ReturnType<typeof mapPatient>>('/v1/patients?limit=100', [], mapPatient);
   const { data: summary, error: summaryError, reload: reloadSummary } = useApiData<PatientSummary | null>('/v1/patients/summary', null);
   const { data: branchOptions } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], b => b);
   const [showAddForm, setShowAddForm] = useState(false);
@@ -76,7 +76,7 @@ export default function Patients() {
       reload();
       void reloadSummary();
     } catch (err) {
-      setFormError(err instanceof Error ? err.message : 'Failed to add customer');
+      setFormError(err instanceof Error ? err.message : 'Failed to add patient');
     } finally {
       setSaving(false);
     }
@@ -95,7 +95,7 @@ export default function Patients() {
   ];
 
   const filtered = useMemo(() => {
-    let list = customerRecords;
+    let list = patientRecords;
     if (activeLifecycle !== 'all') list = list.filter(p => p.lifecycleStage === activeLifecycle);
     if (query) list = list.filter(p =>
       p.name.toLowerCase().includes(query.toLowerCase()) ||
@@ -103,32 +103,32 @@ export default function Patients() {
       p.email.toLowerCase().includes(query.toLowerCase())
     );
     return list;
-  }, [query, activeLifecycle, customerRecords]);
+  }, [query, activeLifecycle, patientRecords]);
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
-        title="Customer360"
-        subtitle="Customer intelligence, lifecycle insights, consent-aware outreach, and LTV management."
-        badge={loadError || summaryError ? 'Live Data Error' : summary ? `${summary.highRiskCount} At Risk · Live DB` : 'Loading live facts'}
+        title="Patients"
+        subtitle="Patient records, lifecycle facts, communication permissions, and stored financial metrics."
+        badge={loadError || summaryError ? 'Data unavailable' : summary ? `${summary.highRiskCount} at risk · Stored patient records` : 'Loading patient records'}
         badgeColor="red"
         actions={
           <button type="button" onClick={() => setShowAddForm(true)} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
-            <UserPlus className="w-4 h-4" /> Add Customer
+            <UserPlus className="w-4 h-4" /> Add Patient
           </button>
         }
       />
 
       {(loadError || summaryError) && (
         <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          Customer data could not be loaded from the live API: {loadError || summaryError}
+          Patient data could not be loaded: {loadError || summaryError}
         </div>
       )}
 
       {showAddForm && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setShowAddForm(false)}>
           <div className="w-full max-w-md rounded-2xl bg-[var(--s1)] border border-[var(--b2)] p-5 shadow-xl" onClick={e => e.stopPropagation()}>
-            <p className="text-sm font-bold text-t1 mb-3">Add Customer</p>
+            <p className="text-sm font-bold text-t1 mb-3">Add Patient</p>
             {formError && <p className="text-[11px] text-red-v mb-2">{formError}</p>}
             <div className="grid grid-cols-2 gap-2.5">
               <input value={form.firstName} onChange={e => setForm(f => ({ ...f, firstName: e.target.value }))} placeholder="First name" className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
@@ -148,7 +148,7 @@ export default function Patients() {
               </select>
             </div>
             <div className="flex gap-2 mt-4">
-              <button type="button" disabled={saving} onClick={createPatient} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition disabled:opacity-40">{saving ? 'Saving…' : 'Add Customer'}</button>
+              <button type="button" disabled={saving} onClick={createPatient} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition disabled:opacity-40">{saving ? 'Saving…' : 'Add Patient'}</button>
               <button type="button" onClick={() => setShowAddForm(false)} className="px-4 py-2 rounded-lg border border-[var(--b1)] text-t2 text-xs font-semibold hover:bg-[var(--s3)] transition">Cancel</button>
             </div>
           </div>
@@ -156,17 +156,17 @@ export default function Patients() {
       )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Total Customers" value={summary?.patientCount ?? '—'} subtitle={summary?.scope === 'assigned_branch' ? 'Assigned branch' : 'All accessible branches'} icon={<Users className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Total Patients" value={summary?.patientCount ?? '—'} subtitle={summary?.scope === 'assigned_branch' ? 'Assigned branch' : 'All accessible branches'} icon={<Users className="w-4 h-4" />} accent="blue" />
         <StatCard title="Active & Retained" value={summary?.activeRetainedCount ?? '—'} subtitle="Current lifecycle facts" icon={<Heart className="w-4 h-4" />} accent="emerald" />
         <StatCard title="At-Risk Churn" value={highRisk ?? '—'} subtitle="Stored score ≥60%" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
-        <StatCard title="Avg Lifetime Value" value={summary ? formatCurrency(summary.averageLifetimeValue) : '—'} subtitle="All scoped customers" icon={<TrendingUp className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Avg Lifetime Value" value={summary ? formatCurrency(summary.averageLifetimeValue) : '—'} subtitle="All scoped patients" icon={<TrendingUp className="w-4 h-4" />} accent="violet" />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_340px]">
-        {/* Main customer list */}
+        {/* Main patient list */}
         <div className="space-y-4">
           {/* Search & filter */}
-          <BentoCard title="Customer Records" subtitle={`Loaded records: ${customerRecords.length}${summary && summary.patientCount > customerRecords.length ? ` of ${summary.patientCount} (first page)` : ''}`}>
+          <BentoCard title="Patient Records" subtitle={`Loaded records: ${patientRecords.length}${summary && summary.patientCount > patientRecords.length ? ` of ${summary.patientCount} (first page)` : ''}`}>
             {/* Lifecycle filter */}
             <div className="flex items-center gap-2 flex-wrap mb-4">
               {['all', 'new', 'active', 'retained', 'at-risk', 'inactive'].map((lc) => (
@@ -181,7 +181,7 @@ export default function Patients() {
                   }`}
                 >
                   {lc === 'all' ? 'All' : lifecycleConfig[lc]?.label ?? lc}
-                  {lc !== 'all' && <span className="ml-1 opacity-70">({customerRecords.filter(p => p.lifecycleStage === lc).length})</span>}
+                  {lc !== 'all' && <span className="ml-1 opacity-70">({patientRecords.filter(p => p.lifecycleStage === lc).length})</span>}
                 </button>
               ))}
             </div>
@@ -190,7 +190,7 @@ export default function Patients() {
             <div className="relative mb-4">
               <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-t3" />
               <input
-                aria-label="Search customers by name, phone or email"
+                aria-label="Search patients by name, phone or email"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="Search name, phone or email…"
@@ -203,7 +203,7 @@ export default function Patients() {
               )}
             </div>
 
-            {/* Customer rows */}
+            {/* Patient rows */}
             <div className="space-y-2">
               {filtered.slice(0, 15).map((patient) => {
                 const lc = lifecycleConfig[patient.lifecycleStage];
@@ -236,10 +236,10 @@ export default function Patients() {
                 );
               })}
               {filtered.length > 15 && (
-                <p className="text-xs text-t3 text-center py-2">{filtered.length - 15} more customers — refine search to filter</p>
+                <p className="text-xs text-t3 text-center py-2">{filtered.length - 15} more patients — refine search to filter</p>
               )}
               {filtered.length === 0 && (
-                <p className="text-sm text-t3 text-center py-6">No customers match your search.</p>
+                <p className="text-sm text-t3 text-center py-6">No patients match your search.</p>
               )}
             </div>
           </BentoCard>
@@ -247,12 +247,12 @@ export default function Patients() {
 
         <div className="space-y-4">
           {/* Quick metrics */}
-          <BentoCard title="Customer Intelligence" subtitle={summary?.scope === 'assigned_branch' ? 'Assigned-branch aggregate facts' : 'Tenant aggregate facts'}>
+          <BentoCard title="Patient Summary" subtitle={summary?.scope === 'assigned_branch' ? 'Assigned-branch aggregate facts' : 'Tenant aggregate facts'}>
             <div className="space-y-3">
               {[
                 { label: 'Most consented channel', value: mostConsentedChannel ?? 'None recorded', icon: <ShieldCheck className="w-3.5 h-3.5 text-emerald-v" /> },
                 { label: 'Marketing consent rate', value: summary?.marketingConsentRate === null || !summary ? 'No denominator' : `${summary.marketingConsentRate}%`, icon: <ShieldCheck className="w-3.5 h-3.5 text-emerald-v" /> },
-                { label: 'Risk review queue', value: summary ? `${summary.highRiskCount} customers` : 'Unavailable', icon: <Sparkles className="w-3.5 h-3.5 text-violet-v" /> },
+                { label: 'Risk review queue', value: summary ? `${summary.highRiskCount} patients` : 'Unavailable', icon: <Sparkles className="w-3.5 h-3.5 text-violet-v" /> },
                 { label: 'Outstanding balances', value: summary ? formatCurrency(summary.outstandingBalance) : 'Unavailable', icon: <AlertCircle className="w-3.5 h-3.5 text-amber-v" /> },
               ].map((item) => (
                 <div key={item.label} className="flex items-center justify-between gap-3 p-2.5 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors">
@@ -267,7 +267,7 @@ export default function Patients() {
           </BentoCard>
 
           {/* Segments */}
-          <BentoCard title="Customer Segments" subtitle="Live segmentation">
+          <BentoCard title="Patient Segments" subtitle="Stored segment counts">
             <div className="space-y-2.5">
               {segments.map((seg) => (
                 <div key={seg.label} className="flex items-center justify-between gap-3 p-3 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-all">
@@ -282,7 +282,7 @@ export default function Patients() {
           </BentoCard>
 
           {/* Branch coverage */}
-          <BentoCard title="Branch Coverage" subtitle="Customers per location">
+          <BentoCard title="Branch Coverage" subtitle="Patients per location">
             <div className="space-y-2.5">
               {branchOptions.map((branch) => (
                 <div key={branch.id} className="flex items-center justify-between gap-3 p-2.5 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors">
@@ -303,10 +303,10 @@ export default function Patients() {
               <Sparkles className="w-4 h-4 text-violet-v" />
               <p className="text-[10px] font-bold uppercase tracking-widest text-violet-v">Outreach Recommendation</p>
             </div>
-            <p className="text-sm font-bold text-t1 mb-1">{summary ? `${summary.highRiskCount} customers need risk review` : 'Risk queue unavailable'}</p>
+            <p className="text-sm font-bold text-t1 mb-1">{summary ? `${summary.highRiskCount} patients are in the risk review queue` : 'Risk queue unavailable'}</p>
             <p className="text-xs text-t2 mb-3">This count uses stored risk scores across the displayed tenant or branch scope. It is a review queue, not an automated outreach decision; consent must be rechecked before contact.</p>
             <button type="button" onClick={() => navigate('/campaigner')} className="w-full py-2 rounded-xl bg-[var(--violet-soft)] hover:bg-[var(--s3)] text-violet-v text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
-              <ArrowRight className="w-3.5 h-3.5" /> Launch outreach campaign
+              <ArrowRight className="w-3.5 h-3.5" /> Open campaign planning
             </button>
           </div>
         </div>

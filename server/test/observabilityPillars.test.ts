@@ -2,12 +2,19 @@ import 'dotenv/config';
 import { describe, it, expect } from 'vitest';
 import Fastify from 'fastify';
 import { metricsPlugin } from '../plugins/metrics';
-import { registry } from '../lib/metrics';
+import { monitoringAccessForEnvironment, registry } from '../lib/metrics';
 import { SLOS, errorBudgetMinutes } from '../lib/slo';
 import { currentTraceCarrier, runInJobContext, getTraceIds } from '../lib/traceContext';
 import { healthRoutes } from '../modules/health/routes';
 
 describe('metrics — /metrics exposition', () => {
+  it('fails the production monitoring boundary closed and accepts only the configured bearer token', () => {
+    expect(monitoringAccessForEnvironment('production', undefined, undefined)).toBe('not_found');
+    expect(monitoringAccessForEnvironment('production', 'monitor-secret', undefined)).toBe('unauthorized');
+    expect(monitoringAccessForEnvironment('production', 'monitor-secret', 'Bearer wrong')).toBe('unauthorized');
+    expect(monitoringAccessForEnvironment('production', 'monitor-secret', 'Bearer monitor-secret')).toBe('ok');
+    expect(monitoringAccessForEnvironment('development', undefined, undefined)).toBe('ok');
+  });
   it('records request duration + count and exposes them (dev: unauthenticated)', async () => {
     const app = Fastify({ logger: false });
     await app.register(metricsPlugin);
@@ -101,8 +108,11 @@ describe('slo — objectives are well-formed and discoverable', () => {
     const res = await app.inject({ method: 'GET', url: '/health' });
     await app.close();
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toMatchObject({ status: 'ok' });
-    expect(typeof res.json().uptimeSeconds).toBe('number');
+    const body = res.json();
+    expect(body).toMatchObject({ status: 'ok' });
+    expect(typeof body.uptimeSeconds).toBe('number');
+    expect(Object.keys(body).sort()).toEqual(['environment', 'release', 'service', 'status', 'time', 'uptimeSeconds']);
+    expect(JSON.stringify(body)).not.toMatch(/payments|insurance|twilio|retell|smtp|provider/i);
   });
 });
 

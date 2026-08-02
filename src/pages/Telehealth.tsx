@@ -14,7 +14,7 @@ const statusColors: Record<string, { dot: string; text: string; bg: string }> = 
 
 export default function Telehealth() {
   const navigate = useNavigate();
-  const { data: sessions, error: loadError } = useApiResource<ApiTelehealthSession, TelehealthSession>(
+  const { data: sessions, source, loading, error: loadError } = useApiResource<ApiTelehealthSession, TelehealthSession>(
     '/v1/telehealth/sessions?limit=100',
     [],
     mapTelehealthSession,
@@ -24,14 +24,15 @@ export default function Telehealth() {
   const confirmedCount = sessions.filter(s => s.status === 'Confirmed').length;
   const totalValue = sessions.reduce((s, sess) => s + sess.value, 0);
   const intakePercent = sessions.length > 0 ? Math.round((intakeComplete / sessions.length) * 100) : 0;
+  const metricsReady = source === 'live' && !loadError;
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Virtual Visit Booking"
-        subtitle="Virtual appointment scheduling, intake management, waiting room, and in-person conversion tracking."
-        badge={loadError ? 'Live Data Error' : `${sessions.length} Today`}
-        badgeColor="blue"
+        subtitle="Virtual appointment and intake workflow status; clinical care occurs only with an authorized provider."
+        badge={loadError ? 'Data unavailable' : metricsReady ? `${sessions.length} today` : 'Loading'}
+        badgeColor={loadError ? 'red' : 'blue'}
         actions={
           <button type="button" onClick={() => navigate('/scheduling')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition">
             <Video className="w-4 h-4" /> Schedule virtual visit
@@ -40,25 +41,29 @@ export default function Telehealth() {
       />
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Virtual Sessions" value={sessions.length} subtitle="Booked today" icon={<Video className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Confirmed" value={confirmedCount} subtitle="Ready to start" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Intake Complete" value={`${intakePercent}%`} subtitle="Pre-visit forms" icon={<Users className="w-4 h-4" />} accent="violet" />
-        <StatCard title="Session Revenue" value={formatCurrency(totalValue)} subtitle="Today's virtual visits" icon={<CalendarDays className="w-4 h-4" />} accent="amber" />
+        <StatCard title="Virtual Sessions" value={metricsReady ? sessions.length : '—'} subtitle={metricsReady ? 'Booked today' : loading ? 'Loading' : 'Unavailable'} icon={<Video className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Confirmed" value={metricsReady ? confirmedCount : '—'} subtitle={metricsReady ? 'Appointment record confirmed' : loading ? 'Loading' : 'Unavailable'} icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Intake Complete" value={metricsReady ? `${intakePercent}%` : '—'} subtitle={metricsReady ? 'Pre-visit forms' : loading ? 'Loading' : 'Unavailable'} icon={<Users className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Scheduled Value" value={metricsReady ? formatCurrency(totalValue) : '—'} subtitle={metricsReady ? 'Not collected revenue' : loading ? 'Loading' : 'Unavailable'} icon={<CalendarDays className="w-4 h-4" />} accent="amber" />
+      </div>
+
+      <div className="rounded-xl border border-[var(--b1)] bg-[var(--blue-soft)] px-4 py-3 text-[11px] text-blue-v">
+        A confirmed appointment does not by itself prove intake, telehealth consent, payment, technical readiness, patient arrival, or clinician availability. Verify each requirement before starting care.
       </div>
 
       {loadError && (
-        <div className="rounded-2xl border border-[rgba(220,38,38,0.18)] bg-red-soft px-4 py-3 text-xs font-semibold text-red-v">
-          Telehealth sessions could not be loaded from the live API: {loadError}
+        <div role="alert" className="rounded-2xl border border-[rgba(220,38,38,0.18)] bg-red-soft px-4 py-3 text-xs font-semibold text-red-v">
+          Virtual-visit records could not be loaded from the clinic service: {loadError}
         </div>
       )}
 
       <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
         {/* Session queue */}
-          <BentoCard title="Virtual Waiting Room" subtitle="Today's sessions · All providers">
+          <BentoCard title="Virtual Visit Schedule" subtitle="Today's stored appointment records · all providers">
             <div className="space-y-3">
             {sessions.length === 0 ? (
               <div className="rounded-2xl border border-dashed border-[var(--b1)] bg-[var(--s2)] px-4 py-6 text-center text-sm text-t3">
-                No live telehealth sessions are loaded for this clinic.
+                No virtual-visit records are available for this clinic today.
               </div>
             ) : sessions.map((session) => {
               const sc = statusColors[session.status];
@@ -109,9 +114,9 @@ export default function Telehealth() {
           <BentoCard title="Virtual Visit Workflow" subtitle="3-step patient journey">
             <div className="space-y-2.5">
               {[
-                { step: 1, title: 'Pre-visit intake', desc: 'Collect context, consent and payment before the session starts.', color: 'bg-blue-500' },
-                { step: 2, title: 'Video waiting room', desc: 'Manage queue, start on time, and take session notes.', color: 'bg-violet-500' },
-                { step: 3, title: 'Post-visit follow-up', desc: 'Trigger reminders, in-person bookings and review requests.', color: 'bg-emerald-500' },
+                { step: 1, title: 'Pre-visit checks', desc: 'Verify required intake, telehealth consent, payment status, and contact details.', color: 'bg-blue-500' },
+                { step: 2, title: 'Video visit', desc: 'Confirm provider availability and use the clinic-approved video and documentation workflow.', color: 'bg-violet-500' },
+                { step: 3, title: 'Post-visit follow-up', desc: 'Send only approved reminders or requests and confirm each delivery state separately.', color: 'bg-emerald-500' },
               ].map((item) => (
                 <div key={item.step} className="flex items-start gap-3 p-3 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors">
                   <div className={`w-6 h-6 rounded-full ${item.color} flex items-center justify-center text-white text-[10px] font-bold shrink-0`}>{item.step}</div>

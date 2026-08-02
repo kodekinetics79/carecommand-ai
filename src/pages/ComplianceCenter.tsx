@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
+import ConfirmationModal from '../components/workflow/ConfirmationModal';
 import { Field, TextInput, Select, Toggle } from '../components/ui/Field';
 import { useSession } from '../hooks/useSession';
 import {
@@ -128,10 +129,10 @@ function OverviewSection() {
         {data && (
           <div className="space-y-4">
             <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
-              <StatCard title="Overall Readiness" value={`${data.overallReadinessScore}%`} subtitle="Weighted across frameworks" accent="violet" />
-              <StatCard title="SOC 2 Readiness" value={`${data.soc2ReadinessPct}%`} accent="blue" />
-              <StatCard title="HIPAA Alignment" value={`${data.hipaaAlignmentPct}%`} accent="cyan" />
-              <StatCard title="Internal Baseline" value={`${data.internalBaselinePct}%`} accent="emerald" />
+              <StatCard title="Self-Assessed Overall Readiness" value={`${data.overallReadinessScore}%`} subtitle="Calculated from recorded internal control status" accent="violet" />
+              <StatCard title="Self-Assessed SOC 2 Readiness" value={`${data.soc2ReadinessPct}%`} subtitle="Internal mapping · not an audit opinion" accent="blue" />
+              <StatCard title="Self-Assessed HIPAA Alignment" value={`${data.hipaaAlignmentPct}%`} subtitle="Internal mapping · not a legal determination" accent="cyan" />
+              <StatCard title="Self-Assessed Internal Baseline" value={`${data.internalBaselinePct}%`} subtitle="Calculated from recorded control status" accent="emerald" />
             </div>
             <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
               <StatCard title="Open Risks" value={String(data.openRisks)} accent="amber" />
@@ -153,7 +154,7 @@ function OverviewSection() {
                 </StatusRow>
                 <StatusRow label="Audit trail">
                   <span className="badge badge-emerald">append-only</span>
-                  <span className="text-[11px] text-t3">Tamper-resistant; enforced at the database.</span>
+                  <span className="text-[11px] text-t3">Insert-only rows are enforced by database controls; verify those controls in each deployed environment.</span>
                 </StatusRow>
                 <StatusRow label="Tenant isolation">
                   <span className="badge badge-amber">app scoping active</span>
@@ -291,10 +292,11 @@ function EvidenceSection({ canWrite }: { canWrite: boolean }) {
   const { data, loading, error, reload } = useAsync(useCallback(() => api.listEvidence(includeDeleted), [includeDeleted]));
   const [adding, setAdding] = useState(false);
   const [versionsFor, setVersionsFor] = useState<string | null>(null);
+  const [deleteEvidenceId, setDeleteEvidenceId] = useState<string | null>(null);
 
   return (
     <div className="space-y-4">
-      <Note>Evidence file custody is not enabled yet. Store an external evidence link and a content hash for now — records keep a tamper-evident version chain, not stored files.</Note>
+      <Note>Evidence file custody is not enabled. Store only an approved external link and content hash. The version chain can reveal later metadata changes; it does not prove that an external file is authentic, complete, or legally sufficient.</Note>
       <div className="flex items-center justify-between gap-2">
         <Toggle checked={includeDeleted} onChange={setIncludeDeleted} label="Include soft-deleted" />
         <div className="flex items-center gap-2">
@@ -328,7 +330,7 @@ function EvidenceSection({ canWrite }: { canWrite: boolean }) {
                 <div className="flex items-center gap-1.5 shrink-0">
                   <button type="button" onClick={() => setVersionsFor(versionsFor === ev.id ? null : ev.id)} className="rounded-lg border border-[var(--b1)] px-2 py-1 text-[11px] font-semibold text-t2 hover:bg-[var(--s3)] inline-flex items-center gap-1"><History className="w-3 h-3" /> Versions</button>
                   {canWrite && !ev.deletedAt && (
-                    <button type="button" onClick={async () => { if (window.confirm('Soft delete this evidence metadata? The record is retained (deletedAt set), not erased.')) { await api.deleteEvidence(ev.id); reload(); } }}
+                    <button type="button" onClick={() => setDeleteEvidenceId(ev.id)}
                       className="rounded-lg border border-[var(--b1)] px-2 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--red-soft)] inline-flex items-center gap-1"><Trash2 className="w-3 h-3" /> Soft delete</button>
                   )}
                 </div>
@@ -338,6 +340,16 @@ function EvidenceSection({ canWrite }: { canWrite: boolean }) {
           ))}
         </div>
       </StateBlock>
+      {deleteEvidenceId && (
+        <ConfirmationModal
+          title="Soft delete evidence metadata?"
+          message="The metadata will be hidden from the default view and retained with a deleted timestamp. This does not erase the record or any externally stored evidence."
+          confirmLabel="Soft delete metadata"
+          tone="red"
+          onClose={() => setDeleteEvidenceId(null)}
+          onConfirm={async () => { await api.deleteEvidence(deleteEvidenceId); reload(); }}
+        />
+      )}
     </div>
   );
 }
@@ -622,7 +634,7 @@ function AuditLogsSection() {
   const { data, loading, error, reload } = useAsync(useCallback(() => api.auditLogs(applied), [applied]));
   return (
     <div className="space-y-4">
-      <Note>The audit trail is <strong>append-only</strong> and enforced at the database — entries cannot be edited or deleted, including from this UI.</Note>
+      <Note>The application treats this audit trail as <strong>append-only</strong>, with insert-only database controls. Release evidence must verify those controls in the deployed database; this screen is not proof of certification or legal compliance.</Note>
       <div className="cc-card p-4 grid gap-2 md:grid-cols-[1fr_1fr_1fr_1fr_auto] items-end">
         <Field label="Action"><TextInput value={filters.action} onChange={e => setFilters(f => ({ ...f, action: e.target.value }))} placeholder="e.g. compliance.evidence.created" /></Field>
         <Field label="Resource"><TextInput value={filters.resource} onChange={e => setFilters(f => ({ ...f, resource: e.target.value }))} /></Field>
@@ -676,11 +688,11 @@ function SecurityPolicySection({ canWrite }: { canWrite: boolean }) {
               <Toggle checked={current.requireMfa} onChange={v => canWrite && set('requireMfa', v)} label="Require MFA" />
               <Toggle checked={current.failedLoginLockout} onChange={v => canWrite && set('failedLoginLockout', v)} label="Failed-login lockout" />
               <Field label="Password expiry (days, blank = none)"><TextInput type="number" disabled={!canWrite} value={current.passwordExpiryDays ?? ''} onChange={e => set('passwordExpiryDays', e.target.value ? Number(e.target.value) : null)} /></Field>
-              <Field label="Session timeout (minutes)"><TextInput type="number" disabled={!canWrite} value={current.sessionTimeoutMinutes} onChange={e => set('sessionTimeoutMinutes', Number(e.target.value))} /></Field>
+              <Field label="Access-token lifetime (minutes; refresh remains separately bounded)"><TextInput type="number" disabled={!canWrite} value={current.sessionTimeoutMinutes} onChange={e => set('sessionTimeoutMinutes', Number(e.target.value))} /></Field>
               <Field label="Data retention (days)"><TextInput type="number" disabled={!canWrite} value={current.dataRetentionDays} onChange={e => set('dataRetentionDays', Number(e.target.value))} /></Field>
               <Field label="Backup frequency"><TextInput disabled={!canWrite} value={current.backupFrequency} onChange={e => set('backupFrequency', e.target.value)} /></Field>
               <Field label="Evidence review frequency"><TextInput disabled={!canWrite} value={current.evidenceReviewFrequency} onChange={e => set('evidenceReviewFrequency', e.target.value)} /></Field>
-              <Field label="Allowed IP ranges (comma separated)"><TextInput disabled={!canWrite} value={current.allowedIpRanges.join(', ')} onChange={e => set('allowedIpRanges', e.target.value.split(',').map(s => s.trim()).filter(Boolean))} /></Field>
+              <Field label="Planned IP restrictions (record only; not enforced)"><TextInput disabled={!canWrite} value={current.allowedIpRanges.join(', ')} onChange={e => set('allowedIpRanges', e.target.value.split(',').map(s => s.trim()).filter(Boolean))} /></Field>
             </div>
             {canWrite && (
               <div className="flex justify-end gap-2">

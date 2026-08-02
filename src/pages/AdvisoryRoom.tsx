@@ -110,9 +110,9 @@ export default function AdvisoryRoom() {
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Advisory Room"
-        subtitle="A built-in advisory team for revenue, growth, front desk, competition, and operations."
-        badge={briefLoading ? 'Loading' : brief ? 'Live Advisory' : 'Fallback'}
-        badgeColor="emerald"
+        subtitle="Operational decision support for revenue, growth, front desk, competition, and operations. Review assumptions before acting."
+        badge={briefLoading ? 'Loading' : brief ? 'Advisory loaded' : 'Data unavailable'}
+        badgeColor={brief ? 'emerald' : 'red'}
         actions={
           <button type="button" onClick={() => navigate('/opportunities')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
             <Sparkles className="w-4 h-4" /> Open Revenue Leaks
@@ -144,14 +144,14 @@ export default function AdvisoryRoom() {
                       <div className={`w-9 h-9 rounded-xl flex items-center justify-center ${meta.accent === 'emerald' ? 'bg-[var(--emerald-soft)] text-emerald-v' : meta.accent === 'blue' ? 'bg-[var(--blue-soft)] text-blue-v' : meta.accent === 'violet' ? 'bg-[var(--violet-soft)] text-violet-v' : meta.accent === 'amber' ? 'bg-[var(--amber-soft)] text-amber-v' : 'bg-[var(--cyan-soft)] text-cyan-v'}`}>
                         {meta.icon}
                       </div>
-                      <span className={`badge ${selected ? 'badge-indigo' : 'badge-blue'}`}>{advisor ? `${advisor.confidence}%` : '...'}</span>
+                      <span className={`badge ${selected ? 'badge-indigo' : 'badge-blue'}`}>{advisor ? `${advisor.confidence}% rule score` : '...'}</span>
                     </div>
                     <p className="mt-3 text-sm font-bold text-t1">{getAdvisorDisplay(advisorType)}</p>
                     <p className="mt-1 text-xs text-t3 leading-relaxed">{meta.description}</p>
                     {advisor && (
                       <>
                         <p className="mt-3 text-xs font-semibold text-t1 leading-relaxed">{advisor.summary}</p>
-                        <p className="mt-2 text-xs text-t3">Expected impact: {formatCurrency(advisor.expectedImpact)}</p>
+                        <p className="mt-2 text-xs text-t3">Rule-based planning estimate: {formatCurrency(advisor.expectedImpact)}</p>
                       </>
                     )}
                   </button>
@@ -220,7 +220,7 @@ export default function AdvisoryRoom() {
         </div>
 
         <div className="space-y-4">
-          <BentoCard title={currentAnswer ? getAdvisorDisplay(currentAnswer.advisorType) : 'Advisor Answer'} subtitle="A clear answer connected to real actions">
+          <BentoCard title={currentAnswer ? getAdvisorDisplay(currentAnswer.advisorType) : 'Advisor Answer'} subtitle="Operational planning output; review the source, evidence, and assumptions">
             {briefLoading && !brief ? (
               <div className="space-y-3">
                 <div className="skeleton h-5 w-2/3 rounded-lg" />
@@ -232,22 +232,26 @@ export default function AdvisoryRoom() {
                 <div>
                   <div className="flex items-center justify-between gap-3 mb-2">
                     <p className="text-sm font-semibold text-t1 leading-relaxed">{currentAnswer.summary}</p>
-                    <span className="badge badge-emerald">{currentAnswer.confidence}% confidence</span>
+                    <span className="badge badge-blue">{currentAnswer.confidence}% rule score</span>
                   </div>
                   <p className="text-sm text-t2 leading-relaxed">{currentAnswer.answer}</p>
+                  <p className="mt-2 text-[11px] text-t3">
+                    Answer source: {currentAnswer.answerSource === 'model' ? 'configured AI model' : 'deterministic rules'} · {currentAnswer.methodology}
+                  </p>
                 </div>
 
                 <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
-                  <p className="text-xs font-bold uppercase tracking-widest text-t3 mb-2">Diagnosis</p>
+                  <p className="text-xs font-bold uppercase tracking-widest text-t3 mb-2">Operational assessment</p>
                   <p className="text-sm text-t1 leading-relaxed">{currentAnswer.diagnosis}</p>
                 </div>
 
                 <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
                   <div className="flex items-center justify-between gap-3 mb-2">
-                    <p className="text-xs font-bold uppercase tracking-widest text-t3">Expected Impact</p>
+                    <p className="text-xs font-bold uppercase tracking-widest text-t3">Rule-based planning estimate</p>
                     <span className="text-sm font-bold text-emerald-v">{formatCurrency(currentAnswer.expectedImpact)}</span>
                   </div>
                   <ProgressBar value={currentAnswer.confidence} color={currentAnswer.confidence >= 85 ? 'emerald' : currentAnswer.confidence >= 70 ? 'amber' : 'blue'} />
+                  <p className="mt-2 text-[11px] text-t3">The score and estimate are unvalidated planning heuristics, not clinical, financial, or outcome predictions.</p>
                 </div>
 
                 <div className="grid gap-3 md:grid-cols-2">

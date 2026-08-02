@@ -13,17 +13,17 @@ interface Command {
 }
 
 const commands: Command[] = [
-  { id: 'c1', label: 'Create Campaign', description: 'Launch a new AI-powered campaign', icon: <Megaphone className="w-4 h-4" />, path: '/campaigner', action: 'navigate', category: 'Actions' },
-  { id: 'c2', label: 'Find Customer', description: 'Search customer profiles and history', icon: <Search className="w-4 h-4" />, path: '/patients', action: 'navigate', category: 'Actions' },
-  { id: 'c3', label: 'Recover Missed Calls', description: 'View and action missed call queue', icon: <Phone className="w-4 h-4" />, path: '/ai-receptionist', action: 'navigate', category: 'Actions' },
-  { id: 'c4', label: 'View Inactive Customers', description: '214 customers at churn risk', icon: <Users className="w-4 h-4" />, path: '/crm', action: 'navigate', category: 'Actions' },
-  { id: 'c5', label: 'Launch Review Campaign', description: 'Boost your clinic reputation score', icon: <Star className="w-4 h-4" />, path: '/reviews', action: 'navigate', category: 'Actions' },
-  { id: 'c6', label: 'Open Revenue Report', description: 'RevenuePulse CFO dashboard', icon: <TrendingUp className="w-4 h-4" />, path: '/revenue', action: 'navigate', category: 'Reports' },
-  { id: 'c7', label: 'Assign Staff Follow-up', description: 'Delegate open tasks to front desk', icon: <UserPlus className="w-4 h-4" />, path: '/staff', action: 'navigate', category: 'Actions' },
-  { id: 'c8', label: 'View Branch Performance', description: 'Compare all clinic locations', icon: <BarChart2 className="w-4 h-4" />, path: '/clinic-radar', action: 'navigate', category: 'Reports' },
-  { id: 'c9', label: 'ClinicRadar AI Insights', description: "See today's detected revenue signals", icon: <Zap className="w-4 h-4" />, path: '/clinic-radar', action: 'navigate', category: 'AI' },
-  { id: 'c10', label: 'Smart Scheduling', description: 'View and fill empty appointment slots', icon: <Zap className="w-4 h-4" />, path: '/scheduling', action: 'navigate', category: 'AI' },
-  { id: 'c11', label: 'Open CareFlow Autopilot', description: 'Review agent playbooks, approvals, and audit trail', icon: <Orbit className="w-4 h-4" />, path: '/autopilot', action: 'navigate', category: 'AI' },
+  { id: 'c1', label: 'Create campaign', description: 'Open campaign setup and review', icon: <Megaphone className="w-4 h-4" />, path: '/campaigner', action: 'navigate', category: 'Actions' },
+  { id: 'c2', label: 'Find patient', description: 'Search patient profiles and history', icon: <Search className="w-4 h-4" />, path: '/patients', action: 'navigate', category: 'Actions' },
+  { id: 'c3', label: 'Review missed calls', description: 'Open the missed-call follow-up queue', icon: <Phone className="w-4 h-4" />, path: '/ai-receptionist', action: 'navigate', category: 'Actions' },
+  { id: 'c4', label: 'View inactive patients', description: 'Review inactive and at-risk patient records', icon: <Users className="w-4 h-4" />, path: '/crm', action: 'navigate', category: 'Actions' },
+  { id: 'c5', label: 'Review reputation', description: 'Open reviews, responses, and campaign setup', icon: <Star className="w-4 h-4" />, path: '/reviews', action: 'navigate', category: 'Actions' },
+  { id: 'c6', label: 'Open revenue report', description: 'Review revenue records and trends', icon: <TrendingUp className="w-4 h-4" />, path: '/revenue', action: 'navigate', category: 'Reports' },
+  { id: 'c7', label: 'Assign staff follow-up', description: 'Open staff tasks and assignments', icon: <UserPlus className="w-4 h-4" />, path: '/staff', action: 'navigate', category: 'Actions' },
+  { id: 'c8', label: 'View branch signals', description: 'Compare available records across locations', icon: <BarChart2 className="w-4 h-4" />, path: '/clinic-radar', action: 'navigate', category: 'Reports' },
+  { id: 'c9', label: 'Open ClinicRadar', description: 'Review stored operational and market signals', icon: <Zap className="w-4 h-4" />, path: '/clinic-radar', action: 'navigate', category: 'Insights' },
+  { id: 'c10', label: 'Open scheduling', description: 'Review appointments and available slots', icon: <Zap className="w-4 h-4" />, path: '/scheduling', action: 'navigate', category: 'Actions' },
+  { id: 'c11', label: 'Open CareFlow Autopilot', description: 'Review playbooks, approvals, and recorded actions', icon: <Orbit className="w-4 h-4" />, path: '/autopilot', action: 'navigate', category: 'Automation' },
 ];
 
 interface CommandPaletteProps {
@@ -77,6 +77,9 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
   return (
     <div className="fixed inset-0 z-[100] flex items-start justify-center pt-[15vh] cmd-backdrop" onClick={onClose}>
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Command search"
         className="w-full max-w-xl glass-surface rounded-2xl overflow-hidden animate-fade-in"
         onClick={e => e.stopPropagation()}
       >
@@ -87,12 +90,13 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
             ref={inputRef}
             value={query}
             onChange={e => setQuery(e.target.value)}
-            placeholder="Search commands, customers, campaigns..."
+            aria-label="Search commands"
+            placeholder="Search commands, patients, and campaigns…"
             className="flex-1 text-sm text-t1 placeholder:text-t3 bg-transparent outline-none"
           />
           <div className="flex items-center gap-1.5">
             <kbd className="text-[10px] font-semibold text-t3 bg-[var(--s3)] px-1.5 py-0.5 rounded">ESC</kbd>
-            <button onClick={onClose} className="w-6 h-6 flex items-center justify-center rounded-lg hover:bg-[var(--s3)] text-t3">
+            <button type="button" onClick={onClose} aria-label="Close command search" className="w-6 h-6 flex items-center justify-center rounded-lg hover:bg-[var(--s3)] text-t3">
               <X className="w-3.5 h-3.5" />
             </button>
           </div>
@@ -125,16 +129,16 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
           ))}
           {filtered.length === 0 && (
             <div className="py-8 text-center">
-              <p className="text-sm text-t3">No commands found for "{query}"</p>
+              <p className="text-sm font-semibold text-t2">No matching commands</p>
+              <p className="mt-1 text-xs text-t3">Try a module or task name instead of “{query}”.</p>
             </div>
           )}
         </div>
 
         {/* Footer */}
         <div className="px-4 py-2.5 border-t border-[var(--b1)] flex items-center gap-4 text-[11px] text-t3">
-          <span className="flex items-center gap-1"><kbd className="bg-[var(--s3)] px-1.5 py-0.5 rounded font-semibold">↑↓</kbd> Navigate</span>
-          <span className="flex items-center gap-1"><kbd className="bg-[var(--s3)] px-1.5 py-0.5 rounded font-semibold">↵</kbd> Select</span>
-          <span className="flex items-center gap-1"><kbd className="bg-[var(--s3)] px-1.5 py-0.5 rounded font-semibold">⌘K</kbd> Toggle</span>
+          <span>Select an item to open it.</span>
+          <span className="ml-auto flex items-center gap-1"><kbd className="bg-[var(--s3)] px-1.5 py-0.5 rounded font-semibold">Esc</kbd> Close</span>
         </div>
       </div>
     </div>

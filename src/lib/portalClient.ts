@@ -27,7 +27,7 @@ async function pf<T>(path: string, init?: RequestInit & { auth?: boolean }): Pro
 export interface PortalDashboard {
   displayName: string; clinicName: string; branchName: string | null;
   cards: Record<string, { state: string; amount?: number; currency?: string; count?: number; service?: string; startsAt?: string; detail?: string }>;
-  paymentPolicyAcknowledged: boolean; allowedActions: string[]; deepLinkTargets: Record<string, string>;
+  paymentPolicyAvailable: boolean; paymentPolicyAcknowledged: boolean; allowedActions: string[]; deepLinkTargets: Record<string, string>;
 }
 export interface PortalAppt { id: string; service: string; startsAt: string; endsAt: string; status: string; provider: string | null }
 export interface PortalRequest { id: string; service: string | null; requestedDateTime: string | null; status: string; createdAt: string }
@@ -48,7 +48,15 @@ export interface PortalIntakePacket {
 export interface PortalInsurance { id: string; planName: string; memberId: string; groupNumber: string | null; subscriberName: string | null; status: string }
 export interface PortalPayment { id: string; amount: number; currency: string; status: string; reason: string; payLink: string | null; payLinkUnavailable: boolean; dueAt: string | null }
 export interface PortalEstimate { id: string; estimatedPatientResponsibility: number; recommendedCollectAmount: number; acknowledged: boolean; createdAt: string; disclaimer: string }
-export interface PortalPreferences { sms: boolean; email: boolean; whatsapp: boolean; voice: boolean; marketing: boolean }
+export interface PortalPreferences {
+  sms: boolean; email: boolean; whatsapp: boolean; marketing: boolean;
+  smsAuthorizationStatus: 'opted_out' | 'opted_in' | 'not_recorded';
+  emailAuthorizationStatus: 'opted_out' | 'opted_in' | 'not_recorded';
+  whatsappAuthorizationStatus: 'opted_out' | 'opted_in' | 'not_recorded';
+  marketingAuthorizationStatus: 'opted_out' | 'opted_in' | 'not_recorded';
+  voice: boolean; voiceOptedOut: boolean;
+  voiceAuthorizationStatus: 'opted_out' | 'opted_in' | 'not_recorded' | string;
+}
 
 export const portalClient = {
   requestLink: (clinicSlug: string, email: string) => pf<{ status: string; message: string; devToken?: string; devNote?: string }>('/v1/portal/auth/request-link', { method: 'POST', auth: false, body: JSON.stringify({ clinicSlug, email }) }),
@@ -79,7 +87,6 @@ export const portalClient = {
   payments: () => pf<PortalPayment[]>('/v1/portal/payments'),
   estimates: () => pf<PortalEstimate[]>('/v1/portal/estimates'),
   acknowledgeEstimate: (id: string) => pf<{ acknowledged: boolean }>(`/v1/portal/estimates/${id}/acknowledge`, { method: 'POST' }),
-  acknowledgePaymentPolicy: () => pf<{ acknowledged: boolean }>('/v1/portal/payment-policy/acknowledge', { method: 'POST' }),
   profile: () => pf<{ firstName: string; lastName: string; email: string; phone: string }>('/v1/portal/profile'),
   saveProfile: (body: { email?: string; phone?: string }) => pf<{ ok: boolean }>('/v1/portal/profile', { method: 'PATCH', body: JSON.stringify(body) }),
   preferences: () => pf<PortalPreferences>('/v1/portal/preferences'),
@@ -96,8 +103,8 @@ export const STATE_META: Record<string, { label: string; badge: string }> = {
   needs_update: { label: 'Needs update', badge: 'badge-amber' },
   payment_required: { label: 'Payment due', badge: 'badge-red' },
   unavailable: { label: 'Not available', badge: 'badge-blue' },
-  on_file: { label: 'On file', badge: 'badge-emerald' },
-  verified_recently: { label: 'Verified recently', badge: 'badge-emerald' },
+  on_file: { label: 'Policy on file', badge: 'badge-blue' },
+  verified_recently: { label: 'Eligibility checked recently', badge: 'badge-emerald' },
   unable_to_verify: { label: 'Clinic review needed', badge: 'badge-amber' },
   expired: { label: 'Expired', badge: 'badge-red' },
 };

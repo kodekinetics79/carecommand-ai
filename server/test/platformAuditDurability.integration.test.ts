@@ -29,6 +29,7 @@ const { env } = await import('../config/env');
 
 let app: FastifyInstance;
 const cleanup: Array<() => Promise<void>> = [];
+const INJECTED_REQUEST_IP = '127.0.0.1';
 
 beforeAll(async () => { app = await buildApp(); }, 60_000);
 afterAll(async () => {
@@ -158,7 +159,7 @@ describe('platform privileged audit durability', () => {
       where: { platformUserId: actorId, action: 'platform.login.failed', targetId: actorId },
     });
     expect(event).toMatchObject({
-      ipHash: hashV('203.0.113.121'),
+      ipHash: hashV(INJECTED_REQUEST_IP),
       userAgentHash: hashV(`platform-login-rollback-${suffix}`),
       metadata: { reason: 'bad_password', locked: false },
     });
@@ -253,7 +254,7 @@ describe('platform privileged audit durability', () => {
       where: { platformUserId: actorId, action: 'platform.login.success', targetId: actorId },
     });
     expect(event).toMatchObject({
-      ipHash: hashV('203.0.113.132'),
+      ipHash: hashV(INJECTED_REQUEST_IP),
       userAgentHash: hashV(`platform-mfa-success-rollback-${suffix}`),
       metadata: { mfa: true },
     });

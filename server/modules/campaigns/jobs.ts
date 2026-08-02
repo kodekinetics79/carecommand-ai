@@ -1,6 +1,7 @@
 import { db } from '../../lib/db';
 import { channelStatus, type CommChannel } from '../../lib/campaigns';
 import { dispatchCampaign } from '../../lib/campaignDispatch';
+import { buildCampaignLaunchPreview, campaignAuthorizationMatches } from '../../lib/campaignIntegrity';
 import { forEachActiveJobTenant } from '../../lib/jobTenantResolver';
 
 // ===========================================================================
@@ -32,12 +33,52 @@ export async function runScheduledCampaigns(now: Date = new Date(), only?: strin
     for (const c of due) {
       if (!c.audienceType) { skipped++; continue; }
       if (isWithinQuietHours(c.quietHours, now)) { skipped++; continue; }
+      const currentPreview = await buildCampaignLaunchPreview(tenantId, c);
+      if (!campaignAuthorizationMatches(c, currentPreview)) {
+        const reason = c.dispatchAuthorizationFingerprint ? 'stale' : 'missing';
+        await db.$transaction(async tx => {
+          await tx.campaign.updateMany({ where: { id: c.id, tenantId, status: 'SCHEDULED' }, data: { status: 'APPROVAL_REQUIRED' } });
+          await tx.auditEvent.create({ data: {
+            tenantId,
+            action: `campaign.scheduled_authorization_${reason}`,
+            resource: 'campaign',
+            resourceId: c.id,
+            userAgent: 'campaign-scheduler',
+            metadata: { reason, currentFingerprint: currentPreview.fingerprint, authorizedFingerprint: c.dispatchAuthorizationFingerprint ?? null },
+          } });
+        });
+        skipped++;
+        continue;
+      }
       const channel = (c.campaignChannel ?? 'sms') as CommChannel;
       // Do not send if the provider is missing — leave it SCHEDULED for later.
       if (channelStatus(channel).setupRequired) { skipped++; continue; }
-      const summary = await dispatchCampaign(tenantId, c.id, {});
-      await db.auditEvent.create({ data: { tenantId, action: 'campaign.scheduled_run', resource: 'campaign', resourceId: c.id, metadata: { sent: summary.sent, suppressed: summary.suppressed, failed: summary.failed } } }).catch(() => {});
-      dispatched++;
+      // Atomically claim this campaign so concurrent scheduler instances cannot
+      // both cross the provider boundary for the same authorization.
+      const claim = await db.campaign.updateMany({
+        where: { id: c.id, tenantId, status: 'SCHEDULED', dispatchAuthorizationFingerprint: currentPreview.fingerprint },
+        data: { status: 'ACTIVE' },
+      });
+      if (claim.count !== 1) { skipped++; continue; }
+      try {
+        const summary = await dispatchCampaign(tenantId, c.id, { authorizationFingerprint: currentPreview.fingerprint });
+        await db.auditEvent.create({ data: { tenantId, action: 'campaign.scheduled_run', resource: 'campaign', resourceId: c.id, metadata: { accepted: summary.accepted, deliveryUnknown: summary.deliveryUnknown, suppressed: summary.suppressed, failed: summary.failed, authorityBlocked: summary.authorityBlocked, atomicBoundaryBlocked: summary.atomicBoundaryBlocked, launchFingerprint: currentPreview.fingerprint } } });
+        if (summary.authorityBlocked > 0 || summary.atomicBoundaryBlocked > 0) skipped++;
+        else dispatched++;
+      } catch (error) {
+        await db.$transaction(async tx => {
+          await tx.campaign.updateMany({ where: { id: c.id, tenantId, status: 'ACTIVE' }, data: { status: 'FAILED' } });
+          await tx.auditEvent.create({ data: {
+            tenantId,
+            action: 'campaign.scheduled_run_failed',
+            resource: 'campaign',
+            resourceId: c.id,
+            userAgent: 'campaign-scheduler',
+            metadata: { reason: error instanceof Error ? error.message : 'unknown_error', launchFingerprint: currentPreview.fingerprint },
+          } });
+        });
+        skipped++;
+      }
     }
   });
   return { dispatched, skipped };

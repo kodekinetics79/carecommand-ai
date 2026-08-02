@@ -4,7 +4,7 @@ import { platformDb } from '../../lib/platformDb';
 import { env } from '../../config/env';
 import { verifyPassword, encryptSecret, decryptSecret } from '../../lib/security';
 import { generateTotpSecret, verifyTotp, totpAuthUri } from '../../lib/totp';
-import { signPlatformToken, signPlatformMfaToken, requirePlatformAccess, platformAuditEvent, runPlatformAuditedMutation, attachPlatformActorContext, platformSessionWasLoggedOut, platformSessionIdHash } from '../../lib/platformAuth';
+import { signPlatformToken, signPlatformMfaToken, requirePlatformAccess, platformAuditEvent, runPlatformAuditedMutation, attachPlatformActorContext, platformSessionWasLoggedOut, platformSessionIdHash, createPlatformAuditEvent, type PlatformMfaPurpose } from '../../lib/platformAuth';
 import { runWithPlatformDatabaseRequest } from '../../lib/platformContextStore';
 
 // ===========================================================================
@@ -69,22 +69,21 @@ export const platformAuthRoutes: FastifyPluginAsync = async app => {
       }
       return reply.code(401).send(INVALID_RESPONSE);
     }
-    if (user.mfaEnabled) {
-      // Password verification is not a successful login. Preserve lockout
-      // state and lastLoginAt until MFA completion and its audit both commit.
-      await platformAuditEvent(request, 'platform.login.password_verified', { type: 'platformUser', id: user.id }, { mfa: false, mfaRequired: true });
-      return reply.send({ mfaRequired: true, mfaToken: signPlatformMfaToken(app, user.id) });
-    }
-    const authenticated = await runPlatformAuditedMutation(request, {
-      action: 'platform.login.success',
-      target: { type: 'platformUser', id: user.id }, metadata: { mfa: false, mfaRequired: false },
-    }, tx => tx.platformUser.update({ where: { id: user.id }, data: { failedLoginCount: 0, lockedUntil: null, lastLoginAt: new Date() } }));
-    return reply.send({ token: signPlatformToken(app, authenticated), user: publicUser(authenticated) });
+    // Password verification alone never creates a privileged platform session.
+    // Unenrolled operators receive only a short-lived MFA-enrollment token.
+    await platformAuditEvent(request, 'platform.login.password_verified', { type: 'platformUser', id: user.id }, {
+      mfa: false,
+      mfaRequired: true,
+      enrollmentRequired: !user.mfaEnabled,
+    });
+    return reply.send(user.mfaEnabled
+      ? { mfaRequired: true, mfaToken: signPlatformMfaToken(app, user.id, 'challenge') }
+      : { mfaSetupRequired: true, mfaToken: signPlatformMfaToken(app, user.id, 'enrollment') });
   });
 
   // Resolves either a full platform session or a platform-mfa login token.
-  async function resolvePlatformActor(request: FastifyRequest): Promise<{ platformUserId: string; type: string; sessionId?: string }> {
-    const payload = await request.jwtVerify<{ platformUserId: string; type: string; sessionId?: string }>();
+  async function resolvePlatformActor(request: FastifyRequest): Promise<{ platformUserId: string; type: string; purpose?: PlatformMfaPurpose; sessionId?: string }> {
+    const payload = await request.jwtVerify<{ platformUserId: string; type: string; purpose?: PlatformMfaPurpose; sessionId?: string }>();
     if (!payload?.platformUserId || !['platform', 'platform-mfa'].includes(payload.type)) throw app.httpErrors.unauthorized('A valid platform token is required.');
     return payload;
   }
@@ -103,22 +102,35 @@ export const platformAuthRoutes: FastifyPluginAsync = async app => {
       await platformAuditEvent(request, 'platform.login.failed', { type: 'platformUser', id: user.id }, { reason: 'bad_mfa' });
       return reply.code(401).send({ error: 'invalid_code', message: 'Invalid authentication code.' });
     }
+    if (actor.type === 'platform-mfa' && actor.purpose === 'enrollment') {
+      if (user.mfaEnabled) throw app.httpErrors.conflict('MFA is already enabled. Sign in again.');
+      const authenticated = await platformDb.$transaction(async tx => {
+        const updated = await tx.platformUser.update({
+          where: { id: user.id },
+          data: { mfaEnabled: true, failedLoginCount: 0, lockedUntil: null, lastLoginAt: new Date() },
+        });
+        await createPlatformAuditEvent(tx, request, 'platform.mfa.enabled', { type: 'platformUser', id: user.id }, { enrollment: true });
+        await createPlatformAuditEvent(tx, request, 'platform.login.success', { type: 'platformUser', id: user.id }, { mfa: true, enrolled: true });
+        return updated;
+      });
+      return reply.send({ token: signPlatformToken(app, authenticated), user: publicUser(authenticated) });
+    }
     if (actor.type === 'platform-mfa') {
+      if (actor.purpose !== 'challenge' || !user.mfaEnabled) throw app.httpErrors.unauthorized('A valid MFA challenge is required.');
       const authenticated = await runPlatformAuditedMutation(request, {
         action: 'platform.login.success', target: { type: 'platformUser', id: user.id }, metadata: { mfa: true },
       }, tx => tx.platformUser.update({ where: { id: user.id }, data: { failedLoginCount: 0, lockedUntil: null, lastLoginAt: new Date() } }));
       return reply.send({ token: signPlatformToken(app, authenticated), user: publicUser(authenticated) });
     }
-    // Enabling MFA from a full session.
-    await runPlatformAuditedMutation(request, {
-      action: 'platform.mfa.enabled', target: { type: 'platformUser', id: user.id },
-    }, tx => tx.platformUser.update({ where: { id: user.id }, data: { mfaEnabled: true } }));
-    return reply.send({ enabled: true });
+    throw app.httpErrors.badRequest('MFA verification must use a short-lived challenge token.');
   });
 
-  app.post('/mfa/setup', { preHandler: requirePlatformAccess(), config: { rateLimit: PLATFORM_AUTH_RATE_LIMIT } }, async request => {
-    const user = await platformDb.platformUser.findFirst({ where: { id: request.platformUser!.id } });
-    if (!user) throw app.httpErrors.unauthorized('A valid platform session is required.');
+  app.post('/mfa/setup', { config: { rateLimit: PLATFORM_AUTH_RATE_LIMIT } }, async request => {
+    const actor = await resolvePlatformActor(request);
+    if (actor.type !== 'platform-mfa' || actor.purpose !== 'enrollment') throw app.httpErrors.unauthorized('A valid MFA enrollment token is required.');
+    const user = await platformDb.platformUser.findFirst({ where: { id: actor.platformUserId, status: 'active' } });
+    if (!user) throw app.httpErrors.unauthorized('A valid platform account is required.');
+    attachPlatformActorContext(request, user);
     if (user.mfaEnabled) throw app.httpErrors.conflict('MFA is already enabled.');
     const secret = generateTotpSecret();
     await runPlatformAuditedMutation(request, {

@@ -156,6 +156,48 @@ export interface CallLog {
   durationSeconds: number;
   sentiment: string | null;
   transcriptSummary: string | null;
+  providerSummary?: {
+    text: string;
+    source: 'PROVIDER_CALL_ANALYSIS';
+    sourceCallId: string | null;
+  } | null;
+  operationalNotes?: {
+    source: 'STAFF_ENTERED';
+    actorUserId: string;
+    recordedAt: string;
+    summary: string | null;
+    correction: string | null;
+    callerIntent: string | null;
+    actionsTaken: string[];
+    followUpNotes: string | null;
+  } | null;
+  unresolvedActionItems?: string[];
+  reviewStatus?: 'UNREVIEWED' | 'DRAFT' | 'REVIEWED' | 'SIGNED_OFF';
+  reviewRevision?: number;
+  reviewedAt?: string | null;
+  signedOffAt?: string | null;
+  reviewedBy?: { id: string; displayName: string } | null;
+  signedOffBy?: { id: string; displayName: string } | null;
+  recordingAvailable?: boolean;
+  recordingAccess?: 'available' | 'restricted' | 'not_available' | 'purged';
+  recordingUrl?: string | null;
+  reviewCapabilities?: { canEdit: boolean; canSignOff: boolean };
+  appointments?: Array<{ id: string; service: string; startsAt: string; status: string }>;
+  appointmentRequests?: Array<{
+    id: string;
+    requestedService: string | null;
+    requestedDateTime: string | null;
+    status: string;
+    bookedAppointmentId: string | null;
+  }>;
+  handoffReferences?: Array<{
+    id: string;
+    title: string;
+    status: string;
+    priority: string;
+    dueAt: string | null;
+    createdAt: string;
+  }>;
   startedAt: string | null;
   endedAt: string | null;
   createdAt: string;
@@ -516,7 +558,7 @@ export function presentLaunchResult(result: LaunchCallResult): LaunchPresentatio
     case 'blocked':
       return { kind: 'err', text: `No call was placed. Launch was blocked: ${launchWords(result.reason)}. Correct the authority or safety condition before retrying.`, refresh: true };
     case 'cancelled':
-      return { kind: 'warn', text: `The launch was cancelled (${launchWords(result.reason)}).${result.providerStopApplied === true ? ' Provider stop was confirmed.' : ' Do not assume provider submission; check the call log before retrying.'}`, refresh: true };
+      return { kind: 'warn', text: `The launch was canceled (${launchWords(result.reason)}).${result.providerStopApplied === true ? ' Provider stop was confirmed.' : ' Do not assume provider submission; check the call log before retrying.'}`, refresh: true };
     case 'reconciliation_required': {
       const missingEvidence = [
         result.providerStopApplied === false ? 'provider stop unconfirmed' : null,
@@ -708,6 +750,14 @@ export const receptionistApi = {
   getRetellConfig: (campaignId: string) => apiRequest<RetellConfig>(`${base}/campaigns/${campaignId}/retell-config`),
 
   listCallLogs: (clinicId: string) => apiRequest<CallLog[]>(`${base}/call-logs?clinicId=${clinicId}`),
+  getCallLog: (id: string) => apiRequest<CallLog>(`${base}/call-logs/${id}`),
+  updateCallReview: (id: string, body: {
+    operation: 'SAVE_DRAFT' | 'MARK_REVIEWED' | 'SIGN_OFF';
+    expectedRevision: number;
+    operationalNotes: { summary?: string | null; correction?: string | null; callerIntent?: string | null; actionsTaken: string[]; followUpNotes?: string | null };
+    unresolvedActionItems: string[];
+    acknowledgeUnresolvedActions?: true;
+  }) => apiRequest<CallLog>(`${base}/call-logs/${id}/operator-review`, { method: 'PATCH', body: JSON.stringify(body) }),
   listAppointmentRequests: (clinicId: string) => apiRequest<AppointmentRequest[]>(`${base}/appointment-requests?clinicId=${clinicId}`),
   listOptOuts: () => apiRequest<OptOut[]>(`${base}/opt-outs`),
   createOptOut: (body: Partial<OptOut> & { clinicId?: string }) => apiRequest<OptOut>(`${base}/opt-outs`, { method: 'POST', body: JSON.stringify(body) }),

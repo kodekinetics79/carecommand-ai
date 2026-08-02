@@ -19,8 +19,8 @@ interface HistoryRow {
 }
 
 const STATUS: Record<string, { cls: string; icon: ElementType; label: string }> = {
-  ACTIVE: { cls: 'badge-emerald', icon: ShieldCheck, label: 'Active' },
-  INACTIVE: { cls: 'badge-red', icon: ShieldX, label: 'Inactive' },
+  ACTIVE: { cls: 'badge-emerald', icon: ShieldCheck, label: 'Payer reports active' },
+  INACTIVE: { cls: 'badge-red', icon: ShieldX, label: 'Payer reports inactive' },
   NEEDS_REVIEW: { cls: 'badge-amber', icon: ShieldAlert, label: 'Needs review' },
   ERROR: { cls: 'badge-red', icon: AlertTriangle, label: 'Error' },
 };
@@ -86,7 +86,7 @@ export default function InsuranceEligibility() {
 
       <div className="grid gap-3 xl:grid-cols-[1fr_1fr] items-start">
         {/* Check form */}
-        <BentoCard title="Run Eligibility Check" subtitle="Real-time 270/271 via Stedi · coverage decided by the payer, not the UI" headerRight={<BadgeCheck className="w-4 h-4 text-t3" />}>
+        <BentoCard title="Request Eligibility Response" subtitle="270/271 via the configured Stedi mode · a point-in-time response, not a coverage or payment guarantee" headerRight={<BadgeCheck className="w-4 h-4 text-t3" />}>
           {!canCheck && !loading && (
             <div className="rounded-lg border border-[var(--b1)] bg-[var(--amber-soft)] p-3 text-[12px] text-amber-v mb-3">Stedi is not configured. Enable the sandbox in Integration Setup to run checks.</div>
           )}
@@ -100,9 +100,9 @@ export default function InsuranceEligibility() {
             <Field label="Payer name"><input value={form.payerName} onChange={e => setForm(f => ({ ...f, payerName: e.target.value }))} placeholder="e.g. Aetna" className={inputCls} /></Field>
             <Field label="Member ID"><input value={form.memberId} onChange={e => setForm(f => ({ ...f, memberId: e.target.value }))} placeholder="e.g. AET-110293" autoComplete="off" className={inputCls} /></Field>
             <Field label="Plan name (optional)"><input value={form.planName} onChange={e => setForm(f => ({ ...f, planName: e.target.value }))} placeholder="e.g. Aetna Core Plus" className={inputCls} /></Field>
-            {error && <p className="text-[12px] text-red-v">{error}</p>}
+            {error && <p role="alert" className="rounded-lg bg-[var(--red-soft)] px-3 py-2 text-[12px] font-semibold text-red-v">{error}</p>}
             <button type="button" disabled={!valid || busy || !canCheck} onClick={check} className="inline-flex items-center gap-2 rounded-lg bg-[var(--indigo)] px-4 py-2 text-[13px] font-semibold text-white hover:opacity-90 disabled:opacity-50">
-              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />} Check eligibility
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />} Request eligibility response
             </button>
             <p className="text-[10.5px] text-t3">Sandbox tip: member IDs ending <code className="font-mono">00</code> → inactive, <code className="font-mono">99</code> → needs review, starting <code className="font-mono">ERR</code> → error.</p>
           </div>
@@ -110,7 +110,7 @@ export default function InsuranceEligibility() {
 
         {/* Result */}
         <BentoCard title="Result" subtitle="Member ID is masked — full value is never returned to the browser">
-          {!result ? <EmptyStatePremium icon={<BadgeCheck className="w-5 h-5" />} title="No check run yet" description="Run an eligibility check to see coverage, copay, deductible, and coinsurance." />
+          {!result ? <EmptyStatePremium icon={<BadgeCheck className="w-5 h-5" />} title="No response requested yet" description="Request an eligibility response to view payer-reported status and benefit information." />
             : (() => {
               const meta = STATUS[result.status] ?? STATUS.ERROR;
               const Icon = meta.icon;
@@ -121,6 +121,9 @@ export default function InsuranceEligibility() {
                     <span className="text-[11px] text-t3">{result.providerMode} · {fmt(result.checkedAt)}</span>
                   </div>
                   <p className="text-[13px] text-t2 leading-snug">{result.message}</p>
+                  <p className="rounded-lg border border-[var(--b1)] bg-[var(--amber-soft)] px-3 py-2 text-[11px] text-amber-v">
+                    Benefits can change. Copay, deductible, and coinsurance values are payer-reported information and may not equal the final patient responsibility after adjudication.
+                  </p>
                   <div className="rounded-xl border border-[var(--b1)] divide-y divide-[var(--b1)]">
                     <Row label="Member ID" value={result.maskedMemberId ?? '—'} mono />
                     <Row label="Payer" value={result.payerName} />
@@ -137,7 +140,7 @@ export default function InsuranceEligibility() {
       </div>
 
       {/* History */}
-      <BentoCard title="Eligibility History" subtitle="Stored verifications · no member IDs are persisted" headerRight={<History className="w-4 h-4 text-t3" />}>
+      <BentoCard title="Eligibility Response History" subtitle="Stored point-in-time responses · this history view omits member IDs" headerRight={<History className="w-4 h-4 text-t3" />}>
         {loading ? <div className="skeleton-line h-24 rounded-lg" />
           : history.length === 0 ? <p className="text-xs text-t3 py-4 text-center">No eligibility checks yet.</p>
           : (

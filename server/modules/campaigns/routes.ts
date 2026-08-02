@@ -4,7 +4,6 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { env } from '../../config/env';
 import { audit } from '../../lib/audit';
-import { claimIdempotency } from '../revenue-protection';
 import { requireRoles } from '../../plugins/roles';
 import { requireFeature, isFeatureEnabled } from '../../lib/entitlements';
 import { emitBusinessEvent, upsertSignal, createRecommendation, type WorkflowEventType } from '../../lib/intelligence';
@@ -12,7 +11,7 @@ import type { Campaign } from '../../generated/prisma/client';
 import {
   CAMPAIGN_TYPES, AUDIENCE_TYPES, STAFF_FACING_AUDIENCES,
   buildAudience, previewAudience, generateDraft, providerReadiness, countOpenSlots,
-  channelStatus, maskDestination, isSuppressed,
+  channelStatus, maskDestination, isSuppressed, NON_VOICE_OUTREACH_AUTHORITY_VERSION,
   type AudienceType, type CommChannel, type CampaignType,
 } from '../../lib/campaigns';
 import { dispatchCampaign } from '../../lib/campaignDispatch';
@@ -21,6 +20,8 @@ import { aiProviderConfigured, draftWithAI } from '../../lib/campaignAI';
 import { RULE_CATALOG, evaluateRule, executeRule } from '../../lib/automationRules';
 import { enterTenantContext } from '../../lib/tenantContext';
 import { resolveIngressTenant } from '../../lib/tenantIngressResolvers';
+import { appendChannelSafetyFooter, buildCampaignLaunchPreview, normalizeProviderDeliveryStatus } from '../../lib/campaignIntegrity';
+import { applyCampaignDeliveryWebhook } from '../../lib/campaignDeliveryWebhook';
 
 // ===========================================================================
 // CRM Campaign / Reactivation engine routes (mounted at /v1/crm — distinct from
@@ -60,6 +61,10 @@ function mapCampaign(c: Campaign) {
     scheduledAt: c.scheduledAt?.toISOString() ?? null, messageSubject: c.messageSubject,
     messageTemplate: c.messageTemplate, draftSource: c.draftSource, audienceSize: c.audienceSize,
     createdAt: c.createdAt.toISOString(),
+    archivedAt: c.archivedAt?.toISOString() ?? null,
+    dispatchAuthorizedAt: c.dispatchAuthorizedAt?.toISOString() ?? null,
+    dispatchAuthorizedByUserId: c.dispatchAuthorizedByUserId,
+    dispatchAuthorizationRecorded: Boolean(c.dispatchAuthorizationFingerprint && c.dispatchAuthorizedByUserId && c.dispatchAuthorizedAt),
     allowedActions: campaignActions(c),
     deepLinkTarget: `campaign/${c.id}`,
     requiresApprovalPending: c.requiresApproval && !c.approvedByUserId,
@@ -68,6 +73,7 @@ function mapCampaign(c: Campaign) {
 
 function campaignActions(c: Campaign): string[] {
   const a: string[] = [];
+  if (c.archivedAt) return a;
   if (c.status === 'APPROVAL_REQUIRED') a.push('edit', 'generate_draft', 'approve');
   if (c.status === 'DRAFT') a.push('edit', 'generate_draft', 'launch');
   if (c.status === 'SCHEDULED') a.push('launch');
@@ -85,7 +91,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
 
   // ----- Campaigns CRUD ---------------------------------------------------
   app.get('/campaigns', async request => {
-    const rows = await db.campaign.findMany({ where: { tenantId: request.auth.tenantId, campaignType: { not: null } }, orderBy: { createdAt: 'desc' }, take: 100 });
+    const rows = await db.campaign.findMany({ where: { tenantId: request.auth.tenantId, campaignType: { not: null }, archivedAt: null }, orderBy: { createdAt: 'desc' }, take: 100 });
     return rows.map(mapCampaign);
   });
 
@@ -168,19 +174,73 @@ export const crmRoutes: FastifyPluginAsync = async app => {
   // ----- Approve ----------------------------------------------------------
   app.post('/campaigns/:id/approve', { preHandler: launchRoles }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
+    const authorization = z.object({
+      previewFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+      confirmExactAudienceTemplateProvider: z.literal(true),
+    }).optional().parse(request.body);
     const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!c) throw app.httpErrors.notFound('Campaign not found');
-    const row = await db.campaign.update({ where: { id }, data: { approvedByUserId: request.auth.userId, approvedAt: new Date(), status: c.status === 'APPROVAL_REQUIRED' ? 'SCHEDULED' : c.status } });
-    await audit(request, { action: 'campaign.approved', resource: 'campaign', resourceId: id });
+    let preview: Awaited<ReturnType<typeof buildCampaignLaunchPreview>> | null = null;
+    if (authorization) {
+      if (!c.audienceType) throw app.httpErrors.badRequest('Campaign has no audience type');
+      const audienceType = c.audienceType as AudienceType;
+      if (!(await isFeatureEnabled(request.auth.tenantId, AUDIENCE_FEATURE[audienceType]))) {
+        throw app.httpErrors.forbidden(`Audience source ${audienceType} is not enabled`);
+      }
+      if (STAFF_FACING_AUDIENCES.has(audienceType)) throw app.httpErrors.badRequest('This audience is staff-facing and cannot be used for patient outreach');
+      preview = await buildCampaignLaunchPreview(request.auth.tenantId, c);
+      if (preview.fingerprint !== authorization.previewFingerprint) {
+        throw app.httpErrors.conflict('Campaign content, audience eligibility, channel, or provider mode changed. Review a new launch preview before scheduling.');
+      }
+    }
+    const approvedAt = new Date();
+    const row = await db.campaign.update({ where: { id }, data: {
+      approvedByUserId: request.auth.userId,
+      approvedAt,
+      status: c.status === 'APPROVAL_REQUIRED' ? 'SCHEDULED' : c.status,
+      ...(preview ? {
+        dispatchAuthorizationFingerprint: preview.fingerprint,
+        dispatchAuthorizedByUserId: request.auth.userId,
+        dispatchAuthorizedAt: approvedAt,
+      } : {}),
+    } });
+    await audit(request, { action: 'campaign.approved', resource: 'campaign', resourceId: id, metadata: preview ? {
+      dispatchAuthorized: true,
+      launchFingerprint: preview.fingerprint,
+      templateRevision: preview.templateRevision,
+      providerMode: preview.providerMode,
+    } : { dispatchAuthorized: false } });
     await emitBusinessEvent(request.auth.tenantId, { eventType: 'campaign.approved', entityType: 'campaign', entityId: id, sourceModule: 'crm', payload: {} }).catch(() => {});
     return mapCampaign(row);
+  });
+
+  // ----- Server-issued launch preview ------------------------------------
+  // The fingerprint binds the exact recipient eligibility snapshot, message
+  // revision, channel, provider identity, and provider mode without returning
+  // recipient identifiers or destinations to the browser.
+  app.get('/campaigns/:id/launch-preview', { preHandler: launchRoles }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId, archivedAt: null } });
+    if (!c) throw app.httpErrors.notFound('Campaign not found');
+    if (!c.audienceType) throw app.httpErrors.badRequest('Campaign has no audience type');
+    return buildCampaignLaunchPreview(request.auth.tenantId, c);
   });
 
   // ----- Launch (build audience → idempotent deliveries) ------------------
   app.post('/campaigns/:id/launch', { preHandler: launchRoles }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
-    const body = z.object({ force: z.boolean().default(false) }).parse(request.body ?? {});
-    const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    const body = z.object({
+      force: z.boolean().default(false),
+      previewFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+      confirmExactAudienceTemplateProvider: z.literal(true),
+    }).parse(request.body ?? {});
+    if (body.force) {
+      return reply.code(409).send({
+        error: 'CAMPAIGN_RECONCILIATION_REQUIRED',
+        message: 'Bulk force retry is disabled. Reconcile provider evidence and authorize a recipient-scoped retry before resubmission.',
+      });
+    }
+    const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId, archivedAt: null } });
     if (!c) throw app.httpErrors.notFound('Campaign not found');
     if (!c.audienceType) throw app.httpErrors.badRequest('Campaign has no audience type');
     if (c.requiresApproval && !c.approvedByUserId) throw app.httpErrors.conflict('Campaign requires approval before launch');
@@ -191,17 +251,53 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     }
     if (STAFF_FACING_AUDIENCES.has(audienceType)) throw app.httpErrors.badRequest('This audience is staff-facing and cannot be used for patient outreach');
 
+    // Fail closed if content, audience eligibility/destinations, channel, or
+    // provider mode changed after the operator reviewed the server preview.
+    const launchPreview = await buildCampaignLaunchPreview(request.auth.tenantId, c);
+    if (launchPreview.fingerprint !== body.previewFingerprint) {
+      return reply.code(409).send({
+        error: 'LAUNCH_PREVIEW_STALE',
+        message: 'Campaign content, audience eligibility, channel, or provider mode changed. Review a new launch preview before dispatch.',
+        currentPreview: launchPreview,
+      });
+    }
+
+    // Persist the operator's exact authority before any provider boundary. A
+    // scheduler can use the same durable evidence, and dispatch revalidates it.
+    const authorizedAt = new Date();
+    await db.$transaction(async tx => {
+      await tx.campaign.update({ where: { id }, data: {
+        dispatchAuthorizationFingerprint: launchPreview.fingerprint,
+        dispatchAuthorizedByUserId: request.auth.userId,
+        dispatchAuthorizedAt: authorizedAt,
+      } });
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId,
+        actorUserId: request.auth.userId,
+        action: 'campaign.dispatch_authorized',
+        resource: 'campaign',
+        resourceId: id,
+        requestId: request.id,
+        ipAddress: request.ip,
+        userAgent: request.headers['user-agent'],
+        metadata: { launchFingerprint: launchPreview.fingerprint, templateRevision: launchPreview.templateRevision, providerMode: launchPreview.providerMode },
+      } });
+    });
+
     // Real send via the provider abstraction (dev mock / live / setup_required).
     // Per-recipient delivery events are emitted inside dispatchCampaign.
-    const result = await dispatchCampaign(request.auth.tenantId, id, { force: body.force });
-    const newStatus = result.sent > 0 ? 'ACTIVE' : 'SCHEDULED';
-    await audit(request, { action: 'campaign.launched', resource: 'campaign', resourceId: id, metadata: { sent: result.sent, suppressed: result.suppressed, skipped: result.skipped, setupRequired: result.setupRequired, failed: result.failed } });
-    await emitBusinessEvent(request.auth.tenantId, { eventType: 'campaign.launched', entityType: 'campaign', entityId: id, sourceModule: 'crm', payload: { sent: result.sent, suppressed: result.suppressed } }).catch(() => {});
+    const result = await dispatchCampaign(request.auth.tenantId, id, { force: body.force, authorizationFingerprint: launchPreview.fingerprint });
+    const newStatus = result.authorityBlocked > 0 || result.atomicBoundaryBlocked > 0
+      ? 'APPROVAL_REQUIRED'
+      : result.accepted > 0 || result.deliveryUnknown > 0 ? 'ACTIVE' : 'SCHEDULED';
+    await audit(request, { action: 'campaign.launched', resource: 'campaign', resourceId: id, metadata: { accepted: result.accepted, deliveryUnknown: result.deliveryUnknown, suppressed: result.suppressed, skipped: result.skipped, setupRequired: result.setupRequired, failed: result.failed, authorityBlocked: result.authorityBlocked, atomicBoundaryBlocked: result.atomicBoundaryBlocked, launchFingerprint: launchPreview.fingerprint, templateRevision: launchPreview.templateRevision, providerMode: launchPreview.providerMode } });
+    await emitBusinessEvent(request.auth.tenantId, { eventType: 'campaign.launched', entityType: 'campaign', entityId: id, sourceModule: 'crm', payload: { accepted: result.accepted, suppressed: result.suppressed } }).catch(() => {});
 
     return reply.send({
-      campaignId: id, status: newStatus, setupRequired: result.setupRequired > 0 && result.sent === 0,
-      summary: { total: result.total, sent: result.sent, suppressed: result.suppressed, skipped: result.skipped, setupRequired: result.setupRequired, pending: result.pending, failed: result.failed },
-      provider: { channel: result.channel, configured: result.provider.configured, setupRequired: result.provider.setupRequired, missing: result.provider.missing, mode: result.provider.mock ? 'mock_dev' : result.provider.configured ? 'configured_pending_provider' : 'unconfigured' },
+      campaignId: id, status: newStatus, setupRequired: result.setupRequired > 0 && result.accepted === 0,
+      summary: { total: result.total, accepted: result.accepted, deliveryUnknown: result.deliveryUnknown, suppressed: result.suppressed, skipped: result.skipped, setupRequired: result.setupRequired, queued: result.queued, failed: result.failed, authorityBlocked: result.authorityBlocked, atomicBoundaryBlocked: result.atomicBoundaryBlocked },
+      provider: { channel: result.channel, configured: result.provider.configured, setupRequired: result.provider.setupRequired, missing: result.provider.missing, mode: launchPreview.providerMode, liveDispatchActivated: launchPreview.liveDispatchActivated },
+      launchFingerprint: launchPreview.fingerprint,
       deepLinkTarget: `campaign/${id}`,
     });
   });
@@ -224,15 +320,23 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     return mapCampaign(row);
   });
 
-  // ----- Delete (hard-remove a campaign + its delivery rows cascade) -------
+  // ----- Archive (preserve campaign + delivery evidence) ------------------
   app.delete('/campaigns/:id', { preHandler: launchRoles }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!c) throw app.httpErrors.notFound('Campaign not found');
-    // CampaignDelivery has onDelete: Cascade, so deliveries are removed with it.
-    await db.campaign.delete({ where: { id } });
-    await audit(request, { action: 'campaign.deleted', resource: 'campaign', resourceId: id, metadata: { campaignType: c.campaignType, status: c.status } });
-    return reply.code(204).send();
+    if (c.archivedAt) return reply.send(mapCampaign(c));
+    const row = await db.$transaction(async tx => {
+      const archived = await tx.campaign.update({ where: { id }, data: { archivedAt: new Date(), status: 'CANCELLED' } });
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+        action: 'campaign.archived', resource: 'campaign', resourceId: id,
+        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
+        metadata: { campaignType: c.campaignType, priorStatus: c.status, evidencePreserved: true },
+      } });
+      return archived;
+    });
+    return reply.send(mapCampaign(row));
   });
 
   // ----- Consent-checked per-lead send (Pipeline CTAs) --------------------
@@ -242,11 +346,11 @@ export const crmRoutes: FastifyPluginAsync = async app => {
   const LEAD_SEND_CTAS = ['send_booking_link', 'send_deposit_link', 'send_intake_form', 'send_follow_up', 'confirm_visit'] as const;
   type LeadSendCta = typeof LEAD_SEND_CTAS[number];
   const SEND_TEMPLATE: Record<LeadSendCta, { subject: string; body: (name: string, service: string, clinic: string) => string }> = {
-    send_booking_link: { subject: 'Book your appointment', body: (n, s, c) => `Hi ${n}, this is ${c}. Ready to book your ${s || 'appointment'}? Reply BOOK and we'll find a time that suits you.` },
-    send_deposit_link: { subject: 'Secure your booking', body: (n, s, c) => `Hi ${n}, ${c} here. To reserve your ${s || 'appointment'}, a small deposit secures your slot. Reply YES and we'll send a secure payment link.` },
-    send_intake_form: { subject: 'Complete your intake', body: (n, s, c) => `Hi ${n}, before your ${s || 'visit'} at ${c}, please complete a short intake form. Reply FORM and we'll send it over.` },
-    send_follow_up: { subject: 'Following up', body: (n, s, c) => `Hi ${n}, it's ${c} following up about your ${s || 'care'}. Would you like to schedule your next visit? Reply YES to book.` },
-    confirm_visit: { subject: 'Confirm your visit', body: (n, s, c) => `Hi ${n}, please confirm your upcoming ${s || 'appointment'} at ${c}. Reply C to confirm or R to reschedule.` },
+    send_booking_link: { subject: 'Appointment options', body: (n, s, c) => `Hi ${n}, this is ${c}. Contact the clinic using verified contact details to review options for your ${s || 'appointment'}. No appointment is held until the clinic confirms it.` },
+    send_deposit_link: { subject: 'Booking deposit information', body: (n, s, c) => `Hi ${n}, ${c} here. Contact the clinic using verified contact details if you need an approved payment link for your ${s || 'appointment'}. Do not send payment information by reply.` },
+    send_intake_form: { subject: 'Intake information', body: (n, s, c) => `Hi ${n}, before your ${s || 'visit'} at ${c}, contact the clinic using verified contact details if you need an approved intake link. Do not send health information by reply.` },
+    send_follow_up: { subject: 'Following up', body: (n, s, c) => `Hi ${n}, it's ${c} following up about your ${s || 'visit'}. Contact the clinic using verified contact details if you would like to discuss next steps.` },
+    confirm_visit: { subject: 'Upcoming visit', body: (n, s, c) => `Hi ${n}, contact ${c} using verified contact details to confirm or request a change to your upcoming ${s || 'appointment'}. This message does not change the appointment.` },
   };
 
   function channelFor(leadChannel: string, hasPhone: boolean, hasEmail: boolean): CommChannel | null {
@@ -287,11 +391,31 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     const tenant = await db.tenant.findUnique({ where: { id: request.auth.tenantId }, select: { name: true } });
     const tpl = SEND_TEMPLATE[body.cta];
     const subject = tpl.subject;
-    const message = tpl.body(lead.name.split(' ')[0], lead.service, tenant?.name ?? 'your clinic');
+    const clinicName = tenant?.name ?? 'your clinic';
+    const message = appendChannelSafetyFooter(channel, tpl.body(lead.name.split(' ')[0], lead.service, clinicName), clinicName);
     const idempotencyKey = `lead-send:${id}:${body.cta}:${new Date().toISOString().slice(0, 10)}`;
 
-    const result = await sendMessage(channel, destination, subject, message, idempotencyKey, { tenantId: request.auth.tenantId, leadId: id });
-    await audit(request, { action: 'crm.lead.message_sent', resource: 'lead', resourceId: id, metadata: { cta: body.cta, channel, status: result.status, mode: result.mode } });
+    const result = await sendMessage(channel, destination, subject, message, idempotencyKey, {
+      tenantId: request.auth.tenantId,
+      leadId: id,
+      regulatedOutreach: { purpose: body.cta },
+    });
+    await audit(request, { action: 'crm.lead.message_submission_result', resource: 'lead', resourceId: id, metadata: { cta: body.cta, channel, status: result.status, mode: result.mode, failureCode: result.failureReason ?? null } });
+
+    if (result.failureReason === 'affirmative_outreach_authority_required') {
+      return reply.code(409).send({
+        status: 'blocked', reason: 'affirmative_authority_required', channel,
+        destinationMasked: maskDestination(destination),
+        message: 'No current consent record ties this message purpose to the approved notice version. Nothing was submitted.',
+      });
+    }
+    if (result.failureReason === 'live_outreach_atomic_boundary_not_activated') {
+      return reply.code(409).send({
+        status: 'blocked', reason: 'live_boundary_not_activated', channel,
+        destinationMasked: maskDestination(destination),
+        message: 'Live outreach is not activated. Nothing was submitted because the last-second consent and opt-out safety control has not been validated.',
+      });
+    }
 
     return reply.code(result.ok ? 200 : 502).send({
       status: result.status, channel, destinationMasked: maskDestination(destination),
@@ -356,7 +480,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
   app.get('/campaigns/:id/deliveries', async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const rows = await db.campaignDelivery.findMany({ where: { tenantId: request.auth.tenantId, campaignId: id }, orderBy: { createdAt: 'desc' }, take: 500 });
-    return rows.map(d => ({ deliveryId: d.id, campaignId: d.campaignId, patientId: d.patientId, leadId: d.leadId, channel: d.channel, destinationMasked: d.destinationMasked, status: d.status, provider: d.provider, providerMessageId: d.providerMessageId, failureReason: d.failureReason, sentAt: d.sentAt?.toISOString() ?? null, deepLinkTarget: `campaign/${id}` }));
+    return rows.map(d => ({ deliveryId: d.id, campaignId: d.campaignId, patientId: d.patientId, leadId: d.leadId, channel: d.channel, destinationMasked: d.destinationMasked, status: d.status, provider: d.provider, providerMessageId: d.providerMessageId, failureReason: d.failureReason, sentAt: d.sentAt?.toISOString() ?? null, providerAcceptedAt: d.providerAcceptedAt?.toISOString() ?? null, deliveredAt: d.deliveredAt?.toISOString() ?? null, statusUpdatedAt: d.statusUpdatedAt.toISOString(), deepLinkTarget: `campaign/${id}` }));
   });
 
   // ----- Opportunity scan: connect real audiences → signals + recs --------
@@ -406,7 +530,36 @@ export const crmRoutes: FastifyPluginAsync = async app => {
   // ----- Communication consent + suppression ------------------------------
   app.get('/consent', async request => {
     const q = z.object({ patientId: uuid.optional() }).parse(request.query);
-    return db.communicationConsent.findMany({ where: { tenantId: request.auth.tenantId, ...(q.patientId ? { patientId: q.patientId } : {}) }, orderBy: { updatedAt: 'desc' }, take: 200 });
+    const [legacyRows, patientEvents] = await Promise.all([
+      db.communicationConsent.findMany({ where: { tenantId: request.auth.tenantId, ...(q.patientId ? { patientId: q.patientId } : {}) }, orderBy: { updatedAt: 'desc' }, take: 200 }),
+      db.consentEvent.findMany({
+        where: {
+          tenantId: request.auth.tenantId,
+          ...(q.patientId ? { patientId: q.patientId } : {}),
+          purpose: { in: ['SMS', 'EMAIL', 'WHATSAPP'] },
+        },
+        orderBy: [{ occurredAt: 'desc' }, { id: 'desc' }],
+        take: 500,
+        select: { id: true, patientId: true, purpose: true, granted: true, source: true, occurredAt: true },
+      }),
+    ]);
+    const eventKeys = new Set<string>();
+    const eventRows = patientEvents.flatMap(event => {
+      const channel = event.purpose.toLowerCase();
+      const key = `${event.patientId}:${channel}`;
+      if (eventKeys.has(key)) return [];
+      eventKeys.add(key);
+      return [{
+        id: event.id, tenantId: request.auth.tenantId, patientId: event.patientId, leadId: null,
+        channel, status: event.granted ? 'opted_in' : 'opted_out', source: event.source,
+        capturedAt: event.occurredAt, revokedAt: event.granted ? null : event.occurredAt,
+        metadata: null, createdAt: event.occurredAt, updatedAt: event.occurredAt,
+      }];
+    });
+    return [
+      ...eventRows,
+      ...legacyRows.filter(row => !row.patientId || !eventKeys.has(`${row.patientId}:${row.channel.toLowerCase()}`)),
+    ].slice(0, 200);
   });
 
   app.post('/consent', { preHandler: writeRoles }, async (request, reply) => {
@@ -414,6 +567,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
       patientId: uuid.optional(), leadId: uuid.optional(), channel: channelEnum,
       status: z.enum(['opted_in', 'opted_out', 'unknown']), source: z.string().trim().max(80).default('staff'),
       purpose: voicePurpose.optional(), policyVersion: z.string().trim().min(1).max(100).optional(),
+      outreachPurpose: z.enum(CAMPAIGN_TYPES).optional(),
       disclosureTextHash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
       evidenceReference: z.string().trim().min(3).max(200).optional(),
       captureMethod: voiceCaptureMethod.optional(), evidenceSource: voiceEvidenceSource.optional(),
@@ -423,12 +577,78 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     if (Boolean(input.patientId) === Boolean(input.leadId)) throw app.httpErrors.badRequest('Exactly one patientId or leadId is required');
 
     if (input.channel !== 'voice') {
-      const existing = await db.communicationConsent.findFirst({ where: { tenantId: request.auth.tenantId, patientId: input.patientId ?? null, leadId: input.leadId ?? null, channel: input.channel } });
-      const row = existing
-        ? await db.communicationConsent.update({ where: { id: existing.id }, data: { status: input.status, source: input.source, capturedAt: new Date(), revokedAt: input.status === 'opted_out' ? new Date() : null } })
-        : await db.communicationConsent.create({ data: { tenantId: request.auth.tenantId, patientId: input.patientId, leadId: input.leadId, channel: input.channel, status: input.status, source: input.source, revokedAt: input.status === 'opted_out' ? new Date() : null } });
-      await audit(request, { action: 'consent.updated', resource: 'communicationConsent', resourceId: row.id, metadata: { channel: input.channel, status: input.status } });
-      return reply.code(201).send(row);
+      if (input.status === 'unknown') throw app.httpErrors.badRequest('Non-voice authority must be an explicit grant or revocation');
+      if (input.status === 'opted_in' && input.leadId) {
+        throw app.httpErrors.conflict('Affirmative lead outreach is unavailable until an immutable, purpose-specific lead authority record is supported');
+      }
+      if (input.status === 'opted_in' && (!input.outreachPurpose || !input.policyVersion || !input.disclosureTextHash
+        || !input.evidenceReference || !input.captureMethod || !input.evidenceSource || !input.jurisdiction)) {
+        throw app.httpErrors.badRequest('Affirmative non-voice authority requires outreachPurpose, policyVersion, disclosureTextHash, evidenceReference, captureMethod, evidenceSource, and jurisdiction');
+      }
+      if (input.captureMethod && input.evidenceSource && VOICE_SOURCE_BY_METHOD[input.captureMethod] !== input.evidenceSource) {
+        throw app.httpErrors.badRequest('Evidence source is incompatible with captureMethod');
+      }
+      if (input.captureMethod === 'import_verified' && !['OWNER', 'ADMIN'].includes(request.auth.role)) {
+        throw app.httpErrors.forbidden('Verified consent imports require OWNER or ADMIN review');
+      }
+      const occurredAt = input.occurredAt ?? new Date();
+      if (occurredAt > new Date(Date.now() + 5 * 60_000) || (input.expiresAt && input.expiresAt <= occurredAt)) {
+        throw app.httpErrors.badRequest('Authority evidence timestamps are invalid');
+      }
+      const channelPurpose = input.channel === 'sms' ? 'SMS' as const : input.channel === 'email' ? 'EMAIL' as const : 'WHATSAPP' as const;
+      const result = await db.$transaction(async tx => {
+        const identityExists = input.patientId
+          ? await tx.patient.count({ where: { id: input.patientId, tenantId: request.auth.tenantId, deletedAt: null } })
+          : await tx.lead.count({ where: { id: input.leadId!, tenantId: request.auth.tenantId } });
+        if (identityExists !== 1) throw app.httpErrors.notFound('Consent identity not found in this tenant');
+
+        if (input.patientId) {
+          const event = await tx.consentEvent.create({ data: {
+            tenantId: request.auth.tenantId,
+            patientId: input.patientId,
+            purpose: channelPurpose,
+            granted: input.status === 'opted_in',
+            source: input.evidenceSource ?? input.source,
+            occurredAt,
+            metadata: input.status === 'opted_in' ? {
+              authorityVersion: NON_VOICE_OUTREACH_AUTHORITY_VERSION,
+              outreachPurpose: input.outreachPurpose!,
+              policyVersion: input.policyVersion!,
+              disclosureTextHash: input.disclosureTextHash!,
+              evidenceReference: input.evidenceReference!,
+              captureMethod: input.captureMethod!,
+              evidenceSource: input.evidenceSource!,
+              jurisdiction: input.jurisdiction!,
+              expiresAt: input.expiresAt?.toISOString() ?? null,
+            } : { authorityVersion: NON_VOICE_OUTREACH_AUTHORITY_VERSION, revocationScope: 'channel_all_purposes' },
+          } });
+          await tx.auditEvent.create({ data: {
+            tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+            action: input.status === 'opted_in' ? 'communication.authority.granted' : 'communication.authority.revoked',
+            resource: 'consentEvent', resourceId: event.id, requestId: request.id,
+            ipAddress: request.ip, userAgent: request.headers['user-agent'],
+            metadata: { channel: input.channel, outreachPurpose: input.outreachPurpose ?? null, policyVersion: input.policyVersion ?? null },
+          } });
+          return { authorityEvent: event };
+        }
+
+        // Leads may revoke/suppress a channel, but cannot acquire affirmative
+        // live authority through the legacy mutable consent record.
+        const existing = await tx.communicationConsent.findFirst({
+          where: { tenantId: request.auth.tenantId, patientId: null, leadId: input.leadId!, channel: input.channel },
+        });
+        const consent = existing
+          ? await tx.communicationConsent.update({ where: { id: existing.id }, data: { status: 'opted_out', source: input.source, capturedAt: occurredAt, revokedAt: occurredAt } })
+          : await tx.communicationConsent.create({ data: { tenantId: request.auth.tenantId, leadId: input.leadId!, channel: input.channel, status: 'opted_out', source: input.source, capturedAt: occurredAt, revokedAt: occurredAt } });
+        await tx.auditEvent.create({ data: {
+          tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+          action: 'communication.authority.revoked', resource: 'communicationConsent', resourceId: consent.id,
+          requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
+          metadata: { channel: input.channel, identityType: 'lead' },
+        } });
+        return { consent };
+      });
+      return reply.code(201).send(result);
     }
 
     if (input.status === 'unknown') throw app.httpErrors.badRequest('Voice evidence must be an explicit grant or revocation');
@@ -524,20 +744,25 @@ export const crmWebhookRoutes: FastifyPluginAsync = async app => {
     if (!resolved) return reply.code(200).send({ received: true, matched: false });
     enterTenantContext({ tenantId: resolved.tenantId, actorId: `webhook:campaign:${resolved.resourceId}`, actorRole: 'WEBHOOK', source: 'webhook', requestId: request.id });
 
-    // Idempotent on the provider event id — duplicate callbacks are acknowledged.
-    const claim = await claimIdempotency('campaign.delivery.webhook', event.data.eventId, resolved.tenantId);
-    if (!claim.claimed) return reply.code(200).send({ received: true, duplicate: true });
-
-    const delivery = await db.campaignDelivery.findFirst({ where: { id: resolved.resourceId, providerMessageId: event.data.providerMessageId } });
-    if (!delivery) return reply.code(200).send({ received: true, matched: false });
-
-    const s = event.data.status.toLowerCase();
-    const mapped = ['delivered', 'sent'].includes(s) ? 'sent' : ['failed', 'undelivered', 'bounced'].includes(s) ? 'failed' : null;
-    // Only transition a non-terminal-from-callback state; never regress a recorded failure.
-    if (mapped && delivery.status !== 'failed') {
-      await db.campaignDelivery.update({ where: { id: delivery.id }, data: { status: mapped, failureReason: mapped === 'failed' ? event.data.status : delivery.failureReason } });
-      await db.auditEvent.create({ data: { tenantId: delivery.tenantId, action: mapped === 'failed' ? 'campaign.delivery.failed' : 'campaign.delivery.sent', resource: 'campaignDelivery', resourceId: delivery.id, ipAddress: request.ip, metadata: { providerStatus: s } } }).catch(() => {});
+    const normalizedStatus = normalizeProviderDeliveryStatus(event.data.status);
+    if (!normalizedStatus) return reply.code(400).send({ error: 'UNSUPPORTED_PROVIDER_STATUS' });
+    try {
+      const result = await applyCampaignDeliveryWebhook({
+        tenantId: resolved.tenantId,
+        deliveryId: resolved.resourceId,
+        providerMessageId: event.data.providerMessageId,
+        eventId: event.data.eventId,
+        providerStatus: event.data.status,
+        normalizedStatus,
+        requestId: request.id,
+        ipAddress: request.ip,
+      });
+      return reply.code(200).send(result);
+    } catch (error) {
+      if (error instanceof Error && error.message === 'CAMPAIGN_DELIVERY_NOT_FOUND') {
+        return reply.code(200).send({ received: true, matched: false });
+      }
+      throw error;
     }
-    return reply.code(200).send({ received: true });
   });
 };

@@ -1,7 +1,7 @@
 import { apiRequest } from './api';
 
 // ============================================================================
-// GrowthPulse CRM service — AI patient growth, retention & revenue recovery.
+// GrowthPulse CRM service — patient growth, retention & revenue recovery.
 // All page data flows through here (no hardcoded sample data in components).
 // Every callable method below is backed by a real endpoint or real-data derivation.
 // ============================================================================
@@ -16,16 +16,18 @@ export const STAGE_LABEL: Record<Stage, string> = {
 };
 
 export interface ConsentFlags {
-  email: boolean; sms: boolean; whatsapp: boolean; voice: boolean;
-  marketing: boolean; doNotContact: boolean; campaignReady: boolean;
+  email: ConsentEvidenceStatus; sms: ConsentEvidenceStatus;
+  whatsapp: ConsentEvidenceStatus; voice: ConsentEvidenceStatus;
+  evidenceAvailable: boolean;
 }
+export type ConsentEvidenceStatus = 'opted_in' | 'opted_out' | 'unknown';
 
 export interface ScoreDriver { label: string; positive: boolean; weight: number }
 export interface CrmLead {
   id: string; name: string; phone: string; email?: string; channel: string;
   service: string; stage: Stage; source: string; estimatedValue: number;
   createdAt: string; ageDays: number; owner: string; branchId: string;
-  score: number; scoreDrivers: ScoreDriver[]; confidence: number;
+  score: number; scoreDrivers: ScoreDriver[];
   nextBestAction: { label: string; cta: CtaId }; bestChannel: string; bestTime: string;
   consent: ConsentFlags; isPatient: boolean;
 }
@@ -46,7 +48,8 @@ export interface CommandMetrics {
 
 export interface SmartSegment {
   id: string; label: string; description: string; patientCount: number; recoverableValue: number;
-  bestChannel: string; recommendedOffer: string; expectedBookingRate: number; campaignCost: number; confidence: number;
+  planningChannel: string; planningOffer: string; planningBookingRate: number; planningCost: number;
+  assumptionNotice: string;
 }
 
 export interface AutomationRule {
@@ -55,18 +58,29 @@ export interface AutomationRule {
 }
 export interface RuleTemplate { key: string; name: string; triggerType: string; actionType: string; config: Record<string, number>; description: string }
 
-// ---- consent derivation (real, from tags/lifecycle until per-record consent API) ----
-function consentFor(tags: string[], lifecycle: string): ConsentFlags {
-  const t = tags.map(x => x.toLowerCase());
-  const dnc = t.includes('opted-out') || t.includes('do-not-contact') || lifecycle.toLowerCase() === 'lost';
-  const marketing = !dnc && (t.includes('marketing') || t.includes('vip') || t.includes('winback') || t.includes('wellness') || t.includes('skincare') || t.includes('referrer'));
+interface CommunicationConsentRow {
+  patientId?: string | null;
+  leadId?: string | null;
+  channel?: string;
+  status?: string;
+}
+
+type ConsentChannel = 'email' | 'sms' | 'whatsapp' | 'voice';
+
+/** Maps only persisted canonical communication-consent rows. Missing evidence stays unknown. */
+export function consentFromCanonicalEvidence(rows: CommunicationConsentRow[], target: { patientId?: string; leadId?: string }): ConsentFlags {
+  const relevant = rows.filter(row => target.patientId ? row.patientId === target.patientId : row.leadId === target.leadId);
+  const statusFor = (channel: ConsentChannel): ConsentEvidenceStatus => {
+    const status = relevant.find(row => row.channel?.toLowerCase() === channel)?.status?.toLowerCase();
+    return status === 'opted_in' || status === 'opted_out' ? status : 'unknown';
+  };
   return {
-    email: !dnc, sms: !dnc, whatsapp: !dnc, voice: !dnc,
-    marketing, doNotContact: dnc, campaignReady: marketing && !dnc,
+    email: statusFor('email'), sms: statusFor('sms'), whatsapp: statusFor('whatsapp'), voice: statusFor('voice'),
+    evidenceAvailable: relevant.some(row => row.status === 'opted_in' || row.status === 'opted_out'),
   };
 }
 
-// ---- AI lead scoring (heuristic over real fields; drivers are explainable) ----
+// ---- Unvalidated planning priority (fixed heuristic over real fields) ----
 const STAGE_INTENT: Record<Stage, number> = { 'new-inquiry': 20, contacted: 40, booked: 70, visited: 80, 'follow-up': 55, retained: 90, lost: 0 };
 function scoreLead(lead: { stage: Stage; estimatedValue: number; createdAt: string; channel: string }, maxValue: number): { score: number; drivers: ScoreDriver[] } {
   const drivers: ScoreDriver[] = [];
@@ -93,9 +107,12 @@ const NBA: Record<Stage, { label: string; cta: CtaId }> = {
 };
 
 export const crmService = {
-  // [LIVE] GET /v1/leads → scored + explainable
+  // [LIVE] GET /v1/leads + canonical communication-consent evidence.
   async getLeads(): Promise<CrmLead[]> {
-    const rows = await apiRequest<Array<Record<string, unknown>>>('/v1/leads?limit=100');
+    const [rows, consents] = await Promise.all([
+      apiRequest<Array<Record<string, unknown>>>('/v1/leads?limit=100'),
+      apiRequest<CommunicationConsentRow[]>('/v1/crm/consent'),
+    ]);
     const maxValue = Math.max(1, ...rows.map(r => num(r.estimatedValue)));
     return rows.map(r => {
       const stage = (String(r.stage ?? 'new-inquiry') as Stage);
@@ -108,9 +125,9 @@ export const crmService = {
         id: String(r.id), name: String(r.name ?? 'Lead'), phone: String(r.phone ?? ''), email: r.email ? String(r.email) : undefined,
         channel, service: String(r.service ?? ''), stage, source: String(r.source ?? 'Unknown'), estimatedValue: ev,
         createdAt, ageDays, owner: String(r.owner ?? 'Unassigned'), branchId: String(r.branchId ?? ''),
-        score, scoreDrivers: drivers, confidence: Math.min(95, 50 + Math.round(score / 3)),
-        nextBestAction: NBA[stage], bestChannel: channel, bestTime: ageDays <= 1 ? 'Now (within the hour)' : 'Late morning / early evening',
-        consent: { email: true, sms: true, whatsapp: ['whatsapp'].includes(channel.toLowerCase()), voice: true, marketing: false, doNotContact: false, campaignReady: false },
+        score, scoreDrivers: drivers,
+        nextBestAction: NBA[stage], bestChannel: channel, bestTime: ageDays <= 1 ? 'Planning assumption: prompt review now' : 'Planning assumption: review during staffed hours',
+        consent: consentFromCanonicalEvidence(consents, { leadId: String(r.id) }),
         isPatient: false,
       };
     });
@@ -118,7 +135,10 @@ export const crmService = {
 
   // [LIVE] GET /v1/patients
   async getPatients(): Promise<CrmPatient[]> {
-    const res = await apiRequest<{ data: Array<Record<string, unknown>> }>('/v1/patients?limit=100');
+    const [res, consents] = await Promise.all([
+      apiRequest<{ data: Array<Record<string, unknown>> }>('/v1/patients?limit=100'),
+      apiRequest<CommunicationConsentRow[]>('/v1/crm/consent'),
+    ]);
     return (res.data ?? []).map(p => {
       const tags = (p.tags as string[]) ?? [];
       const lifecycle = String(p.lifecycleStage ?? 'ACTIVE');
@@ -127,7 +147,7 @@ export const crmService = {
         email: p.email ? String(p.email) : undefined, phone: p.phone ? String(p.phone) : undefined,
         lifecycleStage: lifecycle, churnRisk: num(p.churnRisk), lifetimeValue: num(p.lifetimeValue),
         lastVisit: (p.lastVisitAt as string) ?? null, nextVisit: (p.nextVisitAt as string) ?? null,
-        tags, consent: consentFor(tags, lifecycle),
+        tags, consent: consentFromCanonicalEvidence(consents, { patientId: String(p.id) }),
       };
     });
   },
@@ -137,7 +157,7 @@ export const crmService = {
     await apiRequest(`/v1/leads/${id}`, { method: 'PATCH', body: JSON.stringify({ stage }) });
   },
 
-  // Derived metrics + segments (computed from real data, no fabricated numbers)
+  // Derived metrics. inactiveRecoverable is an explicitly unvalidated 30% planning assumption.
   commandMetrics(leads: CrmLead[], patients: CrmPatient[], campaignRoi: number | null): CommandMetrics {
     const open = leads.filter(l => l.stage !== 'lost' && l.stage !== 'retained');
     const won = leads.filter(l => l.stage === 'retained').length;
@@ -169,19 +189,21 @@ export const crmService = {
       { id: 'winback-tagged', label: 'Reactivation candidates', description: 'Tagged for winback', filter: p => p.tags.map(t => t.toLowerCase()).includes('winback'), offer: 'Limited-time winback', channel: 'WhatsApp', rate: 12 },
     ];
     return defs.map(d => {
-      const ps = patients.filter(p => d.filter(p) && !p.consent.doNotContact);
+      // Candidate membership is not contact eligibility. Campaign preview/dispatch
+      // must re-check canonical consent and suppression evidence.
+      const ps = patients.filter(p => d.filter(p));
       return {
         id: d.id, label: d.label, description: d.description, patientCount: ps.length, recoverableValue: recoverable(ps),
-        bestChannel: d.channel, recommendedOffer: d.offer, expectedBookingRate: d.rate,
-        campaignCost: ps.length * (d.channel === 'Email' ? 0 : d.channel === 'Voice' ? 3 : 1),
-        confidence: ps.length ? Math.min(90, 60 + Math.round(ps.length / 2)) : 0,
+        planningChannel: d.channel, planningOffer: d.offer, planningBookingRate: d.rate,
+        planningCost: ps.length * (d.channel === 'Email' ? 0 : d.channel === 'Voice' ? 3 : 1),
+        assumptionNotice: 'Unvalidated planning assumptions only; not a forecast or consent decision.',
       };
     }).filter(s => s.patientCount > 0);
   },
 
-  // [LIVE] Consent-checked per-lead comms send. Validates consent/suppression
-  // and uses the real provider (returns setup_required if not configured — never
-  // a fake "sent"). Server records an audit event. Surfaces a friendly result.
+  // Governed per-lead communications request. Synthetic mocks can execute;
+  // live submission stays fail-closed behind versioned authority and the
+  // atomic provider boundary. Server records the submission result.
   async sendComms(leadId: string, cta: CtaId): Promise<{ status: string; channel?: string; destinationMasked?: string | null; message?: string }> {
     const res = await apiRequest<{ status: string; channel?: string; destinationMasked?: string | null; missing?: string[]; message?: string }>(`/v1/crm/leads/${leadId}/send`, { method: 'POST', body: JSON.stringify({ cta }) });
     if (res.status === 'setup_required') throw new Error(`${res.channel ?? 'Provider'} not configured (${(res.missing ?? []).join(', ')}). No message sent.`);

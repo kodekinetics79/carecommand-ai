@@ -4,9 +4,9 @@ import { formatCurrency } from '../../utils/formatters';
 import type { BranchHealth } from '../../lib/dashboardService';
 
 function tier(score: number): { tone: RingTone; label: string; chip: string; icon: typeof CircleCheck } {
-  if (score >= 75) return { tone: 'emerald', label: 'Healthy', chip: 'badge-emerald', icon: CircleCheck };
-  if (score >= 55) return { tone: 'amber', label: 'Watch', chip: 'badge-amber', icon: CircleAlert };
-  return { tone: 'red', label: 'At risk', chip: 'badge-red', icon: TriangleAlert };
+  if (score >= 75) return { tone: 'emerald', label: 'Planning range', chip: 'badge-emerald', icon: CircleCheck };
+  if (score >= 55) return { tone: 'amber', label: 'Review', chip: 'badge-amber', icon: CircleAlert };
+  return { tone: 'red', label: 'Priority review', chip: 'badge-red', icon: TriangleAlert };
 }
 
 export default function BranchHealthCard({ branch, onOpen }: { branch: BranchHealth; onOpen: (b: BranchHealth) => void }) {
@@ -17,7 +17,7 @@ export default function BranchHealthCard({ branch, onOpen }: { branch: BranchHea
       role="button" tabIndex={0}
       onClick={() => onOpen(branch)}
       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen(branch); } }}
-      aria-label={`Open ${branch.name} command center — health ${branch.healthScore}, ${t.label}`}
+      aria-label={`Open ${branch.name} command center — unvalidated capacity planning index ${branch.healthScore}, ${t.label}`}
       className="hover-lift group cursor-pointer rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3.5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--indigo)] focus-visible:outline-offset-2"
     >
       <div className="flex items-center gap-3.5">

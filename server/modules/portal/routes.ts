@@ -58,7 +58,7 @@ export const portalRoutes: FastifyPluginAsync = async app => {
   app.get('/dashboard', async request => {
     const { tenantId, patientId } = request.portal!;
     const now = new Date();
-    const [patient, tenant, upcoming, requests, packet, payments, policy, estimate, account] = await Promise.all([
+    const [patient, tenant, upcoming, requests, packet, payments, policy, estimate] = await Promise.all([
       db.patient.findUnique({ where: { id: patientId }, select: { firstName: true, lastName: true, branchId: true } }),
       db.tenant.findUnique({ where: { id: tenantId }, select: { name: true } }),
       db.appointment.findMany({ where: { tenantId, patientId, startsAt: { gte: now }, status: { notIn: ['CANCELED', 'NO_SHOW'] } }, orderBy: { startsAt: 'asc' }, take: 3, select: { id: true, service: true, startsAt: true, status: true } }),
@@ -67,7 +67,6 @@ export const portalRoutes: FastifyPluginAsync = async app => {
       db.paymentRequest.findMany({ where: { tenantId, patientId, status: { in: ['pending', 'requires_action', 'unpaid', 'requested'] } }, select: { amount: true, currency: true } }),
       db.patientInsurancePolicy.findFirst({ where: { tenantId, patientId, active: true }, orderBy: { createdAt: 'desc' }, select: { verificationStatus: true, verifiedAt: true } }),
       db.patientResponsibilityEstimate.findFirst({ where: { tenantId, patientId }, orderBy: { createdAt: 'desc' }, select: { id: true, acknowledgedAt: true } }),
-      db.patientPortalAccount.findFirst({ where: { tenantId, patientId }, select: { paymentPolicyAckAt: true } }),
     ]);
 
     const branchName = patient?.branchId ? (await db.branch.findUnique({ where: { id: patient.branchId }, select: { name: true } }))?.name ?? null : null;
@@ -86,7 +85,10 @@ export const portalRoutes: FastifyPluginAsync = async app => {
       clinicName: tenant?.name ?? 'Your clinic',
       branchName,
       cards,
-      paymentPolicyAcknowledged: !!account?.paymentPolicyAckAt,
+      // No versioned clinic payment-policy artifact exists yet. Never represent
+      // a legacy timestamp as acknowledgment of unknown text/version.
+      paymentPolicyAvailable: false,
+      paymentPolicyAcknowledged: false,
       allowedActions: ['view_appointments', 'request_appointment', 'continue_intake', 'update_insurance', 'view_payments', 'acknowledge_estimate', 'update_preferences'],
       deepLinkTargets: { appointments: '/client/appointments', requests: '/client/requests', intake: '/client/intake', insurance: '/client/insurance', payments: '/client/payments', profile: '/client/profile', preferences: '/client/preferences' },
     };
@@ -373,6 +375,7 @@ export const portalRoutes: FastifyPluginAsync = async app => {
       const code = error instanceof Error ? error.message : '';
       if (code === 'explicit_acceptance_required') throw app.httpErrors.badRequest('Explicit acceptance is required for this acknowledgement');
       if (code === 'acknowledgement_not_approved') throw app.httpErrors.badRequest('The acknowledgement identifier is missing, outdated, or not approved');
+      if (code === 'payment_policy_unavailable') throw app.httpErrors.conflict('Payment-policy acknowledgment is unavailable until the clinic publishes versioned policy text');
       throw error;
     }
     await emitSectionSubmissionEffects(outcome);
@@ -471,15 +474,11 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     });
     return { id, acknowledged: true, deduped: false };
   });
-  app.post('/payment-policy/acknowledge', async request => {
-    const { tenantId, patientId, accountId } = request.portal!;
-    const acct = await db.patientPortalAccount.findUnique({ where: { id: accountId }, select: { paymentPolicyAckAt: true } });
-    if (acct?.paymentPolicyAckAt) return { acknowledged: true, deduped: true }; // idempotent
-    await db.$transaction(async tx => {
-      await tx.patientPortalAccount.update({ where: { id: accountId }, data: { paymentPolicyAckAt: new Date() } });
-      await portalAudit(tenantId, 'portal.paymentPolicy.acknowledged', patientId, request, undefined, { critical: true, tx });
+  app.post('/payment-policy/acknowledge', async (_request, reply) => {
+    return reply.code(409).send({
+      error: 'payment_policy_unavailable',
+      message: 'Payment-policy acknowledgment is unavailable until the clinic publishes versioned policy text.',
     });
-    return { acknowledged: true, deduped: false };
   });
 
   // ===== Profile & communication preferences =============================
@@ -507,11 +506,22 @@ export const portalRoutes: FastifyPluginAsync = async app => {
       db.patient.findFirst({ where: { tenantId, id: patientId }, select: { phone: true } }),
       db.receptionistOptOut.findMany({ where: { tenantId, revokedAt: null, channel: { in: ['ALL', 'VOICE'] }, contactPhone: { not: null } }, select: { contactPhone: true } }),
     ]);
-    const latest = (purpose: string) => events.find(e => e.purpose === purpose)?.granted ?? false;
+    const latestEvent = (purpose: string) => events.find(e => e.purpose === purpose);
+    const status = (purpose: string) => {
+      const event = latestEvent(purpose);
+      return event ? event.granted ? 'opted_in' : 'opted_out' : 'not_recorded';
+    };
     const phone = canonicalDncDestination(patient?.phone ?? '');
     const globallyOptedOut = Boolean(phone) && voiceOptOuts.some(row => canonicalDncDestination(row.contactPhone ?? '') === phone);
     const voice = !globallyOptedOut && voiceConsents[0]?.status === 'opted_in';
-    return { sms: latest('SMS'), email: latest('EMAIL'), whatsapp: latest('WHATSAPP'), voice, marketing: latest('MARKETING') };
+    return {
+      sms: status('SMS') === 'opted_in', email: status('EMAIL') === 'opted_in', whatsapp: status('WHATSAPP') === 'opted_in',
+      smsAuthorizationStatus: status('SMS'), emailAuthorizationStatus: status('EMAIL'),
+      whatsappAuthorizationStatus: status('WHATSAPP'), marketingAuthorizationStatus: status('MARKETING'),
+      voice, voiceOptedOut: globallyOptedOut,
+      voiceAuthorizationStatus: globallyOptedOut ? 'opted_out' : voiceConsents[0]?.status ?? 'not_recorded',
+      marketing: status('MARKETING') === 'opted_in',
+    };
   });
   app.patch('/preferences', async request => {
     const { tenantId, patientId } = request.portal!;
@@ -519,6 +529,9 @@ export const portalRoutes: FastifyPluginAsync = async app => {
       .refine(value => Object.values(value).some(v => v !== undefined), { message: 'Provide at least one preference.' }).parse(request.body);
     if (body.voice === true) {
       throw app.httpErrors.conflict('Voice opt-in requires a purpose-specific disclosure and consent workflow; the generic preference toggle cannot grant outbound authority.');
+    }
+    if (body.sms === true || body.email === true || body.whatsapp === true || body.marketing === true) {
+      throw app.httpErrors.conflict('Permission to send messages requires the approved notice for a specific purpose. This preferences page can record opt-outs only.');
     }
     const updates: Array<[string, boolean]> = [];
     if (body.sms !== undefined) updates.push(['SMS', body.sms]);
@@ -552,8 +565,17 @@ export const portalRoutes: FastifyPluginAsync = async app => {
 
   app.get('/consents', async request => {
     const { tenantId, patientId } = request.portal!;
-    const events = await db.consentEvent.findMany({ where: { tenantId, patientId }, orderBy: { occurredAt: 'desc' }, take: 50, select: { purpose: true, granted: true, occurredAt: true } });
-    return events.map(e => ({ purpose: e.purpose, granted: e.granted, at: e.occurredAt.toISOString() }));
+    const [events, voiceEvents] = await Promise.all([
+      db.consentEvent.findMany({ where: { tenantId, patientId }, orderBy: { occurredAt: 'desc' }, take: 50, select: { purpose: true, granted: true, occurredAt: true } }),
+      db.businessEvent.findMany({
+        where: { tenantId, entityType: 'patient', entityId: patientId, eventType: 'receptionist.voice_global_opt_out.recorded' },
+        orderBy: { occurredAt: 'desc' }, take: 50, select: { occurredAt: true },
+      }),
+    ]);
+    return [
+      ...events.map(event => ({ purpose: event.purpose, granted: event.granted, at: event.occurredAt.toISOString() })),
+      ...voiceEvents.map(event => ({ purpose: 'VOICE', granted: false, at: event.occurredAt.toISOString() })),
+    ].sort((left, right) => right.at.localeCompare(left.at)).slice(0, 50);
   });
 };
 

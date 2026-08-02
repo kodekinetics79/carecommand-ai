@@ -56,26 +56,28 @@ async function main() {
 
   const ownerEmail = savedEmail!;
 
-  // 3) Platform login.
+  // 3) Platform login requires MFA enrollment before issuing a session.
   const loginRes = await post('/v1/platform/auth/login', { email: ownerEmail, password: 'OwnerPass123!' });
-  const ownerToken = JSON.parse(loginRes.body).token as string;
-  check('3. platform login returns a token', loginRes.statusCode === 200 && typeof ownerToken === 'string');
+  const initialLogin = JSON.parse(loginRes.body);
+  const enrollmentToken = initialLogin.mfaToken as string;
+  check('3. platform password login requires MFA enrollment and returns no session', loginRes.statusCode === 200 && initialLogin.mfaSetupRequired === true && !initialLogin.token && typeof enrollmentToken === 'string');
+
+  const setup = JSON.parse((await post('/v1/platform/auth/mfa/setup', {}, enrollmentToken)).body);
+  const enrollment = JSON.parse((await post('/v1/platform/auth/mfa/verify', { code: generateTotp(setup.secret) }, enrollmentToken)).body);
+  const ownerSession = enrollment.token as string;
+  check('5a. MFA enrollment issues the first platform session', typeof ownerSession === 'string');
 
   // 4) Login failure audited.
   await post('/v1/platform/auth/login', { email: ownerEmail, password: 'wrong' });
   const failAudit = await ownerDb.platformAuditEvent.findFirst({ where: { action: 'platform.login.failed' } });
   check('4. failed login is audited', !!failAudit);
 
-  // 5) MFA setup + verify (enable), then login challenge + verify.
-  const setup = JSON.parse((await post('/v1/platform/auth/mfa/setup', {}, ownerToken)).body);
-  const enableCode = generateTotp(setup.secret);
-  const enableRes = await post('/v1/platform/auth/mfa/verify', { code: enableCode }, ownerToken);
+  // 5) Subsequent login requires an MFA challenge.
   const loginMfa = JSON.parse((await post('/v1/platform/auth/login', { email: ownerEmail, password: 'OwnerPass123!' })).body);
   const ownerRow = await ownerDb.platformUser.findUnique({ where: { email: ownerEmail } });
   const challengeCode = generateTotp(decryptSecret(ownerRow!.mfaSecretEnc!)!);
   const mfaLogin = JSON.parse((await post('/v1/platform/auth/mfa/verify', { code: challengeCode }, loginMfa.mfaToken)).body);
-  check('5. MFA setup/enable + login challenge/verify issues session', JSON.parse(enableRes.body).enabled === true && loginMfa.mfaRequired === true && typeof mfaLogin.token === 'string');
-  const ownerSession = mfaLogin.token as string;
+  check('5b. MFA login challenge issues a new session', loginMfa.mfaRequired === true && typeof mfaLogin.token === 'string');
 
   // 7) Tenant JWT cannot access platform endpoints.
   const tenantJwt = app.jwt.sign({ userId: tManaged.admin.id, tenantId: tManaged.id, role: 'ADMIN', type: 'access' });
@@ -130,7 +132,9 @@ async function main() {
   // 6 + 18) Create PLATFORM_ADMIN; ADMIN can manage tenants but not OWNER.
   const adminEmail = `padmin-${randomUUID().slice(0, 8)}@platform.test`;
   const createAdmin = await post('/v1/platform/users', { email: adminEmail, name: 'Admin', password: 'AdminPass123!', role: 'PLATFORM_ADMIN' }, ownerSession);
-  const adminSession = JSON.parse((await post('/v1/platform/auth/login', { email: adminEmail, password: 'AdminPass123!' })).body).token as string;
+  const adminLogin = JSON.parse((await post('/v1/platform/auth/login', { email: adminEmail, password: 'AdminPass123!' })).body);
+  const adminSetup = JSON.parse((await post('/v1/platform/auth/mfa/setup', {}, adminLogin.mfaToken)).body);
+  const adminSession = JSON.parse((await post('/v1/platform/auth/mfa/verify', { code: generateTotp(adminSetup.secret) }, adminLogin.mfaToken)).body).token as string;
   const adminTag = randomUUID().slice(0, 8);
   const adminCreatesTenant = await post('/v1/platform/tenants', { name: 'Admin Clinic', slug: `ac-${adminTag}`, ownerName: 'Admin-created Owner', ownerEmail: `ac-${adminTag}@tenant.test`, ownerPassword: 'TenantOwnerPass123!' }, adminSession);
   check('6. PLATFORM_ADMIN can manage tenants (create 201)', createAdmin.statusCode === 201 && adminCreatesTenant.statusCode === 201);

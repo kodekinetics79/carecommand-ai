@@ -32,6 +32,12 @@ export interface IngressTenantResolution {
   resourceId: string;
 }
 
+export interface PasswordResetIngressResolution {
+  tenantId: string;
+  tokenId: string;
+  userId: string;
+}
+
 export interface RevokedInactiveRefresh {
   userId: string;
   tenantId: string;
@@ -82,6 +88,23 @@ export async function resolveIngressTenant(
   `;
   if (rows.length !== 1) return null;
   return { tenantId: rows[0].tenant_id, resourceId: rows[0].resource_id };
+}
+
+/**
+ * Password reset needs both the exact token row for single-use consumption and
+ * the verified active user as its request-mode RLS actor. The dedicated
+ * SECURITY DEFINER function returns only those opaque IDs after validating the
+ * already-HMACed token; it never returns credential or profile data.
+ */
+export async function resolvePasswordResetIngress(
+  verifiedTokenHash: string,
+): Promise<PasswordResetIngressResolution | null> {
+  const rows = await db.$queryRaw<Array<{ tenant_id: string; token_id: string; user_id: string }>>`
+    SELECT tenant_id, token_id, user_id
+    FROM app_resolve_password_reset_ingress(${verifiedTokenHash}::text)
+  `;
+  if (rows.length !== 1) return null;
+  return { tenantId: rows[0].tenant_id, tokenId: rows[0].token_id, userId: rows[0].user_id };
 }
 
 interface AuthLoginCandidateRow {

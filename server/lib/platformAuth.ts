@@ -32,12 +32,14 @@ interface PlatformJwt {
   sessionId: string;
 }
 
-export function signPlatformToken(app: FastifyInstance, user: { id: string; role: string }, expiresIn = '8h'): string {
+export type PlatformMfaPurpose = 'challenge' | 'enrollment';
+
+export function signPlatformToken(app: FastifyInstance, user: { id: string; role: string }, expiresIn = '15m'): string {
   return app.jwt.sign({ platformUserId: user.id, role: user.role, type: 'platform', sessionId: randomUUID() } as PlatformJwt, { expiresIn });
 }
 
-export function signPlatformMfaToken(app: FastifyInstance, userId: string): string {
-  return app.jwt.sign({ platformUserId: userId, role: 'PLATFORM_MFA' as PlatformRole, type: 'platform-mfa' } as never, { expiresIn: '10m' });
+export function signPlatformMfaToken(app: FastifyInstance, userId: string, purpose: PlatformMfaPurpose): string {
+  return app.jwt.sign({ platformUserId: userId, role: 'PLATFORM_MFA' as PlatformRole, type: 'platform-mfa', purpose } as never, { expiresIn: '10m' });
 }
 
 export function platformSessionIdHash(sessionId: string): string {

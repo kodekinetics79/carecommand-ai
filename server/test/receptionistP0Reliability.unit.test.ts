@@ -182,14 +182,16 @@ describe('receptionist P0 reliability', () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
-  it('always begins with product-controlled AI and recording disclosure before a greeting override', () => {
+  it('uses a fully rendered standalone consent turn before any greeting override', () => {
     const built = buildRetellConfig(promptConfig, { webhookBaseUrl: 'https://api.example.test/' });
     const expected = "Hi, I'm Avery, an AI assistant for Example Clinic. This call may be recorded or monitored for quality and documentation.";
 
-    expect(built.beginMessage.startsWith(expected)).toBe(true);
-    expect(built.beginMessage.indexOf('Clinic-specific compliance language.')).toBeGreaterThan(expected.length - 1);
-    expect(built.beginMessage.indexOf('I can help you schedule today.')).toBeGreaterThan(built.beginMessage.indexOf('Clinic-specific compliance language.'));
-    expect(generateSamples(promptConfig).greeting.startsWith(expected)).toBe(true);
+    expect(built.beginMessage).toBe(`${expected} Clinic-specific compliance language. Is that okay?`);
+    expect(built.beginMessage.endsWith('Is that okay?')).toBe(true);
+    expect(built.beginMessage).not.toContain('I can help you schedule today.');
+    expect(generateSamples(promptConfig).greeting).toBe(built.beginMessage);
+    expect(built.systemPrompt).toContain('After consent is granted, you may say: "I can help you schedule today."');
+    expect(built.systemPrompt).toMatch(/STOP SPEAKING after that question and wait/i);
   });
 
   it('retains the mandatory disclosure even if clinic disclosure and greeting are blank', () => {
@@ -203,7 +205,8 @@ describe('receptionist P0 reliability', () => {
     expect(buildRetellConfig(config, { webhookBaseUrl: 'https://api.example.test' }).beginMessage).toBe(`${expected} Is that okay?`);
     const prompt = generateSystemPrompt(config);
     expect(prompt).toContain(expected);
-    expect(prompt).toContain('must be spoken before any greeting override');
+    expect(prompt).toContain('before any greeting override');
     expect(prompt).toContain('Do not shorten, paraphrase, skip, or replace it.');
+    expect(prompt).toMatch(/Emergency instructions override disclosure completion/i);
   });
 });

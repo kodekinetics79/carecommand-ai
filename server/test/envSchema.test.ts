@@ -79,6 +79,20 @@ describe('env schema — DEPLOYMENT_PROFILE integration-mode gate', () => {
     expect(envSchema.safeParse({ ...base, NODE_ENV: 'production', DEPLOYMENT_PROFILE: 'demo' }).success).toBe(true);
   });
 
+  it.each(['pilot', 'enterprise'] as const)('rejects E2E_TEST_MODE for the %s deployment profile', profile => {
+    const res = envSchema.safeParse({
+      ...productionProfile,
+      DEPLOYMENT_PROFILE: profile,
+      E2E_TEST_MODE: 'true',
+      ALLOWED_MOCK_INTEGRATIONS: 'payments,insurance,ai',
+    });
+    expect(res.success).toBe(false);
+    if (!res.success) {
+      const issue = res.error.issues.find(i => i.path.includes('E2E_TEST_MODE'));
+      expect(issue?.message).toContain('must not enable the local E2E escape hatch');
+    }
+  });
+
   it('pilot + mock payments without acknowledgement → boot fails naming integration, profile, and fix', () => {
     const res = envSchema.safeParse({ ...productionProfile, DEPLOYMENT_PROFILE: 'pilot' });
     expect(res.success).toBe(false);

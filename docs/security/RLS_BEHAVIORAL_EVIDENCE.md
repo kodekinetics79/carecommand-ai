@@ -2,7 +2,7 @@
 
 ## Verdict and scope
 
-The restricted-role PostgreSQL behavioral boundary is **PASS** for all 119 protected tables on a clean disposable database with all 65 migrations applied. The exercised connection reports `current_user = app_rls`. The schema-owner connection is limited to database lifecycle, the two Tenant rows, the two persisted request actors, global reference prerequisites, and public-ingress fixture activation.
+The restricted-role PostgreSQL behavioral boundary is **PASS** for all 123 protected tables on a clean disposable database with all 86 migrations applied. The exercised connection reports `current_user = app_rls`. The schema-owner connection is limited to database lifecycle, the two Tenant rows, the persisted request actors, global reference prerequisites, and public-ingress fixture activation.
 
 This is database-isolation evidence, not HIPAA, SOC 2, or GDPR certification. It does not replace route authorization, provider-contract, production-operations, or live pilot evidence.
 
@@ -12,10 +12,10 @@ This is database-isolation evidence, not HIPAA, SOC 2, or GDPR certification. It
 
 | Contract | Tables | Restricted-role behavior executed |
 |---|---:|---|
-| Mutable tenant table | 114 | SELECT; committed non-conflicting INSERT; meaningful UPDATE; tenant and cross-parent reassignment; DELETE; UPSERT; bulk UPDATE/DELETE |
+| Mutable tenant table | 118 | SELECT; committed non-conflicting INSERT; meaningful UPDATE; tenant and cross-parent reassignment; DELETE; UPSERT; bulk UPDATE/DELETE |
 | Append-only evidence | 4 | SELECT and committed INSERT; UPDATE/DELETE/UPSERT mutation denial, including bulk operations |
 | Read-only tenant root | 1 | Same-tenant SELECT; every runtime write denied |
-| **Total** | **119** | **One catalog-checked adapter per protected table** |
+| **Total** | **123** | **One catalog-checked adapter per protected table** |
 
 Append-only adapters are `AuditEvent`, `ConsentEvent`, `ReceptionistArtifactLifecycleEvent`, and `ReceptionistRecordingConsentEvent`. `Tenant` is read-only to `app_rls`.
 
@@ -25,7 +25,7 @@ For every table, the suite executes real SQL for:
 
 - primary-key visibility with Tenant A, Tenant B, and no context;
 - list, text-search, aggregate count, and JSON export surfaces with the same three contexts;
-- a committed, non-conflicting `app_rls` INSERT for each of the 118 writable protected tables; no `ON CONFLICT DO NOTHING` is used as INSERT evidence;
+- a committed, non-conflicting `app_rls` INSERT for each of the 122 writable protected tables; no `ON CONFLICT DO NOTHING` is used as INSERT evidence;
 - explicit Tenant INSERT denial;
 - cross-tenant and no-context INSERT denial using an existing fixture payload;
 - a meaningful same-tenant UPDATE that changes a safe scalar value, plus cross/no-context UPDATE behavior;
@@ -37,9 +37,9 @@ For every table, the suite executes real SQL for:
 
 The harness captures same-tenant mutation proof immediately after each restricted-role fixture INSERT, before downstream fixtures can turn a valid DELETE into an unrelated foreign-key refusal. Each operation is rolled back after its row count, changed value, or SQLSTATE is captured.
 
-Cross-parent reassignment is exercised with direct SQL on all 66 tables that have a tenant-protected parent reference. All fail closed through RLS, tenant-consistent FK/check constraints, uniqueness constraints, or immutable-evidence triggers. The other 53 tables have no protected parent reference, so cross-parent reassignment is structurally not applicable.
+Cross-parent reassignment is exercised with direct SQL on every adapter that has a tenant-protected parent reference. All fail closed through RLS, tenant-consistent FK/check constraints, uniqueness constraints, or immutable-evidence triggers. Tables without a protected parent reference are structurally not applicable.
 
-Prisma `connect`, nested-create, and nested-update syntax is not a PostgreSQL operation and is genuinely not applicable to this database-only harness for all 119 tables. Its security-relevant database equivalent is covered by the 66 direct cross-parent FK reassignment cases. Prisma API behavior remains an application/integration-test responsibility.
+Prisma `connect`, nested-create, and nested-update syntax is not a PostgreSQL operation and is genuinely not applicable to this database-only harness. Its security-relevant database equivalent is covered by the direct cross-parent FK reassignment cases. Prisma API behavior remains an application/integration-test responsibility.
 
 ## Public ingress and pool semantics
 
@@ -70,14 +70,14 @@ NODE_ENV=test \
 npx tsx server/scripts/withDisposableRlsDatabase.ts -- \
   npx vitest run server/test/rlsBehavioralCoverage.integration.test.ts --reporter=dot
 
-65 migrations applied
+86 migrations applied
 1 test file passed
-962 tests passed
+994 tests passed
 0 failed / 0 skipped
 generated database removed; zero matching disposable databases remained
 ```
 
-The 962 tests are one inventory assertion, eight cases for each of 119 protected tables, eight public-ingress cases, and one pool-cleanup case.
+The 994 tests are one inventory assertion, eight cases for each of 123 protected tables, eight public-ingress cases, and one pool-cleanup case.
 
 Lifecycle refusal and URL/address safety tests:
 

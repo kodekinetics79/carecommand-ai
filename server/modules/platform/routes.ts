@@ -560,8 +560,26 @@ export const platformRoutes: FastifyPluginAsync = async app => {
     await runPlatformAuditedMutation(request, (s: Awaited<ReturnType<typeof ensureSecurity>>) => ({
       action: 'security.policy.updated', target: { type: 'tenant', id: tenantId, tenantId }, metadata: { reason: body.reason, forceMfa: s.requireMfa, sessionTimeoutMinutes: s.sessionTimeoutMinutes },
     }), async tx => {
-      await ensureSecurity(tenantId, tx);
-      return tx.tenantSecurityPolicy.update({ where: { tenantId }, data: { requireMfa: body.forceMfa, passwordExpiryDays: body.passwordExpiryDays, sessionTimeoutMinutes: body.sessionTimeoutMinutes, failedLoginLockout: body.failedLoginLockout, allowedIpRanges: body.ipAllowlist } });
+      const existing = await ensureSecurity(tenantId, tx);
+      const enablingMfa = body.forceMfa === true && !existing.requireMfa;
+      const revokedAt = enablingMfa ? new Date() : undefined;
+      if (enablingMfa) {
+        await tx.user.updateMany({
+          where: { tenantId },
+          data: { refreshTokenHash: null, refreshTokenExpiresAt: null },
+        });
+      }
+      return tx.tenantSecurityPolicy.update({
+        where: { tenantId },
+        data: {
+          requireMfa: body.forceMfa,
+          passwordExpiryDays: body.passwordExpiryDays,
+          sessionTimeoutMinutes: body.sessionTimeoutMinutes,
+          failedLoginLockout: body.failedLoginLockout,
+          allowedIpRanges: body.ipAllowlist,
+          sessionsRevokedAt: revokedAt,
+        },
+      });
     });
     return { ok: true };
   });

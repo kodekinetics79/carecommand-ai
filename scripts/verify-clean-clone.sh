@@ -19,11 +19,17 @@ if [[ "$actual_commit" != "$expected_commit" ]]; then
 fi
 
 cd "$checkout"
+: "${CLEAN_CLONE_DATABASE_MIGRATION_URL:?Set CLEAN_CLONE_DATABASE_MIGRATION_URL to a local PostgreSQL owner URL}"
+export DATABASE_MIGRATION_URL="$CLEAN_CLONE_DATABASE_MIGRATION_URL"
+export DATABASE_URL="$CLEAN_CLONE_DATABASE_MIGRATION_URL"
 npm ci
+npm run db:generate
 npm run check
-npm test
+RLS_DISPOSABLE_DB_ACK=CREATE_AND_DROP_LOCAL_RLS_TEST_DATABASE \
+  npx tsx server/scripts/withDisposableRlsDatabase.ts -- npm test
 npm run verify:no-production-demo-artifacts
-npm run verify:prisma-drift
+RLS_DISPOSABLE_DB_ACK=CREATE_AND_DROP_LOCAL_RLS_TEST_DATABASE \
+  npx tsx server/scripts/withDisposableRlsDatabase.ts -- npm run verify:prisma-drift
 
 if [[ "${CLEAN_CLONE_RUN_DATABASE_GATES:-false}" == "true" ]]; then
   npm run rls:verify
@@ -32,7 +38,7 @@ if [[ "${CLEAN_CLONE_RUN_DATABASE_GATES:-false}" == "true" ]]; then
 fi
 
 if [[ "${CLEAN_CLONE_RUN_BROWSER:-false}" == "true" ]]; then
-  npm run test:e2e
+  RLS_DISPOSABLE_DB_ACK=CREATE_AND_DROP_LOCAL_RLS_TEST_DATABASE npm run test:e2e
 fi
 
 if [[ -n "$(git status --porcelain=v1)" ]]; then

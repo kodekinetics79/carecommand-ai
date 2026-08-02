@@ -36,8 +36,23 @@ async function tenant(phone = randomE164(), entitled = true) {
   await db.tenant.create({ data: { id, name: `Inbound ${id.slice(0, 8)}`, slug: `inbound-${id.slice(0, 8)}` } });
   await db.tenantFeatureEntitlement.create({ data: { tenantId: id, featureKey: 'ai_receptionist', enabled: entitled, source: 'test' } });
   const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Trusted destination', phone, active: true } });
-  await db.receptionistAgent.create({ data: { tenantId: id, clinicId: clinic.id, name: 'Avery', active: true } });
-  return { id, clinicId: clinic.id, phone };
+  const providerAgentId = `agent_${id.replaceAll('-', '')}`;
+  const providerAgentVersion = 3;
+  const providerFingerprint = 'a'.repeat(64);
+  const verifiedAt = new Date();
+  await db.receptionistAgent.create({ data: {
+    tenantId: id, clinicId: clinic.id, name: 'Avery', active: true,
+    providerAgentId, providerVersionTag: 'prod', providerVersion: providerAgentVersion, providerStatus: 'VERIFIED',
+    providerPublished: true, providerAssignedTags: ['prod'],
+    providerWebhookUrl: 'https://api.example.test/v1/receptionist/webhooks/retell',
+    providerWebhookEvents: ['call_started', 'call_ended', 'call_analyzed'],
+    providerDataStorageSetting: 'basic_attributes_only', providerSignedUrl: true,
+    providerResponseEngineType: 'retell-llm', providerResponseEngineId: `llm_${id.replaceAll('-', '')}`,
+    providerResponseEngineVersion: 1,
+    providerFingerprint, providerConfigRevision: 1, providerVerifiedRevision: 1,
+    providerVerifiedAt: verifiedAt, providerVerificationExpiresAt: new Date(verifiedAt.getTime() + 60 * 60_000),
+  } });
+  return { id, clinicId: clinic.id, phone, providerAgentId, providerAgentVersion, providerFingerprint };
 }
 
 function signedInject(url: string, payload: unknown, key = KEY) {
@@ -160,11 +175,17 @@ describe('Retell first-ever inbound trusted destination bootstrap', () => {
       const response = await signedInject('/v1/receptionist/webhooks/retell/fn', {
         name: 'record_recording_preference',
         args: { recording_decision: 'REFUSED', jurisdiction: 'US-NY' },
-        call: { call_id: callId, direction: 'inbound', to_number: t.phone, from_number: '+12125552222' },
+        call: { call_id: callId, agent_id: t.providerAgentId, agent_version: t.providerAgentVersion, direction: 'inbound', to_number: t.phone, from_number: '+12125552222' },
       }, mockKey);
       expect(response.statusCode).toBe(200);
       const call = await db.receptionistCallLog.findFirstOrThrow({ where: { tenantId: t.id, retellCallId: callId } });
       expect(call.recordingConsentStatus).toBe('REFUSED');
+      expect(call).toMatchObject({
+        boundProviderAgentId: t.providerAgentId,
+        boundProviderAgentVersion: t.providerAgentVersion,
+        boundProviderConfigRevision: 1,
+        boundProviderFingerprint: t.providerFingerprint,
+      });
       const evidence = await db.receptionistRecordingConsentEvent.findFirstOrThrow({ where: { tenantId: t.id, callLogId: call.id } });
       expect(evidence).toMatchObject({ decision: 'REFUSED', source: 'retell_signed_consent_tool', providerStorageSetting: 'basic_attributes_only', jurisdiction: 'US-NY' });
       const clinic = await db.receptionistClinic.findUniqueOrThrow({ where: { id: t.clinicId }, select: { name: true, complianceDisclosure: true } });
@@ -172,14 +193,14 @@ describe('Retell first-ever inbound trusted destination bootstrap', () => {
 
       const protectedTool = await signedInject('/v1/receptionist/webhooks/retell/fn', {
         name: 'verify_patient_identity', args: { date_of_birth: '1990-01-01' },
-        call: { call_id: callId, direction: 'inbound', to_number: t.phone, from_number: '+12125552222' },
+        call: { call_id: callId, agent_id: t.providerAgentId, agent_version: t.providerAgentVersion, direction: 'inbound', to_number: t.phone, from_number: '+12125552222' },
       }, mockKey);
       expect(protectedTool.statusCode).toBe(200);
       expect(protectedTool.json()).toMatchObject({ allowed: false, needs_human: true });
 
       const regrant = await signedInject('/v1/receptionist/webhooks/retell/fn', {
         name: 'record_recording_preference', args: { recording_decision: 'GRANTED', jurisdiction: 'US-NY' },
-        call: { call_id: callId, direction: 'inbound', to_number: t.phone, from_number: '+12125552222' },
+        call: { call_id: callId, agent_id: t.providerAgentId, agent_version: t.providerAgentVersion, direction: 'inbound', to_number: t.phone, from_number: '+12125552222' },
       }, mockKey);
       expect(regrant.statusCode).toBe(200);
       expect(regrant.json()).toMatchObject({ recorded: false, decision: 'REFUSED', metadata_only: true });
@@ -187,6 +208,57 @@ describe('Retell first-ever inbound trusted destination bootstrap', () => {
     } finally {
       env.RETELL_API_KEY = KEY;
     }
+  });
+
+  it('rejects missing or drifted provider deployment evidence before patient-data tools', async () => {
+    const t = await tenant();
+    const missingCallId = `missing-deployment-${randomUUID()}`;
+    const missing = await signedInject('/v1/receptionist/webhooks/retell/fn', {
+      name: 'record_recording_preference', args: { recording_decision: 'GRANTED' },
+      call: { call_id: missingCallId, direction: 'inbound', to_number: t.phone, from_number: '+12125550021' },
+    });
+    expect(missing.statusCode).toBe(202);
+    expect(missing.json()).toMatchObject({ allowed: false, needs_human: true });
+    expect(await db.receptionistRecordingConsentEvent.count({ where: { tenantId: t.id } })).toBe(0);
+
+    const callId = `deployment-drift-${randomUUID()}`;
+    const granted = await signedInject('/v1/receptionist/webhooks/retell/fn', {
+      name: 'record_recording_preference', args: { recording_decision: 'GRANTED', jurisdiction: 'test' },
+      call: {
+        call_id: callId, agent_id: t.providerAgentId, agent_version: t.providerAgentVersion,
+        direction: 'inbound', to_number: t.phone, from_number: '+12125550022',
+      },
+    });
+    expect(granted.statusCode).toBe(200);
+    expect(granted.json()).toMatchObject({ recorded: true, metadata_only: true });
+
+    const alternateId = `agent_alt_${randomUUID().replaceAll('-', '')}`;
+    const verifiedAt = new Date();
+    await db.receptionistAgent.create({ data: {
+      tenantId: t.id, clinicId: t.clinicId, name: 'Alternate', active: true,
+      providerAgentId: alternateId, providerVersionTag: 'prod', providerVersion: 8, providerStatus: 'VERIFIED',
+      providerPublished: true, providerAssignedTags: ['prod'],
+      providerWebhookUrl: 'https://api.example.test/v1/receptionist/webhooks/retell',
+      providerWebhookEvents: ['call_started', 'call_ended', 'call_analyzed'],
+      providerDataStorageSetting: 'basic_attributes_only', providerSignedUrl: true,
+      providerResponseEngineType: 'retell-llm', providerResponseEngineId: `llm_alt_${t.id.replaceAll('-', '')}`,
+      providerResponseEngineVersion: 1,
+      providerFingerprint: 'b'.repeat(64), providerConfigRevision: 1, providerVerifiedRevision: 1,
+      providerVerifiedAt: verifiedAt, providerVerificationExpiresAt: new Date(verifiedAt.getTime() + 60 * 60_000),
+    } });
+    const drifted = await signedInject('/v1/receptionist/webhooks/retell/fn', {
+      name: 'take_message', args: { message: 'Please call me back.' },
+      call: {
+        call_id: callId, agent_id: alternateId, agent_version: 8,
+        direction: 'inbound', to_number: t.phone, from_number: '+12125550022',
+      },
+    });
+    expect(drifted.statusCode).toBe(202);
+    expect(drifted.json()).toMatchObject({ allowed: false, needs_human: true });
+    expect(await db.staffTask.count({ where: { tenantId: t.id } })).toBe(0);
+    expect(await db.operationalSignal.count({
+      where: { tenantId: t.id, signalType: 'RECEPTIONIST_INGRESS_REVIEW' },
+    })).toBe(2);
   });
 
   it('expires stale in-progress call leases before reserving new inbound capacity', async () => {
@@ -252,7 +324,9 @@ describe('Retell first-ever inbound trusted destination bootstrap', () => {
       name: 'record_recording_preference', args: { recording_decision: 'GRANTED' },
       call: { call_id: callId, direction: 'inbound', to_number: t.phone, from_number: '+12125550002' },
     });
-    expect(replay.statusCode).toBe(200);
+    // A terminal call cannot reacquire patient-data authority, and a replay
+    // without the exact signed agent deployment is quarantined for review.
+    expect(replay.statusCode).toBe(202);
     expect(replay.json()).toMatchObject({ allowed: false, needs_human: true });
   });
 

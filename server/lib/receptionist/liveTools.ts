@@ -50,6 +50,8 @@ export interface ToolContext {
   callId: string | null;
   callerPhone?: string | null;
   trustedBooking?: TrustedBookingContext;
+  /** Exact local agent established from the signed inbound deployment. */
+  trustedProviderAgentId?: string;
 }
 
 // Bounded caps for caller-supplied free text.
@@ -62,6 +64,7 @@ const CHANGE_CONFIRMATION_TTL_MS = 5 * 60_000;
 const RECEPTIONIST_CALL_LEASE_MS = 4 * 60 * 60_000;
 const MAX_CANONICAL_ANSWER_BYTES = 16 * 1024;
 const MAX_BOOKING_SCHEMA_PROPERTIES = 57;
+const APPOINTMENT_NOTIFICATION_PREFERENCE_POLICY = 'appointment-notification-preference-v1';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const VOICE_MUTABLE_STATUSES = ['CONFIRMED', 'RISKY', 'WAITLIST'] as const;
 
@@ -1045,16 +1048,11 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
         },
         select: { id: true },
       });
-    if (messagingConsent !== null) {
-      await tx.consentEvent.createMany({ data: (['SMS', 'EMAIL'] as const).map(purpose => ({
-        tenantId: ctx.tenantId,
-        patientId: patient.id,
-        purpose,
-        granted: messagingConsent,
-        source: 'receptionist_attested_call',
-        metadata: { callLogId: trusted.callLogId, appointmentId: appointment.id },
-      })) });
-    }
+    // The booking question is deliberately a conservative notification
+    // preference, not channel consent. Never mint SMS/email/marketing authority
+    // from one bundled voice answer. A refusal suppresses confirmations; true or
+    // absent values can proceed only under the clinic's separately governed
+    // transactional-treatment policy and the final shared suppression fence.
     if (messagingConsent !== false) {
       const channels = [
         campaign.smsConfirmation && phone ? 'sms' : null,
@@ -1070,7 +1068,10 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
           status: 'queued',
           attempts: 0,
           consentChecked: false,
-          consentResult: messagingConsent === true ? 'granted_unchecked' : 'not_recorded_transactional',
+          // This answer is not channel consent. Preserve the preference in the
+          // booking business event, while the delivery boundary records only
+          // the separately governed transactional basis.
+          consentResult: 'not_recorded_transactional',
           source: CONFIRMATION_OUTBOX_SOURCE,
           idempotencyKey: `${appointment.id}:${channel}`,
         })),
@@ -1085,11 +1086,20 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
     await auditLive(ctx.tenantId, 'receptionist.appointment.booked', appointment.id, {
       branchId: trusted.branchId, appointmentRequestId: request.id, callLogId: trusted.callLogId,
       via: 'live_call', messagingConsent,
+      notificationPreferencePolicy: APPOINTMENT_NOTIFICATION_PREFERENCE_POLICY,
+      notificationPreferenceAuthorizesMarketing: false,
     }, tx);
     await tx.businessEvent.create({ data: {
       tenantId: ctx.tenantId, eventType: 'receptionist.appointment.booked', entityType: 'appointment',
       entityId: appointment.id, sourceModule: 'receptionist',
-      payload: { appointmentRequestId: request.id, callLogId: trusted.callLogId, live: true, messagingConsent },
+      payload: {
+        appointmentRequestId: request.id,
+        callLogId: trusted.callLogId,
+        live: true,
+        messagingConsent,
+        notificationPreferencePolicy: APPOINTMENT_NOTIFICATION_PREFERENCE_POLICY,
+        notificationPreferenceAuthorizesMarketing: false,
+      },
     } });
     await tx.receptionistCallLog.update({ where: { id: trusted.callLogId }, data: { outcome: 'BOOKED' } });
     return {
@@ -1172,9 +1182,15 @@ export async function handleAgentTool(ctx: ToolContext, name: string, args: Reco
         message: 'Your earlier refusal or withdrawal remains in effect for this call. I will keep it metadata-only and can connect you with staff.',
       };
     }
-    const configuredAgents = call.campaign?.agent
-      ? [call.campaign.agent]
-      : await db.receptionistAgent.findMany({ where: { tenantId: ctx.tenantId, clinicId: call.clinic.id, active: true }, select: { name: true }, take: 2 });
+    const configuredAgents = ctx.trustedProviderAgentId
+      ? await db.receptionistAgent.findMany({
+        where: { id: ctx.trustedProviderAgentId, tenantId: ctx.tenantId, clinicId: call.clinic.id, active: true },
+        select: { name: true },
+        take: 2,
+      })
+      : call.campaign?.agent
+        ? [call.campaign.agent]
+        : await db.receptionistAgent.findMany({ where: { tenantId: ctx.tenantId, clinicId: call.clinic.id, active: true }, select: { name: true }, take: 2 });
     if (configuredAgents.length !== 1) {
       return { recorded: false, message: 'I could not bind that preference to one configured receptionist disclosure. I will keep this call metadata-only and connect you with staff.' };
     }

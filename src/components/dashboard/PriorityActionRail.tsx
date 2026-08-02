@@ -41,7 +41,7 @@ export default function PriorityActionRail({
       <div className="bento-header shrink-0">
         <div>
           <p className="bento-title">Priority Queue</p>
-          <p className="text-[11px] text-t3 mt-0.5">AI-ranked by revenue impact</p>
+          <p className="text-[11px] text-t3 mt-0.5">Ordered by recorded potential value</p>
         </div>
         {atStake > 0 && (
           <div className="text-right shrink-0">
@@ -52,13 +52,13 @@ export default function PriorityActionRail({
       </div>
 
       {/* Filters — fixed above the scrolling queue */}
-      <div className="px-3.5 pt-2.5 pb-1 flex flex-wrap gap-1.5 shrink-0" role="tablist" aria-label="Filter priority actions">
+      <div className="px-3.5 pt-2.5 pb-1 flex flex-wrap gap-1.5 shrink-0" role="group" aria-label="Filter priority actions">
         {FILTERS.map(f => {
           const n = counts[f.id] ?? 0;
           const on = filter === f.id;
           if (f.id !== 'all' && n === 0) return null;
           return (
-            <button key={f.id} type="button" role="tab" aria-selected={on} onClick={() => setFilter(f.id)}
+            <button key={f.id} type="button" aria-pressed={on} onClick={() => setFilter(f.id)}
               className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-semibold transition-colors ${on ? 'bg-[var(--indigo)] text-white' : 'bg-[var(--s3)] text-t2 hover:bg-[var(--s4)]'}`}>
               {f.label}{f.id === 'all' ? ` ${counts.all}` : ` ${n}`}
             </button>
@@ -102,8 +102,8 @@ export function PriorityActionCard({ action, onOpen, onCta }: { action: Priority
       {action.description && <p className="text-[11px] text-t3 mt-1 leading-relaxed line-clamp-2">{action.description}</p>}
       <div className="flex items-center justify-between gap-2 mt-2">
         <span className="text-[10px] text-t3 inline-flex items-center gap-1 min-w-0">
-          <Zap className="w-3 h-3 text-violet-v shrink-0" aria-hidden="true" />
-          {action.aiConfidence}% confidence · <span className="truncate">{action.owner}</span>
+          <CircleDot className="w-3 h-3 text-violet-v shrink-0" aria-hidden="true" />
+          <span className="truncate">Owner: {action.owner}</span>
         </span>
         <span className="flex items-center gap-1.5 shrink-0">
           <button type="button" onClick={() => onCta(action)}

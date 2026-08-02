@@ -16,6 +16,8 @@ export interface SessionUser {
   branch?: { id: string; name: string; location: string } | null;
   tenant: { id: string; name: string; slug: string };
   active: boolean;
+  /** Server-resolved grants, including tenant RoleDefinition overrides. */
+  effectivePermissions?: string[];
 }
 
 export interface AuthSessionResponse {
@@ -30,6 +32,7 @@ export interface AuthMeResponse {
     tenantId: string;
     branchId?: string | null;
     role: string;
+    permissions: string[];
   };
 }
 
@@ -155,7 +158,7 @@ export async function mfaVerifyWithToken(mfaToken: string, code: string): Promis
 }
 
 export async function requestPasswordReset(email: string) {
-  return authRequest<{ message: string; devToken?: string; emailDelivered?: boolean }>('/v1/auth/password-reset/request', { email });
+  return authRequest<{ message: string; resetAvailable?: boolean; devToken?: string; emailDelivered?: boolean }>('/v1/auth/password-reset/request', { email });
 }
 
 export async function confirmPasswordReset(token: string, newPassword: string) {

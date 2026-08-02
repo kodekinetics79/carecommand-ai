@@ -40,10 +40,11 @@ Boot behavior:
 | `pilot` | listed in `ALLOWED_MOCK_INTEGRATIONS` | boots — the mock is an explicit, recorded exclusion |
 | `enterprise` | payments mock, even if acknowledged | **boot fails** — payments are the money path; mock is never valid enterprise evidence |
 
-The effective posture is queryable at `GET /health/integrations`
+The effective posture is queryable by an authorized monitor at `GET /health/integrations`
 (`{ profile, integrations: { payments, insurance, ai, email, sms, voice },
 acknowledgedMockIntegrations }` — provider ids and configured/not_configured
-flags only, never credentials). Use it as the first evidence artifact of every
+flags only, never credentials). Production callers use the same monitoring bearer
+token as `/metrics`; unauthenticated callers receive no inventory. Use it as the first evidence artifact of every
 validation cycle: it makes "which mode was this run in?" a fact, not a claim.
 
 Proof: `server/test/envSchema.test.ts` (gate semantics) and

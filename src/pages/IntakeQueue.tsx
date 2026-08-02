@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { ClipboardList, Loader2, CheckCircle2, AlertCircle, Copy, Check, RefreshCw, FileText, Send } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
+import ModuleTabs from '../components/ui/ModuleTabs';
 import { apiRequest } from '../lib/api';
 import { mapPatient, type ApiPatient } from '../lib/apiAdapters';
 import {
@@ -83,13 +84,14 @@ export default function IntakeQueue() {
 
   return (
     <div className="space-y-6 pb-8">
-      <PageHeader title="Patient Intake" subtitle="Pre-visit intake packets, consent capture, and the staff review queue." badge="New" badgeColor="violet" />
+      <PageHeader title="Patient Intake" subtitle="Pre-visit intake packets, consent capture, and the staff review queue." />
       <div className="flex items-center gap-3 flex-wrap">
-        <div className="flex items-center gap-1 bg-[var(--s2)] border border-[var(--b1)] p-1 rounded-xl w-max">
-          {(['queue', 'all'] as const).map(t => (
-            <button key={t} type="button" onClick={() => setTab(t)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${tab === t ? 'bg-[var(--indigo)] text-white' : 'text-t3 hover:text-t1'}`}>{t === 'queue' ? 'Review queue' : 'All packets'}</button>
-          ))}
-        </div>
+        <ModuleTabs
+          tabs={[{ id: 'queue', label: 'Review queue' }, { id: 'all', label: 'All packets' }]}
+          activeTab={tab}
+          onChange={id => setTab(id as 'queue' | 'all')}
+          ariaLabel="Intake packet views"
+        />
         {/* Originate a new intake for a patient (createPacket). */}
         <div className="flex items-center gap-2 bg-[var(--s2)] border border-[var(--b1)] p-1 rounded-xl">
           <select aria-label="Patient for new intake" value={originatePatientId} onChange={e => setOriginatePatientId(e.target.value)} className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs text-t1 outline-none max-w-[200px]">
@@ -101,10 +103,10 @@ export default function IntakeQueue() {
           </button>
         </div>
       </div>
-      {originateNotice && <p className={`text-xs font-semibold ${originateNotice.kind === 'ok' ? 'text-emerald-v' : 'text-red-v'}`}>{originateNotice.text}</p>}
-      {error && <p className="text-sm text-red-v">{error}</p>}
+      {originateNotice && <p role={originateNotice.kind === 'error' ? 'alert' : 'status'} className={`text-xs font-semibold ${originateNotice.kind === 'ok' ? 'text-emerald-v' : 'text-red-v'}`}>{originateNotice.text}</p>}
+      {error && <p role="alert" className="text-sm text-red-v">{error}</p>}
       {loading ? (
-        <div className="cc-card p-10 text-center text-sm text-t3"><Loader2 className="inline w-5 h-5 animate-spin" /></div>
+        <div className="cc-card p-10 text-center text-sm text-t3" role="status" aria-label="Loading intake packets"><Loader2 className="inline w-5 h-5 animate-spin" /></div>
       ) : (
         <div className="grid lg:grid-cols-[320px_1fr] gap-5">
           <div className="cc-card p-3 space-y-1.5 h-max">

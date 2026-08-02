@@ -22,10 +22,29 @@ const confirmationProviderSend = vi.hoisted(() => vi.fn(async () => ({
 })));
 
 vi.mock('../lib/commsProvider', () => ({
-  // Both exports share one spy: general communications still use sendMessage,
-  // while receptionist confirmations cross only the durable-intent path.
   sendMessage: confirmationProviderSend,
-  sendAuthorizedAppointmentConfirmation: confirmationProviderSend,
+  sendAuthorizedAppointmentConfirmation: async (
+    channel: 'sms' | 'email',
+    destination: string,
+    subject: string,
+    body: string,
+    idempotencyKey: string,
+    authorization: { tenantId: string; eventId: string; attemptNumber: number },
+  ) => {
+    const { fixtureDb } = await import('./helpers/fixtureDb');
+    await fixtureDb.notificationDeliveryAttempt.create({ data: {
+      tenantId: authorization.tenantId,
+      notificationEventId: authorization.eventId,
+      attemptNumber: authorization.attemptNumber,
+      phase: 'SUBMISSION_CLAIM',
+      status: 'submission_claimed',
+      completedAt: new Date(),
+    } });
+    // The shared provider spy intentionally records only invocation count/result;
+    // this wrapper owns the durable authorization arguments above.
+    void channel; void destination; void subject; void body; void idempotencyKey;
+    return confirmationProviderSend();
+  },
 }));
 
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
@@ -234,9 +253,9 @@ describe('canonical receptionist booking atomicity — independent integration o
   });
 
   it.each([
-    ['explicit true', true, 'granted'],
+    ['explicit true', true, 'not_suppressed_transactional'],
     ['absent', undefined, 'not_suppressed_transactional'],
-  ] as const)('queues durable confirmation work for %s consent and never fabricates delivery', async (_label, consentValue, expectedConsent) => {
+  ] as const)('queues durable confirmation work for %s notification preference and never fabricates consent or delivery', async (_label, consentValue, expectedConsent) => {
     const consentField: Field = {
       id: randomUUID(), fieldType: 'CONSENT', label: 'Messaging consent', aiQuestion: 'May the clinic message you?',
       required: consentValue !== undefined, confirmationRequired: false, sortOrder: 0,
@@ -258,11 +277,12 @@ describe('canonical receptionist booking atomicity — independent integration o
       { phase: 'INTENT', status: 'started', attemptNumber: 1 },
       { phase: 'PROVIDER_INTENT', status: 'provider_intent_committed', attemptNumber: 1 },
       { phase: 'RESULT', status: 'accepted', attemptNumber: 1 },
+      { phase: 'SUBMISSION_CLAIM', status: 'submission_claimed', attemptNumber: 1 },
     ]);
     const replay = await f.invoke({ ...f.baseArgs, ...(consentValue === undefined ? {} : { messaging_consent: consentValue }) });
     expect(replay).toMatchObject({ booked: true, duplicate: true, sms_sent: false, sms_accepted: false, sms_status: 'already_accepted' });
     expect(sendMessageMock).toHaveBeenCalledTimes(1);
-    expect(await db.notificationDeliveryAttempt.count({ where: { tenantId: f.tenantId, notificationEventId: event.id } })).toBe(3);
+    expect(await db.notificationDeliveryAttempt.count({ where: { tenantId: f.tenantId, notificationEventId: event.id } })).toBe(4);
   });
 
   it('exposes tenant-scoped accepted-versus-delivered evidence to authorized receptionist staff', async () => {
@@ -288,7 +308,7 @@ describe('canonical receptionist booking atomicity — independent integration o
     expect(await db.auditEvent.count({ where: { tenantId: f.tenantId, action: 'receptionist.confirmationDelivery.listRead' } })).toBe(1);
   });
 
-  it('persists explicit messaging refusal and invokes no confirmation provider', async () => {
+  it('treats the bundled answer as a non-authorizing notification preference and invokes no provider after refusal', async () => {
     const consentField: Field = {
       id: randomUUID(), fieldType: 'CONSENT', label: 'Messaging consent', aiQuestion: 'May the clinic message you?',
       required: true, confirmationRequired: false, sortOrder: 0,
@@ -303,9 +323,16 @@ describe('canonical receptionist booking atomicity — independent integration o
     });
     expect(sendMessageMock).not.toHaveBeenCalled();
     expect(await db.notificationEvent.count({ where: { tenantId: f.tenantId } })).toBe(0);
-    expect(await db.consentEvent.findMany({ where: { tenantId: f.tenantId }, select: { purpose: true, granted: true } })).toEqual(expect.arrayContaining([
-      { purpose: 'SMS', granted: false }, { purpose: 'EMAIL', granted: false },
-    ]));
+    expect(await db.consentEvent.findMany({ where: { tenantId: f.tenantId } })).toEqual([]);
+    const event = await db.businessEvent.findFirstOrThrow({
+      where: { tenantId: f.tenantId, eventType: 'receptionist.appointment.booked' },
+      select: { payload: true },
+    });
+    expect(event.payload).toMatchObject({
+      messagingConsent: false,
+      notificationPreferencePolicy: 'appointment-notification-preference-v1',
+      notificationPreferenceAuthorizesMarketing: false,
+    });
   });
 
   it('rolls the entire booking back when durable confirmation enqueue fails', async () => {

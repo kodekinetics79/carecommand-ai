@@ -80,8 +80,8 @@ export default function Settings() {
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Settings"
-        subtitle="Practice configuration, team access, automation, integrations, and security — all live."
-        badge="Control Panel"
+        subtitle="Manage workspace preferences, team access, integrations, and recorded security controls."
+        badge="Workspace settings"
         badgeColor="violet"
       />
 
@@ -99,6 +99,7 @@ export default function Settings() {
                   key={item.id}
                   type="button"
                   onClick={() => setSection(item.id)}
+                  aria-current={active ? 'page' : undefined}
                   className={`flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-xs font-semibold whitespace-nowrap transition-all ${active ? 'bg-[var(--indigo)] text-white shadow-sm' : 'text-t2 hover:bg-[var(--s3)]'}`}
                 >
                   <Icon className="w-4 h-4 shrink-0" />
@@ -138,12 +139,12 @@ function SettingsSummary() {
   const passingSecurityChecks = securityChecks.filter(Boolean).length;
 
   return (
-    <BentoCard title="Workspace Control Summary" subtitle="Live configuration, integration health, and security posture">
+    <BentoCard title="Workspace summary" subtitle="Current configuration and the latest recorded control status">
       <div className="grid gap-3 xl:grid-cols-[1.3fr_0.9fr]">
         <div className="grid gap-3 grid-cols-2 xl:grid-cols-4">
           <StatCard title="Team Members" value={overview?.summary.totalUsers ?? '—'} subtitle={`${overview?.summary.activeUsers ?? 0} active`} icon={<Users className="w-4 h-4" />} accent="blue" />
-          <StatCard title="Connected" value={connected} subtitle={`${integrations.length} integrations`} icon={<Cable className="w-4 h-4" />} accent="emerald" />
-          <StatCard title="Security Checks" value={posture ? `${passingSecurityChecks}/${securityChecks.length}` : '—'} subtitle="Passing controls" icon={<ShieldCheck className="w-4 h-4" />} accent="violet" />
+          <StatCard title="Configured" value={connected} subtitle={`${integrations.length} integrations`} icon={<Cable className="w-4 h-4" />} accent="emerald" />
+          <StatCard title="Security check results" value={posture ? `${passingSecurityChecks}/${securityChecks.length}` : '—'} subtitle="Latest recorded checks" icon={<ShieldCheck className="w-4 h-4" />} accent="violet" />
           <StatCard title="Active Branches" value={activeBranches} subtitle={`${risky} integrations need attention`} icon={<Building2 className="w-4 h-4" />} accent="amber" />
         </div>
 
@@ -153,12 +154,12 @@ function SettingsSummary() {
               <p className="text-xs font-bold uppercase tracking-widest text-t3">Operational status</p>
               <p className="text-sm font-semibold text-t1 mt-1">{overview?.tenant.name ?? 'Workspace'} · {overview?.tenant.slug ?? '—'}</p>
             </div>
-            <span className="badge badge-emerald">{connected}/{integrations.length} live</span>
+            <span className="badge badge-blue">{connected}/{integrations.length} configured</span>
           </div>
           <div className="space-y-2.5">
             <div className="flex items-center justify-between gap-3 text-xs">
-              <span className="text-t3">Integration health</span>
-              <span className="font-semibold text-t1">{risky === 0 ? 'All healthy' : `${risky} need attention`}</span>
+              <span className="text-t3">Recorded integration health</span>
+              <span className="font-semibold text-t1">{integrations.length === 0 ? 'No integrations loaded' : risky === 0 ? 'No issues reported' : `${risky} need attention`}</span>
             </div>
             <div className="flex items-center justify-between gap-3 text-xs">
               <span className="text-t3">Security posture</span>
@@ -200,7 +201,7 @@ function PreferencesSection() {
         </div>
       </BentoCard>
 
-      <BentoCard title="Language" subtitle="Sets the interface locale. Right-to-left languages adjust layout automatically.">
+      <BentoCard title="Language" subtitle="Sets the saved interface preference and page direction for supported locales.">
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
           {LANGUAGES.map(l => {
             const on = l.code === language;
@@ -213,7 +214,7 @@ function PreferencesSection() {
             );
           })}
         </div>
-        <p className="mt-3 text-[11px] text-t3">Full UI translation is rolling out; the language preference is saved now and applies as locale + text direction. Number and currency formatting follow your selections immediately.</p>
+        <p className="mt-3 text-[11px] text-t3">Some interface text may remain in English while translations are completed. Number and currency formatting use the preferences selected above.</p>
       </BentoCard>
     </div>
   );
@@ -233,7 +234,7 @@ function OverviewSection() {
         <StatCard title="Audit Events" value={s?.recentAuditEvents ?? '—'} subtitle="Recent activity" icon={<Activity className="w-4 h-4" />} accent="amber" />
       </div>
 
-      <BentoCard title="Practice Profile" subtitle="Organisation details" headerRight={<Building2 className="w-4 h-4 text-t3" />}>
+      <BentoCard title="Practice Profile" subtitle="Organization details" headerRight={<Building2 className="w-4 h-4 text-t3" />}>
         <div className="grid sm:grid-cols-2 gap-3">
           <Field label="Practice name" value={data?.tenant.name ?? '—'} />
           <Field label="Workspace slug" value={data?.tenant.slug ?? '—'} />
@@ -283,8 +284,8 @@ function TeamSection() {
   const users = (data?.users ?? []).filter(u => !search || u.displayName.toLowerCase().includes(search.toLowerCase()) || u.email.toLowerCase().includes(search.toLowerCase()));
 
   return (
-    <BentoCard title="Team & Users" subtitle={`${data?.users.length ?? 0} members · live role & access management`} headerRight={
-      <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search…" className="text-xs px-3 py-1.5 border border-[var(--b1)] rounded-xl bg-[var(--s3)] text-t1 placeholder:text-t3 outline-none w-40" />
+    <BentoCard title="Team & users" subtitle={`${data?.users.length ?? 0} member records`} headerRight={
+      <input value={search} onChange={e => setSearch(e.target.value)} aria-label="Search team members" placeholder="Search team…" className="text-xs px-3 py-1.5 border border-[var(--b1)] rounded-xl bg-[var(--s3)] text-t1 placeholder:text-t3 outline-none w-40" />
     }>
       <div className="space-y-2">
         {users.map(user => (
@@ -310,6 +311,8 @@ function TeamSection() {
               type="button"
               disabled={pendingId === user.id}
               onClick={() => toggleActive(user.id, !user.active)}
+              aria-label={`${user.active ? 'Disable' : 'Activate'} ${user.displayName}`}
+              title={`${user.active ? 'Disable' : 'Activate'} ${user.displayName}`}
               className={`text-[10px] font-bold px-2.5 py-1 rounded-full transition disabled:opacity-40 ${user.active ? 'badge badge-emerald' : 'badge badge-red'}`}
             >
               {user.active ? 'Active' : 'Disabled'}
@@ -336,7 +339,7 @@ function RolesSection() {
   }
 
   return (
-    <BentoCard title="Roles & Access" subtitle="Permission groups · live" headerRight={<Lock className="w-4 h-4 text-t3" />}>
+    <BentoCard title="Roles & access" subtitle="Configured permission groups" headerRight={<Lock className="w-4 h-4 text-t3" />}>
       {roles.error && <p className="text-[11px] text-red-v mb-2">{roles.error}</p>}
       <div className="space-y-2.5">
         {roles.data.map(r => (
@@ -350,8 +353,8 @@ function RolesSection() {
       </div>
       {show ? (
         <div className="mt-3 p-3 rounded-xl border border-[var(--b2)] bg-[var(--s2)] space-y-2">
-          <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="Role name" className={inputClass} />
-          <input value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} placeholder="Description" className={inputClass} />
+          <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} aria-label="Role name" placeholder="Role name" className={inputClass} />
+          <input value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} aria-label="Role description" placeholder="Role description" className={inputClass} />
           <div className="flex gap-2">
             <button type="button" disabled={roles.busy} onClick={add} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 disabled:opacity-40">Add role</button>
             <button type="button" onClick={() => setShow(false)} className="px-3 py-2 rounded-lg border border-[var(--b1)] text-t2 text-xs font-semibold hover:bg-[var(--s3)]">Cancel</button>
@@ -378,7 +381,7 @@ function NotificationsSection() {
   }
 
   return (
-    <BentoCard title="Notification Templates" subtitle="Automated patient messaging · live" headerRight={<Bell className="w-4 h-4 text-t3" />}>
+    <BentoCard title="Notification templates" subtitle="Configured patient-message templates; delivery depends on provider setup and consent checks" headerRight={<Bell className="w-4 h-4 text-t3" />}>
       {templates.error && <p className="text-[11px] text-red-v mb-2">{templates.error}</p>}
       <div className="space-y-2.5">
         {templates.data.map(t => (
@@ -397,8 +400,8 @@ function NotificationsSection() {
       </div>
       {show ? (
         <div className="mt-3 p-3 rounded-xl border border-[var(--b2)] bg-[var(--s2)] space-y-2">
-          <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="Template name" className={inputClass} />
-          <input value={form.channel} onChange={e => setForm(f => ({ ...f, channel: e.target.value }))} placeholder="Channel (e.g. WhatsApp + SMS)" className={inputClass} />
+          <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} aria-label="Template name" placeholder="Template name" className={inputClass} />
+          <input value={form.channel} onChange={e => setForm(f => ({ ...f, channel: e.target.value }))} aria-label="Message channel" placeholder="Channel (for example, SMS)" className={inputClass} />
           <div className="flex gap-2">
             <button type="button" disabled={templates.busy} onClick={add} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 disabled:opacity-40">Add template</button>
             <button type="button" onClick={() => setShow(false)} className="px-3 py-2 rounded-lg border border-[var(--b1)] text-t2 text-xs font-semibold hover:bg-[var(--s3)]">Cancel</button>
@@ -448,12 +451,12 @@ function IntegrationsSection() {
     <>
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
         <StatCard title="Integrations" value={data.length} subtitle="Available providers" icon={<Cable className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Connected" value={connected} subtitle="Configured & live" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Configured" value={connected} subtitle="Configuration detected" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
         <StatCard title="Needs Setup" value={data.length - connected} subtitle="Awaiting credentials" icon={<AlertTriangle className="w-4 h-4" />} accent="amber" />
         <StatCard title="Categories" value={grouped.length} subtitle="Provider types" icon={<Activity className="w-4 h-4" />} accent="violet" />
       </div>
 
-      {toast && <div className="rounded-xl border border-[var(--b2)] bg-[var(--blue-soft)] px-3 py-2 text-[11px] font-semibold text-blue-v">{toast}</div>}
+      {toast && <div role="status" aria-live="polite" className="rounded-xl border border-[var(--b2)] bg-[var(--blue-soft)] px-3 py-2 text-[11px] font-semibold text-blue-v">{toast}</div>}
 
       {grouped.map(([category, items]) => (
         <BentoCard key={category} title={category} subtitle={`${items.filter(i => i.configured).length}/${items.length} connected`}>
@@ -527,7 +530,7 @@ function SecuritySection() {
           <StatCard title="Access Token TTL" value={`${p.accessTokenTtlMinutes}m`} subtitle="Session lifetime" icon={<Clock className="w-4 h-4" />} accent="blue" />
           <StatCard title="Audit Events" value={p.auditEventCount} subtitle="Total logged" icon={<Activity className="w-4 h-4" />} accent="violet" />
           <StatCard title="Login Events" value={p.loginEventCount} subtitle="Recorded" icon={<KeyRound className="w-4 h-4" />} accent="emerald" />
-          <StatCard title="Active Sessions" value={sessions.data.filter(s => !s.revoked).length} subtitle="Live now" icon={<Users className="w-4 h-4" />} accent="amber" />
+          <StatCard title="Unrevoked Sessions" value={sessions.data.filter(s => !s.revoked).length} subtitle="Session records" icon={<Users className="w-4 h-4" />} accent="amber" />
         </div>
       )}
 
@@ -544,7 +547,7 @@ function SecuritySection() {
         )}
       </BentoCard>
 
-      <BentoCard title="Active Sessions" subtitle={`${sessions.data.filter(s => !s.revoked).length} live · revoke to force sign-out`}>
+      <BentoCard title="Session records" subtitle={`${sessions.data.filter(s => !s.revoked).length} unrevoked · revoke to require sign-in again`}>
         <div className="space-y-2">
           {sessions.data.map(s => (
             <div key={s.id} className="flex flex-wrap items-center gap-3 p-3 rounded-xl border border-[var(--b1)]">
@@ -554,7 +557,7 @@ function SecuritySection() {
               </div>
               {s.revoked
                 ? <span className="badge badge-red shrink-0">Revoked</span>
-                : <button type="button" disabled={pendingId === s.user.id} onClick={() => revoke(s.user.id)} className="text-[10px] font-semibold text-red-v hover:opacity-80 border border-[var(--b1)] px-2.5 py-1 rounded-lg disabled:opacity-40 shrink-0">{pendingId === s.user.id ? 'Revoking…' : 'Revoke'}</button>
+                : <button type="button" disabled={pendingId === s.user.id} onClick={() => revoke(s.user.id)} aria-label={`Revoke sessions for ${s.user.displayName}`} className="text-[10px] font-semibold text-red-v hover:opacity-80 border border-[var(--b1)] px-2.5 py-1 rounded-lg disabled:opacity-40 shrink-0">{pendingId === s.user.id ? 'Revoking…' : 'Revoke sessions'}</button>
               }
             </div>
           ))}

@@ -1,5 +1,6 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { env, isIngressProxyConfigurationReady, parseAllowedMockIntegrations } from '../../config/env';
+import { metricsAccess } from '../../lib/metrics';
 import { SLOS, errorBudgetMinutes } from '../../lib/slo';
 import { refreshDependencyGauges } from './checks';
 
@@ -41,12 +42,14 @@ export const healthRoutes: FastifyPluginAsync = async app => {
     time: new Date().toISOString(),
   }));
 
-  // Truthful integration posture — the effective mode of every integration in
-  // THIS environment, so an "enterprise validation" run can never silently sit
-  // on mocks (docs/INTEGRATION_MODE_REGISTER.md). Same exposure policy as
-  // /health/slo: unauthenticated, config identifiers only — provider names and
-  // configured/not_configured flags, NEVER credentials or secret values.
-  app.get('/health/integrations', async () => ({
+  // Operational integration inventory. In production it shares the protected
+  // monitoring-token boundary with /metrics so public probes cannot fingerprint
+  // configured providers or deployment profile. It never returns credentials.
+  app.get('/health/integrations', async (request, reply) => {
+    const access = metricsAccess(request.headers.authorization);
+    if (access === 'not_found') return reply.code(404).send();
+    if (access === 'unauthorized') return reply.code(401).send();
+    return {
     profile: env.DEPLOYMENT_PROFILE,
     integrations: {
       // Provider-mode integrations report their effective provider id.
@@ -62,7 +65,8 @@ export const healthRoutes: FastifyPluginAsync = async app => {
     // Mocks this profile has explicitly acknowledged (empty under 'demo' by
     // convention — the gate ignores it there but boot validates the tokens).
     acknowledgedMockIntegrations: parseAllowedMockIntegrations(env.ALLOWED_MOCK_INTEGRATIONS),
-  }));
+    };
+  });
 
   // Published SLO targets — the measurable commitments the alerts fire against.
   app.get('/health/slo', async () => ({

@@ -143,7 +143,7 @@ async function loginPatient(page: Page, data: GoldenData) {
   await expect(page.getByText('Enter your link code')).toBeVisible();
   const outbox = await latestPortalToken(data.tenantId);
   await page.getByLabel('Sign-in code').fill(outbox.token);
-  await page.getByRole('button', { name: 'Continue' }).click();
+  await page.getByRole('button', { name: 'Verify and sign in' }).click();
   await expect(page.getByText(/Hi Avery/)).toBeVisible();
   await assertAccessibilityContract(page, 'patient portal dashboard');
 }
@@ -151,7 +151,7 @@ async function loginPatient(page: Page, data: GoldenData) {
 async function loginStaff(page: Page, data: GoldenData) {
   await page.goto('/login');
   await assertAccessibilityContract(page, 'staff login');
-  await page.getByLabel('Email').fill(data.staffEmail);
+  await page.getByRole('textbox', { name: 'Email', exact: true }).fill(data.staffEmail);
   await page.getByRole('textbox', { name: /Password/ }).fill(STAFF_PASSWORD);
   await page.getByRole('button', { name: /Sign in/i }).click();
   await expect(page).toHaveURL(/\/$/);
@@ -173,7 +173,7 @@ test.describe('staff authentication and accessibility contract', () => {
       await page.goto('/patients');
       await expect(page).toHaveURL(/\/login$/);
 
-      const email = page.getByLabel('Email');
+      const email = page.getByRole('textbox', { name: 'Email', exact: true });
       const password = page.getByRole('textbox', { name: /Password/ });
       await expect(email).toBeVisible();
       await expect(password).toBeVisible();
@@ -249,7 +249,7 @@ test.describe.serial('production-style browser golden journey', () => {
     await expect(page.getByLabel('Open slots')).not.toHaveValue('');
     await page.getByLabel('Reason for visit').fill('Annual physical');
     await page.getByRole('button', { name: /Book appointment/i }).click();
-    await expect(page.getByText(/Booked Annual physical/)).toBeVisible();
+    await expect(page.getByText(/The scheduling system confirmed Annual physical/)).toBeVisible();
     await testInfo.attach('portal-booking', { body: await page.screenshot({ fullPage: true }), contentType: 'image/png' });
 
     const appointment = await db.appointment.findFirstOrThrow({ where: { tenantId: data.tenantId, patientId: data.patientId, service: 'Annual physical' } });
@@ -264,7 +264,7 @@ test.describe.serial('production-style browser golden journey', () => {
     await page.getByPlaceholder('Group # (optional)').fill('GRP-E2E');
     await page.getByPlaceholder('Subscriber name (optional)').fill('Avery Pilot');
     await page.getByRole('button', { name: 'Save' }).click();
-    await expect(page.getByText('Saved')).toBeVisible();
+    await expect(page.getByText(/Policy details saved for clinic review/)).toBeVisible();
 
     // Staff creates the deposit payment link through the real UI (second tab —
     // staff and patient sessions use separate tokens, exactly like production).
@@ -291,15 +291,30 @@ test.describe.serial('production-style browser golden journey', () => {
     const requirement = await db.depositRequirement.findFirstOrThrow({ where: { tenantId: data.tenantId, appointmentId: appointment.id } });
     expect(requirement.status).toBe('link_sent');
 
-    // Patient sees the staff-created deposit and acknowledges the billing policy.
+    // Deposit requirements and responsibility estimates are distinct evidence.
+    // Create an explicit synthetic estimate so this journey can validate the
+    // portal acknowledgement boundary without implying the deposit generated it.
+    await db.patientResponsibilityEstimate.create({
+      data: {
+        tenantId: data.tenantId,
+        branchId: data.branchId,
+        patientId: data.patientId,
+        appointmentId: appointment.id,
+        estimatedPatientResponsibility: 75,
+        recommendedCollectAmount: 75,
+        reason: 'Synthetic E2E estimate for portal acknowledgement validation.',
+      },
+    });
+
+    // Patient sees the staff-created deposit and acknowledges the current estimate.
     await page.getByRole('link', { name: /Payments/i }).click();
     await page.getByRole('button', { name: /Acknowledge/i }).click();
     await expect(page.getByText('Appointment deposit · link_sent')).toBeVisible();
     await expect(page.getByText('$75 USD')).toBeVisible();
     // The explicit synthetic adapter returns an HTTP localhost URL. The portal
     // must not expose that unsafe/dead URL as if it were a real hosted checkout.
-    await expect(page.getByText('Secure payment link not ready — please contact the clinic.')).toBeVisible();
-    await expect(page.getByRole('link', { name: 'Pay', exact: true })).toHaveCount(0);
+    await expect(page.getByText('Payment page unavailable — please contact the clinic.')).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Open payment page', exact: true })).toHaveCount(0);
 
     const eventId = `evt_${randomUUID()}`;
     const body = JSON.stringify({ id: eventId, type: 'checkout.session.completed', data: { object: { id: paymentRequest.providerReference } } });
@@ -346,11 +361,12 @@ test.describe.serial('production-style browser golden journey', () => {
       'deposit.required',
       'payment.request.created',
       'payment.link.created',
-      'portal.paymentPolicy.acknowledged',
+      'portal.estimate.acknowledged',
       'payment.succeeded',
       'monitoring.reading.ingested',
       'monitoring.alert.acknowledged',
     ]));
+    expect(auditActions.map(a => a.action)).not.toContain('portal.paymentPolicy.acknowledged');
 
     expect(consoleErrors).toEqual([]);
     expect(failedRequests).toEqual([]);

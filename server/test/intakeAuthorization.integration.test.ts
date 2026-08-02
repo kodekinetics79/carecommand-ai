@@ -140,7 +140,11 @@ describe('versioned intake acknowledgements', () => {
     expect(view.statusCode).toBe(200);
     const sections = view.json().sections as Array<{ sectionType: string; acknowledgement: { id: string; version: string; text: string } | null }>;
 
-    for (const sectionType of ['payment_policy', 'estimate_acknowledgement'] as const) {
+    expect(sections.find(row => row.sectionType === 'payment_policy')?.acknowledgement).toBeNull();
+    const unavailable = await app.inject({ method: 'POST', url: `/v1/portal/intake/${packet.id}/sections`, headers: portalHeaders, payload: { sectionType: 'payment_policy', data: { accepted: true, acknowledgementId: 'payment_policy:v1' } } });
+    expect(unavailable.statusCode).toBe(409);
+
+    for (const sectionType of ['estimate_acknowledgement'] as const) {
       const acknowledgement = sections.find(row => row.sectionType === sectionType)?.acknowledgement;
       expect(acknowledgement).toEqual(INTAKE_ACKNOWLEDGEMENTS[sectionType]);
       const url = `/v1/portal/intake/${packet.id}/sections`;

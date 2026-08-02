@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { CheckCircle2, ChevronDown, ChevronRight, Copy, Download, FileText, Link2, Loader2, RefreshCw, Save, Upload, UserRoundPlus } from 'lucide-react';
+import { CheckCircle2, ChevronDown, ChevronRight, CircleDashed, Copy, Download, FileText, Link2, Loader2, RefreshCw, Save, Upload, UserRoundPlus } from 'lucide-react';
 import {
   platformAdmin,
   type PilotChecklistView,
@@ -307,7 +307,7 @@ export default function PlatformPilot() {
         <div className="mt-5 grid gap-3 md:grid-cols-3">
           <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s1)] p-4 shadow-sm">
             <p className="text-[11px] font-bold uppercase tracking-wide text-t3">1. Platform admin</p>
-            <p className="mt-1 text-sm text-t2">Create the clinic tenant, owner login, branch, and readiness link.</p>
+            <p className="mt-1 text-sm text-t2">Create the clinic tenant, owner login, branch, and pilot status link.</p>
           </div>
           <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s1)] p-4 shadow-sm">
             <p className="text-[11px] font-bold uppercase tracking-wide text-t3">2. Client setup</p>
@@ -330,7 +330,7 @@ export default function PlatformPilot() {
             <p className="text-[11px] font-bold uppercase tracking-wide text-t3">Clinic tenant</p>
             <h3 className="text-lg font-bold text-t1">Select the client clinic to load or update</h3>
               </div>
-              <select value={selectedTenantId} onChange={e => {
+              <select aria-label="Clinic tenant" value={selectedTenantId} onChange={e => {
                 setSelectedTenantId(e.target.value);
                 setChecklist(null);
                 setPreview(null);
@@ -354,14 +354,14 @@ export default function PlatformPilot() {
             {checklist && selectedTenantId && (
               <div className="mt-4 grid gap-3 sm:grid-cols-2">
                 <div className="rounded-2xl border border-[var(--b1)] bg-[linear-gradient(135deg,var(--s2),var(--s1))] p-4">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-t3">Readiness</p>
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-t3">Checklist completion</p>
                   <p className="mt-1 text-2xl font-bold text-t1">{checklist.readinessScore}%</p>
                   <p className="mt-1 text-xs text-t3">{checklist.readyCount}/{checklist.itemCount} checklist items complete</p>
                 </div>
                 <div className="rounded-2xl border border-[var(--b1)] bg-[linear-gradient(135deg,var(--s2),var(--s1))] p-4">
                   <p className="text-[11px] font-semibold uppercase tracking-wide text-t3">Current tenant</p>
                   <p className="mt-1 text-sm font-semibold text-t1">{checklist.tenant?.name ?? 'Unknown'}</p>
-                  <p className="mt-1 text-xs text-t3">{checklist.counts.patients} patients · {checklist.counts.appointments} appointments · {checklist.counts.policies} active policies</p>
+                  <p className="mt-1 text-xs text-t3">{checklist.counts.patients} patients · {checklist.counts.appointments} appointments · {checklist.counts.policies} policies on file</p>
                 </div>
               </div>
             )}
@@ -369,13 +369,16 @@ export default function PlatformPilot() {
               <div className="mt-4 space-y-2">
                 {checklist.items.map(item => (
                   <div key={item.key} className="flex items-start gap-3 rounded-2xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2.5">
-                    <CheckCircle2 className={`w-4 h-4 shrink-0 ${item.done ? 'text-emerald-v' : 'text-t3'}`} />
+                    {item.done
+                      ? <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-v" aria-hidden="true" />
+                      : <CircleDashed className="w-4 h-4 shrink-0 text-t3" aria-hidden="true" />}
                     <div className="min-w-0">
-                      <p className="text-sm font-semibold text-t1">{item.label}</p>
+                      <p className="text-sm font-semibold text-t1">{item.label} <span className="text-[11px] font-medium text-t3">— {item.done ? 'Complete' : 'Pending'}</span></p>
                       <p className="text-[11px] text-t3">{item.detail}</p>
                     </div>
                   </div>
                 ))}
+                <p className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-[11px] leading-5 text-t3">This checklist summarizes recorded setup tasks. It is not a security assessment, compliance certification, clinical validation, or launch authorization.</p>
               </div>
             )}
           </div>
@@ -383,7 +386,7 @@ export default function PlatformPilot() {
           <div className="rounded-[2rem] border border-[var(--b1)] bg-[var(--s1)] p-5 shadow-sm">
             <button type="button" onClick={() => setCompanyOpen(v => !v)} className="flex w-full items-center justify-between gap-3 text-left">
               <div>
-                <p className="text-[11px] font-bold uppercase tracking-wide text-t3">Customer-ready onboarding</p>
+                <p className="text-[11px] font-bold uppercase tracking-wide text-t3">Clinic onboarding</p>
                 <h3 className="text-lg font-bold text-t1">Provision a new client company</h3>
               </div>
               {companyOpen ? <ChevronDown className="w-4 h-4 text-t3" /> : <ChevronRight className="w-4 h-4 text-t3" />}

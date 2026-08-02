@@ -254,6 +254,25 @@ export interface ApiConversation {
   updatedAt: string;
   patient?: { firstName: string; lastName: string } | null;
   branch?: { name: string } | null;
+  replyReadiness: {
+    channel: 'sms' | 'email' | 'whatsapp' | null;
+    destinationMasked: string | null;
+    identityStatus: 'patient_linked' | 'not_linked';
+    destinationSource: 'linked_patient_record' | 'unavailable';
+    destinationVerificationStatus: 'format_verified' | 'not_verified';
+    authorizationBasis: 'recorded_inbound_conversation_reply' | 'none';
+    explicitConsentStatus: string;
+    consentSource: string | null;
+    consentCapturedAt: string | null;
+    suppressionStatus: 'suppressed' | 'not_suppressed' | 'not_checked_no_destination';
+    submissionState: 'clear' | 'submission_result_unknown' | 'provider_evidence_pending';
+    ready: boolean;
+    readinessReason: 'patient_identity_not_linked' | 'destination_not_available' | 'destination_format_invalid' | 'recipient_suppressed' | 'submission_result_unknown' | 'provider_evidence_pending' | 'ready_for_server_recheck';
+    draftSource: 'rule_based_staff_review_draft';
+    senderIdentity: string;
+    channelTerms: 'operational_reply_to_recorded_inbound_conversation';
+    channelTermsSource: 'carecommand_operational_reply_policy_v1';
+  };
 }
 
 const lifecycleMap = {
@@ -326,7 +345,7 @@ export function mapIntegration(row: ApiIntegration): Integration {
     category: row.category,
     status: row.status.toLowerCase().replace('_', '-') as Integration['status'],
     icon: row.config?.icon ?? 'Cloud',
-    description: row.config?.description ?? `${row.name} operational integration.`,
+    description: row.config?.description ?? 'No integration description provided.',
     lastSync: row.lastSyncAt ? new Date(row.lastSyncAt).toLocaleString() : undefined,
   };
 }
@@ -357,7 +376,7 @@ export function mapAppointment(row: ApiAppointment): Appointment {
     // when a row genuinely lacks a linked patient name.
     patientName: row.patientName?.trim() || 'Unknown patient',
     doctorId: row.providerRef ?? '',
-    doctorName: row.providerRef ?? 'Assigned provider',
+    doctorName: row.providerRef ?? 'Provider not linked',
     branchId: row.branchId,
     service: row.service,
     date: startsAt.toISOString().slice(0, 10),
@@ -388,7 +407,7 @@ export function mapLead(row: ApiLead): Lead {
 export function mapReview(row: ApiReview): Review {
   return {
     id: row.id,
-    patientName: 'Live DB Customer',
+    patientName: 'Reviewer name unavailable',
     branchId: row.branchId ?? '',
     rating: row.rating,
     text: row.text,
@@ -404,9 +423,9 @@ export function mapPartnerReport(row: ApiPartnerReport): LabOrder {
   return {
     id: row.id,
     patientId: row.patientId ?? '',
-    patientName: row.patient ? `${row.patient.firstName} ${row.patient.lastName}` : 'Live DB Customer',
+    patientName: row.patient ? `${row.patient.firstName} ${row.patient.lastName}` : 'Patient not linked',
     doctorId: row.providerRef ?? '',
-    doctorName: row.providerRef ?? 'Assigned provider',
+    doctorName: row.providerRef ?? 'Provider not linked',
     branchId: row.branchId,
     testName: row.reportType,
     orderedAt: row.orderedAt,
@@ -615,5 +634,7 @@ export function mapConversation(row: ApiConversation) {
     lastAgentMessageAt: row.lastAgentMessageAt ?? undefined,
     suggestedSlot: null,
     value: `$${Number(row.estimatedValue).toLocaleString()}`,
+    valueEvidence: 'Recorded estimate · source not verified',
+    replyReadiness: row.replyReadiness,
   };
 }

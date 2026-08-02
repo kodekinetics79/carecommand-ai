@@ -288,6 +288,12 @@ export const envSchema = baseEnvSchema.superRefine((cfg, ctx) => {
     if (cfg.NODE_ENV !== 'production') {
       addProfileIssue('NODE_ENV', `${cfg.DEPLOYMENT_PROFILE} deployments require NODE_ENV=production.`);
     }
+    if (cfg.E2E_TEST_MODE) {
+      addProfileIssue(
+        'E2E_TEST_MODE',
+        `${cfg.DEPLOYMENT_PROFILE} deployments must not enable the local E2E escape hatch. Use DEPLOYMENT_PROFILE=demo for synthetic browser certification.`,
+      );
+    }
     if (!cfg.PLATFORM_DATABASE_URL) {
       addProfileIssue(
         'PLATFORM_DATABASE_URL',

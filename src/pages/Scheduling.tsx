@@ -158,7 +158,7 @@ export default function Scheduling() {
   async function bookAppointment() {
     const patient = patientRecords.find(p => p.id === booking.patientId);
     if (!patient || !patient.branchId || !booking.service.trim()) {
-      setBookingError('Pick a customer and enter a service.');
+      setBookingError('Pick a patient and enter a service.');
       return;
     }
     setSaving(true);
@@ -236,7 +236,7 @@ export default function Scheduling() {
   }
 
   const setLifecycle = (id: string, status: LifecycleStatus, ok: string) => runRowAction(id, () => appointmentsApi.setStatus(id, status), ok);
-  const cancelAppointment = (id: string) => runRowAction(id, () => appointmentsApi.cancel(id), 'Appointment cancelled.');
+  const cancelAppointment = (id: string) => runRowAction(id, () => appointmentsApi.cancel(id), 'Appointment canceled.');
 
   async function submitReschedule(id: string) {
     const startsAt = new Date(`${rescheduleForm.date}T${rescheduleForm.time}:00`);
@@ -247,7 +247,7 @@ export default function Scheduling() {
   }
 
   // ----- Originate an intake link for an appointment's patient ---------------
-  async function sendIntake(appt: ReturnType<typeof mapAppointment>) {
+  async function createAndCopyIntake(appt: ReturnType<typeof mapAppointment>) {
     setIntakeBusy(appt.id);
     setRowNotice(null);
     try {
@@ -272,7 +272,12 @@ export default function Scheduling() {
   const totalValue = todayAppts.reduce((s, a) => s + a.value, 0);
   const riskyCount = todayAppts.filter(a => a.status === 'risky').length;
   const confirmedCount = todayAppts.filter(a => a.status === 'confirmed' || a.status === 'arrived').length;
-  const queueMode = insuranceQueue.some(row => row.providerMode !== 'mock') ? 'Sandbox Active' : 'Mock Mode';
+  const eligibilityModes = [...new Set(insuranceQueue.map(row => row.providerMode).filter(Boolean))];
+  const queueMode = eligibilityModes.length === 0
+    ? 'Provider mode unavailable'
+    : eligibilityModes.length === 1
+      ? `Recorded mode: ${eligibilityModes[0]}`
+      : `Mixed recorded modes: ${eligibilityModes.join(', ')}`;
   const loadError = appointmentError || providerError || patientError || branchError;
 
   async function verifyInsurance(row: AppointmentVerificationQueueRow) {
@@ -297,14 +302,14 @@ export default function Scheduling() {
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
-        title="Smart Scheduling"
-        subtitle="AI-optimised appointment calendar with no-show prediction and slot-filling intelligence."
-        badge={loadError ? 'Live Data Error' : source === 'live' ? 'Live DB' : 'Loading'}
+        title="Scheduling"
+        subtitle="Review appointments, provider availability, recorded risk flags, and front-office follow-up tasks."
+        badge={loadError ? 'Data unavailable' : source === 'live' ? 'Schedule loaded' : 'Loading schedule'}
         badgeColor={loadError ? 'red' : source === 'live' ? 'emerald' : 'blue'}
         actions={
           <div className="flex gap-2">
             <button type="button" onClick={() => setShowBooking(true)} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
-              <CalendarDays className="w-4 h-4" /> Book Appointment
+              <CalendarDays className="w-4 h-4" /> Book appointment
             </button>
           </div>
         }
@@ -313,17 +318,17 @@ export default function Scheduling() {
       {showBooking && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={closeBooking}>
           <div className="w-full max-w-md rounded-2xl bg-[var(--s1)] border border-[var(--b2)] p-5 shadow-xl max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
-            <p className="text-sm font-bold text-t1 mb-3">Book Appointment</p>
-            {bookingError && <p className="text-[11px] text-red-v mb-2">{bookingError}</p>}
+            <p className="text-sm font-bold text-t1 mb-3">Book appointment</p>
+            {bookingError && <p role="alert" className="text-[11px] text-red-v mb-2">{bookingError}</p>}
             <div className="space-y-2.5">
-              <select aria-label="Customer" title="Customer" value={booking.patientId} onChange={e => setBooking(b => ({ ...b, patientId: e.target.value, providerId: '', slotStart: '', slotEnd: '' }))} className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
-                <option value="">Select customer…</option>
+              <select aria-label="Patient" title="Patient" value={booking.patientId} onChange={e => setBooking(b => ({ ...b, patientId: e.target.value, providerId: '', slotStart: '', slotEnd: '' }))} className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
+                <option value="">Select patient…</option>
                 {patientRecords.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
               </select>
               <input value={booking.service} onChange={e => setBooking(b => ({ ...b, service: e.target.value }))} placeholder="Service (e.g. Dermatology Review)" className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
               <div className="grid grid-cols-2 gap-2.5">
                 <select aria-label="Provider" title="Provider" disabled={!booking.patientId} value={booking.providerId} onChange={e => setBooking(b => ({ ...b, providerId: e.target.value, slotStart: '', slotEnd: '' }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-40">
-                  <option value="">{booking.patientId ? 'Select provider…' : 'Pick customer first'}</option>
+                  <option value="">{booking.patientId ? 'Select provider…' : 'Pick patient first'}</option>
                   {bookableProviders.map(p => <option key={p.id} value={p.id}>{p.name} · {p.specialty}</option>)}
                 </select>
                 <input type="date" aria-label="Date" value={booking.date} onChange={e => setBooking(b => ({ ...b, date: e.target.value, slotStart: '', slotEnd: '' }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
@@ -364,7 +369,7 @@ export default function Scheduling() {
               )}
             </div>
             <div className="flex gap-2 mt-4">
-              <button type="button" disabled={saving} onClick={bookAppointment} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition disabled:opacity-40">{saving ? 'Booking…' : booking.providerId && booking.slotStart ? 'Book slot' : 'Book Appointment'}</button>
+              <button type="button" disabled={saving} onClick={bookAppointment} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition disabled:opacity-40">{saving ? 'Booking…' : booking.providerId && booking.slotStart ? 'Book slot' : 'Book appointment'}</button>
               <button type="button" onClick={closeBooking} className="px-4 py-2 rounded-lg border border-[var(--b1)] text-t2 text-xs font-semibold hover:bg-[var(--s3)] transition">Cancel</button>
             </div>
           </div>
@@ -372,15 +377,16 @@ export default function Scheduling() {
       )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Today's Appointments" value={todayAppts.length} subtitle="All branches" icon={<CalendarDays className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Confirmed / Arrived" value={confirmedCount} subtitle="On track" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="No-Show Risk" value={riskyCount} subtitle="AI flagged today" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
-        <StatCard title="Today's Value" value={formatCurrency(totalValue)} subtitle="Appointment revenue" icon={<DollarSign className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Appointments" value={todayAppts.length} subtitle="Selected date and branches" icon={<CalendarDays className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Confirmed or arrived" value={confirmedCount} subtitle="Recorded status" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Risk flagged" value={riskyCount} subtitle="Stored no-show score" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
+        <StatCard title="Recorded value" value={formatCurrency(totalValue)} subtitle="Selected appointments" icon={<DollarSign className="w-4 h-4" />} accent="violet" />
       </div>
 
       {loadError && (
-        <div className="rounded-2xl border border-[rgba(220,38,38,0.18)] bg-red-soft px-4 py-3 text-xs font-semibold text-red-v">
-          Scheduling data could not be loaded from the live API: {loadError}
+        <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[rgba(220,38,38,0.18)] bg-red-soft px-4 py-3 text-xs font-semibold text-red-v">
+          <span>Scheduling data is unavailable. {loadError}</span>
+          <button type="button" onClick={reload} className="rounded-lg border border-current px-3 py-1.5">Try again</button>
         </div>
       )}
 
@@ -394,7 +400,7 @@ export default function Scheduling() {
           <input type="date" aria-label="Pick a date" value={selectedDate} onChange={e => setSelectedDate(e.target.value || todayDate)} className={`px-2 py-1.5 rounded-lg text-xs font-semibold bg-transparent outline-none ${dateOptions.some(o => o.value === selectedDate) ? 'text-t3' : 'bg-[var(--indigo)] text-white'}`} />
         </div>
         <div className="flex items-center gap-1 bg-[var(--s2)] border border-[var(--b1)] p-1 rounded-xl">
-          <button type="button" onClick={() => setSelectedBranch('all')} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedBranch === 'all' ? 'bg-[var(--s3)] text-t1' : 'text-t3 hover:text-t1'}`}>All Branches</button>
+          <button type="button" onClick={() => setSelectedBranch('all')} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedBranch === 'all' ? 'bg-[var(--s3)] text-t1' : 'text-t3 hover:text-t1'}`}>All branches</button>
           {branchRecords.map(b => (
             <button key={b.id} type="button" onClick={() => setSelectedBranch(b.id)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all truncate max-w-[120px] ${selectedBranch === b.id ? 'bg-[var(--s3)] text-t1' : 'text-t3 hover:text-t1'}`}>
               {b.name.split(' ')[0]}
@@ -408,10 +414,10 @@ export default function Scheduling() {
         <div className="space-y-4">
           <BentoCard
             title="Insurance Verification Queue"
-            subtitle="Patient appointments that need a real eligibility check"
+            subtitle="Point-in-time eligibility responses; provider mode is shown exactly as recorded"
             headerRight={<span className="text-xs font-semibold text-t3">{queueMode}</span>}
           >
-            {queueError && <p className="mb-3 text-xs text-red-v">{queueError}</p>}
+            {queueError && <p role="alert" className="mb-3 rounded-lg bg-[var(--red-soft)] px-3 py-2 text-xs font-semibold text-red-v">{queueError}</p>}
             {queueLoading ? (
               <div className="py-8 text-center text-sm text-t3">Loading verification queue…</div>
             ) : insuranceQueue.length === 0 ? (
@@ -448,7 +454,7 @@ export default function Scheduling() {
                           <td className="px-4 py-3 text-t2">{row.payerName}</td>
                           <td className="px-4 py-3 text-t2">{row.memberId}</td>
                           <td className="px-4 py-3">
-                            <span className={`badge ${active ? 'badge-emerald' : 'badge-amber'}`}>{row.eligibilityStatus}</span>
+                            <span className={`badge ${active ? 'badge-emerald' : 'badge-amber'}`}>{active ? 'Payer reports active' : row.eligibilityStatus}</span>
                             <p className="mt-1 text-[11px] text-t3">{row.coverageStatus}</p>
                           </td>
                           <td className="px-4 py-3 text-t2">{active ? formatCurrency(row.copay) : '—'}</td>
@@ -464,7 +470,7 @@ export default function Scheduling() {
                               className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-50"
                             >
                               <RefreshCw className="w-3.5 h-3.5" />
-                              {queueBusy === row.id ? 'Verifying…' : row.eligibilityStatus === 'Active' ? 'Re-verify' : 'Verify Insurance'}
+                              {queueBusy === row.id ? 'Requesting…' : row.eligibilityStatus === 'Active' ? 'Request updated response' : 'Request eligibility response'}
                             </button>
                           </td>
                         </tr>
@@ -476,12 +482,12 @@ export default function Scheduling() {
             )}
           </BentoCard>
 
-          <BentoCard title="Appointment Timeline" subtitle={`${selectedDate === todayDate ? "Today's" : ""} schedule`} headerRight={
+          <BentoCard title="Appointment timeline" subtitle={selectedDate === todayDate ? "Today's schedule" : new Date(`${selectedDate}T12:00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })} headerRight={
             <span className="text-xs font-semibold text-t3">{todayAppts.length} appointments · {formatCurrency(totalValue)}</span>
           }>
             <div className="space-y-2">
               {todayAppts.length === 0 ? (
-                <div className="py-8 text-center text-sm text-t3">No appointments for this date / branch.</div>
+                <div className="py-8 text-center text-sm text-t3">No appointments match the selected date and branch.</div>
               ) : todayAppts.map((appt) => {
                 const sc = statusConfig[appt.status] ?? statusConfig['confirmed'];
                 const isRisky = appt.noShowRisk >= 50;
@@ -533,8 +539,8 @@ export default function Scheduling() {
                                   <XCircle className="w-2.5 h-2.5" /> Cancel
                                 </button>
                               )}
-                              <button type="button" disabled={intakeBusy === appt.id} onClick={() => void sendIntake(appt)} className="inline-flex items-center gap-1 text-[10px] font-semibold text-violet-v bg-[var(--violet-soft)] px-2 py-0.5 rounded-full hover:opacity-80 transition-colors disabled:opacity-40">
-                                <Zap className="w-2.5 h-2.5" /> {intakeBusy === appt.id ? 'Sending…' : 'Send intake'}
+                              <button type="button" disabled={intakeBusy === appt.id} onClick={() => void createAndCopyIntake(appt)} className="inline-flex items-center gap-1 text-[10px] font-semibold text-violet-v bg-[var(--violet-soft)] px-2 py-0.5 rounded-full hover:opacity-80 transition-colors disabled:opacity-40">
+                                <Zap className="w-2.5 h-2.5" /> {intakeBusy === appt.id ? 'Creating…' : 'Create & copy intake link'}
                               </button>
                               {/* Deposit-evaluate excludes FRONT_DESK by design — hide rather than 403. */}
                               {!isFrontDesk && (
@@ -544,7 +550,7 @@ export default function Scheduling() {
                               )}
                             </div>
                             {rowNotice?.id === appt.id && (
-                              <p className={`mt-1.5 text-[10px] font-semibold ${rowNotice.kind === 'ok' ? 'text-emerald-v' : 'text-red-v'}`}>{rowNotice.text}</p>
+                              <p role={rowNotice.kind === 'error' ? 'alert' : 'status'} className={`mt-1.5 rounded px-2 py-1 text-[10px] font-semibold ${rowNotice.kind === 'ok' ? 'bg-[var(--emerald-soft)] text-emerald-v' : 'bg-[var(--red-soft)] text-red-v'}`}>{rowNotice.text}</p>
                             )}
                             {rescheduleFor === appt.id && (
                               <div className="mt-2 flex items-center gap-1.5 flex-wrap">

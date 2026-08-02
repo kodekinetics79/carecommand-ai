@@ -7,6 +7,7 @@ import { db } from '../lib/db';
 import { enterTenantContext, initializeTenantContextScope } from '../lib/tenantContext';
 
 const authErrorMessage = 'Session expired. Please sign in again.';
+const sessionRevokedMessage = 'Your session is no longer active. Please sign in again.';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 declare module 'fastify' {
@@ -49,7 +50,7 @@ export const authPlugin = fp(async app => {
     `;
     const user = rows[0];
     if (!user) throw app.httpErrors.unauthorized(authErrorMessage);
-    if (user.tenant_status !== 'active') throw app.httpErrors.forbidden('suspended_tenant');
+    if (user.tenant_status !== 'active') throw app.httpErrors.forbidden('This clinic workspace is not active. Contact your administrator.');
 
     const context = {
       tenantId: payload.tenantId,
@@ -69,7 +70,7 @@ export const authPlugin = fp(async app => {
         ? issuedAtMs <= revokedAt.getTime()
         : payload.iat && payload.iat < Math.floor(revokedAt.getTime() / 1000)
     )) {
-      throw app.httpErrors.unauthorized('session_revoked');
+      throw app.httpErrors.unauthorized(sessionRevokedMessage);
     }
     request.auth = {
       userId: user.user_id,
@@ -81,11 +82,11 @@ export const authPlugin = fp(async app => {
     // A user-specific control-plane revocation must invalidate the short-lived
     // access token too, not merely its refresh token. The append-only audit
     // receipt is the durable revocation epoch and carries no PHI.
-    const [latestUserRevocation, activeBranch] = await Promise.all([
+    const [latestUserRevocation, activeBranch, securityPolicy, assuranceUser] = await Promise.all([
       db.auditEvent.findFirst({
         where: {
           tenantId: user.tenant_id,
-          action: 'controlPlane.session.revoked',
+          action: { in: ['controlPlane.session.revoked', 'auth.session.revoked'] },
           resource: 'session',
           resourceId: user.user_id,
         },
@@ -95,10 +96,15 @@ export const authPlugin = fp(async app => {
       user.branch_id
         ? db.branch.findFirst({ where: { id: user.branch_id, tenantId: user.tenant_id, active: true }, select: { id: true } })
         : Promise.resolve({ id: 'tenant-wide' }),
+      db.tenantSecurityPolicy.findUnique({ where: { tenantId: user.tenant_id }, select: { requireMfa: true } }),
+      db.user.findFirst({ where: { id: user.user_id, tenantId: user.tenant_id }, select: { mfaEnabled: true } }),
     ]);
-    if (!activeBranch) throw app.httpErrors.forbidden('clinic_inactive');
+    if (!activeBranch) throw app.httpErrors.forbidden('Your assigned clinic location is not active. Contact your administrator.');
+    if (securityPolicy?.requireMfa && !assuranceUser?.mfaEnabled) {
+      throw app.httpErrors.unauthorized('Multi-factor authentication is required. Sign in again to complete setup.');
+    }
     if (latestUserRevocation && latestUserRevocation.occurredAt.getTime() >= issuedAtMs) {
-      throw app.httpErrors.unauthorized('session_revoked');
+      throw app.httpErrors.unauthorized(sessionRevokedMessage);
     }
   });
 });

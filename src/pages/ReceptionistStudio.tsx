@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router';
 import {
   Bot, Building2, Plus, Trash2, Save, Sparkles, Phone,
   GripVertical, ChevronUp, ChevronDown, Copy, Check, ShieldCheck, PhoneOff,
@@ -8,8 +9,12 @@ import {
 } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
+import ModuleTabs from '../components/ui/ModuleTabs';
+import ConfirmationModal from '../components/workflow/ConfirmationModal';
+import FormDialog from '../components/workflow/FormDialog';
 import { Field, TextInput, TextArea, Select, Toggle } from '../components/ui/Field';
 import { useSession } from '../hooks/useSession';
+import { getLocale } from '../lib/preferences';
 import {
   receptionistApi as api,
   FIELD_CATALOG, VOICE_OPTIONS, TONE_OPTIONS, LANGUAGE_OPTIONS, CAMPAIGN_TYPES, TIMEZONE_OPTIONS,
@@ -36,6 +41,15 @@ const TABS: Array<{ id: Tab; label: string; icon: React.ElementType }> = [
   { id: 'activity', label: 'Activity', icon: Activity },
 ];
 
+function isTab(value: string | null): value is Tab {
+  return TABS.some(tab => tab.id === value);
+}
+
+function formatEnumLabel(value: string): string {
+  const words = value.trim().replaceAll('_', ' ').toLowerCase();
+  return words ? words[0].toUpperCase() + words.slice(1) : 'Unknown';
+}
+
 const outcomeBadge: Record<string, string> = {
   BOOKED: 'badge badge-emerald', NOT_INTERESTED: 'badge badge-amber', NO_ANSWER: 'badge badge-blue',
   VOICEMAIL: 'badge badge-blue', ESCALATED: 'badge badge-red', OPTED_OUT: 'badge badge-violet',
@@ -61,17 +75,30 @@ function CopyButton({ value, label = 'Copy' }: { value: string; label?: string }
 }
 
 export default function ReceptionistStudio() {
+  const [searchParams, setSearchParams] = useSearchParams();
   const [clinics, setClinics] = useState<Clinic[]>([]);
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [overview, setOverview] = useState<Overview | null>(null);
   const [activeClinicId, setActiveClinicId] = useState<string>('');
   const [activeCampaignId, setActiveCampaignId] = useState<string>('');
-  const [tab, setTab] = useState<Tab>('clinic');
+  const requestedTab = searchParams.get('tab');
+  const tab: Tab = isTab(requestedTab) ? requestedTab : 'clinic';
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [createDialog, setCreateDialog] = useState<'clinic' | 'campaign' | null>(null);
 
   const activeClinic = clinics.find(c => c.id === activeClinicId) ?? null;
   const activeCampaign = campaigns.find(c => c.id === activeCampaignId) ?? null;
+
+  const selectTab = useCallback((nextTab: Tab, replace = true) => {
+    setSearchParams(previous => {
+      const next = new URLSearchParams(previous);
+      next.set('tab', nextTab);
+      return next;
+    }, { replace });
+  }, [setSearchParams]);
+  const closeCreateDialog = useCallback(() => setCreateDialog(null), []);
 
   const loadClinics = useCallback(async () => {
     const [rows, ov] = await Promise.all([api.listClinics(), api.overview().catch(() => null)]);
@@ -111,37 +138,13 @@ export default function ReceptionistStudio() {
     return () => { active = false; };
   }, [activeClinicId]);
 
-  async function handleCreateClinic() {
-    const name = window.prompt('New clinic name?');
-    if (!name) return;
-    const inboundPhone = window.prompt('Trusted inbound phone number in E.164 format (for example, +12125550100)?');
-    if (!inboundPhone) return;
-    try {
-      const clinic = await api.createClinic({ name, phone: inboundPhone });
-      await loadClinics();
-      setActiveClinicId(clinic.id);
-      setTab('clinic');
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Unable to create clinic');
-    }
+  function handleCreateClinic() {
+    setCreateDialog('clinic');
   }
 
-  async function handleCreateCampaign() {
+  function handleCreateCampaign() {
     if (!activeClinicId) return;
-    const name = window.prompt('New campaign name?');
-    if (!name) return;
-    const campaign = await api.createCampaign({
-      clinicId: activeClinicId,
-      name,
-      offerTitle: 'New offer',
-      offerDescription: 'Describe the offer here.',
-      offerScript: 'Introduce the offer warmly and ask if they would like to book.',
-      appointmentType: 'Consultation',
-      eligibleLocationIds: activeClinic?.locations?.map(l => l.id) ?? [],
-    });
-    await loadCampaigns(activeClinicId);
-    setActiveCampaignId(campaign.id);
-    setTab('campaign');
+    setCreateDialog('campaign');
   }
 
   if (loading) {
@@ -152,7 +155,7 @@ export default function ReceptionistStudio() {
     <div className="space-y-6 pb-10">
       <PageHeader
         title="AI Receptionist Studio"
-        subtitle="Draft and export receptionist prompts, then link and verify the separate immutable Retell deployment used for live calls."
+        subtitle="Draft and export receptionist prompts, then link and verify the separately configured Retell deployment used for live calls."
         badge={`${clinics.length} clinic${clinics.length === 1 ? '' : 's'}`}
         badgeColor="violet"
         actions={
@@ -166,6 +169,49 @@ export default function ReceptionistStudio() {
         <div className="flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--red-soft)] px-3 py-2 text-xs font-semibold text-red-v">
           <AlertCircle className="w-4 h-4" /> {error}
         </div>
+      )}
+
+      {createDialog === 'clinic' && (
+        <FormDialog
+          title="Create clinic"
+          message="Add the clinic identity and trusted inbound number used by receptionist configuration. No live provider is contacted."
+          submitLabel="Create clinic"
+          fields={[
+            { name: 'name', label: 'Clinic name', required: true, placeholder: 'Example Health' },
+            { name: 'phone', label: 'Trusted inbound phone number', type: 'tel', required: true, placeholder: '+12125550100', pattern: '\\+[1-9][0-9]{7,14}', help: 'Use E.164 format, including the country code.' },
+          ]}
+          onClose={closeCreateDialog}
+          onSubmit={async values => {
+            const clinic = await api.createClinic({ name: values.name, phone: values.phone });
+            await loadClinics();
+            setActiveClinicId(clinic.id);
+            selectTab('clinic');
+          }}
+        />
+      )}
+
+      {createDialog === 'campaign' && activeClinic && (
+        <FormDialog
+          title="Create receptionist campaign"
+          message={`Create a draft for ${activeClinic.name}. No calls are placed by this action.`}
+          submitLabel="Create draft"
+          fields={[{ name: 'name', label: 'Campaign name', required: true, placeholder: 'Appointment follow-up' }]}
+          onClose={closeCreateDialog}
+          onSubmit={async values => {
+            const campaign = await api.createCampaign({
+              clinicId: activeClinicId,
+              name: values.name,
+              offerTitle: 'New offer',
+              offerDescription: 'Describe the offer here.',
+              offerScript: 'Introduce the offer warmly and ask if they would like to book.',
+              appointmentType: 'Consultation',
+              eligibleLocationIds: activeClinic.locations?.map(location => location.id) ?? [],
+            });
+            await loadCampaigns(activeClinicId);
+            setActiveCampaignId(campaign.id);
+            selectTab('campaign');
+          }}
+        />
       )}
 
       {overview && (
@@ -229,9 +275,9 @@ export default function ReceptionistStudio() {
                 >
                   <div className="flex items-center justify-between gap-2">
                     <p className="text-xs font-semibold text-t1 truncate">{campaign.name}</p>
-                    <span className={`badge ${campaign.status === 'ACTIVE' ? 'badge-emerald' : campaign.status === 'PAUSED' ? 'badge-amber' : 'badge-blue'}`}>{campaign.status}</span>
+                    <span className={`badge ${campaign.status === 'ACTIVE' ? 'badge-emerald' : campaign.status === 'PAUSED' ? 'badge-amber' : 'badge-blue'}`}>{formatEnumLabel(campaign.status)}</span>
                   </div>
-                  <p className="text-[10px] text-t3 truncate mt-0.5">{campaign.campaignType} · {campaign.intakeFields?.length ?? 0} fields</p>
+                  <p className="text-[10px] text-t3 truncate mt-0.5">{formatEnumLabel(campaign.campaignType)} · {campaign.intakeFields?.length ?? 0} fields</p>
                 </button>
               ))}
             </div>
@@ -239,14 +285,31 @@ export default function ReceptionistStudio() {
 
           {/* Main editing surface */}
           <div className="space-y-4">
-            <div className="flex items-center gap-1 overflow-x-auto rounded-xl bg-[var(--s3)] p-1">
-              {TABS.map(t => {
+            <div className="flex items-center gap-1 overflow-x-auto rounded-xl bg-[var(--s3)] p-1" role="tablist" aria-label="Receptionist Studio sections">
+              {TABS.map((t, index) => {
                 const Icon = t.icon;
                 return (
                   <button
                     key={t.id}
+                    ref={element => { tabRefs.current[index] = element; }}
+                    id={`receptionist-studio-tab-${t.id}`}
                     type="button"
-                    onClick={() => setTab(t.id)}
+                    role="tab"
+                    aria-selected={tab === t.id}
+                    aria-controls={`receptionist-studio-panel-${t.id}`}
+                    tabIndex={tab === t.id ? 0 : -1}
+                    onClick={() => selectTab(t.id)}
+                    onKeyDown={event => {
+                      let nextIndex: number | null = null;
+                      if (event.key === 'ArrowRight' || event.key === 'ArrowDown') nextIndex = (index + 1) % TABS.length;
+                      if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') nextIndex = (index - 1 + TABS.length) % TABS.length;
+                      if (event.key === 'Home') nextIndex = 0;
+                      if (event.key === 'End') nextIndex = TABS.length - 1;
+                      if (nextIndex == null) return;
+                      event.preventDefault();
+                      selectTab(TABS[nextIndex].id);
+                      tabRefs.current[nextIndex]?.focus();
+                    }}
                     className={`flex items-center gap-1.5 whitespace-nowrap rounded-lg px-3 py-1.5 text-xs font-semibold transition-all ${tab === t.id ? 'bg-[var(--s2)] text-t1 shadow-sm' : 'text-t3 hover:text-t2'}`}
                   >
                     <Icon className="w-3.5 h-3.5" /> {t.label}
@@ -255,6 +318,13 @@ export default function ReceptionistStudio() {
               })}
             </div>
 
+            <div
+              id={`receptionist-studio-panel-${tab}`}
+              role="tabpanel"
+              aria-labelledby={`receptionist-studio-tab-${tab}`}
+              tabIndex={0}
+              className="space-y-4 outline-none"
+            >
             {tab === 'clinic' && activeClinic && (
               <ClinicPanel key={activeClinic.id} clinic={activeClinic} onChanged={loadClinics} />
             )}
@@ -280,6 +350,7 @@ export default function ReceptionistStudio() {
             {tab === 'activity' && activeClinic && (
               <ActivityPanel clinicId={activeClinic.id} />
             )}
+            </div>
           </div>
         </div>
       )}
@@ -297,6 +368,54 @@ function EmptyState({ text, onAction, actionLabel }: { text: string; onAction?: 
         </button>
       )}
     </div>
+  );
+}
+
+function ConfirmedButton({
+  children,
+  dialogTitle,
+  message,
+  confirmLabel,
+  tone = 'amber',
+  requireReason = false,
+  reasonLabel,
+  disabled,
+  className,
+  buttonTitle,
+  ariaLabel,
+  onConfirm,
+}: {
+  children: React.ReactNode;
+  dialogTitle: string;
+  message: string;
+  confirmLabel: string;
+  tone?: 'indigo' | 'red' | 'amber';
+  requireReason?: boolean;
+  reasonLabel?: string;
+  disabled?: boolean;
+  className: string;
+  buttonTitle?: string;
+  ariaLabel?: string;
+  onConfirm: (reason: string) => Promise<void> | void;
+}) {
+  const [open, setOpen] = useState(false);
+  const close = useCallback(() => setOpen(false), []);
+  return (
+    <>
+      <button type="button" disabled={disabled} title={buttonTitle} aria-label={ariaLabel} onClick={() => setOpen(true)} className={className}>{children}</button>
+      {open && (
+        <ConfirmationModal
+          title={dialogTitle}
+          message={message}
+          confirmLabel={confirmLabel}
+          tone={tone}
+          requireReason={requireReason}
+          reasonLabel={reasonLabel}
+          onConfirm={onConfirm}
+          onClose={close}
+        />
+      )}
+    </>
   );
 }
 
@@ -340,7 +459,6 @@ function ClinicPanel({ clinic, onChanged }: { clinic: Clinic; onChanged: () => P
   }
 
   async function deleteClinic() {
-    if (!window.confirm(`Delete clinic "${clinic.name}" and all its campaigns? This cannot be undone.`)) return;
     await api.deleteClinic(clinic.id);
     await onChanged();
   }
@@ -350,9 +468,16 @@ function ClinicPanel({ clinic, onChanged }: { clinic: Clinic; onChanged: () => P
       <div className="cc-card p-5 space-y-4">
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-bold text-t1">Clinic Profile</h3>
-          <button type="button" onClick={deleteClinic} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--red-soft)]">
+          <ConfirmedButton
+            dialogTitle="Delete clinic configuration?"
+            message={`Delete ${clinic.name} and all receptionist campaigns under it? This cannot be undone.`}
+            confirmLabel="Delete clinic"
+            tone="red"
+            onConfirm={deleteClinic}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--red-soft)]"
+          >
             <Trash2 className="w-3 h-3" /> Delete
-          </button>
+          </ConfirmedButton>
         </div>
         <div className="grid gap-4 md:grid-cols-2">
           <Field label="Clinic name" required><TextInput value={draft.name} onChange={e => set('name', e.target.value)} /></Field>
@@ -454,7 +579,6 @@ function LocationsEditor({ clinic, onChanged }: { clinic: Clinic; onChanged: () 
   }
 
   async function remove(id: string) {
-    if (!window.confirm('Remove this location?')) return;
     await api.deleteLocation(id);
     await onChanged();
   }
@@ -478,7 +602,16 @@ function LocationsEditor({ clinic, onChanged }: { clinic: Clinic; onChanged: () 
             </div>
             <div className="flex gap-2">
               <button type="button" aria-label="Edit location" title="Edit location" onClick={() => beginEdit(loc)} className="text-t3 hover:text-indigo shrink-0"><Pencil className="w-3.5 h-3.5" /></button>
-              <button type="button" aria-label="Remove location" title="Remove location" onClick={() => remove(loc.id)} className="text-t3 hover:text-red-v shrink-0"><Trash2 className="w-3.5 h-3.5" /></button>
+              <ConfirmedButton
+                dialogTitle="Remove location?"
+                message={`Remove ${loc.name} from this receptionist configuration? Existing scheduling records are not changed.`}
+                confirmLabel="Remove location"
+                tone="red"
+                ariaLabel={`Remove location ${loc.name}`}
+                buttonTitle="Remove location"
+                onConfirm={() => remove(loc.id)}
+                className="text-t3 hover:text-red-v shrink-0"
+              ><Trash2 className="w-3.5 h-3.5" /></ConfirmedButton>
             </div>
           </div>
         ))}
@@ -575,7 +708,6 @@ function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic; campai
   }
 
   async function deleteCampaign() {
-    if (!window.confirm(`Delete campaign "${campaign.name}"?`)) return;
     await api.deleteCampaign(campaign.id);
     await onChanged();
   }
@@ -616,15 +748,22 @@ function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic; campai
       <div className="cc-card p-5 space-y-4">
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-bold text-t1 inline-flex items-center gap-2"><Megaphone className="w-4 h-4 text-indigo" /> Campaign</h3>
-          <button type="button" onClick={deleteCampaign} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--red-soft)]">
+          <ConfirmedButton
+            dialogTitle="Delete receptionist campaign?"
+            message={`Delete ${campaign.name} and its configuration? This action cannot be undone.`}
+            confirmLabel="Delete campaign"
+            tone="red"
+            onConfirm={deleteCampaign}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--red-soft)]"
+          >
             <Trash2 className="w-3 h-3" /> Delete
-          </button>
+          </ConfirmedButton>
         </div>
         <div className="grid gap-4 md:grid-cols-2">
           <Field label="Campaign name" required><TextInput value={draft.name} onChange={e => set('name', e.target.value)} /></Field>
           <Field label="Campaign type">
             <Select value={draft.campaignType} onChange={e => set('campaignType', e.target.value)}>
-              {CAMPAIGN_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+              {CAMPAIGN_TYPES.map(t => <option key={t} value={t}>{formatEnumLabel(t)}</option>)}
             </Select>
           </Field>
           <Field label="Status">
@@ -867,7 +1006,6 @@ function IntakeFieldRow({ field, isFirst, isLast, onMoveUp, onMoveDown, onChange
   }
 
   async function remove() {
-    if (!window.confirm(`Remove field "${field.label}"?`)) return;
     await api.deleteIntakeField(field.id);
     await onChanged();
   }
@@ -888,7 +1026,16 @@ function IntakeFieldRow({ field, isFirst, isLast, onMoveUp, onMoveDown, onChange
           </div>
           <p className="text-[11px] text-t3 truncate mt-0.5">“{field.aiQuestion}”</p>
         </button>
-        <button type="button" aria-label="Remove field" title="Remove field" onClick={remove} className="text-t3 hover:text-red-v shrink-0"><Trash2 className="w-3.5 h-3.5" /></button>
+        <ConfirmedButton
+          dialogTitle="Remove intake field?"
+          message={`Remove ${field.label} from this campaign's call intake flow?`}
+          confirmLabel="Remove field"
+          tone="red"
+          ariaLabel={`Remove field ${field.label}`}
+          buttonTitle="Remove field"
+          onConfirm={remove}
+          className="text-t3 hover:text-red-v shrink-0"
+        ><Trash2 className="w-3.5 h-3.5" /></ConfirmedButton>
       </div>
       {expanded && (
         <div className="border-t border-[var(--b1)] p-3 space-y-3">
@@ -1062,6 +1209,17 @@ function KV({ label, value, mono = true }: { label: string; value: string; mono?
 
 function ActivityPanel({ clinicId }: { clinicId: string }) {
   const [calls, setCalls] = useState<CallLog[]>([]);
+  const [selectedCall, setSelectedCall] = useState<CallLog | null>(null);
+  const [callDetailLoading, setCallDetailLoading] = useState(false);
+  const [callDetailError, setCallDetailError] = useState<string | null>(null);
+  const [reviewSaving, setReviewSaving] = useState(false);
+  const [reviewError, setReviewError] = useState<string | null>(null);
+  const [noteSummary, setNoteSummary] = useState('');
+  const [staffCorrection, setStaffCorrection] = useState('');
+  const [callerIntent, setCallerIntent] = useState('');
+  const [actionsTaken, setActionsTaken] = useState('');
+  const [followUpNotes, setFollowUpNotes] = useState('');
+  const [unresolvedActions, setUnresolvedActions] = useState('');
   const [requests, setRequests] = useState<AppointmentRequest[]>([]);
   const [optOuts, setOptOuts] = useState<OptOut[]>([]);
   const [sub, setSub] = useState<'calls' | 'requests' | 'optouts'>('calls');
@@ -1086,6 +1244,58 @@ function ActivityPanel({ clinicId }: { clinicId: string }) {
     return () => { active = false; };
   }, [clinicId]);
 
+  function hydrateReview(call: CallLog) {
+    setNoteSummary(call.operationalNotes?.summary ?? '');
+    setStaffCorrection(call.operationalNotes?.correction ?? '');
+    setCallerIntent(call.operationalNotes?.callerIntent ?? '');
+    setActionsTaken(call.operationalNotes?.actionsTaken.join('\n') ?? '');
+    setFollowUpNotes(call.operationalNotes?.followUpNotes ?? '');
+    setUnresolvedActions(call.unresolvedActionItems?.join('\n') ?? '');
+  }
+
+  async function openCall(callId: string) {
+    setCallDetailLoading(true); setCallDetailError(null); setReviewError(null);
+    try {
+      const detail = await api.getCallLog(callId);
+      setSelectedCall(detail);
+      hydrateReview(detail);
+    } catch (error) {
+      setSelectedCall(null);
+      setCallDetailError(error instanceof Error ? error.message : 'Call detail could not be loaded.');
+    } finally {
+      setCallDetailLoading(false);
+    }
+  }
+
+  async function saveReview(operation: 'SAVE_DRAFT' | 'MARK_REVIEWED' | 'SIGN_OFF') {
+    if (!selectedCall || selectedCall.reviewStatus === 'SIGNED_OFF') return;
+    const unresolved = unresolvedActions.split('\n').map(value => value.trim()).filter(Boolean);
+    setReviewSaving(true); setReviewError(null);
+    try {
+      await api.updateCallReview(selectedCall.id, {
+        operation,
+        expectedRevision: selectedCall.reviewRevision ?? 0,
+        operationalNotes: {
+          summary: noteSummary.trim() || null,
+          correction: staffCorrection.trim() || null,
+          callerIntent: callerIntent.trim() || null,
+          actionsTaken: actionsTaken.split('\n').map(value => value.trim()).filter(Boolean),
+          followUpNotes: followUpNotes.trim() || null,
+        },
+        unresolvedActionItems: unresolved,
+        ...(operation === 'SIGN_OFF' && unresolved.length > 0 ? { acknowledgeUnresolvedActions: true as const } : {}),
+      });
+      const detail = await api.getCallLog(selectedCall.id);
+      setSelectedCall(detail);
+      hydrateReview(detail);
+      await load();
+    } catch (error) {
+      setReviewError(error instanceof Error ? error.message : 'The call review could not be saved. Reload the call before retrying.');
+    } finally {
+      setReviewSaving(false);
+    }
+  }
+
   async function revokeOptOut() {
     if (!revokingId || revocationReason.trim().length < 5 || !revocationAcknowledged) return;
     setRevocationPending(true); setRevocationError(null);
@@ -1102,21 +1312,28 @@ function ActivityPanel({ clinicId }: { clinicId: string }) {
 
   return (
     <div className="cc-card p-5 space-y-4">
-      <div className="flex items-center gap-1 rounded-xl bg-[var(--s3)] p-1 w-fit">
-        {([['calls', `Call logs (${calls.length})`], ['requests', `Appointments (${requests.length})`], ['optouts', `Do-not-contact (${optOuts.length})`]] as const).map(([id, label]) => (
-          <button key={id} type="button" onClick={() => setSub(id)} className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${sub === id ? 'bg-[var(--s2)] text-t1 shadow-sm' : 'text-t3 hover:text-t2'}`}>{label}</button>
-        ))}
+      <div className="w-fit">
+        <ModuleTabs
+          tabs={[
+            { id: 'calls', label: 'Call logs', count: calls.length },
+            { id: 'requests', label: 'Appointments', count: requests.length },
+            { id: 'optouts', label: 'Do-not-contact', count: optOuts.length },
+          ]}
+          activeTab={sub}
+          onChange={id => setSub(id as typeof sub)}
+          ariaLabel="Activity record type"
+        />
       </div>
 
       {sub === 'calls' && (
         <div className="space-y-2">
           {calls.length === 0 && <p className="text-xs text-t3 py-4 text-center">No calls logged yet. Calls appear here via the RetellAI webhook.</p>}
           {calls.map(call => (
-            <div key={call.id} className="flex items-start justify-between gap-3 rounded-xl border border-[var(--b1)] px-3 py-2.5">
+            <button key={call.id} type="button" onClick={() => void openCall(call.id)} className="w-full flex items-start justify-between gap-3 rounded-xl border border-[var(--b1)] px-3 py-2.5 text-left hover:bg-[var(--s3)]">
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
                   <p className="text-sm font-semibold text-t1 truncate">{call.callerName ?? call.callerPhone ?? 'Unknown caller'}</p>
-                  <span className={outcomeBadge[call.outcome] ?? 'badge badge-blue'}>{call.outcome.replace(/_/g, ' ')}</span>
+                  <span className={outcomeBadge[call.outcome] ?? 'badge badge-blue'}>{formatEnumLabel(call.outcome)}</span>
                 </div>
                 <p className="text-[11px] text-t3 truncate mt-0.5">{call.transcriptSummary ?? '—'}</p>
               </div>
@@ -1124,8 +1341,106 @@ function ActivityPanel({ clinicId }: { clinicId: string }) {
                 <p className="text-[11px] font-semibold text-t2">{Math.floor(call.durationSeconds / 60)}m {call.durationSeconds % 60}s</p>
                 <p className="text-[10px] text-t3">{call.startedAt ? new Date(call.startedAt).toLocaleString() : ''}</p>
               </div>
-            </div>
+            </button>
           ))}
+          {callDetailLoading && <p role="status" className="text-xs text-t3 py-3 text-center"><Loader2 className="w-4 h-4 animate-spin inline mr-2" />Loading permission-aware call detail…</p>}
+          {callDetailError && <p role="alert" className="rounded-xl border border-red-v/30 bg-[var(--red-soft)] p-3 text-xs text-red-v">{callDetailError}</p>}
+          {selectedCall && !callDetailLoading && (
+            <section aria-label="Selected call operational review" className="rounded-2xl border border-[var(--b1)] bg-[var(--s3)] p-4 space-y-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p className="text-sm font-bold text-t1">Call operational review</p>
+                  <p className="text-[11px] text-t3">Provider analysis and staff-authored notes remain separately attributed.</p>
+                </div>
+                <span className={selectedCall.reviewStatus === 'SIGNED_OFF' ? 'badge badge-emerald' : selectedCall.reviewStatus === 'REVIEWED' ? 'badge badge-blue' : 'badge badge-amber'}>
+                  {formatEnumLabel(selectedCall.reviewStatus ?? 'UNREVIEWED')} · revision {selectedCall.reviewRevision ?? 0}
+                </span>
+              </div>
+
+              <div className="grid gap-3 md:grid-cols-2">
+                <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
+                  <p className="text-[10px] font-bold uppercase tracking-wide text-t3">Provider call analysis</p>
+                  <p className="mt-1 text-xs text-t2">{selectedCall.providerSummary?.text ?? 'No provider-derived summary is stored.'}</p>
+                  <p className="mt-2 text-[10px] text-t3">Source: {selectedCall.providerSummary ? 'provider call analysis' : 'not available'}{selectedCall.providerSummary?.sourceCallId ? ` · call ${selectedCall.providerSummary.sourceCallId}` : ''}</p>
+                </div>
+                <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
+                  <p className="text-[10px] font-bold uppercase tracking-wide text-t3">Recording access</p>
+                  <p className="mt-1 text-xs text-t2">
+                    {selectedCall.recordingAccess === 'available' ? 'An authorized HTTPS recording link is available.'
+                      : selectedCall.recordingAccess === 'restricted' ? 'A recording exists, but your role cannot open it.'
+                        : selectedCall.recordingAccess === 'purged' ? 'The recording was purged under the retention workflow.'
+                          : 'No usable recording is stored.'}
+                  </p>
+                  {selectedCall.recordingAccess === 'available' && selectedCall.recordingUrl && (
+                    <a href={selectedCall.recordingUrl} target="_blank" rel="noreferrer" className="mt-2 inline-flex text-xs font-semibold text-indigo hover:underline">Open authorized recording</a>
+                  )}
+                </div>
+              </div>
+
+              <div className="grid gap-3 md:grid-cols-2">
+                <Field label="Staff operational summary" hint="Staff-entered; does not overwrite provider analysis.">
+                  <TextArea value={noteSummary} onChange={event => setNoteSummary(event.target.value)} maxLength={2000} disabled={selectedCall.reviewStatus === 'SIGNED_OFF'} />
+                </Field>
+                <Field label="Staff correction" hint="Record a verified correction to provider-derived analysis; the original remains visible.">
+                  <TextArea value={staffCorrection} onChange={event => setStaffCorrection(event.target.value)} maxLength={2000} disabled={selectedCall.reviewStatus === 'SIGNED_OFF'} />
+                </Field>
+                <Field label="Caller intent" hint="Staff-entered interpretation; verify before sign-off.">
+                  <TextArea value={callerIntent} onChange={event => setCallerIntent(event.target.value)} maxLength={500} disabled={selectedCall.reviewStatus === 'SIGNED_OFF'} />
+                </Field>
+                <Field label="Actions taken" hint="One action per line.">
+                  <TextArea value={actionsTaken} onChange={event => setActionsTaken(event.target.value)} maxLength={6200} disabled={selectedCall.reviewStatus === 'SIGNED_OFF'} />
+                </Field>
+                <Field label="Follow-up notes" hint="Staff-entered operational context only.">
+                  <TextArea value={followUpNotes} onChange={event => setFollowUpNotes(event.target.value)} maxLength={1000} disabled={selectedCall.reviewStatus === 'SIGNED_OFF'} />
+                </Field>
+              </div>
+              <p className="rounded-lg border border-[var(--b1)] bg-[var(--amber-soft)] p-2.5 text-[11px] text-t2">
+                Record minimum-necessary operational facts. Do not enter card data, Social Security numbers, passwords, diagnoses, clinical risk judgments, or speculative labels. Use the proper clinical record for authorized clinical documentation.
+              </p>
+              <Field label="Unresolved action items" hint="One open item per line. Signed-off reviews retain these items as unresolved evidence.">
+                <TextArea value={unresolvedActions} onChange={event => setUnresolvedActions(event.target.value)} maxLength={6200} disabled={selectedCall.reviewStatus === 'SIGNED_OFF'} />
+              </Field>
+
+              <div className="grid gap-3 md:grid-cols-3">
+                <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
+                  <p className="text-[10px] font-bold uppercase tracking-wide text-t3">Appointments</p>
+                  {selectedCall.appointments?.length ? selectedCall.appointments.map(item => <p key={item.id} className="mt-1 text-xs text-t2"><a href="/scheduling" className="font-semibold text-indigo hover:underline">{item.service}</a> · {new Date(item.startsAt).toLocaleString()} · {formatEnumLabel(item.status)}</p>) : <p className="mt-1 text-xs text-t3">No canonical appointment linked.</p>}
+                </div>
+                <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
+                  <p className="text-[10px] font-bold uppercase tracking-wide text-t3">Appointment requests</p>
+                  {selectedCall.appointmentRequests?.length ? selectedCall.appointmentRequests.map(item => <p key={item.id} className="mt-1 text-xs text-t2">{item.requestedService ?? 'Unspecified service'} · {formatEnumLabel(item.status)}{item.requestedDateTime ? ` · ${new Date(item.requestedDateTime).toLocaleString()}` : ''}</p>) : <p className="mt-1 text-xs text-t3">No appointment request linked.</p>}
+                </div>
+                <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
+                  <p className="text-[10px] font-bold uppercase tracking-wide text-t3">Human handoffs</p>
+                  {selectedCall.handoffReferences?.length ? selectedCall.handoffReferences.map(item => <p key={item.id} className="mt-1 text-xs text-t2"><a href="/staff" className="font-semibold text-indigo hover:underline">{item.title}</a> · {formatEnumLabel(item.status)}</p>) : <p className="mt-1 text-xs text-t3">No human-handoff task linked.</p>}
+                </div>
+              </div>
+
+              {selectedCall.operationalNotes && <p className="text-[10px] text-t3">Staff-note source: staff entered by user {selectedCall.operationalNotes.actorUserId} at {new Date(selectedCall.operationalNotes.recordedAt).toLocaleString()}.</p>}
+              {selectedCall.reviewedAt && <p className="text-[10px] text-t3">Reviewed by {selectedCall.reviewedBy?.displayName ?? 'recorded user'} at {new Date(selectedCall.reviewedAt).toLocaleString()}.</p>}
+              {selectedCall.signedOffAt && <p className="text-[10px] text-t3">Final sign-off by {selectedCall.signedOffBy?.displayName ?? 'recorded manager'} at {new Date(selectedCall.signedOffAt).toLocaleString()}.</p>}
+              {reviewError && <p role="alert" className="text-xs text-red-v">{reviewError}</p>}
+              {selectedCall.reviewStatus !== 'SIGNED_OFF' && (
+                <div className="flex flex-wrap gap-2">
+                  <button type="button" disabled={reviewSaving} onClick={() => void saveReview('SAVE_DRAFT')} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-t2 disabled:opacity-50">Save draft</button>
+                  <button type="button" disabled={reviewSaving} onClick={() => void saveReview('MARK_REVIEWED')} className="rounded-lg bg-indigo px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50">Mark reviewed</button>
+                  {selectedCall.reviewCapabilities?.canSignOff && (
+                    <ConfirmedButton
+                      dialogTitle="Finalize manager sign-off?"
+                      message={unresolvedActions.split('\n').some(value => value.trim())
+                        ? 'Unresolved action items remain. Signing off preserves and explicitly acknowledges them as still open; the review becomes final.'
+                        : 'Confirm that the staff notes and linked actions were reviewed. The signed-off review becomes final.'}
+                      confirmLabel="Finalize sign-off"
+                      tone="amber"
+                      disabled={reviewSaving}
+                      onConfirm={() => saveReview('SIGN_OFF')}
+                      className="rounded-lg bg-emerald-v px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+                    >Final manager sign-off</ConfirmedButton>
+                  )}
+                </div>
+              )}
+            </section>
+          )}
         </div>
       )}
 
@@ -1137,7 +1452,7 @@ function ActivityPanel({ clinicId }: { clinicId: string }) {
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
                   <p className="text-sm font-semibold text-t1 truncate">{req.contactName ?? req.contactPhone ?? 'Unknown'}</p>
-                  <span className={`badge ${req.status === 'CONFIRMED' ? 'badge-emerald' : req.status === 'CANCELED' ? 'badge-red' : 'badge-blue'}`}>{req.status}</span>
+                  <span className={`badge ${req.status === 'CONFIRMED' ? 'badge-emerald' : req.status === 'CANCELED' ? 'badge-red' : 'badge-blue'}`}>{formatEnumLabel(req.status)}</span>
                 </div>
                 <p className="text-[11px] text-t3 truncate mt-0.5">{req.bookedSlot || `${req.requestedDate ?? ''} ${req.requestedTime ?? ''}`.trim() || req.appointmentType || '—'}</p>
               </div>
@@ -1261,11 +1576,8 @@ function OutboundPanel({ clinic }: { clinic: Clinic }) {
   const selected = campaigns.find(c => c.id === selectedId) ?? null;
   const canStop = user ? ['OWNER', 'ADMIN'].includes(user.role) : false;
 
-  async function stopOutbound() {
-    const reason = window.prompt('Emergency stop reason (recorded in audit evidence):')?.trim();
-    if (!reason) return;
-    if (reason.length < 5) { setStopError('Enter at least five characters for the stop reason.'); return; }
-    if (!window.confirm('Stop all tenant outbound AI calls now? Active provider calls will be cancelled where possible; uncertain stops require reconciliation.')) return;
+  async function stopOutbound(reason: string) {
+    if (reason.trim().length < 5) throw new Error('Enter at least five characters for the stop reason.');
     setStopping(true); setStopError(null); setStopResult(null);
     try {
       const result = await api.stopOutbound(reason);
@@ -1314,7 +1626,7 @@ function OutboundPanel({ clinic }: { clinic: Clinic }) {
               className={`w-full rounded-lg px-2.5 py-2 text-left text-sm transition-colors ${selectedId === c.id && !creating ? 'bg-[var(--s2)] text-t1' : 'text-t2 hover:bg-[var(--s2)]'}`}
             >
               <span className="block font-semibold truncate">{c.name}</span>
-              <span className="text-[10px] text-t3">{c.status} · {c._count?.targets ?? 0} targets · {c._count?.callLogs ?? 0} calls</span>
+              <span className="text-[10px] text-t3">{formatEnumLabel(c.status)} · {c._count?.targets ?? 0} targets · {c._count?.callLogs ?? 0} calls</span>
             </button>
           ))}
         </div>
@@ -1352,7 +1664,7 @@ function OutboundStopCard({ control, result, canStop, stopping, error, onStop, o
   canStop: boolean;
   stopping: boolean;
   error: string | null;
-  onStop: () => Promise<void>;
+  onStop: (reason: string) => Promise<void>;
   onRetry: () => Promise<void>;
 }) {
   if (!control) return (
@@ -1375,7 +1687,19 @@ function OutboundStopCard({ control, result, canStop, stopping, error, onStop, o
           {control.stopped && control.reason && <p className="text-xs text-t2 mt-2"><span className="font-semibold">Recorded reason:</span> {control.reason}</p>}
           {control.stopped && control.changedAt && <p className="text-[11px] text-t3 mt-1">Stop state last changed {new Date(control.changedAt).toLocaleString()}.</p>}
         </div>
-        {!control.stopped && canStop && <button type="button" disabled={stopping} onClick={() => void onStop()} className="rounded-lg bg-red-v px-3 py-2 text-xs font-bold text-white disabled:opacity-50">{stopping ? 'Stopping…' : 'Emergency stop'}</button>}
+        {!control.stopped && canStop && (
+          <ConfirmedButton
+            dialogTitle="Stop all outbound AI calls?"
+            message="Activate the tenant-wide emergency stop now. Active provider calls will be canceled where possible; uncertain provider outcomes remain blocked for reconciliation."
+            confirmLabel="Activate emergency stop"
+            tone="red"
+            requireReason
+            reasonLabel="Emergency stop reason"
+            disabled={stopping}
+            onConfirm={onStop}
+            className="rounded-lg bg-red-v px-3 py-2 text-xs font-bold text-white disabled:opacity-50"
+          >{stopping ? 'Stopping…' : 'Emergency stop'}</ConfirmedButton>
+        )}
       </div>
       {result && (
         <div className="mt-3 rounded-lg border border-[var(--b1)] p-3 text-xs text-t2">
@@ -1671,7 +1995,6 @@ function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { camp
   const reconciliationBlocksLaunch = launchControlsBlocked({ transportAmbiguous, reconciliationVerified, reconciliations });
 
   async function approveAndRun() {
-    if (!window.confirm(`Approve policy ${campaign.policyVersion ?? '(missing)'} and start this outbound campaign?`)) return;
     setCampaignActionPending(true); setLaunchMsg(null);
     try {
       await api.approveOutboundCampaign(campaign.id, 'RUNNING');
@@ -1727,10 +2050,18 @@ function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { camp
         <div className="flex items-center justify-between gap-3">
           <h3 className="text-sm font-bold text-t1">{campaign.name}</h3>
           <div className="flex items-center gap-2">
-            <span className="badge badge-blue">{campaign.status}</span>
+            <span className="badge badge-blue">{formatEnumLabel(campaign.status)}</span>
             {campaign.status === 'RUNNING'
               ? <button type="button" disabled={campaignActionPending} onClick={pauseCampaign} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-xs font-semibold text-t2">Pause</button>
-              : <button type="button" disabled={campaignActionPending || !campaign.policyVersion} onClick={approveAndRun} className="rounded-lg bg-indigo px-2.5 py-1 text-xs font-semibold text-white disabled:opacity-50">Approve & run</button>}
+              : <ConfirmedButton
+                  dialogTitle="Approve and start outbound campaign?"
+                  message={`Authorize policy ${campaign.policyVersion ?? 'not configured'} and allow this campaign to place calls to its approved targets. Provider configuration and all launch gates still apply.`}
+                  confirmLabel="Approve and start"
+                  tone="amber"
+                  disabled={campaignActionPending || !campaign.policyVersion}
+                  onConfirm={approveAndRun}
+                  className="rounded-lg bg-indigo px-2.5 py-1 text-xs font-semibold text-white disabled:opacity-50"
+                >Approve and start</ConfirmedButton>}
           </div>
         </div>
         <p className="text-[11px] text-t3">
@@ -1761,11 +2092,17 @@ function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { camp
           <div className="grid grid-cols-[1fr_1fr_auto] gap-2 items-end">
             <Field label="Test-call phone number" hint="When a provider is configured, this action may place a real call."><TextInput value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 010 0000" /></Field>
             <Field label="First name (optional)"><TextInput value={firstName} onChange={e => setFirstName(e.target.value)} placeholder="Jordan" /></Field>
-            <button type="button" disabled={launching || outboundStopped || reconciliationBlocksLaunch || !phone || campaign.status !== 'RUNNING' || !configured} onClick={() => {
-              if (window.confirm('Place this test call now? A configured provider may dial the entered phone number.')) void launch();
-            }} className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50 h-[38px]">
+            <ConfirmedButton
+              dialogTitle="Place test call?"
+              message={`A configured provider may immediately dial ${phone || 'the entered number'}. Confirm the number is approved for this pilot test.`}
+              confirmLabel="Place test call"
+              tone="amber"
+              disabled={launching || outboundStopped || reconciliationBlocksLaunch || !phone || campaign.status !== 'RUNNING' || !configured}
+              onConfirm={() => launch()}
+              className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50 h-[38px]"
+            >
               {launching ? <Loader2 className="w-4 h-4 animate-spin" /> : <PhoneOutgoing className="w-4 h-4" />} Place test call
-            </button>
+            </ConfirmedButton>
           </div>
         ) : <p className="text-xs text-t3">Production calls must use an authorized patient or lead target below.</p>}
         {launchMsg && (
@@ -1784,7 +2121,7 @@ function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { camp
             {logs.map(l => (
               <div key={l.id} className="flex items-center justify-between rounded-lg border border-[var(--b1)] px-3 py-2 text-xs">
                 <div className="flex items-center gap-2">
-                  <span className={outcomeBadge[l.outcome] ?? 'badge badge-blue'}>{l.outcome}</span>
+                  <span className={outcomeBadge[l.outcome] ?? 'badge badge-blue'}>{formatEnumLabel(l.outcome)}</span>
                   <span className="text-t2">{l.callerName || l.callerPhone || '—'}</span>
                 </div>
                 <span className="text-t3 font-mono text-[10px]">{l.retellCallId ?? 'no call id'}</span>
@@ -1839,7 +2176,6 @@ function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign:
   }
 
   async function remove(target: CallTarget) {
-    if (!window.confirm(`Remove target ${target.phone}?`)) return;
     setDeletingId(target.id);
     try {
       await api.deleteTarget(campaign.id, target.id);
@@ -1871,7 +2207,7 @@ function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign:
                   return (
                 <div key={t.id} className="flex items-center justify-between rounded-lg border border-[var(--b1)] px-3 py-2 text-xs">
                   <div className="flex items-center gap-2">
-                    <span className="badge badge-blue">{t.status}</span>
+                    <span className="badge badge-blue">{formatEnumLabel(t.status)}</span>
                     <span className="text-t2">{[t.firstName, t.lastName].filter(Boolean).join(' ') || t.phone}</span>
                     <span className="text-t3">{t.phone}</span>
                   </div>
@@ -1879,14 +2215,17 @@ function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign:
                     <button type="button" disabled={!canCall || t.status !== 'PENDING' || !consentReady} title={!consentReady ? `Target is not authorized for this exact campaign (${candidate?.voiceAuthorizationReason ?? 'authorization evidence unavailable'})` : !canCall ? 'Campaign must be running, provider-ready, and not emergency-stopped' : t.status !== 'PENDING' ? `Target is ${t.status}` : 'Call target'} onClick={() => onCall(t)} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 font-semibold text-indigo hover:bg-[var(--s2)] disabled:opacity-50">
                       <PhoneOutgoing className="w-3 h-3" /> Call
                     </button>
-                    <button
-                      type="button"
+                    <ConfirmedButton
+                      dialogTitle="Remove outbound target?"
+                      message={`Remove ${[t.firstName, t.lastName].filter(Boolean).join(' ') || t.phone} from this campaign? No call is placed by this action.`}
+                      confirmLabel="Remove target"
+                      tone="red"
                       disabled={busy || deletingId === t.id}
-                      onClick={() => void remove(t)}
+                      onConfirm={() => remove(t)}
                       className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 font-semibold text-red-v hover:bg-[var(--red-soft)] disabled:opacity-50"
                     >
                       {deletingId === t.id ? 'Removing…' : 'Remove'}
-                    </button>
+                    </ConfirmedButton>
                   </div>
                 </div>
                   );
@@ -1931,9 +2270,7 @@ function BookingRequestQueue({ requests, onChanged }: { requests: BookingRequest
     return { ...canonical, ...reconciledCanonicalByRequest };
   }, [requests, reconciledCanonicalByRequest]);
 
-  async function reject(id: string) {
-    const outcomeReason = window.prompt('Rejection reason (recorded in the audit trail):')?.trim();
-    if (!outcomeReason) return;
+  async function reject(id: string, outcomeReason: string) {
     setBusy(true); setError(null);
     try {
       await api.updateBookingRequest(id, { status: 'REJECTED', outcomeReason });
@@ -1967,7 +2304,7 @@ function BookingRequestQueue({ requests, onChanged }: { requests: BookingRequest
             <div key={r.id} className="rounded-lg border border-[var(--b1)] px-3 py-2.5">
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2 min-w-0">
-                  <span className={requestBadge[r.status]}>{r.status.replace('_', ' ')}</span>
+                  <span className={requestBadge[r.status]}>{formatEnumLabel(r.status)}</span>
                   <span className="text-sm text-t1 font-semibold truncate">{r.collectedName || r.collectedPhone || 'Unknown contact'}</span>
                   {r.status !== 'BOOKED' && r.requestedService && <span className="text-xs text-t3 truncate">· Requested: {r.requestedService}</span>}
                 </div>
@@ -1976,7 +2313,17 @@ function BookingRequestQueue({ requests, onChanged }: { requests: BookingRequest
                     <>
                       <button type="button" disabled={busy} onClick={() => window.open('/scheduling', '_blank', 'noopener,noreferrer')} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-indigo hover:bg-[var(--s2)]">Open scheduler</button>
                       <button type="button" disabled={busy} onClick={() => { setReconcilingId(r.id); setAppointmentId(''); setReason(''); setAcknowledged(false); setError(null); }} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-emerald-v hover:bg-[var(--s2)]">Link canonical appointment</button>
-                      <button type="button" disabled={busy} onClick={() => void reject(r.id)} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--s2)]">Reject</button>
+                      <ConfirmedButton
+                        dialogTitle="Reject appointment request?"
+                        message="Record why this request cannot proceed. This changes the request status; it does not cancel or modify an appointment."
+                        confirmLabel="Reject request"
+                        tone="red"
+                        requireReason
+                        reasonLabel="Rejection reason"
+                        disabled={busy}
+                        onConfirm={outcomeReason => reject(r.id, outcomeReason)}
+                        className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--s2)] disabled:opacity-50"
+                      >Reject</ConfirmedButton>
                     </>
                   )}
                 </div>
@@ -1984,7 +2331,7 @@ function BookingRequestQueue({ requests, onChanged }: { requests: BookingRequest
               <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-t3">
                 {r.status === 'BOOKED' && canonical ? (
                   <span className="font-semibold text-emerald-v">
-                    Booked: {canonical.service} · {new Date(canonical.startsAt).toLocaleString('en-US', { timeZone: canonical.timezone })} {canonical.timezone}
+                    Booked: {canonical.service} · {new Date(canonical.startsAt).toLocaleString(getLocale(), { timeZone: canonical.timezone })} {canonical.timezone}
                     {' · '}{[canonical.locationName, canonical.locationAddress].filter(Boolean).join(', ')}
                     {canonical.providerName ? ` · ${canonical.providerName}` : ''}
                   </span>

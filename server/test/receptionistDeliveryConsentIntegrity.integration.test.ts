@@ -20,7 +20,7 @@ const { env } = await import('../config/env');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { authorizeOutboundProviderIntentTx } = await import('../lib/receptionist/dncFence');
 const { sendAuthorizedAppointmentConfirmation } = await import('../lib/commsProvider');
-const { runWithJobTenantContext } = await import('../lib/tenantContext');
+const { runInTenantContext } = await import('../lib/tenantContext');
 
 const describeDisposable = process.env.RLS_DISPOSABLE_DB ? describe : describe.skip;
 const DISCLOSURE_HASH = 'a'.repeat(64);
@@ -578,15 +578,27 @@ describeDisposable('receptionist delivery/consent database integrity', () => {
     env.TWILIO_AUTH_TOKEN = 'mock_confirmation_authorization';
     env.TWILIO_FROM_NUMBER = '+15555550199';
     try {
-      const authorizedSend = (destination: string, body: string) => runWithJobTenantContext(
-        item.tenantId,
+      const authorizedSend = (destination: string, body: string) => runInTenantContext(
+        {
+          tenantId: item.tenantId,
+          actorId: 'worker:test-authorized-confirmation',
+          actorRole: 'WORKER',
+          source: 'worker',
+        },
         () => sendAuthorizedAppointmentConfirmation(
           'sms', destination, 'Confirmed', body, `${appointment.id}:sms`,
           { tenantId: item.tenantId, eventId: event.id, attemptNumber: 1 },
         ),
-        'worker:test-authorized-confirmation',
       );
-      await expect(authorizedSend(item.patient.phone!, 'Exact authorized body')).resolves.toMatchObject({ status: 'sent', mode: 'mock_dev' });
+      const concurrent = await Promise.all([
+        authorizedSend(item.patient.phone!, 'Exact authorized body'),
+        authorizedSend(item.patient.phone!, 'Exact authorized body'),
+      ]);
+      expect(concurrent.filter(result => result.status === 'sent')).toHaveLength(1);
+      expect(concurrent.filter(result => result.failureReason === 'durable_authorization_invalid')).toHaveLength(1);
+      expect(await db.notificationDeliveryAttempt.count({ where: {
+        tenantId: item.tenantId, notificationEventId: event.id, attemptNumber: 1, phase: 'SUBMISSION_CLAIM',
+      } })).toBe(1);
       await expect(authorizedSend('+15555550198', 'Wrong destination')).resolves.toMatchObject({ status: 'failed', failureReason: 'durable_authorization_invalid' });
 
       await db.notificationDeliveryAttempt.create({ data: {

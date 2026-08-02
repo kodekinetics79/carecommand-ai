@@ -29,6 +29,9 @@ const { assertProductionRateLimitStore, skipRateLimitStoreErrors } = await impor
 
 let app: FastifyInstance;
 const userIds: string[] = [];
+// Fastify injection connects directly over loopback. X-Forwarded-For remains
+// untrusted unless the application explicitly configures a trusted proxy.
+const INJECTED_REQUEST_IP = '127.0.0.1';
 
 beforeAll(async () => {
   app = await buildApp();
@@ -59,6 +62,52 @@ async function platformUser(input: { email: string; password: string; status?: s
 }
 
 describe('platform authentication enumeration resistance', () => {
+  it('requires MFA enrollment before issuing any privileged platform session', async () => {
+    const suffix = randomUUID();
+    const user = await platformUser({
+      email: `mfa-enrollment-${suffix}@platform.test`,
+      password: 'Correct-Enrollment-Password!',
+    });
+
+    const passwordResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/platform/auth/login',
+      payload: { email: user.email, password: 'Correct-Enrollment-Password!' },
+    });
+    expect(passwordResponse.statusCode).toBe(200);
+    expect(passwordResponse.json()).toMatchObject({ mfaSetupRequired: true });
+    expect(passwordResponse.json().token).toBeUndefined();
+    const enrollmentToken = passwordResponse.json().mfaToken as string;
+    expect(enrollmentToken).toEqual(expect.any(String));
+    expect((await app.inject({ method: 'GET', url: '/v1/platform/auth/me', headers: { authorization: `Bearer ${enrollmentToken}` } })).statusCode).toBe(401);
+    expect((await platformDb.platformUser.findUniqueOrThrow({ where: { id: user.id } })).lastLoginAt).toBeNull();
+
+    const setupResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/platform/auth/mfa/setup',
+      headers: { authorization: `Bearer ${enrollmentToken}` },
+    });
+    expect(setupResponse.statusCode).toBe(200);
+    const setup = setupResponse.json() as { secret: string };
+
+    const verified = await app.inject({
+      method: 'POST',
+      url: '/v1/platform/auth/mfa/verify',
+      headers: { authorization: `Bearer ${enrollmentToken}` },
+      payload: { code: generateTotp(setup.secret) },
+    });
+    expect(verified.statusCode).toBe(200);
+    expect(verified.json().token).toEqual(expect.any(String));
+    expect(verified.json().user.mfaEnabled).toBe(true);
+    expect((await app.inject({ method: 'GET', url: '/v1/platform/auth/me', headers: { authorization: `Bearer ${verified.json().token as string}` } })).statusCode).toBe(200);
+
+    const stored = await platformDb.platformUser.findUniqueOrThrow({ where: { id: user.id } });
+    expect(stored.mfaEnabled).toBe(true);
+    expect(stored.lastLoginAt).not.toBeNull();
+    expect(await platformDb.platformAuditEvent.count({ where: { platformUserId: user.id, action: 'platform.mfa.enabled' } })).toBe(1);
+    expect(await platformDb.platformAuditEvent.count({ where: { platformUserId: user.id, action: 'platform.login.success' } })).toBe(1);
+  });
+
   it('revokes only the invoking high-privilege JWT even when two sessions are issued in the same millisecond', async () => {
     const suffix = randomUUID();
     const user = await platformUser({ email: `logout-${suffix}@platform.test`, password: 'Correct-Logout-Password!' });
@@ -147,25 +196,25 @@ describe('platform authentication enumeration resistance', () => {
     expect(byReason('unknown_account')).toMatchObject({
       platformUserId: null,
       targetId: null,
-      ipHash: hashV('203.0.113.101'),
+      ipHash: hashV(INJECTED_REQUEST_IP),
       userAgentHash: hashV(`platform-auth-unknown-${suffix}`),
     });
     expect(byReason('inactive')).toMatchObject({
       platformUserId: inactive.id,
       targetId: inactive.id,
-      ipHash: hashV('203.0.113.102'),
+      ipHash: hashV(INJECTED_REQUEST_IP),
       userAgentHash: hashV(`platform-auth-inactive-${suffix}`),
     });
     expect(byReason('locked')).toMatchObject({
       platformUserId: locked.id,
       targetId: locked.id,
-      ipHash: hashV('203.0.113.103'),
+      ipHash: hashV(INJECTED_REQUEST_IP),
       userAgentHash: hashV(`platform-auth-locked-${suffix}`),
     });
     expect(byReason('bad_password')).toMatchObject({
       platformUserId: wrong.id,
       targetId: wrong.id,
-      ipHash: hashV('203.0.113.104'),
+      ipHash: hashV(INJECTED_REQUEST_IP),
       userAgentHash: hashV(`platform-auth-wrong-${suffix}`),
     });
   });
@@ -230,17 +279,17 @@ describe('platform authentication enumeration resistance', () => {
     const failedEvent = events.find(event => event.action === 'platform.login.failed');
     const successEvent = events.find(event => event.action === 'platform.login.success');
     expect(passwordEvent).toMatchObject({
-      ipHash: hashV('203.0.113.111'),
+      ipHash: hashV(INJECTED_REQUEST_IP),
       userAgentHash: hashV(`platform-mfa-password-${suffix}`),
       metadata: { mfa: false, mfaRequired: true },
     });
     expect(failedEvent).toMatchObject({
-      ipHash: hashV('203.0.113.112'),
+      ipHash: hashV(INJECTED_REQUEST_IP),
       userAgentHash: hashV(`platform-mfa-failed-${suffix}`),
       metadata: { reason: 'bad_mfa' },
     });
     expect(successEvent).toMatchObject({
-      ipHash: hashV('203.0.113.113'),
+      ipHash: hashV(INJECTED_REQUEST_IP),
       userAgentHash: hashV(`platform-mfa-success-${suffix}`),
       metadata: { mfa: true },
     });

@@ -1,10 +1,12 @@
 // Platform Admin Console client. Uses a PlatformUser JWT (NOT a tenant session,
-// NOT the legacy static token). Token is held in localStorage and sent as Bearer.
+// NOT the legacy static token). The privileged token is memory-only: reload or
+// tab close requires re-authentication and no bearer credential is persisted in
+// browser storage.
 const API = (import.meta.env.VITE_API_URL as string | undefined) ?? (import.meta.env.PROD ? '' : 'http://localhost:3001');
-const TOKEN_KEY = 'cc_platform_token';
+let platformToken: string | null = null;
 
-export function getPlatformToken(): string | null { return localStorage.getItem(TOKEN_KEY); }
-export function setPlatformToken(t: string | null) { if (t) localStorage.setItem(TOKEN_KEY, t); else localStorage.removeItem(TOKEN_KEY); }
+export function getPlatformToken(): string | null { return platformToken; }
+export function setPlatformToken(token: string | null) { platformToken = token; }
 
 async function pf<T>(path: string, init?: RequestInit & { auth?: boolean }): Promise<T> {
   const token = getPlatformToken();
@@ -142,7 +144,8 @@ export const TENANT_STATUS_BADGE: Record<string, string> = { active: 'badge-emer
 export const SUB_STATUS_BADGE: Record<string, string> = { ACTIVE: 'badge-emerald', TRIAL: 'badge-violet', PAST_DUE: 'badge-amber', SUSPENDED: 'badge-red', CANCELLED: 'badge-red' };
 
 export const platformAdmin = {
-  login: (email: string, password: string) => pf<{ token?: string; mfaRequired?: boolean; mfaToken?: string; user?: PlatformMe }>(`/v1/platform/auth/login`, { method: 'POST', auth: false, body: JSON.stringify({ email, password }) }),
+  login: (email: string, password: string) => pf<{ token?: string; mfaRequired?: boolean; mfaSetupRequired?: boolean; mfaToken?: string; user?: PlatformMe }>(`/v1/platform/auth/login`, { method: 'POST', auth: false, body: JSON.stringify({ email, password }) }),
+  mfaSetup: (mfaToken: string) => pf<{ secret: string; otpauthUri: string; enabled: false }>(`/v1/platform/auth/mfa/setup`, { method: 'POST', auth: false, headers: { Authorization: `Bearer ${mfaToken}` }, body: '{}' }),
   mfaVerify: (code: string, mfaToken: string) => pf<{ token: string; user: PlatformMe }>(`/v1/platform/auth/mfa/verify`, { method: 'POST', auth: false, headers: { Authorization: `Bearer ${mfaToken}` }, body: JSON.stringify({ code }) }),
   me: () => pf<PlatformMe>(`/v1/platform/auth/me`),
   logout: () => pf<{ loggedOut: boolean }>(`/v1/platform/auth/logout`, { method: 'POST' }),

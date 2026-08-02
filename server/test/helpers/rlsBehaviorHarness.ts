@@ -1,15 +1,10 @@
 import 'dotenv/config';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 import { Pool, type PoolClient } from 'pg';
+import { RLS_TABLE_ADAPTERS, type RlsTableAdapter } from '../../lib/rlsTableAdapters';
 
-export type RlsBehaviorMode = 'MUTABLE' | 'APPEND_ONLY' | 'READ_ONLY';
-
-export type RlsTableAdapter = {
-  table: string;
-  ownershipColumn: 'id' | 'tenantId';
-  mode: RlsBehaviorMode;
-};
+export { RLS_TABLE_ADAPTERS } from '../../lib/rlsTableAdapters';
+export type { RlsBehaviorMode, RlsTableAdapter } from '../../lib/rlsTableAdapters';
 
 type Column = {
   table: string;
@@ -53,36 +48,6 @@ export type MutationEvidence = {
   bulkDelete: OperationResult;
   tenantReassignmentError?: string;
 };
-
-const APPEND_ONLY = new Set([
-  'AuditEvent',
-  'ConsentEvent',
-  'ReceptionistArtifactLifecycleEvent',
-  'ReceptionistRecordingConsentEvent',
-  'NotificationDeliveryAttempt',
-  'ReceptionistVoiceConsentEvent',
-  'ReceptionistOutboundProviderIntent',
-]);
-
-function schemaProtectedTables(): string[] {
-  const schema = readFileSync(new URL('../../../prisma/schema.prisma', import.meta.url), 'utf8');
-  const tables = ['Tenant'];
-  for (const match of schema.matchAll(/^model\s+(\w+)\s*\{([\s\S]*?)^\}/gm)) {
-    const [, modelName, body] = match;
-    const tenantField = body.match(/^\s*tenantId\s+String(\?)?\s+[^\n]*@db\.Uuid/m);
-    if (!tenantField) continue;
-    if (tenantField[1] && modelName !== 'IdempotencyKey') continue;
-    if (modelName === 'PlatformAuditEvent') continue;
-    tables.push(body.match(/^\s*@@map\("([^"]+)"\)/m)?.[1] ?? modelName);
-  }
-  return [...new Set(tables)].sort();
-}
-
-export const RLS_TABLE_ADAPTERS: readonly RlsTableAdapter[] = schemaProtectedTables().map(table => ({
-  table,
-  ownershipColumn: table === 'Tenant' ? 'id' : 'tenantId',
-  mode: table === 'Tenant' ? 'READ_ONLY' : APPEND_ONLY.has(table) ? 'APPEND_ONLY' : 'MUTABLE',
-}));
 
 function quoteIdentifier(value: string): string {
   return `"${value.replaceAll('"', '""')}"`;
@@ -690,6 +655,16 @@ export class RlsBehaviorHarness {
       values.set('phase', 'INTENT');
       values.set('status', 'started');
     }
+    if (table === 'ConversationReplyAttempt') {
+      values.set('phase', 'INTENT');
+      values.set('status', 'authorized');
+      values.set('channel', 'sms');
+      values.set('destinationMasked', '***0000');
+      values.set('messageHash', 'a'.repeat(64));
+      values.set('subjectHash', 'b'.repeat(64));
+      values.set('senderIdentityHash', 'c'.repeat(64));
+      values.set('completedAt', new Date());
+    }
     // Outbound targets require exactly one durable identity. The patient/lead
     // FKs are nullable individually, so the generic required-FK resolver
     // cannot infer this table-level XOR contract.
@@ -834,6 +809,15 @@ export class RlsBehaviorHarness {
     const candidates = (this.columns.get(table) ?? []).filter(column =>
       !column.generated && !excluded.has(column.name) && row[column.name] !== null && row[column.name] !== undefined,
     );
+    // Device identity, capture time, source, and enrollment provenance are
+    // intentionally immutable. Exercise its supported clinical review state
+    // transition instead of trying to mutate protected evidence fields.
+    if (table === 'DeviceReading' && candidates.some(item => item.name === 'validationStatus')) {
+      return {
+        column: 'validationStatus',
+        expression: `CASE "validationStatus" WHEN 'valid' THEN 'suspect' ELSE 'valid' END`,
+      };
+    }
     const column = candidates.find(item => item.name === 'updatedAt')
       ?? candidates.find(item => item.typeName.includes('timestamp'))
       ?? candidates.find(item => item.typeName === 'boolean')

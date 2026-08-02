@@ -10,7 +10,7 @@ export function useSession(options: { hydrate?: boolean } = {}) {
   const hydrate = useCallback(async () => {
     try {
       const response = await apiRequest<AuthMeResponse>('/v1/auth/me');
-      setUser(response.user);
+      setUser({ ...response.user, effectivePermissions: response.access.permissions });
     } catch {
       setUser(null);
     } finally {

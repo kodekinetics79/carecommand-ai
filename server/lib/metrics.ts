@@ -84,6 +84,21 @@ export const dependencyUp = new client.Gauge({
 
 export type MetricsAccess = 'ok' | 'not_found' | 'unauthorized';
 
+export function monitoringAccessForEnvironment(
+  nodeEnv: string,
+  configuredToken: string | undefined,
+  authorizationHeader: string | undefined,
+): MetricsAccess {
+  if (nodeEnv !== 'production') return 'ok';
+  if (!configuredToken) return 'not_found';
+  const provided = authorizationHeader?.startsWith('Bearer ')
+    ? authorizationHeader.slice('Bearer '.length)
+    : '';
+  const a = createHash('sha256').update(provided).digest();
+  const b = createHash('sha256').update(configuredToken).digest();
+  return timingSafeEqual(a, b) ? 'ok' : 'unauthorized';
+}
+
 /**
  * Shared access rule for metrics exposition — used by both the API's /metrics
  * route (plugins/metrics.ts) and the worker's standalone listener
@@ -94,14 +109,7 @@ export type MetricsAccess = 'ok' | 'not_found' | 'unauthorized';
  * lengths differ.
  */
 export function metricsAccess(authorizationHeader: string | undefined): MetricsAccess {
-  if (env.NODE_ENV !== 'production') return 'ok';
-  if (!env.METRICS_TOKEN) return 'not_found';
-  const provided = authorizationHeader?.startsWith('Bearer ')
-    ? authorizationHeader.slice('Bearer '.length)
-    : '';
-  const a = createHash('sha256').update(provided).digest();
-  const b = createHash('sha256').update(env.METRICS_TOKEN).digest();
-  return timingSafeEqual(a, b) ? 'ok' : 'unauthorized';
+  return monitoringAccessForEnvironment(env.NODE_ENV, env.METRICS_TOKEN, authorizationHeader);
 }
 
 /**

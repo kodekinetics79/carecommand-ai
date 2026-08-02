@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
-import { Clock, Phone, TrendingUp, AlertCircle, Sparkles, Zap, ArrowRight } from 'lucide-react';
+import { Clock, Phone, AlertCircle, Sparkles, Zap, ArrowRight } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
@@ -89,13 +89,15 @@ export default function StaffWorkflow() {
   }
 
   const underperformers = staffRecords.filter(member => member.bookingConversionRate < 55 || member.responseTime > 6);
+  const responseThresholdExceptions = staffRecords.filter(member => member.responseTime > 6);
+  const staffMetricsReady = source === 'live' && !loadError;
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Staff Workflow"
         subtitle="Task board, response SLA tracking, booking conversion, and coaching recommendations."
-        badge={loadError ? 'Live Data Error' : `${totals.overdueCount} Overdue · ${source === 'live' ? 'Live DB' : 'Loading'}`}
+        badge={loadError ? 'Data unavailable' : `${totals.overdueCount} overdue · ${source === 'live' ? 'Stored task records' : 'Loading'}`}
         badgeColor="red"
         actions={
           <button type="button" onClick={() => navigate('/autopilot')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
@@ -106,15 +108,15 @@ export default function StaffWorkflow() {
 
       {loadError && (
         <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          Staff workflow data could not be loaded from the live API: {loadError}
+          Staff workflow data could not be loaded: {loadError}
         </div>
       )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Avg Response Time" value={`${totals.avgResponse} min`} subtitle="Network average" icon={<Clock className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Booking Conversion" value={`${totals.avgConversion}%`} subtitle="Across all staff" trend={3} icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Missed Calls" value={totals.totalMissed} subtitle="This month" icon={<Phone className="w-4 h-4" />} accent="red" />
-        <StatCard title="Completed Tasks" value={totals.completedCount} subtitle="This session" icon={<AlertCircle className="w-4 h-4" />} accent="amber" />
+        <StatCard title="Avg Response Time" value={staffMetricsReady ? `${totals.avgResponse} min` : '—'} subtitle={staffMetricsReady ? 'Across loaded staff records' : 'Unavailable'} icon={<Clock className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Booking Conversion" value={staffMetricsReady ? `${totals.avgConversion}%` : '—'} subtitle={staffMetricsReady ? 'Across loaded staff records' : 'Unavailable'} icon={<Clock className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Missed Calls" value={staffMetricsReady ? totals.totalMissed : '—'} subtitle={staffMetricsReady ? 'This month' : 'Unavailable'} icon={<Phone className="w-4 h-4" />} accent="red" />
+        <StatCard title="Completed Tasks" value={staffMetricsReady ? totals.completedCount : '—'} subtitle={staffMetricsReady ? 'Loaded task records' : 'Unavailable'} icon={<AlertCircle className="w-4 h-4" />} accent="amber" />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
@@ -122,7 +124,7 @@ export default function StaffWorkflow() {
           <BentoCard title="Task Board" subtitle="Open tasks · All branches">
             <div className="space-y-2.5">
               {taskRecords.length === 0 ? (
-                <p className="text-sm text-t3 py-4 text-center">No live tasks returned for this clinic.</p>
+                <p className="text-sm text-t3 py-4 text-center">No task records were returned for this clinic.</p>
               ) : taskRecords.map(task => {
                 const priorityStyle = priorityStyles[task.priority as keyof typeof priorityStyles] ?? priorityStyles.low;
                 const statusStyle = statusStyles[task.status] ?? statusStyles.open;
@@ -166,7 +168,7 @@ export default function StaffWorkflow() {
                 </thead>
                 <tbody className="divide-y divide-[var(--b0)]">
                   {[...staffRecords].sort((a, b) => b.bookingConversionRate - a.bookingConversionRate).map(member => {
-                    const branchName = member.branch ?? 'Live branch';
+                    const branchName = member.branch ?? 'Branch not recorded';
                     const score = Math.round((member.bookingConversionRate * 0.4) + (member.followUpRate * 0.3) + (member.patientFeedbackScore * 10 * 0.3));
                     return (
                       <tr key={member.id} className="hover:bg-[var(--s3)] transition-colors group">
@@ -194,7 +196,7 @@ export default function StaffWorkflow() {
                   })}
                 </tbody>
               </table>
-              {staffRecords.length === 0 && <p className="text-sm text-t3 text-center py-4">No live staff profiles returned.</p>}
+              {staffRecords.length === 0 && <p className="text-sm text-t3 text-center py-4">No staff profiles were returned.</p>}
             </div>
           </BentoCard>
         </div>
@@ -219,7 +221,7 @@ export default function StaffWorkflow() {
                     <ProgressBar value={Math.max(0, 100 - (member.responseTime * 10))} size="xs" />
                   </div>
                   <p className="text-[11px] text-t2 mb-2">
-                    Script: use customer name, reference their last service, and offer a specific time slot.
+                    Coaching prompt: confirm the patient's identity, review the documented service context, and offer only an available time slot.
                   </p>
                   <button type="button" onClick={() => navigate('/autopilot')} className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo hover:opacity-80">
                     <Sparkles className="w-3 h-3" /> View coaching script <ArrowRight className="w-3 h-3" />
@@ -250,9 +252,9 @@ export default function StaffWorkflow() {
             <div className="flex items-start gap-3">
               <AlertCircle className="w-5 h-5 text-red-v shrink-0 mt-0.5" />
               <div>
-                <p className="text-sm font-bold text-red-v">SLA Breach Alert</p>
+                <p className="text-sm font-bold text-red-v">Response Threshold Review</p>
                 <p className="text-xs text-t2 mt-0.5 leading-relaxed">
-                  {underperformers.slice(0, 2).map(member => member.name).join(' and ')} are exceeding the 6-minute response-time SLA. Escalate to the branch manager or reassign incoming calls to overflow routing.
+                  {responseThresholdExceptions.length > 0 ? `${responseThresholdExceptions.slice(0, 2).map(member => member.name).join(' and ')} exceed this page's 6-minute response-time review threshold in the loaded records. Review staffing and routing with the branch manager.` : staffMetricsReady ? "No loaded staff record exceeds this page's 6-minute response-time review threshold." : 'Response-time records are unavailable.'}
                 </p>
                 <button type="button" onClick={() => navigate('/ai-receptionist')} className="mt-2 inline-flex items-center gap-1 text-xs font-semibold badge badge-red px-3 py-1.5 rounded-lg hover:opacity-80 transition-colors">
                   <Zap className="w-3 h-3" /> Enable overflow routing

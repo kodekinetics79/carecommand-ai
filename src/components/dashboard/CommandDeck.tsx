@@ -38,8 +38,8 @@ export default function CommandDeck({
   const TrendIcon = trend != null && trend < 0 ? TrendingDown : TrendingUp;
 
   const chips: Array<{ label: string; value: string; dot: string; route: string }> = [
-    { label: 'Auto-recovered', value: formatCurrency(summary.revenueRecovered), dot: 'bg-[var(--emerald)]', route: '/revenue-protection' },
-    { label: 'Open opportunity', value: formatCurrency(summary.activeOpportunities), dot: 'bg-[var(--violet)]', route: '/opportunities' },
+    { label: 'Snapshot recovered amount', value: formatCurrency(summary.revenueRecovered), dot: 'bg-[var(--emerald)]', route: '/revenue-protection' },
+    { label: 'Recorded estimated opportunity value', value: formatCurrency(summary.activeOpportunities), dot: 'bg-[var(--violet)]', route: '/opportunities' },
     { label: 'Awaiting approval', value: String(summary.pendingApprovals), dot: 'bg-[var(--blue)]', route: '/autopilot' },
   ];
 
@@ -54,11 +54,11 @@ export default function CommandDeck({
             <span className="w-1.5 h-1.5 rounded-full bg-[var(--emerald)] live-dot" aria-hidden="true" />
             <p className="text-[10.5px] font-bold uppercase tracking-[0.18em] text-indigo">Today's briefing</p>
             <span className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-bold ring-1 ${riskStyles[risk.level]}`}>
-              <RiskIcon className="w-3 h-3" aria-hidden="true" /> Risk: {risk.label}
+              <RiskIcon className="w-3 h-3" aria-hidden="true" /> Planning signal: {risk.label}
             </span>
           </div>
           <h2 className="text-[16.5px] font-bold text-t1 leading-snug tracking-tight">
-            {formatCurrency(summary.revenueRecovered)} recovered this month — {formatCurrency(summary.activeOpportunities)} still on the table.
+            The latest snapshot records {formatCurrency(summary.revenueRecovered)} in its recovered-amount field; source attribution is not shown here. Recorded estimated opportunity value is {formatCurrency(summary.activeOpportunities)}.
           </h2>
           <div className="flex flex-wrap items-center gap-2.5 mt-3">
             <button type="button" onClick={() => onNavigate('/advisory')}
@@ -67,7 +67,7 @@ export default function CommandDeck({
             </button>
             <button type="button" onClick={() => onNavigate('/campaigner')}
               className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-white px-3.5 py-1.5 text-[12.5px] font-semibold text-t1 hover:bg-[var(--s2)] transition">
-              <Megaphone className="w-3.5 h-3.5 text-t3" aria-hidden="true" /> Launch Campaign
+              <Megaphone className="w-3.5 h-3.5 text-t3" aria-hidden="true" /> Review campaigns
             </button>
           </div>
         </div>

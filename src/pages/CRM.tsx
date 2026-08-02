@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
 import {
-  LayoutDashboard, Kanban, Users, Layers3, Workflow,
+  Users, Layers3, Workflow,
   Search, Sparkles, Zap, Flame, ChevronUp, ChevronDown,
 } from 'lucide-react';
 import BentoCard from '../components/ui/BentoCard';
 import EmptyStatePremium from '../components/ui/EmptyStatePremium';
 import ConfirmationModal from '../components/workflow/ConfirmationModal';
+import ModuleTabs from '../components/ui/ModuleTabs';
 import CRMMetricsStrip from '../components/crm/CRMMetricsStrip';
 import PipelineBoard from '../components/crm/PipelineBoard';
 import SmartSegmentCard from '../components/crm/SmartSegmentCard';
@@ -19,12 +20,12 @@ import { crmService, type CrmLead, type CrmPatient, type CtaId, type CommandMetr
 
 type TabKey = 'command' | 'pipeline' | 'intelligence' | 'segments' | 'automation';
 type PatientSortKey = 'name' | 'value' | 'churn';
-const TABS: Array<{ key: TabKey; label: string; icon: React.ElementType }> = [
-  { key: 'command', label: 'Command View', icon: LayoutDashboard },
-  { key: 'pipeline', label: 'Pipeline', icon: Kanban },
-  { key: 'intelligence', label: 'Patient Intelligence', icon: Users },
-  { key: 'segments', label: 'Smart Segments', icon: Layers3 },
-  { key: 'automation', label: 'Automation Rules', icon: Workflow },
+const TABS: Array<{ key: TabKey; label: string }> = [
+  { key: 'command', label: 'Command View' },
+  { key: 'pipeline', label: 'Pipeline' },
+  { key: 'intelligence', label: 'Patient Intelligence' },
+  { key: 'segments', label: 'Smart Segments' },
+  { key: 'automation', label: 'Automation Rules' },
 ];
 
 export default function CRM() {
@@ -33,6 +34,7 @@ export default function CRM() {
   const [leads, setLeads] = useState<CrmLead[]>([]);
   const [patients, setPatients] = useState<CrmPatient[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [patientSearch, setPatientSearch] = useState('');
   const [sort, setSort] = useState<{ key: PatientSortKey; dir: 'asc' | 'desc' }>({ key: 'churn', dir: 'desc' });
 
@@ -43,12 +45,29 @@ export default function CRM() {
   const [commsModal, setCommsModal] = useState<{ lead: CrmLead; cta: CtaId } | null>(null);
 
   async function reload() {
-    const [l, p] = await Promise.all([crmService.getLeads().catch(() => []), crmService.getPatients().catch(() => [])]);
-    setLeads(l); setPatients(p);
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const [l, p] = await Promise.all([crmService.getLeads(), crmService.getPatients()]);
+      setLeads(l); setPatients(p);
+    } catch {
+      setLoadError('CRM data is unavailable. No empty-pipeline, consent, or value conclusions can be drawn until the service responds.');
+    } finally {
+      setLoading(false);
+    }
   }
   useEffect(() => {
     let a = true;
-    void (async () => { const [l, p] = await Promise.all([crmService.getLeads().catch(() => []), crmService.getPatients().catch(() => [])]); if (a) { setLeads(l); setPatients(p); setLoading(false); } })();
+    void (async () => {
+      try {
+        const [l, p] = await Promise.all([crmService.getLeads(), crmService.getPatients()]);
+        if (a) { setLeads(l); setPatients(p); setLoadError(null); }
+      } catch {
+        if (a) setLoadError('CRM data is unavailable. No empty-pipeline, consent, or value conclusions can be drawn until the service responds.');
+      } finally {
+        if (a) setLoading(false);
+      }
+    })();
     return () => { a = false; };
   }, []);
 
@@ -89,27 +108,33 @@ export default function CRM() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-[13px] text-t3">Patient growth, retention &amp; revenue recovery</p>
         <button type="button" onClick={() => navigate('/campaigner')} className="inline-flex items-center gap-2 rounded-lg bg-[var(--indigo)] px-3.5 py-2 text-[13px] font-semibold text-white hover:opacity-90 transition">
-          <Sparkles className="w-4 h-4" /> Launch Campaign
+          <Sparkles className="w-4 h-4" /> Create Campaign Draft
         </button>
       </div>
 
-      {/* Tabs */}
-      <div className="flex items-center gap-1 overflow-x-auto bg-[var(--s1)] border border-[var(--b1)] p-1 rounded-xl shadow-sm" role="tablist" aria-label="CRM sections">
-        {TABS.map(t => (
-          <button key={t.key} type="button" role="tab" aria-selected={tab === t.key ? 'true' : 'false'} onClick={() => setTab(t.key)}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-all ${tab === t.key ? 'bg-[var(--indigo)] text-white shadow-sm' : 'text-t3 hover:text-t1 hover:bg-[var(--s3)]'}`}>
-            <t.icon className="w-3.5 h-3.5" /> {t.label}
-          </button>
-        ))}
+      <div className="overflow-x-auto">
+        <ModuleTabs
+          tabs={TABS.map(item => ({ id: item.key, label: item.label }))}
+          activeTab={tab}
+          onChange={id => setTab(id as TabKey)}
+          ariaLabel="CRM sections"
+        />
       </div>
 
-      <div className="animate-fade-up">
+      {loadError ? (
+        <BentoCard title="CRM data unavailable" subtitle="The service did not return a complete CRM dataset">
+          <div role="alert" className="rounded-xl border border-red-soft bg-red-soft p-4">
+            <p className="text-sm font-semibold text-red-v">{loadError}</p>
+            <button type="button" onClick={() => void reload()} className="mt-3 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-xs font-semibold text-t1 hover:bg-[var(--s2)]">Retry</button>
+          </div>
+        </BentoCard>
+      ) : loading ? <div className="space-y-3" aria-label="Loading CRM data">{Array.from({ length: 5 }).map((_, i) => <div key={i} className="skeleton-line h-16 rounded-xl" />)}</div> : <div className="animate-fade-up">
         {tab === 'command' && (
           <div className="space-y-4">
             <CRMMetricsStrip m={metrics} onNavigate={navigate} />
-            <BentoCard title="AI next-best actions" subtitle="Highest-intent leads to action now" headerRight={<span className="inline-flex items-center gap-1 text-[11px] font-bold text-violet-v"><Sparkles className="w-3.5 h-3.5" /> AI-ranked</span>}>
+            <BentoCard title="Rule-based planning suggestions" subtitle="Leads ordered by an unvalidated fixed planning heuristic" headerRight={<span className="inline-flex items-center gap-1 text-[11px] font-bold text-amber-v"><Sparkles className="w-3.5 h-3.5" /> Not an AI prediction</span>}>
               {loading ? <div className="space-y-2">{Array.from({ length: 4 }).map((_, i) => <div key={i} className="skeleton-line h-14 rounded-xl" />)}</div>
-                : hotLeads.length === 0 ? <EmptyStatePremium icon={<Flame className="w-5 h-5" />} title="No hot leads right now" description="High-intent leads (score ≥ 70) will surface here for immediate action." />
+                : hotLeads.length === 0 ? <EmptyStatePremium icon={<Flame className="w-5 h-5" />} title="No priority leads in the loaded records" description="Leads with a rule-based planning score ≥ 70 will appear here. This is not an AI prediction." />
                 : <div className="space-y-2">{hotLeads.map(l => (
                   <div key={l.id} className="hover-lift flex items-center gap-3 rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3">
                     <span className="grid place-items-center w-9 h-9 rounded-lg bg-emerald-soft text-emerald-v text-[12px] font-bold shrink-0">{l.score}</span>
@@ -176,19 +201,19 @@ export default function CRM() {
 
         {tab === 'segments' && (
           <div>
-            <p className="text-[12px] text-t3 mb-3">AI-built reactivation & retention segments — consent-aware, with recoverable value and recommended offers.</p>
+            <p className="text-[12px] text-t3 mb-3">Rule-based candidate groups with unvalidated planning assumptions. Membership is not contact eligibility; consent and suppression are verified during campaign preview and dispatch.</p>
             {loading ? <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{Array.from({ length: 6 }).map((_, i) => <div key={i} className="skeleton-line h-52 rounded-2xl" />)}</div>
-              : segments.length === 0 ? <EmptyStatePremium icon={<Layers3 className="w-5 h-5" />} title="No actionable segments yet" description="As patients become inactive or at-risk, AI segments with recoverable value appear here." />
+              : segments.length === 0 ? <EmptyStatePremium icon={<Layers3 className="w-5 h-5" />} title="No candidate groups in the loaded records" description="Rule-based candidate groups appear as patients become inactive or at risk." />
               : <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{segments.map(s => <SmartSegmentCard key={s.id} segment={s} onCreateCampaign={() => navigate('/campaigner')} />)}</div>}
           </div>
         )}
 
         {tab === 'automation' && (
-          <BentoCard title="Automation Rules" subtitle="Trigger → action engine for patient growth" headerRight={<span className="inline-flex items-center gap-1 text-[11px] font-bold text-violet-v"><Workflow className="w-3.5 h-3.5" /> Live engine</span>}>
+          <BentoCard title="Automation Rules" subtitle="Trigger → action rules for patient growth" headerRight={<span className="inline-flex items-center gap-1 text-[11px] font-bold text-violet-v"><Workflow className="w-3.5 h-3.5" /> Configured rules</span>}>
             <AutomationRulesPanel onNavigate={navigate} />
           </BentoCard>
         )}
-      </div>
+      </div>}
 
       {/* Drawers */}
       {scoreLead && <LeadScoreExplanationDrawer lead={scoreLead} onClose={() => setScoreLead(null)} />}
@@ -202,7 +227,7 @@ export default function CRM() {
         />
       )}
       {commsModal && (
-        <ConfirmationModal title={CTA_LABEL[commsModal.cta] ?? 'Send communication'} message={`This will ${CTA_LABEL[commsModal.cta]?.toLowerCase() ?? 'message'} to ${commsModal.lead.name} using a consent-checked channel.`} confirmLabel="Send" tone="indigo"
+        <ConfirmationModal title={CTA_LABEL[commsModal.cta] ?? 'Send communication'} message={`Request ${CTA_LABEL[commsModal.cta]?.toLowerCase() ?? 'a message'} to ${commsModal.lead.name}. Stored badges are not authorization; the server verifies current consent and suppression evidence at dispatch and blocks ineligible contact.`} confirmLabel="Verify & request send" tone="indigo"
           onClose={() => setCommsModal(null)}
           onConfirm={async () => { await crmService.sendComms(commsModal.lead.id, commsModal.cta); }}
         />

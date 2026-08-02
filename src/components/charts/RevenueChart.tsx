@@ -23,7 +23,7 @@ interface RevenueChartProps {
 
 const SERIES = [
   { key: 'revenue' as const, label: 'Revenue', color: '#4F46E5', swatch: 'bg-[var(--indigo)]' },
-  { key: 'recovered' as const, label: 'Recovered', color: '#059669', swatch: 'bg-[var(--emerald)]' },
+  { key: 'recovered' as const, label: 'Associated value field', color: '#059669', swatch: 'bg-[var(--emerald)]' },
 ];
 
 function Frame({ fitParent, children }: { fitParent?: boolean; children: React.ReactNode }) {
@@ -94,9 +94,9 @@ function LiveRevenueChart({ fitParent }: { fitParent?: boolean }) {
   );
 
   if (liveLoading && liveData.length === 0) {
-    return <Frame fitParent={fitParent}><div className="w-full h-full flex items-center justify-center rounded-xl border border-dashed border-[var(--b1)] text-xs text-t3">Loading live revenue snapshots...</div></Frame>;
+    return <Frame fitParent={fitParent}><div className="w-full h-full flex items-center justify-center rounded-xl border border-dashed border-[var(--b1)] text-xs text-t3">Loading recorded revenue snapshots...</div></Frame>;
   }
 
-  const emptyMessage = error ? `Revenue chart unavailable: ${error}` : source === 'offline' ? 'No live revenue snapshots returned.' : 'No revenue data available.';
+  const emptyMessage = error ? `Revenue chart unavailable: ${error}` : source === 'offline' ? 'No recorded revenue snapshots were returned.' : 'No revenue data available.';
   return <RevenueChartView data={liveData} emptyMessage={emptyMessage} fitParent={fitParent} />;
 }

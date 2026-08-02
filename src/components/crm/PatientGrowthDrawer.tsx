@@ -31,7 +31,7 @@ export default function PatientGrowthDrawer({ lead, patient, onClose, onNavigate
     return () => { a = false; };
   }, [patient]);
 
-  const consent = patient?.consent ?? lead?.consent ?? { email: true, sms: true, whatsapp: false, voice: true, marketing: false, doNotContact: false, campaignReady: false };
+  const consent = patient?.consent ?? lead?.consent ?? { email: 'unknown', sms: 'unknown', whatsapp: 'unknown', voice: 'unknown', evidenceAvailable: false };
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end" role="dialog" aria-modal="true" aria-label={`${subjectName} growth profile`}>
@@ -60,7 +60,7 @@ export default function PatientGrowthDrawer({ lead, patient, onClose, onNavigate
           {/* Consent */}
           <Block icon={<ShieldCheck className="w-3.5 h-3.5" />} title="Consent & communication">
             <ConsentBadgeGroup consent={consent} />
-            <p className="text-[11px] text-t3 mt-2">Preferred channel: <span className="font-semibold text-t2">{lead?.bestChannel ?? (consent.whatsapp ? 'WhatsApp' : consent.sms ? 'SMS' : 'Email')}</span></p>
+            <p className="text-[11px] text-t3 mt-2">Recorded lead channel: <span className="font-semibold text-t2">{lead?.bestChannel ?? 'Not available'}</span>. Consent and suppression are checked at dispatch.</p>
           </Block>
 
           {/* Value + risk */}
@@ -71,7 +71,7 @@ export default function PatientGrowthDrawer({ lead, patient, onClose, onNavigate
               <Metric label="Last visit" value={patient!.lastVisit ? new Date(patient!.lastVisit).toLocaleDateString() : '—'} />
               <Metric label="Next visit" value={patient!.nextVisit ? new Date(patient!.nextVisit).toLocaleDateString() : 'Not booked'} />
             </> : <>
-              <Metric label="AI score" value={String(lead!.score)} accent={lead!.score >= 70} />
+              <Metric label="Planning priority" value={String(lead!.score)} accent={lead!.score >= 70} />
               <Metric label="Estimated value" value={formatCurrency(lead!.estimatedValue)} />
               <Metric label="Stage" value={lead!.stage.replace('-', ' ')} />
               <Metric label="Age" value={`${lead!.ageDays}d`} />

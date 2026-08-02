@@ -16,7 +16,7 @@ let emails: Record<Role, string>;
 
 async function login(page: Page, role: Role) {
   await page.goto('/login');
-  await page.getByLabel('Email').fill(emails[role]);
+  await page.getByRole('textbox', { name: 'Email', exact: true }).fill(emails[role]);
   await page.getByRole('textbox', { name: /Password/ }).fill(PASSWORD);
   await page.getByRole('button', { name: /^Sign in$/i }).click();
   await expect(page).toHaveURL(/\/$/);
@@ -62,6 +62,12 @@ test.describe('role-aware real-backend route and action crawl', () => {
       await expect(nav.locator('a[href="#"]')).toHaveCount(0);
       await expect(page.locator('button a, a button')).toHaveCount(0);
       await assertAccessibilityContract(page, `${role}:/`);
+
+      // Sidebar authorization is resolved from /auth/me independently of the
+      // protected-layout session. Wait for a role-specific positive grant so
+      // the inventory cannot sample the transient pre-hydration navigation.
+      const hydratedLink = role === 'OWNER' ? '/control-plane' : role === 'AUDITOR' ? '/compliance' : '/ai-receptionist';
+      await expect(nav.locator(`a[href="${hydratedLink}"]`)).toHaveCount(1);
 
       const hrefs = await nav.locator('a').evaluateAll(anchors => [...new Set(anchors.map(anchor => anchor.getAttribute('href')).filter((href): href is string => Boolean(href)))]);
       expect(hrefs.length).toBeGreaterThan(20);

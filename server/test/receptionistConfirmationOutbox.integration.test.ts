@@ -5,7 +5,29 @@ import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const sendMessage = vi.hoisted(() => vi.fn());
 const suppressionGate = vi.hoisted(() => vi.fn());
-vi.mock('../lib/commsProvider', () => ({ sendAuthorizedAppointmentConfirmation: sendMessage }));
+vi.mock('../lib/commsProvider', () => ({
+  sendAuthorizedAppointmentConfirmation: async (
+    channel: 'sms' | 'email',
+    destination: string,
+    subject: string,
+    body: string,
+    idempotencyKey: string,
+    authorization: { tenantId: string; eventId: string; attemptNumber: number },
+  ) => {
+    // Preserve the production one-consumer boundary while replacing only the
+    // external provider response in this outbox-focused test suite.
+    const { fixtureDb } = await import('./helpers/fixtureDb');
+    await fixtureDb.notificationDeliveryAttempt.create({ data: {
+      tenantId: authorization.tenantId,
+      notificationEventId: authorization.eventId,
+      attemptNumber: authorization.attemptNumber,
+      phase: 'SUBMISSION_CLAIM',
+      status: 'submission_claimed',
+      completedAt: new Date(),
+    } });
+    return sendMessage(channel, destination, subject, body, idempotencyKey, authorization);
+  },
+}));
 vi.mock('../lib/receptionist/dncFence', async importOriginal => {
   const actual = await importOriginal<typeof import('../lib/receptionist/dncFence')>();
   suppressionGate.mockImplementation(actual.isChannelSuppressedTx);
@@ -62,7 +84,7 @@ async function fixture(options: FixtureOptions = {}) {
       idempotencyKey: `${appointment.id}:sms`, status: 'queued',
       attempts: 0, maxAttempts: options.maxAttempts ?? 5,
       nextAttemptAt: options.nextAttemptAt === undefined ? new Date() : options.nextAttemptAt,
-      consentChecked: false, consentResult: options.consentResult ?? 'granted_unchecked',
+      consentChecked: false, consentResult: options.consentResult ?? 'not_recorded_transactional',
     },
   });
   if (event && options.eventStatus && options.eventStatus !== 'queued') {
@@ -136,7 +158,7 @@ describeDisposable('receptionist confirmation outbox — durable provider bounda
     const event = await db.notificationEvent.findUniqueOrThrow({ where: { id: item.event!.id } });
     expect(event).toMatchObject({
       status: 'accepted', attempts: 1, provider: 'mock', providerMessageId: 'provider-accepted-1',
-      consentChecked: true, consentResult: 'granted', failureReason: null,
+      consentChecked: true, consentResult: 'not_suppressed_transactional', failureReason: null,
     });
     expect(event.acceptedAt).not.toBeNull();
     expect(event.sentAt).toBeNull();
@@ -160,10 +182,12 @@ describeDisposable('receptionist confirmation outbox — durable provider bounda
       { phase: 'INTENT', status: 'started' },
       { phase: 'PROVIDER_INTENT', status: 'provider_intent_committed' },
       { phase: 'RESULT', status: 'accepted' },
+      { phase: 'SUBMISSION_CLAIM', status: 'submission_claimed' },
     ]);
     expect(attempts[0]!.completedAt).toBeNull();
     expect(attempts[1]!.completedAt).not.toBeNull();
     expect(attempts[2]!.completedAt).not.toBeNull();
+    expect(attempts[3]!.completedAt).not.toBeNull();
 
     await expect(dispatch(item.tenantId)).resolves.toEqual({ scanned: 0 });
     await expect(processConfirmations(item, true)).resolves.toMatchObject({ sms: { status: 'already_accepted', acceptedNow: false } });
@@ -237,7 +261,7 @@ describeDisposable('receptionist confirmation outbox — durable provider bounda
     expect(result.status).toBe('failed');
   });
 
-  it('quarantines an expired lease after committed provider intent because acceptance is unknowable', async () => {
+  it('quarantines an expired lease after a consumed submission claim because acceptance is unknowable', async () => {
     const item = await fixture({
       eventStatus: 'retrying', attempts: 1, nextAttemptAt: null,
       updatedAt: new Date(Date.now() - 6 * 60_000),
@@ -245,6 +269,10 @@ describeDisposable('receptionist confirmation outbox — durable provider bounda
     await db.notificationDeliveryAttempt.create({ data: {
       tenantId: item.tenantId, notificationEventId: item.event!.id,
       attemptNumber: 1, phase: 'PROVIDER_INTENT', status: 'provider_intent_committed', completedAt: new Date(),
+    } });
+    await db.notificationDeliveryAttempt.create({ data: {
+      tenantId: item.tenantId, notificationEventId: item.event!.id,
+      attemptNumber: 1, phase: 'SUBMISSION_CLAIM', status: 'submission_claimed', completedAt: new Date(),
     } });
 
     await expect(dispatch(item.tenantId)).resolves.toEqual({ scanned: 1 });
@@ -439,9 +467,10 @@ describeDisposable('receptionist confirmation outbox — durable provider bounda
   });
 
   it.each([
-    { label: 'explicit true', consent: true, persisted: 'granted_unchecked', final: 'granted' },
+    { label: 'explicit true preference', consent: true, persisted: 'not_recorded_transactional', final: 'not_suppressed_transactional' },
+    { label: 'legacy granted-looking evidence', consent: true, persisted: 'granted_unchecked', final: 'not_suppressed_transactional' },
     { label: 'absent', consent: null, persisted: 'not_recorded_transactional', final: 'not_suppressed_transactional' },
-  ] as const)('allows $label transactional confirmation while preserving consent evidence', async ({ consent, persisted, final }) => {
+  ] as const)('allows $label transactional confirmation without minting channel consent', async ({ consent, persisted, final }) => {
     const item = await fixture({ consentResult: persisted });
     sendMessage.mockResolvedValue({ ok: true, status: 'sent', mode: 'mock_dev', providerMessageId: `provider-${final}` });
 

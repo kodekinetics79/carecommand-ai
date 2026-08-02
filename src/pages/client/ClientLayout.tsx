@@ -44,7 +44,7 @@ export default function ClientLayout() {
           <div className="w-8 h-8 rounded-lg bg-[var(--indigo)] grid place-items-center shrink-0"><HeartPulse className="w-4 h-4 text-white" /></div>
           <div className="min-w-0 leading-tight">
             <p className="text-sm font-bold text-t1 truncate">{me?.clinicName ?? 'Patient Portal'}</p>
-            <p className="text-[10px] text-t3">Secure patient portal · live customer workspace</p>
+            <p className="text-[10px] text-t3">Patient portal · clinic-managed workspace</p>
           </div>
         </div>
         <div className="flex items-center gap-3">
@@ -59,7 +59,7 @@ export default function ClientLayout() {
             <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-t3">Clinic-defined access</p>
             <p className="mt-1 text-[12px] text-t2 truncate">The clinic decides which patient features are visible in this portal.</p>
           </div>
-          <span className="badge badge-blue shrink-0">Pilot</span>
+          <span className="badge badge-blue shrink-0">Clinic managed</span>
         </div>
       </div>
 

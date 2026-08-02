@@ -1,10 +1,34 @@
 # Evidence Ledger
 
-Last updated: 2026-07-20
+Last updated: 2026-07-31
 
 This ledger records evidence that was actually executed in the local enterprise
 readiness pass. It separates proven local/sandbox behavior from items that must
 be proven in the client's connected environment.
+
+## 2026-07-31 Final SME Convergence Snapshot
+
+This is the current working-candidate evidence. Earlier dated sections remain
+historical and must not be used as current test or migration counts.
+
+| Evidence | Current result |
+| --- | --- |
+| Full application gate | PASS: Prisma validation, server typecheck, ESLint, TypeScript and production Vite build |
+| Full disposable Vitest run | PASS: 106 files, 1,878/1,878 tests |
+| Real-backend Playwright | PASS: 10/10 desktop/mobile journeys, including patient booking/insurance and Owner, Front Desk, and Auditor crawls |
+| RLS catalog and behavior | PASS: 131 application tables, 123 protected, 8 exemptions, 522 policies, ENABLE/FORCE 123/123; 994/994 behavioral assertions |
+| Database lifecycle | PASS: all 86 migrations, deterministic seed, backup/restore parity, RLS topology and 123 tenant-integrity FKs |
+| Prisma drift | PASS: only 123 migration-owned composite FKs and 138 migration-owned indexes differ from the Prisma schema |
+| Production engineering | PASS: 2 files, 32/32 tests; production artifact scanner passed |
+| Dependency integrity | PASS: zero production vulnerabilities at moderate threshold; 575 verified signatures and 194 attestations |
+| Software bill of materials | Generated CycloneDX 1.5 SBOM with 629 components at `/tmp/carecommand-ai-sbom.json` |
+| Credential scan | No Retell-style credential literal in the worktree or Git history; the disclosed credential still requires external rotation |
+
+No repository-fixable P0, P1, or P2 finding remained open after delivery-pod
+and independent-challenge review. This is local synthetic evidence and
+compliance readiness work, not production validation or certification. See
+`docs/testing/FINAL_RELEASE_CANDIDATE_REPORT_2026-07-31.md` for the verdicts and
+external activation gates.
 
 ## Environment
 

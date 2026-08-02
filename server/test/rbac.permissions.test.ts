@@ -96,6 +96,15 @@ describe('permission/action RBAC — backend-enforced, tenant-customisable', () 
     expect((await createPatient(t, t.users.FRONT_DESK)).statusCode).toBe(403); // enforced revocation
   });
 
+  it('an explicit empty override is deny-all and deleting it restores code defaults', async () => {
+    const t = await makeTenant();
+    expect((await createPatient(t, t.users.FRONT_DESK)).statusCode).toBe(201);
+    await setOverride(t.id, 'Front Desk', []);
+    expect((await createPatient(t, t.users.FRONT_DESK)).statusCode).toBe(403);
+    await db.roleDefinition.delete({ where: { tenantId_name: { tenantId: t.id, name: 'Front Desk' } } });
+    expect((await createPatient(t, t.users.FRONT_DESK)).statusCode).toBe(201);
+  });
+
   it('overrides are tenant-scoped: a grant in tenant A does not leak to tenant B', async () => {
     const [a, b] = [await makeTenant(), await makeTenant()];
     await setOverride(a.id, 'Provider', ['patient:read', 'patient:write']);

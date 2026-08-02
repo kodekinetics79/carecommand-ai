@@ -258,6 +258,8 @@ export interface AdvisoryAction {
 export interface AdvisorResponse {
   advisorType: AdvisorType;
   answer: string;
+  answerSource: 'model' | 'rule-based';
+  methodology: string;
   summary: string;
   diagnosis: string;
   recommendedAction: string;

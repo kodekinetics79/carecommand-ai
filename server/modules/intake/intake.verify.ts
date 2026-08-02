@@ -84,7 +84,7 @@ async function main() {
   await pub('POST', `/v1/intake/public/${token}/sections`, { sectionType: 'communication_consent', data: { sms: false, email: true } });
   const smsConsent = await ownerDb.communicationConsent.findFirst({ where: { tenantId: tA.id, patientId: tA.patientId, channel: 'sms' } });
   const emailConsent = await ownerDb.communicationConsent.findFirst({ where: { tenantId: tA.id, patientId: tA.patientId, channel: 'email' } });
-  check('8/9. consent updates CommunicationConsent (sms opted_out, email opted_in)', smsConsent?.status === 'opted_out' && emailConsent?.status === 'opted_in');
+  check('8/9. generic intake records opt-out but cannot grant email authority', smsConsent?.status === 'opted_out' && !emailConsent);
   const consentRec = await ownerDb.patientConsentRecord.findFirst({ where: { tenantId: tA.id, packetId: packet.intakePacketId, consentType: 'communication_sms' } });
   check('10. PatientConsentRecord captured (no fabricated opt-in)', consentRec?.status === 'declined');
 
@@ -109,10 +109,11 @@ async function main() {
   const estAudit = await ownerDb.auditEvent.findFirst({ where: { tenantId: tA.id, action: 'intake.consent.accepted' } });
   check('13. estimate acknowledgement records consent + audit', estConsent?.status === 'accepted' && !!estAudit);
 
-  // 14) Payment policy section does not fake payment.
-  await pub('POST', `/v1/intake/public/${token}/sections`, { sectionType: 'payment_policy', data: { accepted: true, acknowledgementId: INTAKE_ACKNOWLEDGEMENTS.payment_policy.id } });
+  // 14) Payment-policy acknowledgement is disabled until exact versioned
+  // clinic policy text exists, and it never fakes a payment.
+  const paymentPolicy = await pub('POST', `/v1/intake/public/${token}/sections`, { sectionType: 'payment_policy', data: { accepted: true, acknowledgementId: 'payment_policy:v1' } });
   const dep = await ownerDb.depositRequirement.findFirst({ where: { tenantId: tA.id, appointmentId: appt.id } });
-  check('14. payment policy ack does NOT mark deposit paid', dep?.status === 'required');
+  check('14. unavailable payment policy cannot be acknowledged or mark deposit paid', paymentPolicy.statusCode === 400 && dep?.status === 'required');
 
   // 6 + 17) Final submit (idempotent) + gaps create signals/recs/task without dupes.
   const submit1 = JSON.parse((await pub('POST', `/v1/intake/public/${token}/submit`)).body);

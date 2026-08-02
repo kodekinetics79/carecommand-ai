@@ -37,7 +37,7 @@ developer profiles and must not be presented as full pilot production stacks.
    Tenant and platform runtime URLs are optional defense-in-depth comparisons and
    should not be copied into the release job solely for this check.
 5. Start the API and worker, then verify `/health/live`, `/health/ready`,
-   `/health/integrations`, `/health/slo`, and protected metrics on both targets.
+   monitoring-authenticated `/health/integrations`, `/health/slo`, and protected metrics on both targets.
 6. Run smoke, browser, RLS, webhook, worker retry, and PHI-canary tests against
    synthetic data only.
 7. Capture deployment ID, image/commit SHA, migration version, provider modes,

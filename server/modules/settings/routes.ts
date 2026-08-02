@@ -584,39 +584,83 @@ export const settingsRoutes: FastifyPluginAsync = async app => {
 
   app.post('/roles', { preHandler: writeRoles }, async (request, reply) => {
     const { permissions, ...input } = roleCreate.parse(request.body);
-    const row = await db.roleDefinition.create({
-      data: {
-        tenantId: request.auth.tenantId,
-        ...input,
-        ...(permissions !== undefined ? { permissions: sanitizePermissions(permissions) } : {}),
-      },
+    const sanitizedPermissions = permissions === undefined ? undefined : sanitizePermissions(permissions);
+    const row = await runWithTenantContext(request.auth.tenantId, async tx => {
+      const created = await tx.roleDefinition.create({
+        data: {
+          tenantId: request.auth.tenantId,
+          ...input,
+          ...(sanitizedPermissions !== undefined ? { permissions: sanitizedPermissions } : {}),
+        },
+      });
+      await tx.auditEvent.create({
+        data: {
+          tenantId: request.auth.tenantId,
+          actorUserId: request.auth.userId,
+          action: 'role.created',
+          resource: 'roleDefinition',
+          resourceId: created.id,
+          requestId: request.id,
+          ipAddress: request.ip,
+          userAgent: request.headers['user-agent'],
+          metadata: sanitizedPermissions !== undefined ? { permissions: sanitizedPermissions } : undefined,
+        },
+      });
+      return created;
     });
-    await audit(request, { action: 'role.created', resource: 'roleDefinition', resourceId: row.id, metadata: permissions !== undefined ? { permissions: sanitizePermissions(permissions) } : undefined });
     return reply.code(201).send(row);
   });
 
   app.patch('/roles/:id', { preHandler: writeRoles }, async request => {
     const { id } = idParam.parse(request.params);
     const { permissions, ...input } = roleUpdate.parse(request.body);
-    const existing = await db.roleDefinition.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Role not found');
-    const row = await db.roleDefinition.update({
-      where: { id },
-      data: {
-        ...input,
-        ...(permissions !== undefined ? { permissions: sanitizePermissions(permissions) } : {}),
-      },
+    const sanitizedPermissions = permissions === undefined ? undefined : sanitizePermissions(permissions);
+    return runWithTenantContext(request.auth.tenantId, async tx => {
+      const existing = await tx.roleDefinition.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+      if (!existing) throw app.httpErrors.notFound('Role not found');
+      const row = await tx.roleDefinition.update({
+        where: { id },
+        data: {
+          ...input,
+          ...(sanitizedPermissions !== undefined ? { permissions: sanitizedPermissions } : {}),
+        },
+      });
+      await tx.auditEvent.create({
+        data: {
+          tenantId: request.auth.tenantId,
+          actorUserId: request.auth.userId,
+          action: 'role.updated',
+          resource: 'roleDefinition',
+          resourceId: id,
+          requestId: request.id,
+          ipAddress: request.ip,
+          userAgent: request.headers['user-agent'],
+          metadata: sanitizedPermissions !== undefined ? { permissions: sanitizedPermissions } : undefined,
+        },
+      });
+      return row;
     });
-    await audit(request, { action: 'role.updated', resource: 'roleDefinition', resourceId: id, metadata: permissions !== undefined ? { permissions: sanitizePermissions(permissions) } : undefined });
-    return row;
   });
 
   app.delete('/roles/:id', { preHandler: writeRoles }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
-    const existing = await db.roleDefinition.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Role not found');
-    await db.roleDefinition.delete({ where: { id } });
-    await audit(request, { action: 'role.deleted', resource: 'roleDefinition', resourceId: id });
+    await runWithTenantContext(request.auth.tenantId, async tx => {
+      const existing = await tx.roleDefinition.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+      if (!existing) throw app.httpErrors.notFound('Role not found');
+      await tx.roleDefinition.delete({ where: { id } });
+      await tx.auditEvent.create({
+        data: {
+          tenantId: request.auth.tenantId,
+          actorUserId: request.auth.userId,
+          action: 'role.deleted',
+          resource: 'roleDefinition',
+          resourceId: id,
+          requestId: request.id,
+          ipAddress: request.ip,
+          userAgent: request.headers['user-agent'],
+        },
+      });
+    });
     return reply.code(204).send();
   });
 
@@ -1009,20 +1053,29 @@ export const securityRoutes: FastifyPluginAsync = async app => {
 
   app.post('/sessions/:userId/revoke', { preHandler: ownerAdminRoles }, async (request, reply) => {
     const { userId } = z.object({ userId: uuid }).parse(request.params);
-    const existing = await db.user.findFirst({ where: { id: userId, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Session not found');
-    await db.user.update({
-      where: { id: userId },
-      data: {
-        refreshTokenHash: null,
-        refreshTokenExpiresAt: null,
-      },
-    });
-    await audit(request, {
-      action: 'auth.session.revoked',
-      resource: 'session',
-      resourceId: userId,
-      metadata: { reason: 'admin-revoked' },
+    await runWithTenantContext(request.auth.tenantId, async tx => {
+      const existing = await tx.user.findFirst({ where: { id: userId, tenantId: request.auth.tenantId } });
+      if (!existing) throw app.httpErrors.notFound('Session not found');
+      await tx.user.update({
+        where: { id: userId },
+        data: {
+          refreshTokenHash: null,
+          refreshTokenExpiresAt: null,
+        },
+      });
+      await tx.auditEvent.create({
+        data: {
+          tenantId: request.auth.tenantId,
+          actorUserId: request.auth.userId,
+          action: 'auth.session.revoked',
+          resource: 'session',
+          resourceId: userId,
+          requestId: request.id,
+          ipAddress: request.ip,
+          userAgent: request.headers['user-agent'],
+          metadata: { reason: 'admin-revoked' },
+        },
+      });
     });
     return reply.code(204).send();
   });

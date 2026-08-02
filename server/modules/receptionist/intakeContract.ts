@@ -237,7 +237,10 @@ function propertyFor(field: IntakeFieldConfiguration, locationIds: string[]): Re
     case 'REASON_FOR_VISIT':
     case 'CUSTOM_TEXT': return stringProperty(field.label, 300);
     case 'LANGUAGE_PREFERENCE': return stringProperty(field.label, 80);
-    case 'CONSENT':
+    case 'CONSENT': return {
+      type: 'boolean',
+      description: `${field.label}. Non-authorizing appointment-notification preference only; never marketing consent.`,
+    };
     case 'CUSTOM_YES_NO': return { type: 'boolean', description: field.label };
     case 'CUSTOM_DROPDOWN': return stringProperty(field.label, 120, { enum: field.options ?? [] });
   }

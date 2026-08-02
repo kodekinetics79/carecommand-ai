@@ -37,10 +37,12 @@ export default function Dashboard() {
   const [actions, setActions] = useState<PriorityAction[]>([]);
   const [loading, setLoading] = useState(true);
   const [actionsLoading, setActionsLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [actionsError, setActionsError] = useState<string | null>(null);
   const [drawerAction, setDrawerAction] = useState<PriorityAction | null>(null);
 
   // One snapshots fetch feeds both the deck sparkline and the revenue chart.
-  const { data: snapshots, loading: snapshotsLoading } = useApiResource<ApiRevenueSnapshot, RevenueChartRow>(
+  const { data: snapshots, loading: snapshotsLoading, error: snapshotsError } = useApiResource<ApiRevenueSnapshot, RevenueChartRow>(
     '/v1/revenue-snapshots?limit=100',
     [],
     mapRevenueSnapshot,
@@ -52,18 +54,30 @@ export default function Dashboard() {
   useEffect(() => {
     let active = true;
     void (async () => {
-      const [s, b, p, c] = await Promise.all([
-        dashboardService.getSummary().catch(() => null),
-        dashboardService.getBranchHealth().catch(() => []),
-        dashboardService.getProviderUtilization().catch(() => []),
-        dashboardService.getCampaignROI().catch(() => []),
-      ]);
-      if (!active) return;
-      setSummary(s); setBranches(b); setProviders(p); setCampaigns(c); setLoading(false);
+      try {
+        const [s, b, p, c] = await Promise.all([
+          dashboardService.getSummary(),
+          dashboardService.getBranchHealth(),
+          dashboardService.getProviderUtilization(),
+          dashboardService.getCampaignROI(),
+        ]);
+        if (!active) return;
+        setSummary(s); setBranches(b); setProviders(p); setCampaigns(c); setLoadError(null);
+      } catch {
+        if (active) setLoadError('Dashboard summary and operational panels are unavailable. No zero or healthy-state conclusions should be drawn.');
+      } finally {
+        if (active) setLoading(false);
+      }
     })();
     void (async () => {
-      const a = await dashboardService.getPriorityActions().catch(() => []);
-      if (active) { setActions(a); setActionsLoading(false); }
+      try {
+        const a = await dashboardService.getPriorityActions();
+        if (active) { setActions(a); setActionsError(null); }
+      } catch {
+        if (active) setActionsError('Priority queue unavailable; an empty queue cannot be inferred.');
+      } finally {
+        if (active) setActionsLoading(false);
+      }
     })();
     return () => { active = false; };
   }, []);
@@ -84,35 +98,37 @@ export default function Dashboard() {
       <div className="dash-deck">
         {summary
           ? <CommandDeck summary={summary} spark={spark} onNavigate={navigate} />
-          : <div className="skeleton-line h-full min-h-[132px] rounded-2xl" />}
+          : loadError ? <UnavailablePanel message={loadError} /> : <div className="skeleton-line h-full min-h-[132px] rounded-2xl" />}
       </div>
 
       {/* KPI ribbon */}
       <div className="dash-kpis grid gap-2.5 grid-cols-2 lg:grid-cols-4">
-        {loading || !summary ? (
+        {loadError ? (
+          <div role="alert" className="col-span-full rounded-xl border border-red-soft bg-red-soft p-4 text-sm font-semibold text-red-v">KPI data unavailable; zero values are not being shown.</div>
+        ) : loading || !summary ? (
           [0, 1, 2, 3].map(i => <div key={i} className="skeleton-line h-[92px] rounded-xl" />)
         ) : (
           <>
             <StatTile label="Today's appointments" value={summary.todaysAppointments} subtitle="Across your scope" icon={<CalendarDays className="w-4 h-4" />} accent="blue" onClick={() => navigate('/scheduling')} />
             <StatTile label="Active patients" value={summary.activeCustomers} subtitle="Engaged base" icon={<Users className="w-4 h-4" />} accent="cyan" onClick={() => navigate('/patients')} />
-            <StatTile label="Patients at risk" value={summary.noShowRisk} subtitle="No-show flagged today" icon={<AlertCircle className="w-4 h-4" />} accent="red" onClick={() => navigate('/scheduling')} />
-            <StatTile label="Calls recovered" value={summary.callsRecovered}
+            <StatTile label="No-show flags" value={summary.noShowRisk} subtitle="Appointments flagged today" icon={<AlertCircle className="w-4 h-4" />} accent="red" onClick={() => navigate('/scheduling')} />
+            <StatTile label="Call conversations with staff reply evidence" value={summary.callsRecovered}
               format={n => `${Math.round(n)}/${summary.callsRecovered + summary.missedCalls}`}
               meter={summary.callsRecovered + summary.missedCalls > 0 ? summary.callsRecovered / (summary.callsRecovered + summary.missedCalls) : 0}
-              subtitle="Follow-up queue" icon={<Phone className="w-4 h-4" />} accent="amber" onClick={() => navigate('/ai-receptionist')} />
+              subtitle="Provider-accepted staff replies / accepted + unread; delivery not implied" icon={<Phone className="w-4 h-4" />} accent="amber" onClick={() => navigate('/ai-receptionist')} />
           </>
         )}
       </div>
 
       {/* Visualization row — money + capacity */}
       <div className="dash-viz">
-        <BentoCard className="cockpit-card" title="Revenue Performance" subtitle="Recovery & growth trend"
+        <BentoCard className="cockpit-card" title="Revenue snapshot trend" subtitle="Recorded revenue and associated-value fields"
           headerRight={<LineChart className="w-4 h-4 text-violet-v" aria-hidden="true" />}>
-          <RevenueChart data={snapshots} loading={snapshotsLoading} fitParent />
+          {snapshotsError ? <UnavailablePanel message="Revenue snapshots unavailable; no empty or zero trend is inferred." /> : <RevenueChart data={snapshots} loading={snapshotsLoading} fitParent />}
         </BentoCard>
-        <BentoCard className="cockpit-card" title="Provider Capacity" subtitle="Utilization mix & ranking"
+        <BentoCard className="cockpit-card" title="Provider Capacity" subtitle="Recorded utilization, ordered highest to lowest"
           headerRight={<Gauge className="w-4 h-4 text-indigo" aria-hidden="true" />}>
-          {loading ? <div className="skeleton-line h-full min-h-[140px] rounded-xl" /> : (
+          {loadError ? <UnavailablePanel message="Provider capacity data unavailable." /> : loading ? <div className="skeleton-line h-full min-h-[140px] rounded-xl" /> : (
             <Suspense fallback={<div className="skeleton-line h-full min-h-[140px] rounded-xl" />}>
               <ProviderUtilizationPanel providers={providers} />
             </Suspense>
@@ -122,39 +138,43 @@ export default function Dashboard() {
 
       {/* Operations row — locations + growth */}
       <div className="dash-ops">
-        <BentoCard className="cockpit-card" title="Branch Health" subtitle="Derived from live provider capacity"
-          headerRight={branches.length > 0 ? <span className="text-xs font-semibold text-t3 bg-[var(--s3)] px-2.5 py-1 rounded-full">Avg {avgHealth}/100</span> : undefined}>
-          {loading ? (
+        <BentoCard className="cockpit-card" title="Branch Capacity Planning" subtitle="Unvalidated fixed index from utilization and recorded ratings"
+          headerRight={branches.length > 0 ? <span className="text-xs font-semibold text-t3 bg-[var(--s3)] px-2.5 py-1 rounded-full">Planning avg {avgHealth}/100</span> : undefined}>
+          {loadError ? <UnavailablePanel message="Branch data unavailable; no healthy or empty state is inferred." /> : loading ? (
             <div className="space-y-2.5"><div className="skeleton-line h-20 rounded-xl" /><div className="skeleton-line h-20 rounded-xl" /></div>
           ) : branches.length === 0 ? (
-            <p className="text-xs text-t3 py-4 text-center">No branch data available.</p>
+            <p className="text-xs text-t3 py-4 text-center">The loaded dataset contains no branches.</p>
           ) : (
             <div className="space-y-2.5">
               {branches.map(b => <BranchHealthCard key={b.id} branch={b} onOpen={() => navigate('/scheduling')} />)}
             </div>
           )}
         </BentoCard>
-        <BentoCard className="cockpit-card" title="Campaign ROI" subtitle="Reactivation & recall performance"
+        <BentoCard className="cockpit-card" title="Campaign performance evidence" subtitle="Stored audience, booking, and associated-value fields; causation not established"
           headerRight={<button type="button" onClick={() => navigate('/campaigner')} className="text-xs font-semibold text-indigo hover:opacity-75 inline-flex items-center gap-1"><BarChart3 className="w-3.5 h-3.5" aria-hidden="true" /> All campaigns</button>}>
-          {loading ? <SkeletonPanel rows={3} className="!border-0 !shadow-none !p-0" />
+          {loadError ? <UnavailablePanel message="Campaign data unavailable; no campaign-performance conclusion is inferred." /> : loading ? <SkeletonPanel rows={3} className="!border-0 !shadow-none !p-0" />
             : <CampaignROIPanel campaigns={campaigns} onViewAll={() => navigate('/campaigner')} onCreate={() => navigate('/campaigner')} />}
         </BentoCard>
       </div>
 
       {/* Priority queue — full-height rail, scrolls internally */}
       <div className="dash-rail">
-        <PriorityActionRail
+        {actionsError ? <UnavailablePanel message={actionsError} /> : <PriorityActionRail
           actions={actions}
           loading={actionsLoading}
           onOpen={setDrawerAction}
           onCta={openCta}
           onCreateCampaign={() => navigate('/campaigner')}
-        />
+        />}
       </div>
 
       {drawerAction && <ActionDrawer action={drawerAction} onClose={() => setDrawerAction(null)} onNavigate={(r) => { setDrawerAction(null); navigate(r); }} />}
     </div>
   );
+}
+
+function UnavailablePanel({ message }: { message: string }) {
+  return <div role="alert" className="flex h-full min-h-[96px] items-center justify-center rounded-xl border border-red-soft bg-red-soft p-4 text-center text-xs font-semibold text-red-v">{message}</div>;
 }
 
 function CurrencyLanguagePicker() {

@@ -3,9 +3,9 @@ import { db } from '../db';
 import { deleteCallData } from '../retell';
 import type { Prisma } from '../../generated/prisma/client';
 
-export const RECORDING_DISCLOSURE_POLICY_VERSION = '2026-07-28.1';
+export const RECORDING_DISCLOSURE_POLICY_VERSION = '2026-07-31.1';
 export const RECORDING_DISCLOSURE_EVIDENCE_TEMPLATE =
-  "Hi, I'm {{agent_name}}, an AI assistant for {{clinic_name}}. This call may be recorded or monitored for quality and documentation. Is that okay?{{clinic_disclosure}}";
+  "Hi, I'm {{agent_name}}, an AI assistant for {{clinic_name}}. This call may be recorded or monitored for quality and documentation.{{clinic_disclosure}} Is that okay?";
 export const DEFAULT_RECORDING_RETENTION_DAYS = 30;
 export const DEFAULT_TRANSCRIPT_RETENTION_DAYS = 90;
 
@@ -15,9 +15,13 @@ export function disclosureEvidenceHash(disclosure: string): string {
 
 /** Single source of truth for the exact disclosure spoken and hashed. */
 export function renderRecordingDisclosure(input: { agentName: string; clinicName: string; clinicDisclosure?: string | null }): string {
-  const baseline = `Hi, I'm ${input.agentName}, an AI assistant for ${input.clinicName}. This call may be recorded or monitored for quality and documentation. Is that okay?`;
+  const baseline = `Hi, I'm ${input.agentName}, an AI assistant for ${input.clinicName}. This call may be recorded or monitored for quality and documentation.`;
   const clinicDisclosure = input.clinicDisclosure?.trim();
-  return clinicDisclosure ? `${baseline} ${clinicDisclosure}` : baseline;
+  // Supplemental clinic/jurisdiction language is part of the disclosure, not
+  // speech that may follow the consent question. Keeping the question last
+  // makes the provider begin-message an unambiguous consent turn: the agent
+  // must wait for the caller instead of continuing into a greeting or offer.
+  return `${baseline}${clinicDisclosure ? ` ${clinicDisclosure}` : ''} Is that okay?`;
 }
 
 async function retentionDeadline(

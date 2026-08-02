@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { afterAll, describe, expect, it } from 'vitest';
 import { fixtureDb } from './helpers/fixtureDb';
 import { inspectTenantIntegrityManifest, TENANT_INTEGRITY_MANIFEST } from '../modules/platform/prismaDriftGuard';
@@ -41,18 +42,32 @@ describe('dedicated platform database plane', () => {
     const expected = await fixtureDb.$queryRaw<Array<{ tenants: bigint; active: bigint }>>`
       SELECT count(*) AS tenants, count(*) FILTER (WHERE status='active') AS active FROM "Tenant"
     `;
-    const actor = await fixtureDb.platformUser.findFirstOrThrow({ where: { status: 'active' }, select: { id: true, role: true } });
-    const actual = await fixtureDb.$transaction(async tx => {
-      await tx.$executeRaw`SELECT set_config('app.current_platform_actor_id', ${actor.id}, true), set_config('app.current_platform_actor_role', ${actor.role}, true)`;
-      await tx.$executeRawUnsafe('SET LOCAL ROLE app_platform');
-      return tx.$queryRaw<Array<{ tenants: bigint; active_tenants: bigint }>>`SELECT tenants, active_tenants FROM app_platform_overview()`;
+    const actor = await fixtureDb.platformUser.create({
+      data: {
+        id: randomUUID(),
+        email: `database-plane-${randomUUID()}@platform.test`,
+        name: 'Database Plane Test Operator',
+        passwordHash: 'test-only-not-an-authentication-credential',
+        role: 'PLATFORM_AUDITOR',
+        status: 'active',
+      },
+      select: { id: true, role: true },
     });
-    expect(actual[0]?.tenants).toBe(expected[0]?.tenants);
-    expect(actual[0]?.active_tenants).toBe(expected[0]?.active);
-    await expect(fixtureDb.$transaction(async tx => {
-      await tx.$executeRawUnsafe('SET LOCAL ROLE app_platform');
-      await tx.$queryRawUnsafe('SELECT * FROM app_platform_overview()');
-    })).rejects.toThrow(/platform_actor_required|permission denied/i);
+    try {
+      const actual = await fixtureDb.$transaction(async tx => {
+        await tx.$executeRaw`SELECT set_config('app.current_platform_actor_id', ${actor.id}, true), set_config('app.current_platform_actor_role', ${actor.role}, true)`;
+        await tx.$executeRawUnsafe('SET LOCAL ROLE app_platform');
+        return tx.$queryRaw<Array<{ tenants: bigint; active_tenants: bigint }>>`SELECT tenants, active_tenants FROM app_platform_overview()`;
+      });
+      expect(actual[0]?.tenants).toBe(expected[0]?.tenants);
+      expect(actual[0]?.active_tenants).toBe(expected[0]?.active);
+      await expect(fixtureDb.$transaction(async tx => {
+        await tx.$executeRawUnsafe('SET LOCAL ROLE app_platform');
+        await tx.$queryRawUnsafe('SELECT * FROM app_platform_overview()');
+      })).rejects.toThrow(/platform_actor_required|permission denied/i);
+    } finally {
+      await fixtureDb.platformUser.delete({ where: { id: actor.id } });
+    }
   });
 
   it('preserves the SQL-owned tenant-integrity manifest', async () => {

@@ -5,7 +5,11 @@ const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 
 /** Provision a disposable/local app_platform login for automated tests only. */
 export async function ensurePlatformTestDatabaseUrl(): Promise<string> {
-  if (process.env.PLATFORM_DATABASE_URL) {
+  // A disposable lifecycle must keep both database planes on its generated
+  // database. An inherited local URL would make platform requests read a
+  // different catalog from the owner-only fixtures.
+  const disposableDatabase = process.env.RLS_DISPOSABLE_DB;
+  if (!disposableDatabase && process.env.PLATFORM_DATABASE_URL) {
     const configured = new URL(process.env.PLATFORM_DATABASE_URL);
     if (configured.username !== 'app_platform') throw new Error('Test PLATFORM_DATABASE_URL must use app_platform.');
     return configured.toString();
@@ -14,6 +18,9 @@ export async function ensurePlatformTestDatabaseUrl(): Promise<string> {
   const ownerUrl = new URL(process.env.DATABASE_MIGRATION_URL);
   if (!LOCAL_HOSTS.has(ownerUrl.hostname)) {
     throw new Error('Refusing to provision app_platform credentials on a non-local database.');
+  }
+  if (disposableDatabase && decodeURIComponent(ownerUrl.pathname.slice(1)) !== disposableDatabase) {
+    throw new Error('Disposable platform test database must match RLS_DISPOSABLE_DB.');
   }
   const owner = new Pool({ connectionString: ownerUrl.toString(), max: 1 });
   try {

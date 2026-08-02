@@ -16,6 +16,8 @@ vi.mock('../workers/queues', () => ({
 const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { generatePasswordHash, hashRefreshToken } = await import('../lib/security');
+const { env } = await import('../config/env');
+const { TENANT_LOGIN_DUMMY_HASH, verifyTenantLoginPassword } = await import('../modules/auth/routes');
 
 let app: FastifyInstance;
 const createdTenantIds: string[] = [];
@@ -66,6 +68,89 @@ afterAll(async () => {
 });
 
 describe('tenant authentication session lifecycle', () => {
+  it('performs fixed-cost password verification for an unknown tenant identity', async () => {
+    const verifier = vi.fn(async () => false);
+    await expect(verifyTenantLoginPassword('unknown-password', undefined, verifier)).resolves.toBe(false);
+    expect(verifier).toHaveBeenCalledExactlyOnceWith('unknown-password', TENANT_LOGIN_DUMMY_HASH);
+  });
+
+  it('serializes concurrent failed-login accounting and locks at the exact threshold', async () => {
+    const account = await makeLoginUser();
+    await db.tenantSecurityPolicy.upsert({
+      where: { tenantId: account.tenantId },
+      update: { failedLoginLockout: true },
+      create: { tenantId: account.tenantId, failedLoginLockout: true },
+    });
+
+    const attempts = await Promise.all(Array.from({ length: env.AUTH_LOCKOUT_THRESHOLD }, (_, index) => app.inject({
+      method: 'POST',
+      url: '/v1/auth/login',
+      headers: { 'x-forwarded-for': `198.51.100.${index + 10}` },
+      payload: { email: account.email, password: 'Concurrent-Wrong-Password-2026!' },
+    })));
+    expect(attempts.every(response => response.statusCode === 401)).toBe(true);
+    const locked = await db.user.findUniqueOrThrow({ where: { id: account.userId } });
+    expect(locked.lockedUntil?.getTime()).toBeGreaterThan(Date.now());
+    expect(locked.failedLoginCount).toBe(0);
+    expect(await db.auditEvent.count({
+      where: { tenantId: account.tenantId, actorUserId: account.userId, action: 'auth.login.failed' },
+    })).toBe(env.AUTH_LOCKOUT_THRESHOLD);
+    expect(await db.auditEvent.count({
+      where: { tenantId: account.tenantId, actorUserId: account.userId, action: 'auth.login.lockout' },
+    })).toBe(1);
+  });
+
+  it('atomically consumes one reset token and immediately revokes the prior access session', async () => {
+    const account = await makeLoginUser();
+    const login = await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { email: account.email, password: account.password } });
+    expect(login.statusCode).toBe(200);
+    const oldAuthorization = { authorization: `Bearer ${login.json().accessToken as string}` };
+    expect((await app.inject({ method: 'GET', url: '/v1/auth/me', headers: oldAuthorization })).statusCode).toBe(200);
+
+    const requested = await app.inject({ method: 'POST', url: '/v1/auth/password-reset/request', payload: { email: account.email } });
+    const resetToken = requested.json().devToken as string;
+    expect(resetToken).toBeTruthy();
+    const confirmations = await Promise.all([
+      app.inject({ method: 'POST', url: '/v1/auth/password-reset/confirm', payload: { token: resetToken, newPassword: 'Concurrent-Replacement-One-2026!' } }),
+      app.inject({ method: 'POST', url: '/v1/auth/password-reset/confirm', payload: { token: resetToken, newPassword: 'Concurrent-Replacement-Two-2026!' } }),
+    ]);
+    expect(confirmations.map(response => response.statusCode).sort()).toEqual([200, 400]);
+    expect((await app.inject({ method: 'GET', url: '/v1/auth/me', headers: oldAuthorization })).statusCode).toBe(401);
+    expect(await db.passwordResetToken.count({ where: { userId: account.userId, usedAt: { not: null } } })).toBe(1);
+    expect(await db.auditEvent.count({
+      where: { tenantId: account.tenantId, actorUserId: account.userId, action: 'auth.session.revoked', resourceId: account.userId },
+    })).toBe(1);
+    expect(await db.auditEvent.count({
+      where: { tenantId: account.tenantId, actorUserId: account.userId, action: 'auth.password.reset.completed' },
+    })).toBe(1);
+  });
+
+  it('rejects revoked access and MFA-flow tokens at MFA enrollment boundaries', async () => {
+    const accessAccount = await makeLoginUser();
+    const login = await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { email: accessAccount.email, password: accessAccount.password } });
+    const authorization = { authorization: `Bearer ${login.json().accessToken as string}` };
+    expect((await app.inject({ method: 'POST', url: `/v1/security/sessions/${accessAccount.userId}/revoke`, headers: authorization })).statusCode).toBe(204);
+    expect((await app.inject({ method: 'POST', url: '/v1/auth/mfa/setup', headers: authorization })).statusCode).toBe(401);
+
+    const flowAccount = await makeLoginUser();
+    await db.tenantSecurityPolicy.upsert({
+      where: { tenantId: flowAccount.tenantId },
+      update: { requireMfa: true },
+      create: { tenantId: flowAccount.tenantId, requireMfa: true },
+    });
+    const flowLogin = await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { email: flowAccount.email, password: flowAccount.password } });
+    expect(flowLogin.json().status).toBe('mfa_setup_required');
+    const resetRequest = await app.inject({ method: 'POST', url: '/v1/auth/password-reset/request', payload: { email: flowAccount.email } });
+    expect((await app.inject({
+      method: 'POST', url: '/v1/auth/password-reset/confirm',
+      payload: { token: resetRequest.json().devToken as string, newPassword: 'Mfa-Flow-Replacement-2026!' },
+    })).statusCode).toBe(200);
+    expect((await app.inject({
+      method: 'POST', url: '/v1/auth/mfa/setup',
+      headers: { authorization: `Bearer ${flowLogin.json().mfaToken as string}` },
+    })).statusCode).toBe(401);
+  });
+
   it('invalidates a selected access token immediately and permits a fresh login after revocation', async () => {
     const account = await makeLoginUser();
     const login = await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { email: account.email, password: account.password } });
@@ -81,6 +166,27 @@ describe('tenant authentication session lifecycle', () => {
     expect(fresh.statusCode).toBe(200);
     expect((await app.inject({ method: 'GET', url: '/v1/auth/me', headers: { authorization: `Bearer ${fresh.json().accessToken as string}` } })).statusCode).toBe(200);
     expect(await db.auditEvent.count({ where: { tenantId: account.tenantId, action: 'controlPlane.session.revoked', resourceId: account.userId } })).toBe(1);
+  });
+
+  it('invalidates an access token through the tenant Security-page revocation endpoint', async () => {
+    const account = await makeLoginUser();
+    const login = await app.inject({ method: 'POST', url: '/v1/auth/login', payload: { email: account.email, password: account.password } });
+    expect(login.statusCode).toBe(200);
+    const headers = {
+      authorization: `Bearer ${login.json().accessToken as string}`,
+      'x-forwarded-for': '198.51.100.211',
+    };
+
+    const revoked = await app.inject({
+      method: 'POST',
+      url: `/v1/security/sessions/${account.userId}/revoke`,
+      headers,
+    });
+    expect(revoked.statusCode).toBe(204);
+    expect((await app.inject({ method: 'GET', url: '/v1/auth/me', headers })).statusCode).toBe(401);
+    expect(await db.auditEvent.count({
+      where: { tenantId: account.tenantId, action: 'auth.session.revoked', resourceId: account.userId },
+    })).toBe(1);
   });
 
   it('sets correctly scoped cookies, rotates refresh+CSRF tokens, and revokes them on logout', async () => {
@@ -138,6 +244,41 @@ describe('tenant authentication session lifecycle', () => {
     expect(stored?.refreshTokenHash).toBeNull();
     expect(stored?.refreshTokenExpiresAt).toBeNull();
     expect(await db.auditEvent.count({ where: { tenantId: account.tenantId, actorUserId: account.userId, action: 'auth.logout' } })).toBe(1);
+  });
+
+  it('fails access and refresh closed when tenant policy starts requiring MFA', async () => {
+    const account = await makeLoginUser();
+    const login = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/login',
+      payload: { email: account.email, password: account.password },
+    });
+    expect(login.statusCode).toBe(200);
+    const cookies = setCookieHeaders(login);
+    const refreshToken = cookieValue(cookies, 'cc_refresh')!;
+    const csrfToken = cookieValue(cookies, 'cc_csrf')!;
+
+    await db.tenantSecurityPolicy.upsert({
+      where: { tenantId: account.tenantId },
+      update: { requireMfa: true },
+      create: { tenantId: account.tenantId, requireMfa: true },
+    });
+
+    const access = await app.inject({
+      method: 'GET',
+      url: '/v1/auth/me',
+      headers: { authorization: `Bearer ${login.json().accessToken as string}` },
+    });
+    expect(access.statusCode).toBe(401);
+
+    const refresh = await app.inject({
+      method: 'POST',
+      url: '/v1/auth/refresh',
+      headers: { cookie: cookieHeader(refreshToken, csrfToken), 'x-csrf-token': csrfToken },
+    });
+    expect(refresh.statusCode).toBe(403);
+    expect(refresh.json().status).toBe('mfa_reauthentication_required');
+    expect((await db.user.findUnique({ where: { id: account.userId }, select: { refreshTokenHash: true } }))?.refreshTokenHash).toBeNull();
   });
 
   it('supports a separate-origin SPA with API-returned in-memory CSRF values, including reload bootstrap', async () => {

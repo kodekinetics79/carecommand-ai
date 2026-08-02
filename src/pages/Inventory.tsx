@@ -1,12 +1,10 @@
-import { Package, AlertCircle, Clock, Zap, Sparkles, TrendingUp } from 'lucide-react';
+import { Package, AlertCircle, Clock, TrendingUp } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
-import { useState } from 'react';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapInventoryItem, type ApiInventoryItem } from '../lib/apiAdapters';
-import { apiRequest } from '../lib/api';
 import { formatCurrency } from '../utils/formatters';
 
 interface ApiBranchOption { id: string; name: string }
@@ -19,36 +17,9 @@ const statusConfig: Record<string, { label: string; badge: string; border: strin
 };
 
 export default function Inventory() {
-  const { data: stockItems, source, error, reload } = useApiResource<ApiInventoryItem, ReturnType<typeof mapInventoryItem>>('/v1/inventory?limit=100', [], mapInventoryItem);
+  const { data: stockItems, source, error } = useApiResource<ApiInventoryItem, ReturnType<typeof mapInventoryItem>>('/v1/inventory?limit=100', [], mapInventoryItem);
   const { data: branchOptions } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
-  const [reorderingId, setReorderingId] = useState<string | null>(null);
   const loadError = error;
-
-  async function reorder(id: string, reorderLevel: number) {
-    setReorderingId(id);
-    try {
-      // Restock to roughly two reorder cycles' worth of stock.
-      await apiRequest(`/v1/inventory/${id}`, { method: 'PATCH', body: JSON.stringify({ currentStock: Math.max(reorderLevel * 2, reorderLevel + 10) }) });
-      reload();
-    } finally {
-      setReorderingId(null);
-    }
-  }
-
-  async function reorderAll() {
-    const targets = stockItems.filter(item => item.status === 'critical' || item.status === 'low' || item.status === 'expiring');
-    if (targets.length === 0) return;
-    setReorderingId('bulk');
-    try {
-      await Promise.all(targets.map(item => apiRequest(`/v1/inventory/${item.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ currentStock: Math.max(item.reorderLevel * 2, item.reorderLevel + 10) }),
-      })));
-      reload();
-    } finally {
-      setReorderingId(null);
-    }
-  }
 
   const criticalCount = stockItems.filter(i => i.status === 'critical' || i.status === 'low').length;
   const expiringCount = stockItems.filter(i => i.status === 'expiring').length;
@@ -62,34 +33,34 @@ export default function Inventory() {
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
-        title="Inventory Intelligence"
-        subtitle="Stock levels, expiry risk, reorder alerts, and AI supply recommendations across all branches."
-        badge={loadError ? 'Live Data Error' : `${criticalCount + expiringCount} Alerts · ${source === 'live' ? 'Live DB' : 'Loading'}`}
-        badgeColor="red"
-        actions={
-          <button type="button" disabled={reorderingId === 'bulk'} onClick={() => void reorderAll()} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition disabled:opacity-40">
-            <Zap className="w-4 h-4" /> Place All Reorders
-          </button>
-        }
+        title="Inventory"
+        subtitle="Review recorded stock levels, reorder thresholds, expiry dates, and items that need attention."
+        badge={loadError ? 'Data unavailable' : source === 'live' ? `${criticalCount + expiringCount} alerts` : 'Loading inventory'}
+        badgeColor={loadError ? 'red' : criticalCount + expiringCount > 0 ? 'amber' : 'blue'}
       />
 
+      <div role="note" className="rounded-2xl border border-[var(--amber-soft)] bg-[var(--amber-soft)] px-4 py-3 text-xs text-amber-v">
+        Purchasing is not configured in this workspace. Stock counts must only be updated after items are physically received and verified.
+      </div>
+
       {loadError && (
-        <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          Inventory data could not be loaded from the live API: {loadError}
+        <div role="alert" className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          Inventory data is unavailable. {loadError}
         </div>
       )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Total Items Tracked" value={stockItems.length} subtitle="Across all branches" icon={<Package className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Critical / Low Stock" value={criticalCount} subtitle="Needs reorder now" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
-        <StatCard title="Expiring Soon" value={expiringCount} subtitle="Within 30 days" icon={<Clock className="w-4 h-4" />} accent="amber" />
-        <StatCard title="Inventory Value" value={formatCurrency(totalValue)} subtitle="Current stock value" icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Items tracked" value={stockItems.length} subtitle="Loaded records" icon={<Package className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Critical or low" value={criticalCount} subtitle="Below recorded threshold" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
+        <StatCard title="Expiring soon" value={expiringCount} subtitle="Based on stored dates" icon={<Clock className="w-4 h-4" />} accent="amber" />
+        <StatCard title="Recorded value" value={formatCurrency(totalValue)} subtitle="Stock × stored unit cost" icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_340px]">
         {/* Inventory table */}
-        <BentoCard title="Stock Level Dashboard" subtitle="All items across branches">
+        <BentoCard title="Stock levels" subtitle="Recorded items across accessible branches">
           <div className="space-y-2.5">
+            {stockItems.length === 0 && <p className="py-8 text-center text-sm text-t3">No inventory items are recorded for this workspace.</p>}
             {stockItems.map((item) => {
               const sc = statusConfig[item.status];
               const branch = branchOptions.find(b => b.id === item.branchId);
@@ -117,15 +88,11 @@ export default function Inventory() {
 
                   <div className="flex items-center justify-between gap-3">
                     <div className="flex items-center gap-3 text-[11px] text-t3">
-                      <span>~{weeksLeft}w left</span>
+                      <span>Est. {weeksLeft} weeks at recorded use</span>
                       {item.expiryDate && <span className={`font-semibold ${item.status === 'expiring' ? 'text-amber-v' : 'text-t3'}`}>Exp: {item.expiryDate}</span>}
                       <span>{formatCurrency(item.unitCost)}/unit</span>
                     </div>
-                    {(item.status === 'critical' || item.status === 'low') && (
-                      <button type="button" disabled={reorderingId === item.id} onClick={() => reorder(item.id, item.reorderLevel)} className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors disabled:opacity-40">
-                        <Zap className="w-3 h-3" /> {reorderingId === item.id ? 'Ordering…' : 'Reorder now'}
-                      </button>
-                    )}
+                    {(item.status === 'critical' || item.status === 'low') && <span className="text-[10px] font-semibold text-amber-v">Purchasing follow-up required</span>}
                   </div>
                 </div>
               );
@@ -135,9 +102,9 @@ export default function Inventory() {
 
         {/* Right sidebar */}
         <div className="space-y-4">
-          <BentoCard title="AI Supply Recommendations" subtitle="Automated intelligence" headerRight={<Sparkles className="w-4 h-4 text-violet-500" />}>
+          <BentoCard title="Stock alerts" subtitle="Items outside stored stock or expiry thresholds" headerRight={<AlertCircle className="w-4 h-4 text-amber-v" />}>
             <div className="space-y-3">
-              {supplyRecommendations.length === 0 && <p className="text-xs text-t3">No live inventory issues require action.</p>}
+              {supplyRecommendations.length === 0 && <p className="text-xs text-t3">No stock or expiry alerts are recorded.</p>}
               {supplyRecommendations.map((rec) => (
                 <div key={rec.id} className="p-3.5 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all">
                   <div className="flex items-start justify-between gap-2 mb-1.5">
@@ -145,9 +112,7 @@ export default function Inventory() {
                     <span className={`badge shrink-0 ${rec.status === 'critical' ? 'badge-red' : 'badge-amber'}`}>{statusConfig[rec.status]?.label ?? rec.status}</span>
                   </div>
                   <p className="text-[11px] text-t3 mb-2">{rec.currentStock} {rec.unit} available; reorder level is {rec.reorderLevel}.</p>
-                  {(rec.status === 'critical' || rec.status === 'low') && <button type="button" disabled={reorderingId === rec.id} onClick={() => void reorder(rec.id, rec.reorderLevel)} className="inline-flex items-center gap-1 text-xs font-semibold text-indigo hover:opacity-80 disabled:opacity-40">
-                    <Zap className="w-3 h-3" /> {reorderingId === rec.id ? 'Ordering…' : 'Reorder from live record'}
-                  </button>}
+                  {(rec.status === 'critical' || rec.status === 'low') && <p className="text-[11px] font-semibold text-amber-v">Create a purchasing request in your approved external workflow.</p>}
                 </div>
               ))}
             </div>

@@ -7,6 +7,8 @@ import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { Pool } from 'pg';
 
+import { TENANT_INTEGRITY_MANIFEST } from '../modules/platform/prismaDriftGuard';
+
 const ACK = 'CREATE_DROP_LOCAL_RELEASE_TEST_DATABASES';
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 const DATABASE_PREFIX = 'carecommand_test_rc_';
@@ -35,6 +37,15 @@ function databaseUrl(adminUrl: URL, databaseName: string): string {
   url.pathname = `/${databaseName}`;
   url.searchParams.set('schema', 'public');
   return url.toString();
+}
+
+function checkedRuntimeUrl(databaseName: string): string {
+  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required.');
+  const url = new URL(process.env.DATABASE_URL);
+  if (!['postgres:', 'postgresql:'].includes(url.protocol) || !LOCAL_HOSTS.has(url.hostname)) {
+    throw new Error('Release database lifecycle accepts only local PostgreSQL runtime URLs.');
+  }
+  return databaseUrl(url, databaseName);
 }
 
 function libpqUrl(connectionString: string): string {
@@ -90,6 +101,7 @@ async function main(): Promise<void> {
   const restoreName = `${DATABASE_PREFIX}restore_${suffix}`;
   const sourceUrl = databaseUrl(adminUrl, sourceName);
   const restoreUrl = databaseUrl(adminUrl, restoreName);
+  const restoreRuntimeUrl = checkedRuntimeUrl(restoreName);
   const directory = await mkdtemp(join(tmpdir(), 'carecommand-release-lifecycle-'));
   const dumpPath = join(directory, 'synthetic-functional.dump');
   const admin = new Pool({ connectionString: adminUrl.toString(), max: 1 });
@@ -111,15 +123,24 @@ async function main(): Promise<void> {
     });
 
     const before = await snapshot(sourceUrl);
-    await run('pg_dump', ['--format=custom', '--no-owner', '--no-privileges', '--file', dumpPath, libpqUrl(sourceUrl)]);
+    await run('pg_dump', ['--format=custom', '--no-owner', '--file', dumpPath, libpqUrl(sourceUrl)]);
     await admin.query(`CREATE DATABASE "${restoreName}"`);
-    await run('pg_restore', ['--exit-on-error', '--no-owner', '--no-privileges', '--dbname', libpqUrl(restoreUrl), dumpPath]);
+    await run('pg_restore', ['--exit-on-error', '--no-owner', '--dbname', libpqUrl(restoreUrl), dumpPath]);
     const after = await snapshot(restoreUrl);
+
+    await run(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['tsx', 'server/scripts/verifyRlsCatalog.ts'], {
+      ...process.env,
+      DATABASE_URL: restoreRuntimeUrl,
+      DATABASE_MIGRATION_URL: restoreUrl,
+    });
 
     if (JSON.stringify(after) !== JSON.stringify(before)) {
       throw new Error(`Backup/restore snapshot mismatch: ${JSON.stringify({ before, after })}`);
     }
-    if (before.forced_rls_tables !== 119 || before.tenant_integrity_fks !== 120) {
+    if (
+      before.forced_rls_tables <= 0
+      || before.tenant_integrity_fks !== TENANT_INTEGRITY_MANIFEST.compositeForeignKeys
+    ) {
       throw new Error(`Restored security manifest mismatch: ${JSON.stringify(before)}`);
     }
     console.log(`Release database lifecycle PASS: ${JSON.stringify(after)}`);

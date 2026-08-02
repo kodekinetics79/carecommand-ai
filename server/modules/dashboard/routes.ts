@@ -16,7 +16,7 @@ export const dashboardRoutes: FastifyPluginAsync = async app => {
       activeCustomers,
       todaysAppointments,
       noShowRisk,
-      callsRecovered,
+      staffCallReplyConversations,
       missedCalls,
       leadOpportunity,
       conversationOpportunity,
@@ -35,8 +35,15 @@ export const dashboardRoutes: FastifyPluginAsync = async app => {
       db.appointment.count({
         where: { tenantId: request.auth.tenantId, ...scope, deletedAt: null, startsAt: { gte: dayStart, lt: dayEnd }, status: { in: ['RISKY', 'NO_SHOW'] } },
       }),
-      db.conversation.count({
-        where: { tenantId: request.auth.tenantId, ...scope, channel: 'CALL', aiHandled: true },
+      db.conversationReplyAttempt.findMany({
+        where: {
+          tenantId: request.auth.tenantId,
+          phase: 'RESULT',
+          status: { in: ['provider_accepted', 'delivered'] },
+          conversation: { is: { channel: 'CALL', ...scope } },
+        },
+        select: { conversationId: true },
+        distinct: ['conversationId'],
       }),
       db.conversation.count({
         where: { tenantId: request.auth.tenantId, ...scope, channel: 'CALL', status: 'unread' },
@@ -61,7 +68,9 @@ export const dashboardRoutes: FastifyPluginAsync = async app => {
       activeCustomers,
       todaysAppointments,
       noShowRisk,
-      callsRecovered,
+      // Legacy response key retained for compatibility. The value now has
+      // actor-attributed reply-attempt evidence and is not an AI-recovery count.
+      callsRecovered: staffCallReplyConversations.length,
       missedCalls,
       activeOpportunities: Number(leadOpportunity._sum.estimatedValue ?? 0) + Number(conversationOpportunity._sum.estimatedValue ?? 0),
       pendingApprovals,

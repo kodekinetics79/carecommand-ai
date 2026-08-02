@@ -12,10 +12,10 @@ import { db } from './db';
 //
 // Source of truth + safe default: ROLE_PERMISSIONS (code). A tenant MAY override
 // the grant set for a given role by setting RoleDefinition.permissions (a JSON
-// string[]). When that column is a non-empty array it REPLACES the code defaults
+// string[]). When that column is an array (including an empty array) it REPLACES the code defaults
 // for that role in that tenant — this is what makes the per-tenant role editor an
-// actual enforcement control and not a cosmetic catalogue. When it is null/empty,
-// the code defaults apply (fail-safe).
+// actual enforcement control and not a cosmetic catalogue. Only a null/missing
+// override uses the code defaults; an explicit empty array is deny-all.
 //
 // Enforcement is always server-side via requirePermission(); never frontend-only.
 // ===========================================================================
@@ -47,6 +47,31 @@ export const PERMISSIONS = [
   'compliance:read',
   'compliance:manage',
   'audit:read',
+  // Cross-module operational surfaces are separated by data class so access to
+  // one workflow never implies access to unrelated revenue, CRM, inventory, or
+  // provider-configuration data.
+  // Aggregate-sensitive briefing/signals permission. The briefing intentionally
+  // combines appointment, revenue, receptionist, insurance, CRM, and intake
+  // counts, so it is not a fallback for any narrower data-class permission.
+  'operations:read',
+  'operations:write',
+  'crm:read',
+  'crm:write',
+  'campaign:read',
+  'campaign:manage',
+  'revenue:read',
+  'revenue:write',
+  'inventory:read',
+  'inventory:write',
+  'inventory:manage',
+  'integrations:read',
+  'integrations:manage',
+  // Partner reports can contain clinical summaries. Reading, creating, and
+  // marking one reviewed are deliberately independent grants; review defaults
+  // only to OWNER/ADMIN/PROVIDER.
+  'partner-report:read',
+  'partner-report:write',
+  'partner-report:review',
   // AI receptionist call metadata, summaries, and appointment-request artifacts.
   'receptionist:call-artifacts:read',
   // Provider-hosted call recordings may contain substantially more PHI than a
@@ -83,16 +108,33 @@ export const ROLE_PERMISSIONS: Record<UserRole, Permission[]> = {
     'billing:read',
     'staff:read', 'staff:write', 'staff:task-status',
     'settings:read', 'settings:write',
+    'operations:read', 'operations:write',
+    'crm:read', 'crm:write',
+    'campaign:read', 'campaign:manage',
+    'revenue:read', 'revenue:write',
+    'inventory:read', 'inventory:write', 'inventory:manage',
+    'integrations:read', 'integrations:manage',
+    'partner-report:read', 'partner-report:write',
     'receptionist:call-artifacts:read', 'receptionist:manage', 'receptionist:booking-review',
   ],
-  BILLING: ['billing:read', 'billing:write', 'settings:read', 'patient:read', 'intake:read', 'intake:write'],
-  PROVIDER: ['patient:read', 'intake:read', 'appointment:read', 'appointment:write', 'schedule:manage', 'staff:read', 'settings:read'],
+  BILLING: [
+    'billing:read', 'billing:write', 'settings:read', 'patient:read', 'intake:read', 'intake:write',
+    'revenue:read', 'revenue:write',
+  ],
+  PROVIDER: [
+    'patient:read', 'intake:read', 'appointment:read', 'appointment:write', 'schedule:manage', 'staff:read', 'settings:read',
+    'partner-report:read', 'partner-report:review',
+  ],
   FRONT_DESK: [
     'patient:read', 'patient:write', 'intake:read', 'intake:write', 'appointment:read', 'appointment:write', 'billing:read', 'staff:read', 'staff:task-status',
+    'crm:read', 'crm:write', 'campaign:read', 'inventory:read', 'inventory:write', 'partner-report:write',
     'receptionist:call-artifacts:read',
     'receptionist:booking-review',
   ],
-  ANALYST: ['patient:read', 'appointment:read', 'billing:read', 'staff:read', 'settings:read', 'audit:read'],
+  ANALYST: [
+    'patient:read', 'appointment:read', 'billing:read', 'staff:read', 'settings:read', 'audit:read',
+    'operations:read', 'crm:read', 'campaign:read', 'revenue:read', 'inventory:read',
+  ],
   COMPLIANCE_OFFICER: [
     'compliance:read', 'compliance:manage', 'audit:read', 'patient:export',
     'receptionist:call-artifacts:read', 'receptionist:recordings:read',
@@ -131,7 +173,7 @@ export function sanitizePermissions(input: unknown): Permission[] {
 
 /**
  * Resolve the effective permission set for a (tenant, role): the tenant's
- * RoleDefinition override if present and non-empty, otherwise the code defaults.
+ * RoleDefinition override if present (including deny-all), otherwise the code defaults.
  */
 export async function resolvePermissions(tenantId: string, role: UserRole): Promise<Set<Permission>> {
   const defaults = ROLE_PERMISSIONS[role] ?? [];
@@ -141,8 +183,9 @@ export async function resolvePermissions(tenantId: string, role: UserRole): Prom
       where: { tenantId, name },
       select: { permissions: true },
     });
-    const override = sanitizePermissions(definition?.permissions);
-    if (override.length > 0) return new Set(override);
+    if (definition && Array.isArray(definition.permissions)) {
+      return new Set(sanitizePermissions(definition.permissions));
+    }
   }
   return new Set(defaults);
 }

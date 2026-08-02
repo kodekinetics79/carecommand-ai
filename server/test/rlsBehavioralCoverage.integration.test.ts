@@ -1,18 +1,15 @@
 import 'dotenv/config';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { TENANT_DELETE_PROTECTED_TABLES } from '../lib/rlsRuntimeManifest';
 import { isIsolationDenial, isRlsDenial, RLS_TABLE_ADAPTERS, RlsBehaviorHarness } from './helpers/rlsBehaviorHarness';
 
 const IMMUTABLE_DENIALS = ['42501', '23514', '55000', 'P0001'];
 const REASSIGNMENT_DENIALS = ['42501', '23503', '23505', '23514', '55000', 'P0001'];
-const STRICT_APPEND_ONLY_RLS = new Set([
-  'NotificationDeliveryAttempt', 'ReceptionistVoiceConsentEvent', 'ReceptionistOutboundProviderIntent',
-]);
-
 if (!process.env.RLS_DISPOSABLE_DB) {
   describe('RLS behavioral evidence execution guard', () => {
     it('requires the explicit disposable-database lifecycle', () => {
       expect(process.env.RLS_DISPOSABLE_DB).toBeUndefined();
-      expect(RLS_TABLE_ADAPTERS).toHaveLength(122);
+      expect(RLS_TABLE_ADAPTERS).toHaveLength(123);
     });
   });
 } else {
@@ -27,9 +24,9 @@ if (!process.env.RLS_DISPOSABLE_DB) {
   });
 
   describe('RLS behavioral adapter inventory', () => {
-    it('contains exactly one adapter for all 122 deployed protected tables', () => {
-      expect(RLS_TABLE_ADAPTERS).toHaveLength(122);
-      expect(new Set(RLS_TABLE_ADAPTERS.map(adapter => adapter.table)).size).toBe(122);
+    it('contains exactly one adapter for all 123 deployed protected tables', () => {
+      expect(RLS_TABLE_ADAPTERS).toHaveLength(123);
+      expect(new Set(RLS_TABLE_ADAPTERS.map(adapter => adapter.table)).size).toBe(123);
     });
   });
 
@@ -70,7 +67,7 @@ if (!process.env.RLS_DISPOSABLE_DB) {
         expect(none.errorCode).toBe('42501');
       } else if (adapter.mode === 'APPEND_ONLY' || adapter.table === 'ReceptionistOptOut') {
         expect(IMMUTABLE_DENIALS).toContain(own.errorCode);
-        if (STRICT_APPEND_ONLY_RLS.has(adapter.table)) {
+        if (adapter.mode === 'APPEND_ONLY') {
           expect(cross.errorCode).toBe('42501');
           expect(none.errorCode).toBe('42501');
         } else {
@@ -98,9 +95,9 @@ if (!process.env.RLS_DISPOSABLE_DB) {
         expect(own.errorCode).toBe('42501');
         expect(cross.errorCode).toBe('42501');
         expect(none.errorCode).toBe('42501');
-      } else if (adapter.mode === 'APPEND_ONLY' || adapter.table === 'ReceptionistOptOut') {
+      } else if (adapter.mode === 'APPEND_ONLY' || adapter.table === 'ReceptionistOptOut' || TENANT_DELETE_PROTECTED_TABLES.has(adapter.table)) {
         expect(IMMUTABLE_DENIALS).toContain(own.errorCode);
-        if (STRICT_APPEND_ONLY_RLS.has(adapter.table)) {
+        if (adapter.mode === 'APPEND_ONLY') {
           expect(cross.errorCode).toBe('42501');
           expect(none.errorCode).toBe('42501');
         } else {
@@ -140,7 +137,7 @@ if (!process.env.RLS_DISPOSABLE_DB) {
       } else if (adapter.mode === 'APPEND_ONLY' || adapter.table === 'ReceptionistOptOut') {
         expect(IMMUTABLE_DENIALS).toContain(evidence.bulkUpdate.errorCode);
         expect(IMMUTABLE_DENIALS).toContain(evidence.bulkDelete.errorCode);
-        if (STRICT_APPEND_ONLY_RLS.has(adapter.table)) {
+        if (adapter.mode === 'APPEND_ONLY') {
           expect(crossUpdate.errorCode).toBe('42501');
           expect(noneUpdate.errorCode).toBe('42501');
           expect(crossDelete.errorCode).toBe('42501');
@@ -151,6 +148,14 @@ if (!process.env.RLS_DISPOSABLE_DB) {
           expect(crossDelete).toEqual({ count: 0 });
           expect(noneDelete).toEqual({ count: 0 });
         }
+      } else if (TENANT_DELETE_PROTECTED_TABLES.has(adapter.table)) {
+        expect(evidence.bulkUpdate.count).toBeGreaterThan(0);
+        expect(evidence.bulkUpdate.changed).toBe(true);
+        expect(IMMUTABLE_DENIALS).toContain(evidence.bulkDelete.errorCode);
+        expect(crossUpdate).toEqual({ count: 0, changed: false });
+        expect(noneUpdate).toEqual({ count: 0, changed: false });
+        expect(crossDelete).toEqual({ count: 0 });
+        expect(noneDelete).toEqual({ count: 0 });
       } else {
         expect(evidence.bulkUpdate.count).toBeGreaterThan(0);
         expect(evidence.bulkUpdate.changed).toBe(true);

@@ -252,12 +252,12 @@ describe('receptionist /fn booking — real availability + booking', () => {
 
     const wrongCallId = `wrong-deployment-${randomUUID()}`;
     const wrongCall = { ...signedCall, call_id: wrongCallId, agent_id: 'agent_wrong' };
-    expect((await inject(wrongCallId, 'record_recording_preference', { recording_decision: 'GRANTED' }, wrongCall)).statusCode).toBe(200);
+    expect((await inject(wrongCallId, 'record_recording_preference', { recording_decision: 'GRANTED' }, wrongCall)).statusCode).toBe(202);
     const wrongDeployment = await inject(wrongCallId, 'book_appointment', {
       service: t.appointmentType, intake_contract_fingerprint: t.intakeSemanticFingerprint, intake_schema_revision: 1,
     }, wrongCall);
-    expect(wrongDeployment.json()).toMatchObject({ booked: false, needs_human: true });
-    expect((await db.receptionistCallLog.findFirstOrThrow({ where: { tenantId: t.id, retellCallId: wrongCallId } })).campaignId).toBeNull();
+    expect(wrongDeployment.json()).toMatchObject({ allowed: false, needs_human: true });
+    expect(await db.receptionistCallLog.findFirst({ where: { tenantId: t.id, retellCallId: wrongCallId } })).toBeNull();
   });
 
   it('hands off when required PHONE identity is missing from the signed persisted call context', async () => {

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
 import {
   Activity, AlertTriangle, ArrowRight, Bot, CheckCircle2, Clock3,
-  DollarSign, FileCheck2, Loader2, Pause, Play, ShieldCheck, Sparkles, Users,
+  DollarSign, FileCheck2, Loader2, ShieldCheck, Sparkles, Users,
   WandSparkles, Zap,
 } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
@@ -42,12 +42,12 @@ function fmtTime(iso?: string | null) {
 
 export default function Autopilot() {
   const navigate = useNavigate();
-  const [isPaused, setIsPaused] = useState(false);
   const [playbooks, setPlaybooks] = useState<ApiPlaybook[]>([]);
   const [approvals, setApprovals] = useState<ApiApproval[]>([]);
   const [trail, setTrail] = useState<ApiApproval[]>([]);
   const [selectedId, setSelectedId] = useState<string>('');
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -64,7 +64,9 @@ export default function Autopilot() {
         setApprovals(pending);
         setTrail([...executed, ...approved].sort((a, b) => (b.reviewedAt ?? '').localeCompare(a.reviewedAt ?? '')).slice(0, 6));
         setSelectedId(pb[0]?.id ?? '');
-      } catch { /* live-only: leave empty */ } finally {
+      } catch (loadError) {
+        if (active) setError(loadError instanceof Error ? loadError.message : 'Unable to load automation configuration');
+      } finally {
         if (active) setLoading(false);
       }
     })();
@@ -79,7 +81,7 @@ export default function Autopilot() {
       hoursSaved: sum(c => c.monthlyHoursSaved ?? 0),
       guardrailBlocks: sum(c => c.guardrailBlocks ?? 0),
       live: playbooks.filter(p => p.status === 'LIVE').length,
-      autonomy: Math.max(1, ...playbooks.map(p => p.config.autonomyLevel ?? 1)),
+      executionLevel: Math.max(1, ...playbooks.map(p => p.config.autonomyLevel ?? 1)),
     };
   }, [playbooks]);
 
@@ -87,70 +89,67 @@ export default function Autopilot() {
   const selected = playbooks.find(p => p.id === selectedId) ?? null;
 
   const updateApproval = async (id: string, decision: 'approve' | 'dismiss') => {
+    setError(null);
     try {
       await apiRequest(`/v1/autopilot/approvals/${id}/${decision}`, { method: 'POST' });
       setApprovals(cur => cur.map(a => a.id === id ? { ...a, status: decision === 'approve' ? 'APPROVED' : 'DISMISSED' } : a));
-    } catch { /* surfaced by disabled re-click; keep state */ }
+    } catch (approvalError) {
+      setError(approvalError instanceof Error ? approvalError.message : 'Unable to update approval');
+    }
   };
 
-  if (loading) return <div className="cc-card p-12 text-center"><Loader2 className="inline w-6 h-6 animate-spin text-indigo" /></div>;
+  if (loading) return <div className="cc-card p-12 text-center" role="status" aria-live="polite" aria-busy="true"><Loader2 className="inline w-6 h-6 animate-spin text-indigo" /> <span className="sr-only">Loading automation records…</span></div>;
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="CareFlow Autopilot"
-        subtitle="Guarded AI agents that detect, decide, act, and learn across your clinic network."
-        badge={isPaused ? 'Paused' : 'Live Autopilot'}
-        badgeColor={isPaused ? 'amber' : 'emerald'}
-        actions={
-          <button
-            type="button"
-            onClick={() => setIsPaused(c => !c)}
-            className={`inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold transition ${
-              isPaused ? 'bg-[var(--indigo)] text-white hover:opacity-90' : 'border border-[var(--b2)] bg-[var(--s2)] text-t1 hover:bg-[var(--s3)]'
-            }`}
-          >
-            {isPaused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
-            {isPaused ? 'Resume Autopilot' : 'Pause Autopilot'}
-          </button>
-        }
+        subtitle="Review configured automation playbooks, approval requests, and recorded activity."
+        badge={`${kpis.live} active playbook${kpis.live === 1 ? '' : 's'}`}
+        badgeColor={kpis.live > 0 ? 'violet' : 'blue'}
       />
+
+      {error && <div role="alert" className="rounded-2xl border border-[var(--red-soft)] bg-[var(--red-soft)] px-4 py-3 text-sm text-red-v">Automation data is unavailable. {error}</div>}
+
+      <div role="note" className="rounded-2xl border border-[var(--amber-soft)] bg-[var(--amber-soft)] px-4 py-3 text-xs text-amber-v">
+        A tenant-wide pause control is not available on this page. Use the approved operational runbook before changing or stopping an active automation.
+      </div>
 
       <div className="autopilot-hero">
         <div className="relative grid gap-6 lg:grid-cols-[1fr_auto] lg:items-center">
           <div>
             <div className="mb-2 flex items-center gap-2">
               <Sparkles className="w-4 h-4 text-indigo" />
-              <p className="text-xs font-bold uppercase tracking-widest text-indigo">Closed-loop growth engine</p>
+              <p className="text-xs font-bold uppercase tracking-widest text-indigo">Automation overview</p>
             </div>
             <h2 className="max-w-3xl text-xl font-bold leading-snug text-t1">
-              CareFlow surfaced {formatCurrency(kpis.valueRecovered)} in recoverable value across {kpis.agentActions} agent actions — without adding front-desk work.
+              Current playbook records include {kpis.agentActions} runs and {formatCurrency(kpis.valueRecovered)} in associated outcome value.
             </h2>
             <p className="mt-2 max-w-3xl text-sm leading-relaxed text-t2">
-              Unlike a passive dashboard, Autopilot connects revenue signals, consent rules, scheduling inventory, customer context, and staff escalation into one governed action layer.
+              Values shown here come from stored playbook configuration and activity records. Review the source workflow before treating them as realized outcomes.
             </p>
           </div>
           <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-5 py-4">
-            <p className="text-[10px] font-bold uppercase tracking-widest text-indigo">Autonomy level</p>
-            <p className="mt-1 text-2xl font-bold text-t1">Level {kpis.autonomy}</p>
-            <p className="text-xs text-t3">Low-risk actions automated</p>
+            <p className="text-[10px] font-bold uppercase tracking-widest text-indigo">Configured execution level</p>
+            <p className="mt-1 text-2xl font-bold text-t1">Level {kpis.executionLevel}</p>
+            <p className="text-xs text-t3">Stored setting; it does not prove unattended execution</p>
           </div>
         </div>
       </div>
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Value Recovered" value={formatCurrency(kpis.valueRecovered)} subtitle="Autopilot this period" icon={<DollarSign className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Agent Actions" value={String(kpis.agentActions)} subtitle={`Across ${playbooks.length} playbooks`} icon={<Bot className="w-4 h-4" />} accent="violet" />
-        <StatCard title="Human Time Saved" value={`${kpis.hoursSaved}h`} subtitle="Estimated monthly" icon={<Clock3 className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Guardrail Blocks" value={String(kpis.guardrailBlocks)} subtitle="Unsafe actions prevented" icon={<ShieldCheck className="w-4 h-4" />} accent="amber" />
+        <StatCard title="Associated value" value={formatCurrency(kpis.valueRecovered)} subtitle="Stored playbook values" icon={<DollarSign className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Recorded runs" value={String(kpis.agentActions)} subtitle={`Across ${playbooks.length} playbooks`} icon={<Bot className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Estimated time" value={`${kpis.hoursSaved}h`} subtitle="Configured monthly estimate" icon={<Clock3 className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Rule blocks" value={String(kpis.guardrailBlocks)} subtitle="Stored block count" icon={<ShieldCheck className="w-4 h-4" />} accent="amber" />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_390px]">
         <div className="space-y-4">
           <BentoCard
-            title="Agent Playbooks"
-            subtitle="Outcome-driven automations"
-            headerRight={<span className="badge badge-emerald"><span className="w-1.5 h-1.5 rounded-full bg-[var(--emerald)]" /> {kpis.live} live</span>}
+            title="Automation playbooks"
+            subtitle="Configured triggers, actions, and stored metrics"
+            headerRight={<span className="badge badge-violet">{kpis.live} active</span>}
           >
             <div className="grid gap-3 sm:grid-cols-2">
               {playbooks.map(pb => {
@@ -168,14 +167,14 @@ export default function Autopilot() {
                   >
                     <div className="mb-3 flex items-start justify-between gap-3">
                       <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[var(--s3)] text-indigo"><Icon className="w-4 h-4" /></div>
-                      <span className={pb.status === 'LIVE' ? 'badge badge-emerald' : 'badge badge-blue'}>{pb.status.toLowerCase()}</span>
+                      <span className={pb.status === 'LIVE' ? 'badge badge-violet' : 'badge badge-blue'}>{pb.status === 'LIVE' ? 'active' : pb.status.toLowerCase()}</span>
                     </div>
                     <p className="text-sm font-bold text-t1">{pb.name}</p>
                     <p className="mt-1 text-[11px] leading-relaxed text-t3">{pb.config.action ?? pb.description}</p>
                     <div className="mt-3 grid grid-cols-3 gap-2 border-t border-[var(--b1)] pt-3">
-                      <div><p className="text-xs font-bold text-t1">{outcome}</p><p className="text-[10px] text-t3">Outcome</p></div>
-                      <div><p className="text-xs font-bold text-t1">{pb.config.runs ?? 0}</p><p className="text-[10px] text-t3">Runs</p></div>
-                      <div><p className="text-xs font-bold text-t1">{pb.config.successRate ?? 0}%</p><p className="text-[10px] text-t3">Success</p></div>
+                      <div><p className="text-xs font-bold text-t1">{outcome}</p><p className="text-[10px] text-t3">Associated value</p></div>
+                      <div><p className="text-xs font-bold text-t1">{pb.config.runs ?? '—'}</p><p className="text-[10px] text-t3">Recorded runs</p></div>
+                      <div><p className="text-xs font-bold text-t1">{pb.config.successRate != null ? `${pb.config.successRate}%` : '—'}</p><p className="text-[10px] text-t3">Configured rate</p></div>
                     </div>
                   </button>
                 );
@@ -185,12 +184,12 @@ export default function Autopilot() {
           </BentoCard>
 
           {selected && (
-            <BentoCard title="Explainable Decision Trace" subtitle="Why the selected agent takes action" headerRight={<FileCheck2 className="w-4 h-4 text-indigo" />}>
+            <BentoCard title="Playbook decision design" subtitle="How the selected playbook is configured to evaluate an action" headerRight={<FileCheck2 className="w-4 h-4 text-indigo" />}>
               <div className="space-y-3">
                 {[
                   { label: '1 · Detect', text: selected.config.trigger ?? selected.description, icon: Activity, color: 'text-blue-v bg-[var(--blue-soft)]' },
                   { label: '2 · Verify', text: 'Check communication consent, branch rules, capacity, and suppression windows.', icon: ShieldCheck, color: 'text-emerald-v bg-[var(--emerald-soft)]' },
-                  { label: '3 · Decide', text: 'Rank the next-best action by customer fit, likely outcome, and operational load.', icon: Sparkles, color: 'text-violet-v bg-[var(--violet-soft)]' },
+                  { label: '3 · Decide', text: 'Rank the next-best action by patient fit, recorded signals, and operational load.', icon: Sparkles, color: 'text-violet-v bg-[var(--violet-soft)]' },
                   { label: '4 · Act or escalate', text: selected.config.action ?? selected.description, icon: Zap, color: 'text-amber-v bg-[var(--amber-soft)]' },
                 ].map(step => {
                   const Icon = step.icon;
@@ -225,7 +224,7 @@ export default function Autopilot() {
                   <p className="text-[11px] leading-relaxed text-t3">{item.reason}</p>
                   <div className="mt-2 flex items-center justify-between gap-2 text-[10px]">
                     <span className="font-semibold text-t2">{item.payload.scope ?? item.playbook?.name ?? 'Governed agent action'}</span>
-                    <span className="font-bold text-violet-v">{item.confidence}% confidence</span>
+                    <span className="font-bold text-violet-v">Stored score {item.confidence}%</span>
                   </div>
                   <div className="mt-2"><ProgressBar value={item.confidence} color="violet" size="xs" /></div>
                   {item.status === 'PENDING' ? (
@@ -244,7 +243,7 @@ export default function Autopilot() {
             </div>
           </BentoCard>
 
-          <BentoCard title="Live Audit Trail" subtitle="Every action stays explainable" headerRight={<Activity className="w-4 h-4 text-emerald-v" />}>
+          <BentoCard title="Recorded approval activity" subtitle="Recent approved or executed records returned by the API" headerRight={<Activity className="w-4 h-4 text-indigo" />}>
             <div className="space-y-3">
               {trail.map(item => {
                 const kind = item.payload.kind ?? 'success';
@@ -269,10 +268,10 @@ export default function Autopilot() {
           <div className="rounded-2xl border border-[var(--amber-soft)] bg-[var(--amber-soft)] p-4">
             <div className="mb-1.5 flex items-center gap-2">
               <AlertTriangle className="w-4 h-4 text-amber-v" />
-              <p className="text-xs font-bold text-amber-v">Safe by design</p>
+              <p className="text-xs font-bold text-amber-v">Scope boundary</p>
             </div>
             <p className="text-[11px] leading-relaxed text-t2">
-              Clinical advice, diagnosis, treatment changes, and consent exceptions always remain outside Autopilot.
+              Autopilot is not intended to provide clinical advice, diagnosis, treatment changes, or consent exceptions. Verify each playbook and its integrations before activation.
             </p>
           </div>
         </div>

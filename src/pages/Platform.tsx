@@ -5,7 +5,8 @@ import { platformConsole, type PlatformTenant, type PlatformRequest } from '../l
 
 // Platform operator console. Separate from tenant roles: the operator pastes a
 // platform token (held in memory only). Tenant users cannot use this — the
-// backend rejects requests without a valid platform token. No PHI is shown.
+// backend rejects requests without a valid platform token. This surface is
+// intended for tenant-level operations rather than patient records.
 export default function Platform() {
   const [token, setToken] = useState('');
   const [connected, setConnected] = useState(false);
@@ -39,7 +40,7 @@ export default function Platform() {
 
   return (
     <div className="space-y-6 pb-10">
-      <PageHeader title="Platform Control Plane" subtitle="Operator-only. Separate from tenant roles — authenticate with the platform token. No patient/PHI data is shown here." badge="Operator" badgeColor="violet" />
+      <PageHeader title="Platform Control Plane" subtitle="Operator-only. Separate from tenant roles and intended for tenant-level operations. Do not enter patient information in operator fields." badge="Operator" badgeColor="violet" />
 
       <div className="cc-card p-4 flex flex-wrap items-end gap-3">
         <label className="flex-1 min-w-[260px]">
@@ -54,7 +55,7 @@ export default function Platform() {
         </button>
       </div>
 
-      {error && <div className="cc-card p-4 text-sm text-red-v inline-flex items-center gap-2"><ShieldAlert className="w-4 h-4" /> {error}</div>}
+      {error && <div role="alert" className="cc-card p-4 text-sm text-red-v inline-flex items-center gap-2"><ShieldAlert className="w-4 h-4" /> {error}</div>}
 
       {connected && (
         <>

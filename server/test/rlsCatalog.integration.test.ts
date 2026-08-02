@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { readFileSync } from 'node:fs';
 import { afterAll, describe, expect, it } from 'vitest';
 import { db } from '../lib/db';
+import { TENANT_APPEND_ONLY_TABLES } from '../lib/rlsRuntimeManifest';
 
 type CatalogRow = {
   tableName: string;
@@ -18,11 +19,6 @@ type PolicyRow = {
 // PlatformAuditEvent has an optional tenantId that identifies a target rather
 // than row ownership. It is the only explicit tenant-column RLS exemption.
 const TENANT_COLUMN_EXEMPTIONS = new Set(['PlatformAuditEvent']);
-const APPEND_ONLY_TABLES = new Set([
-  'AuditEvent', 'NotificationDeliveryAttempt',
-  'ReceptionistVoiceConsentEvent', 'ReceptionistOutboundProviderIntent',
-]);
-
 function schemaTenantTables(): string[] {
   // Prisma 7's generated namespace no longer exposes DMMF at runtime. Read the
   // authoritative schema directly so this guard also detects a model added
@@ -90,7 +86,7 @@ describe('RLS catalog guard — every tenant-owned model is deny-by-default', ()
     const defects: string[] = [];
     for (const table of expectedTables) {
       const policies = byTable.get(table) ?? [];
-      const expectedCommands = APPEND_ONLY_TABLES.has(table)
+      const expectedCommands = TENANT_APPEND_ONLY_TABLES.has(table)
         ? ['INSERT', 'SELECT']
         : ['DELETE', 'INSERT', 'SELECT', 'UPDATE'];
       const commands = policies.map(policy => policy.command).sort();

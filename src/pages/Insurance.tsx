@@ -103,14 +103,14 @@ export default function Insurance() {
       {/* Slim toolbar — the topbar breadcrumb carries the page title. */}
       <div className="flex flex-wrap items-center justify-between gap-2">
         {loading ? (
-          <span className="badge badge-emerald">Loading live insurer summary...</span>
+          <span className="badge badge-emerald">Loading insurer summary...</span>
         ) : summary ? (
           <span className="badge badge-emerald">{summary.acceptedPayers} accepted insurers</span>
         ) : (
-          <span className="badge badge-red">No live insurer summary</span>
+          <span className="badge badge-red">Insurer summary unavailable</span>
         )}
         <button type="button" onClick={() => navigate('/revenue-protection')} className="inline-flex items-center gap-2 rounded-lg bg-[var(--indigo)] px-3.5 py-2 text-[13px] font-semibold text-white hover:opacity-90 transition">
-          <BadgeCheck className="w-4 h-4" /> Verify Eligibility
+          <BadgeCheck className="w-4 h-4" /> Request eligibility response
         </button>
       </div>
 
@@ -118,35 +118,35 @@ export default function Insurance() {
         <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
           <StatCard title="Accepted Insurers" value={summary.acceptedPayers} subtitle={`of ${summary.totalPayers} configured`} icon={<ShieldCheck className="w-4 h-4" />} accent="emerald" />
           <StatCard title="Policies on File" value={summary.totalPolicies} subtitle="Patient coverage records" icon={<FileText className="w-4 h-4" />} accent="blue" />
-          <StatCard title="Verified Coverage" value={`${summary.verifiedPct}%`} subtitle={`${summary.verifiedPolicies} verified`} icon={<CheckCircle2 className="w-4 h-4" />} accent="violet" />
-          <StatCard title="Insured Patients" value={summary.totalPolicies} subtitle="Covered by a plan" icon={<Users className="w-4 h-4" />} accent="amber" />
+          <StatCard title="Policies Checked" value={`${summary.verifiedPct}%`} subtitle={`${summary.verifiedPolicies} with a recorded check`} icon={<CheckCircle2 className="w-4 h-4" />} accent="violet" />
+          <StatCard title="Patient Policy Records" value={summary.totalPolicies} subtitle="Not a coverage guarantee" icon={<Users className="w-4 h-4" />} accent="amber" />
         </div>
       ) : (
         <div className="rounded-2xl border border-dashed border-[var(--b1)] bg-[var(--s2)] px-4 py-5 text-xs text-t3">
           {loading
-            ? 'Loading the live insurance command center from the backend.'
-            : 'No live insurance overview is available yet, so no summary metrics are being fabricated.'}
+            ? 'Loading the clinic insurance records.'
+            : 'No insurance overview is available yet, so no summary metrics are being estimated.'}
         </div>
       )}
 
       <div className="rounded-2xl border border-[var(--b1)] bg-[var(--blue-soft)] p-4 flex items-start gap-3">
         <Building2 className="w-5 h-5 text-blue-v shrink-0 mt-0.5" />
         <p className="text-xs text-blue-v leading-relaxed">
-          <span className="font-bold">Why this matters:</span> patients overwhelmingly choose providers that accept their insurance.
-          Every plan you accept here widens your addressable patient base and is checked in real time during booking and check-in via Revenue Protection.
+          <span className="font-bold">Keep payer information current:</span> this directory records which insurers the practice says it accepts.
+          Eligibility checks are separate and run only when an enabled provider is available. Payer acceptance and an eligibility response do not guarantee coverage or payment.
         </p>
       </div>
 
       {loadError && (
-        <div className="rounded-2xl border border-[var(--b1)] bg-[var(--red-soft)] px-4 py-3 text-xs font-semibold text-red-v">
-          Insurance overview could not be loaded from the API. The Insurance Command Center is offline until the live backend recovers: {loadError}
+        <div role="alert" className="rounded-2xl border border-[var(--b1)] bg-[var(--red-soft)] px-4 py-3 text-xs font-semibold text-red-v">
+          Insurance overview could not be loaded from the clinic API. No policy, payer, or eligibility conclusion should be inferred from this error: {loadError}
         </div>
       )}
 
       <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
         {/* Accepted insurers directory */}
         <BentoCard title="Accepted Insurers" subtitle="Plans this practice accepts · drives eligibility checks" headerRight={<ShieldCheck className="w-4 h-4 text-t3" />}>
-          {error && <p className="text-[11px] text-red-v mb-2">{error}</p>}
+          {error && <p role="alert" className="rounded-lg bg-[var(--red-soft)] px-3 py-2 text-[11px] font-semibold text-red-v mb-2">{error}</p>}
           <div className="space-y-2.5">
             {loading && <div className="skeleton h-16 rounded-xl" />}
             {!loading && data && data.payers.map(payer => (
@@ -157,7 +157,7 @@ export default function Insurance() {
                   </div>
                   <div className="min-w-0">
                     <p className="text-xs font-bold text-t1 truncate">{payer.name}</p>
-                    <p className="text-[10px] text-t3">{payer.policyCount} {payer.policyCount === 1 ? 'patient' : 'patients'} · via {payer.sourceProvider}</p>
+                    <p className="text-[10px] text-t3">{payer.policyCount} {payer.policyCount === 1 ? 'policy record' : 'policy records'} · via {payer.sourceProvider}</p>
                   </div>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
@@ -174,7 +174,7 @@ export default function Insurance() {
             ))}
             {!loading && !data && !loadError && (
               <div className="rounded-xl border border-dashed border-[var(--b1)] px-3 py-4 text-xs text-t3">
-                No live insurance overview is loaded.
+                No insurance overview records are available.
               </div>
             )}
           </div>
@@ -208,16 +208,16 @@ export default function Insurance() {
                 <p className="text-xs text-t3">No insurers are currently accepted.</p>
               )}
             </div>
-            <p className="text-[10px] text-t3 mt-3">Prospective patients see this list when they book — confirming they're covered before they ever call.</p>
+            <p className="text-[10px] text-t3 mt-3">This list describes practice acceptance only. Patients should confirm network status and benefits with their insurer.</p>
           </BentoCard>
 
           {/* Eligibility CTA */}
           <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
             <div className="flex items-center gap-2 mb-1">
               <BadgeCheck className="w-4 h-4 text-violet-v" />
-              <p className="text-xs font-bold text-t1">Real-time eligibility</p>
+              <p className="text-xs font-bold text-t1">Eligibility checks</p>
             </div>
-            <p className="text-[11px] text-t3 mb-3">Run live coverage checks, capture copays, and track prior authorisations in Revenue Protection.</p>
+            <p className="text-[11px] text-t3 mb-3">Request a payer response, record reported benefit amounts, and track prior-authorization work. Results are point-in-time information, not a payment guarantee.</p>
             <button type="button" onClick={() => navigate('/revenue-protection')} className="w-full py-2 rounded-xl bg-[var(--s3)] hover:bg-[var(--indigo-soft)] text-t1 hover:text-indigo text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
               Open verification queue <ArrowRight className="w-3.5 h-3.5" />
             </button>

@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import type { Prisma } from '../../generated/prisma/client';
 
-export const RPM_EVIDENCE_VERSION = 'rpm-readiness-evidence-v2';
+export const RPM_EVIDENCE_VERSION = 'rpm-readiness-evidence-v3';
+export const RPM_SIGNOFF_ATTESTATION_REVISION = 'rpm-provider-attestation-v1';
 
 export interface RpmPeriod {
   /** Inclusive immutable UTC calendar-month billing boundary. */
@@ -20,6 +21,9 @@ export interface RpmEvidenceSnapshot {
   readingDays: number;
   reviewMinutes: number;
   communicationFlag: boolean;
+  qualifyingReadingCount: number;
+  excludedReadingCount: number;
+  deviceExceptions: Array<{ reason: string; count: number }>;
 }
 
 export function rpmPeriodBounds(now = new Date()): RpmPeriod {
@@ -69,7 +73,7 @@ export async function buildRpmEvidenceSnapshot(
       where: { tenantId, patientId, programType: 'rpm' },
       orderBy: { id: 'asc' },
       select: {
-        id: true, branchId: true, providerKey: true, deviceId: true, programType: true,
+        id: true, patientId: true, branchId: true, providerKey: true, deviceId: true, programType: true,
         status: true, externalRef: true, enrolledAt: true, endedAt: true, updatedAt: true,
       },
     }),
@@ -83,12 +87,13 @@ export async function buildRpmEvidenceSnapshot(
       select: { id: true, occurredAt: true, metadata: true },
     }),
     tx.deviceReading.findMany({
-      where: { tenantId, patientId, validationStatus: 'valid', capturedAt: { gte: period.start, lte: period.asOf } },
+      where: { tenantId, patientId, capturedAt: { gte: period.start, lt: period.end }, receivedAt: { lte: period.asOf } },
       orderBy: { id: 'asc' },
       select: {
         id: true, deviceId: true, branchId: true, readingType: true, value: true,
         numericValue: true, valueSecondary: true, unit: true, capturedAt: true,
         receivedAt: true, source: true, validationStatus: true, dedupeKey: true, createdAt: true,
+        sourceProviderKey: true, sourceEnrollmentId: true,
       },
     }),
     tx.auditEvent.findMany({
@@ -127,7 +132,36 @@ export async function buildRpmEvidenceSnapshot(
       && consentMetadata?.granted === true
       && typeof consentMetadata.evidenceVersion === 'string',
   );
-  const readingDays = new Set(readings.map(reading => reading.capturedAt.toISOString().slice(0, 10))).size;
+  const enrollmentById = new Map(enrollments.map(enrollment => [enrollment.id, enrollment]));
+  const deviceById = new Map(devices.map(device => [device.id, device]));
+  const classifiedReadings = readings.map(reading => {
+    const enrollment = reading.sourceEnrollmentId ? enrollmentById.get(reading.sourceEnrollmentId) : null;
+    const device = reading.deviceId ? deviceById.get(reading.deviceId) : null;
+    let exception: string | null = null;
+    if (reading.validationStatus !== 'valid') exception = 'validation_not_valid';
+    else if (reading.capturedAt > period.asOf) exception = 'future_captured_at';
+    else if (reading.source !== 'webhook') exception = 'not_automated_provider_ingest';
+    else if (!reading.dedupeKey) exception = 'missing_provider_dedupe_evidence';
+    else if (!reading.sourceEnrollmentId || !reading.sourceProviderKey) exception = 'missing_enrollment_provenance';
+    else if (!enrollment) exception = 'enrollment_link_not_found';
+    else if (enrollment.patientId !== patientId) exception = 'enrollment_patient_mismatch';
+    else if (enrollment.programType !== 'rpm') exception = 'enrollment_not_rpm';
+    else if (enrollment.providerKey === 'manual' || enrollment.providerKey !== reading.sourceProviderKey) exception = 'provider_link_mismatch';
+    else if (!enrollment.branchId || reading.branchId !== enrollment.branchId) exception = 'branch_link_mismatch';
+    else if (reading.capturedAt < enrollment.enrolledAt || (enrollment.endedAt && reading.capturedAt >= enrollment.endedAt)) exception = 'outside_enrollment_term';
+    else if (!enrollment.deviceId || !reading.deviceId || reading.deviceId !== enrollment.deviceId) exception = 'device_link_mismatch';
+    else if (!device || (device.branchId && device.branchId !== enrollment.branchId)) exception = 'device_record_mismatch';
+    return { reading, exception, qualifies: exception === null };
+  });
+  const qualifyingReadings = classifiedReadings.filter(item => item.qualifies).map(item => item.reading);
+  const exceptionCounts = new Map<string, number>();
+  for (const item of classifiedReadings) {
+    if (item.exception) exceptionCounts.set(item.exception, (exceptionCounts.get(item.exception) ?? 0) + 1);
+  }
+  const deviceExceptions = [...exceptionCounts.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([reason, count]) => ({ reason, count }));
+  const readingDays = new Set(qualifyingReadings.map(reading => reading.capturedAt.toISOString().slice(0, 10))).size;
   // Review totals are derived exclusively from append-only audit evidence.
   // Mutable RPMBillingReadiness totals are only a display cache and can never
   // satisfy the provider-signoff gate. Minutes are recalculated from the
@@ -181,7 +215,7 @@ export async function buildRpmEvidenceSnapshot(
     } : null,
     enrollments,
     devices,
-    readings,
+    readings: classifiedReadings.map(({ reading, exception, qualifies }) => ({ ...reading, qualifies, exception })),
     reviewEvidence: patientReviewEvents,
   });
   const hash = createHash('sha256').update(JSON.stringify(canonicalSnapshot)).digest('hex');
@@ -194,6 +228,9 @@ export async function buildRpmEvidenceSnapshot(
     readingDays,
     reviewMinutes,
     communicationFlag,
+    qualifyingReadingCount: qualifyingReadings.length,
+    excludedReadingCount: readings.length - qualifyingReadings.length,
+    deviceExceptions,
   };
 }
 
@@ -226,6 +263,7 @@ export async function invalidateRpmProviderSignoff(
       providerSignoffAt: null,
       providerSignoffEvidenceHash: null,
       providerSignoffEvidenceVersion: null,
+      providerSignoffAttestationRevision: null,
       status: 'NEEDS_REVIEW',
       missingRequirements: ['Provider signoff'],
     },

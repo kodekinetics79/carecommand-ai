@@ -31,6 +31,82 @@ export const STAFF_FACING_AUDIENCES = new Set(['prior_auth_followup']);
 export type CommChannel = 'sms' | 'email' | 'voice' | 'whatsapp';
 const INACTIVE_DAYS_DEFAULT = 180;
 
+export const NON_VOICE_OUTREACH_AUTHORITY_VERSION = 1 as const;
+export interface NonVoiceOutreachAuthorityMetadata {
+  authorityVersion: typeof NON_VOICE_OUTREACH_AUTHORITY_VERSION;
+  outreachPurpose: string;
+  policyVersion: string;
+  disclosureTextHash: string;
+  evidenceReference: string;
+  captureMethod: string;
+  evidenceSource: string;
+  jurisdiction: string;
+  expiresAt?: string | null;
+}
+
+function nonVoiceConsentPurpose(channel: CommChannel): 'SMS' | 'EMAIL' | 'WHATSAPP' | null {
+  if (channel === 'sms') return 'SMS';
+  if (channel === 'email') return 'EMAIL';
+  if (channel === 'whatsapp') return 'WHATSAPP';
+  return null;
+}
+
+function validAuthorityMetadata(value: unknown, outreachPurpose: string): value is NonVoiceOutreachAuthorityMetadata {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const metadata = value as Record<string, unknown>;
+  return metadata.authorityVersion === NON_VOICE_OUTREACH_AUTHORITY_VERSION
+    && metadata.outreachPurpose === outreachPurpose
+    && typeof metadata.policyVersion === 'string' && metadata.policyVersion.trim().length > 0
+    && typeof metadata.disclosureTextHash === 'string' && /^[0-9a-f]{64}$/.test(metadata.disclosureTextHash)
+    && typeof metadata.evidenceReference === 'string' && metadata.evidenceReference.trim().length >= 3
+    && typeof metadata.captureMethod === 'string' && metadata.captureMethod.trim().length > 0
+    && typeof metadata.evidenceSource === 'string' && metadata.evidenceSource.trim().length > 0
+    && typeof metadata.jurisdiction === 'string' && metadata.jurisdiction.trim().length >= 2
+    && (metadata.expiresAt == null || (typeof metadata.expiresAt === 'string'
+      && Number.isFinite(Date.parse(metadata.expiresAt)) && Date.parse(metadata.expiresAt) > Date.now()));
+}
+
+/**
+ * Live non-voice outreach requires an exact, append-only patient authority
+ * event for the channel and purpose being submitted. Lead authority remains
+ * fail-closed until the data model has an equivalent immutable lead event.
+ */
+export async function hasAffirmativeNonVoiceOutreachAuthority(
+  tenantId: string,
+  target: { patientId?: string | null; leadId?: string | null },
+  channel: CommChannel,
+  outreachPurpose: string,
+): Promise<boolean> {
+  const purpose = nonVoiceConsentPurpose(channel);
+  if (!purpose || !target.patientId || target.leadId) return false;
+  return (await affirmativelyAuthorizedPatientIds(tenantId, [target.patientId], channel, outreachPurpose)).has(target.patientId);
+}
+
+export async function affirmativelyAuthorizedPatientIds(
+  tenantId: string,
+  patientIds: string[],
+  channel: CommChannel,
+  outreachPurpose: string,
+): Promise<Set<string>> {
+  const purpose = nonVoiceConsentPurpose(channel);
+  if (!purpose || patientIds.length === 0) return new Set();
+  return runWithTenantContext(tenantId, async tx => {
+    const events = await tx.consentEvent.findMany({
+      where: { tenantId, patientId: { in: [...new Set(patientIds)] }, purpose },
+      orderBy: [{ occurredAt: 'desc' }, { id: 'desc' }],
+      select: { patientId: true, granted: true, metadata: true },
+    });
+    const decided = new Set<string>();
+    const authorized = new Set<string>();
+    for (const event of events) {
+      if (decided.has(event.patientId)) continue;
+      decided.add(event.patientId);
+      if (event.granted === true && validAuthorityMetadata(event.metadata, outreachPurpose)) authorized.add(event.patientId);
+    }
+    return authorized;
+  });
+}
+
 export function maskDestination(value?: string | null): string | null {
   if (!value) return null;
   const v = value.trim();
@@ -87,6 +163,8 @@ export interface ProviderReadiness {
   unsupportedChannels: CommChannel[];
   schedulerEnforced: boolean;
   liveSendingSupported: boolean;
+  liveCampaignDispatchActivated: boolean;
+  activationNotice: string;
 }
 
 export function providerReadiness(): ProviderReadiness {
@@ -106,7 +184,12 @@ export function providerReadiness(): ProviderReadiness {
     supportedChannels,
     unsupportedChannels: channels.filter(c => !supportedChannels.includes(c)),
     schedulerEnforced: true,   // approved SCHEDULED campaigns run via the campaign-scheduler worker
-    liveSendingSupported: true, // real Twilio SMS (+ optional HTTP email) senders are wired
+    // Provider adapters exist, but regulated campaign submission stays disabled
+    // until the consent/opt-out decision and durable provider claim share one
+    // database-linearized boundary.
+    liveSendingSupported: false,
+    liveCampaignDispatchActivated: false,
+    activationNotice: 'Live campaign delivery is disabled until the required consent and last-second opt-out safety control is activated and validated.',
   };
 }
 
@@ -358,8 +441,8 @@ export async function countOpenSlots(tenantId: string, days = 7): Promise<number
 export interface CampaignDraft { subject: string; body: string; channel: CommChannel; reason: string; draftSource: 'rule_based' | 'ai'; requiresApproval: true; warnings: string[]; sourceSummary: string }
 
 const TEMPLATES: Record<string, { subject: string; body: string }> = {
-  appointment_reminder: { subject: 'Appointment reminder', body: 'Hi {{firstName}}, this is a reminder of your upcoming appointment at {{clinicName}}. Reply or call us to confirm or reschedule.' },
-  appointment_confirmation: { subject: 'Please confirm your appointment', body: 'Hi {{firstName}}, please confirm your upcoming appointment at {{clinicName}}. Reply or call us to confirm, or to reschedule if needed.' },
+  appointment_reminder: { subject: 'Appointment reminder', body: 'Hi {{firstName}}, this is a reminder of your upcoming appointment at {{clinicName}}. Contact the clinic using verified contact details to confirm or request a change. This message does not change the appointment.' },
+  appointment_confirmation: { subject: 'Please confirm your appointment', body: 'Hi {{firstName}}, contact {{clinicName}} using verified contact details to confirm or request a change to your upcoming appointment. This message does not change the appointment.' },
   no_show_recovery: { subject: 'We missed you', body: 'Hi {{firstName}}, we missed you at your recent appointment with {{clinicName}}. We’d love to help you rebook at a time that works for you.' },
   unpaid_deposit_followup: { subject: 'Complete your booking', body: 'Hi {{firstName}}, your appointment with {{clinicName}} has an outstanding deposit. You can complete payment using the secure link our team will share.' },
   failed_payment_recovery: { subject: 'Payment didn’t go through', body: 'Hi {{firstName}}, a recent payment for your visit with {{clinicName}} didn’t complete. Our team can share a fresh secure payment link whenever you’re ready.' },

@@ -1,7 +1,10 @@
 # Production Readiness — CareCommand AI
 
 Tracking the move from local engineering release-candidate posture to a
-production-operated service. Status as of the 2026-07-30 convergence run.
+production-operated service. Status as of the 2026-07-31 final SME convergence
+run. The current evidence snapshot is
+`docs/testing/FINAL_RELEASE_CANDIDATE_REPORT_2026-07-31.md`; older checkpoints
+below are retained as history.
 
 Legend: ✅ done · 🟡 in progress · ⬜ todo
 
@@ -13,10 +16,10 @@ Legend: ✅ done · 🟡 in progress · ⬜ todo
   is accepted in production only when the explicit break-glass flag
   `PLATFORM_LEGACY_TOKEN_ENABLED=true` is set; prefer PlatformUser login +
   platform JWT. Proof: `server/test/platformLegacyToken.test.ts`.
-- ✅ **RLS / DB-level tenant isolation (local engineering):** 119/119 protected tenant/PHI tables have ENABLE + FORCE RLS; the current catalog has 522 policies and eight documented global/shared exemptions. `app_rls` is non-superuser, has no `BYPASSRLS`, owns no protected tables, and has no platform-table privileges. The table-driven restricted-role harness proves 962 same/cross/no-context CRUD and relationship behaviors across all 119 tables, including connection-pool cleanup. Platform control data uses the separate least-privilege `app_platform` client/role. Evidence: `docs/security/RLS_COVERAGE_MATRIX.md`, `RLS_BEHAVIORAL_EVIDENCE.md`, and `PLATFORM_DATABASE_PLANE.md`.
+- ✅ **RLS / DB-level tenant isolation (local engineering):** 123/123 protected tenant/PHI tables have ENABLE + FORCE RLS; the current catalog has 522 policies and eight documented global/shared exemptions. `app_rls` is non-superuser, has no `BYPASSRLS`, owns no protected tables, and has no platform-table privileges. The table-driven restricted-role harness proves 994 same/cross/no-context CRUD and relationship behaviors across all 123 tables, including public-ingress and connection-pool cleanup. Platform control data uses the separate least-privilege `app_platform` client/role. Evidence: `docs/security/RLS_COVERAGE_MATRIX.md`, `RLS_BEHAVIORAL_EVIDENCE.md`, and `PLATFORM_DATABASE_PLANE.md`.
   - **Production cutover check:** the deployed `DATABASE_URL` must authenticate as `app_rls`, `PLATFORM_DATABASE_URL` as `app_platform`, and migrations as the distinct schema owner. Re-run catalog/behavior probes against the deployed topology before handling PHI; local proof is not deployed evidence.
 - 🟡 **Observability**: backend foundation shipped — **PHI-safe structured logging** (`server/config/logger.ts`: pino `redact` for auth/cookie/token/webhook-signature paths, used app-wide) and a **vendor-neutral error-capture seam** (`server/lib/observability.ts`): the HTTP error handler captures every **5xx with id-only context** (requestId/route/method/tenantId/userId/statusCode — never bodies/PHI) as a structured `event:'exception'` log and forwards to a registered reporter. **Sentry is a ~6-line boot wiring** (`setErrorReporter` + `@sentry/node`, gated by `SENTRY_DSN`) documented in the module — no premature dependency. Proven by `server/test/observability.test.ts` (redaction, capture, reporter forwarding/throw-safety, 5xx-vs-4xx routing). *Remaining:* install + wire Sentry for real, frontend error reporting, uptime + error-rate alerting.
-- ⬜ **Secrets**: rotate the values shared in chat (Neon/Redis/Retell + JWT/encryption); confirm all are Vercel-encrypted env, none in git.
+- ⬜ **Secrets**: rotate every value disclosed outside the approved secret manager, including the Retell credential disclosed in chat; confirm the replacements are stored only in the approved deployment secret manager and absent from source/history. The current Retell-style literal scan found no match in the worktree or Git history.
 
 ## Phase 2 — Reliability
 - 🟡 **Background workers** — a **unified worker runtime** (`server/workers/index.ts`, `npm run worker:start`) now drains **all three** queues in one always-on process (autopilot execution, campaign scheduler, compliance maintenance) and registers every repeatable schedule idempotently, with a `QUEUES_ENABLED` guard, graceful shutdown, and worker faults routed to `captureException`. Previously `worker:start` booted autopilot + compliance but **not** campaign, so the campaign queue had no consumer. Proven by `server/test/worker.integration.test.ts` — enqueues an APPROVED autopilot action and asserts the worker executes it (status → EXECUTED + audit) against real Redis + Postgres. *Remaining:* deploy this process to a small always-on host (Render/Fly/Railway) next to the serverless API; the API/Vercel deploy does not host it.
@@ -35,7 +38,7 @@ Legend: ✅ done · 🟡 in progress · ⬜ todo
   (comma-separated: `payments,insurance,ai`; unknown tokens always fail boot).
   `enterprise` additionally **never** allows mock payments, acknowledged or not
   (money path). Effective posture is truthfully reported at
-  `GET /health/integrations` (provider ids + configured/not_configured flags,
+  authenticated `GET /health/integrations` (monitoring bearer token; provider ids + configured/not_configured flags,
   no secrets). Proof: `server/test/envSchema.test.ts`,
   `server/test/observabilityPillars.test.ts`. Contract:
   [docs/INTEGRATION_MODE_REGISTER.md](/Users/zackkhan/carecommand-ai/docs/INTEGRATION_MODE_REGISTER.md).

@@ -19,7 +19,7 @@ export default function Login() {
   const location = useLocation();
   const { signIn } = useSession({ hydrate: false });
 
-  // "Remember me" pre-fills the email on return (convenience only; no token change).
+  // Email-only convenience; authentication tokens and session duration are unchanged.
   const rememberedEmail = typeof localStorage !== 'undefined' ? localStorage.getItem(REMEMBER_KEY) : null;
   const [mode, setMode] = useState<Mode>('login');
   const [email, setEmail] = useState(rememberedEmail ?? '');
@@ -37,6 +37,7 @@ export default function Login() {
   const [info, setInfo] = useState<string | null>(null);
   const [showPw, setShowPw] = useState(false);
   const [showNewPw, setShowNewPw] = useState(false);
+  const resetUiAvailable = !import.meta.env.PROD;
 
   function goHome() {
     const destination = (location.state as { from?: string } | null)?.from ?? '/';
@@ -45,7 +46,7 @@ export default function Login() {
 
   async function run(fn: () => Promise<void>) {
     setLoading(true); setError(null);
-    try { await fn(); } catch (err) { setError(err instanceof Error ? err.message : 'Something went wrong'); }
+    try { await fn(); } catch (err) { setError(err instanceof Error ? err.message : 'We could not complete that request. Please try again.'); }
     finally { setLoading(false); }
   }
 
@@ -77,6 +78,11 @@ export default function Login() {
 
   const onResetRequest = (e: FormEvent) => { e.preventDefault(); void run(async () => {
     const res = await requestPasswordReset(email.trim().toLowerCase());
+    if (res.resetAvailable === false) {
+      setInfo('Self-service password reset is not configured. Contact your clinic administrator for account recovery.');
+      setMode('login');
+      return;
+    }
     setInfo(res.message);
     if (res.devToken) setResetToken(res.devToken); // dev-only convenience; absent in production
     setMode('resetConfirm');
@@ -118,10 +124,10 @@ export default function Login() {
           </div>
 
           <h1 className="text-[1.6rem] font-bold text-t1 leading-snug tracking-tight mt-8 animate-fade-up login-rise-1">
-            Run your entire clinic from <span className="text-indigo">one command center.</span>
+            Work across configured clinic modules from <span className="text-indigo">one command center.</span>
           </h1>
           <p className="text-[13.5px] text-t2 leading-relaxed mt-2.5 max-w-lg animate-fade-up login-rise-2">
-            Scheduling, revenue protection, patient growth, insurance, and an AI front desk — unified in one secure platform.
+            Scheduling, patient engagement, insurance workflows, and front-office tools in one clinic workspace.
           </p>
 
           <div className="grid grid-cols-2 gap-3 mt-7">
@@ -158,7 +164,7 @@ export default function Login() {
           <div className="mb-6">
             <h2 className="text-[1.35rem] font-bold text-t1 tracking-tight">Sign in to your clinic workspace</h2>
             <p className="text-[13px] text-t3 mt-1.5 leading-relaxed">
-              Access scheduling, CRM, payments, revenue protection, and operational insights from one secure platform.
+              Use the modules and clinic locations assigned to your account.
             </p>
           </div>
 
@@ -168,10 +174,10 @@ export default function Login() {
           {mode === 'login' && (
             <form onSubmit={onLogin} className="space-y-4">
               <Labeled label="Email" icon={<Mail className="w-4 h-4 text-t3 shrink-0" />}>
-                <input type="email" value={email} onChange={e => { setEmail(e.target.value); setTenantRequired(false); setTenantSlug(''); }} className={fieldInput} placeholder="you@clinic.com" autoComplete="email" autoFocus />
+                <input type="email" value={email} onChange={e => { setEmail(e.target.value); setTenantRequired(false); setTenantSlug(''); }} className={fieldInput} placeholder="you@clinic.com" autoComplete="email" required autoFocus />
               </Labeled>
               <Labeled label="Password" icon={<Lock className="w-4 h-4 text-t3 shrink-0" />}>
-                <input type={showPw ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} className={fieldInput} placeholder="••••••••" autoComplete="current-password" />
+                <input type={showPw ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} className={fieldInput} placeholder="••••••••" autoComplete="current-password" required />
                 <PwReveal shown={showPw} onToggle={() => setShowPw(v => !v)} />
               </Labeled>
               {tenantRequired && (
@@ -184,15 +190,17 @@ export default function Login() {
                 <label className="inline-flex items-center gap-2 cursor-pointer select-none">
                   <input type="checkbox" checked={rememberMe} onChange={e => setRememberMe(e.target.checked)}
                     className="h-4 w-4 rounded border-[var(--b2)] text-[var(--indigo)] accent-[var(--indigo)] focus-visible:outline-2 focus-visible:outline-[var(--indigo)]" />
-                  <span className="text-[13px] text-t2">Remember me</span>
+                  <span className="text-[13px] text-t2">Remember email on this device</span>
                 </label>
-                <button type="button" onClick={() => { setError(null); setInfo(null); setMode('reset'); }} className="text-[13px] font-semibold text-indigo hover:underline">Forgot password?</button>
+                {resetUiAvailable ? (
+                  <button type="button" onClick={() => { setError(null); setInfo(null); setMode('reset'); }} className="text-[13px] font-semibold text-indigo hover:underline">Forgot password?</button>
+                ) : <span className="text-[11px] text-t3">Account recovery: contact your administrator</span>}
               </div>
 
               <button type="submit" disabled={loading} className={primaryBtn}>{loading ? 'Signing in…' : 'Sign in'}</button>
 
               <p className="flex items-center justify-center gap-1.5 text-[11px] text-t3">
-                <ShieldCheck className="w-3.5 h-3.5 text-emerald-v" aria-hidden="true" /> Protected workspace · Integration-ready · audit-ready
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-v" aria-hidden="true" /> Role-based access · recorded account activity
               </p>
             </form>
           )}
@@ -202,13 +210,13 @@ export default function Login() {
               {mode === 'mfaSetup' && mfaSetupData && (
                 <div className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3 space-y-2">
                   <p className="text-xs font-semibold text-t2 inline-flex items-center gap-1.5"><Smartphone className="w-3.5 h-3.5" /> Set up your authenticator</p>
-                  <p className="text-[11px] text-t3">Your organization requires MFA. Add this secret to an authenticator app (Google Authenticator, 1Password, Authy), then enter the 6-digit code.</p>
-                  <code className="block break-all rounded-lg bg-[var(--s2)] px-2 py-1.5 text-[11px] font-mono text-t1">{mfaSetupData.secret}</code>
+                  <p id="mfa-setup-help" className="text-[11px] text-t3">Your organization requires multi-factor authentication (MFA). Add this setup key to your authenticator app, then enter its 6-digit code. Keep the setup key private.</p>
+                  <code aria-label="Authenticator setup key" className="block break-all rounded-lg bg-[var(--s2)] px-2 py-1.5 text-[11px] font-mono text-t1">{mfaSetupData.secret}</code>
                 </div>
               )}
               {mode === 'mfa' && <p className="text-sm text-t2">Enter the 6-digit code from your authenticator app.</p>}
               <Labeled label="Verification code" icon={<KeyRound className="w-4 h-4 text-t3 shrink-0" />}>
-                <input inputMode="numeric" value={code} onChange={e => setCode(e.target.value)} className={fieldInput} placeholder="123456" autoComplete="one-time-code" maxLength={6} autoFocus />
+                <input inputMode="numeric" value={code} onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))} className={fieldInput} placeholder="123456" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} aria-describedby={mode === 'mfaSetup' ? 'mfa-setup-help' : undefined} required autoFocus />
               </Labeled>
               <button type="submit" disabled={loading} className={primaryBtn}>{loading ? 'Verifying…' : 'Verify & continue'}</button>
               <button type="button" onClick={() => { setMode('login'); setCode(''); }} className="w-full text-center text-[13px] font-semibold text-t3 hover:underline">Back to sign in</button>
@@ -217,11 +225,11 @@ export default function Login() {
 
           {mode === 'reset' && (
             <form onSubmit={onResetRequest} className="space-y-4">
-              <p className="text-sm text-t2">Enter your email to start a password reset.</p>
+              <p className="text-sm text-t2">Enter your email to generate a local development reset token.</p>
               <Labeled label="Email" icon={<Mail className="w-4 h-4 text-t3 shrink-0" />}>
-                <input type="email" value={email} onChange={e => setEmail(e.target.value)} className={fieldInput} placeholder="you@clinic.com" autoComplete="email" autoFocus />
+                <input type="email" value={email} onChange={e => setEmail(e.target.value)} className={fieldInput} placeholder="you@clinic.com" autoComplete="email" required autoFocus />
               </Labeled>
-              <button type="submit" disabled={loading} className={primaryBtn}>{loading ? 'Sending…' : 'Send reset link'}</button>
+              <button type="submit" disabled={loading} className={primaryBtn}>{loading ? 'Generating…' : 'Generate local reset token'}</button>
               <button type="button" onClick={() => { setError(null); setInfo(null); setMode('login'); }} className="w-full text-center text-[13px] font-semibold text-t3 hover:underline">Back to sign in</button>
             </form>
           )}
@@ -230,10 +238,10 @@ export default function Login() {
             <form onSubmit={onResetConfirm} className="space-y-4">
               <p className="text-sm text-t2">Enter the reset token and choose a new password.</p>
               <Labeled label="Reset token" icon={<KeyRound className="w-4 h-4 text-t3 shrink-0" />}>
-                <input value={resetToken} onChange={e => setResetToken(e.target.value)} className={fieldInput} placeholder="paste token" autoFocus />
+                <input value={resetToken} onChange={e => setResetToken(e.target.value)} className={fieldInput} placeholder="Paste the reset token" autoComplete="off" required autoFocus />
               </Labeled>
               <Labeled label="New password" icon={<Lock className="w-4 h-4 text-t3 shrink-0" />}>
-                <input type={showNewPw ? 'text' : 'password'} value={newPassword} onChange={e => setNewPassword(e.target.value)} className={fieldInput} placeholder="At least 8 characters" autoComplete="new-password" />
+                <input type={showNewPw ? 'text' : 'password'} value={newPassword} onChange={e => setNewPassword(e.target.value)} className={fieldInput} placeholder="Follow your organization’s password policy" autoComplete="new-password" required />
                 <PwReveal shown={showNewPw} onToggle={() => setShowNewPw(v => !v)} />
               </Labeled>
               <button type="submit" disabled={loading} className={primaryBtn}>{loading ? 'Updating…' : 'Reset password'}</button>
@@ -244,7 +252,9 @@ export default function Login() {
           {mode === 'expired' && (
             <div className="space-y-4">
               <p className="text-sm text-t2">{info ?? 'Your password has expired and must be reset before signing in.'}</p>
-              <button type="button" onClick={() => { setError(null); setInfo(null); setMode('reset'); }} className={primaryBtn}>Reset password</button>
+              {resetUiAvailable
+                ? <button type="button" onClick={() => { setError(null); setInfo(null); setMode('reset'); }} className={primaryBtn}>Reset password</button>
+                : <p role="alert" className="rounded-lg bg-[var(--amber-soft)] px-3 py-2 text-sm text-amber-v">Self-service password reset is unavailable. Contact your clinic administrator.</p>}
             </div>
           )}
 
@@ -265,12 +275,12 @@ export default function Login() {
 }
 
 const FEATURES: Array<{ icon: typeof ShieldCheck; title: string; sub: string; chip: string }> = [
-  { icon: Bot, title: 'AI Receptionist', sub: 'Answers calls & books 24/7', chip: 'bg-[var(--indigo-soft)] text-indigo' },
-  { icon: TrendingUp, title: 'Revenue Leak Recovery', sub: 'Finds & recovers lost revenue', chip: 'bg-emerald-50 text-emerald-600' },
-  { icon: CalendarDays, title: 'Smart Scheduling', sub: 'Fills gaps, cuts no-shows', chip: 'bg-blue-50 text-blue-600' },
-  { icon: Users, title: 'Patient CRM & Reactivation', sub: 'Win-backs & retention', chip: 'bg-violet-50 text-violet-600' },
-  { icon: BadgeCheck, title: 'Insurance & Eligibility', sub: 'Prevent denials before they happen', chip: 'bg-cyan-50 text-cyan-600' },
-  { icon: CreditCard, title: 'Payments & Deposits', sub: 'Protect every booking', chip: 'bg-amber-50 text-amber-600' },
+  { icon: Bot, title: 'AI Receptionist', sub: 'When configured, review calls, handoffs, and booking workflows', chip: 'bg-[var(--indigo-soft)] text-indigo' },
+  { icon: TrendingUp, title: 'Revenue Workflows', sub: 'Review recorded risks and follow-up queues', chip: 'bg-emerald-50 text-emerald-600' },
+  { icon: CalendarDays, title: 'Scheduling', sub: 'Manage appointments and available slots', chip: 'bg-blue-50 text-blue-600' },
+  { icon: Users, title: 'Patient CRM', sub: 'Organize consent-aware engagement', chip: 'bg-violet-50 text-violet-600' },
+  { icon: BadgeCheck, title: 'Insurance Workflows', sub: 'Track eligibility and follow-up status', chip: 'bg-cyan-50 text-cyan-600' },
+  { icon: CreditCard, title: 'Payment Workflows', sub: 'Track requests and provider-confirmed status', chip: 'bg-amber-50 text-amber-600' },
 ];
 
 function PwReveal({ shown, onToggle }: { shown: boolean; onToggle: () => void }) {

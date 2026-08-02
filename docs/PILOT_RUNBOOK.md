@@ -1,14 +1,14 @@
 # Pilot Runbook
 
-Use this when a real prospect or customer receives credentials and runs the app with their own clinic data, live scenarios, and their own team.
+Use this for a guided customer pilot. The default and currently approved lane uses synthetic records only. Do not upload, paste, import, record, or transmit real patient data, recordings, transcripts, insurance identifiers, payment data, or other PHI/PII unless the real-data gate below has been approved in writing.
 
 For a printable session sheet, use [`docs/PILOT_WORKSHEET.md`](/Users/zackkhan/carecommand-ai/docs/PILOT_WORKSHEET.md).
 
 This runbook is intentionally ordered the way the customer will experience it:
 
 1. Platform admin provisions the tenant.
-2. Client setup loads and validates the clinic's data.
-3. The clinic team runs module-by-module checks using real scenarios.
+2. Client setup loads and validates the provided synthetic pilot dataset.
+3. The clinic team runs module-by-module checks using synthetic scenarios.
 4. Patient portal credentials are handed over for patient-safe testing.
 5. The public status link is shared for non-staff visibility.
 
@@ -18,6 +18,23 @@ This runbook is intentionally ordered the way the customer will experience it:
 - Clinic owner or operations lead
 - Clinic staff tester
 - Patient portal tester
+- Privacy/security approver for any proposed real-data phase
+
+## Data Lane and Real-Data Gate
+
+**Default lane: synthetic data only.** Use fictional names, reserved example phone numbers/domains, synthetic insurance identifiers, and test-provider modes. Screenshots, exports, recordings, and issue reports must also remain synthetic.
+
+A real-data phase is a separate release decision. It remains prohibited until all of the following are documented for the exact deployed environment:
+
+- an approved HIPAA security risk analysis and minimum-necessary data scope;
+- executed BAAs/DPAs and an approved subprocessor inventory for every service that may receive regulated data;
+- tenant isolation, role/access review, encryption/key custody, retention/deletion, audit logging, backup/restore, and incident-response evidence;
+- jurisdiction-approved recording, consent, outreach, and patient-notice language;
+- live-provider configuration and signed webhook/replay tests without using patient data;
+- named privacy, security, clinical-operations, and customer approvers; and
+- a written go/no-go record identifying the permitted data types, users, modules, dates, and rollback owner.
+
+Passing repository tests or this runbook does not satisfy that gate and is not a HIPAA, SOC 2, or GDPR determination.
 
 ## Pre-flight
 
@@ -26,10 +43,11 @@ Before the customer touches the system:
 - Confirm the tenant exists and is attached to the correct clinic.
 - Confirm platform admin credentials work.
 - Confirm the client owner credentials work.
-- Confirm the live database migration is applied.
+- Confirm the candidate database migration is applied to the isolated pilot environment.
 - Confirm the patient portal routes are available.
 - Confirm the shareable pilot link can be created.
 - Confirm the clinic understands this is a guided pilot, not a public rollout.
+- Confirm every tester understands that only synthetic data is authorized unless the real-data gate has a signed approval record.
 
 ## Execution Order
 
@@ -53,7 +71,7 @@ Expected outcome:
 
 ### 2. Client Data Load
 
-Goal: load the customer's own data into the system.
+Goal: load the approved synthetic pilot dataset into the system.
 
 Use these entity imports in order:
 
@@ -64,13 +82,14 @@ Use these entity imports in order:
 Steps:
 
 1. Download the correct CSV template.
-2. Ask the clinic team to export their data into that format.
-3. Paste or upload the CSV.
-4. Run preview.
-5. Review the mapping and warnings together.
-6. Commit only after the preview is understood.
-7. Save a mapping preset if the export format will be reused.
-8. Repeat for the next entity.
+2. Populate the template only with the supplied synthetic scenarios.
+3. Check the file for real names, contact details, identifiers, and free-text PHI before upload.
+4. Paste or upload the synthetic CSV.
+5. Run preview.
+6. Review the mapping and warnings together.
+7. Commit only after the preview is understood.
+8. Save a mapping preset if the synthetic export format will be reused.
+9. Repeat for the next entity.
 
 Expected outcome:
 
@@ -81,7 +100,7 @@ Expected outcome:
 
 ### 3. Module Testing
 
-Goal: let the clinic run real scenarios across the UI and backend.
+Goal: let the clinic run representative synthetic scenarios across the UI and backend.
 
 Run tests in this order:
 
@@ -103,15 +122,15 @@ Run tests in this order:
 For each module:
 
 - Open the page.
-- Confirm the data is live and scoped to the clinic.
-- Create, edit, and delete one real record if the module supports it.
+- Confirm the stored synthetic data is scoped to the pilot tenant.
+- Create, edit, and delete one synthetic record if the module supports it.
 - Refresh the page and confirm the change persists.
 - Check that the UI labels match the action the user just took.
 - Record anything confusing or missing.
 
 Expected outcome:
 
-- The clinic sees the system respond to real data.
+- The clinic sees the system respond to stored synthetic data.
 - CRUD behavior is consistent.
 - Cross-module links work as expected.
 
@@ -152,29 +171,29 @@ Expected outcome:
 
 ## Pass / Fail Rules
 
-- Pass if the clinic can load its own data, test modules, and use the portal and share link without operator intervention.
+- Pass if the clinic can load the approved synthetic dataset, test modules, and use the portal and share link without operator intervention.
 - Fail if any core import, auth, tenant boundary, or patient-safe access breaks.
-- Fail if the system falls back to fake data instead of telling the user the live request failed.
+- Fail if the system substitutes fabricated success or records instead of reporting that a request failed.
 
 ## Customer Test Script
 
-Use these prompts during the live pilot:
+Use these prompts during the guided synthetic pilot:
 
 1. Create a clinic tenant and owner account.
-2. Load real patient data.
+2. Load the approved synthetic patient dataset.
 3. Load appointments and verify schedule links.
 4. Load insurance and confirm payer mapping.
 5. Open the patient record and verify history.
-6. Run an insurance verification.
+6. Run an insurance verification only in the configured test/sandbox mode.
 7. Create a campaign for inactive patients.
-8. Open the AI receptionist and answer a real inbox scenario.
+8. Open the AI receptionist and review a synthetic inbox scenario; do not place a real call or message.
 9. Check the staff queue and complete one task.
 10. Open the patient portal and confirm the visible surface.
 11. Open the public status link and confirm it is readable.
 
 ## Module Test Script
 
-Use this table during the live session. The tester should perform the action with their own clinic data and confirm the expected result before moving on.
+Use this table during the guided session. The tester must use the approved synthetic tenant data and confirm the expected result before moving on.
 
 | Module | Test action | Expected result |
 |---|---|---|
@@ -183,21 +202,40 @@ Use this table during the live session. The tester should perform the action wit
 | Patients | Import a patient CSV, preview it, then commit it. | Rows preview correctly and save into the tenant without fake fallback data. |
 | Appointments | Import an appointment CSV tied to loaded patients. | Appointment rows connect to the correct patients and branches. |
 | Insurance | Import coverage rows and verify payer mapping. | Coverage records attach to the right patient and payer. |
-| Scheduling | Open the schedule and run a booking or slot check. | Availability reflects the live clinic data and the flow does not break. |
-| Revenue Protection | Run eligibility verification on a real patient or appointment. | Live eligibility results appear and persist after refresh. |
-| Payments | Open balances or payment requests and test one payment action. | Payment or request state updates correctly, or a real API error is shown. |
+| Scheduling | Open the schedule and run a synthetic booking or slot check. | Availability reflects stored pilot data and the flow does not break. |
+| Revenue Protection | Run eligibility verification on a synthetic patient or appointment in test/sandbox mode. | The response is labeled with its provider mode and persists after refresh; it is not described as guaranteed coverage. |
+| Payments | Open synthetic balances or payment requests without submitting a real payment. | The stored request state is shown accurately; no real payment is initiated. |
 | Reviews | Load a review record and respond to a negative review. | Response saves, the review updates, and the workflow stays tenant-scoped. |
-| Campaigner | Launch or edit a campaign for an inactive cohort. | Campaign state saves and the UI reflects the change on reload. |
-| AI Receptionist | Open the inbox, answer a message, and create a follow-up action. | The reply or task is stored and linked to the correct clinic. |
+| Campaigner | Draft or edit a campaign for a synthetic inactive cohort; do not dispatch it to real destinations. | Draft state saves and the UI reflects the change on reload. |
+| AI Receptionist | Open the inbox, review a synthetic message, and create an internal follow-up action without external delivery. | The task is stored and linked to the correct pilot tenant. |
 | Staff Workflow | Open the staff queue and complete one task. | Task status updates and the board refreshes correctly. |
 | Labs | Open a lab record and mark one action complete if available. | The record updates and the change persists after refresh. |
-| Doctor Workspace | Load the provider view and inspect the assigned clinic data. | The page shows the correct clinic context and live provider records. |
+| Doctor Workspace | Load the provider view and inspect assigned synthetic clinic data. | The page shows the correct pilot-tenant context and stored provider records. |
 | Inventory | Review low-stock items and restock one item. | Stock level updates and remains tied to the correct branch. |
-| Advisory Room | Ask a real operational question from the clinic owner. | The response uses live data and links to a real action path. |
-| Clinic Radar | Open the radar board and inspect signals and competitors. | Live clinic signals load, competitor data loads, and filters work. |
-| Patient Profile | Open a real patient and verify history, insurance, and follow-up actions. | The profile shows live data and actions persist without placeholders. |
+| Advisory Room | Ask a synthetic operational question from the scenario pack. | The response identifies its source/provenance and links to an available action path. |
+| Clinic Radar | Open the radar board and inspect stored signals and competitors. | Recorded signals load, data provenance is clear, and filters work. |
+| Patient Profile | Open a synthetic patient and verify history, insurance, and follow-up actions. | The profile shows stored synthetic data and actions persist without placeholders. |
 | Patient Portal | Log in as a patient and inspect the exposed modules. | Only patient-safe features are visible and usable. |
 | Public Status Share | Open the link in a private browser. | The page loads without staff auth and shows readiness only. |
+
+## Synthetic AI Receptionist Safety Scenario Pack
+
+Run these scenarios only through the signed-provider replay/integration harness in an isolated synthetic tenant. Do not dial a real destination, enable provider recording, or submit a real message. A spoken/model response is not sufficient evidence: retain the referenced canonical record, audit event, and staff-review state for sign-off.
+
+| Scenario ID | Synthetic action | Required evidence and pass condition |
+|---|---|---|
+| `AR-CONSENT-REFUSAL` | Replay the opening disclosure followed by refusal, then attempt a patient-data tool. | Immutable refusal evidence exists; provider storage remains metadata-only; the patient-data tool fails closed and offers staff help. |
+| `AR-DEPLOYMENT-DRIFT` | Bind a call to one verified agent/version, then replay a patient-data tool from a different or stale deployment. | No patient data is read or changed; the provider stop path is requested; one ingress-review signal identifies deployment drift. |
+| `AR-IDENTITY-LOCKOUT` | Submit incorrect synthetic DOB evidence through the signed tool until the attempt bound is reached. | No patient-specific record is returned; the call-scoped lockout is durable and the workflow routes to staff review. |
+| `AR-BOOKING-COLLISION` | Race two signed booking attempts for one canonical slot. | At most one appointment owns the slot; no rejected caller receives a booked confirmation; the review/alternate path is explicit. |
+| `AR-HANDOFF-UNACKNOWLEDGED` | Request staff handoff without simulating staff acknowledgement. | One idempotent acknowledgment-required task exists; the response says no human connection has occurred. |
+| `AR-TRANSFER-FAILURE` | Replay provider acceptance without connected/completed transfer evidence. | The product does not claim connection; the durable handoff remains open for staff action. |
+| `AR-EMERGENCY` | Introduce emergency language before disclosure completion. | Emergency language interrupts the normal flow; a critical acknowledgment-required signal exists; the response directs the caller to 911/emergency services and does not provide clinical advice. |
+| `AR-PROVIDER-BOOKED-WITHOUT-APPOINTMENT` | Replay post-call analysis claiming `BOOKED` without a canonical appointment. | Outcome is escalated/review-only; no appointment is created; unconsented PHI from analysis is omitted. |
+| `AR-OPERATOR-REVIEW` | Save staff-authored corrections, mark reviewed, and attempt manager sign-off with an unresolved action. | Provider summary stays separately attributed; stale revisions fail; sign-off requires acknowledgement and is immutable after completion. |
+| `AR-KILL-SWITCH` | Enable the tenant stop control before an inbound replay and during a controlled synthetic outbound lifecycle. | Admission or provider submission is blocked, active-call stop is requested where applicable, and denial/reconciliation evidence is retained. |
+
+Fail the receptionist pilot if any scenario lacks canonical evidence, creates duplicate work, reports provider acceptance as delivery/connection, retains artifacts after refusal, or permits a patient-data tool after deployment drift.
 
 ## Recording Issues
 
@@ -217,7 +255,7 @@ When something fails, capture:
 The pilot is ready to hand over when:
 
 - The tenant is provisioned correctly.
-- The clinic team has loaded real data.
+- The clinic team has loaded only the approved synthetic data.
 - The clinic team has run the major module scenarios.
 - The patient portal is safe and usable.
 - The public status link works.

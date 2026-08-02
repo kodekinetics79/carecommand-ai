@@ -62,12 +62,12 @@ export interface AddonDef { key: string; name: string; description: string; feat
 export const ADDONS: AddonDef[] = [
   { key: 'ai_receptionist', name: 'AI Receptionist', description: 'Voice/SMS AI front desk and receptionist studio.', featureKey: 'ai_receptionist' },
   { key: 'device_integration', name: 'Device Integration Center', description: 'Connect clinical and front-desk devices.', featureKey: 'device_integration' },
-  { key: 'insurance_eligibility', name: 'Insurance Eligibility', description: 'Real-time eligibility and benefits checks.', featureKey: 'insurance_eligibility' },
+  { key: 'insurance_eligibility', name: 'Insurance Eligibility', description: 'Eligibility and benefit inquiries through a configured provider.', featureKey: 'insurance_eligibility' },
   { key: 'advanced_reports', name: 'Advanced Reports', description: 'Advanced analytics and custom reporting.', featureKey: 'advanced_reports' },
   { key: 'extra_location', name: 'Extra Location', description: 'Add additional clinic locations.', featureKey: 'multi_location' },
   { key: 'extra_users', name: 'Extra Users', description: 'Add additional user seats.', featureKey: null },
   { key: 'campaign_automation', name: 'Campaign Automation', description: 'Automated multi-channel patient campaigns.', featureKey: 'campaign_automation' },
-  { key: 'compliance_readiness', name: 'Compliance Readiness Center', description: 'SOC 2 Readiness and HIPAA Alignment tooling.', featureKey: 'compliance_readiness' },
+  { key: 'compliance_readiness', name: 'Compliance Readiness Center', description: 'Internal SOC 2 readiness and HIPAA alignment self-assessment tooling; not certification.', featureKey: 'compliance_readiness' },
 ];
 
 // Statuses that grant feature access (past_due keeps a grace window; suspended/

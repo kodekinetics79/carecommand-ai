@@ -16,6 +16,7 @@ import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import { apiRequest } from '../lib/api';
+import { getLocale } from '../lib/preferences';
 import { useSession } from '../hooks/useSession';
 import type { IntegrationStatus } from '../types';
 
@@ -108,36 +109,37 @@ export default function Integrations() {
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
-        title="Integrations Hub"
-        subtitle="Operational status for insurance, payments, communication, reputation, and AI providers."
-        badge={`${configuredCount} configured · ${loading ? 'Loading…' : 'Live status'}`}
-        badgeColor="blue"
+        title="Integrations"
+        subtitle="Review provider configuration, operating mode, supported workflows, and the latest recorded health status."
+        badge={error ? 'Status unavailable' : loading ? 'Loading status' : `${configuredCount} configured`}
+        badgeColor={error ? 'red' : loading ? 'blue' : 'violet'}
         actions={
           <button
             type="button"
             onClick={() => navigate('/settings')}
             className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition"
           >
-            <Sparkles className="w-4 h-4" /> Open Settings
+            <Sparkles className="w-4 h-4" /> Open settings
           </button>
         }
       />
 
       {error && (
-        <div className="rounded-2xl border border-[var(--red-soft)] bg-[var(--red-soft)] p-4 text-sm text-red-v">
-          {error}
+        <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[var(--red-soft)] bg-[var(--red-soft)] p-4 text-sm text-red-v">
+          <span>Integration status is unavailable. {error}</span>
+          <button type="button" onClick={() => void loadStatuses()} className="rounded-lg border border-current px-3 py-1.5 text-xs font-semibold">Try again</button>
         </div>
       )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Configured" value={configuredCount} subtitle="Providers ready" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Healthy" value={healthyCount} subtitle="Healthy connections" icon={<ShieldCheck className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Sandbox" value={sandboxCount} subtitle="Sandbox-ready or active" icon={<RefreshCw className="w-4 h-4" />} accent="violet" />
-        <StatCard title="Mock" value={mockCount} subtitle="Fallback / not configured" icon={<AlertCircle className="w-4 h-4" />} accent="amber" />
+        <StatCard title="Configured" value={configuredCount} subtitle="Configuration detected" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Healthy" value={healthyCount} subtitle="Reported healthy" icon={<ShieldCheck className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Sandbox" value={sandboxCount} subtitle="Sandbox mode" icon={<RefreshCw className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Mock" value={mockCount} subtitle="No provider request" icon={<AlertCircle className="w-4 h-4" />} accent="amber" />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_320px]">
-        <BentoCard title="Integration Status" subtitle="Honest provider readiness and health" headerRight={<Cloud className="w-4 h-4 text-t3" />}>
+        <BentoCard title="Provider status" subtitle="Configuration and recorded health by provider" headerRight={<Cloud className="w-4 h-4 text-t3" />}>
           <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
             <div className="relative flex-1">
               <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-t3" />
@@ -166,6 +168,12 @@ export default function Integrations() {
           </div>
 
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            {!loading && filteredRows.length === 0 && (
+              <div className="sm:col-span-2 rounded-2xl border border-dashed border-[var(--b2)] p-8 text-center">
+                <p className="text-sm font-semibold text-t1">{statusRows.length === 0 ? 'No integrations available' : 'No matching integrations'}</p>
+                <p className="mt-1 text-xs text-t3">{statusRows.length === 0 ? 'Provider records will appear after they are added to this workspace.' : 'Clear the search or choose another category.'}</p>
+              </div>
+            )}
             {filteredRows.map(row => {
               const Icon = iconMap[row.category] || iconMap.default;
               const result = testResults[row.key];
@@ -208,8 +216,8 @@ export default function Integrations() {
                       <span className="font-semibold text-t1">{row.configured ? 'Yes' : 'No'}</span>
                     </div>
                     <div className="flex items-center justify-between gap-3">
-                      <span>Last check</span>
-                      <span className="font-semibold text-t1">{row.lastSyncAt ? new Date(row.lastSyncAt).toLocaleString('en-US') : '—'}</span>
+                      <span>Last recorded activity</span>
+                      <span className="font-semibold text-t1">{row.lastSyncAt ? new Date(row.lastSyncAt).toLocaleString(getLocale()) : '—'}</span>
                     </div>
                     <div className="flex items-center justify-between gap-3">
                       <span>Risk</span>
@@ -219,12 +227,12 @@ export default function Integrations() {
 
                   {row.missingEnvVars.length > 0 && (
                     <p className="mt-3 text-[11px] text-t3">
-                      Missing env: {row.missingEnvVars.join(', ')}
+                      Server configuration needed: {row.missingEnvVars.join(', ')}
                     </p>
                   )}
 
                   {result && (
-                    <div className="mt-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3 text-[11px] text-t2">
+                    <div role="status" aria-live="polite" className="mt-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3 text-[11px] text-t2">
                       {result}
                     </div>
                   )}
@@ -246,14 +254,14 @@ export default function Integrations() {
         </BentoCard>
 
         <div className="space-y-4">
-          <BentoCard title="Integration Notes" subtitle="What the owner should know">
+          <BentoCard title="Status definitions" subtitle="How to interpret provider modes">
             <div className="space-y-2">
               {[
-                { title: 'Mock Mode', text: 'Safe fallback when a provider is not configured.' },
-                { title: 'Sandbox Ready', text: 'Credentials are present but not actively connected.' },
-                { title: 'Sandbox Active', text: 'Configured and ready for test transactions or sandbox calls.' },
-                { title: 'Live Not Configured', text: 'Production credentials or activation are not configured.' },
-                { title: 'Live Active', text: 'Provider is live and health checks are passing.' },
+                { title: 'Mock mode', text: 'The app records a simulated result and does not submit a request to the provider.' },
+                { title: 'Sandbox ready', text: 'Sandbox configuration is detected; run a connection check before testing a workflow.' },
+                { title: 'Sandbox active', text: 'The latest recorded sandbox connection check succeeded.' },
+                { title: 'Live not configured', text: 'Production configuration or activation is missing.' },
+                { title: 'Live active', text: 'The latest recorded production connection check succeeded. This does not guarantee a future provider request.' },
               ].map(item => (
                 <div key={item.title} className="rounded-xl border border-[var(--b1)] p-3">
                   <p className="text-sm font-semibold text-t1">{item.title}</p>
@@ -263,7 +271,7 @@ export default function Integrations() {
             </div>
           </BentoCard>
 
-          <BentoCard title="Provider Categories" subtitle="Coverage across the platform">
+          <BentoCard title="Provider categories" subtitle="Available integrations by workflow">
             <div className="space-y-2">
               {categories.filter(item => item !== 'All').map(item => (
                 <div key={item} className="flex items-center justify-between gap-3 rounded-xl border border-[var(--b1)] p-3">
@@ -277,7 +285,7 @@ export default function Integrations() {
               onClick={() => navigate('/control-plane')}
               className="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-xl border border-dashed border-[var(--b2)] px-4 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition"
             >
-              <ShieldCheck className="w-3.5 h-3.5" /> Open Control Plane
+              <ShieldCheck className="w-3.5 h-3.5" /> Open control plane
             </button>
           </BentoCard>
         </div>

@@ -43,6 +43,12 @@ function signWebhook(secret: string, payload: unknown): { raw: string; sig: stri
 
 let app: FastifyInstance;
 const createdTenantIds: string[] = [];
+const realSuiteStart = new Date();
+const rpmSuiteNow = new Date(Date.UTC(
+  realSuiteStart.getUTCFullYear(),
+  realSuiteStart.getUTCMonth() + 1,
+  1,
+) - 1);
 
 async function makeTenant(planKey: 'enterprise' | 'starter') {
   const id = randomUUID();
@@ -71,31 +77,67 @@ function inTenant<T>(t: TenantFixture, work: () => Promise<T>): Promise<T> {
   return runWithTenantContext(t.id, async () => work(), { id: t.adminUserId, role: 'ADMIN' });
 }
 
-async function prepareRpmBaseEvidence(t: TenantFixture, deviceId?: string) {
+async function prepareRpmBaseEvidence(t: TenantFixture, deviceId?: string, latestReadingAt?: Date) {
   const admin = auth(tok(t.id, t.adminUserId));
-  expect((await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: admin, payload: { patientId: t.patientId, providerKey: 'manual', ...(deviceId ? { deviceId } : {}) } })).statusCode).toBe(201);
+  const linkedDeviceId = deviceId ?? (await db.device.create({
+    data: { tenantId: t.id, branchId: t.branchId, name: 'RPM fixture device', deviceType: 'scale', active: true, status: 'online' },
+    select: { id: true },
+  })).id;
+  const enrollmentResponse = await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: admin, payload: { patientId: t.patientId, providerKey: 'withings', deviceId: linkedDeviceId } });
+  expect(enrollmentResponse.statusCode).toBe(201);
+  const enrollmentId = enrollmentResponse.json().id as string;
+  const period = rpmPeriodBounds();
+  await db.patientDeviceEnrollment.update({ where: { id: enrollmentId }, data: { enrolledAt: period.start } });
   expect((await app.inject({ method: 'POST', url: '/v1/connected-care/consent', headers: admin, payload: { patientId: t.patientId, consentType: 'rpm', granted: true, method: 'written' } })).statusCode).toBe(201);
 
   const now = new Date();
+  const readingAsOf = latestReadingAt ?? now;
   await db.deviceReading.createMany({
     data: Array.from({ length: 16 }, (_, day) => ({
       tenantId: t.id,
       patientId: t.patientId,
+      deviceId: linkedDeviceId,
       branchId: t.branchId,
       readingType: 'weight',
       value: `${80 + day / 10}`,
       numericValue: 80 + day / 10,
       unit: 'kg',
-      capturedAt: new Date(now.getTime() - day * 24 * 60 * 60_000),
-      source: 'manual',
+      capturedAt: new Date(readingAsOf.getTime() - day * 24 * 60 * 60_000),
+      source: 'webhook',
       validationStatus: 'valid',
+      dedupeKey: `rpm-fixture-${randomUUID()}`,
+      sourceProviderKey: 'withings',
+      sourceEnrollmentId: enrollmentId,
     })),
   });
   return { admin, now };
 }
 
-async function prepareCompleteRpmEvidence(t: TenantFixture, deviceId?: string) {
-  const { admin, now } = await prepareRpmBaseEvidence(t, deviceId);
+async function rpmReadinessRow(patientId: string, headers: Record<string, string>) {
+  const response = await app.inject({ method: 'GET', url: '/v1/connected-care/rpm-readiness', headers });
+  expect(response.statusCode).toBe(200);
+  const row = (response.json() as Array<{
+    patientId: string; evidenceVersion: string; evidenceHash: string; signoffAttestationRevision: string;
+  }>).find(item => item.patientId === patientId);
+  expect(row).toBeTruthy();
+  return row!;
+}
+
+async function signoffRpm(patientId: string, headers: Record<string, string>, overrides: Record<string, string> = {}) {
+  const evidence = await rpmReadinessRow(patientId, headers);
+  return app.inject({
+    method: 'POST', url: `/v1/connected-care/rpm-readiness/${patientId}/signoff`, headers,
+    payload: {
+      expectedEvidenceVersion: evidence.evidenceVersion,
+      expectedEvidenceHash: evidence.evidenceHash,
+      attestationRevision: evidence.signoffAttestationRevision,
+      ...overrides,
+    },
+  });
+}
+
+async function prepareCompleteRpmEvidence(t: TenantFixture, deviceId?: string, latestReadingAt?: Date) {
+  const { admin, now } = await prepareRpmBaseEvidence(t, deviceId, latestReadingAt);
   const endedAt = new Date(now.getTime() - 2 * 60_000);
   const startedAt = new Date(endedAt.getTime() - 20 * 60_000);
   const review = await app.inject({
@@ -117,13 +159,24 @@ async function prepareCompleteRpmEvidence(t: TenantFixture, deviceId?: string) {
 }
 
 beforeAll(async () => {
+  // RPM v2 uses fixed UTC calendar months. Keep this suite deterministic even
+  // during the first 15 days of a month, when a real-time `now - day` fixture
+  // cannot truthfully provide 16 current-period device-days. Faking Date only
+  // leaves timers and database behavior real, while month-end also guarantees
+  // database-generated audit timestamps remain inside the evidence cutoff.
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(rpmSuiteNow);
   app = await buildApp();
 }, 60_000);
 
 afterAll(async () => {
-  for (const id of createdTenantIds) await db.tenant.delete({ where: { id } }).catch(() => {});
-  await app?.close();
-  await db.$disconnect();
+  try {
+    for (const id of createdTenantIds) await db.tenant.delete({ where: { id } }).catch(() => {});
+    await app?.close();
+    await db.$disconnect();
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 describe('insurance provider registry + eligibility (integration)', () => {
@@ -195,7 +248,8 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     const SECRET = `whsec-${randomUUID()}`;
     await configureDeviceProviderSecret(t.id, 'withings', SECRET);
 
-    const enroll = await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: auth(admin), payload: { patientId: t.patientId, providerKey: 'withings', externalRef: 'EXT-IT-1' } });
+    const device = await db.device.create({ data: { tenantId: t.id, branchId: t.branchId, name: 'Linked Withings device', deviceType: 'scale', active: true, status: 'online' } });
+    const enroll = await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: auth(admin), payload: { patientId: t.patientId, providerKey: 'withings', externalRef: 'EXT-IT-1', deviceId: device.id } });
     expect(enroll.statusCode).toBe(201);
 
     const { raw, sig } = signWebhook(SECRET, { readings: [{ patientExternalRef: 'EXT-IT-1', readingType: 'glucose', value: '330', numericValue: 330, unit: 'mg/dL' }] });
@@ -207,6 +261,72 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
 
     const logs = JSON.parse((await app.inject({ method: 'GET', url: '/v1/connected-care/sync-logs', headers: auth(admin) })).body);
     expect(logs[0].readingsIngested).toBe(1);
+    const stored = await db.deviceReading.findFirstOrThrow({ where: { tenantId: t.id, patientId: t.patientId } });
+    expect(stored).toMatchObject({ deviceId: device.id, source: 'webhook', sourceProviderKey: 'withings', sourceEnrollmentId: enroll.json().id });
+    const evidence = await inTenant(t, () => db.$transaction(tx => buildRpmEvidenceSnapshot(tx, t.id, t.patientId, rpmPeriodBounds())));
+    expect(evidence).toMatchObject({ readingDays: 1, qualifyingReadingCount: 1, excludedReadingCount: 0, deviceExceptions: [] });
+  });
+
+  it('counts only device-bound automated evidence: 16 manual/unlinked days count as zero and 15 linked plus one manual count as 15', async () => {
+    const makeEnrollment = async (t: TenantFixture) => {
+      const device = await db.device.create({ data: { tenantId: t.id, branchId: t.branchId, name: 'Evidence device', deviceType: 'scale', active: true, status: 'online' } });
+      const enrollment = await db.patientDeviceEnrollment.create({ data: { tenantId: t.id, patientId: t.patientId, branchId: t.branchId, providerKey: 'withings', deviceId: device.id, programType: 'rpm', status: 'active', enrolledAt: rpmPeriodBounds().start } });
+      return { device, enrollment };
+    };
+    const asOf = new Date();
+
+    const unlinkedTenant = await makeTenant('enterprise');
+    await makeEnrollment(unlinkedTenant);
+    await db.deviceReading.createMany({ data: Array.from({ length: 16 }, (_, day) => ({
+      tenantId: unlinkedTenant.id, patientId: unlinkedTenant.patientId, branchId: unlinkedTenant.branchId,
+      readingType: 'weight', value: '80', numericValue: 80, unit: 'kg',
+      capturedAt: new Date(asOf.getTime() - day * 24 * 60 * 60_000), source: day % 2 ? 'manual' : 'import', validationStatus: 'valid',
+    })) });
+    const unlinked = await inTenant(unlinkedTenant, () => db.$transaction(tx => buildRpmEvidenceSnapshot(tx, unlinkedTenant.id, unlinkedTenant.patientId, rpmPeriodBounds())));
+    expect(unlinked).toMatchObject({ readingDays: 0, qualifyingReadingCount: 0, excludedReadingCount: 16 });
+    expect(unlinked.deviceExceptions).toEqual([{ reason: 'not_automated_provider_ingest', count: 16 }]);
+
+    const mixedTenant = await makeTenant('enterprise');
+    const { device, enrollment } = await makeEnrollment(mixedTenant);
+    await db.deviceReading.createMany({ data: Array.from({ length: 16 }, (_, day) => ({
+      tenantId: mixedTenant.id, patientId: mixedTenant.patientId, branchId: mixedTenant.branchId,
+      deviceId: day < 15 ? device.id : null, readingType: 'weight', value: '80', numericValue: 80, unit: 'kg',
+      capturedAt: new Date(asOf.getTime() - day * 24 * 60 * 60_000), source: day < 15 ? 'webhook' : 'manual', validationStatus: 'valid',
+      dedupeKey: day < 15 ? `linked-${randomUUID()}` : null,
+      sourceProviderKey: day < 15 ? 'withings' : null,
+      sourceEnrollmentId: day < 15 ? enrollment.id : null,
+    })) });
+    const mixed = await inTenant(mixedTenant, () => db.$transaction(tx => buildRpmEvidenceSnapshot(tx, mixedTenant.id, mixedTenant.patientId, rpmPeriodBounds())));
+    expect(mixed).toMatchObject({ readingDays: 15, qualifyingReadingCount: 15, excludedReadingCount: 1 });
+    expect(mixed.deviceExceptions).toEqual([{ reason: 'not_automated_provider_ingest', count: 1 }]);
+  });
+
+  it('excludes provider/device mismatches, future timestamps, and readings outside the enrollment term without exposing row data', async () => {
+    const t = await makeTenant('enterprise');
+    const period = rpmPeriodBounds();
+    const day = (offset: number) => new Date(period.start.getTime() + offset * 24 * 60 * 60_000);
+    const device = await db.device.create({ data: { tenantId: t.id, branchId: t.branchId, name: 'Bound device', deviceType: 'scale', active: true, status: 'online' } });
+    const otherDevice = await db.device.create({ data: { tenantId: t.id, branchId: t.branchId, name: 'Other device', deviceType: 'scale', active: true, status: 'online' } });
+    const enrollment = await db.patientDeviceEnrollment.create({ data: { tenantId: t.id, patientId: t.patientId, branchId: t.branchId, providerKey: 'withings', deviceId: device.id, programType: 'rpm', status: 'active', enrolledAt: day(5) } });
+    // PostgreSQL's now() is not controlled by Vitest's fake JS clock. Pin the
+    // receipt time before the custom day-15 cutoff so all four rows are
+    // deterministically selected and then rejected by provenance classification.
+    const base = { tenantId: t.id, patientId: t.patientId, branchId: t.branchId, readingType: 'weight', value: '80', numericValue: 80, unit: 'kg', source: 'webhook', validationStatus: 'valid', sourceEnrollmentId: enrollment.id, receivedAt: period.start };
+    await db.deviceReading.createMany({ data: [
+      { ...base, deviceId: device.id, capturedAt: day(10), dedupeKey: `mismatch-${randomUUID()}`, sourceProviderKey: 'validic' },
+      { ...base, deviceId: device.id, capturedAt: day(20), dedupeKey: `future-${randomUUID()}`, sourceProviderKey: 'withings' },
+      { ...base, deviceId: device.id, capturedAt: day(2), dedupeKey: `outside-${randomUUID()}`, sourceProviderKey: 'withings' },
+      { ...base, deviceId: otherDevice.id, capturedAt: day(11), dedupeKey: `device-${randomUUID()}`, sourceProviderKey: 'withings' },
+    ] });
+    const snapshot = await inTenant(t, () => db.$transaction(tx => buildRpmEvidenceSnapshot(tx, t.id, t.patientId, { ...period, asOf: day(15) })));
+    expect(snapshot).toMatchObject({ readingDays: 0, qualifyingReadingCount: 0, excludedReadingCount: 4 });
+    expect(snapshot.deviceExceptions).toEqual([
+      { reason: 'device_link_mismatch', count: 1 },
+      { reason: 'future_captured_at', count: 1 },
+      { reason: 'outside_enrollment_term', count: 1 },
+      { reason: 'provider_link_mismatch', count: 1 },
+    ]);
+    expect(Object.keys(snapshot.deviceExceptions[0]!).sort()).toEqual(['count', 'reason']);
   });
 
   it('FAILS CLOSED: rejects an unsigned / unverifiable webhook (P0) and writes no readings; a correctly-signed one still ingests', async () => {
@@ -284,7 +404,7 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     expect(readiness[0].requirements.some((r: { key: string; met: boolean }) => r.key === 'reading_days' && !r.met)).toBe(true);
 
     // Fail closed: an under-qualified record cannot capture provider signoff.
-    const signed = await app.inject({ method: 'POST', url: `/v1/connected-care/rpm-readiness/${t.patientId}/signoff`, headers: auth(tok(t.id, t.providerUserId)) });
+    const signed = await signoffRpm(t.patientId, auth(tok(t.id, t.providerUserId)));
     expect(signed.statusCode).toBe(409);
     expect(signed.json().message).toContain('complete current evidence');
     const stored = await db.rPMBillingReadiness.findFirstOrThrow({ where: { tenantId: t.id, patientId: t.patientId } });
@@ -298,12 +418,17 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     const { admin, firstReviewStartedAt } = await prepareCompleteRpmEvidence(t);
     const provider = auth(tok(t.id, t.providerUserId));
 
-    const signed = await app.inject({ method: 'POST', url: `/v1/connected-care/rpm-readiness/${t.patientId}/signoff`, headers: provider });
+    const reviewedEvidence = await rpmReadinessRow(t.patientId, provider);
+    const staleAttestation = await signoffRpm(t.patientId, provider, { attestationRevision: 'rpm-provider-attestation-v0' });
+    expect(staleAttestation.statusCode).toBe(409);
+    expect(staleAttestation.json().message).toContain('attestation revision is stale');
+    const signed = await signoffRpm(t.patientId, provider);
     expect(signed.statusCode).toBe(200);
     expect(signed.json().status).toBe('READY');
     const firstSnapshot = await db.rPMBillingReadiness.findFirstOrThrow({ where: { tenantId: t.id, patientId: t.patientId } });
     expect(firstSnapshot.providerSignoffUserId).toBe(t.providerUserId);
-    expect(firstSnapshot.providerSignoffEvidenceVersion).toBe('rpm-readiness-evidence-v2');
+    expect(firstSnapshot.providerSignoffEvidenceVersion).toBe('rpm-readiness-evidence-v3');
+    expect(firstSnapshot.providerSignoffAttestationRevision).toBe('rpm-provider-attestation-v1');
     expect(firstSnapshot.providerSignoffEvidenceHash).toMatch(/^[a-f0-9]{64}$/);
 
     const mutationEndedAt = firstReviewStartedAt;
@@ -331,12 +456,25 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     const invalidationAudit = await db.auditEvent.findFirstOrThrow({ where: { tenantId: t.id, action: 'connectedcare.rpm.signoff_invalidated', resourceId: t.patientId }, orderBy: { occurredAt: 'desc' } });
     expect(invalidationAudit.metadata).toMatchObject({ reason: 'review_evidence_mutated', priorEvidenceHash: firstSnapshot.providerSignoffEvidenceHash });
 
-    const reSigned = await app.inject({ method: 'POST', url: `/v1/connected-care/rpm-readiness/${t.patientId}/signoff`, headers: provider });
+    const staleHash = await signoffRpm(t.patientId, provider, { expectedEvidenceHash: reviewedEvidence.evidenceHash });
+    expect(staleHash.statusCode).toBe(409);
+    expect(staleHash.json().message).toContain('evidence changed after review');
+    const currentEvidence = await inTenant(t, () => db.$transaction(tx => buildRpmEvidenceSnapshot(tx, t.id, t.patientId, rpmPeriodBounds())));
+    await db.rPMBillingReadiness.update({
+      where: { tenantId_patientId_periodStart: { tenantId: t.id, patientId: t.patientId, periodStart: rpmPeriodBounds().start } },
+      data: { reviewMinutes: 999, communicationFlag: false },
+    });
+    const reSigned = await app.inject({
+      method: 'POST', url: `/v1/connected-care/rpm-readiness/${t.patientId}/signoff`, headers: provider,
+      payload: { expectedEvidenceVersion: currentEvidence.version, expectedEvidenceHash: currentEvidence.hash, attestationRevision: 'rpm-provider-attestation-v1' },
+    });
     expect(reSigned.statusCode).toBe(200);
     expect(reSigned.json().status).toBe('READY');
     const renewed = await db.rPMBillingReadiness.findFirstOrThrow({ where: { tenantId: t.id, patientId: t.patientId } });
     expect(renewed.providerSignoffEvidenceHash).toMatch(/^[a-f0-9]{64}$/);
     expect(renewed.providerSignoffEvidenceHash).not.toBe(firstSnapshot.providerSignoffEvidenceHash);
+    expect(renewed.reviewMinutes).toBe(currentEvidence.reviewMinutes);
+    expect(renewed.communicationFlag).toBe(currentEvidence.communicationFlag);
     expect(await db.auditEvent.count({ where: { tenantId: t.id, action: 'connectedcare.rpm.signoff', resourceId: t.patientId } })).toBe(2);
   });
 
@@ -350,7 +488,7 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
       data: { reviewMinutes: 999, communicationFlag: true, status: 'READY' },
     });
 
-    const refused = await app.inject({ method: 'POST', url: `/v1/connected-care/rpm-readiness/${t.patientId}/signoff`, headers: auth(tok(t.id, t.providerUserId)) });
+    const refused = await signoffRpm(t.patientId, auth(tok(t.id, t.providerUserId)));
     expect(refused.statusCode).toBe(409);
     expect(refused.json().message).toContain('20 clinical review minutes');
     expect(refused.json().message).toContain('Patient communication');
@@ -368,7 +506,7 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     const t = await makeTenant('enterprise');
     await prepareCompleteRpmEvidence(t);
     const provider = auth(tok(t.id, t.providerUserId));
-    expect((await app.inject({ method: 'POST', url: `/v1/connected-care/rpm-readiness/${t.patientId}/signoff`, headers: provider })).json().status).toBe('READY');
+    expect((await signoffRpm(t.patientId, provider)).json().status).toBe('READY');
     const asOf = new Date();
     const currentPeriod = rpmPeriodBounds(asOf);
     const initial = await inTenant(t, () => computeAndStoreRpmReadiness(t.id, t.patientId, asOf));
@@ -398,10 +536,17 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     const t = await makeTenant('enterprise');
     const now = new Date();
     const device = await db.device.create({ data: { tenantId: t.id, branchId: t.branchId, name: 'RPM Monitor', deviceType: 'vitals_monitor', status: 'online', active: true, lastSeenAt: new Date(now.getTime() - 48 * 60 * 60_000) } });
-    const { admin } = await prepareCompleteRpmEvidence(t, device.id);
+    const { admin } = await prepareCompleteRpmEvidence(t, device.id, new Date(now.getTime() - 48 * 60 * 60_000));
     const provider = auth(tok(t.id, t.providerUserId));
-    expect((await app.inject({ method: 'POST', url: `/v1/connected-care/rpm-readiness/${t.patientId}/signoff`, headers: provider })).json().status).toBe('READY');
+    expect((await signoffRpm(t.patientId, provider)).json().status).toBe('READY');
 
+    // Fixture setup performs enrollment and evidence writes after device
+    // creation. Reassert the exact detector precondition immediately before
+    // scanning instead of depending on timestamps from earlier setup steps.
+    await inTenant(t, () => db.device.update({
+      where: { id: device.id },
+      data: { status: 'online', active: true, lastSeenAt: new Date(now.getTime() - 48 * 60 * 60_000) },
+    }));
     const detected = await detectOfflineDevices(t.id, 24, now);
     expect(detected.flipped).toBe(1);
     const period = rpmPeriodBounds(now);
@@ -409,14 +554,20 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     expect(invalidated).toMatchObject({ status: 'NEEDS_REVIEW', providerSignoffAt: null, providerSignoffEvidenceHash: null });
     expect(await db.auditEvent.count({ where: { tenantId: t.id, action: 'connectedcare.rpm.signoff_invalidated', resourceId: t.patientId, metadata: { path: ['reason'], equals: 'offline_detector_device_status_mutated' } } })).toBe(1);
 
-    expect((await app.inject({ method: 'POST', url: `/v1/connected-care/rpm-readiness/${t.patientId}/signoff`, headers: provider })).json().status).toBe('READY');
+    expect((await signoffRpm(t.patientId, provider)).json().status).toBe('READY');
     const online = await app.inject({ method: 'PATCH', url: `/v1/devices/${device.id}`, headers: admin, payload: { status: 'online' } });
     expect(online.statusCode).toBe(200);
-    expect((await app.inject({ method: 'POST', url: `/v1/connected-care/rpm-readiness/${t.patientId}/signoff`, headers: provider })).json().status).toBe('READY');
-    const detectorNow = new Date(now.getTime() + 25 * 60 * 60_000);
+    expect((await signoffRpm(t.patientId, provider)).json().status).toBe('READY');
+    // The suite clock is month-end, so advancing 25 hours would test a
+    // different billing period. Make the owner-controlled fixture stale in
+    // place, preserving the intended same-period detector/signoff lock race.
+    await inTenant(t, () => db.device.update({
+      where: { id: device.id },
+      data: { lastSeenAt: new Date(now.getTime() - 48 * 60 * 60_000) },
+    }));
     const [raceDetection, raceSignoff] = await Promise.all([
-      detectOfflineDevices(t.id, 24, detectorNow),
-      app.inject({ method: 'POST', url: `/v1/connected-care/rpm-readiness/${t.patientId}/signoff`, headers: provider }),
+      detectOfflineDevices(t.id, 24, now),
+      signoffRpm(t.patientId, provider),
     ]);
     expect(raceDetection.flipped).toBe(1);
     expect(raceSignoff.statusCode).toBe(200);
@@ -497,7 +648,11 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     expect(granted.json().evidenceVersion).not.toBe(revoked.json().evidenceVersion);
     const versions = await db.auditEvent.findMany({ where: { tenantId: t.id, action: 'connectedcare.consent.version_created', resourceId: t.patientId }, orderBy: { occurredAt: 'asc' } });
     expect(versions).toHaveLength(2);
-    expect(versions.map(v => (v.metadata as { granted: boolean }).granted)).toEqual([true, false]);
+    // The Date-only suite clock deliberately gives both evidence snapshots the
+    // same application timestamp. UUID tie ordering is not consent semantics;
+    // prove that both immutable decisions exist and that current state is the
+    // revocation below.
+    expect(versions.map(v => (v.metadata as { granted: boolean }).granted)).toEqual(expect.arrayContaining([true, false]));
     const readiness = (await app.inject({ method: 'GET', url: '/v1/connected-care/rpm-readiness', headers: admin })).json() as Array<{ requirements: Array<{ key: string; met: boolean }> }>;
     expect(readiness[0]?.requirements.find(r => r.key === 'consent')?.met).toBe(false);
   });
@@ -530,16 +685,18 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     const admin = auth(tok(t.id, t.adminUserId));
     await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: admin, payload: { patientId: t.patientId, providerKey: 'manual' } });
     expect((await app.inject({ method: 'POST', url: `/v1/connected-care/rpm-readiness/${t.patientId}/signoff`, headers: admin })).statusCode).toBe(403);
+    const evidence = await rpmReadinessRow(t.patientId, admin);
+    const signoffPayload = { expectedEvidenceVersion: evidence.evidenceVersion, expectedEvidenceHash: evidence.evidenceHash, attestationRevision: evidence.signoffAttestationRevision };
 
     const noProfile = await db.user.create({ data: { tenantId: t.id, branchId: t.branchId, role: 'PROVIDER', active: true, email: `np-${randomUUID()}@it.test`, displayName: 'No profile' } });
-    expect((await app.inject({ method: 'POST', url: `/v1/connected-care/rpm-readiness/${t.patientId}/signoff`, headers: auth(tok(t.id, noProfile.id)) })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'POST', url: `/v1/connected-care/rpm-readiness/${t.patientId}/signoff`, headers: auth(tok(t.id, noProfile.id)), payload: signoffPayload })).statusCode).toBe(403);
     const otherBranch = await db.branch.create({ data: { tenantId: t.id, name: 'provider-other', location: 'z' } });
     const wrongBranchUser = await db.user.create({ data: { tenantId: t.id, branchId: otherBranch.id, role: 'PROVIDER', active: true, email: `wb-${randomUUID()}@it.test`, displayName: 'Wrong branch provider' } });
     await db.providerProfile.create({ data: { tenantId: t.id, branchId: otherBranch.id, userId: wrongBranchUser.id, specialty: 'Primary Care' } });
-    expect((await app.inject({ method: 'POST', url: `/v1/connected-care/rpm-readiness/${t.patientId}/signoff`, headers: auth(tok(t.id, wrongBranchUser.id)) })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'POST', url: `/v1/connected-care/rpm-readiness/${t.patientId}/signoff`, headers: auth(tok(t.id, wrongBranchUser.id)), payload: signoffPayload })).statusCode).toBe(403);
     // The correctly scoped provider passes identity/profile authorization and
     // reaches the independent evidence-completeness gate.
-    const signed = await app.inject({ method: 'POST', url: `/v1/connected-care/rpm-readiness/${t.patientId}/signoff`, headers: auth(tok(t.id, t.providerUserId)) });
+    const signed = await signoffRpm(t.patientId, auth(tok(t.id, t.providerUserId)));
     expect(signed.statusCode).toBe(409);
     expect(signed.json().message).toContain('complete current evidence');
   });

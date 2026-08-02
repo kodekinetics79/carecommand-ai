@@ -14,13 +14,23 @@ const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
 const { sendMessage: sendMessageUnscoped } = await import('../lib/commsProvider');
 const { dispatchCampaign: dispatchCampaignUnscoped } = await import('../lib/campaignDispatch');
+const { buildCampaignLaunchPreview } = await import('../lib/campaignIntegrity');
 const { isDestinationOptedOut: isDestinationOptedOutUnscoped, generateDraft } = await import('../lib/campaigns');
 const { runWithJobTenantContext } = await import('../lib/tenantContext');
 
 const sendMessage = (...args: Parameters<typeof sendMessageUnscoped>) =>
   runWithJobTenantContext(args[5].tenantId, () => sendMessageUnscoped(...args), 'worker:test-comms');
-const dispatchCampaign = (tenantId: string, ...args: Parameters<typeof dispatchCampaignUnscoped> extends [string, ...infer Rest] ? Rest : never) =>
-  runWithJobTenantContext(tenantId, () => dispatchCampaignUnscoped(tenantId, ...args), 'worker:test-comms');
+const dispatchCampaign = (tenantId: string, campaignId: string, opts: { force?: boolean } = {}) =>
+  runWithJobTenantContext(tenantId, async () => {
+    const campaign = await db.campaign.findFirstOrThrow({ where: { tenantId, id: campaignId } });
+    const preview = await buildCampaignLaunchPreview(tenantId, campaign);
+    await db.campaign.update({ where: { id: campaignId }, data: {
+      dispatchAuthorizationFingerprint: preview.fingerprint,
+      dispatchAuthorizedByUserId: '00000000-0000-4000-8000-000000000001',
+      dispatchAuthorizedAt: new Date(),
+    } });
+    return dispatchCampaignUnscoped(tenantId, campaignId, { ...opts, authorizationFingerprint: preview.fingerprint });
+  }, 'worker:test-comms');
 const isDestinationOptedOut = (tenantId: string, ...args: Parameters<typeof isDestinationOptedOutUnscoped> extends [string, ...infer Rest] ? Rest : never) =>
   runWithJobTenantContext(tenantId, () => isDestinationOptedOutUnscoped(tenantId, ...args), 'worker:test-comms');
 
@@ -185,6 +195,57 @@ describe('commsProvider.sendMessage — truthful delivery', () => {
     expect(typeof res.failureReason).toBe('string');
     (env as typeof env).TWILIO_BASE_URL = twilioBase;
   });
+
+  it('keeps regulated live outreach behind exact authority and an inactive atomic boundary', async () => {
+    const t = await makeTenant();
+    const patient = await makeInactivePatient(t.id, t.branchId, { phone: '+15551230004' });
+    setLiveCreds();
+    stubResponder = () => ({ code: 201, body: { sid: 'must_not_be_submitted' } });
+    const before = stubHits;
+    const context = {
+      tenantId: t.id,
+      patientId: patient.id,
+      regulatedOutreach: { purpose: 'inactive_patient_reactivation' },
+    } as const;
+
+    const missing = await sendMessage('sms', patient.phone!, 'S', 'B', `k-${randomUUID()}`, context);
+    expect(missing).toMatchObject({ status: 'failed', failureReason: 'affirmative_outreach_authority_required' });
+
+    await runWithJobTenantContext(t.id, tx => tx.consentEvent.create({ data: {
+      tenantId: t.id, patientId: patient.id, purpose: 'SMS', granted: true, source: 'legacy_unversioned',
+      occurredAt: new Date('2026-08-01T10:00:00.000Z'),
+    } }), 'worker:test-comms');
+    const unversioned = await sendMessage('sms', patient.phone!, 'S', 'B', `k-${randomUUID()}`, context);
+    expect(unversioned.failureReason).toBe('affirmative_outreach_authority_required');
+
+    await runWithJobTenantContext(t.id, tx => tx.consentEvent.create({ data: {
+      tenantId: t.id, patientId: patient.id, purpose: 'SMS', granted: true, source: 'patient_written',
+      occurredAt: new Date('2026-08-01T10:01:00.000Z'),
+      metadata: {
+        authorityVersion: 1,
+        outreachPurpose: 'inactive_patient_reactivation',
+        policyVersion: 'sms-reactivation-2026-08-01',
+        disclosureTextHash: 'a'.repeat(64),
+        evidenceReference: 'consent-form:test-1',
+        captureMethod: 'written',
+        evidenceSource: 'patient_written',
+        jurisdiction: 'US-NY',
+      },
+    } }), 'worker:test-comms');
+    const authorizedButInactive = await sendMessage('sms', patient.phone!, 'S', 'B', `k-${randomUUID()}`, context);
+    expect(authorizedButInactive).toMatchObject({ status: 'failed', failureReason: 'live_outreach_atomic_boundary_not_activated' });
+    expect(stubHits).toBe(before);
+  });
+
+  it('does not require live authority for an explicitly synthetic mock send', async () => {
+    const t = await makeTenant();
+    setMockCreds();
+    const result = await sendMessage('sms', '+15551230005', 'S', 'B', `k-${randomUUID()}`, {
+      tenantId: t.id,
+      regulatedOutreach: { purpose: 'inactive_patient_reactivation' },
+    });
+    expect(result).toMatchObject({ status: 'sent', mode: 'mock_dev' });
+  });
 });
 
 // ===========================================================================
@@ -203,12 +264,12 @@ describe('campaign engine — consent/suppression is enforced before send', () =
     const summary = await dispatchCampaign(t.id, campaign.id, {});
 
     expect(summary.suppressed).toBeGreaterThanOrEqual(1);
-    expect(summary.sent).toBeGreaterThanOrEqual(1);
+    expect(summary.accepted).toBeGreaterThanOrEqual(1);
     const rows = await db.campaignDelivery.findMany({ where: { tenantId: t.id, campaignId: campaign.id } });
     const byPatient = new Map(rows.map(r => [r.patientId, r]));
     expect(byPatient.get(optedOut.id)?.status).toBe('suppressed');
     expect(byPatient.get(optedOut.id)?.providerMessageId).toBeNull();
-    expect(byPatient.get(sendable.id)?.status).toBe('sent');
+    expect(byPatient.get(sendable.id)?.status).toBe('accepted');
   });
 });
 
@@ -229,7 +290,7 @@ describe('cross-module: AI receptionist opt-out (ReceptionistOptOut, channel ALL
     const summary = await dispatchCampaign(t.id, campaign.id, {});
     const row = await db.campaignDelivery.findFirst({ where: { tenantId: t.id, campaignId: campaign.id, patientId: patient.id } });
     expect(row?.status).toBe('suppressed');
-    expect(summary.sent).toBe(0);
+    expect(summary.accepted).toBe(0);
   });
 
   it('(a2) is honored even when the phone is stored in a different format (E.164 normalization)', async () => {
@@ -253,18 +314,22 @@ describe('cross-module: AI receptionist opt-out (ReceptionistOptOut, channel ALL
     // isSuppressed with the destination), so it returns a 409 "blocked".
   });
 
-  it('(c) GAP: receptionist OUTBOUND targets are NOT filtered by ReceptionistOptOut (receptionist-owned; reported, not fixed here)', async () => {
+  it('(c) receptionist outbound targets require an exact identity and share the opt-out suppression gate', async () => {
     const t = await makeTenant();
     const phone = '+15552220004';
+    const patient = await makeInactivePatient(t.id, t.branchId, { phone });
     await db.receptionistOptOut.create({ data: { tenantId: t.id, contactPhone: phone, channel: 'ALL', reason: 'AI call' } });
     const clinic = await db.receptionistClinic.create({ data: { tenantId: t.id, name: 'Main clinic', phone: phoneFor(t.id) }, select: { id: true } });
     const campaign = await db.receptionistOutboundCampaign.create({ data: { tenantId: t.id, clinicId: clinic.id, name: 'Outbound', script: 'Call the patient.', requiredFields: ['firstName', 'lastName', 'phone'] }, select: { id: true } });
-    // outbound.ts adds targets with no suppression filter — the opted-out contact
-    // lands in the call queue. This documents the gap (fix belongs in the
-    // receptionist module's target selection / call-launch path).
-    const target = await db.receptionistCallTarget.create({ data: { tenantId: t.id, campaignId: campaign.id, phone, firstName: 'Opted', lastName: 'Out' }, select: { id: true, status: true } });
-    expect(target.status).toBe('PENDING'); // queued to be called despite the opt-out
-    expect(await isDestinationOptedOut(t.id, phone, 'voice')).toBe(true); // the data to suppress it exists and is queryable
+    // A stored target is not permission to dial: every target is bound to exactly
+    // one canonical patient/lead, and the launch path rechecks this shared gate
+    // before provider contact (covered end-to-end by receptionist outbound tests).
+    const target = await db.receptionistCallTarget.create({
+      data: { tenantId: t.id, campaignId: campaign.id, patientId: patient.id, phone, firstName: 'Opted', lastName: 'Out' },
+      select: { patientId: true, leadId: true, status: true },
+    });
+    expect(target).toMatchObject({ patientId: patient.id, leadId: null, status: 'PENDING' });
+    expect(await isDestinationOptedOut(t.id, phone, 'voice')).toBe(true);
   });
 });
 

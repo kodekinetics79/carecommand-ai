@@ -108,14 +108,14 @@ async function claimConfirmation(tenantId: string, eventId: string): Promise<Cla
       if ((leaseIntent?.startedAt ?? event.updatedAt).getTime() > Date.now() - RETRYING_LEASE_MS) {
         return { sent: false, status: 'retry_in_progress', acceptedNow: false };
       }
-      const providerIntent = await tx.notificationDeliveryAttempt.findUnique({
+      const submissionClaim = await tx.notificationDeliveryAttempt.findUnique({
         where: { tenantId_notificationEventId_attemptNumber_phase: {
-          tenantId, notificationEventId: eventId, attemptNumber: event.attempts, phase: 'PROVIDER_INTENT',
+          tenantId, notificationEventId: eventId, attemptNumber: event.attempts, phase: 'SUBMISSION_CLAIM',
         } },
         select: { id: true },
       });
       const exhausted = event.attempts >= event.maxAttempts;
-      const status = providerIntent ? 'delivery_unknown' : exhausted ? 'dead_lettered' : 'failed';
+      const status = submissionClaim ? 'delivery_unknown' : exhausted ? 'dead_lettered' : 'failed';
       await appendAttempt(tx, {
         tenantId, eventId, attemptNumber: event.attempts, status,
         failureCode: 'dispatch_lease_expired', completed: true,
@@ -173,7 +173,10 @@ async function claimConfirmation(tenantId: string, eventId: string): Promise<Cla
       eventId, tenantId, appointmentId: appointment.id, patientId: appointment.patient.id,
       channel: event.channel, idempotencyKey: event.idempotencyKey!, attemptNumber,
       maxAttempts: event.maxAttempts, destination, firstName: appointment.patient.firstName,
-      consentEvidence: event.consentResult === 'granted_unchecked' ? 'granted' : 'not_suppressed_transactional',
+      // A receptionist booking preference never becomes affirmative channel or
+      // marketing consent. Provider submission relies on the transactional
+      // appointment purpose plus the final shared suppression/DNC fence.
+      consentEvidence: 'not_suppressed_transactional',
       service: appointment.service, startsAt: appointment.startsAt, timezone: appointment.branch.timezone,
     };
   });

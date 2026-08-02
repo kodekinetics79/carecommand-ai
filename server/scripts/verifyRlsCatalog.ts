@@ -2,6 +2,8 @@ import 'dotenv/config';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { db } from '../lib/db';
+import { EXPECTED_RUNTIME_ROLE, TENANT_APPEND_ONLY_TABLES } from '../lib/rlsRuntimeManifest';
+import { RLS_TABLE_ADAPTERS } from '../lib/rlsTableAdapters';
 
 type TableRow = {
   table_name: string;
@@ -57,20 +59,16 @@ type Classification = {
   expectedPrivileges: ReadonlySet<string>;
 };
 
-const EXPECTED_RUNTIME_ROLE = 'app_rls';
 const MATRIX_PATH = resolve('docs/security/RLS_COVERAGE_MATRIX.md');
 const CRUD = new Set(['SELECT', 'INSERT', 'UPDATE', 'DELETE']);
 const READ_ONLY = new Set(['SELECT']);
 const READ_APPEND = new Set(['SELECT', 'INSERT']);
 const NO_PRIVILEGES = new Set<string>();
-const FULL_CRUD_EVIDENCE = new Set(['AiGuardrail']);
-const TENANT_APPEND_ONLY_TABLES = new Set([
-  'AuditEvent',
-  'NotificationDeliveryAttempt',
-  'ReceptionistOutboundProviderIntent',
-  'ReceptionistVoiceConsentEvent',
-]);
-
+// Keep generated documentation aligned with the executable, schema-derived
+// restricted-role adapter inventory. The behavioral suite still has to run;
+// this set proves every protected table has a concrete test adapter instead of
+// maintaining a stale hand-written allowlist.
+const FULL_CRUD_EVIDENCE = new Set(RLS_TABLE_ADAPTERS.map(adapter => adapter.table));
 const GLOBAL_CLASSIFICATIONS: Record<string, Classification> = {
   SubscriptionPlan: globalReference('D', 'Commercial subscription-plan catalogue.', READ_ONLY),
   SubscriptionPlanFeature: globalReference('D', 'Plan-to-feature catalogue mapping.', READ_ONLY),

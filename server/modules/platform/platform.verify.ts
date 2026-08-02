@@ -8,6 +8,8 @@ import { randomUUID } from 'node:crypto';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '../../generated/prisma/client';
 import { buildApp } from '../../app';
+import { decryptSecret } from '../../lib/security';
+import { generateTotp } from '../../lib/totp';
 
 const ownerDb = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_MIGRATION_URL ?? process.env.DATABASE_URL }) });
 const PLATFORM_OWNER_EMAIL = process.env.PLATFORM_OWNER_EMAIL;
@@ -26,10 +28,32 @@ async function main() {
     payload: { email: PLATFORM_OWNER_EMAIL, password: PLATFORM_OWNER_PASSWORD },
   });
   const platformLoginBody = JSON.parse(platformLogin.body);
-  if (platformLogin.statusCode !== 200 || !platformLoginBody.token) {
-    throw new Error('PlatformUser login failed or requires MFA; run this verifier with a dedicated non-MFA test operator.');
+  if (platformLogin.statusCode !== 200 || !platformLoginBody.mfaToken) {
+    throw new Error('PlatformUser password verification failed.');
   }
-  const platformToken = platformLoginBody.token as string;
+  let verificationCode: string;
+  if (platformLoginBody.mfaSetupRequired) {
+    const setup = await app.inject({
+      method: 'POST', url: '/v1/platform/auth/mfa/setup',
+      headers: { authorization: `Bearer ${platformLoginBody.mfaToken}`, 'x-forwarded-for': ip() },
+    });
+    const setupBody = JSON.parse(setup.body);
+    if (setup.statusCode !== 200 || !setupBody.secret) throw new Error('Platform MFA enrollment setup failed.');
+    verificationCode = generateTotp(setupBody.secret);
+  } else {
+    const operator = await ownerDb.platformUser.findUnique({ where: { email: PLATFORM_OWNER_EMAIL } });
+    const secret = operator?.mfaSecretEnc ? decryptSecret(operator.mfaSecretEnc) : null;
+    if (!secret) throw new Error('Platform MFA challenge secret is unavailable to the verifier.');
+    verificationCode = generateTotp(secret);
+  }
+  const verified = await app.inject({
+    method: 'POST', url: '/v1/platform/auth/mfa/verify',
+    headers: { authorization: `Bearer ${platformLoginBody.mfaToken}`, 'x-forwarded-for': ip() },
+    payload: { code: verificationCode },
+  });
+  const verifiedBody = JSON.parse(verified.body);
+  if (verified.statusCode !== 200 || !verifiedBody.token) throw new Error('Platform MFA verification failed.');
+  const platformToken = verifiedBody.token as string;
   const plat = (m: 'GET' | 'PATCH' | 'POST', url: string, payload?: unknown) =>
     app.inject({ method: m, url, headers: { authorization: `Bearer ${platformToken}`, 'x-forwarded-for': ip() }, payload: payload as object });
   const tenantTok = (userId: string, tenantId: string) => app.jwt.sign({ userId, tenantId, role: 'OWNER', type: 'access' });

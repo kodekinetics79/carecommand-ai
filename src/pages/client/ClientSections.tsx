@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router';
 import {
   CalendarDays, ClipboardList, FileText, ShieldCheck, CreditCard, User, Bell, Loader2,
-  ChevronRight, Plus, ExternalLink, Info, ShieldAlert, X, CheckCircle2,
+  ChevronRight, Plus, ExternalLink, X, CheckCircle2,
 } from 'lucide-react';
 import EmptyStatePremium from '../../components/ui/EmptyStatePremium';
 import { formatCurrency } from '../../utils/formatters';
@@ -34,7 +34,7 @@ function StatPill({ label, value }: { label: string; value: string }) {
 
 function LoadError({ title, message }: { title: string; message: string }) {
   return (
-    <div className="rounded-2xl border border-[rgba(220,38,38,0.18)] bg-red-soft px-4 py-4">
+    <div role="alert" className="rounded-2xl border border-[rgba(220,38,38,0.18)] bg-red-soft px-4 py-4">
       <p className="text-sm font-bold text-red-v">{title}</p>
       <p className="mt-1 text-[12px] leading-6 text-t2">{message}</p>
     </div>
@@ -81,25 +81,17 @@ export function ClientDashboard() {
       <div className="rounded-[2rem] border border-[var(--b1)] bg-[linear-gradient(135deg,rgba(255,255,255,0.92),rgba(245,247,255,0.88))] p-5 sm:p-6 mb-5 shadow-[0_18px_55px_rgba(15,23,42,0.08)]">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="min-w-0 max-w-2xl">
-            <p className="text-[11px] font-bold uppercase tracking-[0.24em] text-t3">Pilot dashboard</p>
+            <p className="text-[11px] font-bold uppercase tracking-[0.24em] text-t3">Patient dashboard</p>
             <h1 className="mt-1 text-2xl sm:text-[2rem] font-black tracking-tight text-t1">Hi {d.displayName.split(' ')[0]}, your care is in one place.</h1>
             <p className="mt-2 text-[13px] text-t2 leading-relaxed">You can review appointments, request visits, update insurance, and manage reminders in the same portal the clinic configured for your account.</p>
           </div>
-          <StateBadge state={d.paymentPolicyAcknowledged ? 'completed' : 'action_required'} />
+          <span className="badge badge-blue">Clinic-managed access</span>
         </div>
         <div className="mt-4 grid gap-3 sm:grid-cols-3">
           <StatPill label="Clinic" value={`${d.clinicName}${d.branchName ? ` · ${d.branchName}` : ''}`} />
-          <StatPill label="Portal state" value={d.paymentPolicyAcknowledged ? 'Billing policy acknowledged' : 'Billing policy pending'} />
+          <StatPill label="Available actions" value={`${nextSteps.length} shown by the clinic`} />
           <StatPill label="Action set" value={`${nextSteps.length} next steps available`} />
         </div>
-        {!d.paymentPolicyAcknowledged && (
-          <div className="mt-4 rounded-2xl border border-[var(--b1)] bg-white/75 px-4 py-3">
-            <p className="text-[12px] text-t2 flex items-start gap-2">
-              <Info className="w-4 h-4 text-indigo shrink-0 mt-0.5" />
-              The payments module will still show balances and estimates, but the portal has not yet recorded the policy acknowledgment step.
-            </p>
-          </div>
-        )}
         {nextSteps.length > 0 && (
           <div className="mt-4 flex flex-wrap gap-2">
             {nextSteps.slice(0, 4).map(step => (
@@ -210,7 +202,7 @@ function UpcomingApptRow({ appt, onChanged }: { appt: PortalAppt; onChanged: () 
         <div className="mt-3 rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2.5 space-y-2">
           {providerId ? (
             <>
-              <label className="block space-y-1"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">New date</span><input className={inp} type="date" value={date} onChange={e => setDate(e.target.value)} /></label>
+              <label className="block space-y-1"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">New date</span><input className={inp} type="date" value={date} onChange={e => { setSlots([]); setSelectedSlot(''); setDate(e.target.value); }} /></label>
               <label className="block space-y-1"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">Open slots</span>
                 <select className={inp} value={selectedSlot} onChange={e => setSelectedSlot(e.target.value)} aria-label="Open slots">
                   {slots.length === 0 ? <option value="">No open slots on this date</option> : slots.map(s => <option key={s.startsAt} value={s.startsAt}>{new Date(s.startsAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</option>)}
@@ -282,8 +274,10 @@ export function ClientRequests() {
   const [bookingReason, setBookingReason] = useState('');
   const [service, setService] = useState(''); const [when, setWhen] = useState(''); const [notes, setNotes] = useState('');
   const [busy, setBusy] = useState(false); const [msg, setMsg] = useState<string | null>(null);
+  const [msgIsError, setMsgIsError] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [bookingMsg, setBookingMsg] = useState<string | null>(null);
+  const [bookingMsgIsError, setBookingMsgIsError] = useState(false);
   const [bookingBusy, setBookingBusy] = useState(false);
   async function load() { setRows(await portalClient.requests()); }
   async function loadSlots(nextProviderId = providerId, nextDate = bookingDate) {
@@ -320,24 +314,25 @@ export function ClientRequests() {
           setSelectedSlot(data.slots[0]?.startsAt ?? '');
         }
       } catch (e) {
-        if (a) { setSlots([]); setSelectedSlot(''); setBookingMsg(e instanceof Error ? e.message : 'Could not load slots'); }
+        if (a) { setSlots([]); setSelectedSlot(''); setBookingMsgIsError(true); setBookingMsg(e instanceof Error ? e.message : 'Could not load slots'); }
       }
     })();
     return () => { a = false; };
   }, [providerId, bookingDate]);
   async function submit() {
-    setBusy(true); setMsg(null);
-    try { const r = await portalClient.createRequest({ service: service.trim(), requestedDateTime: when || undefined, notes: notes.trim() || undefined }); setMsg(r.deduped ? 'You already have a matching request pending review.' : 'Request submitted — the clinic will be in touch.'); setService(''); setWhen(''); setNotes(''); await load(); }
-    catch (e) { setMsg(e instanceof Error ? e.message : 'Could not submit'); } finally { setBusy(false); }
+    setBusy(true); setMsg(null); setMsgIsError(false);
+    try { const r = await portalClient.createRequest({ service: service.trim(), requestedDateTime: when || undefined, notes: notes.trim() || undefined }); setMsg(r.deduped ? 'You already have a matching request pending staff review.' : 'Request recorded for staff review. This is not a confirmed appointment, and no response time is promised.'); setService(''); setWhen(''); setNotes(''); await load(); }
+    catch (e) { setMsgIsError(true); setMsg(e instanceof Error ? e.message : 'Could not submit'); } finally { setBusy(false); }
   }
   async function book() {
-    setBookingBusy(true); setBookingMsg(null);
+    setBookingBusy(true); setBookingMsg(null); setBookingMsgIsError(false);
     try {
       const appt = await portalClient.bookSlot(providerId, { startsAt: selectedSlot, durationMin: 30, reason: bookingReason.trim(), channel: 'EMAIL' });
-      setBookingMsg(`Booked ${appt.service} for ${new Date(appt.startsAt).toLocaleString()}.`);
+      setBookingMsg(`The scheduling system confirmed ${appt.service} for ${new Date(appt.startsAt).toLocaleString()}.`);
       setBookingReason('');
       await loadSlots(providerId, bookingDate);
     } catch (e) {
+      setBookingMsgIsError(true);
       setBookingMsg(e instanceof Error ? e.message : 'Could not book this slot');
     } finally {
       setBookingBusy(false);
@@ -365,7 +360,7 @@ export function ClientRequests() {
                 <select
                   className={inp}
                   value={providerId}
-                  onChange={e => setProviderId(e.target.value)}
+                  onChange={e => { setSlots([]); setSelectedSlot(''); setProviderId(e.target.value); }}
                   aria-label="Provider"
                 >
                   {providers.map(p => <option key={p.id} value={p.id}>{p.name}{p.specialty ? ` - ${p.specialty}` : ''}</option>)}
@@ -373,7 +368,7 @@ export function ClientRequests() {
               </label>
               <label className="block space-y-1">
                 <span className="text-[11px] font-bold uppercase tracking-wide text-t3">Date</span>
-                <input className={inp} type="date" value={bookingDate} onChange={e => setBookingDate(e.target.value)} />
+                <input className={inp} type="date" value={bookingDate} onChange={e => { setSlots([]); setSelectedSlot(''); setBookingDate(e.target.value); }} />
               </label>
             </div>
             <label className="block space-y-1">
@@ -396,7 +391,7 @@ export function ClientRequests() {
             >
               {bookingBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <CalendarDays className="w-4 h-4" />} Book appointment
             </button>
-            {bookingMsg && <p className="text-[12px] text-emerald-v">{bookingMsg}</p>}
+            {bookingMsg && <p role={bookingMsgIsError ? 'alert' : 'status'} aria-live={bookingMsgIsError ? 'assertive' : 'polite'} className={`text-[12px] ${bookingMsgIsError ? 'text-red-v' : 'text-emerald-v'}`}>{bookingMsg}</p>}
           </>
         )}
       </div>
@@ -408,7 +403,7 @@ export function ClientRequests() {
           <input className={inp} value={notes} onChange={e => setNotes(e.target.value)} placeholder="Notes (optional)" />
         </div>
         <button type="button" disabled={busy || service.trim().length < 2} onClick={submit} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50"><Plus className="w-4 h-4" /> Submit request</button>
-        {msg && <p className="text-[12px] text-emerald-v">{msg}</p>}
+        {msg && <p role={msgIsError ? 'alert' : 'status'} aria-live={msgIsError ? 'assertive' : 'polite'} className={`text-[12px] ${msgIsError ? 'text-red-v' : 'text-emerald-v'}`}>{msg}</p>}
       </div>
       {loadError ? <LoadError title="Appointment requests unavailable" message={loadError} /> : !rows ? <Skel /> : rows.length === 0 ? <EmptyStatePremium icon={<ClipboardList className="w-5 h-5" />} title="No requests yet" description="Submit a request above and track its status here." /> :
         <div className="space-y-2">{rows.map(r => (
@@ -439,9 +434,9 @@ const INTAKE_FIELDS: Record<string, IntakeField[]> = {
     { key: 'payerName', label: 'Insurer / payer (optional)', type: 'text' },
   ],
   communication_consent: [
-    { key: 'sms', label: 'Allow SMS reminders', type: 'checkbox' },
-    { key: 'email', label: 'Allow email updates', type: 'checkbox' },
-    { key: 'voice', label: 'Allow voice calls', type: 'checkbox' },
+    { key: 'sms', label: 'Opt out of SMS reminders', type: 'checkbox' },
+    { key: 'email', label: 'Opt out of email updates', type: 'checkbox' },
+    { key: 'voice', label: 'Opt out of voice calls', type: 'checkbox' },
   ],
   insurance_card: [
     { key: 'hasFront', label: 'I have my insurance card details ready', type: 'checkbox' },
@@ -533,7 +528,18 @@ function IntakeSection({ packetId, section, disabled, onSaved }: { packetId: str
           {fields ? fields.map(f => (
             f.type === 'checkbox' ? (
               <label key={f.key} className="flex items-center gap-2 text-[13px] text-t2">
-                <input type="checkbox" checked={Boolean(values[f.key])} onChange={e => setValues(v => ({ ...v, [f.key]: e.target.checked }))} /> {f.label}
+                <input
+                  type="checkbox"
+                  checked={section.sectionType === 'communication_consent' ? values[f.key] === false : Boolean(values[f.key])}
+                  onChange={e => setValues(v => {
+                    const next = { ...v };
+                    if (section.sectionType === 'communication_consent') {
+                      if (e.target.checked) next[f.key] = false;
+                      else delete next[f.key];
+                    } else next[f.key] = e.target.checked;
+                    return next;
+                  })}
+                /> {f.label}
               </label>
             ) : (
               <label key={f.key} className="block space-y-1">
@@ -599,7 +605,7 @@ export function ClientIntake() {
             </div>
           )
         ))}</div>}
-      <p className="text-[11px] text-t3 mt-4">Fill in the sections above and submit for review. You can also use the secure link your clinic sent. Submitted forms are reviewed by staff.</p>
+      <p className="text-[11px] text-t3 mt-4">Fill in the sections above and submit for review. You can also use the intake link your clinic provided. Submitted forms are reviewed by staff.</p>
     </div>
   );
 }
@@ -610,6 +616,7 @@ export function ClientInsurance() {
   const [adding, setAdding] = useState(false);
   const [form, setForm] = useState({ planName: '', memberId: '', groupNumber: '', subscriberName: '' });
   const [busy, setBusy] = useState(false); const [msg, setMsg] = useState<string | null>(null);
+  const [msgIsError, setMsgIsError] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   async function load() { setRows(await portalClient.insurance()); }
   useEffect(() => {
@@ -625,15 +632,15 @@ export function ClientInsurance() {
     })();
     return () => { a = false; };
   }, []);
-  async function save() { setBusy(true); setMsg(null); try { await portalClient.saveInsurance(form); setMsg('Saved — the clinic will verify your coverage.'); setAdding(false); setForm({ planName: '', memberId: '', groupNumber: '', subscriberName: '' }); await load(); } catch (e) { setMsg(e instanceof Error ? e.message : 'Could not save'); } finally { setBusy(false); } }
+  async function save() { setBusy(true); setMsg(null); setMsgIsError(false); try { await portalClient.saveInsurance(form); setMsg('Policy details saved for clinic review. This does not confirm eligibility, coverage, or payment.'); setAdding(false); setForm({ planName: '', memberId: '', groupNumber: '', subscriberName: '' }); await load(); } catch (e) { setMsgIsError(true); setMsg(e instanceof Error ? e.message : 'Could not save'); } finally { setBusy(false); } }
   const inp = 'w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--indigo)]';
   if (loadError) return <LoadError title="Insurance unavailable" message={loadError} />;
   if (!rows) return <Skel />;
   return (
     <div>
-      <H icon={ShieldCheck} title="Insurance" sub="Your coverage on file (the clinic verifies eligibility)" />
+      <H icon={ShieldCheck} title="Insurance" sub="Policy records on file · not a coverage or payment guarantee" />
       <div className="space-y-2 mb-4">
-        {rows.length === 0 ? <EmptyStatePremium icon={<ShieldCheck className="w-5 h-5" />} title="No insurance on file" description="Add your plan so the clinic can verify your coverage." cta={{ label: 'Add insurance', onClick: () => setAdding(true) }} /> :
+        {rows.length === 0 ? <EmptyStatePremium icon={<ShieldCheck className="w-5 h-5" />} title="No insurance policy on file" description="Add policy details for clinic review. Saving them does not verify eligibility or coverage." cta={{ label: 'Add insurance', onClick: () => setAdding(true) }} /> :
           rows.map(p => (
             <div key={p.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3.5 flex items-center justify-between gap-3">
               <div><p className="text-[13px] font-bold text-t1">{p.planName}</p><p className="text-[12px] text-t3">Member {p.memberId}{p.groupNumber ? ` · Group ${p.groupNumber}` : ''}</p></div>
@@ -653,7 +660,7 @@ export function ClientInsurance() {
           <div className="flex gap-2"><button type="button" disabled={busy || form.planName.trim().length < 1 || form.memberId.trim().length < 2} onClick={save} className="rounded-lg bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50">Save</button><button type="button" onClick={() => setAdding(false)} className="rounded-lg border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2">Cancel</button></div>
         </div>
       )}
-      {msg && <p className="text-[12px] text-emerald-v mt-2">{msg}</p>}
+      {msg && <p role={msgIsError ? 'alert' : 'status'} aria-live={msgIsError ? 'assertive' : 'polite'} className={`text-[12px] mt-2 ${msgIsError ? 'text-red-v' : 'text-emerald-v'}`}>{msg}</p>}
     </div>
   );
 }
@@ -662,17 +669,16 @@ export function ClientInsurance() {
 export function ClientPayments() {
   const [payments, setPayments] = useState<PortalPayment[] | null>(null);
   const [estimates, setEstimates] = useState<PortalEstimate[]>([]);
-  const [dashboard, setDashboard] = useState<PortalDashboard | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  async function load() { const [p, e, d] = await Promise.all([portalClient.payments(), portalClient.estimates(), portalClient.dashboard()]); setPayments(p); setEstimates(e); setDashboard(d); }
+  async function load() { const [p, e] = await Promise.all([portalClient.payments(), portalClient.estimates()]); setPayments(p); setEstimates(e); }
   useEffect(() => {
     let a = true;
     void (async () => {
       setLoadError(null);
       try {
-        const [p, e, d] = await Promise.all([portalClient.payments(), portalClient.estimates(), portalClient.dashboard()]);
-        if (a) { setPayments(p); setEstimates(e); setDashboard(d); }
+        const [p, e] = await Promise.all([portalClient.payments(), portalClient.estimates()]);
+        if (a) { setPayments(p); setEstimates(e); }
       } catch (err) {
         if (a) setLoadError(err instanceof Error ? err.message : 'Failed to load payments');
       }
@@ -680,34 +686,26 @@ export function ClientPayments() {
     return () => { a = false; };
   }, []);
   async function ackEstimate(id: string) { setBusy(id); try { await portalClient.acknowledgeEstimate(id); await load(); } finally { setBusy(null); } }
-  async function ackPolicy() { setBusy('policy'); try { await portalClient.acknowledgePaymentPolicy(); await load(); } finally { setBusy(null); } }
   if (loadError) return <LoadError title="Payments unavailable" message={loadError} />;
   if (!payments) return <Skel />;
   return (
     <div>
-      <H icon={CreditCard} title="Payments & estimates" sub="Pay securely — payments are confirmed by your provider, never marked paid here" />
-      {dashboard && !dashboard.paymentPolicyAcknowledged && (
-        <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4 mb-4 flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <p className="text-[13px] font-semibold text-t1">Payment policy acknowledgment needed</p>
-            <p className="text-[12px] text-t3 mt-0.5">This is part of the live portal handoff. It keeps the billing flow honest before a customer starts testing scenarios.</p>
-          </div>
-          <button type="button" disabled={busy === 'policy'} onClick={ackPolicy} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-2 text-[12px] font-semibold text-white hover:opacity-90 disabled:opacity-50">
-            {busy === 'policy' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldAlert className="w-3.5 h-3.5" />} Acknowledge
-          </button>
-        </div>
-      )}
+      <H icon={CreditCard} title="Payments & estimates" sub="Provider-hosted payment links and recorded status · final cost may differ from an estimate" />
+      <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4 mb-4">
+        <p className="text-[13px] font-semibold text-t1">Payment policy acknowledgment unavailable</p>
+        <p className="text-[12px] text-t3 mt-0.5">The clinic has not published versioned payment-policy text in this portal. No acknowledgment can be recorded until the exact policy and version are displayed.</p>
+      </div>
       <p className="text-[11px] font-bold uppercase tracking-wide text-t3 mb-2">Balances</p>
-      {payments.length === 0 ? <p className="text-[13px] text-t3">No payments due.</p> :
+      {payments.length === 0 ? <p className="text-[13px] text-t3">No payment requests are currently shown in this portal.</p> :
         <div className="space-y-2">{payments.map(p => (
           <div key={p.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3.5 flex items-center justify-between gap-3">
             <div><p className="text-[13px] font-bold text-t1">{formatCurrency(p.amount)} <span className="text-[11px] font-normal text-t3">{p.currency}</span></p><p className="text-[12px] text-t3">{p.reason} · {p.status}</p></div>
             {p.payLink
               // payLink is the provider-hosted checkout page (absolute URL) — open it directly.
-              ? <a href={p.payLink} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[12px] font-semibold text-white hover:opacity-90">Pay <ExternalLink className="w-3.5 h-3.5" /></a>
+              ? <a href={p.payLink} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[12px] font-semibold text-white hover:opacity-90">Open payment page <ExternalLink className="w-3.5 h-3.5" /></a>
               : p.payLinkUnavailable
-                // Honest state — a balance is owed but no secure link is ready yet.
-                ? <span className="text-[11px] text-t3 text-right max-w-[10rem]">Secure payment link not ready — please contact the clinic.</span>
+                // A payment request exists, but a provider-hosted page is unavailable.
+                ? <span className="text-[11px] text-t3 text-right max-w-[10rem]">Payment page unavailable — please contact the clinic.</span>
                 : <span className="badge badge-blue">{p.status}</span>}
           </div>
         ))}</div>}
@@ -731,6 +729,7 @@ export function ClientProfile() {
   const [p, setP] = useState<{ firstName: string; lastName: string; email: string; phone: string } | null>(null);
   const [email, setEmail] = useState(''); const [phone, setPhone] = useState('');
   const [busy, setBusy] = useState(false); const [msg, setMsg] = useState<string | null>(null);
+  const [msgIsError, setMsgIsError] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   useEffect(() => {
     let a = true;
@@ -746,7 +745,7 @@ export function ClientProfile() {
     return () => { a = false; };
   }, []);
   if (loadError) return <LoadError title="Profile unavailable" message={loadError} />;
-  async function save() { setBusy(true); setMsg(null); try { await portalClient.saveProfile({ email: email.trim() || undefined, phone: phone.trim() || undefined }); setMsg('Saved.'); } catch (e) { setMsg(e instanceof Error ? e.message : 'Could not save'); } finally { setBusy(false); } }
+  async function save() { setBusy(true); setMsg(null); setMsgIsError(false); try { await portalClient.saveProfile({ email: email.trim() || undefined, phone: phone.trim() || undefined }); setMsg('Contact details saved.'); } catch (e) { setMsgIsError(true); setMsg(e instanceof Error ? e.message : 'Could not save'); } finally { setBusy(false); } }
   const inp = 'w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--indigo)]';
   if (!p) return <Skel n={2} />;
   return (
@@ -756,7 +755,7 @@ export function ClientProfile() {
         <div><p className="text-[11px] uppercase tracking-wide text-t3">Name</p><p className="text-sm font-semibold text-t1">{p.firstName} {p.lastName}</p></div>
         <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Email</span><input className={inp} type="email" value={email} onChange={e => setEmail(e.target.value)} /></label>
         <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Phone</span><input className={inp} value={phone} onChange={e => setPhone(e.target.value)} /></label>
-        <div className="flex items-center gap-3"><button type="button" disabled={busy} onClick={save} className="rounded-lg bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50">Save changes</button>{msg && <span className="text-[12px] text-emerald-v">{msg}</span>}</div>
+        <div className="flex items-center gap-3"><button type="button" disabled={busy} onClick={save} className="rounded-lg bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50">Save changes</button>{msg && <span role={msgIsError ? 'alert' : 'status'} aria-live={msgIsError ? 'assertive' : 'polite'} className={`text-[12px] ${msgIsError ? 'text-red-v' : 'text-emerald-v'}`}>{msg}</span>}</div>
       </div>
     </div>
   );
@@ -782,34 +781,50 @@ export function ClientPreferences() {
     })();
     return () => { a = false; };
   }, []);
-  async function toggle(key: keyof PortalPreferences) { if (!prefs) return; setBusy(key); try { await portalClient.savePreferences({ [key]: !prefs[key] }); await load(); } finally { setBusy(null); } }
+  type TogglePreference = 'email' | 'sms' | 'whatsapp' | 'marketing';
+  type AuthorizationStatusKey = 'emailAuthorizationStatus' | 'smsAuthorizationStatus' | 'whatsappAuthorizationStatus' | 'marketingAuthorizationStatus';
+  async function optOut(key: TogglePreference) { if (!prefs) return; setBusy(key); try { await portalClient.savePreferences({ [key]: false }); await load(); } finally { setBusy(null); } }
+  async function optOutVoice() { setBusy('voice'); try { await portalClient.savePreferences({ voice: false }); await load(); } finally { setBusy(null); } }
   if (loadError) return <LoadError title="Preferences unavailable" message={loadError} />;
   if (!prefs) return <Skel n={2} />;
-  const ROWS: Array<{ key: keyof PortalPreferences; label: string; desc: string }> = [
-    { key: 'email', label: 'Email', desc: 'Appointment reminders & updates by email' },
-    { key: 'sms', label: 'SMS', desc: 'Text message reminders' },
-    { key: 'whatsapp', label: 'WhatsApp', desc: 'WhatsApp messages' },
-    { key: 'voice', label: 'Voice calls', desc: 'Phone calls and voice reminders' },
-    { key: 'marketing', label: 'Marketing', desc: 'Offers & news (opting out stops all campaigns)' },
+  const ROWS: Array<{ key: TogglePreference; statusKey: AuthorizationStatusKey; label: string; desc: string }> = [
+    { key: 'email', statusKey: 'emailAuthorizationStatus', label: 'Email', desc: 'Appointment reminders & updates by email' },
+    { key: 'sms', statusKey: 'smsAuthorizationStatus', label: 'SMS', desc: 'Text message reminders' },
+    { key: 'whatsapp', statusKey: 'whatsappAuthorizationStatus', label: 'WhatsApp', desc: 'WhatsApp messages' },
+    { key: 'marketing', statusKey: 'marketingAuthorizationStatus', label: 'Marketing', desc: 'Offers & news' },
   ];
   return (
     <div>
-      <H icon={Bell} title="Communication preferences" sub="Choose how your clinic can contact you" />
+      <H icon={Bell} title="Communication preferences" sub="Review recorded contact preferences and add opt-outs" />
       <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s1)] divide-y divide-[var(--b1)] mb-5">
         {ROWS.map(r => (
           <div key={r.key} className="flex items-center justify-between gap-3 px-4 py-3">
-            <div><p className="text-[13px] font-semibold text-t1">{r.label}</p><p className="text-[11px] text-t3">{r.desc}</p></div>
-            <button type="button" role="switch" aria-checked={prefs[r.key] ? 'true' : 'false'} aria-label={`${prefs[r.key] ? 'Disable' : 'Enable'} ${r.label}`} disabled={busy === r.key} onClick={() => toggle(r.key)}
-              className={`relative w-10 h-6 rounded-full shrink-0 transition-colors ${prefs[r.key] ? 'bg-[var(--indigo)]' : 'bg-[var(--b2)]'}`}>
-              <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition-all ${prefs[r.key] ? 'left-[18px]' : 'left-0.5'}`} />
-            </button>
+            <div><p className="text-[13px] font-semibold text-t1">{r.label}</p><p className="text-[11px] text-t3">{r.desc}</p><p className="text-[11px] text-t3 mt-0.5">{prefs[r.statusKey] === 'opted_out' ? 'Opt-out recorded' : prefs[r.statusKey] === 'opted_in' ? 'Prior affirmative preference recorded; live authority is checked separately' : 'No authorization recorded'}</p></div>
+            {prefs[r.statusKey] === 'opted_out'
+              ? <span className="badge badge-red">Opted out</span>
+              : <button type="button" aria-label={`Opt out of ${r.label}`} disabled={busy === r.key} onClick={() => optOut(r.key)} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[12px] font-semibold text-red-v hover:bg-[var(--red-soft)] disabled:opacity-50">{busy === r.key ? 'Recording…' : 'Opt out'}</button>}
           </div>
         ))}
       </div>
-      <p className="text-[11px] font-bold uppercase tracking-wide text-t3 mb-2">Consent history</p>
-      {history.length === 0 ? <p className="text-[12px] text-t3">No consent changes recorded yet.</p> :
+      <p className="text-[11px] text-t3 -mt-3 mb-5">This portal records opt-outs only. Purpose-specific, versioned authorization must be captured through the clinic's approved disclosure workflow.</p>
+      <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4 mb-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="text-[13px] font-semibold text-t1">Voice calls</p>
+            <p className="text-[11px] text-t3 mt-0.5">{prefs.voiceOptedOut ? 'A global voice-call opt-out is recorded.' : 'No portal voice-call opt-out is recorded.'}</p>
+          </div>
+          {prefs.voiceOptedOut ? <span className="badge badge-red">Opted out</span> : (
+            <button type="button" disabled={busy === 'voice'} onClick={optOutVoice} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[12px] font-semibold text-red-v hover:bg-[var(--red-soft)] disabled:opacity-50">
+              {busy === 'voice' ? 'Recording…' : 'Opt out of voice calls'}
+            </button>
+          )}
+        </div>
+        <p className="text-[11px] text-t3 mt-2">This portal can record an opt-out only. It cannot grant, restore, or imply permission for outbound calls; the clinic must use a purpose-specific disclosure and consent process.</p>
+      </div>
+      <p className="text-[11px] font-bold uppercase tracking-wide text-t3 mb-2">Preference and opt-out history</p>
+      {history.length === 0 ? <p className="text-[12px] text-t3">No preference or opt-out changes recorded yet.</p> :
         <div className="space-y-1">{history.slice(0, 12).map((h, i) => (
-          <div key={i} className="flex items-center justify-between text-[11px] rounded-lg border border-[var(--b1)] px-3 py-1.5"><span className="text-t2 capitalize">{h.purpose.toLowerCase()} {h.granted ? 'opted in' : 'opted out'}</span><span className="text-t3">{new Date(h.at).toLocaleDateString()}</span></div>
+          <div key={i} className="flex items-center justify-between text-[11px] rounded-lg border border-[var(--b1)] px-3 py-1.5"><span className="text-t2 capitalize">{h.purpose.toLowerCase()} {h.granted ? 'prior preference recorded (not current authority)' : 'opted out'}</span><span className="text-t3">{new Date(h.at).toLocaleDateString()}</span></div>
         ))}</div>}
     </div>
   );

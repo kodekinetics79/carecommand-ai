@@ -97,7 +97,7 @@ export function stediSandboxCheck(req: EligibilityRequest): EligibilityResult {
   const copay = [10, 20, 25, 35, 40][seed % 5];
   const deductibleRemaining = [0, 150, 400, 750, 1200][(seed >> 3) % 5];
   const coinsurance = [0, 10, 20][(seed >> 5) % 3];
-  return base('ACTIVE', true, 'Active coverage confirmed for the requested service.', {
+  return base('ACTIVE', true, 'Sandbox response reports active benefit information for the requested service. This is not a coverage or payment guarantee.', {
     copay, deductibleRemaining, coinsurance,
     benefitsInformation: [
       { code: '1', name: 'Active Coverage', serviceTypeCodes: ['30'] },

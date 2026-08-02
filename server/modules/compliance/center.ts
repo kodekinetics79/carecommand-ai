@@ -8,6 +8,7 @@ import { env } from '../../config/env';
 import { requireRoles } from '../../plugins/roles';
 import { requireFeature } from '../../lib/entitlements';
 import type { Prisma } from '../../generated/prisma/client';
+import { runWithTenantContext } from '../../lib/tenantContext';
 
 const PASSWORD_MIN_LENGTH = env.PASSWORD_MIN_LENGTH;
 const LOCKOUT_THRESHOLD = env.AUTH_LOCKOUT_THRESHOLD;
@@ -499,8 +500,36 @@ export const complianceCenterRoutes: FastifyPluginAsync = async app => {
       evidenceReviewFrequency: z.string().trim().max(40).optional(),
     }).parse(request.body);
     const tenantId = tenant(request);
-    const row = await db.tenantSecurityPolicy.upsert({ where: { tenantId }, update: input, create: { tenantId, ...input } });
-    await audit(request, { action: 'compliance.securityPolicy.updated', resource: 'tenantSecurityPolicy', resourceId: row.id, metadata: input as Prisma.InputJsonObject });
+    const row = await runWithTenantContext(tenantId, async tx => {
+      const existing = await tx.tenantSecurityPolicy.findUnique({ where: { tenantId } });
+      const enablingMfa = input.requireMfa === true && !existing?.requireMfa;
+      const revokedAt = enablingMfa ? new Date() : undefined;
+      if (enablingMfa) {
+        await tx.user.updateMany({
+          where: { tenantId },
+          data: { refreshTokenHash: null, refreshTokenExpiresAt: null },
+        });
+      }
+      const updated = await tx.tenantSecurityPolicy.upsert({
+        where: { tenantId },
+        update: { ...input, sessionsRevokedAt: revokedAt },
+        create: { tenantId, ...input, sessionsRevokedAt: revokedAt },
+      });
+      await tx.auditEvent.create({
+        data: {
+          tenantId,
+          actorUserId: request.auth.userId,
+          action: 'compliance.securityPolicy.updated',
+          resource: 'tenantSecurityPolicy',
+          resourceId: updated.id,
+          requestId: request.id,
+          ipAddress: request.ip,
+          userAgent: request.headers['user-agent'],
+          metadata: input as Prisma.InputJsonObject,
+        },
+      });
+      return updated;
+    });
     return row;
   });
 
