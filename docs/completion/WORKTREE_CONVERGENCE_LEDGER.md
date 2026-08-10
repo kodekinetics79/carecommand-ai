@@ -1,5 +1,13 @@
 # Worktree Convergence Ledger — Phase 0 Recovery
 
+## 2026-08-10 CTO disposition and preservation completion
+
+The CTO selected `baec496f46c143566138e7fd2fceb1ddd5c6dad2` plus the preserved Tier 1 working state as authoritative. Recovery commit `3be33cff2039058dd1c651fb4124846f824d642a` is retained on `recovery/tier1-authoritative-snapshot-20260810`; implementation continues only on `fix/tier1-p1-authoritative-20260810`.
+
+The five missing worktrees with unrecoverable unstaged bytes are classified `HISTORICAL_UNRECOVERABLE_UNSTAGED_WORK`. This classification documents the loss without blocking current engineering. Their surviving commits remain reachable. The M09 staged index remains a named donor patch and was not applied. `codex/accepted-module-convergence` remains reference-only, and its 121-migration lineage is quarantined.
+
+The verified all-refs bundle and three recovery patches are recorded in `BRANCH_AUTHORITY.md`. No worktree metadata, branch, stash, or donor artifact was pruned.
+
 ## 2026-08-10 Tier 1 P1 closure re-audit (current)
 
 - Registered worktrees: 77; existing paths: 1; missing/prunable paths: 76.

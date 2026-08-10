@@ -1,5 +1,20 @@
 # Release Readiness Report
 
+## 2026-08-10 authoritative Tier 1 P1 closure — final verdict
+
+**NO-GO.** Repository authority, provider call-ID collision handling, queue isolation, retry lifecycle, bounded recovery/operator retry, emergency claim truthfulness, and exact signed identity replay are internally accepted. The eligibility closure is rejected after the maximum two remediation cycles.
+
+Remaining P1 blockers:
+
+1. Stale `PROVIDER_IN_FLIGHT` eligibility executions have no production caller for the reconciliation scanner and are omitted from the clinic reconciliation list, so a post-claim crash can remain invisible indefinitely.
+2. `confirmed_succeeded` returns `manual_evidence_pending` without durably persisting or auditing that state, reason, or staff work item.
+3. Browser idempotency keys survive ambiguity only in memory; a reload/process loss can assign a new key to the same logical action.
+4. The required normal full regression fails 1/1,946 assertions because the shared append-only evidence manifest does not include the new `EligibilityExecution` delete-protection entry.
+
+P2 items: multi-instance recovery can duplicate bounded scan/Redis reads without a distributed lease; isolated test imports can leave meta-only Redis keys; no clinic-facing eligibility reconciliation UI or staff eligibility Playwright scenario exists. Actual emergency spoken-before-tool timing remains external provider evidence and is not claimed as verified.
+
+`npm run check`, production build, zero-to-head migration, genuine 86→87 upgrade, drift, runtime role, full RLS, focused finance/booking/data/content, AI/queue suites, and the scoped desktop/mobile portal-insurance Playwright run pass. No release tag, push, deployment, Tier 2 execution, live provider transaction, or real PHI is authorized.
+
 ## 2026-08-10 Tier 1 wave — authoritative current verdict
 
 **NO-GO.** This current working tree must not inherit the older GO verdict below.

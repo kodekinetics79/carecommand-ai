@@ -1,5 +1,20 @@
 # Change Attribution
 
+## 2026-08-10 authoritative Tier 1 P1 closure attribution
+
+| Commit | Attribution |
+|---|---|
+| `3be33cf` | Non-release recovery snapshot: attributed Tier 1 source, tests, deterministic profiles, Chrome fixes, simulations, and evidence |
+| `ac415d7` | Provider call-ID collision fail-closed handling and autopilot dispatch safety |
+| `c78a840` | Bounded autopilot recovery, queue generation fencing, and terminal-retry handling |
+| `c693f4a` | Production queue namespace guard, exact signed identity replay, emergency claim truthfulness, real retry lifecycle and role coverage |
+| `48c2b56` | Durable eligibility execution identity, state machine, RLS model, and forward migration |
+| `1a37610` | Eligibility audit/outbox, HMAC rotation, client logical-action keys, provenance/date truthfulness, and database guards |
+
+The two eligibility commits contain only work from the eligibility/RCM lane. The three AI/queue commits contain no Prisma migration. The final evidence reconciliation is documentation-only. `.playwright-no-server.config.ts` and `.tmp_inspect.ts` were excluded from Git and preserved in the manifest-backed local archive recorded in `BRANCH_AUTHORITY.md`.
+
+No donor migration, M09 patch, provider payload, credential, PHI, database dump, Playwright artifact, build output, or temporary log was committed.
+
 ## 2026-08-10 Tier 1 working-state attribution (current)
 
 The exact pre-closure state contains 29 unstaged tracked paths and 20 untracked leaf files (10 untracked status entries), with no staged, deleted, renamed, or unmerged paths. It is preserved by the SHA-verified Desktop patch recorded in `docs/completion/BRANCH_AUTHORITY.md`.

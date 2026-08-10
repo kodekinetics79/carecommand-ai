@@ -1,5 +1,29 @@
 # Test Execution Evidence
 
+## 2026-08-10 authoritative Tier 1 P1 closure (final)
+
+Environment: authoritative branch `fix/tier1-p1-authoritative-20260810`, local PostgreSQL/Redis, guarded disposable databases, synthetic fixtures, mock/disabled providers. No live call, payer request, payment, claim, production data, or PHI.
+
+| Gate | Result |
+|---|---|
+| `npm run check` | PASS: Prisma validation, API typecheck, ESLint, client typecheck, production build |
+| Focused Tier 1 preservation regression | PASS: 12 files, 115/115 tests |
+| AI/queue focused final run | PASS: 6 files, 57/57; independent final probes 7/7 plus overlapping-scanner probe |
+| Eligibility focused final run | PASS: 61/61; execution 12/12; frontend/env 29/29 |
+| Full RLS behavioral suite | PASS: 1002/1002; corrective eligibility evidence later reported 1007/1007 |
+| RLS catalog/runtime role | PASS: 132 application tables, 124 protected, 526 policies; restricted runtime role |
+| Prisma drift | PASS: 123 migration-owned composite FKs, 135 migration-owned indexes |
+| Zero-to-head migration | PASS: all 87 migrations; RLS verification passed; disposable database dropped |
+| Authoritative upgrade | PASS: genuine 86→87; only `20260810090000_eligibility_execution_integrity` applied; RLS/FORCE and four policies verified |
+| Playwright portal-insurance smoke | PASS: 2/2, desktop Chromium 4.7 s and Pixel 7 4.4 s; 57.0 s total |
+| Chrome manual observation | PASS, scoped: real Chrome rendered login without console warnings; protected eligibility deep link redirected to login; absent API produced visible `Failed to fetch` on synthetic sign-in |
+| Full normal disposable regression | **FAIL**: 111/112 files, 1,945/1,946 tests; `server/test/rlsGuard.test.ts:82` manifest mismatch for `EligibilityExecution`; no timeout override; 240.25 s wall |
+| `git diff --check` | PASS before evidence reconciliation |
+
+Full-regression log: `/tmp/carecommand-full-regression-1a37610-20260810.log`, SHA-256 `65932de380a455ee5a749461bcba0f974c9477a66edb1073720f284533e39923`. Playwright log: `/tmp/carecommand-eligibility-playwright-1a37610.log`, SHA-256 `907022ce006215dc12992cd610e381d95d95b1867c39dfbe5c87c4c36dfe08b6`.
+
+Independent distributed-systems review: PASS for internal scope; actual emergency audio/event ordering remains external evidence only. Independent eligibility/RCM review: REJECTED. Stale `PROVIDER_IN_FLIGHT` executions have no production scanner and are excluded from operator listing; `manual_evidence_pending` is returned without a durable state/audit/task; in-memory browser keys do not survive reload after an ambiguous result. The portal Playwright spec does not cover staff eligibility checks, effective-date rendering, or reconciliation UI.
+
 ## 2026-08-10 Tier 1 simulation checkpoint (current)
 
 This section supersedes older snapshots for the current dirty tree. Environment: local macOS, Node 24, PostgreSQL 17 and Redis 7 containers, synthetic data only; no production/PHI/provider transaction.
