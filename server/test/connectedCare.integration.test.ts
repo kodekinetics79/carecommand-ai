@@ -24,6 +24,8 @@ const { buildRpmEvidenceSnapshot, rpmPeriodBounds } = await import('../lib/conne
 const { computeAndStoreRpmReadiness, countCurrentReadyRpmPatients } = await import('../lib/connectedCare/rpmReadinessService');
 const { aiContextBuilder } = await import('../lib/ai/context');
 const { runWithTenantContext } = await import('../lib/tenantContext');
+const { runWithJobTenantContext } = await import('../lib/tenantContext');
+const { scanEligibilityReconciliationWork } = await import('../lib/eligibilityExecution');
 
 // Configure a per-tenant device provider row with an encrypted webhook secret,
 // exactly as the devices config route / seed do. This is what makes an inbound
@@ -289,11 +291,16 @@ describe('insurance provider registry + eligibility (integration)', () => {
       },
     });
     const admin = auth(tok(t.id, t.adminUserId));
+    const frontDeskUser = await db.user.create({ data: {
+      tenantId: t.id, branchId: t.branchId, role: 'FRONT_DESK', active: true,
+      email: `fd-${t.id.slice(0, 8)}@it.test`, displayName: 'Front Desk',
+    } });
+    const frontDesk = auth(tok(t.id, frontDeskUser.id));
     const unauthenticated = await app.inject({ method: 'GET', url: '/v1/insurance/eligibility/executions/reconciliation' });
     expect(unauthenticated.statusCode).toBe(401);
     const crossTenant = await app.inject({
       method: 'POST', url: `/v1/insurance/eligibility/executions/${execution.id}/reconcile`, headers: auth(tok(other.id, other.adminUserId)),
-      payload: { resolution: 'confirmed_failed', reason: 'Cross tenant attempt must not resolve' },
+      payload: { resolution: 'confirmed_failed', expectedGeneration: 0, reason: 'Cross tenant attempt must not resolve' },
     });
     expect(crossTenant.statusCode).toBe(404);
     const list = await app.inject({ method: 'GET', url: '/v1/insurance/eligibility/executions/reconciliation', headers: admin });
@@ -302,26 +309,67 @@ describe('insurance provider registry + eligibility (integration)', () => {
     expect(list.json()).toEqual(expect.arrayContaining([expect.objectContaining({
       id: abandonedReady.id,
       status: 'READY',
-      operatorState: 'safe_to_resume_with_original_idempotency_key',
+      operatorState: 'stale_ready',
       providerCallMayHaveOccurred: false,
     })]));
+    expect((await app.inject({ method: 'GET', url: '/v1/insurance/eligibility/executions/reconciliation?state=all', headers: frontDesk })).statusCode).toBe(200);
+    expect((await app.inject({
+      method: 'POST', url: `/v1/insurance/eligibility/executions/${execution.id}/claim`, headers: frontDesk,
+      payload: { expectedGeneration: 0 },
+    })).statusCode).toBe(403);
 
+    await runWithJobTenantContext(t.id, () => scanEligibilityReconciliationWork(t.id), 'worker:test-connected-care');
+    const pending = await db.eligibilityExecution.findUniqueOrThrow({ where: { id: execution.id } });
     const fabricatedSuccess = await app.inject({
       method: 'POST', url: `/v1/insurance/eligibility/executions/${execution.id}/reconcile`, headers: admin,
-      payload: { resolution: 'confirmed_succeeded', reason: 'Staff cannot invent a provider result' },
+      payload: { resolution: 'confirmed_succeeded', expectedGeneration: pending.reconciliationGeneration, reason: 'Staff cannot invent a provider result' },
     });
-    expect(fabricatedSuccess.statusCode).toBe(409);
-    expect(fabricatedSuccess.json()).toMatchObject({ status: 'manual_evidence_pending', providerRetrievalSupported: false });
-    expect(fabricatedSuccess.json().allowedActions).toEqual(['confirmed_not_submitted', 'confirmed_failed']);
+    expect(fabricatedSuccess.statusCode).toBe(400);
+
+    const claim = await app.inject({
+      method: 'POST', url: `/v1/insurance/eligibility/executions/${execution.id}/claim`, headers: admin,
+      payload: { expectedGeneration: pending.reconciliationGeneration },
+    });
+    expect(claim.statusCode).toBe(200);
 
     const safeReset = await app.inject({
       method: 'POST', url: `/v1/insurance/eligibility/executions/${execution.id}/reconcile`, headers: admin,
-      payload: { resolution: 'confirmed_not_submitted', reason: 'Provider portal confirms it was not submitted' },
+      payload: { resolution: 'confirmed_not_submitted', expectedGeneration: pending.reconciliationGeneration, reason: 'Provider portal confirms it was not submitted' },
     });
     expect(safeReset.statusCode).toBe(200);
     expect(safeReset.json()).toMatchObject({ status: 'READY', providerCalled: false });
     expect(await db.eligibilityExecution.findUnique({ where: { id: execution.id } })).toMatchObject({ status: 'READY' });
     expect(await db.auditEvent.count({ where: { tenantId: t.id, action: 'eligibility.execution.reconciled', resourceId: execution.id } })).toBe(1);
+
+    const pendingReady = await db.eligibilityExecution.findUniqueOrThrow({ where: { id: abandonedReady.id } });
+    expect(pendingReady.status).toBe('MANUAL_EVIDENCE_PENDING');
+    expect((await app.inject({
+      method: 'POST', url: `/v1/insurance/eligibility/executions/${abandonedReady.id}/claim`, headers: admin,
+      payload: { expectedGeneration: pendingReady.reconciliationGeneration - 1 },
+    })).statusCode).toBe(409);
+    expect((await app.inject({
+      method: 'POST', url: `/v1/insurance/eligibility/executions/${abandonedReady.id}/claim`, headers: admin,
+      payload: { expectedGeneration: pendingReady.reconciliationGeneration },
+    })).statusCode).toBe(200);
+    const tomorrow = new Date(Date.now() + 24 * 60 * 60_000);
+    const manual = await app.inject({
+      method: 'POST', url: `/v1/insurance/eligibility/executions/${abandonedReady.id}/reconcile`, headers: admin,
+      payload: {
+        resolution: 'confirmed_succeeded', expectedGeneration: pendingReady.reconciliationGeneration,
+        reason: 'Verified in payer portal against exact member and service date',
+        evidence: {
+          outcome: 'ACTIVE', source: 'PAYER_PORTAL', reference: 'PORTAL-REF-1001', verifiedAt: new Date().toISOString(),
+          effectiveFrom: tomorrow.toISOString(), expiresAt: null,
+          attestation: { patientMatches: true, policyMatches: true, payerMatches: true, serviceAndDateMatch: true },
+        },
+      },
+    });
+    expect(manual.statusCode).toBe(200);
+    expect(manual.json()).toMatchObject({ status: 'MANUALLY_RECONCILED', providerCalled: false });
+    const verification = await db.eligibilityVerification.findUniqueOrThrow({ where: { id: manual.json().verificationId } });
+    expect(verification).toMatchObject({ coverageStatus: 'NEEDS_REVIEW', coverageActive: false, copay: null, deductibleRemaining: null, coinsurance: null });
+    expect(await db.patientInsurancePolicy.findUniqueOrThrow({ where: { id: t.inactivePolicyId } })).toMatchObject({ verificationStatus: 'needs_review' });
+    expect(await db.patient.findUniqueOrThrow({ where: { id: t.patientId } })).toMatchObject({ eligibilityStatus: 'NEEDS_REVIEW' });
   });
 });
 

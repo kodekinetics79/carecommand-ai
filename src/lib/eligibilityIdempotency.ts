@@ -10,6 +10,10 @@ export function eligibilityRequestHeaders(idempotencyKey = createEligibilityIdem
 
 const pendingEligibilityActions = new Map<string, string>();
 
+function eligibilityStorage() {
+  try { return globalThis.localStorage; } catch { return undefined; }
+}
+
 function stableSignature(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(stableSignature).join(',')}]`;
@@ -18,19 +22,29 @@ function stableSignature(value: unknown): string {
 }
 
 export async function runEligibilityAction<T>(contract: string, input: unknown, request: (idempotencyKey: string) => Promise<T>): Promise<T> {
-  const signature = `${contract}:${stableSignature(input)}`;
-  const key = pendingEligibilityActions.get(signature) ?? createEligibilityIdempotencyKey();
+  const canonical = `${contract}:${stableSignature(input)}`;
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
+  const signature = `${contract}:${Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')}`;
+  const storageKey = `eligibility-action:${signature}`;
+  const storage = eligibilityStorage();
+  const stored = storage?.getItem(storageKey) ?? undefined;
+  const key = pendingEligibilityActions.get(signature) ?? stored ?? createEligibilityIdempotencyKey();
   pendingEligibilityActions.set(signature, key);
+  storage?.setItem(storageKey, key);
   try {
     const result = await request(key);
     pendingEligibilityActions.delete(signature);
+    storage?.removeItem(storageKey);
     return result;
   } catch (error) {
     if (error instanceof ApiError) {
       const state = String(error.code ?? error.details?.status ?? error.details?.error ?? '');
       const ambiguousConflict = error.status === 409 && ['reconciliation_required', 'execution_in_progress'].includes(state);
       const ambiguousTransport = error.status >= 500 || error.status === 408 || error.status === 429;
-      if (!ambiguousConflict && !ambiguousTransport) pendingEligibilityActions.delete(signature);
+      if (!ambiguousConflict && !ambiguousTransport) {
+        pendingEligibilityActions.delete(signature);
+        storage?.removeItem(storageKey);
+      }
     }
     throw error;
   }

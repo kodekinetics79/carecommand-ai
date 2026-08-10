@@ -16,14 +16,17 @@ import {
   campaignQueue,
   complianceQueue,
   monitoringQueue,
+  eligibilityReconciliationQueue,
   registerCampaignSchedules,
   registerComplianceSchedules,
   registerMonitoringSchedules,
+  registerEligibilityReconciliationSchedule,
 } from './queues';
 import { createAutopilotWorker } from './autopilot.worker';
 import { createCampaignWorker } from './campaign.worker';
 import { createComplianceWorker } from './compliance.worker';
 import { createMonitoringWorker } from './monitoring.worker';
+import { createEligibilityReconciliationWorker } from './eligibilityReconciliation.worker';
 import { reconcileStrandedAutopilotDispatches } from './autopilotRecovery';
 
 // ===========================================================================
@@ -54,13 +57,14 @@ export async function startWorkers(): Promise<WorkerRuntime> {
   // DB role can bypass RLS, and non-production can opt in via the env flag.
   await assertRlsRuntimeRole();
 
-  const workers = [createAutopilotWorker(), createComplianceWorker(), createCampaignWorker(), createMonitoringWorker()];
+  const workers = [createAutopilotWorker(), createComplianceWorker(), createCampaignWorker(), createMonitoringWorker(), createEligibilityReconciliationWorker()];
 
   // Idempotent on every boot — upsertJobScheduler dedupes by scheduler id, so
   // restarts never create duplicate schedules.
   await registerComplianceSchedules();
   await registerCampaignSchedules();
   await registerMonitoringSchedules();
+  await registerEligibilityReconciliationSchedule();
 
   const AUTOPILOT_RECOVERY_INTERVAL_MS = 60_000;
   let activeAutopilotRecoveryPass: Promise<void> | null = null;
@@ -89,7 +93,7 @@ export async function startWorkers(): Promise<WorkerRuntime> {
   // Publish queue backlog to the metrics registry so alerts can fire on a
   // growing/stuck queue. The worker is the source of truth for depth; sampling
   // every 15s is negligible Redis load.
-  const queues = [autopilotQueue, campaignQueue, complianceQueue, monitoringQueue];
+  const queues = [autopilotQueue, campaignQueue, complianceQueue, monitoringQueue, eligibilityReconciliationQueue];
   await sampleQueueDepths(queues);
   const depthTimer = setInterval(() => { void sampleQueueDepths(queues); }, 15_000);
   depthTimer.unref?.();
@@ -102,7 +106,7 @@ export async function startWorkers(): Promise<WorkerRuntime> {
     clearInterval(depthTimer);
     clearInterval(autopilotRecoveryTimer);
     await Promise.allSettled(workers.map(worker => worker.close()));
-    await Promise.allSettled([autopilotQueue.close(), complianceQueue.close(), campaignQueue.close(), monitoringQueue.close()]);
+    await Promise.allSettled([autopilotQueue.close(), complianceQueue.close(), campaignQueue.close(), monitoringQueue.close(), eligibilityReconciliationQueue.close()]);
     if (metricsServer) await new Promise(resolve => metricsServer.close(() => resolve(null)));
     await db.$disconnect();
     // Last, so spans emitted while draining still flush to the exporter.
@@ -118,7 +122,7 @@ const isDirectRun = process.argv[1] ? import.meta.url === `file://${process.argv
 if (isDirectRun) {
   startWorkers()
     .then(({ workers, shutdown }) => {
-      console.info(`[workers] runtime started — draining ${workers.length} queues (autopilot, compliance, campaign, monitoring-safety)`);
+      console.info(`[workers] runtime started — draining ${workers.length} queues (autopilot, compliance, campaign, monitoring-safety, eligibility-reconciliation)`);
       let closing = false;
       const onSignal = async (signal: string) => {
         if (closing) return;

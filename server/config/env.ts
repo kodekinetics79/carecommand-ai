@@ -104,6 +104,11 @@ const baseEnvSchema = z.object({
   // Optional one-generation dual-read key for controlled rotations.
   ELIGIBILITY_HMAC_PREVIOUS_SECRET: z.string().min(32).optional(),
   ELIGIBILITY_HMAC_PREVIOUS_KEY_VERSION: z.string().regex(/^[A-Za-z0-9._-]{1,32}$/).optional(),
+  ELIGIBILITY_RECONCILIATION_ENABLED: booleanString(true),
+  ELIGIBILITY_RECONCILIATION_INTERVAL_SECONDS: z.coerce.number().int().min(30).max(3600).default(60),
+  ELIGIBILITY_RECONCILIATION_STALE_SECONDS: z.coerce.number().int().min(300).max(86400).default(300),
+  ELIGIBILITY_RECONCILIATION_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(25),
+  ELIGIBILITY_RECONCILIATION_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(10).default(2),
   // Dedicated HMAC key for tenant-scoped BullMQ envelopes. Optional for a
   // staged rollout; JWT_REFRESH_SECRET is used with domain separation if unset.
   // The secret never appears in queue payloads.
@@ -242,6 +247,9 @@ const baseEnvSchema = z.object({
 export const envSchema = baseEnvSchema.superRefine((cfg, ctx) => {
   if ((cfg.NODE_ENV === 'production' || cfg.DEPLOYMENT_PROFILE !== 'demo') && !cfg.ELIGIBILITY_HMAC_SECRET) {
     ctx.addIssue({ code: 'custom', path: ['ELIGIBILITY_HMAC_SECRET'], message: 'ELIGIBILITY_HMAC_SECRET is required outside local/demo development and must remain stable across JWT rotation.' });
+  }
+  if ((cfg.NODE_ENV === 'production' || cfg.DEPLOYMENT_PROFILE !== 'demo') && !cfg.ELIGIBILITY_RECONCILIATION_ENABLED) {
+    ctx.addIssue({ code: 'custom', path: ['ELIGIBILITY_RECONCILIATION_ENABLED'], message: 'Eligibility reconciliation scanning must remain enabled outside local/demo development.' });
   }
   if (Boolean(cfg.ELIGIBILITY_HMAC_PREVIOUS_SECRET) !== Boolean(cfg.ELIGIBILITY_HMAC_PREVIOUS_KEY_VERSION)) {
     ctx.addIssue({ code: 'custom', path: ['ELIGIBILITY_HMAC_PREVIOUS_SECRET'], message: 'Previous eligibility HMAC secret and key version must be configured together.' });

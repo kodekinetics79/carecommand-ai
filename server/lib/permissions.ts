@@ -37,6 +37,7 @@ export const PERMISSIONS = [
   'schedule:manage',
   'billing:read',
   'billing:write',
+  'insurance:reconcile',
   'staff:read',
   'staff:write',
   // Narrow operational grant: update an existing task's lifecycle without
@@ -106,6 +107,7 @@ export const ROLE_PERMISSIONS: Record<UserRole, Permission[]> = {
     'intake:read', 'intake:write',
     'appointment:read', 'appointment:write', 'schedule:manage',
     'billing:read',
+    'insurance:reconcile',
     'staff:read', 'staff:write', 'staff:task-status',
     'settings:read', 'settings:write',
     'operations:read', 'operations:write',
@@ -119,6 +121,7 @@ export const ROLE_PERMISSIONS: Record<UserRole, Permission[]> = {
   ],
   BILLING: [
     'billing:read', 'billing:write', 'settings:read', 'patient:read', 'intake:read', 'intake:write',
+    'insurance:reconcile',
     'revenue:read', 'revenue:write',
   ],
   PROVIDER: [

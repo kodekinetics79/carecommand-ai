@@ -261,6 +261,7 @@ model User {
   receptionistCallsSignedOff ReceptionistCallLog[] @relation("ReceptionistCallSignoff")
   conversationReplyAttempts ConversationReplyAttempt[]
   eligibilityExecutions          EligibilityExecution[]          @relation("EligibilityExecutionActor")
+  eligibilityReconciliationsVerified EligibilityExecution[]      @relation("EligibilityReconciliationVerifier")
 
   @@unique([tenantId, email])
   @@unique([tenantId, id])
@@ -776,7 +777,9 @@ model StaffTask {
   tenant       Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   branch       Branch?    @relation(fields: [branchId], references: [id], onDelete: SetNull)
   assignedTo   User?      @relation(fields: [assignedToId], references: [id], onDelete: SetNull)
+  eligibilityReconciliation EligibilityExecution? @relation("EligibilityReconciliationTask")
 
+  @@unique([tenantId, id])
   @@index([tenantId, status, dueAt])
   @@index([tenantId, assignedToId, status])
 }
@@ -1006,6 +1009,8 @@ enum EligibilityExecutionStatus {
   SUCCEEDED
   FAILED_DEFINITIVE
   RECONCILIATION_REQUIRED
+  MANUAL_EVIDENCE_PENDING
+  MANUALLY_RECONCILED
 }
 
 model EligibilityExecution {
@@ -1028,6 +1033,21 @@ model EligibilityExecution {
   resultVerificationId String?                    @db.Uuid
   failureCode          String?
   reconciliationReason String?
+  reconciliationLeaseOwner String?
+  reconciliationLeaseExpiresAt DateTime?
+  reconciliationGeneration Int                       @default(0)
+  reconciliationTaskId String?                       @db.Uuid
+  manualEvidenceOutcome String?
+  manualEvidenceSource String?
+  manualEvidenceReference String?
+  manualEvidenceVerifiedAt DateTime?
+  manualEvidenceVerifiedByUserId String?              @db.Uuid
+  manualCoverageEffectiveFrom DateTime?
+  manualCoverageExpiresAt DateTime?
+  manualCopay          Decimal?                       @db.Decimal(12, 2)
+  manualDeductibleRemaining Decimal?                  @db.Decimal(12, 2)
+  manualCoinsurance    Decimal?                       @db.Decimal(12, 4)
+  manualEvidenceNotes  String?
   claimedAt            DateTime                   @default(now())
   providerStartedAt    DateTime?
   providerCompletedAt  DateTime?
@@ -1041,10 +1061,15 @@ model EligibilityExecution {
   payer                InsurancePayer?            @relation(fields: [tenantId, payerId], references: [tenantId, id], onDelete: Restrict)
   policy               PatientInsurancePolicy?    @relation(fields: [tenantId, policyId], references: [tenantId, id], onDelete: Restrict)
   actorUser            User?                      @relation("EligibilityExecutionActor", fields: [tenantId, actorUserId], references: [tenantId, id], onDelete: Restrict)
+  manualEvidenceVerifiedBy User?                  @relation("EligibilityReconciliationVerifier", fields: [tenantId, manualEvidenceVerifiedByUserId], references: [tenantId, id], onDelete: Restrict)
+  reconciliationTask   StaffTask?                 @relation("EligibilityReconciliationTask", fields: [tenantId, reconciliationTaskId], references: [tenantId, id], onDelete: Restrict)
   resultVerification   EligibilityVerification?   @relation(fields: [tenantId, resultVerificationId], references: [tenantId, id], onDelete: Restrict)
 
   @@unique([tenantId, idempotencyKeyHash])
   @@unique([tenantId, resultVerificationId])
+  @@unique([tenantId, reconciliationTaskId])
+  @@index([status, reconciliationLeaseExpiresAt, updatedAt])
+  @@index([tenantId, status, reconciliationLeaseExpiresAt])
   @@index([tenantId, status, updatedAt])
   @@index([tenantId, patientId, createdAt])
 }

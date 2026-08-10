@@ -202,3 +202,26 @@ export async function enqueueMonitoringTenantJob(operation: MonitoringJobName, t
   const data = createTenantJobEnvelope({ queue: 'monitoring-safety', operation, tenantId, _otel: currentTraceCarrier() });
   await monitoringQueue.add(`${operation}-tenant`, data, { jobId: tenantJobId(data) });
 }
+
+// ---- Eligibility reconciliation queue ------------------------------------
+export const eligibilityReconciliationQueue: Queue<ScheduledQueueData, void, string> = QUEUES_ENABLED
+  ? new Queue('eligibility-reconciliation', {
+      connection: redisConnection,
+      prefix: bullMqPrefix,
+      defaultJobOptions: { attempts: 3, backoff: { type: 'exponential', delay: 2000 }, removeOnComplete: 500, removeOnFail: 1000 },
+    })
+  : disabledQueue('eligibility-reconciliation');
+
+export async function registerEligibilityReconciliationSchedule() {
+  if (!env.ELIGIBILITY_RECONCILIATION_ENABLED) return;
+  await eligibilityReconciliationQueue.upsertJobScheduler(
+    'eligibility-reconciliation-scan',
+    { every: env.ELIGIBILITY_RECONCILIATION_INTERVAL_SECONDS * 1000 },
+    { name: 'scan', data: {} },
+  );
+}
+
+export async function enqueueEligibilityReconciliationTenantJob(tenantId: string) {
+  const data = createTenantJobEnvelope({ queue: 'eligibility-reconciliation', operation: 'scan', tenantId, _otel: currentTraceCarrier() });
+  await eligibilityReconciliationQueue.add('scan-tenant', data, { jobId: tenantJobId(data) });
+}

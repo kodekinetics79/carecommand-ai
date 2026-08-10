@@ -259,6 +259,11 @@ type EligibilityOutcome = {
   storeRawResponse: boolean;
 };
 
+export type EligibilityReconciliationCapability = {
+  verifiedResponseLookupSupported: boolean;
+  resolutionPath: 'provider_lookup' | 'manual_payer_evidence';
+};
+
 export type PaymentOutcome = {
   amount: number;
   currency: string;
@@ -564,6 +569,10 @@ class MockEligibilityProvider {
   providerKey = 'mock';
   displayName = 'Mock Eligibility';
   mode: ProviderMode = 'mock';
+  reconciliationCapability: EligibilityReconciliationCapability = {
+    verifiedResponseLookupSupported: false,
+    resolutionPath: 'manual_payer_evidence',
+  };
 
   async getPayerList(context: RevenueContext) {
     const rows = await db.insurancePayer.findMany({
@@ -626,6 +635,26 @@ class MockEligibilityProvider {
   async runEligibilityCheck(_input: EligibilityCheckContext): Promise<EligibilityOutcome> {
     return this.normalizeEligibilityResponse({}, _input);
   }
+}
+
+const manualEvidenceOnlyCapability = Object.freeze<EligibilityReconciliationCapability>({
+  verifiedResponseLookupSupported: false,
+  resolutionPath: 'manual_payer_evidence',
+});
+
+const eligibilityReconciliationCapabilities = {
+  mock: manualEvidenceOnlyCapability,
+  stedi: manualEvidenceOnlyCapability,
+  availity: manualEvidenceOnlyCapability,
+  pverify: manualEvidenceOnlyCapability,
+  optum: manualEvidenceOnlyCapability,
+} satisfies Record<string, EligibilityReconciliationCapability>;
+
+export function eligibilityProviderReconciliationCapability(providerKey: string): EligibilityReconciliationCapability {
+  // Each shipped adapter declares whether it has a verified response retrieval
+  // API. Unknown/historical adapters fail closed to durable manual evidence.
+  return eligibilityReconciliationCapabilities[providerKey as keyof typeof eligibilityReconciliationCapabilities]
+    ?? manualEvidenceOnlyCapability;
 }
 
 export class StediEligibilityProvider extends MockEligibilityProvider {

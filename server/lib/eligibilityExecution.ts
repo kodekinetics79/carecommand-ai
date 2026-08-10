@@ -1,4 +1,4 @@
-import { createHmac } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import type { FastifyRequest } from 'fastify';
 import { env } from '../config/env';
 import type { EligibilityExecution, Prisma } from '../generated/prisma/client';
@@ -106,6 +106,7 @@ async function createOrLoadExecution<TOutcome, TResult>(input: RunEligibilityExe
   const [{ idempotencyKeyHash, requestFingerprint, hmacKeyVersion }] = identities;
   return db.$transaction(async tx => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`eligibility:${input.context.tenantId}:${idempotencyKeyHash}`}, 0))`;
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`eligibility-fingerprint:${input.context.tenantId}:${requestFingerprint}`}, 0))`;
     const existing = await tx.eligibilityExecution.findFirst({
       where: { tenantId: input.context.tenantId, OR: identities.map(identity => ({ idempotencyKeyHash: identity.idempotencyKeyHash })) },
     });
@@ -137,6 +138,15 @@ async function createOrLoadExecution<TOutcome, TResult>(input: RunEligibilityExe
       }
       return existing;
     }
+    const activeByFingerprint = await tx.eligibilityExecution.findFirst({
+      where: {
+        tenantId: input.context.tenantId,
+        requestFingerprint: { in: identities.map(identity => identity.requestFingerprint) },
+        status: { in: ['READY', 'PROVIDER_IN_FLIGHT', 'RECONCILIATION_REQUIRED', 'MANUAL_EVIDENCE_PENDING'] },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (activeByFingerprint) return activeByFingerprint;
     const created = await tx.eligibilityExecution.create({
       data: {
         tenantId: input.context.tenantId,
@@ -203,10 +213,10 @@ async function claimProviderAttempt(execution: EligibilityExecution): Promise<{ 
 }
 
 async function requireReplayable<TResult>(execution: EligibilityExecution, replay: (verificationId: string) => Promise<TResult>): Promise<EligibilityExecutionResult<TResult>> {
-  if (execution.status === 'SUCCEEDED' && execution.resultVerificationId) {
+  if ((execution.status === 'SUCCEEDED' || execution.status === 'MANUALLY_RECONCILED') && execution.resultVerificationId) {
     return { executionId: execution.id, replayed: true, result: await replay(execution.resultVerificationId) };
   }
-  if (execution.status === 'RECONCILIATION_REQUIRED') {
+  if (execution.status === 'RECONCILIATION_REQUIRED' || execution.status === 'MANUAL_EVIDENCE_PENDING') {
     throw new EligibilityExecutionConflictError('reconciliation_required', execution.id);
   }
   if (execution.status === 'FAILED_DEFINITIVE') {
@@ -332,4 +342,116 @@ export async function reconcileStaleEligibilityExecutions(tenantId: string, stal
     }
     return stale.length;
   });
+}
+
+export async function scanEligibilityReconciliationWork(tenantId: string, now = new Date(), limit = env.ELIGIBILITY_RECONCILIATION_BATCH_SIZE) {
+  const staleBefore = new Date(now.getTime() - env.ELIGIBILITY_RECONCILIATION_STALE_SECONDS * 1000);
+  const leaseOwner = `eligibility-scan:${randomUUID()}`;
+  const leaseExpiresAt = new Date(now.getTime() + 60_000);
+  const candidates = await db.$queryRaw<Array<{ id: string }>>`
+      SELECT id
+      FROM "EligibilityExecution"
+      WHERE "tenantId" = ${tenantId}::uuid
+        AND "reconciliationTaskId" IS NULL
+        AND ("reconciliationLeaseExpiresAt" IS NULL OR "reconciliationLeaseExpiresAt" < ${now})
+        AND (
+          status = 'RECONCILIATION_REQUIRED'
+          OR (status = 'READY' AND "createdAt" < ${staleBefore})
+          OR (status = 'PROVIDER_IN_FLIGHT' AND "providerStartedAt" < ${staleBefore})
+      )
+      ORDER BY "updatedAt" ASC
+      LIMIT ${limit}
+    `;
+  let escalated = 0;
+  let errors = 0;
+  for (const candidate of candidates) {
+    try {
+      const didEscalate = await db.$transaction(async tx => {
+        const rows = await tx.$queryRaw<Array<{
+          id: string; branchId: string; status: EligibilityExecution['status']; reconciliationReason: string | null;
+          reconciliationGeneration: number; providerKey: string;
+        }>>`
+          SELECT id, "branchId", status, "reconciliationReason", "reconciliationGeneration", "providerKey"
+          FROM "EligibilityExecution"
+          WHERE id = ${candidate.id}::uuid
+            AND "tenantId" = ${tenantId}::uuid
+            AND "reconciliationTaskId" IS NULL
+            AND ("reconciliationLeaseExpiresAt" IS NULL OR "reconciliationLeaseExpiresAt" < ${now})
+            AND (
+              status = 'RECONCILIATION_REQUIRED'
+              OR (status = 'READY' AND "createdAt" < ${staleBefore})
+              OR (status = 'PROVIDER_IN_FLIGHT' AND "providerStartedAt" < ${staleBefore})
+            )
+          FOR UPDATE SKIP LOCKED
+        `;
+        const row = rows[0];
+        if (!row) return false;
+        const leased = await tx.eligibilityExecution.updateMany({
+          where: {
+            id: row.id,
+            tenantId,
+            status: row.status,
+            reconciliationGeneration: row.reconciliationGeneration,
+            reconciliationTaskId: null,
+            OR: [{ reconciliationLeaseExpiresAt: null }, { reconciliationLeaseExpiresAt: { lt: now } }],
+          },
+          data: {
+            reconciliationLeaseOwner: leaseOwner,
+            reconciliationLeaseExpiresAt: leaseExpiresAt,
+            reconciliationGeneration: { increment: 1 },
+          },
+        });
+        if (leased.count !== 1) return false;
+        const providerCallMayHaveOccurred = row.status !== 'READY';
+        const task = await tx.staffTask.create({ data: {
+          tenantId,
+          branchId: row.branchId,
+          title: 'Reconcile ambiguous insurance eligibility response',
+          priority: 'high',
+          status: 'OPEN',
+          dueAt: now,
+          metadata: {
+            workflow: 'eligibility_reconciliation',
+            eligibilityExecutionId: row.id,
+            providerKey: row.providerKey,
+            providerCallMayHaveOccurred,
+            noAutomaticPayerRetry: true,
+          },
+        } });
+        const bound = await tx.eligibilityExecution.updateMany({
+          where: {
+            id: row.id,
+            tenantId,
+            status: row.status,
+            reconciliationGeneration: row.reconciliationGeneration + 1,
+            reconciliationLeaseOwner: leaseOwner,
+            reconciliationTaskId: null,
+          },
+          data: {
+            status: 'MANUAL_EVIDENCE_PENDING',
+            reconciliationReason: row.reconciliationReason ?? (row.status === 'READY' ? 'stale_ready_without_provider_claim' : 'stale_or_ambiguous_provider_attempt'),
+            reconciliationTaskId: task.id,
+            reconciliationLeaseOwner: null,
+            reconciliationLeaseExpiresAt: null,
+          },
+        });
+        if (bound.count !== 1) throw new Error('Eligibility reconciliation lease was lost');
+        await tx.auditEvent.create({ data: {
+          tenantId,
+          actorUserId: null,
+          action: 'eligibility.execution.manual_evidence_requested',
+          resource: 'eligibilityExecution',
+          resourceId: row.id,
+          metadata: { taskId: task.id, providerKey: row.providerKey, providerCallMayHaveOccurred, noAutomaticPayerRetry: true },
+        } });
+        return true;
+      });
+      if (didEscalate) escalated += 1;
+    } catch {
+      // A malformed or concurrently corrupted row must not prevent other tenant
+      // work from becoming visible. The worker reports only aggregate counts.
+      errors += 1;
+    }
+  }
+  return { scanned: candidates.length, escalated, errors };
 }

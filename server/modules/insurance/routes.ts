@@ -12,8 +12,8 @@ import { encryptSecret } from '../../lib/security';
 import { INSURANCE_PROVIDERS, maskMemberId } from '../../lib/connectedCare/catalog';
 import { runStediEligibility, type NormalizedEligibility } from '../../lib/connectedCare/eligibilityService';
 import { env } from '../../config/env';
-import { createInsuranceProvider } from '../revenue-protection';
-import { requirePermission } from '../../lib/permissions';
+import { createInsuranceProvider, eligibilityProviderReconciliationCapability } from '../revenue-protection';
+import { getRequestPermissions, requirePermission } from '../../lib/permissions';
 import {
   EligibilityExecutionConflictError,
   eligibilityIdempotencyKey,
@@ -41,7 +41,7 @@ function isPolicyRangeConflict(error: unknown): boolean {
 const uuid = z.string().uuid();
 const adminRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
 const deskRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'FRONT_DESK');
-const reconciliationRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'BILLING');
+const insuranceReconcile = requirePermission('insurance:reconcile');
 const insuranceRead = requirePermission('billing:read');
 
 export const insuranceRoutes: FastifyPluginAsync = async app => {
@@ -584,17 +584,21 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
     }));
   });
 
-  app.get('/eligibility/executions/reconciliation', { preHandler: reconciliationRoles }, async request => {
-    const q = z.object({ limit: z.coerce.number().int().min(1).max(100).default(25) }).parse(request.query);
-    const staleReadyBefore = new Date(Date.now() - 5 * 60_000);
+  app.get('/eligibility/executions/reconciliation', { preHandler: insuranceRead }, async request => {
+    const q = z.object({ limit: z.coerce.number().int().min(1).max(100).default(25), state: z.enum(['unresolved', 'in_flight', 'manual_pending', 'reconciled', 'terminal', 'all']).default('unresolved') }).parse(request.query);
+    const canReconcile = (await getRequestPermissions(request)).has('insurance:reconcile');
+    const requestedState = canReconcile ? q.state : 'unresolved';
+    const statusByState = {
+      unresolved: ['READY', 'PROVIDER_IN_FLIGHT', 'RECONCILIATION_REQUIRED', 'MANUAL_EVIDENCE_PENDING'],
+      in_flight: ['PROVIDER_IN_FLIGHT'], manual_pending: ['MANUAL_EVIDENCE_PENDING'], reconciled: ['MANUALLY_RECONCILED'],
+      terminal: ['SUCCEEDED', 'FAILED_DEFINITIVE', 'MANUALLY_RECONCILED'],
+      all: ['READY', 'PROVIDER_IN_FLIGHT', 'RECONCILIATION_REQUIRED', 'MANUAL_EVIDENCE_PENDING', 'SUCCEEDED', 'FAILED_DEFINITIVE', 'MANUALLY_RECONCILED'],
+    } as const;
     const rows = await db.eligibilityExecution.findMany({
       where: {
         tenantId: request.auth.tenantId,
         ...branchScope(request),
-        OR: [
-          { status: 'RECONCILIATION_REQUIRED' },
-          { status: 'READY', createdAt: { lt: staleReadyBefore } },
-        ],
+        status: { in: [...statusByState[requestedState]] },
       },
       orderBy: { updatedAt: 'asc' },
       take: q.limit,
@@ -610,53 +614,174 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
         requestContract: true,
         status: true,
         reconciliationReason: true,
+        reconciliationGeneration: true,
+        reconciliationTaskId: true,
+        reconciliationTask: { select: { status: true, assignedToId: true, assignedTo: { select: { displayName: true } } } },
+        manualEvidenceOutcome: true,
+        manualEvidenceSource: true,
+        manualEvidenceReference: true,
+        manualEvidenceVerifiedAt: true,
         providerStartedAt: true,
+        createdAt: true,
         updatedAt: true,
+        patient: { select: { firstName: true, lastName: true } },
       },
     });
     await audit(request, { action: 'eligibility.execution.reconciliation.list', resource: 'eligibilityExecution', metadata: { count: rows.length } });
-    return rows.map(row => ({
-      ...row,
-      operatorState: row.status === 'READY' ? 'safe_to_resume_with_original_idempotency_key' : 'manual_reconciliation_required',
-      providerCallMayHaveOccurred: row.status !== 'READY',
-    }));
+    return rows.map(({ patient, ...row }) => {
+      const capability = eligibilityProviderReconciliationCapability(row.providerKey);
+      const staleBefore = Date.now() - env.ELIGIBILITY_RECONCILIATION_STALE_SECONDS * 1000;
+      const stale = row.status === 'READY'
+        ? row.createdAt.getTime() < staleBefore
+        : row.status === 'PROVIDER_IN_FLIGHT' && Boolean(row.providerStartedAt && row.providerStartedAt.getTime() < staleBefore);
+      return {
+        ...row,
+        patientName: `${patient.firstName} ${patient.lastName}`,
+        operatorState: row.status === 'MANUALLY_RECONCILED' ? 'reconciled'
+          : row.status === 'FAILED_DEFINITIVE' || row.status === 'SUCCEEDED' ? 'terminal'
+            : row.status === 'PROVIDER_IN_FLIGHT' ? stale ? 'stale_provider_in_flight' : 'provider_in_flight'
+              : row.status === 'RECONCILIATION_REQUIRED' ? 'reconciliation_required'
+                : row.status === 'READY' ? stale ? 'stale_ready' : 'retryable_ready'
+                  : row.reconciliationTask?.assignedToId ? 'manual_claimed' : 'manual_pending',
+        providerCallMayHaveOccurred: row.providerStartedAt !== null,
+        providerRetrievalSupported: capability.verifiedResponseLookupSupported,
+        resolutionPath: capability.resolutionPath,
+        noAutomaticPayerRetry: true,
+        stale,
+        canReconcile,
+        ageSeconds: Math.max(0, Math.floor((Date.now() - row.createdAt.getTime()) / 1000)),
+      };
+    });
   });
 
-  app.post('/eligibility/executions/:id/reconcile', { preHandler: reconciliationRoles }, async (request, reply) => {
+  app.post('/eligibility/executions/:id/claim', { preHandler: insuranceReconcile }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
-    const body = z.object({
-      resolution: z.enum(['confirmed_not_submitted', 'confirmed_failed', 'confirmed_succeeded']),
-      reason: z.string().trim().min(8).max(500),
-    }).parse(request.body);
-    const execution = await db.eligibilityExecution.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    const { expectedGeneration } = z.object({ expectedGeneration: z.number().int().nonnegative() }).parse(request.body);
+    return db.$transaction(async tx => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`eligibility-reconciliation:${request.auth.tenantId}:${id}`}, 0))`;
+      const execution = await tx.eligibilityExecution.findFirst({ where: { id, tenantId: request.auth.tenantId }, include: { reconciliationTask: true } });
+      if (!execution) throw app.httpErrors.notFound('Eligibility execution not found');
+      assertBranchAccess(request, execution.branchId);
+      if (execution.reconciliationGeneration !== expectedGeneration) throw app.httpErrors.conflict('Eligibility reconciliation changed; reload before claiming');
+      if (execution.status !== 'MANUAL_EVIDENCE_PENDING' || !execution.reconciliationTask) throw app.httpErrors.conflict('Eligibility reconciliation is not claimable');
+      if (execution.reconciliationTask.assignedToId === request.auth.userId && execution.reconciliationTask.status === 'IN_PROGRESS') {
+        return { executionId: id, taskId: execution.reconciliationTask.id, claimed: true, replayed: true };
+      }
+      const claimed = await tx.staffTask.updateMany({ where: {
+        id: execution.reconciliationTask.id, tenantId: request.auth.tenantId, status: 'OPEN', assignedToId: null,
+      }, data: { status: 'IN_PROGRESS', assignedToId: request.auth.userId } });
+      if (claimed.count !== 1) throw app.httpErrors.conflict('Eligibility reconciliation is already claimed');
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+        action: 'eligibility.execution.reconciliation.claimed', resource: 'eligibilityExecution', resourceId: id,
+        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
+        metadata: { taskId: execution.reconciliationTask.id, generation: expectedGeneration },
+      } });
+      return { executionId: id, taskId: execution.reconciliationTask.id, claimed: true, replayed: false };
+    });
+  });
+
+  app.post('/eligibility/executions/:id/reconcile', { preHandler: insuranceReconcile }, async (request, reply) => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const evidence = z.object({
+      outcome: z.enum(['ACTIVE', 'INACTIVE', 'UNCERTAIN']),
+      source: z.enum(['PAYER_PORTAL', 'PAYER_PHONE', 'PAYER_DOCUMENT']),
+      reference: z.string().trim().regex(/^[A-Za-z0-9._:/-]{3,100}$/),
+      verifiedAt: z.coerce.date(), effectiveFrom: z.coerce.date().nullable().optional(), expiresAt: z.coerce.date().nullable().optional(),
+      copay: z.coerce.number().nonnegative().max(1_000_000).nullable().optional(),
+      deductibleRemaining: z.coerce.number().nonnegative().max(1_000_000).nullable().optional(),
+      coinsurance: z.coerce.number().min(0).max(1).nullable().optional(), notes: z.string().trim().min(3).max(500).optional(),
+      attestation: z.object({
+        patientMatches: z.literal(true), policyMatches: z.literal(true), payerMatches: z.literal(true), serviceAndDateMatch: z.literal(true),
+      }),
+    }).refine(value => value.verifiedAt <= new Date(Date.now() + 5 * 60_000), { message: 'Evidence time cannot be in the future' })
+      .refine(value => !value.effectiveFrom || !value.expiresAt || value.expiresAt > value.effectiveFrom, { message: 'Coverage end must be after coverage effective date' });
+    const body = z.discriminatedUnion('resolution', [
+      z.object({ resolution: z.literal('confirmed_not_submitted'), expectedGeneration: z.number().int().nonnegative(), reason: z.string().trim().min(8).max(500) }),
+      z.object({ resolution: z.literal('confirmed_failed'), expectedGeneration: z.number().int().nonnegative(), reason: z.string().trim().min(8).max(500) }),
+      z.object({ resolution: z.literal('confirmed_succeeded'), expectedGeneration: z.number().int().nonnegative(), reason: z.string().trim().min(8).max(500), evidence }),
+    ]).parse(request.body);
+    const execution = await db.eligibilityExecution.findFirst({ where: { id, tenantId: request.auth.tenantId }, include: { reconciliationTask: true } });
     if (!execution) throw app.httpErrors.notFound('Eligibility execution not found');
     assertBranchAccess(request, execution.branchId);
-    if (execution.status !== 'RECONCILIATION_REQUIRED') throw app.httpErrors.conflict('Only reconciliation-required executions may be resolved');
-    if (body.resolution === 'confirmed_succeeded') {
-      return reply.code(409).send({
-        status: 'manual_evidence_pending',
-        executionId: execution.id,
-        providerRetrievalSupported: false,
-        allowedActions: ['confirmed_not_submitted', 'confirmed_failed'],
-        nextAction: 'Verify the transaction in the payer portal using the execution timestamp and provider reference. Do not enter benefit values manually.',
-        message: 'This adapter cannot retrieve a verified prior payer response. The execution remains reconciliation-required until independent payer evidence is available.',
-      });
-    }
+    if (execution.reconciliationGeneration !== body.expectedGeneration) throw app.httpErrors.conflict('Eligibility reconciliation changed; reload before resolving');
+    if (execution.status !== 'MANUAL_EVIDENCE_PENDING' || !execution.reconciliationTask) throw app.httpErrors.conflict('Only manual-evidence-pending executions may be resolved');
+    if (execution.reconciliationTask.assignedToId !== request.auth.userId || execution.reconciliationTask.status !== 'IN_PROGRESS') throw app.httpErrors.conflict('Claim this reconciliation task before resolving it');
     const nextStatus = body.resolution === 'confirmed_not_submitted' ? 'READY' : 'FAILED_DEFINITIVE';
-    await db.$transaction(async tx => {
+    const resolved = await db.$transaction(async tx => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`eligibility-execution:${execution.id}`}, 0))`;
+      const current = await tx.eligibilityExecution.findFirstOrThrow({
+        where: { id: execution.id, tenantId: request.auth.tenantId },
+        include: { policy: true, payer: true, reconciliationTask: true, appointment: true },
+      });
+      if (current.status !== 'MANUAL_EVIDENCE_PENDING' || current.reconciliationGeneration !== body.expectedGeneration) throw app.httpErrors.conflict('Eligibility reconciliation changed; reload before resolving');
+      if (body.resolution === 'confirmed_succeeded') {
+        const serviceAt = current.appointment?.startsAt ?? current.createdAt;
+        const outsideCoverageDates = Boolean(
+          (body.evidence.effectiveFrom && serviceAt < body.evidence.effectiveFrom)
+          || (body.evidence.expiresAt && serviceAt >= body.evidence.expiresAt),
+        );
+        const effectiveOutcome = outsideCoverageDates ? 'UNCERTAIN' : body.evidence.outcome;
+        const active = effectiveOutcome === 'ACTIVE';
+        const coverageStatus = effectiveOutcome === 'UNCERTAIN' ? 'NEEDS_REVIEW' : effectiveOutcome;
+        const verification = await tx.eligibilityVerification.create({ data: {
+          tenantId: current.tenantId, branchId: current.branchId, patientId: current.patientId,
+          appointmentId: current.appointmentId, payerId: current.payerId, policyId: current.policyId,
+          providerMode: 'manual_evidence', coverageStatus, coverageActive: active,
+          planName: current.policy?.planName ?? 'Unknown plan', payerName: current.payer?.name ?? 'Unknown payer',
+          copay: body.evidence.copay ?? null, deductibleRemaining: body.evidence.deductibleRemaining ?? null, coinsurance: body.evidence.coinsurance ?? null,
+          eligibilityMessage: 'Coverage status was manually reconciled from recorded payer evidence. This is not a payment guarantee.',
+          payerReference: body.evidence.reference, decisionSource: 'MANUAL_PAYER_EVIDENCE',
+          effectiveFrom: body.evidence.effectiveFrom ?? null, expiresAt: body.evidence.expiresAt ?? null, checkedAt: body.evidence.verifiedAt,
+          normalizedResponse: {
+            coverageStatus, coverageActive: active, evidenceSource: body.evidence.source, evidenceReference: body.evidence.reference,
+            verifiedAt: body.evidence.verifiedAt.toISOString(), effectiveFrom: body.evidence.effectiveFrom?.toISOString() ?? null,
+            expiresAt: body.evidence.expiresAt?.toISOString() ?? null, copay: body.evidence.copay ?? null,
+            deductibleRemaining: body.evidence.deductibleRemaining ?? null, coinsurance: body.evidence.coinsurance ?? null,
+            benefitDataIncomplete: body.evidence.copay == null || body.evidence.deductibleRemaining == null || body.evidence.coinsurance == null,
+            noPaymentGuarantee: true, dateApplicable: !outsideCoverageDates, attestation: body.evidence.attestation,
+          },
+        } });
+        const updated = await tx.eligibilityExecution.updateMany({
+          where: { id: current.id, tenantId: current.tenantId, status: 'MANUAL_EVIDENCE_PENDING', reconciliationGeneration: current.reconciliationGeneration },
+          data: {
+            status: 'MANUALLY_RECONCILED', resultVerificationId: verification.id, completedAt: new Date(), providerCompletedAt: current.providerCompletedAt ?? new Date(),
+            reconciliationGeneration: { increment: 1 }, reconciliationLeaseOwner: null, reconciliationLeaseExpiresAt: null,
+            manualEvidenceOutcome: effectiveOutcome, manualEvidenceSource: body.evidence.source, manualEvidenceReference: body.evidence.reference,
+            manualEvidenceVerifiedAt: body.evidence.verifiedAt, manualEvidenceVerifiedByUserId: request.auth.userId,
+            manualCoverageEffectiveFrom: body.evidence.effectiveFrom ?? null, manualCoverageExpiresAt: body.evidence.expiresAt ?? null,
+            manualCopay: body.evidence.copay ?? null, manualDeductibleRemaining: body.evidence.deductibleRemaining ?? null,
+            manualCoinsurance: body.evidence.coinsurance ?? null, manualEvidenceNotes: body.evidence.notes ?? body.reason,
+          },
+        });
+        if (updated.count !== 1) throw app.httpErrors.conflict('Eligibility reconciliation changed; reload before resolving');
+        if (current.policyId) await tx.patientInsurancePolicy.updateMany({ where: { id: current.policyId, tenantId: current.tenantId }, data: { verificationStatus: active ? 'verified' : effectiveOutcome === 'INACTIVE' ? 'inactive' : 'needs_review', verifiedAt: body.evidence.verifiedAt } });
+        await tx.patient.updateMany({ where: { id: current.patientId, tenantId: current.tenantId }, data: { eligibilityStatus: active ? 'ACTIVE' : effectiveOutcome === 'INACTIVE' ? 'INACTIVE' : 'NEEDS_REVIEW', eligibilityLastVerifiedAt: body.evidence.verifiedAt } });
+        if (current.appointmentId) await tx.appointment.updateMany({ where: { id: current.appointmentId, tenantId: current.tenantId }, data: { eligibilityStatus: active ? 'ACTIVE' : effectiveOutcome === 'INACTIVE' ? 'INACTIVE' : 'NEEDS_REVIEW', eligibilityLastVerifiedAt: body.evidence.verifiedAt } });
+        await tx.staffTask.update({ where: { id: current.reconciliationTaskId! }, data: { status: 'COMPLETED' } });
+        await tx.businessEvent.create({ data: { tenantId: current.tenantId, eventType: 'insurance.eligibility.manually_reconciled', entityType: 'eligibilityVerification', entityId: verification.id, sourceModule: 'insurance', payload: { executionId: current.id, coverageStatus, noPaymentGuarantee: true } } });
+        await tx.auditEvent.create({ data: {
+          tenantId: current.tenantId, actorUserId: request.auth.userId, action: 'eligibility.execution.manually_reconciled', resource: 'eligibilityExecution', resourceId: current.id,
+          requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
+          metadata: { resolution: body.resolution, evidenceSource: body.evidence.source, evidenceReference: body.evidence.reference, coverageStatus, noPaymentGuarantee: true },
+        } });
+        return { executionId: current.id, status: 'MANUALLY_RECONCILED', verificationId: verification.id, providerCalled: false };
+      }
       const updated = await tx.eligibilityExecution.updateMany({
-        where: { id: execution.id, tenantId: request.auth.tenantId, status: 'RECONCILIATION_REQUIRED' },
+        where: { id: execution.id, tenantId: request.auth.tenantId, status: 'MANUAL_EVIDENCE_PENDING', reconciliationGeneration: current.reconciliationGeneration },
         data: {
           status: nextStatus,
+          reconciliationGeneration: { increment: 1 },
           failureCode: body.resolution === 'confirmed_failed' ? 'provider_failure_confirmed' : null,
           reconciliationReason: body.reason,
+          reconciliationTaskId: body.resolution === 'confirmed_not_submitted' ? null : current.reconciliationTaskId,
           providerStartedAt: body.resolution === 'confirmed_not_submitted' ? null : execution.providerStartedAt,
           providerCompletedAt: body.resolution === 'confirmed_not_submitted' ? null : new Date(),
           completedAt: body.resolution === 'confirmed_failed' ? new Date() : null,
         },
       });
       if (updated.count !== 1) throw app.httpErrors.conflict('Eligibility execution was already reconciled');
+      await tx.staffTask.update({ where: { id: current.reconciliationTaskId! }, data: { status: 'COMPLETED' } });
       await tx.auditEvent.create({
         data: {
           tenantId: request.auth.tenantId,
@@ -670,7 +795,8 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
           metadata: { resolution: body.resolution, reason: body.reason },
         },
       });
+      return { executionId: execution.id, status: nextStatus, providerCalled: false };
     });
-    return { executionId: execution.id, status: nextStatus, providerCalled: false };
+    return reply.send(resolved);
   });
 };

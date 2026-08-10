@@ -24,6 +24,26 @@ describe('env schema — eligibility HMAC rotation', () => {
   });
 });
 
+describe('env schema — eligibility reconciliation scheduler', () => {
+  it('uses bounded safe local defaults', () => {
+    expect(envSchema.parse(base)).toMatchObject({
+      ELIGIBILITY_RECONCILIATION_ENABLED: true,
+      ELIGIBILITY_RECONCILIATION_INTERVAL_SECONDS: 60,
+      ELIGIBILITY_RECONCILIATION_STALE_SECONDS: 300,
+      ELIGIBILITY_RECONCILIATION_BATCH_SIZE: 25,
+      ELIGIBILITY_RECONCILIATION_MAX_CONCURRENCY: 2,
+    });
+  });
+
+  it('rejects disabled scanning outside demo and rejects unsafe scheduler bounds', () => {
+    expect(envSchema.safeParse({ ...productionProfile, ELIGIBILITY_RECONCILIATION_ENABLED: 'false' }).success).toBe(false);
+    expect(envSchema.safeParse({ ...productionProfile, ELIGIBILITY_RECONCILIATION_INTERVAL_SECONDS: 5 }).success).toBe(false);
+    expect(envSchema.safeParse({ ...productionProfile, ELIGIBILITY_RECONCILIATION_STALE_SECONDS: 30 }).success).toBe(false);
+    expect(envSchema.safeParse({ ...productionProfile, ELIGIBILITY_RECONCILIATION_BATCH_SIZE: 101 }).success).toBe(false);
+    expect(envSchema.safeParse({ ...productionProfile, ELIGIBILITY_RECONCILIATION_MAX_CONCURRENCY: 11 }).success).toBe(false);
+  });
+});
+
 const productionProfile = {
   ...base,
   NODE_ENV: 'production' as const,

@@ -149,6 +149,41 @@ describe('durable eligibility execution boundary', () => {
     expect(await fixtureDb.integrationRunLog.count({ where: { tenantId: f.tenantId, status: 'reconciliation_required' } })).toBe(1);
   });
 
+  it('returns the same unresolved execution for a changed browser key with the same request fingerprint', async () => {
+    const f = await fixture();
+    let calls = 0;
+    const provider = async () => {
+      calls += 1;
+      throw new Error('synthetic lost response');
+    };
+    await inTenant(f, async () => {
+      await expect(runInput(f, { key: 'browser-key-before-reload', provider })).rejects.toMatchObject({ code: 'reconciliation_required' });
+      await expect(runInput(f, { key: 'browser-key-after-reload', provider })).rejects.toMatchObject({ code: 'reconciliation_required' });
+    });
+    expect(calls).toBe(1);
+    expect(await fixtureDb.eligibilityExecution.count({ where: { tenantId: f.tenantId } })).toBe(1);
+  });
+
+  it('serializes simultaneous changed browser keys onto one active fingerprint execution', async () => {
+    const f = await fixture();
+    let calls = 0;
+    const provider = async () => {
+      calls += 1;
+      await new Promise(resolve => setTimeout(resolve, 50));
+      return { coverageStatus: 'ACTIVE' };
+    };
+    await inTenant(f, async () => {
+      const outcomes = await Promise.allSettled([
+        runInput(f, { key: 'simultaneous-browser-key-a', provider }),
+        runInput(f, { key: 'simultaneous-browser-key-b', provider }),
+      ]);
+      expect(outcomes.filter(outcome => outcome.status === 'fulfilled')).toHaveLength(1);
+      expect(outcomes.filter(outcome => outcome.status === 'rejected')).toHaveLength(1);
+    });
+    expect(calls).toBe(1);
+    expect(await fixtureDb.eligibilityExecution.count({ where: { tenantId: f.tenantId } })).toBe(1);
+  });
+
   it('rolls back normalized and downstream writes together when finalization fails', async () => {
     const f = await fixture();
     await inTenant(f, async () => {

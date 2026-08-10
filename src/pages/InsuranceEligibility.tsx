@@ -18,6 +18,12 @@ interface HistoryRow {
   id: string; patientName: string; coverageStatus: string; planName: string; payerName: string;
   copay: number; deductibleRemaining: number; coinsurance: number; providerMode: string; checkedAt: string; effectiveFrom?: string | null; expiresAt?: string | null;
 }
+interface ReconciliationRow {
+  id: string; patientName: string; providerKey: string; providerMode: string; status: string; operatorState: string;
+  reconciliationReason: string | null; reconciliationGeneration: number; providerCallMayHaveOccurred: boolean;
+  providerRetrievalSupported: boolean; noAutomaticPayerRetry: boolean; ageSeconds: number; canReconcile: boolean;
+  reconciliationTask?: { status: string; assignedToId: string | null; assignedTo?: { displayName: string } | null } | null;
+}
 
 const STATUS: Record<string, { cls: string; icon: ElementType; label: string }> = {
   ACTIVE: { cls: 'badge-emerald', icon: ShieldCheck, label: 'Payer reports active' },
@@ -26,6 +32,11 @@ const STATUS: Record<string, { cls: string; icon: ElementType; label: string }> 
   ERROR: { cls: 'badge-red', icon: AlertTriangle, label: 'Error' },
 };
 function fmt(iso: string): string { return new Date(iso).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }); }
+const emptyEvidence = () => ({
+  outcome: 'UNCERTAIN', source: 'PAYER_PORTAL', reference: '', verifiedAt: '', effectiveFrom: '', expiresAt: '',
+  copay: '', deductibleRemaining: '', coinsurance: '', notes: '',
+  patientMatches: false, policyMatches: false, payerMatches: false, serviceAndDateMatch: false,
+});
 
 export default function InsuranceEligibility() {
   const [providers, setProviders] = useState<ProviderRow[]>([]);
@@ -36,10 +47,17 @@ export default function InsuranceEligibility() {
   const [result, setResult] = useState<EligibilityResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [reconciliations, setReconciliations] = useState<ReconciliationRow[]>([]);
+  const [reconciliationFilter, setReconciliationFilter] = useState<'unresolved' | 'in_flight' | 'manual_pending' | 'reconciled' | 'terminal' | 'all'>('unresolved');
+  const [evidenceExecutionId, setEvidenceExecutionId] = useState<string | null>(null);
+  const [evidence, setEvidence] = useState(emptyEvidence);
 
   const loadHistory = useCallback(async () => {
     try { setHistory(await apiRequest<HistoryRow[]>('/v1/insurance/eligibility/history')); } catch { /* non-fatal */ }
   }, []);
+  const loadReconciliations = useCallback(async (state = reconciliationFilter) => {
+    try { setReconciliations(await apiRequest<ReconciliationRow[]>(`/v1/insurance/eligibility/executions/reconciliation?state=${state}&limit=100`)); } catch { /* entitlement/permission may hide this workflow */ }
+  }, [reconciliationFilter]);
   const load = useCallback(async () => {
     try {
       const [prov, pats] = await Promise.all([
@@ -47,10 +65,10 @@ export default function InsuranceEligibility() {
         crmService.getPatients().catch(() => [] as CrmPatient[]),
       ]);
       setProviders(prov); setPatients(pats);
-      await loadHistory();
+      await Promise.all([loadHistory(), loadReconciliations()]);
     } catch (e) { setError(e instanceof Error ? e.message : 'Failed to load'); }
     finally { setLoading(false); }
-  }, [loadHistory]);
+  }, [loadHistory, loadReconciliations]);
   // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { void load(); }, [load]);
 
@@ -70,6 +88,49 @@ export default function InsuranceEligibility() {
       await loadHistory();
     } catch (e) { setError(e instanceof Error ? e.message : 'Eligibility check failed'); }
     finally { setBusy(false); }
+  }
+
+  async function claimReconciliation(row: ReconciliationRow) {
+    setError(null);
+    try {
+      await apiRequest(`/v1/insurance/eligibility/executions/${row.id}/claim`, { method: 'POST', body: JSON.stringify({ expectedGeneration: row.reconciliationGeneration }) });
+      await loadReconciliations();
+    } catch (e) { setError(e instanceof Error ? e.message : 'Unable to claim reconciliation'); }
+  }
+
+  async function resolveWithoutCoverage(row: ReconciliationRow, resolution: 'confirmed_not_submitted' | 'confirmed_failed') {
+    const reason = window.prompt('Record the payer verification reason (minimum 8 characters):');
+    if (!reason) return;
+    try {
+      await apiRequest(`/v1/insurance/eligibility/executions/${row.id}/reconcile`, { method: 'POST', body: JSON.stringify({ resolution, expectedGeneration: row.reconciliationGeneration, reason }) });
+      await loadReconciliations();
+    } catch (e) { setError(e instanceof Error ? e.message : 'Unable to resolve reconciliation'); }
+  }
+
+  async function submitManualEvidence(row: ReconciliationRow) {
+    try {
+      const nullableNumber = (value: string) => value.trim() === '' ? null : Number(value);
+      await apiRequest(`/v1/insurance/eligibility/executions/${row.id}/reconcile`, {
+        method: 'POST',
+        body: JSON.stringify({
+          resolution: 'confirmed_succeeded', expectedGeneration: row.reconciliationGeneration,
+          reason: evidence.notes || 'Verified against payer evidence',
+          evidence: {
+            outcome: evidence.outcome, source: evidence.source, reference: evidence.reference,
+            verifiedAt: evidence.verifiedAt, effectiveFrom: evidence.effectiveFrom || null, expiresAt: evidence.expiresAt || null,
+            copay: nullableNumber(evidence.copay), deductibleRemaining: nullableNumber(evidence.deductibleRemaining), coinsurance: nullableNumber(evidence.coinsurance),
+            notes: evidence.notes || undefined,
+            attestation: {
+              patientMatches: evidence.patientMatches, policyMatches: evidence.policyMatches,
+              payerMatches: evidence.payerMatches, serviceAndDateMatch: evidence.serviceAndDateMatch,
+            },
+          },
+        }),
+      });
+      setEvidenceExecutionId(null);
+      setEvidence(emptyEvidence());
+      await Promise.all([loadReconciliations(), loadHistory()]);
+    } catch (e) { setError(e instanceof Error ? e.message : 'Unable to record payer evidence'); }
   }
 
   return (
@@ -141,6 +202,63 @@ export default function InsuranceEligibility() {
             })()}
         </BentoCard>
       </div>
+
+      <BentoCard title="Eligibility Reconciliation" subtitle="Server-held work queue · payer calls are never retried from this workflow" headerRight={<AlertTriangle className="w-4 h-4 text-amber-v" />}>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <select value={reconciliationFilter} onChange={event => { const state = event.target.value as typeof reconciliationFilter; setReconciliationFilter(state); void loadReconciliations(state); }} className={inputCls} aria-label="Reconciliation filter">
+            <option value="unresolved">Unresolved</option><option value="in_flight">Provider in flight</option><option value="manual_pending">Manual evidence pending</option><option value="reconciled">Reconciled</option><option value="terminal">Terminal</option><option value="all">All</option>
+          </select>
+          <button type="button" onClick={() => void loadReconciliations()} className="rounded-lg border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-indigo">Reload from server</button>
+        </div>
+        <p className="mb-3 rounded-lg bg-[var(--amber-soft)] px-3 py-2 text-[11px] text-amber-v">Do not submit a new payer request for these rows. Verify the existing attempt with the payer, then record only the evidence actually returned. Eligibility is not a payment guarantee.</p>
+        {reconciliations.length === 0 ? <p className="py-4 text-center text-xs text-t3">No reconciliation work matches this filter.</p> : (
+          <div className="space-y-2">
+            {reconciliations.map(row => (
+              <div key={row.id} className="rounded-xl border border-[var(--b1)] p-3">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div><p className="text-sm font-semibold text-t1">{row.patientName}</p><p className="text-[11px] text-t3">{row.providerKey} · {row.operatorState.replaceAll('_', ' ')} · age {Math.floor(row.ageSeconds / 60)}m</p></div>
+                  <span className="badge badge-amber">{row.status.replaceAll('_', ' ')}</span>
+                </div>
+                <p className="mt-2 text-[11px] text-t2">{row.reconciliationReason ?? 'Awaiting server scan or provider outcome.'}</p>
+                <p className="mt-1 text-[10px] text-red-v">Provider call may have occurred: {row.providerCallMayHaveOccurred ? 'yes' : 'no'} · verified response lookup: {row.providerRetrievalSupported ? 'available' : 'not supported'}</p>
+                {row.canReconcile && row.status === 'MANUAL_EVIDENCE_PENDING' && (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {!row.reconciliationTask?.assignedToId ? <button type="button" onClick={() => void claimReconciliation(row)} className="rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-xs font-semibold text-white">Claim task</button> : <>
+                      <button type="button" onClick={() => { setEvidence(emptyEvidence()); setEvidenceExecutionId(row.id); }} className="rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-xs font-semibold text-white">Record payer evidence</button>
+                      <button type="button" onClick={() => void resolveWithoutCoverage(row, 'confirmed_not_submitted')} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold">Not submitted</button>
+                      <button type="button" onClick={() => void resolveWithoutCoverage(row, 'confirmed_failed')} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-red-v">Confirmed failed</button>
+                    </>}
+                  </div>
+                )}
+                {evidenceExecutionId === row.id && (
+                  <div className="mt-3 grid gap-2 rounded-lg bg-[var(--s2)] p-3 sm:grid-cols-2">
+                    <Field label="Payer outcome"><select value={evidence.outcome} onChange={e => setEvidence(v => ({ ...v, outcome: e.target.value }))} className={inputCls}><option>ACTIVE</option><option>INACTIVE</option><option>UNCERTAIN</option></select></Field>
+                    <Field label="Evidence source"><select value={evidence.source} onChange={e => setEvidence(v => ({ ...v, source: e.target.value }))} className={inputCls}><option>PAYER_PORTAL</option><option>PAYER_PHONE</option><option>PAYER_DOCUMENT</option></select></Field>
+                    <Field label="Payer reference"><input value={evidence.reference} onChange={e => setEvidence(v => ({ ...v, reference: e.target.value }))} className={inputCls} /></Field>
+                    <Field label="Verified at"><input type="datetime-local" value={evidence.verifiedAt} onChange={e => setEvidence(v => ({ ...v, verifiedAt: e.target.value }))} className={inputCls} /></Field>
+                    <Field label="Coverage effective (optional)"><input type="date" value={evidence.effectiveFrom} onChange={e => setEvidence(v => ({ ...v, effectiveFrom: e.target.value }))} className={inputCls} /></Field>
+                    <Field label="Coverage end (optional)"><input type="date" value={evidence.expiresAt} onChange={e => setEvidence(v => ({ ...v, expiresAt: e.target.value }))} className={inputCls} /></Field>
+                    <Field label="Copay (unknown = blank)"><input inputMode="decimal" value={evidence.copay} onChange={e => setEvidence(v => ({ ...v, copay: e.target.value }))} className={inputCls} /></Field>
+                    <Field label="Deductible remaining (unknown = blank)"><input inputMode="decimal" value={evidence.deductibleRemaining} onChange={e => setEvidence(v => ({ ...v, deductibleRemaining: e.target.value }))} className={inputCls} /></Field>
+                    <Field label="Coinsurance 0–1 (unknown = blank)"><input inputMode="decimal" value={evidence.coinsurance} onChange={e => setEvidence(v => ({ ...v, coinsurance: e.target.value }))} className={inputCls} /></Field>
+                    <Field label="Verification notes"><input value={evidence.notes} onChange={e => setEvidence(v => ({ ...v, notes: e.target.value }))} className={inputCls} /></Field>
+                    <fieldset className="sm:col-span-2 space-y-1 rounded-lg border border-[var(--b1)] p-2">
+                      <legend className="px-1 text-[11px] font-semibold text-t2">Required evidence match attestation</legend>
+                      {([
+                        ['patientMatches', 'Evidence matches this patient'],
+                        ['policyMatches', 'Evidence matches this policy/member contract'],
+                        ['payerMatches', 'Evidence came from the named payer'],
+                        ['serviceAndDateMatch', 'Service and date of service match this request'],
+                      ] as const).map(([key, label]) => <label key={key} className="flex items-center gap-2 text-[11px] text-t2"><input type="checkbox" checked={evidence[key]} onChange={event => setEvidence(value => ({ ...value, [key]: event.target.checked }))} />{label}</label>)}
+                    </fieldset>
+                    <div className="sm:col-span-2 flex gap-2"><button type="button" disabled={!evidence.reference || !evidence.verifiedAt || !evidence.patientMatches || !evidence.policyMatches || !evidence.payerMatches || !evidence.serviceAndDateMatch} onClick={() => void submitManualEvidence(row)} className="rounded-lg bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">Attest matches and save</button><button type="button" onClick={() => setEvidenceExecutionId(null)} className="rounded-lg border border-[var(--b1)] px-3 py-2 text-xs">Cancel</button></div>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </BentoCard>
 
       {/* History */}
       <BentoCard title="Eligibility Response History" subtitle="Stored point-in-time responses · this history view omits member IDs" headerRight={<History className="w-4 h-4 text-t3" />}>
