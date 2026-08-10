@@ -82,7 +82,10 @@ describe('RLS runtime-role guard', () => {
     expect([...TENANT_DELETE_PROTECTED_TABLES].sort()).toEqual([
       'Campaign',
       'CampaignDelivery',
+      'EligibilityExecution',
     ]);
+    expect(TENANT_APPEND_ONLY_TABLES.has('EligibilityExecution')).toBe(false);
+    expect(TENANT_DELETE_PROTECTED_TABLES.has('EligibilityExecution')).toBe(true);
   });
   it('classifies a superuser connection as bypassing RLS', async () => {
     const status = await checkRlsRuntimeRole(roleClient('postgres', true, false));
