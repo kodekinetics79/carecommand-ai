@@ -12,7 +12,7 @@ import ProgressBar from '../components/ui/ProgressBar';
 import { formatCurrency } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapAppointment, mapProviderProfile, mapPatient, type ApiAppointment, type ApiProviderProfile, type ApiPatient } from '../lib/apiAdapters';
-import { apiRequest, ApiError } from '../lib/api';
+import { ApiError } from '../lib/api';
 import { appointmentsApi, schedulingApi, type LifecycleStatus, type ProviderSlot } from '../lib/appointments';
 import { intakeApi } from '../lib/intake';
 import { useSession } from '../hooks/useSession';
@@ -28,7 +28,7 @@ const dateOptions = [0, 1, 2].map(offset => ({
   label: offset === 0 ? 'Today' : offset === 1 ? 'Tomorrow' : new Date(isoDate(offset)).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric' }),
 }));
 const todayDate = dateOptions[0].value;
-const emptyBooking = { patientId: '', providerId: '', service: '', date: todayDate, time: '10:00', channel: 'EMAIL', value: '150', slotStart: '', slotEnd: '' };
+const emptyBooking = { patientId: '', providerId: '', service: '', date: todayDate, channel: 'EMAIL', slotStart: '', slotEnd: '' };
 
 // Client mirror of the backend lifecycle transition rules (appointments/routes.ts)
 // so we only offer actions the server will accept; a race still surfaces as a 409.
@@ -157,44 +157,25 @@ export default function Scheduling() {
 
   async function bookAppointment() {
     const patient = patientRecords.find(p => p.id === booking.patientId);
-    if (!patient || !patient.branchId || !booking.service.trim()) {
-      setBookingError('Pick a patient and enter a service.');
+    if (!patient || !patient.branchId || !booking.service.trim() || !booking.providerId || !booking.slotStart) {
+      setBookingError('Pick a patient, service, provider, and an available canonical slot before booking.');
       return;
     }
     setSaving(true);
     setBookingError(null);
     try {
-      // Preferred path: a provider + a real open slot → conflict-safe booking that
-      // sets providerProfileId and is guarded by the DB exclusion constraint.
-      if (booking.providerId && booking.slotStart) {
-        const durationMin = booking.slotEnd
-          ? Math.max(5, Math.round((new Date(booking.slotEnd).getTime() - new Date(booking.slotStart).getTime()) / 60000))
-          : 30;
-        await schedulingApi.book(booking.providerId, {
-          patientId: patient.id,
-          startsAt: booking.slotStart,
-          durationMin,
-          service: booking.service.trim(),
-          channel: booking.channel,
-        });
-      } else {
-        // Fallback (noted): no provider availability configured yet, so fall back to
-        // an unconstrained free-time booking. Not cross-path conflict-guarded.
-        const startsAt = new Date(`${booking.date}T${booking.time}:00`);
-        await apiRequest('/v1/appointments', {
-          method: 'POST',
-          body: JSON.stringify({
-            branchId: patient.branchId,
-            patientId: patient.id,
-            service: booking.service.trim(),
-            startsAt: startsAt.toISOString(),
-            endsAt: new Date(startsAt.getTime() + 30 * 60000).toISOString(),
-            channel: booking.channel,
-            value: Number(booking.value) || 0,
-            status: 'CONFIRMED',
-          }),
-        });
-      }
+      // Canonical slot booking sets providerProfileId and is guarded by the
+      // shared database exclusion constraint used by every booking channel.
+      const durationMin = booking.slotEnd
+        ? Math.max(5, Math.round((new Date(booking.slotEnd).getTime() - new Date(booking.slotStart).getTime()) / 60000))
+        : 30;
+      await schedulingApi.book(booking.providerId, {
+        patientId: patient.id,
+        startsAt: booking.slotStart,
+        durationMin,
+        service: booking.service.trim(),
+        channel: booking.channel,
+      });
       const bookedDate = booking.date;
       closeBooking();
       setSelectedDate(bookedDate);
@@ -359,17 +340,12 @@ export default function Scheduling() {
                 </div>
               )}
 
-              {/* Fallback: manual time entry when no provider/slot is used */}
-              {(!booking.providerId || slots.length === 0) && (
-                <div className="grid grid-cols-2 gap-2.5">
-                  <input type="time" aria-label="Time (manual)" value={booking.time} onChange={e => setBooking(b => ({ ...b, time: e.target.value }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
-                  <input type="number" aria-label="Value" value={booking.value} onChange={e => setBooking(b => ({ ...b, value: e.target.value }))} placeholder="Value ($)" className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
-                  <p className="col-span-2 text-[10px] text-t3">Manual time is an unconstrained fallback (no cross-path conflict guard). Prefer a provider slot above.</p>
-                </div>
+              {booking.patientId && bookableProviders.length === 0 && (
+                <p role="alert" className="text-[11px] text-amber-v">No provider is configured for this patient's clinic. Configure a provider and availability before booking.</p>
               )}
             </div>
             <div className="flex gap-2 mt-4">
-              <button type="button" disabled={saving} onClick={bookAppointment} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition disabled:opacity-40">{saving ? 'Booking…' : booking.providerId && booking.slotStart ? 'Book slot' : 'Book appointment'}</button>
+              <button type="button" disabled={saving || !booking.providerId || !booking.slotStart} onClick={bookAppointment} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition disabled:opacity-40">{saving ? 'Booking…' : 'Book canonical slot'}</button>
               <button type="button" onClick={closeBooking} className="px-4 py-2 rounded-lg border border-[var(--b1)] text-t2 text-xs font-semibold hover:bg-[var(--s3)] transition">Cancel</button>
             </div>
           </div>

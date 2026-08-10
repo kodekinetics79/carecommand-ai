@@ -37,7 +37,10 @@ export default function Dashboard() {
   const [actions, setActions] = useState<PriorityAction[]>([]);
   const [loading, setLoading] = useState(true);
   const [actionsLoading, setActionsLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [summaryError, setSummaryError] = useState(false);
+  const [branchesError, setBranchesError] = useState(false);
+  const [providersError, setProvidersError] = useState(false);
+  const [campaignsError, setCampaignsError] = useState(false);
   const [actionsError, setActionsError] = useState<string | null>(null);
   const [drawerAction, setDrawerAction] = useState<PriorityAction | null>(null);
 
@@ -54,20 +57,22 @@ export default function Dashboard() {
   useEffect(() => {
     let active = true;
     void (async () => {
-      try {
-        const [s, b, p, c] = await Promise.all([
+      const [summaryResult, branchesResult, providersResult, campaignsResult] = await Promise.allSettled([
           dashboardService.getSummary(),
           dashboardService.getBranchHealth(),
           dashboardService.getProviderUtilization(),
           dashboardService.getCampaignROI(),
-        ]);
-        if (!active) return;
-        setSummary(s); setBranches(b); setProviders(p); setCampaigns(c); setLoadError(null);
-      } catch {
-        if (active) setLoadError('Dashboard summary and operational panels are unavailable. No zero or healthy-state conclusions should be drawn.');
-      } finally {
-        if (active) setLoading(false);
-      }
+      ]);
+      if (!active) return;
+      if (summaryResult.status === 'fulfilled') setSummary(summaryResult.value);
+      if (branchesResult.status === 'fulfilled') setBranches(branchesResult.value);
+      if (providersResult.status === 'fulfilled') setProviders(providersResult.value);
+      if (campaignsResult.status === 'fulfilled') setCampaigns(campaignsResult.value);
+      setSummaryError(summaryResult.status === 'rejected');
+      setBranchesError(branchesResult.status === 'rejected');
+      setProvidersError(providersResult.status === 'rejected');
+      setCampaignsError(campaignsResult.status === 'rejected');
+      setLoading(false);
     })();
     void (async () => {
       try {
@@ -98,12 +103,12 @@ export default function Dashboard() {
       <div className="dash-deck">
         {summary
           ? <CommandDeck summary={summary} spark={spark} onNavigate={navigate} />
-          : loadError ? <UnavailablePanel message={loadError} /> : <div className="skeleton-line h-full min-h-[132px] rounded-2xl" />}
+          : summaryError ? <UnavailablePanel message="Dashboard summary is unavailable. No zero or healthy-state conclusions should be drawn." /> : <div className="skeleton-line h-full min-h-[132px] rounded-2xl" />}
       </div>
 
       {/* KPI ribbon */}
       <div className="dash-kpis grid gap-2.5 grid-cols-2 lg:grid-cols-4">
-        {loadError ? (
+        {summaryError ? (
           <div role="alert" className="col-span-full rounded-xl border border-red-soft bg-red-soft p-4 text-sm font-semibold text-red-v">KPI data unavailable; zero values are not being shown.</div>
         ) : loading || !summary ? (
           [0, 1, 2, 3].map(i => <div key={i} className="skeleton-line h-[92px] rounded-xl" />)
@@ -128,7 +133,7 @@ export default function Dashboard() {
         </BentoCard>
         <BentoCard className="cockpit-card" title="Provider Capacity" subtitle="Recorded utilization, ordered highest to lowest"
           headerRight={<Gauge className="w-4 h-4 text-indigo" aria-hidden="true" />}>
-          {loadError ? <UnavailablePanel message="Provider capacity data unavailable." /> : loading ? <div className="skeleton-line h-full min-h-[140px] rounded-xl" /> : (
+          {providersError ? <UnavailablePanel message="Provider capacity data unavailable." /> : loading ? <div className="skeleton-line h-full min-h-[140px] rounded-xl" /> : (
             <Suspense fallback={<div className="skeleton-line h-full min-h-[140px] rounded-xl" />}>
               <ProviderUtilizationPanel providers={providers} />
             </Suspense>
@@ -140,7 +145,7 @@ export default function Dashboard() {
       <div className="dash-ops">
         <BentoCard className="cockpit-card" title="Branch Capacity Planning" subtitle="Unvalidated fixed index from utilization and recorded ratings"
           headerRight={branches.length > 0 ? <span className="text-xs font-semibold text-t3 bg-[var(--s3)] px-2.5 py-1 rounded-full">Planning avg {avgHealth}/100</span> : undefined}>
-          {loadError ? <UnavailablePanel message="Branch data unavailable; no healthy or empty state is inferred." /> : loading ? (
+          {branchesError ? <UnavailablePanel message="Branch data unavailable; no healthy or empty state is inferred." /> : loading ? (
             <div className="space-y-2.5"><div className="skeleton-line h-20 rounded-xl" /><div className="skeleton-line h-20 rounded-xl" /></div>
           ) : branches.length === 0 ? (
             <p className="text-xs text-t3 py-4 text-center">The loaded dataset contains no branches.</p>
@@ -152,7 +157,7 @@ export default function Dashboard() {
         </BentoCard>
         <BentoCard className="cockpit-card" title="Campaign performance evidence" subtitle="Stored audience, booking, and associated-value fields; causation not established"
           headerRight={<button type="button" onClick={() => navigate('/campaigner')} className="text-xs font-semibold text-indigo hover:opacity-75 inline-flex items-center gap-1"><BarChart3 className="w-3.5 h-3.5" aria-hidden="true" /> All campaigns</button>}>
-          {loadError ? <UnavailablePanel message="Campaign data unavailable; no campaign-performance conclusion is inferred." /> : loading ? <SkeletonPanel rows={3} className="!border-0 !shadow-none !p-0" />
+          {campaignsError ? <UnavailablePanel message="Campaign data unavailable; no campaign-performance conclusion is inferred." /> : loading ? <SkeletonPanel rows={3} className="!border-0 !shadow-none !p-0" />
             : <CampaignROIPanel campaigns={campaigns} onViewAll={() => navigate('/campaigner')} onCreate={() => navigate('/campaigner')} />}
         </BentoCard>
       </div>

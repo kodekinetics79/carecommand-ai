@@ -570,8 +570,19 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
           });
           committed.updated++;
         } else {
+          const latestActive = await tx.patientInsurancePolicy.findFirst({
+            where: { tenantId, patientId: patient.id, active: true },
+            orderBy: { coverageOrder: 'desc' },
+          });
+          const coverageOrder = (latestActive?.coverageOrder ?? 0) + 1;
           await tx.patientInsurancePolicy.create({
-            data: { tenantId, branchId: branch.id, patientId: patient.id, payerId: payer.id, planName, memberId, verificationStatus, active, ...(subscriberName ? { subscriberName } : {}), ...(relationship ? { relationship } : {}), ...(groupNumber ? { groupNumber } : {}), ...(payerReference ? { payerReference } : {}) },
+            data: {
+              tenantId, branchId: branch.id, patientId: patient.id, payerId: payer.id, planName, memberId, verificationStatus, coverageOrder, active,
+              ...(subscriberName ? { subscriberName } : {}),
+              ...(relationship ? { relationship } : {}),
+              ...(groupNumber ? { groupNumber } : {}),
+              ...(payerReference ? { payerReference } : {}),
+            },
           });
           committed.created++;
         }

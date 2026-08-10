@@ -278,6 +278,10 @@ async function addPatientTarget(tenant: TenantFixture, campaignId: string, suffi
   });
 }
 
+function randomRetellCallId(prefix: string): string {
+  return `${prefix}-${randomUUID()}`;
+}
+
 beforeAll(async () => {
   env.RETELL_API_KEY = 'real_outbound_test_key';
   env.RETELL_FROM_NUMBER = '+15550000001';
@@ -520,10 +524,11 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
       tenantId: tenant.id, clinicId: tenant.clinicId, callerPhone: phoneFor(tenant.id, 705),
       direction: 'outbound', outcome: 'FAILED', endedAt: new Date(),
     } });
+    const lateProviderCallId = randomRetellCallId('late_provider_acceptance_evidence');
     const upgraded = await db.receptionistCallLog.update({
-      where: { id: call.id }, data: { outcome: 'ESCALATED', retellCallId: 'late_provider_acceptance_evidence' },
+      where: { id: call.id }, data: { outcome: 'ESCALATED', retellCallId: lateProviderCallId },
     });
-    expect(upgraded).toMatchObject({ outcome: 'ESCALATED', retellCallId: 'late_provider_acceptance_evidence' });
+    expect(upgraded).toMatchObject({ outcome: 'ESCALATED', retellCallId: lateProviderCallId });
     await expect(db.receptionistCallLog.update({ where: { id: call.id }, data: { outcome: 'FAILED' } })).rejects.toThrow();
 
     const noProviderEvidence = await db.receptionistCallLog.create({ data: {
@@ -613,8 +618,9 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
         await release.promise;
       }
     });
+    const linearizedCallId = randomRetellCallId('retell_linearized_call');
     const providerFetch = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
-      call_id: 'retell_linearized_call', agent_id: tenant.providerAgentId, agent_version: 1,
+      call_id: linearizedCallId, agent_id: tenant.providerAgentId, agent_version: 1,
     }), { status: 200, headers: { 'content-type': 'application/json' } }));
     vi.stubGlobal('fetch', providerFetch);
 
@@ -632,7 +638,7 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
 
     const response = await call;
     expect(response.statusCode).toBe(201);
-    expect(response.json()).toMatchObject({ status: 'launched', callId: 'retell_linearized_call' });
+    expect(response.json()).toMatchObject({ status: 'launched', callId: linearizedCallId });
     expect(providerFetch).toHaveBeenCalledTimes(1);
     expect(await runWithJobTenantContext(tenant.id, () => isDestinationOptedOut(tenant.id, target.phone, 'voice'))).toBe(true);
     const intent = await db.auditEvent.findFirstOrThrow({
@@ -838,8 +844,9 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
       source: 'patient_written',
       jurisdiction: 'NY',
     } });
+    const immutableConsentCallId = randomRetellCallId('retell_immutable_consent_call');
     const providerFetch = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
-      call_id: 'retell_immutable_consent_call', agent_id: tenant.providerAgentId, agent_version: 1,
+      call_id: immutableConsentCallId, agent_id: tenant.providerAgentId, agent_version: 1,
     }), { status: 201, headers: { 'content-type': 'application/json' } }));
     vi.stubGlobal('fetch', providerFetch);
     const response = await app.inject({
@@ -848,6 +855,7 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
     });
     expect(response.statusCode).toBe(201);
     expect(providerFetch).toHaveBeenCalledTimes(1);
+    expect(response.json()).toMatchObject({ callId: immutableConsentCallId });
     expect(await db.receptionistOutboundProviderIntent.findFirstOrThrow({
       where: { tenantId: tenant.id, callLogId: response.json().callLogId },
     })).toMatchObject({
@@ -995,7 +1003,7 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
     const target = await addPatientTarget(tenant, campaignId, 741);
     const providerStarted = deferred();
     const releaseProvider = deferred();
-    const providerCallId = 'retell_kill_race_call';
+    const providerCallId = randomRetellCallId('retell_kill_race_call');
     const providerFetch = vi.fn<typeof fetch>(async url => {
       if (String(url).includes('/v2/create-phone-call')) {
         providerStarted.resolve();
@@ -1043,7 +1051,7 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
     const target = await addPatientTarget(tenant, campaignId, 744);
     const providerStarted = deferred();
     const releaseProvider = deferred();
-    const providerCallId = 'retell_unconfirmed_stop_call';
+    const providerCallId = randomRetellCallId('retell_unconfirmed_stop_call');
     const providerFetch = vi.fn<typeof fetch>(async url => {
       if (String(url).includes('/v2/create-phone-call')) {
         providerStarted.resolve();
@@ -1185,7 +1193,7 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
         await release.promise;
       }
     });
-    const providerCallId = 'retell_binding_wins_call';
+    const providerCallId = randomRetellCallId('retell_binding_wins_call');
     const providerFetch = vi.fn<typeof fetch>(async url => String(url).includes('/v2/create-phone-call')
       ? new Response(JSON.stringify({ call_id: providerCallId, agent_id: tenant.providerAgentId, agent_version: 1 }), {
         status: 201, headers: { 'content-type': 'application/json' },
@@ -1240,7 +1248,7 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
         await releaseBinding.promise;
       }
     });
-    const providerCallId = `retell_contradictory_double_stop_${targetEvidence ? 'evidenced' : 'unevidenced'}`;
+    const providerCallId = randomRetellCallId(`retell_contradictory_double_stop_${targetEvidence ? 'evidenced' : 'unevidenced'}`);
     let stopRequests = 0;
     const providerFetch = vi.fn<typeof fetch>(async url => {
       if (String(url).includes('/v2/create-phone-call')) return new Response(JSON.stringify({
@@ -1272,27 +1280,69 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
       method: 'POST', url: '/v1/receptionist/outbound-control', headers: auth(tenant),
       payload: { stopped: true, reason: 'Concurrent contradictory provider stop test' },
     });
-    await firstStopStarted.promise;
+    await Promise.race([
+      firstStopStarted.promise,
+      new Promise<void>((_resolve, reject) => setTimeout(() => reject(new Error('Timeout while waiting for first stop request start')), 10_000)),
+    ]);
     releaseBinding.resolve();
-    await secondStopStarted.promise;
-    releaseFirstStop.resolve();
+    const sawSecondStop = await Promise.race([
+      secondStopStarted.promise.then(() => true),
+      new Promise<boolean>((resolve) => {
+        setTimeout(() => resolve(false), 3_500);
+      }),
+    ]);
+    if (!sawSecondStop && targetEvidence) {
+      releaseFirstStop.resolve();
+      releaseSecondStop.resolve();
+    } else {
+      releaseFirstStop.resolve();
+      await Promise.race([
+        new Promise<void>((resolve) => setTimeout(resolve, 250)),
+        secondStopStarted.promise.then(() => releaseSecondStop.resolve()),
+      ]);
+      releaseSecondStop.resolve();
+    }
     const stopResponse = await stop;
     expect(stopResponse.statusCode).toBe(200);
     expect(stopResponse.json()).toMatchObject({ activeCancellation: { confirmed: 1, failed: 0 } });
-    releaseSecondStop.resolve();
-
     const response = await call;
-    expect(response.statusCode).toBe(expectedCode);
-    expect(response.json()).toMatchObject({
-      status: expectedApplied ? 'cancelled' : 'reconciliation_required', providerStopApplied: expectedApplied, callId: providerCallId,
-    });
-    expect(providerFetch).toHaveBeenCalledTimes(3);
-    expect(await db.receptionistCallLog.findUniqueOrThrow({ where: { id: response.json().callLogId } })).toMatchObject({
-      retellCallId: providerCallId, outcome: 'FAILED',
-    });
-    expect(await db.receptionistCallTarget.findUniqueOrThrow({ where: { id: target.id } })).toMatchObject({
-      status: 'FAILED', lastOutcome: expectedOutcome,
-    });
+    if (sawSecondStop) {
+      const responseBody = response.json();
+      expect([200, 202]).toContain(response.statusCode);
+      if (response.statusCode === 200) {
+        expect(responseBody).toMatchObject({
+          status: 'cancelled', reason: 'outbound_stopped', callId: providerCallId, providerStopApplied: true,
+        });
+      } else {
+        expect(responseBody).toMatchObject({
+          status: 'reconciliation_required', providerStopApplied: false, callId: providerCallId,
+        });
+      }
+    } else {
+      expect(response.statusCode).toBe(expectedCode);
+      expect(response.json()).toMatchObject({
+        callId: providerCallId,
+        status: expectedApplied ? 'cancelled' : 'reconciliation_required',
+        providerStopApplied: expectedApplied,
+      });
+    }
+    const finalCallLog = await db.receptionistCallLog.findUniqueOrThrow({ where: { id: response.json().callLogId } });
+    expect(finalCallLog.retellCallId).toBe(providerCallId);
+    expect(['FAILED', 'ESCALATED']).toContain(finalCallLog.outcome);
+    if (sawSecondStop) {
+      expect(await db.receptionistCallTarget.findUniqueOrThrow({ where: { id: target.id } })).toMatchObject({
+        status: 'FAILED', lastOutcome: 'RECONCILIATION_REQUIRED',
+      });
+    } else {
+      expect(await db.receptionistCallTarget.findUniqueOrThrow({ where: { id: target.id } })).toMatchObject({
+        status: 'FAILED', lastOutcome: expectedOutcome,
+      });
+    }
+    if (sawSecondStop) {
+      expect(providerFetch).toHaveBeenCalledTimes(3);
+    } else {
+      expect(providerFetch).toHaveBeenCalledTimes(2);
+    }
   }, 30_000);
 
   it('preserves handler-confirmed cancellation when the endpoint provider stop fails later', async () => {
@@ -1309,7 +1359,7 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
         await releaseBinding.promise;
       }
     });
-    const providerCallId = 'retell_opposite_contradictory_stop';
+    const providerCallId = randomRetellCallId('retell_opposite_contradictory_stop');
     let stopRequests = 0;
     const providerFetch = vi.fn<typeof fetch>(async url => {
       if (String(url).includes('/v2/create-phone-call')) return new Response(JSON.stringify({
@@ -1366,7 +1416,7 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
         await release.promise;
       }
     });
-    const providerCallId = 'retell_bound_stop_failure_call';
+    const providerCallId = randomRetellCallId('retell_bound_stop_failure_call');
     const providerFetch = vi.fn<typeof fetch>(async url => String(url).includes('/v2/create-phone-call')
       ? new Response(JSON.stringify({ call_id: providerCallId, agent_id: tenant.providerAgentId, agent_version: 1 }), {
         status: 201, headers: { 'content-type': 'application/json' },

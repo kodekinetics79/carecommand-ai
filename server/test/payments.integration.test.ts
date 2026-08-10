@@ -227,6 +227,78 @@ describe('money path — Stripe webhook is signature-verified and idempotent', (
     expect(completedClaims).toBe(2);
   });
 
+  it.each(['failed', 'expired'])('accepts a later provider success after an earlier %s event', async terminalStatus => {
+    const t = await makeTenant();
+    const patient = await db.patient.create({
+      data: { tenantId: t.id, branchId: t.branchId, firstName: 'Later', lastName: 'Success', outstandingBalance: 100 },
+    });
+    const pr = await makePaymentRequest(t.id, t.branchId, { patientId: patient.id, status: terminalStatus });
+    const body = JSON.stringify({ id: `evt_${randomUUID()}`, type: 'payment_intent.succeeded', data: { object: { id: pr.providerReference, amount_received: 5000 } } });
+
+    const response = await webhook(body, { 'stripe-signature': stripeSignature(body) });
+
+    expect(response.statusCode).toBe(200);
+    expect((await db.paymentRequest.findUniqueOrThrow({ where: { id: pr.id } })).status).toBe('collected');
+    expect(await db.paymentTransaction.count({ where: { paymentRequestId: pr.id, status: 'succeeded' } })).toBe(1);
+    expect(Number((await db.patient.findUniqueOrThrow({ where: { id: patient.id } })).outstandingBalance)).toBe(50);
+  });
+
+  it('defers an out-of-order refund until success arrives, then reconciles it exactly once', async () => {
+    const t = await makeTenant();
+    const patient = await db.patient.create({
+      data: { tenantId: t.id, branchId: t.branchId, firstName: 'Refund', lastName: 'Ordering', outstandingBalance: 100 },
+    });
+    const pr = await makePaymentRequest(t.id, t.branchId, { patientId: patient.id });
+    const refundEventId = `evt_${randomUUID()}`;
+    const refundBody = JSON.stringify({ id: refundEventId, type: 'charge.refunded', data: { object: { id: pr.providerReference, amount_refunded: 5000 } } });
+
+    const early = await webhook(refundBody, { 'stripe-signature': stripeSignature(refundBody) });
+    expect(early.statusCode).toBe(409);
+    expect(early.json()).toMatchObject({ received: false, retryable: true, deferred: 'awaiting_success' });
+    expect((await db.idempotencyKey.findUniqueOrThrow({ where: { scope_key: { scope: 'stripe.webhook', key: refundEventId } } })).resultId).toBeNull();
+    expect(await db.paymentTransaction.count({ where: { paymentRequestId: pr.id } })).toBe(0);
+
+    const successBody = JSON.stringify({ id: `evt_${randomUUID()}`, type: 'payment_intent.succeeded', data: { object: { id: pr.providerReference, amount_received: 5000 } } });
+    expect((await webhook(successBody, { 'stripe-signature': stripeSignature(successBody) })).statusCode).toBe(200);
+    expect((await webhook(refundBody, { 'stripe-signature': stripeSignature(refundBody) })).statusCode).toBe(200);
+
+    expect((await db.paymentRequest.findUniqueOrThrow({ where: { id: pr.id } })).status).toBe('refunded');
+    expect(await db.paymentTransaction.count({ where: { paymentRequestId: pr.id, status: 'refunded' } })).toBe(1);
+    expect(Number((await db.patient.findUniqueOrThrow({ where: { id: patient.id } })).outstandingBalance)).toBe(100);
+    expect((await db.idempotencyKey.findUniqueOrThrow({ where: { scope_key: { scope: 'stripe.webhook', key: refundEventId } } })).resultId).toBe(pr.id);
+  });
+
+  it('applies cumulative partial-refund events as deltas and terminalizes only at the full amount', async () => {
+    const t = await makeTenant();
+    const patient = await db.patient.create({
+      data: { tenantId: t.id, branchId: t.branchId, firstName: 'Partial', lastName: 'Refund', outstandingBalance: 100 },
+    });
+    const pr = await makePaymentRequest(t.id, t.branchId, { patientId: patient.id });
+    await db.depositRequirement.create({
+      data: { tenantId: t.id, branchId: t.branchId, patientId: patient.id, paymentRequestId: pr.id, status: 'requested', requiredAmount: 50, collectedAmount: 0, reason: 'Appointment deposit', mode: 'live' },
+    });
+    const successBody = JSON.stringify({ id: `evt_${randomUUID()}`, type: 'payment_intent.succeeded', data: { object: { id: pr.providerReference, amount_received: 5000 } } });
+    expect((await webhook(successBody, { 'stripe-signature': stripeSignature(successBody) })).statusCode).toBe(200);
+
+    for (const cumulativeMinorUnits of [2000, 3000]) {
+      const body = JSON.stringify({ id: `evt_${randomUUID()}`, type: 'charge.refunded', data: { object: { id: pr.providerReference, amount_refunded: cumulativeMinorUnits } } });
+      expect((await webhook(body, { 'stripe-signature': stripeSignature(body) })).statusCode).toBe(200);
+      expect((await db.paymentRequest.findUniqueOrThrow({ where: { id: pr.id } })).status).toBe('collected');
+    }
+    expect(Number((await db.paymentTransaction.aggregate({ _sum: { amount: true }, where: { paymentRequestId: pr.id, status: 'refunded' } }))._sum.amount)).toBe(30);
+    expect(Number((await db.patient.findUniqueOrThrow({ where: { id: patient.id } })).outstandingBalance)).toBe(80);
+    expect(Number((await db.depositRequirement.findFirstOrThrow({ where: { paymentRequestId: pr.id } })).collectedAmount)).toBe(20);
+
+    const fullBody = JSON.stringify({ id: `evt_${randomUUID()}`, type: 'charge.refunded', data: { object: { id: pr.providerReference, amount_refunded: 5000 } } });
+    expect((await webhook(fullBody, { 'stripe-signature': stripeSignature(fullBody) })).statusCode).toBe(200);
+    expect((await db.paymentRequest.findUniqueOrThrow({ where: { id: pr.id } })).status).toBe('refunded');
+    expect(Number((await db.paymentTransaction.aggregate({ _sum: { amount: true }, where: { paymentRequestId: pr.id, status: 'refunded' } }))._sum.amount)).toBe(50);
+    expect(Number((await db.patient.findUniqueOrThrow({ where: { id: patient.id } })).outstandingBalance)).toBe(100);
+    const deposit = await db.depositRequirement.findFirstOrThrow({ where: { paymentRequestId: pr.id } });
+    expect(deposit.status).toBe('refunded');
+    expect(Number(deposit.collectedAmount)).toBe(0);
+  });
+
   it.each(['reconciliation_required', 'reconciliation_required_paid'])('reconciles success from %s and later checkout finalization cannot regress collected', async initialStatus => {
     const t = await makeTenant();
     const patient = await db.patient.create({
@@ -373,6 +445,12 @@ describe('money path — Stripe webhook is signature-verified and idempotent', (
       data: { tenantId: t.id, branchId: t.branchId, firstName: 'Refund', lastName: 'Patient', outstandingBalance: 10 },
     });
     const pr = await makePaymentRequest(t.id, t.branchId, { patientId: patient.id, status: 'collected' });
+    await db.paymentTransaction.create({
+      data: {
+        tenantId: t.id, branchId: t.branchId, patientId: patient.id, paymentRequestId: pr.id,
+        amount: 50, currency: 'USD', status: 'succeeded', mode: 'live', providerReference: pr.providerReference,
+      },
+    });
     const deposit = await db.depositRequirement.create({
       data: {
         tenantId: t.id, branchId: t.branchId, patientId: patient.id, paymentRequestId: pr.id,

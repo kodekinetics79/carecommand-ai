@@ -111,6 +111,7 @@ interface InsuranceRail {
   eligibilitySupported: boolean;
   benefitsSupported: boolean;
   priorAuthSupported: boolean;
+  priorAuthTrackingSupported: boolean;
   claimStatusSupportedFuture: boolean;
   payerListStatus: string;
   lastEligibilityCheck: string | null;
@@ -1089,7 +1090,7 @@ export default function ControlPlane() {
                   <div className="mt-2 space-y-1 text-[11px] text-t2">
                     <p>Eligibility: {provider.eligibilitySupported ? 'Yes' : 'No'}</p>
                     <p>Benefits: {provider.benefitsSupported ? 'Yes' : 'No'}</p>
-                    <p>Prior auth: {provider.priorAuthSupported ? 'Yes' : 'No'}</p>
+                    <p>Prior auth: {provider.priorAuthSupported ? 'Payer-connected' : provider.priorAuthTrackingSupported ? 'Manual tracking only' : 'No'}</p>
                     <p>Payer list: {provider.payerListStatus}</p>
                     <p>Error rate: {provider.errorRate}%</p>
                   </div>

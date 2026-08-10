@@ -51,6 +51,15 @@ describe('general app content integrity', () => {
     expect(providers).toContain("value={metricsReady ? providerRecords.length : '—'}");
   });
 
+  it('keeps successful dashboard panels visible when an optional module is unavailable', () => {
+    const dashboard = source('src/pages/Dashboard.tsx');
+
+    expect(dashboard).toContain('Promise.allSettled');
+    expect(dashboard).toContain('summaryResult.status');
+    expect(dashboard).toContain('campaignsResult.status');
+    expect(dashboard).not.toContain('Dashboard summary and operational panels are unavailable');
+  });
+
   it('keeps patient insurance content point-in-time, masked, and fact based', () => {
     const profile = source('src/pages/PatientProfile.tsx');
 
@@ -106,6 +115,9 @@ describe('general app content integrity', () => {
     const revenue = source('src/pages/Revenue.tsx');
 
     expect(scheduling).toContain('Select patient…');
+    expect(scheduling).toContain('Book canonical slot');
+    expect(scheduling).not.toContain('unconstrained fallback');
+    expect(scheduling).not.toContain("status: 'CONFIRMED'");
     expect(scheduling).not.toMatch(/customer/i);
     expect(autopilot).toContain('patient fit, recorded signals');
     expect(autopilot).not.toContain('customer fit');

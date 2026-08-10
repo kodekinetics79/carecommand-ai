@@ -42,7 +42,7 @@ const CLIENT_LAUNCH_ATTEMPT_SCOPE = 'receptionist.outbound-client-attempt';
 export const MAX_TENANT_ACTIVE_CALLS = 3;
 export const DEFAULT_VOICE_MINUTES_LIMIT = 500;
 
-type ProviderBoundaryTestStage = 'before_suppression_fence' | 'suppression_fence_acquired' | 'provider_intent_committed' | 'before_provider_binding_lock' | 'provider_binding_committed';
+type ProviderBoundaryTestStage = 'before_suppression_fence' | 'suppression_fence_acquired' | 'provider_intent_committed' | 'before_provider_binding_lock' | 'provider_binding_committed' | 'before_call_stopping_evaluation';
 let providerBoundaryTestHook: ((stage: ProviderBoundaryTestStage) => Promise<void>) | null = null;
 
 /** Deterministic interleaving support for integration tests only. */
@@ -1617,6 +1617,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       // must retain metadata only; an in-call grant cannot upgrade this setting.
       dataStorageSetting: 'basic_attributes_only',
     });
+    await providerBoundaryTestHook?.('before_call_stopping_evaluation');
 
     const cancelAcceptedCall = async (providerCallId: string) => {
       const providerStop = await stopPhoneCall(providerCallId);
@@ -1638,19 +1639,28 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
             select: { id: true },
           })
           : null;
-        const alreadyConfirmed = existing.outcome === 'FAILED'
+      const alreadyConfirmed = existing.outcome === 'FAILED'
           && existing.endedAt !== null
           && existing.retellCallId === providerCallId
           && durableTargetStop !== null;
         const effectiveProviderStopApplied = providerStopApplied || alreadyConfirmed;
+        const conflictingRetellCall = existing.retellCallId === null
+          ? await tx.receptionistCallLog.findFirst({
+            where: { tenantId: request.auth.tenantId, retellCallId: providerCallId },
+            select: { id: true },
+          })
+          : null;
         const nextOutcome = existing.outcome === 'IN_PROGRESS'
           ? (effectiveProviderStopApplied ? 'FAILED' as const : 'ESCALATED' as const)
           : existing.outcome === 'FAILED' && !effectiveProviderStopApplied && existing.retellCallId === null
             ? 'ESCALATED' as const
             : existing.outcome;
+        const nextRetellCallId = existing.retellCallId === null && conflictingRetellCall === null
+          ? providerCallId
+          : existing.retellCallId;
         await tx.receptionistCallLog.update({
           where: { id: callLog.id },
-          data: { retellCallId: existing.retellCallId ?? providerCallId, outcome: nextOutcome, endedAt: existing.endedAt ?? new Date() },
+          data: { retellCallId: nextRetellCallId, outcome: nextOutcome, endedAt: existing.endedAt ?? new Date() },
         });
         if (target) await tx.receptionistCallTarget.updateMany({
           where: { id: target.id, tenantId: request.auth.tenantId, campaignId: campaign.id },
@@ -1962,14 +1972,32 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
           return { cancelled: false as const, bound: 1, recoveredByCallback: true as const };
         }
         if (latestCall.retellCallId !== null) throw new Error('provider_call_binding_collision');
+        const collidingRetellCall = await tx.receptionistCallLog.findFirst({
+          where: { tenantId: request.auth.tenantId, retellCallId: result.callId },
+          select: { id: true },
+        });
+        if (collidingRetellCall !== null) {
+          return { cancelled: false as const, bound: 0, reusedRetellCallId: collidingRetellCall.id, collision: true as const };
+        }
         const bound = await tx.receptionistCallLog.updateMany({
           where: { id: callLog.id, tenantId: request.auth.tenantId, retellCallId: null, outcome: 'IN_PROGRESS', endedAt: null },
           data: { retellCallId: result.callId },
         });
-        return { cancelled: false as const, bound: bound.count };
+        return { cancelled: false as const, bound: bound.count, collision: false as const, reusedRetellCallId: null };
       });
       if (binding.cancelled) return await cancelAcceptedCall(result.callId);
-      if (binding.bound !== 1) throw new Error('provider_call_binding_lost');
+      if (binding.bound !== 1 && !binding.collision) throw new Error('provider_call_binding_lost');
+      if (binding.collision) {
+        if (binding.reusedRetellCallId) {
+          request.log.warn({
+            callLogId: callLog.id, providerCallId: result.callId, reusedRetellCallId: binding.reusedRetellCallId, tenantId: request.auth.tenantId,
+          }, 'Provider call ID collision encountered while binding outbound call intent');
+        } else {
+          request.log.warn({
+            callLogId: callLog.id, providerCallId: result.callId, tenantId: request.auth.tenantId,
+          }, 'Provider call binding collision encountered while binding outbound call intent');
+        }
+      }
       await providerBoundaryTestHook?.('provider_binding_committed');
       if (await outboundStopped(request.auth.tenantId)) {
         const stoppedCall = await db.receptionistCallLog.findFirst({

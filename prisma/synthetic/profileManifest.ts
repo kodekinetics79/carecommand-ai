@@ -27,6 +27,11 @@ export const syntheticProfiles: Record<SyntheticProfile, SyntheticProfileManifes
     tenants: 2, clinics: 3, users: 12, portalAccounts: 2, patients: 24, appointments: 48, calls: 16, paymentRequests: 12, documents: 12, notifications: 24, auditEvents: 48,
     description: 'Small deterministic dataset for unit, integration and browser journeys.',
   },
+  TIER1: {
+    profile: 'TIER1', fixedSeed: SYNTHETIC_SEED, controlledClock: SYNTHETIC_CLOCK,
+    tenants: 4, clinics: 8, users: 40, portalAccounts: 4, patients: 1_000, appointments: 1_600, calls: 400, paymentRequests: 250, documents: 500, notifications: 1_000, auditEvents: 2_000,
+    description: 'Functional-scale multi-client wave with exactly 1,000 synthetic patients and representative dependent records.',
+  },
   PILOT: {
     profile: 'PILOT', fixedSeed: SYNTHETIC_SEED, controlledClock: SYNTHETIC_CLOCK,
     tenants: 4, clinics: 8, users: 40, portalAccounts: 4, patients: 2_000, appointments: 4_000, calls: 1_000, paymentRequests: 500, documents: 1_000, notifications: 2_000, auditEvents: 5_000,

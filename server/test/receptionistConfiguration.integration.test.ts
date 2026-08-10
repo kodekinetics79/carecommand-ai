@@ -146,16 +146,21 @@ describe('AI receptionist trusted configuration', () => {
     expect(invalid.statusCode).toBe(400);
     expect(await db.receptionistClinic.count({ where: { tenantId: t.id } })).toBe(0);
 
+    const basePhone = phone();
     const valid = await app.inject({
       method: 'POST', url: '/v1/receptionist/clinics', headers: auth(t, 'MANAGER'),
       payload: {
-        name: 'Valid clinic', phone: '+1 (212) 555-0100', timezone: 'America/New_York',
-        humanFallbackNumber: '+1 (212) 555-0199',
+        name: 'Valid clinic', phone: `+1 (${basePhone.slice(2, 5)}) ${basePhone.slice(5, 8)}-${basePhone.slice(8)}`,
+        timezone: 'America/New_York',
+        humanFallbackNumber: `+1 (${basePhone.slice(2, 5)}) ${basePhone.slice(5, 8)}-${basePhone.slice(8)}`,
         workingHours: { monday: { open: true, start: '09:00', end: '17:00' }, sunday: { open: false } },
       },
     });
     expect(valid.statusCode).toBe(201);
-    expect(valid.json()).toMatchObject({ phone: '+12125550100', humanFallbackNumber: '+12125550199' });
+    expect(valid.json()).toMatchObject({
+      phone: basePhone,
+      humanFallbackNumber: basePhone,
+    });
   });
 
   it('allows only one active inbound destination globally under concurrent cross-tenant creates and reactivation', async () => {
@@ -371,10 +376,11 @@ describe('AI receptionist trusted configuration', () => {
     const [owner, foreign] = await Promise.all([tenant(), tenant()]);
     const ownerClinic = (await createClinic(owner, { name: 'Provider-ready clinic' })).json().id as string;
     const foreignClinic = (await createClinic(foreign, { name: 'Foreign provider clinic' })).json().id as string;
+    const providerAgentId = `agent_pilot_exact_${randomUUID()}`;
     env.RETELL_API_KEY = 'real-provider-key';
     env.RETELL_BASE_URL = 'https://api.retellai.com';
     const providerPayload = {
-      agent_id: 'agent_pilot_exact', version: 17, assigned_tags: ['prod', 'production'], is_published: true,
+      agent_id: providerAgentId, version: 17, assigned_tags: ['prod', 'production'], is_published: true,
       voice_id: 'voice_safe', language: 'en-US',
       webhook_url: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`,
       webhook_events: ['call_started', 'call_ended', 'call_analyzed'],
@@ -391,14 +397,14 @@ describe('AI receptionist trusted configuration', () => {
         llm_id: 'llm_safe', version: 3, is_published: true, tool_call_strict_mode: true,
         general_tools: [providerBookingTool],
       }
-      : String(url).includes('list-agents') ? listedRetellAgent('agent_pilot_exact', providerPayload.version as number, ['prod', 'production'])
+      : String(url).includes('list-agents') ? listedRetellAgent(providerAgentId, providerPayload.version as number, ['prod', 'production'])
         : providerPayload), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
 
     try {
       const created = await app.inject({
         method: 'POST', url: '/v1/receptionist/agents', headers: auth(owner, 'MANAGER'),
-        payload: { clinicId: ownerClinic, name: 'Pilot Receptionist', providerAgentId: 'agent_pilot_exact', providerVersionTag: 'prod' },
+        payload: { clinicId: ownerClinic, name: 'Pilot Receptionist', providerAgentId, providerVersionTag: 'prod' },
       });
       expect(created.statusCode).toBe(201);
       expect(created.json()).toMatchObject({ providerStatus: 'UNVERIFIED', providerVersion: null });
@@ -411,7 +417,7 @@ describe('AI receptionist trusted configuration', () => {
         providerVoiceId: 'voice_safe', providerLanguage: 'en-US', providerLastAttemptStatus: 'SUCCEEDED',
       });
       expect(fetchMock).toHaveBeenCalledWith(
-        'https://api.retellai.com/get-agent/agent_pilot_exact?version=prod',
+        `https://api.retellai.com/get-agent/${providerAgentId}?version=prod`,
         expect.objectContaining({ headers: { Authorization: 'Bearer real-provider-key' } }),
       );
       const stored = await db.receptionistAgent.findUniqueOrThrow({ where: { id: agentId } });
@@ -429,7 +435,7 @@ describe('AI receptionist trusted configuration', () => {
 
       const foreignAgent = await app.inject({
         method: 'POST', url: '/v1/receptionist/agents', headers: auth(foreign, 'OWNER'),
-        payload: { clinicId: foreignClinic, name: 'Duplicate deployment', providerAgentId: 'agent_pilot_exact', providerVersionTag: 'production', active: false },
+        payload: { clinicId: foreignClinic, name: 'Duplicate deployment', providerAgentId, providerVersionTag: 'production', active: false },
       });
       expect(foreignAgent.statusCode).toBe(201);
       const duplicateVerify = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${foreignAgent.json().id}/verify-provider`, headers: auth(foreign, 'OWNER') });
@@ -479,7 +485,7 @@ describe('AI receptionist trusted configuration', () => {
       expect(activeCampaign.statusCode).toBe(200);
       expect(activeCampaign.json()).toMatchObject({
         status: 'ACTIVE', intakeSchemaAttestedRevision: campaignDraft.json().intakeSchemaRevision,
-        intakeSchemaProviderAgentId: 'agent_pilot_exact', intakeSchemaProviderVersion: 17,
+        intakeSchemaProviderAgentId: providerAgentId, intakeSchemaProviderVersion: 17,
       });
       expect(activeCampaign.json().intakeSchemaFingerprint).toMatch(/^[a-f0-9]{64}$/);
       const duplicateActiveDeployment = await db.receptionistCampaign.create({

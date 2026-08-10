@@ -1,5 +1,22 @@
 # Change Attribution
 
+## 2026-08-10 Tier 1 working-state attribution (current)
+
+The exact pre-closure state contains 29 unstaged tracked paths and 20 untracked leaf files (10 untracked status entries), with no staged, deleted, renamed, or unmerged paths. It is preserved by the SHA-verified Desktop patch recorded in `docs/completion/BRANCH_AUTHORITY.md`.
+
+| Category | Paths / ownership |
+|---|---|
+| Tier 1 evidence and release recovery (14) | Two tracked testing reports, the convergence ledger, and 11 simulation evidence files |
+| Tier 1 deterministic profile (5) | `prisma/seedSynthetic.ts`, three `prisma/synthetic/*` files, and `server/test/syntheticDataCatalog.test.ts` |
+| Historical agent work carried into Tier 1 — autopilot/queue (9) | Autopilot routes, worker/index/queues, worker test, and untracked dispatch/recovery sources and tests |
+| Historical agent work carried into Tier 1 — voice (4) | Receptionist outbound plus configuration, signed-booking, and outbound-target tests |
+| Tier 1 finance/eligibility/portal work (8) | Control plane, portal, revenue-protection, money/payment tests, ControlPlane UI, portal-insurance integration and E2E |
+| Tier 1 Chrome core fixes (5) | Branch route/foundation test, content test, Dashboard, Scheduling |
+| Historical pilot simulation/status work (2) | Platform pilot route and pilot simulation script |
+| Generated/local helpers (2) | `.playwright-no-server.config.ts`, `.tmp_inspect.ts`; neither is production code |
+
+The categories attribute custody and wave origin; they do not assert that each historical hunk has a known human author. No current path is discarded. The five scoped-pass implementations remain in the durable patch, but no focused commit was made because the repository-authority gate remains blocked by lost dirty snapshots and divergent migration authority.
+
 Date: 2026-07-30
 
 ## Preserved starting state

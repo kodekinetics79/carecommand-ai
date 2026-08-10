@@ -10,6 +10,7 @@ import { assertRlsRuntimeRole } from '../lib/rlsGuard';
 import { registerSentry } from '../lib/observability';
 import { sampleQueueDepths } from '../lib/metrics';
 import { startWorkerMetricsServer } from './metricsServer';
+import { captureException } from '../lib/observability';
 import {
   autopilotQueue,
   campaignQueue,
@@ -23,6 +24,7 @@ import { createAutopilotWorker } from './autopilot.worker';
 import { createCampaignWorker } from './campaign.worker';
 import { createComplianceWorker } from './compliance.worker';
 import { createMonitoringWorker } from './monitoring.worker';
+import { reconcileStrandedAutopilotDispatches } from './autopilotRecovery';
 
 // ===========================================================================
 // Unified background-worker runtime.
@@ -60,6 +62,30 @@ export async function startWorkers(): Promise<WorkerRuntime> {
   await registerCampaignSchedules();
   await registerMonitoringSchedules();
 
+  const AUTOPILOT_RECOVERY_INTERVAL_MS = 60_000;
+  let activeAutopilotRecoveryPass: Promise<void> | null = null;
+  const runAutopilotRecoveryPass = async () => {
+    if (activeAutopilotRecoveryPass) return activeAutopilotRecoveryPass;
+    activeAutopilotRecoveryPass = (async () => {
+      try {
+        const summary = await reconcileStrandedAutopilotDispatches();
+        if (summary.reconciled > 0 || summary.errors > 0) {
+          console.info({ summary }, 'autopilot dispatch recovery pass completed');
+        }
+      } catch (error) {
+        captureException(error instanceof Error ? error : new Error(String(error)), {
+          route: 'worker:autopilot-dispatch-recovery-pass',
+        });
+      } finally {
+        activeAutopilotRecoveryPass = null;
+      }
+    })();
+    return activeAutopilotRecoveryPass;
+  };
+  await runAutopilotRecoveryPass();
+  const autopilotRecoveryTimer = setInterval(() => { void runAutopilotRecoveryPass(); }, AUTOPILOT_RECOVERY_INTERVAL_MS);
+  autopilotRecoveryTimer.unref?.();
+
   // Publish queue backlog to the metrics registry so alerts can fire on a
   // growing/stuck queue. The worker is the source of truth for depth; sampling
   // every 15s is negligible Redis load.
@@ -74,6 +100,7 @@ export async function startWorkers(): Promise<WorkerRuntime> {
 
   const shutdown = async () => {
     clearInterval(depthTimer);
+    clearInterval(autopilotRecoveryTimer);
     await Promise.allSettled(workers.map(worker => worker.close()));
     await Promise.allSettled([autopilotQueue.close(), complianceQueue.close(), campaignQueue.close(), monitoringQueue.close()]);
     if (metricsServer) await new Promise(resolve => metricsServer.close(() => resolve(null)));

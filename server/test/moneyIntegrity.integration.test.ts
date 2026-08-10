@@ -26,6 +26,7 @@ const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { recomputeEntitlements } = await import('../lib/entitlements');
 const { runWithTenantContext } = await import('../lib/tenantContext');
+const { insuranceRailCapability } = await import('../modules/control-plane/routes');
 
 let app: FastifyInstance;
 const createdTenantIds: string[] = [];
@@ -85,6 +86,27 @@ describe('#1 revenue overview totals are DB aggregates (correct past the 50-row 
 });
 
 describe('#3 control-plane test buttons are honest (no fabricated success)', () => {
+  it('derives Stedi sandbox/live mode from runtime mode and never configures unavailable adapters', () => {
+    expect(insuranceRailCapability('stedi', { selectedProvider: 'stedi', stediApiKey: 'test-key', stediTestMode: true })).toEqual({ configured: true, mode: 'sandbox' });
+    expect(insuranceRailCapability('stedi', { selectedProvider: 'stedi', stediApiKey: 'live-key', stediTestMode: false })).toEqual({ configured: true, mode: 'live' });
+    expect(insuranceRailCapability('optum', { selectedProvider: 'optum', stediTestMode: false })).toEqual({ configured: false, mode: 'mock' });
+  });
+
+  it('reports unavailable payer adapters and prior-auth submission truthfully', async () => {
+    const t = await makeTenant();
+    const res = await app.inject({ method: 'GET', url: '/v1/control-plane/insurance-rails', headers: auth(t, t.ownerId) });
+    expect(res.statusCode).toBe(200);
+    const rows = res.json() as Array<Record<string, unknown>>;
+    expect(rows).toHaveLength(4);
+    for (const row of rows) {
+      expect(row.priorAuthSupported).toBe(false);
+      expect(row.priorAuthTrackingSupported).toBe(true);
+    }
+    for (const provider of ['availity', 'pverify', 'optum']) {
+      expect(rows.find(row => row.provider === provider)).toMatchObject({ configured: false, mode: 'mock' });
+    }
+  });
+
   it('finance test-payment-link returns not_configured and NEVER persists a fake Stripe payment request', async () => {
     const t = await makeTenant();
     const res = await app.inject({ method: 'POST', url: '/v1/control-plane/finance-rails/stripe/test-payment-link', headers: auth(t, t.ownerId) });

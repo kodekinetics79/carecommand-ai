@@ -1,5 +1,25 @@
 # Release Readiness Report
 
+## 2026-08-10 Tier 1 wave — authoritative current verdict
+
+**NO-GO.** This current working tree must not inherit the older GO verdict below.
+
+Release blockers:
+
+1. Repository authority is unresolved: the primary tree contains substantial uncommitted work, six previously reported dirty/unique worktrees no longer exist at their registered paths, and `codex/accepted-module-convergence` has extensive divergent history from the ledger-declared branch.
+2. Eligibility provider calls and subsequent durable effects lack a tenant-scoped idempotent/atomic workflow boundary.
+3. Persistent BullMQ queues are not scoped to a disposable database/environment; stale jobs crossed the Chrome test dataset boundary.
+4. Autopilot recovery is serial and slow for 101 jobs, and `dispatch_failed` work has no authorized tenant retry path.
+5. The single required end-wave disposable full regression failed its default timing gate: 106/109 files and 1,899/1,902 tests passed, while three tests timed out. Those 3 files passed 60/60 with a 30-second ceiling, so this is a performance/test-budget failure rather than an assertion failure.
+6. `npm run check` fails on two lint errors in the pre-existing untracked `.playwright-no-server.config.ts`; Prisma validation and API typecheck pass, but the production build stage is not reached by the umbrella command.
+7. Independent review found two further P1s: outbound call-ID collision can continue without durable binding, and BullMQ failure handling marks dispatch terminal before scheduled retry exhaustion.
+
+Positive evidence includes successful zero-to-head Tier 1 generation, focused finance/core/worker/voice suites, restricted local infrastructure, corrected financial webhook behavior, real atomic staff-task execution, and corrected Chrome-observed branch/dashboard/scheduling behavior. Live calls were authorization-blocked; object storage and email lanes were setup-required. No real payment, claim, eligibility transaction, production data, or PHI was used.
+
+The older report is retained below as historical evidence only and does not describe this tree.
+
+Independent acceptance result: F1/F2/F4 REJECTED; F3/F5/F6 scoped PASS; F7/F8 narrow defect-level PASS. Overall REJECTED / NO-GO.
+
 Date: 2026-07-30  
 Scope: local repository and disposable local databases using synthetic data only.
 

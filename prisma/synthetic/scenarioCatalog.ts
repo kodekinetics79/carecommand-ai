@@ -1,4 +1,4 @@
-export type SyntheticProfile = 'FUNCTIONAL' | 'PILOT' | 'EDGE';
+export type SyntheticProfile = 'FUNCTIONAL' | 'TIER1' | 'PILOT' | 'EDGE';
 
 export interface SyntheticScenario {
   scenarioId: string;

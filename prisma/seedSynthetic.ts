@@ -64,7 +64,7 @@ async function seed(): Promise<void> {
     const id = stableUuid('tenant', index);
     const status = profile.profile === 'EDGE'
       ? ['active', 'suspended', 'cancelled', 'active', 'suspended'][index % 5]
-      : profile.profile === 'PILOT' && index === profile.tenants - 1 ? 'suspended' : 'active';
+      : (profile.profile === 'PILOT' || profile.profile === 'TIER1') && index === profile.tenants - 1 ? 'suspended' : 'active';
     tenantIds.push(id);
     tenants.push({
       id,

@@ -103,6 +103,14 @@ const integrationDefinitions = [
 const insuranceProviders = ['stedi', 'availity', 'pverify', 'optum'] as const;
 const paymentProviders = ['stripe', 'square', 'authorize_net', 'clover', 'paypal'] as const;
 
+export function insuranceRailCapability(
+  provider: (typeof insuranceProviders)[number],
+  runtime: { selectedProvider: string; stediApiKey?: string; stediTestMode: boolean },
+): { configured: boolean; mode: 'sandbox' | 'live' | 'mock' } {
+  const configured = provider === 'stedi' && runtime.selectedProvider === 'stedi' && Boolean(runtime.stediApiKey);
+  return { configured, mode: configured ? (runtime.stediTestMode ? 'sandbox' : 'live') : 'mock' };
+}
+
 function safeEmail(metadata: unknown) {
   if (!metadata || typeof metadata !== 'object') return null;
   const email = (metadata as { email?: unknown }).email;
@@ -303,7 +311,13 @@ async function buildInsuranceRails(tenantId: string) {
   ]);
 
   return insuranceProviders.map(provider => {
-    const configured = env.INSURANCE_PROVIDER === provider && Boolean(env.STEDI_API_KEY || provider !== 'stedi');
+    // Stedi is the only implemented eligibility adapter. Merely selecting an
+    // unimplemented provider must not present that rail as configured.
+    const { configured, mode } = insuranceRailCapability(provider, {
+      selectedProvider: env.INSURANCE_PROVIDER,
+      stediApiKey: env.STEDI_API_KEY,
+      stediTestMode: env.STEDI_TEST_MODE,
+    });
     const providerPolicies = policies.filter(policy => policy.payer?.sourceProvider === provider || policy.payer?.name.toLowerCase().includes(provider));
     const providerVerifications = verifications.filter(verification => verification.payer?.sourceProvider === provider || verification.payerName.toLowerCase().includes(provider));
     const providerAuths = priorAuths.filter(item => item.payer?.sourceProvider === provider);
@@ -313,17 +327,20 @@ async function buildInsuranceRails(tenantId: string) {
       provider,
       name: provider === 'optum' ? 'Optum / Change Healthcare' : provider[0].toUpperCase() + provider.slice(1),
       configured,
-      mode: configured ? (provider === 'stedi' && env.STEDI_TEST_MODE ? 'sandbox' : 'sandbox') : 'mock',
-      modeLabel: configured ? 'Sandbox Ready' : 'Mock Mode',
-      eligibilitySupported: true,
-      benefitsSupported: true,
-      priorAuthSupported: provider !== 'pverify' || true,
+      mode,
+      modeLabel: formatMode(mode, configured),
+      eligibilitySupported: provider === 'stedi',
+      benefitsSupported: provider === 'stedi',
+      // The application tracks manually-entered prior-auth status but does not
+      // submit or query prior authorizations through a payer adapter yet.
+      priorAuthSupported: false,
+      priorAuthTrackingSupported: true,
       claimStatusSupportedFuture: provider === 'stedi' || provider === 'optum',
       payerListStatus: payers.some(payer => payer.sourceProvider === provider) ? 'Loaded' : 'Not Loaded',
       lastEligibilityCheck: providerVerifications[0]?.checkedAt.toISOString() ?? null,
       lastFailedCheck: providerVerifications.find(item => item.coverageStatus !== 'covered')?.checkedAt.toISOString() ?? null,
       errorRate: providerVerifications.length > 0 ? Math.round((providerVerifications.filter(item => item.coverageStatus !== 'covered').length / providerVerifications.length) * 100) : 0,
-      workflows: ['Eligibility verification', 'Benefits verification', 'Prior authorization', 'Patient responsibility estimation', 'Denial risk alert'],
+      workflows: ['Eligibility verification', 'Benefits verification', 'Manual prior authorization tracking', 'Patient responsibility estimation', 'Denial risk alert'],
       actions: ['Test eligibility check', 'View normalized response', 'View integration logs', 'Open Revenue Protection'],
       logs: providerLogs.map(log => ({
         id: log.id,

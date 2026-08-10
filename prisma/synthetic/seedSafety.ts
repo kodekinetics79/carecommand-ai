@@ -1,6 +1,6 @@
 import type { SyntheticProfile } from './scenarioCatalog';
 
-const PROFILE_NAMES = new Set<SyntheticProfile>(['FUNCTIONAL', 'PILOT', 'EDGE']);
+const PROFILE_NAMES = new Set<SyntheticProfile>(['FUNCTIONAL', 'TIER1', 'PILOT', 'EDGE']);
 const SAFE_DATABASE_NAME = /^(?:cc|carecommand)_(?:test|synthetic|e2e|rls)_[a-z0-9_]+$/i;
 
 export interface SyntheticSeedTargetInput {
@@ -18,7 +18,7 @@ export interface SyntheticSeedTarget {
 
 export function assertSyntheticSeedTarget(input: SyntheticSeedTargetInput): SyntheticSeedTarget {
   const profile = (input.profile ?? '').toUpperCase() as SyntheticProfile;
-  if (!PROFILE_NAMES.has(profile)) throw new Error('SYNTHETIC_PROFILE must be FUNCTIONAL, PILOT, or EDGE');
+  if (!PROFILE_NAMES.has(profile)) throw new Error('SYNTHETIC_PROFILE must be FUNCTIONAL, TIER1, PILOT, or EDGE');
   if (input.nodeEnv !== 'test') throw new Error('Synthetic profiles require NODE_ENV=test');
   if (!input.connectionString) throw new Error('SYNTHETIC_DATABASE_URL or DATABASE_MIGRATION_URL is required');
 
@@ -32,4 +32,3 @@ export function assertSyntheticSeedTarget(input: SyntheticSeedTargetInput): Synt
   }
   return { profile, databaseName, connectionString: input.connectionString };
 }
-

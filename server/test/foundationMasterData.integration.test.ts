@@ -138,6 +138,26 @@ describe('foundation clinic and workforce master-data integrity', () => {
     expect(valid.json().timezone).toBe('America/Los_Angeles');
   });
 
+  it('lists only the assigned clinic for a branch-scoped user', async () => {
+    const t = await fixture();
+    const token = app.jwt.sign({
+      tenantId: t.tenantId,
+      userId: t.target.id,
+      role: 'FRONT_DESK',
+      branchId: t.branchA.id,
+      type: 'access',
+      sessionIssuedAtMs: Date.now(),
+    });
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/branches',
+      headers: { authorization: `Bearer ${token}`, 'x-forwarded-for': '198.51.100.210' },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().data).toHaveLength(1);
+    expect(response.json().data[0].id).toBe(t.branchA.id);
+  });
+
   it('rejects foreign, inactive, or unselected primary clinic access without damaging existing access', async () => {
     const t = await fixture();
     const other = await fixture();

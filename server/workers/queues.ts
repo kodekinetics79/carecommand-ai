@@ -1,4 +1,5 @@
 import { Queue, type ConnectionOptions } from 'bullmq';
+import { randomUUID } from 'node:crypto';
 import { env } from '../config/env';
 import { currentTraceCarrier, type TraceCarrier } from '../lib/traceContext';
 import { createTenantJobEnvelope, tenantJobId, type TenantJobEnvelope } from '../lib/jobEnvelope';
@@ -6,10 +7,17 @@ import { createTenantJobEnvelope, tenantJobId, type TenantJobEnvelope } from '..
 export interface AutopilotExecutionJob {
   approvalId: string;
   tenantId: string;
+  dispatchAttemptId: string;
   // W3C trace context captured at enqueue so the worker's span is a child of
   // the request that triggered it (one trace_id spans request → job → worker).
   _otel?: TraceCarrier;
 }
+
+export type EnqueueAutopilotExecutionResult = {
+  state: 'queued' | 'disabled';
+  jobId: string;
+  dispatchAttemptId: string;
+};
 
 // Queues need Redis. On Redis-less deploys (serverless) set QUEUES_ENABLED=false:
 // no connection is opened, the app boots, request routes all work, and background
@@ -51,12 +59,28 @@ export const autopilotQueue: Queue<AutopilotExecutionJob, void, 'execute-approve
     })
   : disabledQueue('autopilot-execution');
 
-export async function enqueueAutopilotExecution(data: AutopilotExecutionJob) {
-  await autopilotQueue.add(
+export async function enqueueAutopilotExecution(input: {
+  approvalId: string;
+  tenantId: string;
+  dispatchAttemptId?: string;
+  _otel?: TraceCarrier;
+}): Promise<EnqueueAutopilotExecutionResult> {
+  const dispatchAttemptId = input.dispatchAttemptId ?? randomUUID();
+  const data: AutopilotExecutionJob = {
+    approvalId: input.approvalId,
+    tenantId: input.tenantId,
+    dispatchAttemptId,
+    _otel: input._otel ?? currentTraceCarrier(),
+  };
+  const job = await autopilotQueue.add(
     'execute-approved-action',
-    { ...data, _otel: data._otel ?? currentTraceCarrier() },
+    { ...data },
     { jobId: `autopilot-approval-${data.approvalId}` },
   );
+  const jobId = `autopilot-approval-${data.approvalId}`;
+  return job
+    ? { state: 'queued', jobId: job.id ?? jobId, dispatchAttemptId }
+    : { state: 'disabled', jobId, dispatchAttemptId };
 }
 
 // ---- Compliance maintenance queue -----------------------------------------

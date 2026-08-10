@@ -20,8 +20,11 @@ const branchInput = z.object({
 export const branchRoutes: FastifyPluginAsync = async app => {
   app.get('/', async request => {
     const query = paginationSchema.parse(request.query);
+    const scope = branchScope(request);
     const rows = await db.branch.findMany({
-      where: { tenantId: request.auth.tenantId, ...branchScope(request) },
+      // Branch-scoped actors may only list their assigned Branch. Other models
+      // expose this relationship as `branchId`; on Branch itself the key is `id`.
+      where: { tenantId: request.auth.tenantId, ...(scope.branchId ? { id: scope.branchId } : {}) },
       orderBy: { id: 'asc' },
       cursor: query.cursor ? { id: query.cursor } : undefined,
       skip: query.cursor ? 1 : 0,

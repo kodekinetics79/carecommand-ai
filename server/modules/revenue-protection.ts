@@ -2875,7 +2875,10 @@ export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
       const successResult = await db.$transaction(async tx => {
         const locked = await lockStripeReconciliation(tx, eventId, paymentRequest.id);
         if (locked.eventComplete) return 'duplicate' as const;
-        if (!['pending', 'link_sent', 'provider_pending', 'reconciliation_required', 'reconciliation_required_paid'].includes(locked.paymentStatus ?? '')) {
+        // A provider may deliver a failure/expiry before the eventual success
+        // for the same payment intent/session. Those states describe the last
+        // observed attempt, not proof that money can never settle later.
+        if (!['pending', 'link_sent', 'provider_pending', 'reconciliation_required', 'reconciliation_required_paid', 'failed', 'expired'].includes(locked.paymentStatus ?? '')) {
           await tx.idempotencyKey.updateMany({ where: { scope: 'stripe.webhook', key: event.id }, data: { resultId: paymentRequest.id } });
           return 'terminal_state' as const;
         }
@@ -2946,15 +2949,39 @@ export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
         request.log.warn({ err: error, eventId: event.id, operation: 'payment_success_workflow_event' }, 'Optional payment success workflow event fan-out failed');
       }
     } else if (refunded) {
-      // Refund: record a `refunded` transaction (reduces net revenueProtected), reverse
-      // the request/deposit collection state, and restore the patient's AR balance.
+      // Stripe's amount_refunded is cumulative. Persist only the delta beyond
+      // refunds already recorded for this request, keep a partial refund in the
+      // collected state, and restore AR by exactly that delta.
       const refundResult = await db.$transaction(async tx => {
         const locked = await lockStripeReconciliation(tx, eventId, paymentRequest.id);
         if (locked.eventComplete) return 'duplicate' as const;
-        if (locked.paymentStatus !== 'collected') {
-          await tx.idempotencyKey.updateMany({ where: { scope: 'stripe.webhook', key: event.id }, data: { resultId: paymentRequest.id } });
-          return 'terminal_state' as const;
+        const [settled, refundedSoFar] = await Promise.all([
+          tx.paymentTransaction.aggregate({
+            _sum: { amount: true },
+            where: { tenantId: paymentRequest.tenantId, paymentRequestId: paymentRequest.id, status: { in: ['succeeded', 'paid'] } },
+          }),
+          tx.paymentTransaction.aggregate({
+            _sum: { amount: true },
+            where: { tenantId: paymentRequest.tenantId, paymentRequestId: paymentRequest.id, status: 'refunded' },
+          }),
+        ]);
+        const settledTotal = roundMoney(toNumber(settled._sum.amount));
+        const priorRefundTotal = roundMoney(toNumber(refundedSoFar._sum.amount));
+
+        // Do not consume an out-of-order refund. Leaving resultId null makes the
+        // durable webhook claim reprocessable after the success event arrives.
+        if (settledTotal <= 0 || (locked.paymentStatus !== 'collected' && locked.paymentStatus !== 'refunded')) {
+          return 'awaiting_success' as const;
         }
+        const cumulativeRefundTotal = roundMoney(refundAmount);
+        if (cumulativeRefundTotal > settledTotal) return 'invalid_refund_total' as const;
+        const refundDelta = roundMoney(Math.max(0, cumulativeRefundTotal - priorRefundTotal));
+        if (refundDelta === 0) {
+          await tx.idempotencyKey.updateMany({ where: { scope: 'stripe.webhook', key: event.id }, data: { resultId: paymentRequest.id } });
+          return 'no_change' as const;
+        }
+        const fullyRefunded = cumulativeRefundTotal >= settledTotal;
+        const remainingCollected = roundMoney(settledTotal - cumulativeRefundTotal);
         await tx.paymentTransaction.create({
           data: {
             tenantId: paymentRequest.tenantId,
@@ -2962,23 +2989,23 @@ export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
             patientId: paymentRequest.patientId ?? undefined,
             appointmentId: paymentRequest.appointmentId ?? undefined,
             paymentRequestId: paymentRequest.id,
-            amount: refundAmount,
+            amount: refundDelta,
             currency: paymentRequest.currency,
             status: 'refunded',
             mode: paymentRequest.mode,
             providerReference: typeof object.id === 'string' ? object.id : paymentRequest.providerReference ?? undefined,
             receivedAt: new Date(),
-            rawResponse: { eventId: event.id, type: event.type, source: 'stripe-webhook', refundAmount },
+            rawResponse: { eventId: event.id, type: event.type, source: 'stripe-webhook', refundAmount: refundDelta, cumulativeRefundTotal },
           },
         });
-        await tx.paymentRequest.update({ where: { id: paymentRequest.id }, data: { status: 'refunded' } });
+        await tx.paymentRequest.update({ where: { id: paymentRequest.id }, data: { status: fullyRefunded ? 'refunded' : 'collected' } });
         await tx.depositRequirement.updateMany({
-          where: { tenantId: paymentRequest.tenantId, paymentRequestId: paymentRequest.id, status: 'collected' },
-          data: { status: 'refunded', collectedAmount: 0 },
+          where: { tenantId: paymentRequest.tenantId, paymentRequestId: paymentRequest.id, status: { in: ['collected', 'refunded'] } },
+          data: { status: fullyRefunded ? 'refunded' : 'collected', collectedAmount: remainingCollected },
         });
         // AR reconciliation: a refund restores the previously-reduced outstanding balance.
         if (paymentRequest.patientId) {
-          await tx.patient.updateMany({ where: { id: paymentRequest.patientId, tenantId: paymentRequest.tenantId }, data: { outstandingBalance: { increment: refundAmount } } });
+          await tx.patient.updateMany({ where: { id: paymentRequest.patientId, tenantId: paymentRequest.tenantId }, data: { outstandingBalance: { increment: refundDelta } } });
         }
         await tx.integrationRunLog.create({
           data: {
@@ -2989,7 +3016,7 @@ export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
             operation: 'webhook.refund',
             status: 'success',
             requestSummary: { eventId: event.id, type: event.type },
-            responseSummary: { paymentRequestId: paymentRequest.id, refundAmount },
+            responseSummary: { paymentRequestId: paymentRequest.id, refundAmount: refundDelta, cumulativeRefundTotal },
           },
         });
         await tx.auditEvent.create({
@@ -2998,7 +3025,7 @@ export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
             action: 'payment.refunded',
             resource: 'paymentRequest',
             resourceId: paymentRequest.id,
-            metadata: { eventId: event.id, appointmentId: paymentRequest.appointmentId, refundAmount },
+            metadata: { eventId: event.id, appointmentId: paymentRequest.appointmentId, refundAmount: refundDelta, cumulativeRefundTotal, fullyRefunded },
           },
         });
         // A refund is complete only when its money state and mandatory audit
@@ -3008,7 +3035,9 @@ export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
         return 'processed' as const;
       });
       if (refundResult === 'duplicate') return reply.code(200).send({ received: true, duplicate: true });
-      if (refundResult === 'terminal_state') return reply.code(200).send({ received: true, ignored: 'terminal_payment_state' });
+      if (refundResult === 'awaiting_success') return reply.code(409).send({ received: false, retryable: true, deferred: 'awaiting_success' });
+      if (refundResult === 'invalid_refund_total') return reply.code(409).send({ received: false, retryable: false, error: 'refund_exceeds_settled_amount' });
+      if (refundResult === 'no_change') return reply.code(200).send({ received: true, duplicateEconomicEffect: true });
     } else if (disputed) {
       // The durable dispute fact, its mandatory audit evidence, and webhook
       // completion are one unit. The operational alert is downstream fan-out:

@@ -1,5 +1,29 @@
 # Test Execution Evidence
 
+## 2026-08-10 Tier 1 simulation checkpoint (current)
+
+This section supersedes older snapshots for the current dirty tree. Environment: local macOS, Node 24, PostgreSQL 17 and Redis 7 containers, synthetic data only; no production/PHI/provider transaction.
+
+| Command / probe | Result |
+|---|---|
+| Zero-to-head migrations plus `TIER1` seed through disposable wrapper | PASS: 86 migrations; 4 tenants, 8 clinics, 40 users, 1,000 patients, 1,600 appointments, 400 calls, 250 payments, 500 documents, 1,000 notifications, 2,000 audits; database dropped |
+| `npx vitest run prisma/synthetic/...` focused catalog suite | PASS: 3/3 |
+| Core clinic disposable regression | PASS: 5 files, 36/36 tests, 77.67 s |
+| Finance post-fix regression | PASS: 3 files, 42/42 tests, 70.09 s |
+| Worker real Postgres/Redis regression | PASS: 4/4 tests |
+| Autopilot route/recovery regression | PASS: 11/11 only with explicit 30 s timeout; 101-row recovery took about 17.5 s |
+| Voice consent/DNC disposable race suite | PASS: 13/13 |
+| `server/test/appContentIntegrity.unit.test.ts` | PASS: 14/14 |
+| Branch-scope focused foundation test | PASS: 1/1 selected test |
+| `npx tsc -p tsconfig.app.json --noEmit` | PASS |
+| `npm run verify:no-production-demo-artifacts` | PASS |
+| Real local Chrome desktop/mobile scenarios | Completed; three defects reproduced and corrected, with corrected behavior observed |
+| Full disposable `npm test` | FAIL: 106 files passed / 3 timed out; 1,899 tests passed / 3 timed out (1,902 total), 1,039.75 s |
+| Focused rerun of the three timed-out files with 30 s ceiling | PASS: 3 files, 60/60 tests, 125.50 s; demonstrates functional pass but default performance gate failure |
+| `npm run check` | FAIL at lint after Prisma validation and API typecheck passed: two pre-existing `no-explicit-any` errors in untracked `.playwright-no-server.config.ts`; build stage not reached |
+
+Chrome used the real local API and web app. Live telephony, real payments/claims, object upload, and email delivery were not exercised. Full logs are retained at `/tmp/carecommand-wave-full-test.log` for this local session only. The full-regression timeouts were `autopilotRecovery.integration` (101-row page), `endpointAuthorization.integration`, and `receptionistBooking.integration`; none failed an assertion under the focused 30-second rerun.
+
 Date: 2026-07-31
 Environment: local macOS workspace; Node 24; PostgreSQL 17 and Redis 7 in local containers; synthetic data only. No production system or real PHI was accessed.
 

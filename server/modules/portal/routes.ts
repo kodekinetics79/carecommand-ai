@@ -415,11 +415,55 @@ export const portalRoutes: FastifyPluginAsync = async app => {
       return { id: existing.id, status: 'pending_review', deduped: true };
     }
     const branchId = patient?.branchId ?? (await firstBranch(tenantId));
-    const row = await db.$transaction(async tx => {
-      const created = await tx.patientInsurancePolicy.create({ data: { tenantId, branchId, patientId, planName: body.planName, memberId: body.memberId, groupNumber: body.groupNumber, subscriberName: body.subscriberName, verificationStatus: 'pending', active: true } });
-      await portalAudit(tenantId, 'portal.insurance.updated', created.id, request, undefined, { critical: true, tx });
-      return created;
-    });
+    let row: { id: string };
+    try {
+      row = await db.$transaction(async tx => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${tenantId}), hashtext(${patientId}))`;
+        const activePolicies = await tx.patientInsurancePolicy.findMany({
+          where: { tenantId, patientId, active: true },
+          select: { coverageOrder: true, effectiveFrom: true, effectiveTo: true },
+          orderBy: { coverageOrder: 'asc' },
+        });
+        const effectiveFrom = new Date();
+        const occupiedOrders = new Set(
+          activePolicies
+            .filter(policy => policyRangesOverlap(effectiveFrom, null, policy.effectiveFrom, policy.effectiveTo))
+            .map(policy => policy.coverageOrder),
+        );
+        let coverageOrder = 1;
+        while (occupiedOrders.has(coverageOrder)) {
+          coverageOrder += 1;
+          if (coverageOrder > 9) throw new Error('INSURANCE_POLICY_MAX_DEPTH');
+        }
+
+        const created = await tx.patientInsurancePolicy.create({
+          data: {
+            tenantId,
+            branchId,
+            patientId,
+            planName: body.planName,
+            memberId: body.memberId,
+            groupNumber: body.groupNumber,
+            subscriberName: body.subscriberName,
+            verificationStatus: 'pending',
+            active: true,
+            coverageOrder,
+            effectiveFrom,
+            payerReference: body.memberId,
+          },
+        });
+        await portalAudit(tenantId, 'portal.insurance.updated', created.id, request, undefined, { critical: true, tx });
+        return created;
+      }, { isolationLevel: 'Serializable' });
+    } catch (error) {
+      if ((error instanceof Error && error.message === 'INSURANCE_POLICY_MAX_DEPTH') || isPolicyRangeConflict(error)) {
+        return reply.code(409).send({
+          error: 'insurance_policy_conflict',
+          message: 'Coverage at this order overlaps an existing active policy. Please review your existing policy first, then retry.',
+        });
+      }
+      throw error;
+    }
     return reply.code(201).send({ id: row.id, status: 'pending_review', deduped: false });
   });
   app.patch('/insurance/:policyId', async (request, reply) => {
@@ -582,6 +626,21 @@ export const portalRoutes: FastifyPluginAsync = async app => {
 // ---- helpers ---------------------------------------------------------------
 function safeAppt(a: { id: string; service: string; startsAt: Date; endsAt: Date; status: string; providerRef: string | null }) {
   return { id: a.id, service: a.service, startsAt: a.startsAt.toISOString(), endsAt: a.endsAt.toISOString(), status: a.status, provider: a.providerRef };
+}
+function isPolicyRangeConflict(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const anyErr = error as { code?: string; meta?: { code?: string; constraint?: unknown }; message?: string };
+  const dbCode = anyErr.code ?? anyErr.meta?.code;
+  if (dbCode === 'P2004' || dbCode === 'P2034' || dbCode === '23P01') return true;
+  if (typeof anyErr.message === 'string' && anyErr.message.includes('PatientInsurancePolicy_active_order_range_excl')) return true;
+  return false;
+}
+function policyRangesOverlap(aStart: Date, aEnd: Date | null, bStart: Date, bEnd: Date | null): boolean {
+  const left = aStart.getTime();
+  const right = aEnd ? aEnd.getTime() : Number.POSITIVE_INFINITY;
+  const otherLeft = bStart.getTime();
+  const otherRight = bEnd ? bEnd.getTime() : Number.POSITIVE_INFINITY;
+  return left < otherRight && otherLeft < right;
 }
 function safePaymentUrl(value: string | null): string | null {
   if (!value) return null;

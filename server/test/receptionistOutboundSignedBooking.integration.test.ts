@@ -93,8 +93,9 @@ describe('outbound receptionist to signed canonical booking', () => {
       tenantId, branchId: branch.id, firstName: 'Outbound', lastName: 'Patient',
       phone: patientPhone, dateOfBirth: new Date('1990-01-02T00:00:00.000Z'), lifecycleStage: 'ACTIVE', tags: [],
     } });
+    const clinicPhone = `+1${(BigInt(`0x${tenantId.replaceAll('-', '').slice(0, 14)}`) % 9_000_000_000n + 1_000_000_000n).toString().slice(-10)}`;
     const clinic = await db.receptionistClinic.create({ data: {
-      tenantId, name: 'Pilot Clinic', phone: '+15550000002', timezone: 'UTC',
+      tenantId, name: 'Pilot Clinic', phone: clinicPhone, timezone: 'UTC',
     } });
     const location = await db.receptionistLocation.create({ data: {
       tenantId, clinicId: clinic.id, branchId: branch.id, name: 'Canonical Front Desk',
