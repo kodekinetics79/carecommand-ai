@@ -26,6 +26,8 @@ export interface NormalizedEligibility {
   message: string;
   payerReference: string | null;
   checkedAt: string;
+  effectiveFrom?: string | null;
+  expiresAt?: string | null;
 }
 
 export interface EligibilityResult {

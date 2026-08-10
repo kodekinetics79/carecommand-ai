@@ -17,7 +17,10 @@ ALTER TABLE "EligibilityVerification" ALTER COLUMN "deductibleRemaining" DROP DE
 ALTER TABLE "EligibilityVerification" ALTER COLUMN "deductibleRemaining" DROP NOT NULL;
 ALTER TABLE "EligibilityVerification" ALTER COLUMN "coinsurance" DROP DEFAULT;
 ALTER TABLE "EligibilityVerification" ALTER COLUMN "coinsurance" DROP NOT NULL;
-ALTER TABLE "EligibilityVerification" ADD COLUMN "decisionSource" TEXT NOT NULL DEFAULT 'PAYER_RESPONSE';
+-- Historical rows include simulator/mock responses whose provenance cannot be
+-- reconstructed safely. Never backfill them as payer-verified.
+ALTER TABLE "EligibilityVerification" ADD COLUMN "decisionSource" TEXT NOT NULL DEFAULT 'LEGACY_UNVERIFIED';
+ALTER TABLE "EligibilityVerification" ADD COLUMN "effectiveFrom" TIMESTAMP(3);
 ALTER TABLE "EligibilityVerification" ADD COLUMN "expiresAt" TIMESTAMP(3);
 
 -- The existing migration-owned rls_uq_* indexes already provide the unique
@@ -33,6 +36,7 @@ CREATE TABLE "EligibilityExecution" (
   "policyId" UUID,
   "actorUserId" UUID,
   "idempotencyKeyHash" TEXT NOT NULL,
+  "hmacKeyVersion" TEXT NOT NULL,
   "requestFingerprint" TEXT NOT NULL,
   "requestContract" TEXT NOT NULL,
   "providerKey" TEXT NOT NULL,
@@ -77,5 +81,40 @@ CREATE POLICY "rls_eligibility_execution_update" ON "EligibilityExecution"
   WITH CHECK (app_rls_tenant_allowed("tenantId"));
 CREATE POLICY "rls_eligibility_execution_delete" ON "EligibilityExecution"
   FOR DELETE TO app_rls USING (app_rls_tenant_allowed("tenantId"));
-
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE "EligibilityExecution" TO app_rls;
+
+CREATE FUNCTION eligibility_execution_integrity_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'EligibilityExecution rows are durable and cannot be deleted' USING ERRCODE = '23514';
+  END IF;
+  IF TG_OP = 'UPDATE' AND ROW(NEW."tenantId", NEW."branchId", NEW."patientId", NEW."appointmentId", NEW."payerId", NEW."policyId", NEW."actorUserId",
+         NEW."idempotencyKeyHash", NEW."hmacKeyVersion", NEW."requestFingerprint", NEW."requestContract", NEW."providerKey", NEW."providerMode",
+         NEW."providerExecutionKey", NEW."claimedAt", NEW."createdAt")
+     IS DISTINCT FROM
+     ROW(OLD."tenantId", OLD."branchId", OLD."patientId", OLD."appointmentId", OLD."payerId", OLD."policyId", OLD."actorUserId",
+         OLD."idempotencyKeyHash", OLD."hmacKeyVersion", OLD."requestFingerprint", OLD."requestContract", OLD."providerKey", OLD."providerMode",
+         OLD."providerExecutionKey", OLD."claimedAt", OLD."createdAt") THEN
+    RAISE EXCEPTION 'EligibilityExecution identity fields are immutable' USING ERRCODE = '23514';
+  END IF;
+  IF TG_OP = 'UPDATE' AND NEW.status IS DISTINCT FROM OLD.status AND NOT (
+    (OLD.status = 'READY' AND NEW.status = 'PROVIDER_IN_FLIGHT') OR
+    (OLD.status = 'PROVIDER_IN_FLIGHT' AND NEW.status IN ('SUCCEEDED', 'FAILED_DEFINITIVE', 'RECONCILIATION_REQUIRED')) OR
+    (OLD.status = 'RECONCILIATION_REQUIRED' AND NEW.status IN ('READY', 'FAILED_DEFINITIVE'))
+  ) THEN
+    RAISE EXCEPTION 'Illegal EligibilityExecution state transition: % -> %', OLD.status, NEW.status USING ERRCODE = '23514';
+  END IF;
+  IF (NEW.status = 'READY' AND (NEW."providerStartedAt" IS NOT NULL OR NEW."resultVerificationId" IS NOT NULL OR NEW."completedAt" IS NOT NULL OR NEW."failureCode" IS NOT NULL))
+    OR (NEW.status = 'PROVIDER_IN_FLIGHT' AND (NEW."providerStartedAt" IS NULL OR NEW."resultVerificationId" IS NOT NULL OR NEW."completedAt" IS NOT NULL))
+    OR (NEW.status = 'SUCCEEDED' AND (NEW."resultVerificationId" IS NULL OR NEW."providerStartedAt" IS NULL OR NEW."providerCompletedAt" IS NULL OR NEW."completedAt" IS NULL OR NEW."failureCode" IS NOT NULL))
+    OR (NEW.status = 'FAILED_DEFINITIVE' AND (NEW."resultVerificationId" IS NOT NULL OR NEW."failureCode" IS NULL OR NEW."completedAt" IS NULL))
+    OR (NEW.status = 'RECONCILIATION_REQUIRED' AND (NEW."resultVerificationId" IS NOT NULL OR NEW."reconciliationReason" IS NULL)) THEN
+    RAISE EXCEPTION 'EligibilityExecution state fields are inconsistent with status %', NEW.status USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER eligibility_execution_integrity_guard
+BEFORE INSERT OR UPDATE OR DELETE ON "EligibilityExecution"
+FOR EACH ROW EXECUTE FUNCTION eligibility_execution_integrity_guard();

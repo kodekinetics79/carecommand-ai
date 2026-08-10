@@ -126,6 +126,24 @@ describe('#6 Stedi normalizer does not invent coverage when the 271 omits fields
     expect(outcome.deductibleRemaining).toBe(300);
     expect(outcome.coinsurance).toBe(0.1);
   });
+
+  it.each([{}, { benefitsInformation: [{}] }, { benefitsInformation: [{ coverageStatus: { malformed: true } }] }])('never treats an empty or malformed 2xx payload as active coverage', payload => {
+    const outcome = new StediEligibilityProvider().normalizeEligibilityResponse(payload, { tenantId: randomUUID() });
+    expect(outcome.coverageActive).toBe(false);
+    expect(outcome.coverageStatus).toBe('uncertain');
+    expect(outcome.benefitUncertainty).toBe(true);
+    expect(outcome.eligibilityMessage).toContain('not confirmed');
+  });
+
+  it('preserves payer effective/end dates exactly and leaves omitted dates unknown', () => {
+    const provider = new StediEligibilityProvider();
+    const dated = provider.normalizeEligibilityResponse({ benefitsInformation: [{ coverageStatus: 'active', effectiveDate: '2026-01-01', terminationDate: '2026-12-31' }] }, { tenantId: randomUUID() });
+    expect(dated.effectiveFrom).toBe('2026-01-01T00:00:00.000Z');
+    expect(dated.expiresAt).toBe('2026-12-31T00:00:00.000Z');
+    const omitted = provider.normalizeEligibilityResponse({ benefitsInformation: [{ coverageStatus: 'active' }] }, { tenantId: randomUUID() });
+    expect(omitted.effectiveFrom).toBeNull();
+    expect(omitted.expiresAt).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------

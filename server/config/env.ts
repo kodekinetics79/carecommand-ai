@@ -97,6 +97,13 @@ const baseEnvSchema = z.object({
   RLS_ENFORCE_RUNTIME_ROLE: booleanString(false),
   JWT_SECRET: z.string().min(32),
   JWT_REFRESH_SECRET: z.string().min(32),
+  // Stable, versioned key for eligibility request/idempotency fingerprints.
+  // This must not share the routinely rotated JWT secrets in real deployments.
+  ELIGIBILITY_HMAC_SECRET: z.string().min(32).optional(),
+  ELIGIBILITY_HMAC_KEY_VERSION: z.string().regex(/^[A-Za-z0-9._-]{1,32}$/).default('v1'),
+  // Optional one-generation dual-read key for controlled rotations.
+  ELIGIBILITY_HMAC_PREVIOUS_SECRET: z.string().min(32).optional(),
+  ELIGIBILITY_HMAC_PREVIOUS_KEY_VERSION: z.string().regex(/^[A-Za-z0-9._-]{1,32}$/).optional(),
   // Dedicated HMAC key for tenant-scoped BullMQ envelopes. Optional for a
   // staged rollout; JWT_REFRESH_SECRET is used with domain separation if unset.
   // The secret never appears in queue payloads.
@@ -233,6 +240,15 @@ const baseEnvSchema = z.object({
 // Cross-field production hardening. Exported so tests can exercise the schema
 // in isolation (see server/test/envSchema.test.ts).
 export const envSchema = baseEnvSchema.superRefine((cfg, ctx) => {
+  if ((cfg.NODE_ENV === 'production' || cfg.DEPLOYMENT_PROFILE !== 'demo') && !cfg.ELIGIBILITY_HMAC_SECRET) {
+    ctx.addIssue({ code: 'custom', path: ['ELIGIBILITY_HMAC_SECRET'], message: 'ELIGIBILITY_HMAC_SECRET is required outside local/demo development and must remain stable across JWT rotation.' });
+  }
+  if (Boolean(cfg.ELIGIBILITY_HMAC_PREVIOUS_SECRET) !== Boolean(cfg.ELIGIBILITY_HMAC_PREVIOUS_KEY_VERSION)) {
+    ctx.addIssue({ code: 'custom', path: ['ELIGIBILITY_HMAC_PREVIOUS_SECRET'], message: 'Previous eligibility HMAC secret and key version must be configured together.' });
+  }
+  if (cfg.ELIGIBILITY_HMAC_PREVIOUS_KEY_VERSION === cfg.ELIGIBILITY_HMAC_KEY_VERSION) {
+    ctx.addIssue({ code: 'custom', path: ['ELIGIBILITY_HMAC_PREVIOUS_KEY_VERSION'], message: 'Previous eligibility HMAC key version must differ from the current version.' });
+  }
   if (cfg.NODE_ENV === 'production' && cfg.QUEUE_NAMESPACE === 'carecommand-local') {
     ctx.addIssue({ code: 'custom', path: ['QUEUE_NAMESPACE'], message: 'QUEUE_NAMESPACE must be explicitly set to a deployment-unique value in production.' });
   }

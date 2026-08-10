@@ -6,9 +6,11 @@ import { fixtureDb } from './helpers/fixtureDb';
 import {
   EligibilityExecutionConflictError,
   eligibilityRequestIdentity,
+  eligibilityRequestIdentitiesForKeys,
   runEligibilityExecution,
 } from '../lib/eligibilityExecution';
 import { runWithTenantContext } from '../lib/tenantContext';
+import { db } from '../lib/db';
 
 const tenantIds: string[] = [];
 
@@ -109,6 +111,8 @@ describe('durable eligibility execution boundary', () => {
     expect(await fixtureDb.eligibilityExecution.count({ where: { tenantId: f.tenantId } })).toBe(1);
     expect(await fixtureDb.eligibilityVerification.count({ where: { tenantId: f.tenantId } })).toBe(1);
     expect(await fixtureDb.auditEvent.count({ where: { tenantId: f.tenantId, action: 'eligibility.checked' } })).toBe(1);
+    expect(await fixtureDb.auditEvent.count({ where: { tenantId: f.tenantId, action: 'eligibility.execution.requested' } })).toBe(1);
+    expect(await fixtureDb.businessEvent.count({ where: { tenantId: f.tenantId, eventType: 'insurance.eligibility.requested' } })).toBe(1);
   });
 
   it('rejects key reuse with a different PHI fingerprint and persists neither the raw key nor member identifier', async () => {
@@ -206,6 +210,41 @@ describe('durable eligibility execution boundary', () => {
     });
   });
 
+  it('resumes a durable READY intent after a crash-before-provider-call exactly once', async () => {
+    const f = await fixture();
+    const identity = eligibilityRequestIdentity(f.tenantId, 'crash-before-call-key', {
+      contract: 'insurance_v1', patientId: f.patientId, policyId: f.policyId, payerId: f.payerId, memberId: 'MEMBER-SECRET-9912',
+    });
+    await fixtureDb.eligibilityExecution.create({
+      data: {
+        ...f,
+        ...identity,
+        requestContract: 'insurance_v1',
+        providerKey: 'test',
+        providerMode: 'sandbox',
+        status: 'READY',
+      },
+    });
+    let calls = 0;
+    await inTenant(f, async () => {
+      const result = await runInput(f, {
+        key: 'crash-before-call-key',
+        provider: async () => { calls += 1; return { coverageStatus: 'ACTIVE' }; },
+      });
+      expect(result.replayed).toBe(false);
+    });
+    expect(calls).toBe(1);
+    expect(await fixtureDb.eligibilityExecution.findFirst({ where: { tenantId: f.tenantId } })).toMatchObject({ status: 'SUCCEEDED' });
+  });
+
+  it('fails closed for a suspended tenant before creating or resuming an execution', async () => {
+    const f = await fixture();
+    await fixtureDb.tenant.update({ where: { id: f.tenantId }, data: { status: 'suspended' } });
+    await expect(inTenant(f, () => runInput(f, { key: 'suspended-tenant-key' }))).rejects.toThrow('unknown, suspended, or archived');
+    expect(await fixtureDb.eligibilityExecution.count({ where: { tenantId: f.tenantId } })).toBe(0);
+    await fixtureDb.tenant.update({ where: { id: f.tenantId }, data: { status: 'active' } });
+  });
+
   it('namespaces identical idempotency keys and fingerprints by tenant', async () => {
     const a = await fixture();
     const b = await fixture();
@@ -221,5 +260,45 @@ describe('durable eligibility execution boundary', () => {
     const a = eligibilityRequestIdentity(tenantId, 'canonical-test-key', { patientId: 'p', memberId: 'm' });
     const b = eligibilityRequestIdentity(tenantId, 'canonical-test-key', { memberId: 'm', patientId: 'p' });
     expect(a).toEqual(b);
+  });
+
+  it('retains a deterministic prior-key identity candidate during HMAC rotation', () => {
+    const tenantId = randomUUID();
+    const candidates = eligibilityRequestIdentitiesForKeys(tenantId, 'rotation-replay-key', { patientId: 'p', memberId: 'secret-member' }, [
+      { version: 'v2', secret: 'current-eligibility-secret'.repeat(2) },
+      { version: 'v1', secret: 'previous-eligibility-secret'.repeat(2) },
+    ]);
+    expect(candidates.map(candidate => candidate.hmacKeyVersion)).toEqual(['v2', 'v1']);
+    expect(candidates[0]?.idempotencyKeyHash).not.toBe(candidates[1]?.idempotencyKeyHash);
+    expect(JSON.stringify(candidates)).not.toContain('rotation-replay-key');
+    expect(JSON.stringify(candidates)).not.toContain('secret-member');
+  });
+
+  it('denies same-tenant identity rewrites, deletion, and state corruption while allowing orchestration', async () => {
+    const f = await fixture();
+    const identity = eligibilityRequestIdentity(f.tenantId, 'database-guard-key', {
+      contract: 'insurance_v1', patientId: f.patientId, policyId: f.policyId, payerId: f.payerId, memberId: 'MEMBER-SECRET-9912',
+    });
+    const execution = await fixtureDb.eligibilityExecution.create({ data: {
+      ...f, ...identity, requestContract: 'insurance_v1', providerKey: 'test', providerMode: 'sandbox', status: 'READY',
+    } });
+    await inTenant(f, async () => {
+      await expect(db.eligibilityExecution.update({ where: { id: execution.id }, data: { requestFingerprint: '0'.repeat(64) } })).rejects.toThrow(/immutable/i);
+      await expect(db.eligibilityExecution.update({ where: { id: execution.id }, data: { status: 'SUCCEEDED' } })).rejects.toThrow(/state transition|state fields/i);
+      await expect(db.eligibilityExecution.delete({ where: { id: execution.id } })).rejects.toThrow();
+      await expect(runInput(f, { key: 'database-guard-key' })).resolves.toMatchObject({ replayed: false });
+    });
+    expect(await fixtureDb.eligibilityExecution.findUniqueOrThrow({ where: { id: execution.id } })).toMatchObject({ status: 'SUCCEEDED', requestFingerprint: identity.requestFingerprint });
+  });
+
+  it('defaults unverifiable legacy verification provenance truthfully', async () => {
+    const f = await fixture();
+    const row = await fixtureDb.eligibilityVerification.create({ data: {
+      tenantId: f.tenantId, branchId: f.branchId, patientId: f.patientId, providerMode: 'sandbox', coverageStatus: 'unknown',
+      planName: 'Legacy', payerName: 'Legacy', coverageActive: false, eligibilityMessage: 'Historical row', normalizedResponse: {},
+    } });
+    expect(row.decisionSource).toBe('LEGACY_UNVERIFIED');
+    expect(row.effectiveFrom).toBeNull();
+    expect(row.expiresAt).toBeNull();
   });
 });

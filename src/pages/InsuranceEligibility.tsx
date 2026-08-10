@@ -6,16 +6,17 @@ import EmptyStatePremium from '../components/ui/EmptyStatePremium';
 import { apiRequest } from '../lib/api';
 import { crmService, type CrmPatient } from '../lib/crmService';
 import { formatCurrency } from '../utils/formatters';
+import { eligibilityRequestHeaders, runEligibilityAction } from '../lib/eligibilityIdempotency';
 
 interface ProviderRow { key: string; displayName: string; status: string; mode: string }
 interface EligibilityResult {
   verificationId: string; status: string; coverageActive: boolean; planName: string; payerName: string;
   copay: number; deductibleRemaining: number; coinsurance: number; message: string; payerReference: string | null;
-  maskedMemberId: string | null; providerMode: string; checkedAt: string;
+  maskedMemberId: string | null; providerMode: string; checkedAt: string; effectiveFrom?: string | null; expiresAt?: string | null;
 }
 interface HistoryRow {
   id: string; patientName: string; coverageStatus: string; planName: string; payerName: string;
-  copay: number; deductibleRemaining: number; coinsurance: number; providerMode: string; checkedAt: string;
+  copay: number; deductibleRemaining: number; coinsurance: number; providerMode: string; checkedAt: string; effectiveFrom?: string | null; expiresAt?: string | null;
 }
 
 const STATUS: Record<string, { cls: string; icon: ElementType; label: string }> = {
@@ -61,10 +62,10 @@ export default function InsuranceEligibility() {
     if (!valid) return;
     setBusy(true); setError(null); setResult(null);
     try {
-      const res = await apiRequest<EligibilityResult>('/v1/insurance/eligibility/check', {
-        method: 'POST',
-        body: JSON.stringify({ patientId: form.patientId, payerName: form.payerName.trim(), memberId: form.memberId.trim(), planName: form.planName.trim() || undefined }),
-      });
+      const input = { patientId: form.patientId, payerName: form.payerName.trim(), memberId: form.memberId.trim(), planName: form.planName.trim() || undefined };
+      const res = await runEligibilityAction('insurance_v1', input, key => apiRequest<EligibilityResult>('/v1/insurance/eligibility/check', {
+        method: 'POST', headers: eligibilityRequestHeaders(key), body: JSON.stringify(input),
+      }));
       setResult(res);
       await loadHistory();
     } catch (e) { setError(e instanceof Error ? e.message : 'Eligibility check failed'); }
@@ -132,6 +133,8 @@ export default function InsuranceEligibility() {
                     <Row label="Deductible remaining" value={formatCurrency(result.deductibleRemaining)} />
                     <Row label="Coinsurance" value={`${result.coinsurance}%`} />
                     <Row label="Payer reference" value={result.payerReference ?? '—'} mono />
+                    <Row label="Coverage effective" value={result.effectiveFrom ? fmt(result.effectiveFrom) : 'Unknown — payer did not provide'} />
+                    <Row label="Coverage end" value={result.expiresAt ? fmt(result.expiresAt) : 'Unknown — payer did not provide'} />
                   </div>
                 </div>
               );

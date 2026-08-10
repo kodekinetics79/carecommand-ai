@@ -30,6 +30,7 @@ export const TENANT_APPEND_ONLY_TABLES = new Set([
  * cross-tenant attempts remain invisible through RLS.
  */
 export const TENANT_DELETE_PROTECTED_TABLES = new Set([
+  'EligibilityExecution',
   'Campaign',
   'CampaignDelivery',
 ]);

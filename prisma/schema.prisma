@@ -980,7 +980,8 @@ model EligibilityVerification {
   normalizedResponse      Json
   rawResponse             Json?
   checkedAt               DateTime                        @default(now())
-  decisionSource          String                          @default("PAYER_RESPONSE")
+  decisionSource          String                          @default("LEGACY_UNVERIFIED")
+  effectiveFrom           DateTime?
   expiresAt               DateTime?
   createdAt               DateTime                        @default(now())
   updatedAt               DateTime                        @updatedAt
@@ -1017,6 +1018,7 @@ model EligibilityExecution {
   policyId             String?                    @db.Uuid
   actorUserId          String?                    @db.Uuid
   idempotencyKeyHash   String
+  hmacKeyVersion       String
   requestFingerprint   String
   requestContract      String
   providerKey          String

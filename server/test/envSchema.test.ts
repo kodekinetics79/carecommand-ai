@@ -12,7 +12,17 @@ const base = {
   DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
   JWT_SECRET: 'x'.repeat(32),
   JWT_REFRESH_SECRET: 'y'.repeat(32),
+  ELIGIBILITY_HMAC_SECRET: 'e'.repeat(32),
 };
+
+describe('env schema — eligibility HMAC rotation', () => {
+  it('requires a dedicated stable secret in production and validates paired prior generations', () => {
+    const withoutEligibilitySecret = { ...productionProfile, ELIGIBILITY_HMAC_SECRET: undefined };
+    expect(envSchema.safeParse(withoutEligibilitySecret).success).toBe(false);
+    expect(envSchema.safeParse({ ...productionProfile, ELIGIBILITY_HMAC_PREVIOUS_SECRET: 'p'.repeat(32) }).success).toBe(false);
+    expect(envSchema.safeParse({ ...productionProfile, ELIGIBILITY_HMAC_PREVIOUS_SECRET: 'p'.repeat(32), ELIGIBILITY_HMAC_PREVIOUS_KEY_VERSION: 'v0' }).success).toBe(true);
+  });
+});
 
 const productionProfile = {
   ...base,

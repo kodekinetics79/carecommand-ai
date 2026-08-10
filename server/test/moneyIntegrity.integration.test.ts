@@ -158,6 +158,7 @@ describe('#5 insurance eligibility never presents a simulator result as a real p
     expect(res.json().message).toBe('An unexpected error occurred');
     const v = await db.eligibilityVerification.findFirst({ where: { tenantId: t.id, patientId: patient.id } });
     expect(v).toBeNull();
+    expect(await db.eligibilityExecution.count({ where: { tenantId: t.id } })).toBe(0);
   });
 });
 

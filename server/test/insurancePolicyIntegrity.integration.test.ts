@@ -78,6 +78,28 @@ describe('insurance policy integrity', () => {
     expect(mismatch.statusCode).toBe(400);
     const crossTenantPolicy = await app.inject({ method: 'POST', url: '/v1/insurance/eligibility/check', headers: b.headers, payload: { patientId: b.patientId, policyId, payerName: a.payerName, memberId: 'EXACT-0293' } });
     expect(crossTenantPolicy.statusCode).toBe(400);
+    expect(await db.eligibilityExecution.count({ where: { tenantId: a.tenantId } })).toBe(0);
+
+    const stalePatient = await db.patient.create({ data: { tenantId: a.tenantId, branchId: a.branchId, firstName: 'Stale', lastName: 'Policy' } });
+    const stalePolicy = await db.patientInsurancePolicy.create({
+      data: {
+        tenantId: a.tenantId,
+        branchId: a.branchId,
+        patientId: stalePatient.id,
+        payerId: a.payerId,
+        planName: 'Expired PPO',
+        memberId: 'STALE-0001',
+        effectiveFrom: new Date(Date.now() - 10 * 24 * 60 * 60_000),
+        effectiveTo: new Date(Date.now() - 24 * 60 * 60_000),
+      },
+    });
+    const stale = await app.inject({
+      method: 'POST', url: '/v1/insurance/eligibility/check', headers: { ...a.headers, 'idempotency-key': 'stale-policy-eligibility' },
+      payload: { patientId: stalePatient.id, policyId: stalePolicy.id, payerName: a.payerName, memberId: 'STALE-0001' },
+    });
+    expect(stale.statusCode).toBe(400);
+    expect(await db.eligibilityExecution.count({ where: { tenantId: a.tenantId } })).toBe(0);
+
     const exact = await app.inject({ method: 'POST', url: '/v1/insurance/eligibility/check', headers: { ...a.headers, 'idempotency-key': 'policy-integrity-exact-match' }, payload: { patientId: a.patientId, policyId, payerName: a.payerName, memberId: 'EXACT-0293' } });
     expect(exact.statusCode).toBe(201);
     const verification = await db.eligibilityVerification.findUniqueOrThrow({ where: { id: exact.json().verificationId as string } });

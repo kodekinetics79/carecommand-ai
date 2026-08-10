@@ -41,6 +41,13 @@ afterAll(async () => {
 });
 
 describe('RLS catalog guard — every tenant-owned model is deny-by-default', () => {
+  it('keeps the committed coverage matrix classified for every tenant-owned schema table', () => {
+    const matrix = readFileSync(new URL('../../docs/security/RLS_COVERAGE_MATRIX.md', import.meta.url), 'utf8');
+    const missing = schemaTenantTables().filter(table => !matrix.includes(`| \`${table}\` |`));
+    expect(missing, 'tenant-owned schema tables missing from the authoritative RLS coverage matrix').toEqual([]);
+    expect(matrix).not.toContain('UNCLASSIFIED');
+  });
+
   it('keeps the deployed catalog synchronized with tenant ownership in the Prisma schema', async () => {
     const expected = schemaTenantTables();
     const rows = await db.$queryRaw<Array<{ tableName: string }>>`

@@ -253,6 +253,7 @@ describe('insurance provider registry + eligibility (integration)', () => {
 
   it('lists and resolves ambiguous executions without fabricating successful payer data', async () => {
     const t = await makeTenant('enterprise');
+    const other = await makeTenant('enterprise');
     const execution = await db.eligibilityExecution.create({
       data: {
         tenantId: t.id,
@@ -261,6 +262,7 @@ describe('insurance provider registry + eligibility (integration)', () => {
         policyId: t.activePolicyId,
         actorUserId: t.adminUserId,
         idempotencyKeyHash: 'a'.repeat(64),
+        hmacKeyVersion: 'v1',
         requestFingerprint: 'b'.repeat(64),
         requestContract: 'insurance_v1',
         providerKey: 'stedi',
@@ -269,17 +271,48 @@ describe('insurance provider registry + eligibility (integration)', () => {
         reconciliationReason: 'provider_outcome_ambiguous',
       },
     });
+    const abandonedReady = await db.eligibilityExecution.create({
+      data: {
+        tenantId: t.id,
+        branchId: t.branchId,
+        patientId: t.patientId,
+        policyId: t.inactivePolicyId,
+        actorUserId: t.adminUserId,
+        idempotencyKeyHash: 'c'.repeat(64),
+        hmacKeyVersion: 'v1',
+        requestFingerprint: 'd'.repeat(64),
+        requestContract: 'insurance_v1',
+        providerKey: 'stedi',
+        providerMode: 'sandbox',
+        status: 'READY',
+        createdAt: new Date(Date.now() - 10 * 60_000),
+      },
+    });
     const admin = auth(tok(t.id, t.adminUserId));
+    const unauthenticated = await app.inject({ method: 'GET', url: '/v1/insurance/eligibility/executions/reconciliation' });
+    expect(unauthenticated.statusCode).toBe(401);
+    const crossTenant = await app.inject({
+      method: 'POST', url: `/v1/insurance/eligibility/executions/${execution.id}/reconcile`, headers: auth(tok(other.id, other.adminUserId)),
+      payload: { resolution: 'confirmed_failed', reason: 'Cross tenant attempt must not resolve' },
+    });
+    expect(crossTenant.statusCode).toBe(404);
     const list = await app.inject({ method: 'GET', url: '/v1/insurance/eligibility/executions/reconciliation', headers: admin });
     expect(list.statusCode).toBe(200);
     expect(list.json()).toEqual(expect.arrayContaining([expect.objectContaining({ id: execution.id, status: 'RECONCILIATION_REQUIRED' })]));
+    expect(list.json()).toEqual(expect.arrayContaining([expect.objectContaining({
+      id: abandonedReady.id,
+      status: 'READY',
+      operatorState: 'safe_to_resume_with_original_idempotency_key',
+      providerCallMayHaveOccurred: false,
+    })]));
 
     const fabricatedSuccess = await app.inject({
       method: 'POST', url: `/v1/insurance/eligibility/executions/${execution.id}/reconcile`, headers: admin,
       payload: { resolution: 'confirmed_succeeded', reason: 'Staff cannot invent a provider result' },
     });
     expect(fabricatedSuccess.statusCode).toBe(409);
-    expect(fabricatedSuccess.json().status).toBe('provider_retrieval_required');
+    expect(fabricatedSuccess.json()).toMatchObject({ status: 'manual_evidence_pending', providerRetrievalSupported: false });
+    expect(fabricatedSuccess.json().allowedActions).toEqual(['confirmed_not_submitted', 'confirmed_failed']);
 
     const safeReset = await app.inject({
       method: 'POST', url: `/v1/insurance/eligibility/executions/${execution.id}/reconcile`, headers: admin,

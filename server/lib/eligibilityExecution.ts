@@ -32,17 +32,38 @@ function canonicalize(value: unknown): string {
   return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${canonicalize(record[key])}`).join(',')}}`;
 }
 
-function eligibilityHmac(domain: string, value: string): string {
-  return createHmac('sha256', env.JWT_REFRESH_SECRET)
+function eligibilityHmac(secret: string, domain: string, value: string): string {
+  return createHmac('sha256', secret)
     .update(`carecommand:${domain}:v1\0${value}`)
     .digest('hex');
 }
 
+export function eligibilityRequestIdentitiesForKeys(
+  tenantId: string,
+  rawKey: string,
+  fingerprintParts: Record<string, unknown>,
+  keys: ReadonlyArray<{ version: string; secret: string }>,
+) {
+  return keys.map(key => ({
+    hmacKeyVersion: key.version,
+    idempotencyKeyHash: eligibilityHmac(key.secret, 'eligibility-idempotency', `${tenantId}\0${rawKey}`),
+    requestFingerprint: eligibilityHmac(key.secret, 'eligibility-request', canonicalize({ tenantId, ...fingerprintParts })),
+  }));
+}
+
 export function eligibilityRequestIdentity(tenantId: string, rawKey: string, fingerprintParts: Record<string, unknown>) {
-  return {
-    idempotencyKeyHash: eligibilityHmac('eligibility-idempotency', `${tenantId}\0${rawKey}`),
-    requestFingerprint: eligibilityHmac('eligibility-request', canonicalize({ tenantId, ...fingerprintParts })),
-  };
+  return eligibilityRequestIdentitiesForKeys(tenantId, rawKey, fingerprintParts, [{
+    version: env.ELIGIBILITY_HMAC_KEY_VERSION,
+    secret: env.ELIGIBILITY_HMAC_SECRET ?? env.JWT_SECRET,
+  }])[0]!;
+}
+
+function eligibilityRequestIdentityCandidates(tenantId: string, rawKey: string, fingerprintParts: Record<string, unknown>) {
+  const keys = [{ version: env.ELIGIBILITY_HMAC_KEY_VERSION, secret: env.ELIGIBILITY_HMAC_SECRET ?? env.JWT_SECRET }];
+  if (env.ELIGIBILITY_HMAC_PREVIOUS_SECRET && env.ELIGIBILITY_HMAC_PREVIOUS_KEY_VERSION) {
+    keys.push({ version: env.ELIGIBILITY_HMAC_PREVIOUS_KEY_VERSION, secret: env.ELIGIBILITY_HMAC_PREVIOUS_SECRET });
+  }
+  return eligibilityRequestIdentitiesForKeys(tenantId, rawKey, fingerprintParts, keys);
 }
 
 type ExecutionContext = {
@@ -77,18 +98,20 @@ export type EligibilityExecutionResult<TResult> = {
 };
 
 async function createOrLoadExecution<TOutcome, TResult>(input: RunEligibilityExecutionInput<TOutcome, TResult>) {
-  const { idempotencyKeyHash, requestFingerprint } = eligibilityRequestIdentity(
+  const identities = eligibilityRequestIdentityCandidates(
     input.context.tenantId,
     input.rawIdempotencyKey,
     input.fingerprintParts,
   );
+  const [{ idempotencyKeyHash, requestFingerprint, hmacKeyVersion }] = identities;
   return db.$transaction(async tx => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`eligibility:${input.context.tenantId}:${idempotencyKeyHash}`}, 0))`;
-    const existing = await tx.eligibilityExecution.findUnique({
-      where: { tenantId_idempotencyKeyHash: { tenantId: input.context.tenantId, idempotencyKeyHash } },
+    const existing = await tx.eligibilityExecution.findFirst({
+      where: { tenantId: input.context.tenantId, OR: identities.map(identity => ({ idempotencyKeyHash: identity.idempotencyKeyHash })) },
     });
     if (existing) {
-      if (existing.requestFingerprint !== requestFingerprint) {
+      const matchingIdentity = identities.find(identity => identity.hmacKeyVersion === existing.hmacKeyVersion);
+      if (!matchingIdentity || existing.requestFingerprint !== matchingIdentity.requestFingerprint) {
         throw new EligibilityExecutionConflictError('idempotency_key_reused', existing.id);
       }
       if (
@@ -114,7 +137,7 @@ async function createOrLoadExecution<TOutcome, TResult>(input: RunEligibilityExe
       }
       return existing;
     }
-    return tx.eligibilityExecution.create({
+    const created = await tx.eligibilityExecution.create({
       data: {
         tenantId: input.context.tenantId,
         branchId: input.context.branchId,
@@ -124,12 +147,42 @@ async function createOrLoadExecution<TOutcome, TResult>(input: RunEligibilityExe
         policyId: input.context.policyId ?? undefined,
         actorUserId: input.context.actorUserId ?? undefined,
         idempotencyKeyHash,
+        hmacKeyVersion,
         requestFingerprint,
         requestContract: input.requestContract,
         providerKey: input.providerKey,
         providerMode: input.providerMode,
       },
     });
+    await tx.auditEvent.create({
+      data: {
+        tenantId: input.context.tenantId,
+        actorUserId: input.context.actorUserId ?? undefined,
+        action: 'eligibility.execution.requested',
+        resource: 'eligibilityExecution',
+        resourceId: created.id,
+        requestId: input.context.requestId,
+        ipAddress: input.context.ipAddress,
+        userAgent: input.context.userAgent,
+        metadata: {
+          requestContract: input.requestContract,
+          providerKey: input.providerKey,
+          providerMode: input.providerMode,
+          branchId: input.context.branchId,
+        },
+      },
+    });
+    await tx.businessEvent.create({
+      data: {
+        tenantId: input.context.tenantId,
+        eventType: 'insurance.eligibility.requested',
+        entityType: 'eligibilityExecution',
+        entityId: created.id,
+        sourceModule: 'insurance',
+        payload: { provider: input.providerKey, requestContract: input.requestContract },
+      },
+    });
+    return created;
   });
 }
 

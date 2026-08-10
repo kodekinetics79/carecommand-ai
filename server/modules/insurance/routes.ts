@@ -414,6 +414,8 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
         mode: row.providerMode,
         simulated,
         checkedAt: row.checkedAt,
+        effectiveFrom: row.effectiveFrom,
+        expiresAt: row.expiresAt,
       };
     };
 
@@ -465,6 +467,8 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
               message: outcome.eligibilityMessage,
               payerReference: outcome.payerReference,
               checkedAt: outcome.checkedAt,
+              effectiveFrom: outcome.effectiveFrom,
+              expiresAt: outcome.expiresAt,
             };
             return {
               n,
@@ -499,6 +503,8 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
               eligibilityMessage: outcome.n.message,
               payerReference: outcome.n.payerReference,
               decisionSource: outcome.simulated ? 'SIMULATED' : 'PAYER_RESPONSE',
+              effectiveFrom: outcome.n.effectiveFrom ? new Date(outcome.n.effectiveFrom) : null,
+              expiresAt: outcome.n.expiresAt ? new Date(outcome.n.expiresAt) : null,
               normalizedResponse: { ...outcome.n, simulated: outcome.simulated } as unknown as Prisma.InputJsonValue,
             },
           });
@@ -534,6 +540,8 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
               mode: outcome.providerMode,
               simulated: outcome.simulated,
               checkedAt: created.checkedAt,
+              effectiveFrom: created.effectiveFrom,
+              expiresAt: created.expiresAt,
             },
             auditMetadata: { mode: outcome.providerMode, status: outcome.n.status, simulated: outcome.simulated },
           };
@@ -561,7 +569,7 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
     const rows = await db.eligibilityVerification.findMany({
       where: { tenantId: request.auth.tenantId, ...branchScope(request), ...(q.patientId ? { patientId: q.patientId } : {}) },
       orderBy: { checkedAt: 'desc' }, take: q.limit,
-      select: { id: true, patientId: true, coverageStatus: true, coverageActive: true, planName: true, payerName: true, copay: true, deductibleRemaining: true, coinsurance: true, eligibilityMessage: true, providerMode: true, checkedAt: true },
+      select: { id: true, patientId: true, coverageStatus: true, coverageActive: true, planName: true, payerName: true, copay: true, deductibleRemaining: true, coinsurance: true, eligibilityMessage: true, providerMode: true, checkedAt: true, effectiveFrom: true, expiresAt: true },
     });
     const pIds = [...new Set(rows.map(r => r.patientId))];
     const patients = pIds.length ? await db.patient.findMany({ where: { id: { in: pIds }, tenantId: request.auth.tenantId }, select: { id: true, firstName: true, lastName: true } }) : [];
@@ -578,11 +586,15 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
 
   app.get('/eligibility/executions/reconciliation', { preHandler: reconciliationRoles }, async request => {
     const q = z.object({ limit: z.coerce.number().int().min(1).max(100).default(25) }).parse(request.query);
+    const staleReadyBefore = new Date(Date.now() - 5 * 60_000);
     const rows = await db.eligibilityExecution.findMany({
       where: {
         tenantId: request.auth.tenantId,
         ...branchScope(request),
-        status: 'RECONCILIATION_REQUIRED',
+        OR: [
+          { status: 'RECONCILIATION_REQUIRED' },
+          { status: 'READY', createdAt: { lt: staleReadyBefore } },
+        ],
       },
       orderBy: { updatedAt: 'asc' },
       take: q.limit,
@@ -603,7 +615,11 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
       },
     });
     await audit(request, { action: 'eligibility.execution.reconciliation.list', resource: 'eligibilityExecution', metadata: { count: rows.length } });
-    return rows;
+    return rows.map(row => ({
+      ...row,
+      operatorState: row.status === 'READY' ? 'safe_to_resume_with_original_idempotency_key' : 'manual_reconciliation_required',
+      providerCallMayHaveOccurred: row.status !== 'READY',
+    }));
   });
 
   app.post('/eligibility/executions/:id/reconcile', { preHandler: reconciliationRoles }, async (request, reply) => {
@@ -618,9 +634,12 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
     if (execution.status !== 'RECONCILIATION_REQUIRED') throw app.httpErrors.conflict('Only reconciliation-required executions may be resolved');
     if (body.resolution === 'confirmed_succeeded') {
       return reply.code(409).send({
-        status: 'provider_retrieval_required',
+        status: 'manual_evidence_pending',
         executionId: execution.id,
-        message: 'A successful payer result may only be finalized from an independently retrieved provider response.',
+        providerRetrievalSupported: false,
+        allowedActions: ['confirmed_not_submitted', 'confirmed_failed'],
+        nextAction: 'Verify the transaction in the payer portal using the execution timestamp and provider reference. Do not enter benefit values manually.',
+        message: 'This adapter cannot retrieve a verified prior payer response. The execution remains reconciliation-required until independent payer evidence is available.',
       });
     }
     const nextStatus = body.resolution === 'confirmed_not_submitted' ? 'READY' : 'FAILED_DEFINITIVE';

@@ -240,6 +240,8 @@ type EligibilityOutcome = {
   eligibilityMessage: string;
   payerReference: string;
   checkedAt: string;
+  effectiveFrom: string | null;
+  expiresAt: string | null;
   providerMode: ProviderMode;
   providerName: string;
   needsPriorAuth: boolean;
@@ -605,6 +607,8 @@ class MockEligibilityProvider {
       eligibilityMessage: deriveCoverageMessage({ coverageActive, copay, deductibleRemaining, needsPriorAuth, benefitUncertainty }),
       payerReference: context.policy?.memberId ? `${payerName}-${context.policy.memberId}` : inferPayerReference({ payerName, patientId: patient?.id, appointmentId: appointment?.id }),
       checkedAt: new Date().toISOString(),
+      effectiveFrom: null,
+      expiresAt: null,
       providerMode: this.mode,
       providerName: this.displayName,
       needsPriorAuth,
@@ -684,14 +688,15 @@ export class StediEligibilityProvider extends MockEligibilityProvider {
     const deductible = asRecord(benefits.deductible);
     const officeVisit = asRecord(benefits.officeVisit);
     const benefitsSummary = asRecord(benefits.benefits);
-    const statusText = String(
+    const rawStatus =
       benefits.coverageStatus ??
       benefits.eligibilityStatus ??
       payload.coverageStatus ??
-      payload.status ??
-      'active',
-    ).toLowerCase();
-    const coverageActive = statusText.includes('active') || statusText.includes('verified') || statusText.includes('covered');
+      payload.status;
+    const statusText = typeof rawStatus === 'string' ? rawStatus.trim().toLowerCase() : '';
+    const explicitlyInactive = /(^|\b)(inactive|terminated|invalid|not covered|denied)(\b|$)/.test(statusText);
+    const coverageActive = !explicitlyInactive && /(^|\b)(active|verified|covered)(\b|$)/.test(statusText);
+    const coverageStatusUncertain = !coverageActive && !explicitlyInactive;
     const planName = String(benefits.planName ?? benefits.planDescription ?? context.policy?.planName ?? 'Stedi Health Plan');
     const payerName = String(benefits.payerName ?? benefits.payer ?? context.payer?.name ?? 'Stedi Test Payer');
     const memberId = String(benefits.memberId ?? context.policy?.memberId ?? inferPayerReference({ payerName, patientId: context.patient?.id, appointmentId: context.appointment?.id }));
@@ -732,7 +737,14 @@ export class StediEligibilityProvider extends MockEligibilityProvider {
       payload.authorizationRequired ??
       '',
     ).toLowerCase().includes('true') || deductibleRemaining > 1600 || /surgery|injection|procedure|botox|laser|consultation/i.test(serviceName);
-    const benefitUncertainty = !response || !Object.keys(payload).length || Boolean(payload.warnings?.length) || benefitDataIncomplete;
+    const benefitUncertainty = !response || !Object.keys(payload).length || Boolean(payload.warnings?.length) || benefitDataIncomplete || coverageStatusUncertain;
+    const parsePayerDate = (value: unknown): string | null => {
+      if (typeof value !== 'string' || !value.trim()) return null;
+      const parsed = new Date(value);
+      return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+    };
+    const effectiveFrom = parsePayerDate(benefits.effectiveFrom ?? benefits.effectiveDate ?? payload.effectiveFrom ?? payload.effectiveDate);
+    const expiresAt = parsePayerDate(benefits.expiresAt ?? benefits.terminationDate ?? benefits.endDate ?? payload.expiresAt ?? payload.terminationDate ?? payload.endDate);
     const payerReference = String(
       benefits.payerReference ??
       payload.id ??
@@ -742,12 +754,14 @@ export class StediEligibilityProvider extends MockEligibilityProvider {
     const riskLevel = buildEligibilityRiskLevel({ coverageActive, copay, deductibleRemaining, needsPriorAuth, benefitUncertainty });
     const recommendedAction = buildRecommendedAction({ coverageActive, copay, deductibleRemaining, needsPriorAuth });
     const revenueAtRisk = coverageActive ? 0 : Math.max(185, Math.round((context.patient?.outstandingBalance ?? 0) * 0.4 + copay));
-    const eligibilityMessage = benefitDataIncomplete
+    const eligibilityMessage = coverageStatusUncertain
+      ? 'Payer response did not contain a recognized coverage status; coverage is not confirmed and requires manual review.'
+      : benefitDataIncomplete
       ? `Payer response did not include ${missingBenefitFields.join(', ')}; benefit estimate is incomplete and must be verified manually before quoting the patient.`
       : deriveCoverageMessage({ coverageActive, copay, deductibleRemaining, needsPriorAuth, benefitUncertainty });
 
     return {
-      coverageStatus: coverageActive ? (benefitUncertainty ? 'uncertain' : 'active') : 'inactive',
+      coverageStatus: coverageStatusUncertain ? 'uncertain' : coverageActive ? (benefitUncertainty ? 'uncertain' : 'active') : 'inactive',
       memberId,
       planName,
       payerName,
@@ -758,6 +772,8 @@ export class StediEligibilityProvider extends MockEligibilityProvider {
       eligibilityMessage,
       payerReference,
       checkedAt: new Date().toISOString(),
+      effectiveFrom,
+      expiresAt,
       providerMode: this.mode,
       providerName: this.displayName,
       needsPriorAuth,
@@ -1890,8 +1906,6 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     if (providerStatus.setupRequired) {
       return reply.code(200).send({ status: 'setup_required', setupRequired: true, provider: providerStatus.provider, missing: providerStatus.missing, message: `Configure the ${providerStatus.provider} eligibility provider to run real checks.` });
     }
-    await emitBusinessEvent(request.auth.tenantId, { eventType: 'insurance.eligibility.requested', entityType: 'appointment', entityId: body.appointmentId ?? body.patientId ?? null, sourceModule: 'insurance', payload: { provider: providerStatus.provider } }).catch(() => {});
-
     const entities = await resolveBranchIdAndEntities(request, { tenantId: request.auth.tenantId, branchId: request.auth.branchId ?? undefined }, body);
     if (body.patientId && !entities.patient) throw app.httpErrors.notFound('Patient not found');
     if (body.appointmentId && !entities.appointment) throw app.httpErrors.notFound('Appointment not found');
@@ -1975,6 +1989,8 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
               eligibilityMessage: outcome.eligibilityMessage,
               payerReference,
               decisionSource: outcome.providerMode === 'live' ? 'PAYER_RESPONSE' : 'SIMULATED',
+              effectiveFrom: outcome.effectiveFrom ? new Date(outcome.effectiveFrom) : null,
+              expiresAt: outcome.expiresAt ? new Date(outcome.expiresAt) : null,
               normalizedResponse: {
                 coverageStatus: outcome.coverageStatus,
                 planName: outcome.planName,
@@ -1986,6 +2002,8 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
                 eligibilityMessage: outcome.eligibilityMessage,
                 payerReference,
                 checkedAt: outcome.checkedAt,
+                effectiveFrom: outcome.effectiveFrom,
+                expiresAt: outcome.expiresAt,
                 providerMode: outcome.providerMode,
                 providerName: outcome.providerName,
                 needsPriorAuth: outcome.needsPriorAuth,
