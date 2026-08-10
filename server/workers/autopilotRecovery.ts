@@ -6,6 +6,7 @@ import { reconcileAutopilotDispatchFailure } from '../modules/autopilot/dispatch
 import { autopilotQueue } from './queues';
 
 const RECOVERY_PAGE_SIZE = 100;
+const RECOVERY_CONCURRENCY = 8;
 
 export type QueuedAutopilotDispatch = {
   approvalId: string;
@@ -20,6 +21,19 @@ export type AutopilotRecoverySummary = {
   stale: number;
   errors: number;
 };
+
+async function mapConcurrent<T, R>(values: T[], concurrency: number, fn: (value: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let cursor = 0;
+  await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    for (;;) {
+      const index = cursor++;
+      if (index >= values.length) return;
+      results[index] = await fn(values[index]);
+    }
+  }));
+  return results;
+}
 
 function payloadRecord(payload: Prisma.JsonValue): Record<string, Prisma.JsonValue> {
   return payload && typeof payload === 'object' && !Array.isArray(payload)
@@ -155,21 +169,27 @@ export async function reconcileStrandedAutopilotDispatches(options?: {
     let afterId: string | undefined;
     for (;;) {
       const page = await readQueuedPage(tenantId, afterId);
-      for (const candidate of page.rows) {
-        summary.scanned += 1;
+      const outcomes = await mapConcurrent(page.rows, RECOVERY_CONCURRENCY, async candidate => {
         try {
           const result = await reconcileQueuedAutopilotDispatch(candidate);
-          if (result.outcome === 'reconciled' || result.outcome === 'already_reconciled') summary.reconciled += 1;
-          else if (result.outcome === 'healthy') summary.healthy += 1;
-          else summary.stale += 1;
+          if (result.outcome === 'reconciled' || result.outcome === 'already_reconciled') return 'reconciled' as const;
+          if (result.outcome === 'healthy') return 'healthy' as const;
+          return 'stale' as const;
         } catch (error) {
-          summary.errors += 1;
           captureException(error instanceof Error ? error : new Error(String(error)), {
             route: 'worker:autopilot-dispatch-recovery-scan',
             requestId: `autopilot-approval-${candidate.approvalId}`,
             tenantId,
           });
+          return 'error' as const;
         }
+      });
+      summary.scanned += outcomes.length;
+      for (const outcome of outcomes) {
+        if (outcome === 'reconciled') summary.reconciled += 1;
+        else if (outcome === 'healthy') summary.healthy += 1;
+        else if (outcome === 'stale') summary.stale += 1;
+        else summary.errors += 1;
       }
       if (!page.lastId || page.sourceCount < RECOVERY_PAGE_SIZE) break;
       afterId = page.lastId;

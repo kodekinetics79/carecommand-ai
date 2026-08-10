@@ -1977,6 +1977,23 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
           select: { id: true },
         });
         if (collidingRetellCall !== null) {
+          const endedAt = new Date();
+          await tx.receptionistCallLog.update({
+            where: { id: callLog.id },
+            data: { outcome: 'ESCALATED', endedAt },
+          });
+          if (target) await tx.receptionistCallTarget.updateMany({
+            where: { id: target.id, tenantId: request.auth.tenantId, campaignId: campaign.id },
+            data: { status: 'FAILED', lastOutcome: 'RECONCILIATION_REQUIRED', lastCallLogId: callLog.id },
+          });
+          await tx.auditEvent.create({ data: {
+            tenantId: request.auth.tenantId,
+            actorUserId: request.auth.userId,
+            action: 'receptionist.call.providerIdCollision',
+            resource: 'receptionistCallLog',
+            resourceId: callLog.id,
+            metadata: { reusedRetellCallId: collidingRetellCall.id, providerStopRequired: true },
+          } });
           return { cancelled: false as const, bound: 0, reusedRetellCallId: collidingRetellCall.id, collision: true as const };
         }
         const bound = await tx.receptionistCallLog.updateMany({
@@ -1997,6 +2014,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
             callLogId: callLog.id, providerCallId: result.callId, tenantId: request.auth.tenantId,
           }, 'Provider call binding collision encountered while binding outbound call intent');
         }
+        throw new Error('provider_call_id_collision');
       }
       await providerBoundaryTestHook?.('provider_binding_committed');
       if (await outboundStopped(request.auth.tenantId)) {
@@ -2012,7 +2030,10 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       const stopped = await stopPhoneCall(result.callId).catch(() => ({ ok: false, applied: false, error: 'provider_stop_failed' as const }));
       await db.receptionistCallLog.updateMany({
         where: { id: callLog.id, tenantId: request.auth.tenantId },
-        data: { outcome: 'ESCALATED', endedAt: new Date(), retellCallId: result.callId },
+        // A provider ID already bound to another local call can never be
+        // attached here. The durable provider intent and manual-review task
+        // correlate this accepted-but-quarantined call instead.
+        data: { outcome: 'ESCALATED', endedAt: new Date() },
       }).catch(() => undefined);
       if (target) await db.receptionistCallTarget.updateMany({
         where: { id: target.id, tenantId: request.auth.tenantId, campaignId: campaign.id },

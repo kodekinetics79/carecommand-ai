@@ -122,18 +122,29 @@ describe('AI receptionist safety workflows', () => {
     })).resolves.toMatchObject({ booked: false, needs_human: true });
     expect(await db.appointmentRequest.count({ where: { tenantId: tenant.id } })).toBe(0);
 
-    const goodCtx = { tenantId: tenant.id, callId: `call-${randomUUID()}`, callerPhone: '+12125550144' };
+    const goodCtx = { tenantId: tenant.id, callId: `call-${randomUUID()}`, callerPhone: '+12125550144', providerInvocationId: randomUUID() };
     await expect(trustedTool(goodCtx, 'verify_patient_identity', { date_of_birth: '1985-04-03' })).resolves.toMatchObject({ verified: true });
     const proof = await db.idempotencyKey.findUniqueOrThrow({ where: { scope_key: { scope: 'receptionist.voice-identity', key: `${tenant.id}:${goodCtx.callId}` } } });
     expect(proof.resultId).toBe(patient.id);
 
-    const badCtx = { tenantId: tenant.id, callId: `call-${randomUUID()}`, callerPhone: '+12125550144' };
+    const badCtx = { tenantId: tenant.id, callId: `call-${randomUUID()}`, callerPhone: '+12125550144', providerInvocationId: randomUUID() };
     for (let attempt = 0; attempt < 3; attempt += 1) {
+      badCtx.providerInvocationId = randomUUID();
       await expect(trustedTool(badCtx, 'verify_patient_identity', { date_of_birth: '1985-04-04' })).resolves.toMatchObject({ verified: false });
     }
+    badCtx.providerInvocationId = randomUUID();
     await expect(trustedTool(badCtx, 'verify_patient_identity', { date_of_birth: '1985-04-03' })).resolves.toMatchObject({ verified: false, locked: true, needs_human: true });
     expect(await db.auditEvent.count({ where: { tenantId: tenant.id, action: 'receptionist.identity.failed', resourceId: badCtx.callId } })).toBe(3);
     expect(await db.auditEvent.count({ where: { tenantId: tenant.id, action: 'receptionist.identity.locked', resourceId: badCtx.callId } })).toBe(1);
+  });
+
+  it('does not consume another identity attempt for an exact provider invocation replay', async () => {
+    const tenant = await makeTenant();
+    const ctx = { tenantId: tenant.id, callId: `call-${randomUUID()}`, callerPhone: '+12125550999', providerInvocationId: randomUUID() };
+    const first = await trustedTool(ctx, 'verify_patient_identity', { date_of_birth: '1985-04-04' });
+    const replay = await trustedTool(ctx, 'verify_patient_identity', { date_of_birth: '1985-04-04' });
+    expect(replay).toEqual(first);
+    expect(await db.auditEvent.count({ where: { tenantId: tenant.id, action: 'receptionist.identity.failed', resourceId: ctx.callId } })).toBe(1);
   });
 
   it('persists an immediate replay-safe DNC suppression without putting the phone in audit metadata', async () => {
@@ -158,7 +169,7 @@ describe('AI receptionist safety workflows', () => {
     const patient = await db.patient.create({ data: { tenantId: tenant.id, branchId: tenant.branchId, firstName: 'Voice', lastName: 'Patient', phone: '+12125550122', dateOfBirth: new Date('1980-01-02T00:00:00.000Z') } });
     const originalStart = new Date(`${new Date(Date.now() + 5 * 86_400_000).toISOString().slice(0, 10)}T09:00:00.000Z`);
     const appointment = await db.appointment.create({ data: { tenantId: tenant.id, branchId: tenant.branchId, patientId: patient.id, providerProfileId: provider.id, providerRef: provider.id, service: service.name, serviceCatalogItemId: service.id, startsAt: originalStart, endsAt: new Date(originalStart.getTime() + 30 * 60_000), status: 'CONFIRMED', channel: 'CALL' } });
-    const ctx = { tenantId: tenant.id, callId: `call-${randomUUID()}`, callerPhone: '+12125550122' };
+    const ctx = { tenantId: tenant.id, callId: `call-${randomUUID()}`, callerPhone: '+12125550122', providerInvocationId: randomUUID() };
 
     await expect(trustedTool(ctx, 'list_upcoming_appointments', {})).resolves.toMatchObject({ verified: false, appointments: [] });
     await expect(trustedTool(ctx, 'verify_patient_identity', { date_of_birth: '1980-01-02' })).resolves.toMatchObject({ verified: true });

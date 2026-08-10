@@ -214,4 +214,40 @@ describe('Autopilot approval dispatch execution behavior', () => {
       },
     })).toBe(0);
   });
+
+  it('allows an authorized tenant operator to audit and enqueue a new failed dispatch generation', async () => {
+    const t = await fixture();
+    await db.autopilotApproval.update({
+      where: { id: t.approval.id },
+      data: { status: 'APPROVED', reviewedById: t.owner.userId, reviewedAt: new Date(), payload: {
+        actionType: 'CREATE_STAFF_TASK', task: { title: 'Call patient', priority: 'HIGH' },
+        dispatch: { state: 'dispatch_failed', attemptId: randomUUID(), failureCode: 'worker_terminal_failure' },
+      } },
+    });
+    const response = await app.inject({
+      method: 'POST', url: `/v1/autopilot/approvals/${t.approval.id}/dispatch`, headers: headers(t.manager, 'MANAGER'),
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.dispatch).toMatchObject({ state: 'queued', attemptId: expect.any(String) });
+    expect(queueMocks.enqueue).toHaveBeenCalledWith({
+      approvalId: t.approval.id, tenantId: t.tenantId, dispatchAttemptId: body.dispatch.attemptId,
+    });
+    expect(await db.auditEvent.count({ where: {
+      tenantId: t.tenantId, action: 'autopilot.approval.redispatchRequested', resourceId: t.approval.id,
+    } })).toBe(1);
+  });
+
+  it('denies operator dispatch across tenant boundaries', async () => {
+    const owner = await fixture();
+    const other = await fixture();
+    await db.autopilotApproval.update({ where: { id: other.approval.id }, data: {
+      status: 'APPROVED', payload: { dispatch: { state: 'dispatch_failed', attemptId: randomUUID() } },
+    } });
+    const response = await app.inject({
+      method: 'POST', url: `/v1/autopilot/approvals/${other.approval.id}/dispatch`, headers: headers(owner.owner, 'OWNER'),
+    });
+    expect(response.statusCode).toBe(409);
+    expect(queueMocks.enqueue).not.toHaveBeenCalled();
+  });
 });

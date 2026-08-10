@@ -5,7 +5,7 @@ import type { Prisma } from '../generated/prisma/client';
 import { runWithJobTenantContext } from '../lib/tenantContext';
 import { reconcileAutopilotDispatchFailure } from '../modules/autopilot/dispatch';
 import { observed } from './observedJob';
-import { redisConnection, type AutopilotExecutionJob } from './queues';
+import { bullMqPrefix, redisConnection, type AutopilotExecutionJob } from './queues';
 
 function payloadRecord(payload: Prisma.JsonValue): Record<string, Prisma.JsonValue> {
   return payload && typeof payload === 'object' && !Array.isArray(payload)
@@ -37,6 +37,10 @@ export type AutopilotExecutionOutcome =
   | { outcome: 'executed'; resource: 'staffTask'; resourceId: string }
   | { outcome: 'already_executed'; resource: string | null; resourceId: string | null }
   | { outcome: 'stale' };
+
+export function isFinalAutopilotAttempt(attemptsMade: number, configuredAttempts: number | undefined): boolean {
+  return attemptsMade + 1 >= Math.max(1, Math.trunc(configuredAttempts ?? 1));
+}
 
 /**
  * Executes the currently supported autopilot action behind an exact persisted
@@ -140,34 +144,35 @@ export function createAutopilotWorker(): Worker<AutopilotExecutionJob> {
   const worker = new Worker<AutopilotExecutionJob>(
     'autopilot-execution',
     observed('autopilot-execution', async job => {
-      await executeAutopilotApprovedAction({
-        approvalId: job.data.approvalId,
-        tenantId: job.data.tenantId,
-        dispatchAttemptId: job.data.dispatchAttemptId,
-        jobId: job.id,
-        attemptsMade: job.attemptsMade,
-      });
+      try {
+        await executeAutopilotApprovedAction({
+          approvalId: job.data.approvalId,
+          tenantId: job.data.tenantId,
+          dispatchAttemptId: job.data.dispatchAttemptId,
+          jobId: job.id,
+          attemptsMade: job.attemptsMade,
+        });
+      } catch (error) {
+        if (isFinalAutopilotAttempt(job.attemptsMade, job.opts.attempts)) {
+          await reconcileAutopilotDispatchFailure({
+            approvalId: job.data.approvalId,
+            tenantId: job.data.tenantId,
+            code: 'worker_terminal_failure',
+            jobId: job.id,
+            dispatchAttemptId: job.data.dispatchAttemptId,
+            attempts: job.attemptsMade + 1,
+          });
+        }
+        throw error;
+      }
     }),
-    { connection: redisConnection, concurrency: 5 },
+    { connection: redisConnection, prefix: bullMqPrefix, concurrency: 5 },
   );
 
   worker.on('completed', job => console.info({ jobId: job.id }, 'autopilot job completed'));
   worker.on('failed', (job, error) => {
     if (!job) return;
     captureException(error, { route: 'worker:autopilot-execution', requestId: job.id });
-    void reconcileAutopilotDispatchFailure({
-      approvalId: job.data.approvalId,
-      tenantId: job.data.tenantId,
-      code: 'worker_terminal_failure',
-      jobId: job.id,
-      dispatchAttemptId: job.data.dispatchAttemptId,
-      attempts: job.attemptsMade,
-    }).catch(reconcileError => {
-      captureException(reconcileError instanceof Error ? reconcileError : new Error(String(reconcileError)), {
-        route: 'worker:autopilot-execution:reconcile-failed',
-        requestId: job.id,
-      });
-    });
   });
 
   return worker;

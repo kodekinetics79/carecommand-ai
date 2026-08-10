@@ -14,7 +14,7 @@ export interface AutopilotExecutionJob {
 }
 
 export type EnqueueAutopilotExecutionResult = {
-  state: 'queued' | 'disabled';
+  state: 'queued' | 'disabled' | 'generation_conflict';
   jobId: string;
   dispatchAttemptId: string;
 };
@@ -23,6 +23,7 @@ export type EnqueueAutopilotExecutionResult = {
 // no connection is opened, the app boots, request routes all work, and background
 // jobs are simply not enqueued (there is no worker to consume them anyway).
 const QUEUES_ENABLED = env.QUEUES_ENABLED;
+export const bullMqPrefix = `carecommand:${env.QUEUE_NAMESPACE}`;
 const redisUrl = QUEUES_ENABLED ? new URL(env.REDIS_URL) : null;
 
 export const redisConnection: ConnectionOptions = redisUrl ? {
@@ -50,6 +51,7 @@ function disabledQueue<R, V, N extends string>(name: string): Queue<R, V, N> {
 export const autopilotQueue: Queue<AutopilotExecutionJob, void, 'execute-approved-action'> = QUEUES_ENABLED
   ? new Queue('autopilot-execution', {
       connection: redisConnection,
+      prefix: bullMqPrefix,
       defaultJobOptions: {
         attempts: 5,
         backoff: { type: 'exponential', delay: 1000 },
@@ -72,12 +74,25 @@ export async function enqueueAutopilotExecution(input: {
     dispatchAttemptId,
     _otel: input._otel ?? currentTraceCarrier(),
   };
+  const jobId = `autopilot-approval-${data.approvalId}`;
+  const existing = await autopilotQueue.getJob(jobId);
+  if (existing) {
+    const existingState = await existing.getState();
+    if (existingState === 'failed' || existingState === 'completed') {
+      await existing.updateData(data);
+      await existing.retry(existingState);
+      return { state: 'queued', jobId, dispatchAttemptId };
+    }
+    if (existing.data.dispatchAttemptId !== dispatchAttemptId) {
+      return { state: 'generation_conflict', jobId, dispatchAttemptId };
+    }
+    return { state: 'queued', jobId, dispatchAttemptId };
+  }
   const job = await autopilotQueue.add(
     'execute-approved-action',
     { ...data },
-    { jobId: `autopilot-approval-${data.approvalId}` },
+    { jobId },
   );
-  const jobId = `autopilot-approval-${data.approvalId}`;
   return job
     ? { state: 'queued', jobId: job.id ?? jobId, dispatchAttemptId }
     : { state: 'disabled', jobId, dispatchAttemptId };
@@ -101,6 +116,7 @@ export type ScheduledQueueData = ScheduledTickData | TenantJobEnvelope;
 export const complianceQueue: Queue<ScheduledQueueData, void, string> = QUEUES_ENABLED
   ? new Queue('compliance-maintenance', {
       connection: redisConnection,
+      prefix: bullMqPrefix,
       defaultJobOptions: {
         attempts: 3,
         backoff: { type: 'exponential', delay: 2000 },
@@ -140,6 +156,7 @@ export async function enqueueComplianceTenantJob(operation: ComplianceJobName, t
 export const campaignQueue: Queue<ScheduledQueueData, void, string> = QUEUES_ENABLED
   ? new Queue('campaign-scheduler', {
       connection: redisConnection,
+      prefix: bullMqPrefix,
       defaultJobOptions: { attempts: 3, backoff: { type: 'exponential', delay: 2000 }, removeOnComplete: 500, removeOnFail: 1000 },
     })
   : disabledQueue('campaign-scheduler');
@@ -164,6 +181,7 @@ export type MonitoringJobName = 'missed-reading-scan' | 'device-offline-scan';
 export const monitoringQueue: Queue<ScheduledQueueData, void, string> = QUEUES_ENABLED
   ? new Queue('monitoring-safety', {
       connection: redisConnection,
+      prefix: bullMqPrefix,
       defaultJobOptions: { attempts: 3, backoff: { type: 'exponential', delay: 2000 }, removeOnComplete: 500, removeOnFail: 1000 },
     })
   : disabledQueue('monitoring-safety');

@@ -3,6 +3,7 @@ import { captureException } from '../lib/observability';
 import { observed } from './observedJob';
 import {
   enqueueComplianceTenantJob,
+  bullMqPrefix,
   redisConnection,
   type ComplianceJobName,
   type ScheduledQueueData,
@@ -75,7 +76,7 @@ export function createComplianceWorker(): Worker<ScheduledQueueData, void, strin
       });
       await runTenantComplianceJob(operation, envelope.tenantId);
     }),
-    { connection: redisConnection, concurrency: 3 },
+    { connection: redisConnection, prefix: bullMqPrefix, concurrency: 3 },
   );
 
   worker.on('completed', job => console.info({ jobId: job.id, name: job.name }, 'compliance job completed'));

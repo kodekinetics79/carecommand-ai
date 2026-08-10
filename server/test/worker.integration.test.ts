@@ -3,7 +3,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import type { Worker } from 'bullmq';
 import { fixtureDb as db } from './helpers/fixtureDb';
-import { createAutopilotWorker, executeAutopilotApprovedAction } from '../workers/autopilot.worker';
+import { createAutopilotWorker, executeAutopilotApprovedAction, isFinalAutopilotAttempt } from '../workers/autopilot.worker';
 import { enqueueAutopilotExecution } from '../workers/queues';
 
 // Proves the background worker actually CONSUMES an enqueued job end-to-end
@@ -35,6 +35,12 @@ async function waitFor<T>(probe: () => Promise<T | null>, timeoutMs = 30_000): P
 }
 
 describe('worker runtime — queues are actually drained', () => {
+  it('terminalizes only when the configured retry budget is exhausted', () => {
+    expect(isFinalAutopilotAttempt(0, 5)).toBe(false);
+    expect(isFinalAutopilotAttempt(3, 5)).toBe(false);
+    expect(isFinalAutopilotAttempt(4, 5)).toBe(true);
+    expect(isFinalAutopilotAttempt(0, undefined)).toBe(true);
+  });
   async function fixture(dispatchAttemptId = randomUUID()) {
     const tenantId = randomUUID();
     await db.tenant.create({ data: { id: tenantId, name: `wk-${tenantId.slice(0, 6)}`, slug: `wk-${tenantId.slice(0, 8)}` } });

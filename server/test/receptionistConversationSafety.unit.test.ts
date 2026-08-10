@@ -75,6 +75,14 @@ describe('AI receptionist conversation safety contract', () => {
     expect(prompt).toMatch(/mentions a possible emergency at ANY point, interrupt what you are saying/i);
     expect(prompt).toMatch(/overrides finishing the disclosure or waiting for consent/i);
     expect(prompt.indexOf('Emergency precedence:')).toBeLessThan(prompt.indexOf('# Trusted call-direction branch'));
+    const emergency = buildRetellConfig(baseConfig, { webhookBaseUrl: 'https://api.example.test' }).tools
+      .find(tool => tool.name === 'report_emergency') as {
+        speak_during_execution: boolean;
+        parameters: { required: string[]; properties: Record<string, unknown> };
+      };
+    expect(emergency.speak_during_execution).toBe(false);
+    expect(emergency.parameters.required).toContain('emergency_instruction_spoken');
+    expect(emergency.parameters.properties.emergency_instruction_spoken).toMatchObject({ type: 'boolean', const: true });
   });
 
   it('branches only on trusted direction and fails closed for wrong parties and voicemail', () => {

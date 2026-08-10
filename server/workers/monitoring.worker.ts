@@ -1,7 +1,7 @@
 import { Worker } from 'bullmq';
 import { captureException } from '../lib/observability';
 import { observed } from './observedJob';
-import { enqueueMonitoringTenantJob, redisConnection, type MonitoringJobName, type ScheduledQueueData } from './queues';
+import { bullMqPrefix, enqueueMonitoringTenantJob, redisConnection, type MonitoringJobName, type ScheduledQueueData } from './queues';
 import { detectMissedReadings, detectOfflineDevices } from '../lib/connectedCare/safetyDetection';
 import { assertSchedulerTick, validateTenantJobEnvelope } from '../lib/jobEnvelope';
 import { resolveActiveJobTenantIds } from '../lib/jobTenantResolver';
@@ -44,7 +44,7 @@ export function createMonitoringWorker(): Worker<ScheduledQueueData, void, strin
         console.info({ checked: r.checked, flipped: r.flipped, created: r.created }, 'device-offline scan complete');
       }
     }),
-    { connection: redisConnection, concurrency: 2 },
+    { connection: redisConnection, prefix: bullMqPrefix, concurrency: 2 },
   );
 
   worker.on('completed', job => console.info({ jobId: job.id, name: job.name }, 'monitoring safety job completed'));

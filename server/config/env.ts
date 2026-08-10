@@ -83,6 +83,9 @@ const baseEnvSchema = z.object({
   // changes and seeding keep running as the owner. Falls back to DATABASE_URL.
   DATABASE_MIGRATION_URL: z.string().optional(),
   REDIS_URL: z.string().url().default('redis://localhost:6379'),
+  // Immutable deployment/dataset identity for BullMQ Redis keys. Tests must
+  // provide a run-unique value before importing queue modules.
+  QUEUE_NAMESPACE: z.string().regex(/^[A-Za-z0-9:_-]{1,80}$/).default('carecommand-local'),
   // Set false on Redis-less deploys (e.g. serverless). The app boots and all
   // request routes work; background jobs are simply not enqueued.
   QUEUES_ENABLED: booleanString(true),

@@ -1,7 +1,7 @@
 import { Worker } from 'bullmq';
 import { captureException } from '../lib/observability';
 import { observed } from './observedJob';
-import { enqueueCampaignTenantJob, redisConnection, type ScheduledQueueData } from './queues';
+import { bullMqPrefix, enqueueCampaignTenantJob, redisConnection, type ScheduledQueueData } from './queues';
 import { runScheduledCampaigns } from '../modules/campaigns/jobs';
 import { assertSchedulerTick, validateTenantJobEnvelope } from '../lib/jobEnvelope';
 import { resolveActiveJobTenantIds } from '../lib/jobTenantResolver';
@@ -29,7 +29,7 @@ export function createCampaignWorker(): Worker<ScheduledQueueData, void, string>
       }
       throw new Error(`Unknown campaign scheduler job: ${job.name}`);
     }),
-    { connection: redisConnection, concurrency: 1 },
+    { connection: redisConnection, prefix: bullMqPrefix, concurrency: 1 },
   );
 
   worker.on('completed', job => console.info({ jobId: job.id, name: job.name }, 'campaign scheduler run completed'));

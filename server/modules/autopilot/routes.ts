@@ -131,4 +131,57 @@ export const autopilotRoutes: FastifyPluginAsync = async app => {
     await audit(request, { action: 'autopilot.approval.dismissed', resource: 'autopilotApproval', resourceId: id });
     return { id, status: 'DISMISSED' };
   });
+
+  app.post('/approvals/:id/dispatch', { preHandler: requireRoles('OWNER', 'ADMIN', 'MANAGER') }, async (request, reply) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(request.params);
+    const requestedAttemptId = randomUUID();
+    const approval = await db.$transaction(async transaction => {
+      await transaction.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${'autopilot:' + id}, 0))`;
+      const existing = await transaction.autopilotApproval.findFirst({
+        where: { id, tenantId: request.auth.tenantId, status: 'APPROVED' },
+      });
+      if (!existing) throw app.httpErrors.conflict('Only an approved, unexecuted action can be dispatched');
+      const dispatch = payloadRecord(existing.payload).dispatch;
+      const record = dispatch && typeof dispatch === 'object' && !Array.isArray(dispatch)
+        ? dispatch as Record<string, Prisma.JsonValue> : {};
+      if (record.state === 'queued') throw app.httpErrors.conflict('This approved action is already queued');
+      if (record.state !== 'dispatch_failed' && record.state !== 'pending_dispatch') {
+        throw app.httpErrors.conflict('This approved action is not retryable');
+      }
+      const attemptId = record.state === 'pending_dispatch' && typeof record.attemptId === 'string'
+        ? record.attemptId : requestedAttemptId;
+      const updated = await transaction.autopilotApproval.update({
+        where: { id },
+        data: { payload: withDispatchState(existing.payload, 'pending_dispatch', { attemptId }) },
+      });
+      await transaction.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId,
+        actorUserId: request.auth.userId,
+        action: 'autopilot.approval.redispatchRequested',
+        resource: 'autopilotApproval',
+        resourceId: id,
+        metadata: { dispatchAttemptId: attemptId },
+      } });
+      return { ...updated, dispatchAttemptId: attemptId };
+    });
+
+    const enqueue = await enqueueAutopilotExecution({
+      approvalId: approval.id,
+      tenantId: request.auth.tenantId,
+      dispatchAttemptId: approval.dispatchAttemptId,
+    });
+    if (enqueue.state === 'queued') {
+      await recordAutopilotDispatchQueued({
+        approvalId: approval.id, tenantId: request.auth.tenantId,
+        jobId: enqueue.jobId, dispatchAttemptId: approval.dispatchAttemptId,
+      });
+      return reply.code(200).send({ id, status: 'APPROVED', dispatch: { state: 'queued', attemptId: approval.dispatchAttemptId } });
+    }
+    if (enqueue.state === 'disabled') {
+      return reply.code(202).send({ id, status: 'APPROVED', dispatch: { state: 'pending_dispatch', attemptId: approval.dispatchAttemptId } });
+    }
+    return reply.code(202).send({ id, status: 'APPROVED', dispatch: {
+      state: 'pending_dispatch', attemptId: approval.dispatchAttemptId, reason: 'generation_conflict',
+    } });
+  });
 };

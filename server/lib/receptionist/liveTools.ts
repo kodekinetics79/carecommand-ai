@@ -52,6 +52,8 @@ export interface ToolContext {
   trustedBooking?: TrustedBookingContext;
   /** Exact local agent established from the signed inbound deployment. */
   trustedProviderAgentId?: string;
+  /** Provider-native stable custom-function invocation identifier. */
+  providerInvocationId?: string;
 }
 
 // Bounded caps for caller-supplied free text.
@@ -405,6 +407,8 @@ export async function reportEmergency(ctx: ToolContext, args: Record<string, unk
   const task = await createSafetyTask(ctx, 'emergency', args);
   return {
     emergency_recorded: true,
+    protocol_compliant: args.emergency_instruction_spoken === true,
+    needs_human: args.emergency_instruction_spoken === true ? undefined : true,
     acknowledgment_pending: true,
     duplicate: task.duplicate,
     task_id: task.taskId,
@@ -424,37 +428,38 @@ export async function verifyPatientIdentity(ctx: ToolContext, args: Record<strin
   if (!callId || !phone || !dobText || !/^\d{4}-\d{2}-\d{2}$/.test(dobText)) {
     return { verified: false, needs_human: true, message: 'I cannot complete secure verification on this call. I can connect you with the front desk.' };
   }
-  const since = new Date(Date.now() - IDENTITY_LOCK_MINUTES * 60_000);
-  const failedAttempts = await db.auditEvent.count({
-    where: {
-      tenantId: ctx.tenantId,
-      action: 'receptionist.identity.failed',
-      resource: 'receptionistCall',
-      resourceId: callId,
-      occurredAt: { gte: since },
-    },
-  });
-  if (failedAttempts >= MAX_IDENTITY_ATTEMPTS) {
-    await db.auditEvent.create({ data: { tenantId: ctx.tenantId, action: 'receptionist.identity.locked', resource: 'receptionistCall', resourceId: callId, metadata: { lockMinutes: IDENTITY_LOCK_MINUTES } } });
-    return { verified: false, locked: true, needs_human: true, message: 'I cannot continue identity verification on this call. Please contact the front desk.' };
+  const invocationId = sanitizeText(ctx.providerInvocationId, 180);
+  if (!invocationId) {
+    const handoff = await createSafetyTask(ctx, 'human_handoff', { reason_category: 'identity_replay_boundary' });
+    return { verified: false, needs_human: true, manual_review: true, task_id: handoff.taskId, duplicate: handoff.duplicate,
+      message: 'I cannot complete secure verification on this call. I can connect you with the front desk.' };
   }
-
-  const matches = (await patientsByCanonicalPhone(ctx.tenantId, phone)).filter(patient =>
-    patient.dateOfBirth?.toISOString().slice(0, 10) === dobText,
-  );
-  if (matches.length !== 1) {
-    await db.auditEvent.create({ data: { tenantId: ctx.tenantId, action: 'receptionist.identity.failed', resource: 'receptionistCall', resourceId: callId, metadata: { attempt: failedAttempts + 1 } } });
-    return { verified: false, remaining_attempts: Math.max(0, MAX_IDENTITY_ATTEMPTS - failedAttempts - 1), message: 'I could not verify those details. Please try again or ask for the front desk.' };
-  }
-
-  const key = `${ctx.tenantId}:${callId}`;
-  await db.idempotencyKey.upsert({
-    where: { scope_key: { scope: 'receptionist.voice-identity', key } },
-    update: { resultId: matches[0].id },
-    create: { tenantId: ctx.tenantId, scope: 'receptionist.voice-identity', key, resultId: matches[0].id },
+  return db.$transaction(async tx => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'identity:' + ctx.tenantId + ':' + callId})::bigint)`;
+    const receiptKey = `${ctx.tenantId}:${callId}:${invocationId}`;
+    const prior = await tx.idempotencyKey.findUnique({ where: { scope_key: { scope: 'receptionist.voice-identity-attempt', key: receiptKey } } });
+    if (prior?.resultId) return JSON.parse(prior.resultId) as Record<string, unknown>;
+    const since = new Date(Date.now() - IDENTITY_LOCK_MINUTES * 60_000);
+    const failedAttempts = await tx.auditEvent.count({ where: { tenantId: ctx.tenantId, action: 'receptionist.identity.failed', resource: 'receptionistCall', resourceId: callId, occurredAt: { gte: since } } });
+    let result: Record<string, unknown>;
+    if (failedAttempts >= MAX_IDENTITY_ATTEMPTS) {
+      const locked = await tx.auditEvent.count({ where: { tenantId: ctx.tenantId, action: 'receptionist.identity.locked', resourceId: callId, occurredAt: { gte: since } } });
+      if (!locked) await tx.auditEvent.create({ data: { tenantId: ctx.tenantId, action: 'receptionist.identity.locked', resource: 'receptionistCall', resourceId: callId, metadata: { lockMinutes: IDENTITY_LOCK_MINUTES } } });
+      result = { verified: false, locked: true, needs_human: true, message: 'I cannot continue identity verification on this call. Please contact the front desk.' };
+    } else {
+      const matches = (await patientsByCanonicalPhone(ctx.tenantId, phone, tx)).filter(patient => patient.dateOfBirth?.toISOString().slice(0, 10) === dobText);
+      if (matches.length !== 1) {
+        await tx.auditEvent.create({ data: { tenantId: ctx.tenantId, action: 'receptionist.identity.failed', resource: 'receptionistCall', resourceId: callId, metadata: { attempt: failedAttempts + 1 } } });
+        result = { verified: false, remaining_attempts: Math.max(0, MAX_IDENTITY_ATTEMPTS - failedAttempts - 1), message: 'I could not verify those details. Please try again or ask for the front desk.' };
+      } else {
+        await tx.idempotencyKey.upsert({ where: { scope_key: { scope: 'receptionist.voice-identity', key: `${ctx.tenantId}:${callId}` } }, update: { resultId: matches[0].id }, create: { tenantId: ctx.tenantId, scope: 'receptionist.voice-identity', key: `${ctx.tenantId}:${callId}`, resultId: matches[0].id } });
+        await tx.auditEvent.create({ data: { tenantId: ctx.tenantId, action: 'receptionist.identity.verified', resource: 'receptionistCall', resourceId: callId, metadata: { method: 'caller_number_plus_dob' } } });
+        result = { verified: true, message: 'Thank you. Your identity is verified for this call.' };
+      }
+    }
+    await tx.idempotencyKey.create({ data: { tenantId: ctx.tenantId, scope: 'receptionist.voice-identity-attempt', key: receiptKey, resultId: JSON.stringify(result) } });
+    return result;
   });
-  await db.auditEvent.create({ data: { tenantId: ctx.tenantId, action: 'receptionist.identity.verified', resource: 'receptionistCall', resourceId: callId, metadata: { method: 'caller_number_plus_dob' } } });
-  return { verified: true, message: 'Thank you. Your identity is verified for this call.' };
 }
 
 async function verifiedPatientForCall(ctx: ToolContext): Promise<string | null> {

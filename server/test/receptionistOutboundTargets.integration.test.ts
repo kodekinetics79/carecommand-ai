@@ -413,6 +413,28 @@ describe('AI receptionist persistent reconciliation evidence', () => {
       triggerSources: ['RECONCILIATION_REQUIRED'],
     })]);
   });
+
+  it('fails closed and creates durable review when the provider reuses a bound call ID', async () => {
+    const tenant = await makeTenant();
+    const campaignId = await createCampaign(tenant, { status: 'RUNNING' });
+    const target = await addPatientTarget(tenant, campaignId, 973);
+    const providerCallId = randomRetellCallId('retell_collision');
+    const original = await db.receptionistCallLog.create({ data: {
+      tenantId: tenant.id, clinicId: tenant.clinicId, outboundCampaignId: campaignId,
+      retellCallId: providerCallId, callerPhone: target.phone, direction: 'outbound', outcome: 'FAILED', endedAt: new Date(),
+    } });
+    const providerFetch = vi.fn<typeof fetch>(async url => String(url).includes('/v2/create-phone-call')
+      ? new Response(JSON.stringify({ call_id: providerCallId, agent_id: tenant.providerAgentId, agent_version: 1 }), { status: 201, headers: { 'content-type': 'application/json' } })
+      : new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', providerFetch);
+    const response = await app.inject({ method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaignId}/call`, headers: auth(tenant), payload: { targetId: target.id, phone: target.phone } });
+    expect(response.statusCode).toBe(202);
+    expect(response.json()).toMatchObject({ status: 'reconciliation_required', providerStopApplied: true, reviewRecorded: true });
+    const quarantined = await db.receptionistCallLog.findUniqueOrThrow({ where: { id: response.json().callLogId } });
+    expect(quarantined).toMatchObject({ retellCallId: null, outcome: 'ESCALATED', endedAt: expect.any(Date) });
+    expect((await db.receptionistCallLog.findUniqueOrThrow({ where: { id: original.id } })).retellCallId).toBe(providerCallId);
+    expect(await db.auditEvent.count({ where: { tenantId: tenant.id, action: 'receptionist.call.providerIdCollision', resourceId: quarantined.id } })).toBe(1);
+  });
 });
 
 describe('AI receptionist fail-closed quiet hours', () => {

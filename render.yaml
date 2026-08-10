@@ -94,6 +94,8 @@ envVarGroups:
         value: demo
       - key: QUEUES_ENABLED
         value: "true"
+      - key: QUEUE_NAMESPACE
+        value: carecommand-render
       - key: RLS_ENFORCE_RUNTIME_ROLE
         value: "false"     # enterprise validation/prod: set true after DATABASE_URL uses app_rls
       - key: PLATFORM_LEGACY_TOKEN_ENABLED

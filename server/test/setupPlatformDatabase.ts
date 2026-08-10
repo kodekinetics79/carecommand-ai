@@ -5,6 +5,10 @@ import { PrismaClient } from '../generated/prisma/client';
 import { ensurePlatformTestDatabaseUrl } from './helpers/platformTestDatabase';
 import { ensureTestSubscriptionCatalog } from './helpers/subscriptionCatalog';
 
+// Queue modules parse env at import time. Give every Vitest file sandbox a
+// disposable namespace so retained BullMQ jobs cannot cross test datasets.
+process.env.QUEUE_NAMESPACE ??= `test-${process.pid}-${Date.now()}-${process.env.VITEST_POOL_ID ?? '0'}`;
+
 process.env.PLATFORM_DATABASE_URL = await ensurePlatformTestDatabaseUrl();
 
 const migrationUrl = process.env.DATABASE_MIGRATION_URL;
