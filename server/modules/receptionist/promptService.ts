@@ -533,9 +533,8 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
         properties: {
           reason_category: { type: 'string', enum: ['possible_emergency'], description: 'Emergency routing classification.' },
           message: { type: 'string', description: 'Very brief minimum-necessary reason; do not collect detailed history.' },
-          emergency_instruction_spoken: { type: 'boolean', const: true, description: 'Set true only after the 911/ER instruction was spoken.' },
         },
-        required: ['reason_category', 'emergency_instruction_spoken'],
+        required: ['reason_category'],
       },
     },
   ];

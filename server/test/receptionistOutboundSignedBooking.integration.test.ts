@@ -208,6 +208,10 @@ describe('outbound receptionist to signed canonical booking', () => {
     const identity = await invokeSignedTool('verify_patient_identity', { date_of_birth: '1990-01-02' });
     expect(identity.statusCode).toBe(200);
     expect(identity.json()).toMatchObject({ verified: true });
+    const identityReplay = await invokeSignedTool('verify_patient_identity', { date_of_birth: '1990-01-02' });
+    expect(identityReplay.statusCode).toBe(200);
+    expect(identityReplay.json()).toEqual(identity.json());
+    expect(await db.auditEvent.count({ where: { tenantId, action: 'receptionist.identity.verified', resourceId: providerCallId } })).toBe(1);
 
     const booked = await invokeSignedTool('book_appointment', {
       first_name: patient.firstName,

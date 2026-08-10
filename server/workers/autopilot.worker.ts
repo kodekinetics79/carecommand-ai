@@ -1,5 +1,6 @@
 import { UnrecoverableError, Worker } from 'bullmq';
 import { z } from 'zod';
+import { env } from '../config/env';
 import { captureException } from '../lib/observability';
 import type { Prisma } from '../generated/prisma/client';
 import { runWithJobTenantContext } from '../lib/tenantContext';
@@ -40,6 +41,12 @@ export type AutopilotExecutionOutcome =
 
 export function isFinalAutopilotAttempt(attemptsMade: number, configuredAttempts: number | undefined): boolean {
   return attemptsMade + 1 >= Math.max(1, Math.trunc(configuredAttempts ?? 1));
+}
+
+let executionTestHook: ((attemptsMade: number) => Promise<void>) | undefined;
+export function setAutopilotExecutionTestHook(hook?: (attemptsMade: number) => Promise<void>) {
+  if (env.NODE_ENV !== 'test') throw new Error('autopilot execution test hook is test-only');
+  executionTestHook = hook;
 }
 
 /**
@@ -145,6 +152,7 @@ export function createAutopilotWorker(): Worker<AutopilotExecutionJob> {
     'autopilot-execution',
     observed('autopilot-execution', async job => {
       try {
+        await executionTestHook?.(job.attemptsMade);
         await executeAutopilotApprovedAction({
           approvalId: job.data.approvalId,
           tenantId: job.data.tenantId,

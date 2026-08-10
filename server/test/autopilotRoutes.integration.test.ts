@@ -250,4 +250,11 @@ describe('Autopilot approval dispatch execution behavior', () => {
     expect(response.statusCode).toBe(409);
     expect(queueMocks.enqueue).not.toHaveBeenCalled();
   });
+
+  it('denies PROVIDER operator redispatch', async () => {
+    const t = await fixture();
+    const response = await app.inject({ method: 'POST', url: `/v1/autopilot/approvals/${t.approval.id}/dispatch`, headers: headers(t.provider, 'PROVIDER') });
+    expect(response.statusCode).toBe(403);
+    expect(queueMocks.enqueue).not.toHaveBeenCalled();
+  });
 });

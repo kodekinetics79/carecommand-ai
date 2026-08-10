@@ -407,8 +407,7 @@ export async function reportEmergency(ctx: ToolContext, args: Record<string, unk
   const task = await createSafetyTask(ctx, 'emergency', args);
   return {
     emergency_recorded: true,
-    protocol_compliant: args.emergency_instruction_spoken === true,
-    needs_human: args.emergency_instruction_spoken === true ? undefined : true,
+    protocol_status: 'pending_provider_evidence',
     acknowledgment_pending: true,
     duplicate: task.duplicate,
     task_id: task.taskId,

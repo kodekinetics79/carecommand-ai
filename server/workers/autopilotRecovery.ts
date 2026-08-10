@@ -179,7 +179,8 @@ export async function reconcileStrandedAutopilotDispatches(options?: {
       const outcomes = await mapConcurrent(candidates, RECOVERY_CONCURRENCY, async candidate => {
         try {
           const result = await reconcileQueuedAutopilotDispatch(candidate);
-          if (result.outcome === 'reconciled' || result.outcome === 'already_reconciled') return 'reconciled' as const;
+          if (result.outcome === 'reconciled') return 'reconciled' as const;
+          if (result.outcome === 'already_reconciled') return 'stale' as const;
           if (result.outcome === 'healthy') return 'healthy' as const;
           return 'stale' as const;
         } catch (error) {

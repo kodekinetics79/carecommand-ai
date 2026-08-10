@@ -233,6 +233,9 @@ const baseEnvSchema = z.object({
 // Cross-field production hardening. Exported so tests can exercise the schema
 // in isolation (see server/test/envSchema.test.ts).
 export const envSchema = baseEnvSchema.superRefine((cfg, ctx) => {
+  if (cfg.NODE_ENV === 'production' && cfg.QUEUE_NAMESPACE === 'carecommand-local') {
+    ctx.addIssue({ code: 'custom', path: ['QUEUE_NAMESPACE'], message: 'QUEUE_NAMESPACE must be explicitly set to a deployment-unique value in production.' });
+  }
   // Missing production configuration is rejected when platformDb is
   // constructed. Keeping that boot-time check outside this reusable schema
   // preserves isolated env-schema tests and tooling that never load platform.

@@ -3,8 +3,8 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import type { Worker } from 'bullmq';
 import { fixtureDb as db } from './helpers/fixtureDb';
-import { createAutopilotWorker, executeAutopilotApprovedAction, isFinalAutopilotAttempt } from '../workers/autopilot.worker';
-import { enqueueAutopilotExecution } from '../workers/queues';
+import { createAutopilotWorker, executeAutopilotApprovedAction, isFinalAutopilotAttempt, setAutopilotExecutionTestHook } from '../workers/autopilot.worker';
+import { autopilotQueue, enqueueAutopilotExecution } from '../workers/queues';
 
 // Proves the background worker actually CONSUMES an enqueued job end-to-end
 // (real Redis + Postgres, no queue mock): an exactly fenced APPROVED action
@@ -20,6 +20,8 @@ beforeAll(() => {
 
 afterAll(async () => {
   await worker.close();
+  await autopilotQueue.obliterate({ force: true });
+  await autopilotQueue.close();
   for (const id of tenantIds) await db.tenant.delete({ where: { id } }).catch(() => {});
   await db.$disconnect();
 });
@@ -92,6 +94,27 @@ describe('worker runtime — queues are actually drained', () => {
       where: { tenantId: t.tenantId, action: 'autopilot.approval.executed', resourceId: t.approval.id },
     })).toBe(1);
   }, 40_000);
+
+  it('keeps the durable dispatch queued through BullMQ retries and terminalizes exactly once at attempt five', async () => {
+    const t = await fixture();
+    const observedStates: string[] = [];
+    setAutopilotExecutionTestHook(async () => {
+      const row = await db.autopilotApproval.findUniqueOrThrow({ where: { id: t.approval.id } });
+      observedStates.push(String((row.payload as { dispatch: { state: string } }).dispatch.state));
+      throw new Error('transient-test-failure');
+    });
+    try {
+      await enqueueAutopilotExecution({ approvalId: t.approval.id, tenantId: t.tenantId, dispatchAttemptId: t.dispatchAttemptId });
+      await waitFor(async () => {
+        const row = await db.autopilotApproval.findUniqueOrThrow({ where: { id: t.approval.id } });
+        return (row.payload as { dispatch: { state: string } }).dispatch.state === 'dispatch_failed' ? row : null;
+      }, 30_000);
+      expect(observedStates).toEqual(['queued', 'queued', 'queued', 'queued', 'queued']);
+      expect(await db.auditEvent.count({ where: { tenantId: t.tenantId, action: 'autopilot.approval.dispatchFailed', resourceId: t.approval.id } })).toBe(1);
+    } finally {
+      setAutopilotExecutionTestHook(undefined);
+    }
+  }, 35_000);
 
   it('denies a stale dispatch attempt without creating a side effect', async () => {
     const t = await fixture();

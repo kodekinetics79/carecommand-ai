@@ -22,7 +22,20 @@ const productionProfile = {
   CORS_ORIGINS: 'https://pilot.carecommand.example.com',
   COOKIE_SAMESITE: 'none' as const,
   METRICS_TOKEN: 'metrics-test-token',
+  QUEUE_NAMESPACE: 'carecommand-production-test',
 };
+
+describe('env schema — BullMQ namespace', () => {
+  it('fails production parsing when the deployment namespace is absent or unsafe default', () => {
+    expect(envSchema.safeParse({ ...base, NODE_ENV: 'production' }).success).toBe(false);
+    expect(envSchema.safeParse({ ...base, NODE_ENV: 'production', QUEUE_NAMESPACE: 'carecommand-local' }).success).toBe(false);
+  });
+
+  it('preserves the local default and accepts an explicit production namespace', () => {
+    expect(envSchema.parse(base).QUEUE_NAMESPACE).toBe('carecommand-local');
+    expect(envSchema.safeParse({ ...base, NODE_ENV: 'production', QUEUE_NAMESPACE: 'tenant-prod-a' }).success).toBe(true);
+  });
+});
 
 describe('env schema — ingress proxy posture', () => {
   it('keeps direct-origin mode safe by default and marks unconfigured trusted-proxy mode not ready', () => {
@@ -46,7 +59,7 @@ describe('env schema — PORTAL_TOKEN_OUTBOX_PATH production guard', () => {
   });
 
   it('accepts production + outbox path when E2E_TEST_MODE=true (Playwright harness)', () => {
-    const res = envSchema.safeParse({ ...base, NODE_ENV: 'production', PORTAL_TOKEN_OUTBOX_PATH: '.playwright/portal-outbox.jsonl', E2E_TEST_MODE: 'true' });
+    const res = envSchema.safeParse({ ...base, NODE_ENV: 'production', QUEUE_NAMESPACE: 'e2e-test', PORTAL_TOKEN_OUTBOX_PATH: '.playwright/portal-outbox.jsonl', E2E_TEST_MODE: 'true' });
     expect(res.success).toBe(true);
   });
 
@@ -62,7 +75,7 @@ describe('env schema — PORTAL_TOKEN_OUTBOX_PATH production guard', () => {
   });
 
   it('production without the outbox path parses fine (no flag needed)', () => {
-    expect(envSchema.safeParse({ ...base, NODE_ENV: 'production' }).success).toBe(true);
+    expect(envSchema.safeParse({ ...base, NODE_ENV: 'production', QUEUE_NAMESPACE: 'production-test' }).success).toBe(true);
   });
 });
 
@@ -75,8 +88,8 @@ describe('env schema — PORTAL_TOKEN_OUTBOX_PATH production guard', () => {
 describe('env schema — DEPLOYMENT_PROFILE integration-mode gate', () => {
   it('demo profile (default) boots with all providers mock — including under NODE_ENV=production (E2E harness)', () => {
     expect(envSchema.safeParse({ ...base }).success).toBe(true);
-    expect(envSchema.safeParse({ ...base, NODE_ENV: 'production' }).success).toBe(true);
-    expect(envSchema.safeParse({ ...base, NODE_ENV: 'production', DEPLOYMENT_PROFILE: 'demo' }).success).toBe(true);
+    expect(envSchema.safeParse({ ...base, NODE_ENV: 'production', QUEUE_NAMESPACE: 'production-test' }).success).toBe(true);
+    expect(envSchema.safeParse({ ...base, NODE_ENV: 'production', QUEUE_NAMESPACE: 'production-test', DEPLOYMENT_PROFILE: 'demo' }).success).toBe(true);
   });
 
   it.each(['pilot', 'enterprise'] as const)('rejects E2E_TEST_MODE for the %s deployment profile', profile => {

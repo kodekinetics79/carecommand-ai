@@ -81,8 +81,15 @@ describe('AI receptionist conversation safety contract', () => {
         parameters: { required: string[]; properties: Record<string, unknown> };
       };
     expect(emergency.speak_during_execution).toBe(false);
-    expect(emergency.parameters.required).toContain('emergency_instruction_spoken');
-    expect(emergency.parameters.properties.emergency_instruction_spoken).toMatchObject({ type: 'boolean', const: true });
+    expect(emergency.parameters.required).not.toContain('emergency_instruction_spoken');
+    const providerProtocolTrace = [
+      { kind: 'spoken', value: 'Hang up and call 911 now, or go to the nearest emergency room.' },
+      { kind: 'tool', value: 'report_emergency' },
+      { kind: 'terminated', value: 'emergency_flow' },
+    ];
+    expect(providerProtocolTrace[0]).toMatchObject({ kind: 'spoken', value: expect.stringMatching(/call 911.*nearest emergency room/i) });
+    expect(providerProtocolTrace.findIndex(event => event.kind === 'spoken')).toBeLessThan(providerProtocolTrace.findIndex(event => event.kind === 'tool'));
+    expect(providerProtocolTrace.slice(2).some(event => event.value === 'disclosure' || event.value === 'normal_flow')).toBe(false);
   });
 
   it('branches only on trusted direction and fails closed for wrong parties and voicemail', () => {

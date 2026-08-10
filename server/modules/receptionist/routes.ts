@@ -3059,6 +3059,11 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         callerPhone: activeCall.callerPhone,
         trustedBooking,
         trustedProviderAgentId: trustedInboundDeployment?.localAgentId,
+        // Retell's represented custom-function contract has no documented
+        // delivery ID. The raw body is immutable only after signature
+        // verification above; hashing it dedupes byte-identical redelivery
+        // without persisting DOB or inventing a provider field.
+        providerInvocationId: createHash('sha256').update(request.rawBody ?? Buffer.alloc(0)).digest('hex'),
       },
       body.name,
       trustedToolArgs,
