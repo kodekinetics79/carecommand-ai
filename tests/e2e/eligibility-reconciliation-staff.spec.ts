@@ -76,7 +76,8 @@ test.describe('real staff eligibility reconciliation workflow', () => {
   let fixture: Fixture;
   let worker: ReturnType<typeof createEligibilityReconciliationWorker>;
 
-  test.beforeEach(async (_fixtures, testInfo) => {
+  test.beforeEach(async ({ page }, testInfo) => {
+    void page;
     fixture = await seed(testInfo.project.name);
     worker = createEligibilityReconciliationWorker();
   });
