@@ -1,5 +1,17 @@
 # Change Attribution
 
+## 2026-08-10 final eligibility recovery closure attribution
+
+| Commit | Attribution |
+|---|---|
+| `9d240de` | Durable eligibility reconciliation state/workflow, production worker registration, row fencing, clinic UI, and migration 88 |
+| `78723fd` | Crash recovery, route, frontend, Redis namespace, delete-protection, and real-backend staff journey tests |
+| `2470b2c` | Reconciliation scheduler contract coverage |
+| `3f8f238` | Initial staff journey lint correction; subsequently found to break Playwright fixture collection |
+| `ce1b9a4` | Final Playwright fixture-contract correction with passing lint, typecheck, desktop, and mobile runs |
+
+The release-evidence commit is documentation-only. The independent Eligibility/RCM review rejected closure on remaining P1 truthfulness and success-response-loss defects, so no release tag was created. No provider credential/payload, PHI, database dump, browser artifact, temporary log, push, deployment, or donor migration was committed.
+
 ## 2026-08-10 authoritative Tier 1 P1 closure attribution
 
 | Commit | Attribution |

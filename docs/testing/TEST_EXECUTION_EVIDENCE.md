@@ -1,5 +1,43 @@
 # Test Execution Evidence
 
+## 2026-08-10 final eligibility recovery closure — final evidence
+
+Environment: branch `fix/eligibility-reconciliation-final-20260810`, guarded disposable PostgreSQL databases, uniquely namespaced local Redis, synthetic fixtures, and mock/disabled providers. No production, real payer, live provider request, real PHI, claim, payment, push, deployment, or new worktree was used.
+
+Implementation commits: `9d240de` (durable reconciliation, worker registration, row fencing, clinic workflow, migration), `78723fd` (SDET recovery/browser/namespace coverage), `2470b2c` (scheduler contract), `3f8f238` and `ce1b9a4` (Playwright lint/fixture corrections). Final migration count: 88; latest `20260810160000_eligibility_reconciliation_workflow`.
+
+| Gate | Result |
+|---|---|
+| Baseline delete-protection manifest | Reproduced FAIL: 1 failed/9 passed; fixed result PASS 10/10 with lifecycle behavior reviewed |
+| Consolidated eligibility/reconciliation suite | PASS: 11 files, 103/103 tests; 10.50 s Vitest, 13.00 s wall |
+| Scoped payment/appointment/AI-queue preservation regression | PASS: 10 files, 93/93 tests; 31.11 s |
+| Reconciliation concurrency/performance | Correctness PASS: 101 rows produced 101 tasks and 101 audits, zero provider lookups/errors/residual row leases; independent review found duplicate page scanning across two instances (P2) |
+| Staff real-backend Playwright | PASS: 2/2; desktop Chromium 2.2 s, Pixel 7 2.4 s, 14.4 s total |
+| Full RLS behavior | PASS: 1002/1002; 6.79 s |
+| RLS catalog/runtime role | PASS: 132 application tables, 124 protected, 526 policies; restricted runtime role |
+| Prisma drift | PASS: 123 migration-owned composite FKs and 135 migration-owned indexes |
+| Zero-to-head migration | PASS: all 88 migrations applied in a guarded disposable database |
+| Authoritative upgrade | PASS: genuine 87→88; only `20260810160000_eligibility_reconciliation_workflow` applied; new states, forced RLS, and task FK verified |
+| Prisma validation/typecheck/lint/build | PASS; `npm run check` and production build completed successfully |
+| Full normal disposable regression | PASS: 118 files, 1,967/1,967 tests; 168.71 s Vitest, 171.11 s wall; no timeout override |
+| Independent Eligibility/RCM review | **REJECTED**: four P1 truthfulness/continuity defects and four P2 capability/operability gaps remain |
+
+Primary logs: `/tmp/carecommand-elig-recon-cycle2-combined-9d240de.log` (SHA-256 `75c5983f0fcdbeea91796c79e30bdcb6481906bcb9bde6c5c781d5e37a61a69e`), `/tmp/carecommand-eligibility-final-playwright-rerun.log` (`0acd8af9402994c8fa8d91422a329c7312e45b8da9dc06335af3e2b376a8a6f6`), `/tmp/carecommand-eligibility-final-scoped-regression.log` (`3365becce35ecddc3282b9a15cc57f6e6161d139971f6eea1c58cb75fc52330b`), `/tmp/carecommand-eligibility-final-rls.log` (`bcdf291f88aa25e0eedf225654cc2353cd7007a5dea7e5cffbf06b6e42d48fae`), `/tmp/carecommand-eligibility-final-drift.log` (`69e307d70a575d13a510f97feab37818228fae13162c57896269ada63ece00b4`), and `/tmp/carecommand-eligibility-final-full-regression.log` (`52c0811074dc0374cd8a601e0122c02fdbc03eb0b4d579f674093f0f7d805d23`).
+
+The independent reviewer rejected release closure because: the reconciliation UI lacks payer/service/date/request/attempt/audit context needed for its attestation; manual evidence is mislabeled in visible history; unknown nullable benefits can render as `$0`/`null%`; and a successfully persisted provider result followed by lost HTTP/browser identity can create a second execution. P2 findings are duplicate multi-instance page scans, an unimplemented safe-lookup adapter path, incomplete proof of the required close-before-delete Redis cleanup sequence, and production scheduler numeric defaults that are bounded but not explicit. Therefore the final verdict is **NO-GO**. No closure tag was created.
+
+## 2026-08-10 final eligibility recovery closure — starting state
+
+- Starting branch: `fix/tier1-p1-authoritative-20260810`
+- Starting HEAD: `165c903d591cc500efae55e770ae0b5933b64d9f`
+- Focused closure branch: `fix/eligibility-reconciliation-final-20260810`
+- Starting migration count: 87; latest `20260810090000_eligibility_execution_integrity`
+- Starting worktree: clean
+- Recovery bundle: `/Users/zackkhan/Desktop/carecommand-recovery/carecommand-all-refs-tier1-p1-final-20260810.bundle`; verified before branch creation
+- Known baseline regression: `server/test/rlsGuard.test.ts:82` expects the shared delete-protection manifest to classify `EligibilityExecution`
+
+This closure is limited to eligibility reconciliation, server-authoritative action continuity, the staff reconciliation workflow, delete-protection classification, and directly related distributed-scan/Redis test hygiene. No Tier 2, live provider, production, donor migration, worktree, push, or deployment is authorized.
+
 ## 2026-08-10 authoritative Tier 1 P1 closure (final)
 
 Environment: authoritative branch `fix/tier1-p1-authoritative-20260810`, local PostgreSQL/Redis, guarded disposable databases, synthetic fixtures, mock/disabled providers. No live call, payer request, payment, claim, production data, or PHI.

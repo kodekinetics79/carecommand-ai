@@ -1,5 +1,19 @@
 # Release Readiness Report
 
+## 2026-08-10 final eligibility recovery closure — final verdict
+
+**NO-GO.** The focused branch closes durable stale discovery, production scheduler registration, manual-review persistence, exactly-once task/audit effects, clinic claim/resolve actions, tenant/role fences, the delete-protection manifest failure, and the required real-backend desktop/mobile journey. All static, migration, drift, RLS, focused, browser, and normal full-regression gates pass. The independent Eligibility/RCM reviewer nevertheless rejected the result after the maximum two remediation cycles.
+
+Remaining P1 blockers:
+
+1. The clinic attestation workflow does not display the actual payer, requested service/date, request time, last attempt, or execution-specific audit. `serviceType` is not durably recoverable for the staff review that asks them to attest it.
+2. Manually reconciled eligibility is stored with correct provenance but visible history omits that provenance and labels the result as payer-reported. Unknown nullable benefits can also render as `$0` or `null%`.
+3. Server continuity excludes `SUCCEEDED` from same-fingerprint recovery. If the provider result is committed but the HTTP response and browser identity are lost, a new key can create another execution/provider call.
+
+P2 items: two scanner instances can duplicate candidate-page reads despite exactly-once effects; safe provider lookup/retrieval paths are declared but not implemented for shipped adapters; the Redis test does not prove the required close-connections-before-namespace-delete order; and production scheduler numbers have bounded silent defaults instead of mandatory explicit values.
+
+Current evidence: consolidated eligibility 103/103; scoped preservation 93/93; RLS 1002/1002; staff Playwright 2/2; full normal regression 118 files and 1,967/1,967 tests; all 88 migrations and genuine 87→88 upgrade pass; drift passes at 123 composite FKs/135 indexes; `npm run check` and production build pass. These passing gates do not cure the remaining product defects. No local closure tag, push, deployment, Tier 2 work, live provider transaction, or real PHI access occurred.
+
 ## 2026-08-10 authoritative Tier 1 P1 closure — final verdict
 
 **NO-GO.** Repository authority, provider call-ID collision handling, queue isolation, retry lifecycle, bounded recovery/operator retry, emergency claim truthfulness, and exact signed identity replay are internally accepted. The eligibility closure is rejected after the maximum two remediation cycles.
