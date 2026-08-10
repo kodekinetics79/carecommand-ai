@@ -20,6 +20,7 @@ export type AutopilotRecoverySummary = {
   healthy: number;
   stale: number;
   errors: number;
+  limited: boolean;
 };
 
 async function mapConcurrent<T, R>(values: T[], concurrency: number, fn: (value: T) => Promise<R>): Promise<R[]> {
@@ -155,6 +156,7 @@ export async function reconcileQueuedAutopilotDispatch(candidate: QueuedAutopilo
  */
 export async function reconcileStrandedAutopilotDispatches(options?: {
   tenantIds?: string[];
+  maxCandidates?: number;
 }): Promise<AutopilotRecoverySummary> {
   const summary: AutopilotRecoverySummary = {
     scanned: 0,
@@ -162,14 +164,19 @@ export async function reconcileStrandedAutopilotDispatches(options?: {
     healthy: 0,
     stale: 0,
     errors: 0,
+    limited: false,
   };
+  const maxCandidates = Math.max(1, Math.min(10_000, Math.trunc(options?.maxCandidates ?? 1_000)));
   const tenantIds = options?.tenantIds ?? await resolveActiveJobTenantIds();
 
   for (const tenantId of tenantIds) {
     let afterId: string | undefined;
     for (;;) {
       const page = await readQueuedPage(tenantId, afterId);
-      const outcomes = await mapConcurrent(page.rows, RECOVERY_CONCURRENCY, async candidate => {
+      const remaining = maxCandidates - summary.scanned;
+      if (remaining <= 0) { summary.limited = true; return summary; }
+      const candidates = page.rows.slice(0, remaining);
+      const outcomes = await mapConcurrent(candidates, RECOVERY_CONCURRENCY, async candidate => {
         try {
           const result = await reconcileQueuedAutopilotDispatch(candidate);
           if (result.outcome === 'reconciled' || result.outcome === 'already_reconciled') return 'reconciled' as const;
@@ -190,6 +197,10 @@ export async function reconcileStrandedAutopilotDispatches(options?: {
         else if (outcome === 'healthy') summary.healthy += 1;
         else if (outcome === 'stale') summary.stale += 1;
         else summary.errors += 1;
+      }
+      if (candidates.length < page.rows.length || summary.scanned >= maxCandidates) {
+        summary.limited = page.sourceCount === RECOVERY_PAGE_SIZE || candidates.length < page.rows.length;
+        return summary;
       }
       if (!page.lastId || page.sourceCount < RECOVERY_PAGE_SIZE) break;
       afterId = page.lastId;

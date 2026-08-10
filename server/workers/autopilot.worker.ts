@@ -1,4 +1,4 @@
-import { Worker } from 'bullmq';
+import { UnrecoverableError, Worker } from 'bullmq';
 import { z } from 'zod';
 import { captureException } from '../lib/observability';
 import type { Prisma } from '../generated/prisma/client';
@@ -74,7 +74,7 @@ export async function executeAutopilotApprovedAction(input: {
     if (approval.status !== 'APPROVED') return { outcome: 'stale' as const };
 
     const parsed = createStaffTaskPayload.safeParse(approval.payload);
-    if (!parsed.success) throw new Error(`unsupported_autopilot_payload:${z.prettifyError(parsed.error)}`);
+    if (!parsed.success) throw new UnrecoverableError(`unsupported_autopilot_payload:${z.prettifyError(parsed.error)}`);
     if (parsed.data.dispatch.attemptId !== input.dispatchAttemptId) return { outcome: 'stale' as const };
 
     const task = await tx.staffTask.create({
@@ -153,7 +153,7 @@ export function createAutopilotWorker(): Worker<AutopilotExecutionJob> {
           attemptsMade: job.attemptsMade,
         });
       } catch (error) {
-        if (isFinalAutopilotAttempt(job.attemptsMade, job.opts.attempts)) {
+        if (error instanceof UnrecoverableError || isFinalAutopilotAttempt(job.attemptsMade, job.opts.attempts)) {
           await reconcileAutopilotDispatchFailure({
             approvalId: job.data.approvalId,
             tenantId: job.data.tenantId,

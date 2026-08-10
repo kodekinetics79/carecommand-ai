@@ -135,6 +135,17 @@ describe('Autopilot startup/periodic dispatch recovery', () => {
     });
   });
 
+  it('bounds a recovery pass without claiming unscanned candidates', async () => {
+    const first = await queuedApproval();
+    const secondAttempt = randomUUID();
+    await db.autopilotApproval.create({ data: {
+      tenantId: first.tenantId, playbookId: first.approval.playbookId, title: 'Bounded second', reason: 'test', confidence: 50,
+      status: 'APPROVED', payload: { actionType: 'CREATE_STAFF_TASK', task: { title: 'Bounded second', priority: 'NORMAL' }, dispatch: { state: 'queued', attemptId: secondAttempt, recordedAt: new Date().toISOString() } },
+    } });
+    const summary = await reconcileStrandedAutopilotDispatches({ tenantIds: [first.tenantId], maxCandidates: 1 });
+    expect(summary).toMatchObject({ scanned: 1, reconciled: 1, limited: true });
+  });
+
   it.each([
     ['newer pending generation', 'APPROVED', 'pending_dispatch'],
     ['newer queued generation', 'APPROVED', 'queued'],
