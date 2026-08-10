@@ -78,7 +78,7 @@ describe('insurance policy integrity', () => {
     expect(mismatch.statusCode).toBe(400);
     const crossTenantPolicy = await app.inject({ method: 'POST', url: '/v1/insurance/eligibility/check', headers: b.headers, payload: { patientId: b.patientId, policyId, payerName: a.payerName, memberId: 'EXACT-0293' } });
     expect(crossTenantPolicy.statusCode).toBe(400);
-    const exact = await app.inject({ method: 'POST', url: '/v1/insurance/eligibility/check', headers: a.headers, payload: { patientId: a.patientId, policyId, payerName: a.payerName, memberId: 'EXACT-0293' } });
+    const exact = await app.inject({ method: 'POST', url: '/v1/insurance/eligibility/check', headers: { ...a.headers, 'idempotency-key': 'policy-integrity-exact-match' }, payload: { patientId: a.patientId, policyId, payerName: a.payerName, memberId: 'EXACT-0293' } });
     expect(exact.statusCode).toBe(201);
     const verification = await db.eligibilityVerification.findUniqueOrThrow({ where: { id: exact.json().verificationId as string } });
     expect(verification.policyId).toBe(policyId);

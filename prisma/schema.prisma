@@ -131,6 +131,7 @@ model Tenant {
   insurancePayers                     InsurancePayer[]
   patientInsurancePolicies            PatientInsurancePolicy[]
   eligibilityVerifications            EligibilityVerification[]
+  eligibilityExecutions               EligibilityExecution[]
   benefitSnapshots                    BenefitSnapshot[]
   priorAuthorizations                 PriorAuthorization[]
   patientResponsibilityEstimates      PatientResponsibilityEstimate[]
@@ -259,6 +260,7 @@ model User {
   receptionistCallsReviewed ReceptionistCallLog[] @relation("ReceptionistCallReviewer")
   receptionistCallsSignedOff ReceptionistCallLog[] @relation("ReceptionistCallSignoff")
   conversationReplyAttempts ConversationReplyAttempt[]
+  eligibilityExecutions          EligibilityExecution[]          @relation("EligibilityExecutionActor")
 
   @@unique([tenantId, email])
   @@unique([tenantId, id])
@@ -288,6 +290,7 @@ model Branch {
   opportunities                  Opportunity[]
   patientInsurancePolicies       PatientInsurancePolicy[]
   eligibilityVerifications       EligibilityVerification[]
+  eligibilityExecutions                EligibilityExecution[]
   benefitSnapshots               BenefitSnapshot[]
   priorAuthorizations            PriorAuthorization[]
   patientResponsibilityEstimates PatientResponsibilityEstimate[]
@@ -349,6 +352,7 @@ model Patient {
   opportunities                  Opportunity[]
   patientInsurancePolicies       PatientInsurancePolicy[]
   eligibilityVerifications       EligibilityVerification[]
+  eligibilityExecutions          EligibilityExecution[]
   priorAuthorizations            PriorAuthorization[]
   patientResponsibilityEstimates PatientResponsibilityEstimate[]
   paymentRequests                PaymentRequest[]
@@ -405,6 +409,7 @@ model Appointment {
   branch                         Branch                          @relation(fields: [branchId], references: [id], onDelete: Restrict)
   patient                        Patient                         @relation(fields: [patientId], references: [id], onDelete: Restrict)
   eligibilityVerifications       EligibilityVerification[]
+  eligibilityExecutions          EligibilityExecution[]
   priorAuthorizations            PriorAuthorization[]
   patientResponsibilityEstimates PatientResponsibilityEstimate[]
   paymentRequests                PaymentRequest[]
@@ -913,9 +918,11 @@ model InsurancePayer {
   tenant                   Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   policies                 PatientInsurancePolicy[]
   eligibilityVerifications EligibilityVerification[]
+  eligibilityExecutions    EligibilityExecution[]
   priorAuthorizations      PriorAuthorization[]
 
   @@unique([tenantId, name])
+  @@unique([tenantId, id], map: "rls_uq_35b3e6f59f37fcd04a3e")
   @@index([tenantId, active])
 }
 
@@ -944,7 +951,9 @@ model PatientInsurancePolicy {
   patient            Patient                   @relation(fields: [patientId], references: [id], onDelete: Cascade)
   payer              InsurancePayer?           @relation(fields: [payerId], references: [id], onDelete: SetNull)
   verifications      EligibilityVerification[]
+  eligibilityExecutions EligibilityExecution[]
 
+  @@unique([tenantId, id], map: "rls_uq_b26040eb7d6bd7af1bd7")
   @@index([tenantId, branchId, active])
   @@index([tenantId, patientId, active])
   @@index([tenantId, patientId, coverageOrder, effectiveFrom, effectiveTo], map: "PatientInsurancePolicy_tenantId_patientId_coverageOrder_effecti")
@@ -962,15 +971,17 @@ model EligibilityVerification {
   coverageStatus          String
   planName                String
   payerName               String
-  copay                   Decimal                         @default(0) @db.Decimal(12, 2)
-  deductibleRemaining     Decimal                         @default(0) @db.Decimal(12, 2)
-  coinsurance             Decimal                         @default(0) @db.Decimal(12, 2)
+  copay                   Decimal?                        @db.Decimal(12, 2)
+  deductibleRemaining     Decimal?                        @db.Decimal(12, 2)
+  coinsurance             Decimal?                        @db.Decimal(12, 2)
   coverageActive          Boolean                         @default(false)
   eligibilityMessage      String
   payerReference          String?
   normalizedResponse      Json
   rawResponse             Json?
   checkedAt               DateTime                        @default(now())
+  decisionSource          String                          @default("PAYER_RESPONSE")
+  expiresAt               DateTime?
   createdAt               DateTime                        @default(now())
   updatedAt               DateTime                        @updatedAt
   tenant                  Tenant                          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
@@ -981,9 +992,59 @@ model EligibilityVerification {
   policy                  PatientInsurancePolicy?         @relation(fields: [policyId], references: [id], onDelete: SetNull)
   benefitSnapshots        BenefitSnapshot[]
   responsibilityEstimates PatientResponsibilityEstimate[]
+  eligibilityExecution    EligibilityExecution?
 
+  @@unique([tenantId, id], map: "rls_uq_2f328b9831427730c6c4")
   @@index([tenantId, branchId, checkedAt])
   @@index([tenantId, coverageStatus, checkedAt])
+}
+
+enum EligibilityExecutionStatus {
+  READY
+  PROVIDER_IN_FLIGHT
+  SUCCEEDED
+  FAILED_DEFINITIVE
+  RECONCILIATION_REQUIRED
+}
+
+model EligibilityExecution {
+  id                   String                     @id @default(uuid()) @db.Uuid
+  tenantId             String                     @db.Uuid
+  branchId             String                     @db.Uuid
+  patientId            String                     @db.Uuid
+  appointmentId        String?                    @db.Uuid
+  payerId              String?                    @db.Uuid
+  policyId             String?                    @db.Uuid
+  actorUserId          String?                    @db.Uuid
+  idempotencyKeyHash   String
+  requestFingerprint   String
+  requestContract      String
+  providerKey          String
+  providerMode         String
+  providerExecutionKey String                     @default(uuid()) @db.Uuid
+  status               EligibilityExecutionStatus @default(READY)
+  resultVerificationId String?                    @db.Uuid
+  failureCode          String?
+  reconciliationReason String?
+  claimedAt            DateTime                   @default(now())
+  providerStartedAt    DateTime?
+  providerCompletedAt  DateTime?
+  completedAt          DateTime?
+  createdAt            DateTime                   @default(now())
+  updatedAt            DateTime                   @updatedAt
+  tenant               Tenant                     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  branch               Branch                     @relation(fields: [tenantId, branchId], references: [tenantId, id], onDelete: Restrict)
+  patient              Patient                    @relation(fields: [tenantId, patientId], references: [tenantId, id], onDelete: Restrict)
+  appointment          Appointment?               @relation(fields: [tenantId, appointmentId], references: [tenantId, id], onDelete: Restrict)
+  payer                InsurancePayer?            @relation(fields: [tenantId, payerId], references: [tenantId, id], onDelete: Restrict)
+  policy               PatientInsurancePolicy?    @relation(fields: [tenantId, policyId], references: [tenantId, id], onDelete: Restrict)
+  actorUser            User?                      @relation("EligibilityExecutionActor", fields: [tenantId, actorUserId], references: [tenantId, id], onDelete: Restrict)
+  resultVerification   EligibilityVerification?   @relation(fields: [tenantId, resultVerificationId], references: [tenantId, id], onDelete: Restrict)
+
+  @@unique([tenantId, idempotencyKeyHash])
+  @@unique([tenantId, resultVerificationId])
+  @@index([tenantId, status, updatedAt])
+  @@index([tenantId, patientId, createdAt])
 }
 
 model BenefitSnapshot {

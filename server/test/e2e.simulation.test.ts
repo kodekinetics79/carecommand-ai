@@ -86,7 +86,7 @@ async function runJourney(c: Clinic): Promise<Record<string, StepResult>> {
 
   // 1) Insurance: configure Stedi sandbox + run an eligibility check.
   await app.inject({ method: 'POST', url: '/v1/insurance/providers/stedi/configure', headers: admin, payload: { mode: 'sandbox', config: {} } });
-  const elig = await app.inject({ method: 'POST', url: '/v1/insurance/eligibility/check', headers: admin, payload: { patientId: c.patientId, policyId: c.policyId, payerName: 'Aetna', memberId: 'AET-110293' } });
+  const elig = await app.inject({ method: 'POST', url: '/v1/insurance/eligibility/check', headers: { ...admin, 'idempotency-key': 'e2e-simulation-eligibility' }, payload: { patientId: c.patientId, policyId: c.policyId, payerName: 'Aetna', memberId: 'AET-110293' } });
   steps.eligibility = ok(elig.statusCode === 201 && elig.json().status === 'ACTIVE', `status=${elig.statusCode}`);
 
   // 2) Revenue policy: a new-patient deposit rule (so a deposit applies below).

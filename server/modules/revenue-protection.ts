@@ -13,6 +13,11 @@ import { recordWorkflowEvent, emitBusinessEvent } from '../lib/intelligence';
 import { eligibilityProviderStatus, runDenialPreventionForAppointment } from '../lib/insuranceIntelligence';
 import { paymentProviderStatus } from '../lib/deposits';
 import type { Prisma } from '../generated/prisma/client';
+import {
+  EligibilityExecutionConflictError,
+  eligibilityIdempotencyKey,
+  runEligibilityExecution,
+} from '../lib/eligibilityExecution';
 
 // --- Idempotency -----------------------------------------------------------
 // Claims a unique (scope,key). Returns claimed=false on redelivery, exposing
@@ -135,6 +140,7 @@ type RevenueContext = {
 };
 
 type EligibilityCheckContext = RevenueContext & {
+  providerExecutionKey?: string;
   serviceType?: string;
   patient?: {
     id: string;
@@ -640,7 +646,7 @@ export class StediEligibilityProvider extends MockEligibilityProvider {
         memberId: context.policy?.memberId ?? `TEST-${randomUUID().slice(0, 8).toUpperCase()}`,
       };
       const requestBody = {
-        controlNumber: randomUUID().replace(/-/g, '').slice(0, 12),
+        controlNumber: (context.providerExecutionKey ?? randomUUID()).replace(/-/g, '').slice(0, 12),
         tradingPartnerServiceId: payer?.tradingPartnerServiceId ?? 'TEST',
         provider: {
           organizationName: 'CareCommand Clinic',
@@ -1016,12 +1022,12 @@ async function selectDefaultPayer(context: RevenueContext) {
   });
 }
 
-async function createEligibilityAlert(context: RevenueContext, branchId: string, patientId: string | null, appointmentId: string | null, outcome: EligibilityOutcome, verificationId: string) {
+async function createEligibilityAlert(context: RevenueContext, branchId: string, patientId: string | null, appointmentId: string | null, outcome: EligibilityOutcome, verificationId: string, client?: Prisma.TransactionClient) {
   const riskThemes = deriveEligibilityRisk(outcome);
   if (!riskThemes.length) return null;
   const [primaryTheme, ...rest] = riskThemes;
   // RLS (B-3): RevenueProtectionAlert is tenant-isolated; create under context.
-  return runWithTenantContext(context.tenantId, tx => tx.revenueProtectionAlert.create({
+  const create = (tx: Prisma.TransactionClient) => tx.revenueProtectionAlert.create({
     data: {
       tenantId: context.tenantId,
       branchId,
@@ -1048,17 +1054,18 @@ async function createEligibilityAlert(context: RevenueContext, branchId: string,
         : 'Collect deposit or route to front desk follow-up.',
       actionLink: '/revenue-protection',
     },
-  }));
+  });
+  return client ? create(client) : runWithTenantContext(context.tenantId, create);
 }
 
-async function buildResponsibilityEstimate(context: RevenueContext, branchId: string, patientId: string, appointmentId: string | null, verificationId: string, outcome: EligibilityOutcome) {
+async function buildResponsibilityEstimate(context: RevenueContext, branchId: string, patientId: string, appointmentId: string | null, verificationId: string, outcome: EligibilityOutcome, client: Prisma.TransactionClient = db) {
   const appointment = appointmentId
-    ? await db.appointment.findFirst({
+    ? await client.appointment.findFirst({
         where: { id: appointmentId, tenantId: context.tenantId },
         select: { value: true, noShowRisk: true, service: true },
       })
     : null;
-  const patient = await db.patient.findFirst({
+  const patient = await client.patient.findFirst({
     where: { id: patientId, tenantId: context.tenantId },
     select: { outstandingBalance: true, churnRisk: true, lifecycleStage: true },
   });
@@ -1071,7 +1078,7 @@ async function buildResponsibilityEstimate(context: RevenueContext, branchId: st
     Math.min(responsibility, appointmentValue * 0.4),
   );
 
-  return db.patientResponsibilityEstimate.create({
+  return client.patientResponsibilityEstimate.create({
     data: {
       tenantId: context.tenantId,
       branchId,
@@ -1140,6 +1147,55 @@ function mapVerification(row: {
       : 'Request updated insurance before appointment.',
     riskLevel: row.coverageActive ? (toNumber(row.deductibleRemaining) > 1000 ? 'MEDIUM' : 'LOW') : 'HIGH',
     revenueAtRisk: row.coverageActive ? 0 : Math.max(185, Math.round(toNumber(row.deductibleRemaining) * 0.18 + toNumber(row.copay))),
+  };
+}
+
+async function buildRevenueEligibilityResponse(tenantId: string, verificationId: string, client: Prisma.TransactionClient = db) {
+  const verification = await client.eligibilityVerification.findFirst({
+    where: { id: verificationId, tenantId },
+    include: {
+      branch: { select: { name: true } },
+      patient: { select: { firstName: true, lastName: true } },
+      payer: { select: { name: true } },
+      policy: { select: { memberId: true } },
+    },
+  });
+  if (!verification) throw new Error('Eligibility result is unavailable');
+  const outcome = verification.normalizedResponse as unknown as EligibilityOutcome;
+  const alert = await client.revenueProtectionAlert.findFirst({
+    where: { tenantId, sourceType: 'eligibility', evidence: { path: ['verificationId'], equals: verificationId } },
+    select: { id: true, estimatedValue: true },
+  });
+  return {
+    verificationId: verification.id,
+    id: verification.id,
+    branchId: verification.branchId,
+    branchName: verification.branch.name,
+    patientId: verification.patientId,
+    patientName: `${verification.patient.firstName} ${verification.patient.lastName}`,
+    appointmentId: verification.appointmentId ?? null,
+    payerId: verification.payerId ?? null,
+    payerName: verification.payer?.name ?? verification.payerName,
+    policyId: verification.policyId ?? null,
+    memberId: verification.policy?.memberId ?? null,
+    planName: verification.planName,
+    coverageStatus: verification.coverageStatus.toUpperCase(),
+    coverageActive: verification.coverageActive,
+    copay: verification.copay === null ? null : toNumber(verification.copay),
+    deductibleRemaining: verification.deductibleRemaining === null ? null : toNumber(verification.deductibleRemaining),
+    coinsurance: verification.coinsurance === null ? null : toNumber(verification.coinsurance),
+    benefitDataIncomplete: outcome.benefitDataIncomplete,
+    missingBenefitFields: outcome.missingBenefitFields,
+    eligibilityMessage: verification.eligibilityMessage,
+    payerReference: verification.payerReference ?? outcome.payerReference,
+    checkedAt: verification.checkedAt.toISOString(),
+    providerMode: verification.providerMode,
+    alertId: alert?.id ?? null,
+    priorAuthRequired: outcome.priorAuthRequired,
+    recommendedAction: outcome.recommendedAction,
+    riskLevel: outcome.riskLevel,
+    revenueAtRisk: toNumber(alert?.estimatedValue ?? outcome.revenueAtRisk),
+    benefitUncertainty: outcome.benefitUncertainty,
   };
 }
 
@@ -1847,210 +1903,200 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     if (payer && policy.payer.id !== payer.id) throw app.httpErrors.badRequest('Selected payer does not match the policy');
     const selectedPayer = payer ?? policy.payer;
     const provider = createInsuranceProvider();
+    const patientId = entities.patient?.id ?? body.patientId!;
+    const appointmentId = entities.appointment?.id ?? body.appointmentId ?? null;
+    const rawIdempotencyKey = eligibilityIdempotencyKey(request);
 
-    let outcome: EligibilityOutcome;
     try {
-      outcome = await provider.runEligibilityCheck({
-        tenantId: request.auth.tenantId,
-        branchId: entities.branchId,
-        patient: entities.patient ?? undefined,
-        appointment: entities.appointment ?? undefined,
-        payer: { id: selectedPayer.id, name: selectedPayer.name, tradingPartnerServiceId: selectedPayer.tradingPartnerServiceId, sourceProvider: selectedPayer.sourceProvider },
-        policy: policy ? {
-          id: policy.id,
-          planName: policy.planName,
+      const execution = await runEligibilityExecution({
+        context: {
+          tenantId: request.auth.tenantId,
+          branchId: entities.branchId,
+          patientId,
+          appointmentId,
+          payerId: selectedPayer.id,
+          policyId: policy.id,
+          actorUserId: request.auth.userId,
+          requestId: request.id,
+          ipAddress: request.ip,
+          userAgent: request.headers['user-agent'],
+        },
+        rawIdempotencyKey,
+        fingerprintParts: {
+          contract: 'revenue_protection_v1',
+          branchId: entities.branchId,
+          patientId,
+          appointmentId,
+          payerId: selectedPayer.id,
+          policyId: policy.id,
           memberId: policy.memberId,
-          groupNumber: policy.groupNumber,
-          subscriberName: policy.subscriberName,
-        } : undefined,
-        serviceType: body.serviceType ?? entities.appointment?.service,
-      });
-    } catch (error) {
-      if (!(error instanceof ProviderOperationError)) throw error;
-      await emitBusinessEvent(request.auth.tenantId, { eventType: 'insurance.eligibility.failed', entityType: 'appointment', entityId: body.appointmentId ?? body.patientId ?? null, sourceModule: 'insurance', payload: { provider: providerStatus.provider, reason: 'provider_unavailable' } }).catch(() => {});
-      return reply.code(503).send({ status: 'provider_unavailable', retryable: true, provider: providerStatus.provider, message: 'Eligibility provider is temporarily unavailable. No eligibility result was created.' });
-    }
-
-    const verification = await db.eligibilityVerification.create({
-      data: {
-        tenantId: request.auth.tenantId,
-        branchId: entities.branchId,
-        patientId: entities.patient?.id ?? body.patientId!,
-        appointmentId: entities.appointment?.id ?? body.appointmentId ?? undefined,
-        payerId: selectedPayer.id,
-        policyId: policy?.id ?? undefined,
-        providerMode: outcome.providerMode,
-        coverageStatus: outcome.coverageStatus,
-        planName: outcome.planName,
-        payerName: outcome.payerName,
-        copay: outcome.copay,
-        deductibleRemaining: outcome.deductibleRemaining,
-        coinsurance: outcome.coinsurance,
-        coverageActive: outcome.coverageActive,
-        eligibilityMessage: outcome.eligibilityMessage,
-        payerReference: outcome.payerReference,
-        normalizedResponse: {
-          ...outcome,
-          providerMode: outcome.providerMode,
-          providerName: outcome.providerName,
-        } as Prisma.InputJsonValue,
-        ...(outcome.storeRawResponse && outcome.rawResponse ? { rawResponse: outcome.rawResponse as Prisma.InputJsonValue } : {}),
-      },
-    });
-
-    await Promise.all([
-      db.patient.updateMany({
-        where: { id: entities.patient?.id ?? body.patientId!, tenantId: request.auth.tenantId },
-        data: {
-          eligibilityStatus: outcome.coverageActive ? 'ACTIVE' : 'INACTIVE',
-          eligibilityLastVerifiedAt: new Date(),
+          providerKey: provider.providerKey,
+          serviceType: body.serviceType ?? entities.appointment?.service ?? null,
         },
-      }),
-      entities.appointment
-        ? db.appointment.updateMany({
-            where: { id: entities.appointment.id, tenantId: request.auth.tenantId },
+        requestContract: 'revenue_protection_v1',
+        providerKey: provider.providerKey,
+        providerMode: provider.mode,
+        executeProvider: providerExecutionKey => provider.runEligibilityCheck({
+          tenantId: request.auth.tenantId,
+          branchId: entities.branchId,
+          providerExecutionKey,
+          patient: entities.patient ?? undefined,
+          appointment: entities.appointment ?? undefined,
+          payer: { id: selectedPayer.id, name: selectedPayer.name, tradingPartnerServiceId: selectedPayer.tradingPartnerServiceId, sourceProvider: selectedPayer.sourceProvider },
+          policy: {
+            id: policy.id,
+            planName: policy.planName,
+            memberId: policy.memberId,
+            groupNumber: policy.groupNumber,
+            subscriberName: policy.subscriberName,
+          },
+          serviceType: body.serviceType ?? entities.appointment?.service,
+        }),
+        finalize: async (tx, outcome, executionId) => {
+          const verifiedAt = new Date();
+          const missing = new Set(outcome.missingBenefitFields);
+          const payerReference = outcome.payerReference.includes(policy.memberId) ? null : outcome.payerReference;
+          const verification = await tx.eligibilityVerification.create({
             data: {
-              eligibilityStatus: outcome.coverageActive ? 'ACTIVE' : 'INACTIVE',
-              eligibilityLastVerifiedAt: new Date(),
+              tenantId: request.auth.tenantId,
+              branchId: entities.branchId,
+              patientId,
+              appointmentId: appointmentId ?? undefined,
+              payerId: selectedPayer.id,
+              policyId: policy.id,
+              providerMode: outcome.providerMode,
+              coverageStatus: outcome.coverageStatus,
+              planName: outcome.planName,
+              payerName: outcome.payerName,
+              copay: missing.has('copay') ? null : outcome.copay,
+              deductibleRemaining: missing.has('deductibleRemaining') ? null : outcome.deductibleRemaining,
+              coinsurance: missing.has('coinsurance') ? null : outcome.coinsurance,
+              coverageActive: outcome.coverageActive,
+              eligibilityMessage: outcome.eligibilityMessage,
+              payerReference,
+              decisionSource: outcome.providerMode === 'live' ? 'PAYER_RESPONSE' : 'SIMULATED',
+              normalizedResponse: {
+                coverageStatus: outcome.coverageStatus,
+                planName: outcome.planName,
+                payerName: outcome.payerName,
+                copay: missing.has('copay') ? null : outcome.copay,
+                deductibleRemaining: missing.has('deductibleRemaining') ? null : outcome.deductibleRemaining,
+                coinsurance: missing.has('coinsurance') ? null : outcome.coinsurance,
+                coverageActive: outcome.coverageActive,
+                eligibilityMessage: outcome.eligibilityMessage,
+                payerReference,
+                checkedAt: outcome.checkedAt,
+                providerMode: outcome.providerMode,
+                providerName: outcome.providerName,
+                needsPriorAuth: outcome.needsPriorAuth,
+                priorAuthRequired: outcome.priorAuthRequired,
+                benefitUncertainty: outcome.benefitUncertainty,
+                riskLevel: outcome.riskLevel,
+                recommendedAction: outcome.recommendedAction,
+                revenueAtRisk: outcome.revenueAtRisk,
+                benefitDataIncomplete: outcome.benefitDataIncomplete,
+                missingBenefitFields: outcome.missingBenefitFields,
+              } as Prisma.InputJsonValue,
             },
-          })
-        : Promise.resolve(),
-      policy
-        ? db.patientInsurancePolicy.update({
+          });
+          await tx.patient.updateMany({
+            where: { id: patientId, tenantId: request.auth.tenantId },
+            data: { eligibilityStatus: outcome.coverageActive ? 'ACTIVE' : 'INACTIVE', eligibilityLastVerifiedAt: verifiedAt },
+          });
+          if (appointmentId) {
+            await tx.appointment.updateMany({
+              where: { id: appointmentId, tenantId: request.auth.tenantId },
+              data: { eligibilityStatus: outcome.coverageActive ? 'ACTIVE' : 'INACTIVE', eligibilityLastVerifiedAt: verifiedAt },
+            });
+          }
+          await tx.patientInsurancePolicy.update({
             where: { id: policy.id },
+            data: { verificationStatus: outcome.coverageActive ? 'verified' : 'inactive', verifiedAt },
+          });
+          await tx.benefitSnapshot.create({
             data: {
-              verificationStatus: outcome.coverageActive ? 'verified' : 'inactive',
-              verifiedAt: new Date(),
+              tenantId: request.auth.tenantId,
+              branchId: entities.branchId,
+              verificationId: verification.id,
+              summary: outcome.eligibilityMessage,
+              details: {
+                coverageStatus: outcome.coverageStatus,
+                payerName: outcome.payerName,
+                planName: outcome.planName,
+                copay: missing.has('copay') ? null : outcome.copay,
+                deductibleRemaining: missing.has('deductibleRemaining') ? null : outcome.deductibleRemaining,
+                coinsurance: missing.has('coinsurance') ? null : outcome.coinsurance,
+                needsPriorAuth: outcome.needsPriorAuth,
+                benefitUncertainty: outcome.benefitUncertainty,
+              },
             },
-          })
-        : Promise.resolve(),
-    ]);
-
-    const verificationDetails = await db.eligibilityVerification.findUnique({
-      where: { id: verification.id },
-      include: {
-        branch: { select: { name: true } },
-        patient: { select: { firstName: true, lastName: true } },
-        payer: { select: { name: true } },
-        policy: { select: { memberId: true, planName: true, groupNumber: true } },
-      },
-    });
-    if (!verificationDetails) {
-      throw app.httpErrors.internalServerError('Unable to load verification details');
-    }
-
-    await db.benefitSnapshot.create({
-      data: {
-        tenantId: request.auth.tenantId,
-        branchId: entities.branchId,
-        verificationId: verification.id,
-        summary: outcome.eligibilityMessage,
-        details: {
-          coverageStatus: outcome.coverageStatus,
-          payerName: outcome.payerName,
-          planName: outcome.planName,
-          copay: outcome.copay,
-          deductibleRemaining: outcome.deductibleRemaining,
-          coinsurance: outcome.coinsurance,
-          needsPriorAuth: outcome.needsPriorAuth,
-          benefitUncertainty: outcome.benefitUncertainty,
+          });
+          if (entities.patient) {
+            await buildResponsibilityEstimate(
+              { tenantId: request.auth.tenantId, branchId: entities.branchId },
+              entities.branchId,
+              entities.patient.id,
+              appointmentId,
+              verification.id,
+              outcome,
+              tx,
+            );
+          }
+          await createEligibilityAlert(
+            { tenantId: request.auth.tenantId, branchId: entities.branchId },
+            entities.branchId,
+            patientId,
+            appointmentId,
+            outcome,
+            verification.id,
+            tx,
+          );
+          await tx.integrationRunLog.create({
+            data: {
+              tenantId: request.auth.tenantId,
+              branchId: entities.branchId,
+              provider: provider.providerKey,
+              providerMode: outcome.providerMode,
+              operation: 'eligibility.check',
+              status: 'success',
+              requestSummary: { executionId, patientId, appointmentId, payerId: selectedPayer.id },
+              responseSummary: { coverageStatus: outcome.coverageStatus, benefitDataIncomplete: outcome.benefitDataIncomplete },
+            },
+          });
+          const eligEvent = !outcome.coverageActive ? 'insurance.eligibility.failed' : outcome.benefitUncertainty ? 'insurance.eligibility.needs_review' : 'insurance.eligibility.completed';
+          await tx.businessEvent.create({
+            data: {
+              tenantId: request.auth.tenantId,
+              eventType: eligEvent,
+              entityType: 'eligibilityVerification',
+              entityId: verification.id,
+              sourceModule: 'insurance',
+              payload: { coverageStatus: outcome.coverageStatus, appointmentId, executionId },
+            },
+          });
+          return {
+            verificationId: verification.id,
+            result: await buildRevenueEligibilityResponse(request.auth.tenantId, verification.id, tx),
+            auditMetadata: { branchId: entities.branchId, providerMode: outcome.providerMode, coverageStatus: outcome.coverageStatus },
+          };
         },
-      },
-    });
-
-    if (entities.patient) {
-      await buildResponsibilityEstimate(
-        { tenantId: request.auth.tenantId, branchId: entities.branchId },
-        entities.branchId,
-        entities.patient.id,
-        entities.appointment?.id ?? body.appointmentId ?? null,
-        verification.id,
-        outcome,
-      );
+        replay: verificationId => buildRevenueEligibilityResponse(request.auth.tenantId, verificationId),
+      });
+      if (!execution.replayed && execution.result.appointmentId) {
+        await runDenialPreventionForAppointment(request.auth.tenantId, execution.result.appointmentId, { actorUserId: request.auth.userId, branchId: entities.branchId }).catch(() => {});
+      }
+      return reply.send({ ...execution.result, executionId: execution.executionId, replayed: execution.replayed });
+    } catch (error) {
+      if (!(error instanceof EligibilityExecutionConflictError)) throw error;
+      return reply.code(409).send({
+        status: error.code,
+        executionId: error.executionId,
+        retryable: false,
+        message: error.code === 'reconciliation_required'
+          ? 'The payer outcome is ambiguous and requires staff reconciliation. The provider was not called again.'
+          : 'This eligibility execution cannot be repeated with the supplied idempotency key.',
+      });
     }
-
-    const alert = await createEligibilityAlert(
-      { tenantId: request.auth.tenantId, branchId: entities.branchId },
-      entities.branchId,
-      entities.patient?.id ?? body.patientId ?? null,
-      entities.appointment?.id ?? body.appointmentId ?? null,
-      outcome,
-      verification.id,
-    );
-
-    await db.integrationRunLog.create({
-      data: {
-        tenantId: request.auth.tenantId,
-        branchId: entities.branchId,
-        provider: provider.providerKey,
-        providerMode: outcome.providerMode,
-        operation: 'eligibility.check',
-        status: 'success',
-        requestSummary: {
-          patientId: body.patientId ?? entities.patient?.id ?? null,
-          appointmentId: body.appointmentId ?? entities.appointment?.id ?? null,
-          payerId: payer?.id ?? null,
-        },
-        responseSummary: {
-          coverageStatus: outcome.coverageStatus,
-          payerName: outcome.payerName,
-          planName: outcome.planName,
-          copay: outcome.copay,
-          deductibleRemaining: outcome.deductibleRemaining,
-          coinsurance: outcome.coinsurance,
-        },
-      },
-    });
-
-    // Intelligence: completion/needs-review/failed event + rule-based denial
-    // prevention for the linked appointment (creates signals/tasks/alerts).
-    const eligEvent = !outcome.coverageActive ? 'insurance.eligibility.failed' : outcome.benefitUncertainty ? 'insurance.eligibility.needs_review' : 'insurance.eligibility.completed';
-    await emitBusinessEvent(request.auth.tenantId, { eventType: eligEvent as 'insurance.eligibility.completed', entityType: 'eligibilityVerification', entityId: verification.id, sourceModule: 'insurance', payload: { coverageStatus: outcome.coverageStatus, appointmentId: verification.appointmentId } }).catch(() => {});
-    if (verification.appointmentId) {
-      await runDenialPreventionForAppointment(request.auth.tenantId, verification.appointmentId, { actorUserId: request.auth.userId, branchId: entities.branchId }).catch(() => {});
-    }
-    await audit(request, {
-      action: 'eligibility.checked',
-      resource: 'eligibilityVerification',
-      resourceId: verification.id,
-      metadata: { branchId: entities.branchId, providerMode: outcome.providerMode, coverageStatus: outcome.coverageStatus },
-    });
-
-    return reply.send({
-      verificationId: verification.id,
-      id: verification.id,
-      branchId: verificationDetails.branchId,
-      branchName: verificationDetails.branch.name,
-      patientId: verificationDetails.patientId,
-      patientName: `${verificationDetails.patient.firstName} ${verificationDetails.patient.lastName}`,
-      appointmentId: verificationDetails.appointmentId ?? null,
-      payerId: verificationDetails.payerId ?? null,
-      payerName: verificationDetails.payer?.name ?? outcome.payerName,
-      policyId: verificationDetails.policyId ?? null,
-      memberId: verificationDetails.policy?.memberId ?? outcome.memberId,
-      planName: verificationDetails.planName,
-      coverageStatus: verificationDetails.coverageStatus.toUpperCase(),
-      coverageActive: verificationDetails.coverageActive,
-      // Honesty: a benefit field the payer omitted is reported as null (unknown),
-      // never as a fabricated dollar figure.
-      copay: outcome.missingBenefitFields.includes('copay') ? null : toNumber(verificationDetails.copay),
-      deductibleRemaining: outcome.missingBenefitFields.includes('deductibleRemaining') ? null : toNumber(verificationDetails.deductibleRemaining),
-      coinsurance: outcome.missingBenefitFields.includes('coinsurance') ? null : toNumber(verificationDetails.coinsurance),
-      benefitDataIncomplete: outcome.benefitDataIncomplete,
-      missingBenefitFields: outcome.missingBenefitFields,
-      eligibilityMessage: verificationDetails.eligibilityMessage,
-      payerReference: verificationDetails.payerReference ?? outcome.payerReference,
-      checkedAt: verificationDetails.checkedAt.toISOString(),
-      // Report the TRUE provider mode ('mock' | 'sandbox' | 'live'); never relabel a
-      // genuine live Stedi check as sandbox.
-      providerMode: verificationDetails.providerMode,
-      alertId: alert?.id ?? null,
-      priorAuthRequired: outcome.priorAuthRequired,
-      recommendedAction: outcome.recommendedAction,
-      riskLevel: outcome.riskLevel,
-      revenueAtRisk: toNumber(alert?.estimatedValue ?? outcome.revenueAtRisk),
-      benefitUncertainty: outcome.benefitUncertainty,
-    });
   });
 
   app.patch('/eligibility/:id/status', { preHandler: [insuranceFeature, billingWrite] }, async (request, reply) => {

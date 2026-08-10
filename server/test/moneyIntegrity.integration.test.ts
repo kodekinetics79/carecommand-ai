@@ -151,12 +151,46 @@ describe('#5 insurance eligibility never presents a simulator result as a real p
     await db.insuranceProvider.create({ data: { tenantId: t.id, providerKey: 'stedi', displayName: 'Stedi', category: 'INSURANCE', mode: 'production', status: 'ACTIVE' } });
 
     const res = await app.inject({
-      method: 'POST', url: '/v1/insurance/eligibility/check', headers: { ...auth(t, t.ownerId), 'content-type': 'application/json' },
+      method: 'POST', url: '/v1/insurance/eligibility/check', headers: { ...auth(t, t.ownerId), 'content-type': 'application/json', 'idempotency-key': 'money-integrity-eligibility' },
       payload: JSON.stringify({ patientId: patient.id, payerName: 'Acme Health', memberId: 'MEM12345' }),
     });
     expect(res.statusCode).toBe(503);
     expect(res.json().message).toBe('An unexpected error occurred');
     const v = await db.eligibilityVerification.findFirst({ where: { tenantId: t.id, patientId: patient.id } });
     expect(v).toBeNull();
+  });
+});
+
+describe('#6 both eligibility surfaces use the durable execution boundary', () => {
+  it('replays revenue-protection eligibility without duplicating canonical or downstream rows', async () => {
+    const t = await makeTenant();
+    const patient = await db.patient.create({ data: { tenantId: t.id, branchId: t.branchId, firstName: 'Revenue', lastName: 'Patient' } });
+    const payer = await db.insurancePayer.create({ data: { tenantId: t.id, name: 'Revenue Test Payer', sourceProvider: 'mock' } });
+    const policy = await db.patientInsurancePolicy.create({
+      data: { tenantId: t.id, branchId: t.branchId, patientId: patient.id, payerId: payer.id, planName: 'Test PPO', memberId: 'REV-MEMBER-1234' },
+    });
+    const headers = { ...auth(t, t.ownerId), 'idempotency-key': 'revenue-eligibility-replay' };
+    const payload = { branchId: t.branchId, patientId: patient.id, payerId: payer.id, policyId: policy.id, serviceType: 'office visit' };
+
+    const first = await app.inject({ method: 'POST', url: '/v1/revenue-protection/eligibility/check', headers, payload });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().replayed).toBe(false);
+    const replay = await app.inject({ method: 'POST', url: '/v1/revenue-protection/eligibility/check', headers, payload });
+    expect(replay.statusCode).toBe(200);
+    expect(replay.json()).toMatchObject({
+      verificationId: first.json().verificationId,
+      executionId: first.json().executionId,
+      replayed: true,
+    });
+
+    expect(await db.eligibilityExecution.count({ where: { tenantId: t.id } })).toBe(1);
+    expect(await db.eligibilityVerification.count({ where: { tenantId: t.id } })).toBe(1);
+    expect(await db.benefitSnapshot.count({ where: { tenantId: t.id } })).toBe(1);
+    expect(await db.patientResponsibilityEstimate.count({ where: { tenantId: t.id } })).toBe(1);
+    expect(await db.integrationRunLog.count({ where: { tenantId: t.id, operation: 'eligibility.check', status: 'success' } })).toBe(1);
+    expect(await db.auditEvent.count({ where: { tenantId: t.id, action: 'eligibility.checked' } })).toBe(1);
+    const storedVerification = await db.eligibilityVerification.findFirstOrThrow({ where: { tenantId: t.id } });
+    expect(storedVerification.rawResponse).toBeNull();
+    expect(JSON.stringify(storedVerification.normalizedResponse)).not.toContain('REV-MEMBER-1234');
   });
 });

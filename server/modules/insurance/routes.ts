@@ -14,6 +14,11 @@ import { runStediEligibility, type NormalizedEligibility } from '../../lib/conne
 import { env } from '../../config/env';
 import { createInsuranceProvider } from '../revenue-protection';
 import { requirePermission } from '../../lib/permissions';
+import {
+  EligibilityExecutionConflictError,
+  eligibilityIdempotencyKey,
+  runEligibilityExecution,
+} from '../../lib/eligibilityExecution';
 
 function insStatus(def: { supportsSandbox: boolean }, mode: string, hasRequired: boolean): string {
   if (mode === 'sandbox' && def.supportsSandbox) return 'SANDBOX';
@@ -36,6 +41,7 @@ function isPolicyRangeConflict(error: unknown): boolean {
 const uuid = z.string().uuid();
 const adminRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
 const deskRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'FRONT_DESK');
+const reconciliationRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'BILLING');
 const insuranceRead = requirePermission('billing:read');
 
 export const insuranceRoutes: FastifyPluginAsync = async app => {
@@ -386,68 +392,167 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
     // copay/deductible is never presented as a real payer (271) response. connectedCare/*
     // is owned elsewhere and is NOT modified — we reuse revenue-protection's provider.
     const liveConfigured = providerRuntimeCapability('stedi', 'production').enabled;
-    let n: NormalizedEligibility;
-    let providerMode: string;
-    let raw: unknown;
-    let simulated: boolean;
-
-    if (input.providerKey === 'stedi' && provider.mode === 'production' && liveConfigured) {
-      // REAL path — identical adapter to revenue-protection's eligibility check.
-      const outcome = await createInsuranceProvider().runEligibilityCheck({
-        tenantId, branchId: patient.branchId,
-        payer: policyPayer,
-        policy: { id: policy.id, planName: policy.planName, memberId: policy.memberId },
-        serviceType: input.serviceType,
-      });
-      providerMode = outcome.providerMode;
-      // Only a genuine 'live' payer response is NOT a simulation.
-      simulated = outcome.providerMode !== 'live';
-      n = {
-        status: outcome.coverageActive ? (outcome.coverageStatus === 'uncertain' ? 'NEEDS_REVIEW' : 'ACTIVE') : 'INACTIVE',
-        coverageActive: outcome.coverageActive, planName: outcome.planName, payerName: outcome.payerName,
-        copay: outcome.copay, deductibleRemaining: outcome.deductibleRemaining, coinsurance: outcome.coinsurance,
-        message: outcome.eligibilityMessage, payerReference: outcome.payerReference, checkedAt: outcome.checkedAt,
+    const rawIdempotencyKey = eligibilityIdempotencyKey(request);
+    const responseFromVerification = async (verificationId: string) => {
+      const row = await db.eligibilityVerification.findFirst({ where: { id: verificationId, tenantId } });
+      if (!row) throw app.httpErrors.internalServerError('Eligibility result is unavailable');
+      const normalized = row.normalizedResponse as Record<string, unknown>;
+      const simulated = normalized.simulated === true;
+      return {
+        verificationId: row.id,
+        status: row.coverageStatus,
+        coverageActive: row.coverageActive,
+        planName: row.planName,
+        payerName: row.payerName,
+        copay: row.copay === null ? null : Number(row.copay),
+        deductibleRemaining: row.deductibleRemaining === null ? null : Number(row.deductibleRemaining),
+        coinsurance: row.coinsurance === null ? null : Number(row.coinsurance),
+        message: row.eligibilityMessage,
+        payerReference: row.payerReference,
+        maskedMemberId: maskMemberId(input.memberId),
+        providerMode: row.providerMode,
+        mode: row.providerMode,
+        simulated,
+        checkedAt: row.checkedAt,
       };
-      raw = outcome.storeRawResponse && outcome.rawResponse ? outcome.rawResponse : { note: 'raw payer response withheld' };
-    } else {
-      // SIMULATED path — FORCE sandbox labeling; never present 'production' fabricated
-      // data as a real result.
-      const result = runStediEligibility(
-        { memberId: input.memberId, payerName: input.payerName, planName: input.planName, serviceType: input.serviceType },
-        'sandbox',
-      );
-      n = result.normalized;
-      providerMode = 'sandbox';
-      simulated = true;
-      raw = result.raw;
+    };
+
+    try {
+      const execution = await runEligibilityExecution({
+        context: {
+          tenantId,
+          branchId: patient.branchId,
+          patientId: patient.id,
+          payerId: policyPayer.id,
+          policyId: policy.id,
+          actorUserId: request.auth.userId,
+          requestId: request.id,
+          ipAddress: request.ip,
+          userAgent: request.headers['user-agent'],
+        },
+        rawIdempotencyKey,
+        fingerprintParts: {
+          contract: 'insurance_v1',
+          branchId: patient.branchId,
+          patientId: patient.id,
+          policyId: policy.id,
+          payerId: policyPayer.id,
+          memberId: input.memberId,
+          providerKey: input.providerKey,
+          serviceType: input.serviceType ?? null,
+        },
+        requestContract: 'insurance_v1',
+        providerKey: input.providerKey,
+        providerMode: provider.mode,
+        executeProvider: async providerExecutionKey => {
+          if (input.providerKey === 'stedi' && provider.mode === 'production' && liveConfigured) {
+            const outcome = await createInsuranceProvider().runEligibilityCheck({
+              tenantId,
+              branchId: patient.branchId,
+              providerExecutionKey,
+              payer: policyPayer,
+              policy: { id: policy.id, planName: policy.planName, memberId: policy.memberId },
+              serviceType: input.serviceType,
+            });
+            const n: NormalizedEligibility = {
+              status: outcome.coverageActive ? (outcome.coverageStatus === 'uncertain' ? 'NEEDS_REVIEW' : 'ACTIVE') : 'INACTIVE',
+              coverageActive: outcome.coverageActive,
+              planName: outcome.planName,
+              payerName: outcome.payerName,
+              copay: outcome.copay,
+              deductibleRemaining: outcome.deductibleRemaining,
+              coinsurance: outcome.coinsurance,
+              message: outcome.eligibilityMessage,
+              payerReference: outcome.payerReference,
+              checkedAt: outcome.checkedAt,
+            };
+            return {
+              n,
+              providerMode: outcome.providerMode,
+              simulated: outcome.providerMode !== 'live',
+              raw: outcome.storeRawResponse && outcome.rawResponse ? outcome.rawResponse : { note: 'raw payer response withheld' },
+            };
+          }
+          const result = runStediEligibility(
+            { memberId: input.memberId, payerName: input.payerName, planName: input.planName, serviceType: input.serviceType },
+            'sandbox',
+          );
+          return { n: result.normalized, providerMode: 'sandbox', simulated: true, raw: result.raw };
+        },
+        finalize: async (tx, outcome, executionId) => {
+          const verifiedAt = new Date();
+          const created = await tx.eligibilityVerification.create({
+            data: {
+              tenantId,
+              branchId: patient.branchId,
+              patientId: patient.id,
+              providerMode: outcome.providerMode,
+              payerId: policy.payerId,
+              policyId: policy.id,
+              coverageStatus: outcome.n.status,
+              coverageActive: outcome.n.coverageActive,
+              planName: outcome.n.planName,
+              payerName: outcome.n.payerName,
+              copay: outcome.n.copay,
+              deductibleRemaining: outcome.n.deductibleRemaining,
+              coinsurance: outcome.n.coinsurance,
+              eligibilityMessage: outcome.n.message,
+              payerReference: outcome.n.payerReference,
+              decisionSource: outcome.simulated ? 'SIMULATED' : 'PAYER_RESPONSE',
+              normalizedResponse: { ...outcome.n, simulated: outcome.simulated } as unknown as Prisma.InputJsonValue,
+            },
+          });
+          await tx.patientInsurancePolicy.update({ where: { id: policy.id }, data: { verificationStatus: outcome.n.coverageActive ? 'verified' : 'inactive', verifiedAt } });
+          if (policy.coverageOrder === 1) {
+            await tx.patient.update({ where: { id: patient.id }, data: { eligibilityStatus: outcome.n.coverageActive ? 'ACTIVE' : 'INACTIVE', eligibilityLastVerifiedAt: verifiedAt } });
+          }
+          await tx.businessEvent.create({
+            data: {
+              tenantId,
+              eventType: 'insurance.eligibility.completed',
+              entityType: 'eligibilityVerification',
+              entityId: created.id,
+              sourceModule: 'insurance',
+              payload: { status: outcome.n.status, executionId },
+            },
+          });
+          return {
+            verificationId: created.id,
+            result: {
+              verificationId: created.id,
+              status: outcome.n.status,
+              coverageActive: outcome.n.coverageActive,
+              planName: outcome.n.planName,
+              payerName: outcome.n.payerName,
+              copay: outcome.n.copay,
+              deductibleRemaining: outcome.n.deductibleRemaining,
+              coinsurance: outcome.n.coinsurance,
+              message: outcome.n.message,
+              payerReference: outcome.n.payerReference,
+              maskedMemberId: maskMemberId(input.memberId),
+              providerMode: outcome.providerMode,
+              mode: outcome.providerMode,
+              simulated: outcome.simulated,
+              checkedAt: created.checkedAt,
+            },
+            auditMetadata: { mode: outcome.providerMode, status: outcome.n.status, simulated: outcome.simulated },
+          };
+        },
+        replay: responseFromVerification,
+      });
+      return reply.code(execution.replayed ? 200 : 201).send({ ...execution.result, executionId: execution.executionId, replayed: execution.replayed });
+    } catch (error) {
+      if (!(error instanceof EligibilityExecutionConflictError)) throw error;
+      const statusCode = error.code === 'idempotency_key_reused' ? 409 : 409;
+      return reply.code(statusCode).send({
+        status: error.code,
+        executionId: error.executionId,
+        retryable: false,
+        message: error.code === 'reconciliation_required'
+          ? 'The payer outcome is ambiguous and requires staff reconciliation. The provider was not called again.'
+          : 'This eligibility execution cannot be repeated with the supplied idempotency key.',
+      });
     }
-
-    const verification = await db.$transaction(async tx => {
-      const created = await tx.eligibilityVerification.create({ data: {
-        tenantId, branchId: patient.branchId, patientId: patient.id, providerMode,
-        payerId: policy.payerId, policyId: policy.id,
-        coverageStatus: n.status, coverageActive: n.coverageActive, planName: n.planName, payerName: n.payerName,
-        copay: n.copay, deductibleRemaining: n.deductibleRemaining, coinsurance: n.coinsurance,
-        eligibilityMessage: n.message, payerReference: n.payerReference,
-        normalizedResponse: { ...n, simulated } as unknown as object, rawResponse: raw as object,
-      }, select: { id: true, checkedAt: true } });
-      await tx.patientInsurancePolicy.update({ where: { id: policy.id }, data: { verificationStatus: n.coverageActive ? 'verified' : 'inactive', verifiedAt: new Date() } });
-      if (policy.coverageOrder === 1) {
-        await tx.patient.update({ where: { id: patient.id }, data: { eligibilityStatus: n.coverageActive ? 'ACTIVE' : 'INACTIVE', eligibilityLastVerifiedAt: new Date() } });
-      }
-      return created;
-    });
-    // Audit WITHOUT PHI — never log the member ID.
-    await audit(request, { action: 'insurance.eligibility.checked', resource: 'eligibilityVerification', resourceId: verification.id, metadata: { providerKey: input.providerKey, status: n.status, mode: providerMode, simulated } });
-    await emitBusinessEvent(tenantId, { eventType: 'insurance.eligibility.completed', entityType: 'eligibilityVerification', entityId: verification.id, sourceModule: 'insurance', payload: { status: n.status } }).catch(() => {});
-
-    return reply.code(201).send({
-      verificationId: verification.id, status: n.status, coverageActive: n.coverageActive,
-      planName: n.planName, payerName: n.payerName, copay: n.copay, deductibleRemaining: n.deductibleRemaining,
-      coinsurance: n.coinsurance, message: n.message, payerReference: n.payerReference,
-      maskedMemberId: maskMemberId(input.memberId), providerMode, mode: providerMode, simulated,
-      checkedAt: verification.checkedAt,
-    });
   });
 
   // Eligibility history (no member IDs are persisted; PHI-minimal).
@@ -462,6 +567,91 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
     const patients = pIds.length ? await db.patient.findMany({ where: { id: { in: pIds }, tenantId: request.auth.tenantId }, select: { id: true, firstName: true, lastName: true } }) : [];
     const pmap = new Map(patients.map(p => [p.id, `${p.firstName} ${p.lastName}`]));
     await audit(request, { action: 'insurance.eligibility.history.read', resource: 'eligibilityVerification', metadata: { count: rows.length, patientScoped: Boolean(q.patientId) } });
-    return rows.map(r => ({ ...r, copay: Number(r.copay), deductibleRemaining: Number(r.deductibleRemaining), coinsurance: Number(r.coinsurance), patientName: pmap.get(r.patientId) ?? 'Unknown' }));
+    return rows.map(r => ({
+      ...r,
+      copay: r.copay === null ? null : Number(r.copay),
+      deductibleRemaining: r.deductibleRemaining === null ? null : Number(r.deductibleRemaining),
+      coinsurance: r.coinsurance === null ? null : Number(r.coinsurance),
+      patientName: pmap.get(r.patientId) ?? 'Unknown',
+    }));
+  });
+
+  app.get('/eligibility/executions/reconciliation', { preHandler: reconciliationRoles }, async request => {
+    const q = z.object({ limit: z.coerce.number().int().min(1).max(100).default(25) }).parse(request.query);
+    const rows = await db.eligibilityExecution.findMany({
+      where: {
+        tenantId: request.auth.tenantId,
+        ...branchScope(request),
+        status: 'RECONCILIATION_REQUIRED',
+      },
+      orderBy: { updatedAt: 'asc' },
+      take: q.limit,
+      select: {
+        id: true,
+        branchId: true,
+        patientId: true,
+        appointmentId: true,
+        payerId: true,
+        policyId: true,
+        providerKey: true,
+        providerMode: true,
+        requestContract: true,
+        status: true,
+        reconciliationReason: true,
+        providerStartedAt: true,
+        updatedAt: true,
+      },
+    });
+    await audit(request, { action: 'eligibility.execution.reconciliation.list', resource: 'eligibilityExecution', metadata: { count: rows.length } });
+    return rows;
+  });
+
+  app.post('/eligibility/executions/:id/reconcile', { preHandler: reconciliationRoles }, async (request, reply) => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const body = z.object({
+      resolution: z.enum(['confirmed_not_submitted', 'confirmed_failed', 'confirmed_succeeded']),
+      reason: z.string().trim().min(8).max(500),
+    }).parse(request.body);
+    const execution = await db.eligibilityExecution.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    if (!execution) throw app.httpErrors.notFound('Eligibility execution not found');
+    assertBranchAccess(request, execution.branchId);
+    if (execution.status !== 'RECONCILIATION_REQUIRED') throw app.httpErrors.conflict('Only reconciliation-required executions may be resolved');
+    if (body.resolution === 'confirmed_succeeded') {
+      return reply.code(409).send({
+        status: 'provider_retrieval_required',
+        executionId: execution.id,
+        message: 'A successful payer result may only be finalized from an independently retrieved provider response.',
+      });
+    }
+    const nextStatus = body.resolution === 'confirmed_not_submitted' ? 'READY' : 'FAILED_DEFINITIVE';
+    await db.$transaction(async tx => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`eligibility-execution:${execution.id}`}, 0))`;
+      const updated = await tx.eligibilityExecution.updateMany({
+        where: { id: execution.id, tenantId: request.auth.tenantId, status: 'RECONCILIATION_REQUIRED' },
+        data: {
+          status: nextStatus,
+          failureCode: body.resolution === 'confirmed_failed' ? 'provider_failure_confirmed' : null,
+          reconciliationReason: body.reason,
+          providerStartedAt: body.resolution === 'confirmed_not_submitted' ? null : execution.providerStartedAt,
+          providerCompletedAt: body.resolution === 'confirmed_not_submitted' ? null : new Date(),
+          completedAt: body.resolution === 'confirmed_failed' ? new Date() : null,
+        },
+      });
+      if (updated.count !== 1) throw app.httpErrors.conflict('Eligibility execution was already reconciled');
+      await tx.auditEvent.create({
+        data: {
+          tenantId: request.auth.tenantId,
+          actorUserId: request.auth.userId,
+          action: 'eligibility.execution.reconciled',
+          resource: 'eligibilityExecution',
+          resourceId: execution.id,
+          requestId: request.id,
+          ipAddress: request.ip,
+          userAgent: request.headers['user-agent'],
+          metadata: { resolution: body.resolution, reason: body.reason },
+        },
+      });
+    });
+    return { executionId: execution.id, status: nextStatus, providerCalled: false };
   });
 };

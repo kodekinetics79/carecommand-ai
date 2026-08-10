@@ -204,11 +204,22 @@ describe('insurance provider registry + eligibility (integration)', () => {
     const admin = tok(t.id, t.adminUserId);
     await app.inject({ method: 'POST', url: '/v1/insurance/providers/stedi/configure', headers: auth(admin), payload: { mode: 'sandbox', config: {} } });
 
-    const active = JSON.parse((await app.inject({ method: 'POST', url: '/v1/insurance/eligibility/check', headers: auth(admin), payload: { patientId: t.patientId, policyId: t.activePolicyId, payerName: 'Aetna', memberId: 'AET-110293' } })).body);
+    const active = JSON.parse((await app.inject({ method: 'POST', url: '/v1/insurance/eligibility/check', headers: { ...auth(admin), 'idempotency-key': 'connected-active-eligibility' }, payload: { patientId: t.patientId, policyId: t.activePolicyId, payerName: 'Aetna', memberId: 'AET-110293' } })).body);
     expect(active.status).toBe('ACTIVE');
     expect(active.maskedMemberId).toBe('••••0293');
+    expect(active.replayed).toBe(false);
+    const activeReplay = JSON.parse((await app.inject({ method: 'POST', url: '/v1/insurance/eligibility/check', headers: { ...auth(admin), 'idempotency-key': 'connected-active-eligibility' }, payload: { patientId: t.patientId, policyId: t.activePolicyId, payerName: 'Aetna', memberId: 'AET-110293' } })).body);
+    expect(activeReplay).toMatchObject({ verificationId: active.verificationId, executionId: active.executionId, replayed: true, status: 'ACTIVE' });
+    expect(await db.eligibilityVerification.count({ where: { tenantId: t.id, policyId: t.activePolicyId } })).toBe(1);
+    const storedActive = await db.eligibilityVerification.findUniqueOrThrow({ where: { id: active.verificationId } });
+    expect(storedActive.rawResponse).toBeNull();
+    expect(JSON.stringify(storedActive.normalizedResponse)).not.toContain('AET-110293');
 
-    const inactive = JSON.parse((await app.inject({ method: 'POST', url: '/v1/insurance/eligibility/check', headers: auth(admin), payload: { patientId: t.patientId, policyId: t.inactivePolicyId, payerName: 'Aetna', memberId: 'AET-1100' } })).body);
+    const conflicting = await app.inject({ method: 'POST', url: '/v1/insurance/eligibility/check', headers: { ...auth(admin), 'idempotency-key': 'connected-active-eligibility' }, payload: { patientId: t.patientId, policyId: t.inactivePolicyId, payerName: 'Aetna', memberId: 'AET-1100' } });
+    expect(conflicting.statusCode).toBe(409);
+    expect(conflicting.json().status).toBe('idempotency_key_reused');
+
+    const inactive = JSON.parse((await app.inject({ method: 'POST', url: '/v1/insurance/eligibility/check', headers: { ...auth(admin), 'idempotency-key': 'connected-inactive-eligibility' }, payload: { patientId: t.patientId, policyId: t.inactivePolicyId, payerName: 'Aetna', memberId: 'AET-1100' } })).body);
     expect(inactive.status).toBe('INACTIVE');
 
     const history = JSON.parse((await app.inject({ method: 'GET', url: '/v1/insurance/eligibility/history', headers: auth(admin) })).body);
@@ -232,12 +243,52 @@ describe('insurance provider registry + eligibility (integration)', () => {
     const b = await makeTenant('enterprise');
     const aAdmin = tok(a.id, a.adminUserId);
     await app.inject({ method: 'POST', url: '/v1/insurance/providers/stedi/configure', headers: auth(aAdmin), payload: { mode: 'sandbox', config: {} } });
-    await app.inject({ method: 'POST', url: '/v1/insurance/eligibility/check', headers: auth(aAdmin), payload: { patientId: a.patientId, policyId: a.activePolicyId, payerName: 'Aetna', memberId: 'AET-110293' } });
+    await app.inject({ method: 'POST', url: '/v1/insurance/eligibility/check', headers: { ...auth(aAdmin), 'idempotency-key': 'connected-tenant-a-eligibility' }, payload: { patientId: a.patientId, policyId: a.activePolicyId, payerName: 'Aetna', memberId: 'AET-110293' } });
 
     const aHistory = JSON.parse((await app.inject({ method: 'GET', url: '/v1/insurance/eligibility/history', headers: auth(aAdmin) })).body);
     expect(aHistory.length).toBe(1);
     const bHistory = JSON.parse((await app.inject({ method: 'GET', url: '/v1/insurance/eligibility/history', headers: auth(tok(b.id, b.adminUserId)) })).body);
     expect(bHistory.length).toBe(0);
+  });
+
+  it('lists and resolves ambiguous executions without fabricating successful payer data', async () => {
+    const t = await makeTenant('enterprise');
+    const execution = await db.eligibilityExecution.create({
+      data: {
+        tenantId: t.id,
+        branchId: t.branchId,
+        patientId: t.patientId,
+        policyId: t.activePolicyId,
+        actorUserId: t.adminUserId,
+        idempotencyKeyHash: 'a'.repeat(64),
+        requestFingerprint: 'b'.repeat(64),
+        requestContract: 'insurance_v1',
+        providerKey: 'stedi',
+        providerMode: 'sandbox',
+        status: 'RECONCILIATION_REQUIRED',
+        reconciliationReason: 'provider_outcome_ambiguous',
+      },
+    });
+    const admin = auth(tok(t.id, t.adminUserId));
+    const list = await app.inject({ method: 'GET', url: '/v1/insurance/eligibility/executions/reconciliation', headers: admin });
+    expect(list.statusCode).toBe(200);
+    expect(list.json()).toEqual(expect.arrayContaining([expect.objectContaining({ id: execution.id, status: 'RECONCILIATION_REQUIRED' })]));
+
+    const fabricatedSuccess = await app.inject({
+      method: 'POST', url: `/v1/insurance/eligibility/executions/${execution.id}/reconcile`, headers: admin,
+      payload: { resolution: 'confirmed_succeeded', reason: 'Staff cannot invent a provider result' },
+    });
+    expect(fabricatedSuccess.statusCode).toBe(409);
+    expect(fabricatedSuccess.json().status).toBe('provider_retrieval_required');
+
+    const safeReset = await app.inject({
+      method: 'POST', url: `/v1/insurance/eligibility/executions/${execution.id}/reconcile`, headers: admin,
+      payload: { resolution: 'confirmed_not_submitted', reason: 'Provider portal confirms it was not submitted' },
+    });
+    expect(safeReset.statusCode).toBe(200);
+    expect(safeReset.json()).toMatchObject({ status: 'READY', providerCalled: false });
+    expect(await db.eligibilityExecution.findUnique({ where: { id: execution.id } })).toMatchObject({ status: 'READY' });
+    expect(await db.auditEvent.count({ where: { tenantId: t.id, action: 'eligibility.execution.reconciled', resourceId: execution.id } })).toBe(1);
   });
 });
 
