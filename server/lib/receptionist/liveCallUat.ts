@@ -111,7 +111,7 @@ export function liveCallUatStatus(now = new Date(), tenantId?: string): LiveCall
   else if (!Number.isFinite(expiresAtMs) || expiresAtMs <= now.getTime()) blockingReason = 'live_test_authorization_expired';
   else if (!isWithinLiveCallWindow(now, env.LIVE_TEST_TIMEZONE, env.LIVE_TEST_WINDOW_START, env.LIVE_TEST_WINDOW_END)) blockingReason = 'live_test_outside_window';
   else if (env.LIVE_TEST_MAX_CALLS < 1 || env.LIVE_TEST_MAX_TOTAL_MINUTES < env.LIVE_TEST_MAX_CALL_MINUTES) blockingReason = 'live_test_limits_invalid';
-  else if (env.LIVE_TEST_MAX_PROVIDER_COST_USD <= 0 || projectedMaximumCostUsd > env.LIVE_TEST_MAX_PROVIDER_COST_USD) blockingReason = 'live_test_cost_cap_invalid';
+  else if (env.LIVE_TEST_MAX_PROVIDER_COST_USD <= 0) blockingReason = 'live_test_cost_cap_invalid';
 
   return {
     enabled: env.LIVE_TEST_CALLS_AUTHORIZED,

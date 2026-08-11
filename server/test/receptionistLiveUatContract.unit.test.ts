@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 const outboundSource = readFileSync('server/modules/receptionist/outbound.ts', 'utf8');
+const liveUatSource = readFileSync('server/lib/receptionist/liveCallUat.ts', 'utf8');
 const retellSource = readFileSync('server/lib/retell.ts', 'utf8');
 const studioSource = readFileSync('src/pages/ReceptionistStudio.tsx', 'utf8');
 const apiSource = readFileSync('src/lib/receptionist.ts', 'utf8');
@@ -13,7 +14,7 @@ describe('live AI receptionist UAT production contract', () => {
   it('fences the provider boundary with exact runtime authorization and run-level admission controls', () => {
     expect(outboundSource).toContain('authorizeLiveCallDestination');
     expect(outboundSource).toContain('evaluateLiveCallAdmission');
-    expect(outboundSource).toContain('live_test_destination_not_allowlisted');
+    expect(liveUatSource).toContain('live_test_destination_not_allowlisted');
     expect(outboundSource).toContain('live_test_single_active_call');
     expect(outboundSource).toContain('live_test_call_cap_reached');
     expect(outboundSource).toContain('live_test_minute_cap_reached');
@@ -24,7 +25,7 @@ describe('live AI receptionist UAT production contract', () => {
   it('creates the synthetic recipient from server-held environment authorization rather than browser-supplied phone data', () => {
     expect(outboundSource).toContain("app.post('/outbound-campaigns/:id/live-test-target'");
     expect(outboundSource).toContain('liveCallUatDestination(request.auth.tenantId)');
-    expect(outboundSource).toContain('live_test_tenant_not_authorized');
+    expect(liveUatSource).toContain('live_test_tenant_not_authorized');
     expect(outboundSource).toContain('acknowledgeAuthorizedSyntheticRecipient');
     expect(studioSource).toContain('Attach authorized synthetic recipient');
     expect(studioSource).toContain('the browser cannot supply or change the number');

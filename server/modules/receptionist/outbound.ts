@@ -1002,7 +1002,9 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     if (!campaign.purpose || !campaign.policyVersion || !campaign.legalBasis) {
       return reply.code(409).send({ status: 'blocked', reason: 'campaign_authority_incomplete' });
     }
-    const requiresConsent = campaign.legalBasis === 'EXPLICIT_CONSENT' || campaign.purpose === 'PATIENT_REACTIVATION';
+    const campaignPurpose = campaign.purpose;
+    const campaignPolicyVersion = campaign.policyVersion;
+    const requiresConsent = campaign.legalBasis === 'EXPLICIT_CONSENT' || campaignPurpose === 'PATIENT_REACTIVATION';
     if (requiresConsent && !body.acknowledgeSyntheticConsentEvidence) {
       return reply.code(409).send({ status: 'blocked', reason: 'synthetic_consent_attestation_required' });
     }
@@ -1032,8 +1034,8 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
           where: {
             tenantId: request.auth.tenantId,
             leadId: lead.id,
-            purpose: campaign.purpose,
-            policyVersion: campaign.policyVersion,
+            purpose: campaignPurpose,
+            policyVersion: campaignPolicyVersion,
             evidenceReference,
             granted: true,
           },
@@ -1043,11 +1045,11 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
           await tx.receptionistVoiceConsentEvent.create({ data: {
             tenantId: request.auth.tenantId,
             leadId: lead.id,
-            purpose: campaign.purpose,
+            purpose: campaignPurpose,
             granted: true,
-            policyVersion: campaign.policyVersion,
+            policyVersion: campaignPolicyVersion,
             disclosureTextHash: fingerprintJson({
-              policyVersion: campaign.policyVersion,
+              policyVersion: campaignPolicyVersion,
               disclosure: campaign.consentText ?? campaign.script,
               scenario: body.scenario,
             }),
@@ -1546,7 +1548,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
           return { callLog: reservedCall };
         });
 
-    if ('blocked' in reservation) {
+    if ('blocked' in reservation && reservation.blocked) {
       const statusCode = ['concurrency_limit_reached', 'live_test_call_cap_reached', 'live_test_single_active_call'].includes(reservation.blocked) ? 429
         : ['voice_minutes_limit_reached', 'live_test_minute_cap_reached', 'live_test_cost_cap_reached'].includes(reservation.blocked) ? 402
           : reservation.blocked === 'live_test_not_active' ? 403
