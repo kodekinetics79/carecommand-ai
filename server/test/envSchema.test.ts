@@ -323,3 +323,42 @@ describe('env schema — DEPLOYMENT_PROFILE integration-mode gate', () => {
     expect(invalid.success).toBe(false);
   });
 });
+
+describe('env schema — attended synthetic live voice UAT', () => {
+  const validLiveUat = () => ({
+    ...base,
+    DEPLOYMENT_PROFILE: 'demo' as const,
+    RETELL_API_KEY: 'retell-live-test-key',
+    RETELL_FROM_NUMBER: '+12125550199',
+    LIVE_TEST_CALLS_AUTHORIZED: 'true',
+    LIVE_TEST_EXECUTION_ID: 'voice-uat-run-001',
+    LIVE_TEST_TENANT_ID: '11111111-1111-4111-8111-111111111111',
+    AUTHORIZED_TEST_PHONE_E164: '+12025550123',
+    LIVE_TEST_EXPIRES_AT: new Date(Date.now() + 60 * 60 * 1_000).toISOString(),
+    LIVE_TEST_TIMEZONE: 'America/New_York',
+    LIVE_TEST_WINDOW_START: '09:00',
+    LIVE_TEST_WINDOW_END: '20:00',
+    LIVE_TEST_MAX_CALLS: 2,
+    LIVE_TEST_MAX_CALL_MINUTES: 5,
+    LIVE_TEST_MAX_TOTAL_MINUTES: 10,
+    LIVE_TEST_MAX_PROVIDER_COST_USD: 3,
+    LIVE_TEST_ESTIMATED_COST_PER_MINUTE_USD: 0.2,
+  });
+
+  it('accepts one short-lived exact recipient with conservative call, minute, and cost caps', () => {
+    const parsed = envSchema.safeParse(validLiveUat());
+    expect(parsed.success).toBe(true);
+  });
+
+  it('rejects a mock provider, multiple recipients, expired authorization, and a cost budget that can be exceeded', () => {
+    expect(envSchema.safeParse({ ...validLiveUat(), RETELL_API_KEY: 'mock_local' }).success).toBe(false);
+    expect(envSchema.safeParse({ ...validLiveUat(), LIVE_TEST_RECIPIENT_ALLOWLIST: '+12125550100' }).success).toBe(false);
+    expect(envSchema.safeParse({ ...validLiveUat(), LIVE_TEST_EXPIRES_AT: new Date(Date.now() - 1_000).toISOString() }).success).toBe(false);
+    expect(envSchema.safeParse({ ...validLiveUat(), LIVE_TEST_MAX_PROVIDER_COST_USD: 1 }).success).toBe(false);
+  });
+
+  it('rejects live-test admission in pilot and enterprise deployment profiles', () => {
+    expect(envSchema.safeParse({ ...validLiveUat(), DEPLOYMENT_PROFILE: 'pilot' }).success).toBe(false);
+    expect(envSchema.safeParse({ ...validLiveUat(), DEPLOYMENT_PROFILE: 'enterprise' }).success).toBe(false);
+  });
+});

@@ -46,5 +46,12 @@ describe('eligibility reconciliation frontend continuity', () => {
     expect(source).not.toContain('sessionStorage');
     expect(source).toContain('payer calls are never retried from this workflow');
     expect(source).toContain('Eligibility is not a payment guarantee.');
+    expect(source).toContain("decisionSource === 'MANUAL_PAYER_EVIDENCE'");
+    expect(source).toContain('Manually verified');
+    expect(source).toContain("value === null ? 'Unknown'");
+    expect(source).toContain('Manual payer evidence');
+    expect(source).toContain('requestedServiceType');
+    expect(source).toContain('resultSource');
+    expect(source).toContain('Execution audit history');
   });
 });

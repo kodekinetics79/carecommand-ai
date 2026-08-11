@@ -1949,6 +1949,8 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     const patientId = entities.patient?.id ?? body.patientId!;
     const appointmentId = entities.appointment?.id ?? body.appointmentId ?? null;
     const rawIdempotencyKey = eligibilityIdempotencyKey(request);
+    const requestedServiceType = body.serviceType ?? entities.appointment?.service ?? null;
+    const requestedServiceAt = entities.appointment?.startsAt ?? new Date();
 
     try {
       const execution = await runEligibilityExecution({
@@ -1960,6 +1962,8 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
           payerId: selectedPayer.id,
           policyId: policy.id,
           actorUserId: request.auth.userId,
+          requestedServiceType,
+          requestedServiceAt,
           requestId: request.id,
           ipAddress: request.ip,
           userAgent: request.headers['user-agent'],
@@ -1974,7 +1978,10 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
           policyId: policy.id,
           memberId: policy.memberId,
           providerKey: provider.providerKey,
-          serviceType: body.serviceType ?? entities.appointment?.service ?? null,
+          serviceType: requestedServiceType,
+          // Keep same-day retry/reload identity stable while retaining the
+          // precise requested instant on the durable EligibilityExecution.
+          requestedServiceAt: requestedServiceAt.toISOString().slice(0, 10),
         },
         requestContract: 'revenue_protection_v1',
         providerKey: provider.providerKey,

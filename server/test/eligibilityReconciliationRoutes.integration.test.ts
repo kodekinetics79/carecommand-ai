@@ -76,7 +76,8 @@ async function createExecution(f: TenantFixture, options: { branch?: 'first' | '
   const branchId = options.branch === 'second' ? f.secondBranchId : f.firstBranchId;
   const patientId = options.branch === 'second' ? f.secondPatientId : f.firstPatientId;
   const status = options.status ?? 'RECONCILIATION_REQUIRED';
-  return fixtureDb.eligibilityExecution.create({ data: {
+  const requestedServiceAt = new Date('2026-07-15T14:00:00.000Z');
+  const execution = await fixtureDb.eligibilityExecution.create({ data: {
     tenantId: f.tenantId, branchId, patientId,
     payerId: options.branch === 'second' ? undefined : f.payerId,
     policyId: options.branch === 'second' ? undefined : f.firstPolicyId,
@@ -84,11 +85,22 @@ async function createExecution(f: TenantFixture, options: { branch?: 'first' | '
     idempotencyKeyHash: randomBytes(32).toString('hex'), hmacKeyVersion: 'v1',
     requestFingerprint: randomBytes(32).toString('hex'), requestContract: 'insurance_v1',
     providerKey: 'test-payer', providerMode: 'sandbox', status,
+    requestedServiceType: 'MRI imaging review',
+    requestedServiceAt,
+    providerStartedAt: status === 'RECONCILIATION_REQUIRED' ? new Date(Date.now() - 8 * 60_000) : undefined,
     reconciliationReason: status === 'RECONCILIATION_REQUIRED' ? 'provider_outcome_ambiguous' : undefined,
     failureCode: status === 'FAILED_DEFINITIVE' ? 'provider_failure_confirmed' : undefined,
     completedAt: status === 'FAILED_DEFINITIVE' ? new Date() : undefined,
     createdAt: status === 'READY' ? new Date(Date.now() - 10 * 60_000) : undefined,
   } });
+  await fixtureDb.auditEvent.create({
+    data: {
+      tenantId: f.tenantId, actorUserId: f.admin.id, action: 'eligibility.execution.requested',
+      resource: 'eligibilityExecution', resourceId: execution.id,
+      metadata: { requestedServiceType: 'MRI imaging review', requestedServiceAt: requestedServiceAt.toISOString() },
+    },
+  });
+  return execution;
 }
 
 async function surface(f: TenantFixture, executionId: string) {
@@ -124,7 +136,12 @@ describe('eligibility reconciliation routes', () => {
     });
     expect(frontDeskList.statusCode).toBe(200);
     expect(frontDeskList.json()).toEqual([
-      expect.objectContaining({ id: firstPending.id, status: 'MANUAL_EVIDENCE_PENDING', canReconcile: false, noAutomaticPayerRetry: true }),
+      expect.objectContaining({
+        id: firstPending.id, status: 'MANUAL_EVIDENCE_PENDING', canReconcile: false, noAutomaticPayerRetry: true,
+        payerName: 'Synthetic Payer', planName: 'Synthetic Plan', requestedServiceType: 'MRI imaging review',
+        requestedServiceAt: '2026-07-15T14:00:00.000Z', requestTime: expect.any(String), lastAttemptAt: expect.any(String),
+        auditTrail: expect.arrayContaining([expect.objectContaining({ action: 'eligibility.execution.requested' })]),
+      }),
     ]);
     expect(frontDeskList.json()).not.toEqual(expect.arrayContaining([
       expect.objectContaining({ id: secondPending.id }), expect.objectContaining({ id: terminal.id }),
@@ -251,6 +268,18 @@ describe('eligibility reconciliation routes', () => {
     expect(await fixtureDb.auditEvent.count({
       where: { tenantId: f.tenantId, resourceId: candidate.id, action: 'eligibility.execution.manually_reconciled' },
     })).toBe(1);
+
+    const reconciledList = await app.inject({
+      method: 'GET', url: '/v1/insurance/eligibility/executions/reconciliation?state=reconciled', headers: headers(f, f.manager),
+    });
+    expect(reconciledList.statusCode).toBe(200);
+    expect(reconciledList.json()).toEqual(expect.arrayContaining([expect.objectContaining({
+      id: candidate.id, resultSource: 'MANUAL_PAYER_EVIDENCE', resultStatus: 'NEEDS_REVIEW',
+      manualEvidenceSource: 'PAYER_PORTAL', manualEvidenceReference: 'PAYER-REF-123',
+      manualCopay: null, manualDeductibleRemaining: null, manualCoinsurance: null,
+      payerName: 'Synthetic Payer', planName: 'Synthetic Plan', requestedServiceType: 'MRI imaging review',
+      auditTrail: expect.arrayContaining([expect.objectContaining({ action: 'eligibility.execution.manually_reconciled' })]),
+    })]));
 
     const terminalRetry = await app.inject({
       method: 'POST', url: `/v1/insurance/eligibility/executions/${candidate.id}/reconcile`, headers: headers(f, f.manager),

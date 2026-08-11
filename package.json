@@ -36,8 +36,10 @@
     "test:watch": "vitest",
     "e2e:serve": "mkdir -p .playwright && rm -f .playwright/portal-outbox.jsonl && VITE_API_URL=http://127.0.0.1:43201 VITE_AUTH_MODE=login-required VITE_DEMO_FALLBACK=false VITE_DEFAULT_CLINIC_SLUG= npm run build && concurrently -k -n api,web \"NODE_ENV=production E2E_TEST_MODE=true API_PORT=43201 CORS_ORIGINS=http://127.0.0.1:44173 PORTAL_TOKEN_OUTBOX_PATH=.playwright/portal-outbox.jsonl STRIPE_WEBHOOK_SECRET=whsec_pw_e2e npm run api:start\" \"npm run preview -- --host 127.0.0.1 --port 44173\"",
     "test:e2e": "tsx server/scripts/withDisposableRlsDatabase.ts -- tsx server/scripts/runPlaywright.ts",
+    "test:e2e:chrome": "E2E_USE_INSTALLED_CHROME=true E2E_HEADLESS=false npm run test:e2e",
     "check": "npm run db:validate && npm run api:typecheck && npm run lint && npm run build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:e2e:live-voice": "RUN_LIVE_VOICE_UAT=true E2E_USE_INSTALLED_CHROME=true E2E_HEADLESS=false npm run test:e2e -- --project=desktop-installed-chrome tests/e2e/receptionist-live-uat.spec.ts"
   },
   "dependencies": {
     "@fastify/cors": "^11.3.0",

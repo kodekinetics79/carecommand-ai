@@ -33,11 +33,18 @@ async function seed(projectName: string) {
     planName: 'Synthetic Evidence Plan', memberId: 'PRIVATE-E2E-MEMBER',
   } });
   const stale = new Date(Date.now() - 10 * 60_000);
+  const requestedServiceAt = new Date('2026-07-15T14:00:00.000Z');
   const execution = await db.eligibilityExecution.create({ data: {
     tenantId, branchId: branch.id, patientId: patient.id, payerId: payer.id, policyId: policy.id, actorUserId: staff.id,
     idempotencyKeyHash: randomBytes(32).toString('hex'), hmacKeyVersion: 'v1',
     requestFingerprint: randomBytes(32).toString('hex'), requestContract: 'insurance_v1',
-    providerKey: 'test-payer', providerMode: 'sandbox', status: 'PROVIDER_IN_FLIGHT', providerStartedAt: stale, createdAt: stale,
+    providerKey: 'test-payer', providerMode: 'sandbox', status: 'PROVIDER_IN_FLIGHT',
+    requestedServiceType: 'MRI imaging review', requestedServiceAt, providerStartedAt: stale, createdAt: stale,
+  } });
+  await db.auditEvent.create({ data: {
+    tenantId, actorUserId: staff.id, action: 'eligibility.execution.requested',
+    resource: 'eligibilityExecution', resourceId: execution.id,
+    metadata: { requestedServiceType: 'MRI imaging review', requestedServiceAt: requestedServiceAt.toISOString() },
   } });
 
   const otherTenantId = randomUUID();
@@ -107,7 +114,13 @@ test.describe('real staff eligibility reconciliation workflow', () => {
     await page.goto('/insurance-eligibility');
     await expect(page.getByRole('heading', { name: 'Eligibility Reconciliation' })).toBeVisible();
     await expect(page.getByText(/stale provider in flight/i)).toBeVisible();
+    await expect(page.getByText(/Synthetic Payer · Synthetic Evidence Plan/i)).toBeVisible();
+    await expect(page.getByText('Service: MRI imaging review')).toBeVisible();
+    await expect(page.getByText(/Requested:/)).toBeVisible();
+    await expect(page.getByText(/Last attempt:/)).toBeVisible();
     await expect(page.getByText('Provider call may have occurred: yes · verified response lookup: not supported')).toBeVisible();
+    await page.getByText(/Execution audit history/).click();
+    await expect(page.getByText(/eligibility › execution › requested/)).toBeVisible();
 
     await enqueueEligibilityReconciliationTenantJob(fixture.tenantId);
     await expect.poll(async () => (await db.eligibilityExecution.findUniqueOrThrow({ where: { id: fixture.execution.id } })).status).toBe('MANUAL_EVIDENCE_PENDING');
@@ -140,7 +153,14 @@ test.describe('real staff eligibility reconciliation workflow', () => {
     await page.getByLabel('Service and date of service match this request').check();
     await page.getByRole('button', { name: 'Attest matches and save' }).click();
     await expect.poll(async () => (await db.eligibilityExecution.findUniqueOrThrow({ where: { id: fixture.execution.id } })).status).toBe('MANUALLY_RECONCILED');
-    await expect(page.getByText('Payer reports active').first()).toBeVisible();
+    await expect(page.getByText('Manually verified active').first()).toBeVisible();
+    await expect(page.getByText('Manual payer evidence').first()).toBeVisible();
+    await expect(page.getByText('Unknown').first()).toBeVisible();
+
+    await page.getByLabel('Reconciliation filter').selectOption('reconciled');
+    await expect(page.getByText(/Synthetic Payer · Synthetic Evidence Plan/i)).toBeVisible();
+    await expect(page.getByText('Result source: Manual payer evidence')).toBeVisible();
+    await expect(page.getByText('Result status: Manually verified active')).toBeVisible();
 
     const reconciled = await db.eligibilityExecution.findUniqueOrThrow({ where: { id: fixture.execution.id } });
     expect(reconciled).toMatchObject({ status: 'MANUALLY_RECONCILED', manualEvidenceReference: 'PW-E2E-REF-123', manualEvidenceOutcome: 'ACTIVE' });

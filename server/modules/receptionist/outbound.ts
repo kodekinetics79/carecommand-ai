@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { env } from '../../config/env';
-import { retellConfigStatus, createPhoneCall, stopPhoneCall } from '../../lib/retell';
+import { retellConfigStatus, createPhoneCall, getPhoneCall, stopPhoneCall } from '../../lib/retell';
 import { isDestinationOptedOut, isSuppressed, isValidE164, toE164 } from '../../lib/campaigns';
 import { requireRoles } from '../../plugins/roles';
 import {
@@ -25,6 +25,16 @@ import {
   issueProviderIntentCorrelation,
   providerIntentMetadataForRetell,
 } from '../../lib/receptionist/providerIntentCorrelation';
+import {
+  authorizeLiveCallDestination,
+  evaluateLiveCallAdmission,
+  liveCallUatDestination,
+  liveCallUatDisclosure,
+  liveCallUatScope,
+  liveCallUatStatus,
+  maskPhone,
+  maskProviderId,
+} from '../../lib/receptionist/liveCallUat';
 
 const uuid = z.string().uuid();
 const idParam = z.object({ id: uuid });
@@ -39,6 +49,7 @@ const OUTBOUND_PURPOSES = ['CARE_COORDINATION', 'APPOINTMENT_REMINDER', 'PATIENT
 const OUTBOUND_LEGAL_BASES = ['EXPLICIT_CONSENT', 'TREATMENT_OPERATIONS'] as const;
 const STRICT_HH_MM = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 const CLIENT_LAUNCH_ATTEMPT_SCOPE = 'receptionist.outbound-client-attempt';
+const LIVE_UAT_TARGET_SOURCE_PREFIX = 'live_voice_uat:';
 export const MAX_TENANT_ACTIVE_CALLS = 3;
 export const DEFAULT_VOICE_MINUTES_LIMIT = 500;
 
@@ -577,16 +588,50 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       },
     });
     const readyAgents = linkedAgents.filter(agent => !agentReadinessReason(agent)).length;
+    const liveTest = liveCallUatStatus(new Date(), request.auth.tenantId);
+    const liveScope = liveCallUatScope();
+    const liveAttempts = liveScope
+      ? await db.idempotencyKey.findMany({
+        where: { tenantId: request.auth.tenantId, scope: liveScope },
+        select: { resultId: true },
+        take: Math.max(20, liveTest.maxCalls + 1),
+      })
+      : [];
+    const liveCallIds = liveAttempts
+      .map(attempt => attempt.resultId)
+      .filter((value): value is string => Boolean(value && !value.startsWith('blocked:') && value !== 'dispatching'));
+    const liveCalls = liveCallIds.length
+      ? await db.receptionistCallLog.findMany({
+        where: { tenantId: request.auth.tenantId, id: { in: liveCallIds } },
+        select: { durationSeconds: true, endedAt: true, outcome: true },
+      })
+      : [];
+    const connectedSeconds = liveCalls.reduce((sum, call) => sum + call.durationSeconds, 0);
+    const liveAdmission = evaluateLiveCallAdmission({
+      attemptsUsed: liveAttempts.length,
+      connectedSeconds,
+      activeCalls: liveCalls.filter(call => !call.endedAt && call.outcome === 'IN_PROGRESS').length,
+    }, new Date(), request.auth.tenantId);
     return {
       configured: status.configured && readyAgents > 0,
       mock: status.mock,
       missing: [...status.missing, ...(readyAgents ? [] : ['AGENT_DEPLOYMENT'])],
       readyAgents,
       adhocTestCallsAllowed: status.mock && env.NODE_ENV !== 'production',
+      liveTest: {
+        ...liveTest,
+        attemptsUsed: liveAttempts.length,
+        callsRemaining: Math.max(0, liveTest.maxCalls - liveAttempts.length),
+        minutesUsed: Math.ceil(connectedSeconds / 60),
+        minutesRemaining: Math.max(0, liveTest.maxTotalMinutes - Math.ceil(connectedSeconds / 60)),
+        activeCalls: liveCalls.filter(call => !call.endedAt && call.outcome === 'IN_PROGRESS').length,
+        admissionReason: liveAdmission.allowed ? null : liveAdmission.reason,
+      },
       checklist: [
         { key: 'RETELL_API_KEY', label: 'Retell API key', set: !status.missing.includes('RETELL_API_KEY') },
         { key: 'RETELL_FROM_NUMBER', label: 'Outbound caller number', set: !status.missing.includes('RETELL_FROM_NUMBER') },
         { key: 'AGENT_DEPLOYMENT', label: 'Published agent deployment', set: readyAgents > 0 },
+        { key: 'LIVE_TEST_CALLS_AUTHORIZED', label: 'Attended live-test authorization', set: liveTest.active },
       ],
     };
   });
@@ -861,6 +906,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
             : 'treatment_operations' as const;
         candidates.push({
           ...identity,
+          phone: maskPhone(identity.phone) ?? 'masked',
           voiceAuthorizationReady: !suppressed && (!requiresImmutableConsent || consent !== null),
           voiceAuthorizationReason,
         });
@@ -871,14 +917,15 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
 
   app.get('/outbound-campaigns/:id/targets', { preHandler: callArtifactRead }, async request => {
     const { id } = idParam.parse(request.params);
-    return db.receptionistCallTarget.findMany({ where: { tenantId: request.auth.tenantId, campaignId: id }, orderBy: { createdAt: 'asc' } });
+    const rows = await db.receptionistCallTarget.findMany({ where: { tenantId: request.auth.tenantId, campaignId: id }, orderBy: { createdAt: 'asc' } });
+    return rows.map(row => ({ ...row, phone: maskPhone(row.phone) }));
   });
 
   app.post('/outbound-campaigns/:id/targets', { preHandler: writeRoles }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
     const body = z.object({
       targets: z.array(z.object({
-        phone: z.string().trim().min(3).max(40),
+        phone: z.string().trim().min(3).max(40).optional(),
         firstName: z.string().trim().max(120).optional(),
         lastName: z.string().trim().max(120).optional(),
         email: z.string().trim().max(160).optional(),
@@ -893,20 +940,19 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       const seenDestinations = new Set<string>();
       for (const target of body.targets) {
         if (Boolean(target.patientId) === Boolean(target.leadId)) throw new Error('target_exact_identity_required');
-        const phone = toE164(target.phone);
-        if (!isValidE164(phone)) throw new Error('target_phone_invalid');
-        if (seenDestinations.has(phone)) throw new Error('target_destination_duplicate');
-        seenDestinations.add(phone);
-        if (await tx.receptionistCallTarget.count({ where: { tenantId: request.auth.tenantId, campaignId: id, phone } })) {
-          throw new Error('target_destination_duplicate');
-        }
         const identity = target.patientId
           ? await tx.patient.findFirst({ where: { id: target.patientId, tenantId: request.auth.tenantId, deletedAt: null }, select: { phone: true } })
           : await tx.lead.findFirst({ where: { id: target.leadId!, tenantId: request.auth.tenantId }, select: { phone: true } });
         if (!identity) throw new Error('target_identity_foreign_or_inactive');
         const identityPhone = toE164(identity.phone ?? '');
-        if (!isValidE164(identityPhone) || identityPhone !== phone) throw new Error('target_phone_identity_mismatch');
-        rows.push({ ...target, phone });
+        if (!isValidE164(identityPhone)) throw new Error('target_phone_invalid');
+        if (target.phone && !target.phone.includes('*') && toE164(target.phone) !== identityPhone) throw new Error('target_phone_identity_mismatch');
+        if (seenDestinations.has(identityPhone)) throw new Error('target_destination_duplicate');
+        seenDestinations.add(identityPhone);
+        if (await tx.receptionistCallTarget.count({ where: { tenantId: request.auth.tenantId, campaignId: id, phone: identityPhone } })) {
+          throw new Error('target_destination_duplicate');
+        }
+        rows.push({ ...target, phone: identityPhone });
       }
       return rows;
     }).catch(error => {
@@ -927,6 +973,140 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     return reply.code(201).send({ added: created.count });
   });
 
+  // Attach the one environment-authorized destination to an explicitly
+  // synthetic lead. The raw destination never comes from the browser and is
+  // never returned. This keeps live UAT separate from normal patient data and
+  // prevents an operator from changing the recipient at runtime.
+  app.post('/outbound-campaigns/:id/live-test-target', { preHandler: [ownerAdminRoles, writeRoles] }, async (request, reply) => {
+    const { id } = idParam.parse(request.params);
+    const body = z.object({
+      firstName: z.string().trim().min(1).max(120).default('Jordan'),
+      lastName: z.string().trim().max(120).default('Test'),
+      scenario: z.string().trim().min(2).max(120).default('attended synthetic voice UAT'),
+      acknowledgeAuthorizedSyntheticRecipient: z.literal(true),
+      acknowledgeSyntheticConsentEvidence: z.boolean().default(false),
+    }).strict().parse(request.body ?? {});
+    const liveTest = liveCallUatStatus(new Date(), request.auth.tenantId);
+    const destination = liveCallUatDestination(request.auth.tenantId);
+    if (!liveTest.active || !destination || !liveTest.executionId) {
+      return reply.code(409).send({ status: 'blocked', reason: liveTest.blockingReason ?? 'live_test_not_active' });
+    }
+    const campaign = await db.receptionistOutboundCampaign.findFirst({
+      where: { id, tenantId: request.auth.tenantId },
+      select: {
+        id: true, purpose: true, policyVersion: true, legalBasis: true,
+        consentText: true, script: true,
+      },
+    });
+    if (!campaign) throw app.httpErrors.notFound('Campaign not found');
+    if (!campaign.purpose || !campaign.policyVersion || !campaign.legalBasis) {
+      return reply.code(409).send({ status: 'blocked', reason: 'campaign_authority_incomplete' });
+    }
+    const requiresConsent = campaign.legalBasis === 'EXPLICIT_CONSENT' || campaign.purpose === 'PATIENT_REACTIVATION';
+    if (requiresConsent && !body.acknowledgeSyntheticConsentEvidence) {
+      return reply.code(409).send({ status: 'blocked', reason: 'synthetic_consent_attestation_required' });
+    }
+    const source = `${LIVE_UAT_TARGET_SOURCE_PREFIX}${liveTest.executionId}:${campaign.id}`;
+    const evidenceReference = `${source}:staff-authorized`;
+    const result = await runWithTenantContext(request.auth.tenantId, async tx => {
+      let lead = await tx.lead.findFirst({
+        where: { tenantId: request.auth.tenantId, source, phone: destination, deletedAt: null },
+        select: { id: true, name: true, phone: true },
+      });
+      if (!lead) {
+        lead = await tx.lead.create({
+          data: {
+            tenantId: request.auth.tenantId,
+            name: `${body.firstName} ${body.lastName}`.trim(),
+            phone: destination,
+            channel: 'CALL',
+            service: 'Synthetic live voice UAT',
+            stage: 'TEST_AUTHORIZED',
+            source,
+          },
+          select: { id: true, name: true, phone: true },
+        });
+      }
+      if (requiresConsent) {
+        const existingConsent = await tx.receptionistVoiceConsentEvent.findFirst({
+          where: {
+            tenantId: request.auth.tenantId,
+            leadId: lead.id,
+            purpose: campaign.purpose,
+            policyVersion: campaign.policyVersion,
+            evidenceReference,
+            granted: true,
+          },
+          select: { id: true },
+        });
+        if (!existingConsent) {
+          await tx.receptionistVoiceConsentEvent.create({ data: {
+            tenantId: request.auth.tenantId,
+            leadId: lead.id,
+            purpose: campaign.purpose,
+            granted: true,
+            policyVersion: campaign.policyVersion,
+            disclosureTextHash: fingerprintJson({
+              policyVersion: campaign.policyVersion,
+              disclosure: campaign.consentText ?? campaign.script,
+              scenario: body.scenario,
+            }),
+            evidenceReference,
+            captureMethod: 'STAFF_ATTESTED_SYNTHETIC_UAT',
+            source: 'CARECOMMAND_LIVE_UAT',
+            actorUserId: request.auth.userId,
+            jurisdiction: 'SYNTHETIC_UAT',
+          } });
+        }
+      }
+      let target = await tx.receptionistCallTarget.findFirst({
+        where: { tenantId: request.auth.tenantId, campaignId: campaign.id, phone: destination },
+        select: { id: true, leadId: true, status: true },
+      });
+      if (!target) {
+        target = await tx.receptionistCallTarget.create({
+          data: {
+            tenantId: request.auth.tenantId,
+            campaignId: campaign.id,
+            leadId: lead.id,
+            firstName: body.firstName,
+            lastName: body.lastName,
+            phone: destination,
+            status: 'PENDING',
+          },
+          select: { id: true, leadId: true, status: true },
+        });
+      } else if (target.leadId !== lead.id) {
+        throw new Error('live_test_destination_already_bound');
+      }
+      await auditOutboundMutation(tx, request, {
+        action: 'receptionist.liveUat.targetAttached',
+        resource: 'receptionistCallTarget',
+        resourceId: target.id,
+        metadata: {
+          campaignId: campaign.id,
+          executionId: liveTest.executionId,
+          destinationMasked: maskPhone(destination),
+          scenario: body.scenario,
+          synthetic: true,
+          consentEvidenceCreated: requiresConsent,
+        },
+      });
+      return { targetId: target.id, leadId: lead.id, status: target.status };
+    }).catch(error => {
+      const reason = error instanceof Error ? error.message : 'live_test_target_failed';
+      throw app.httpErrors.conflict(`Live-test target could not be attached: ${reason}.`);
+    });
+    return reply.code(201).send({
+      status: 'attached',
+      targetId: result.targetId,
+      leadId: result.leadId,
+      targetStatus: result.status,
+      destinationMasked: maskPhone(destination),
+      executionId: liveTest.executionId,
+    });
+  });
+
   app.delete('/outbound-campaigns/:campaignId/targets/:id', { preHandler: writeRoles }, async (request, reply) => {
     const params = z.object({ campaignId: uuid, id: uuid }).parse(request.params);
     const target = await db.receptionistCallTarget.findFirst({
@@ -938,7 +1118,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       action: 'receptionist.target.deleted',
       resource: 'receptionistCallTarget',
       resourceId: params.id,
-      metadata: { campaignId: params.campaignId, phone: target.phone },
+      metadata: { campaignId: params.campaignId, destinationMasked: maskPhone(target.phone) },
     });
     return reply.code(204).send();
   });
@@ -1050,7 +1230,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
   app.post('/outbound-campaigns/:id/call', { preHandler: writeRoles }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
     const body = z.object({
-      phone: z.string().trim().min(3).max(40),
+      phone: z.string().trim().min(3).max(40).optional(),
       firstName: z.string().trim().max(120).optional(),
       lastName: z.string().trim().max(120).optional(),
       email: z.string().trim().max(160).optional(),
@@ -1117,10 +1297,35 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       ? await db.receptionistCallTarget.findFirst({ where: { id: body.targetId, tenantId: request.auth.tenantId, campaignId: campaign.id } })
       : null;
     if (body.targetId && !target) throw app.httpErrors.notFound('Target not found for this campaign');
-    const canonicalDialDestination = toE164(body.phone);
+    const canonicalDialDestination = toE164(body.phone ?? target?.phone ?? '');
     if (!isValidE164(canonicalDialDestination)) {
       await audit(request, { action: 'receptionist.call.blocked', resource: 'receptionistOutboundCampaign', resourceId: campaign.id, metadata: { reason: 'invalid_e164_destination' } });
       return reply.code(400).send({ status: 'blocked', reason: 'invalid_e164_destination' });
+    }
+    const liveAuthorization = env.LIVE_TEST_CALLS_AUTHORIZED
+      ? authorizeLiveCallDestination(canonicalDialDestination, new Date(), request.auth.tenantId)
+      : null;
+    if (liveAuthorization && !liveAuthorization.allowed) {
+      await audit(request, {
+        action: 'receptionist.call.blocked',
+        resource: target ? 'receptionistCallTarget' : 'receptionistOutboundCampaign',
+        resourceId: target?.id ?? campaign.id,
+        metadata: {
+          campaignId: campaign.id,
+          reason: liveAuthorization.reason,
+          destinationMasked: maskPhone(canonicalDialDestination),
+          executionId: liveAuthorization.status.executionId,
+        },
+      });
+      return reply.code(403).send({ status: 'blocked', reason: liveAuthorization.reason });
+    }
+    const liveTest = liveAuthorization?.allowed ? liveAuthorization.status : null;
+    if (liveTest && !body.clientAttemptToken) {
+      await audit(request, {
+        action: 'receptionist.call.blocked', resource: 'receptionistOutboundCampaign', resourceId: campaign.id,
+        metadata: { reason: 'live_test_attempt_token_required', executionId: liveTest.executionId },
+      });
+      return reply.code(409).send({ status: 'blocked', reason: 'live_test_attempt_token_required' });
     }
     if (!target && !(retellConfigStatus().mock && env.NODE_ENV !== 'production')) {
       await audit(request, { action: 'receptionist.call.blocked', resource: 'receptionistOutboundCampaign', resourceId: campaign.id, metadata: { reason: 'adhoc_call_not_authorized' } });
@@ -1131,7 +1336,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       return reply.code(409).send({ status: 'blocked', reason: 'target_identity_unbound' });
     }
     if (target) {
-      const identityMatches = toE164(body.phone) === toE164(target.phone)
+      const identityMatches = (body.phone === undefined || toE164(body.phone) === toE164(target.phone))
         && sameOptionalIdentity(body.firstName, target.firstName)
         && sameOptionalIdentity(body.lastName, target.lastName)
         && sameOptionalIdentity(body.email, target.email);
@@ -1160,7 +1365,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     // Consult ReceptionistOptOut (voice channel; ALL/VOICE suppress it), tenant-
     // scoped. This closes gap (c): outbound targets are queued without a filter,
     // so suppression MUST be enforced here at the dial. Record + skip, no dial.
-    if (await isDestinationOptedOut(request.auth.tenantId, dialIdentity.phone, 'voice')) {
+    if (await isDestinationOptedOut(request.auth.tenantId, canonicalDialDestination, 'voice')) {
       const callLog = await db.receptionistCallLog.create({
         data: {
           tenantId: request.auth.tenantId, clinicId: campaign.clinicId, outboundCampaignId: campaign.id, targetId: body.targetId,
@@ -1242,6 +1447,39 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
             await finishClientAttempt('dispatching');
           }
           await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-capacity:${request.auth.tenantId}`})::bigint)`;
+          let liveAttempt: { scope: string; key: string } | null = null;
+          if (liveTest) {
+            const scope = liveCallUatScope(liveTest.executionId ?? undefined);
+            if (!scope || !body.clientAttemptToken) return { blocked: 'live_test_configuration_invalid' as const };
+            const key = `${request.auth.tenantId}:${campaign.id}:${body.clientAttemptToken}`;
+            await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`live-voice-uat:${scope}:${request.auth.tenantId}`}::text, 0))::text AS locked`;
+            const existingAttempt = await tx.idempotencyKey.findUnique({
+              where: { scope_key: { scope, key } },
+              select: { id: true },
+            });
+            if (existingAttempt) return { blocked: 'live_test_attempt_replayed' as const };
+            const priorAttempts = await tx.idempotencyKey.findMany({
+              where: { tenantId: request.auth.tenantId, scope },
+              select: { resultId: true },
+              take: liveTest.maxCalls + 1,
+            });
+            const priorCallIds = priorAttempts
+              .map(attempt => attempt.resultId)
+              .filter((value): value is string => Boolean(value && value !== 'dispatching' && !value.startsWith('blocked:')));
+            const priorCalls = priorCallIds.length
+              ? await tx.receptionistCallLog.findMany({
+                where: { tenantId: request.auth.tenantId, id: { in: priorCallIds } },
+                select: { durationSeconds: true, endedAt: true, outcome: true },
+              })
+              : [];
+            const admission = evaluateLiveCallAdmission({
+              attemptsUsed: priorAttempts.length,
+              connectedSeconds: priorCalls.reduce((sum, call) => sum + call.durationSeconds, 0),
+              activeCalls: priorCalls.filter(call => !call.endedAt && call.outcome === 'IN_PROGRESS').length,
+            }, new Date(), request.auth.tenantId);
+            if (!admission.allowed) return { blocked: admission.reason as 'live_test_call_cap_reached' | 'live_test_single_active_call' | 'live_test_minute_cap_reached' | 'live_test_cost_cap_reached' | 'live_test_not_active' };
+            liveAttempt = { scope, key };
+          }
           const aiUsage = await tx.tenantAiUsage.upsert({
             where: { tenantId: request.auth.tenantId },
             update: {},
@@ -1262,7 +1500,8 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
           const activeCalls = await tx.receptionistCallLog.count({
             where: { tenantId: request.auth.tenantId, outcome: 'IN_PROGRESS', endedAt: null },
           });
-          if (activeCalls >= MAX_TENANT_ACTIVE_CALLS) {
+          const activeCallLimit = liveTest ? 1 : MAX_TENANT_ACTIVE_CALLS;
+          if (activeCalls >= activeCallLimit) {
             await finishClientAttempt('blocked:concurrency_limit_reached');
             return { blocked: 'concurrency_limit_reached' as const };
           }
@@ -1293,14 +1532,25 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
             }
           }
           const reservedCall = await tx.receptionistCallLog.create({ data: callLogData });
+          if (liveAttempt) {
+            await tx.idempotencyKey.create({
+              data: {
+                tenantId: request.auth.tenantId,
+                scope: liveAttempt.scope,
+                key: liveAttempt.key,
+                resultId: reservedCall.id,
+              },
+            });
+          }
           await finishClientAttempt(reservedCall.id);
           return { callLog: reservedCall };
         });
 
     if ('blocked' in reservation) {
-      const statusCode = reservation.blocked === 'concurrency_limit_reached' ? 429
-        : reservation.blocked === 'voice_minutes_limit_reached' ? 402
-          : 409;
+      const statusCode = ['concurrency_limit_reached', 'live_test_call_cap_reached', 'live_test_single_active_call'].includes(reservation.blocked) ? 429
+        : ['voice_minutes_limit_reached', 'live_test_minute_cap_reached', 'live_test_cost_cap_reached'].includes(reservation.blocked) ? 402
+          : reservation.blocked === 'live_test_not_active' ? 403
+            : 409;
       await audit(request, {
         action: 'receptionist.call.blocked',
         resource: target ? 'receptionistCallTarget' : 'receptionistOutboundCampaign',
@@ -1592,7 +1842,10 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       dynamicVariables: {
         clinic_name: campaign.clinic.name,
         agent_name: campaign.agent?.name ?? 'Riley',
-        disclosure: campaign.clinic.complianceDisclosure,
+        disclosure: liveTest
+          ? liveCallUatDisclosure(campaign.clinic.complianceDisclosure)
+          : campaign.clinic.complianceDisclosure,
+        live_test_disclosure: liveTest ? liveCallUatDisclosure(null) : '',
         consent_text: campaign.consentText ?? '',
         human_handoff: campaign.humanHandoffInstruction ?? '',
         script: campaign.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'
@@ -1611,8 +1864,10 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         tenantId: request.auth.tenantId, outboundCampaignId: campaign.id,
         receptionistCampaignId: campaign.receptionistCampaignId,
         callLogId: callLog.id, targetId: body.targetId ?? null,
+        ...(liveTest ? { liveTestExecutionId: liveTest.executionId } : {}),
         ...providerIntentMetadataForRetell(providerCorrelation),
       },
+      ...(liveTest ? { maxCallDurationMs: liveTest.maxCallMinutes * 60_000 } : {}),
       // No verified prior recording consent is attached to this launch. Retell
       // must retain metadata only; an in-call grant cannot upgrade this setting.
       dataStorageSetting: 'basic_attributes_only',
@@ -2071,11 +2326,205 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       trackingDegraded ||= linked.count !== 1;
     }
     try {
-      await audit(request, { action: 'receptionist.call.launched', resource: 'receptionistCallLog', resourceId: callLog.id, metadata: { campaignId: campaign.id, mock: result.mock } });
+      await audit(request, {
+        action: 'receptionist.call.launched', resource: 'receptionistCallLog', resourceId: callLog.id,
+        metadata: {
+          campaignId: campaign.id,
+          mock: result.mock,
+          liveTestExecutionId: liveTest?.executionId ?? null,
+          destinationMasked: maskPhone(canonicalDialDestination),
+        },
+      });
     } catch {
       trackingDegraded = true;
     }
     return reply.code(201).send({ status: 'launched', callId: result.callId, callLogId: callLog.id, mock: result.mock, trackingDegraded });
+  });
+
+  // Provider lifecycle polling fallback for attended UAT when a public signed
+  // webhook is not available. This endpoint never returns transcripts,
+  // recordings, phone numbers, or free-text analysis and never invents a
+  // successful business outcome from a technically ended provider call.
+  app.post('/outbound-campaigns/:campaignId/call-logs/:id/provider-sync', { preHandler: writeRoles }, async (request, reply) => {
+    const params = z.object({ campaignId: uuid, id: uuid }).parse(request.params);
+    const localCall = await db.receptionistCallLog.findFirst({
+      where: {
+        id: params.id,
+        tenantId: request.auth.tenantId,
+        outboundCampaignId: params.campaignId,
+      },
+      include: {
+        outboundCampaign: {
+          select: {
+            id: true,
+            defaultBranchId: true,
+            maxRetryAttempts: true,
+            agent: { select: { providerAgentId: true, providerVersion: true } },
+          },
+        },
+        target: { select: { id: true, attempts: true, status: true } },
+      },
+    });
+    if (!localCall) throw app.httpErrors.notFound('Call log not found');
+    if (!localCall.retellCallId) {
+      return reply.code(409).send({ status: 'blocked', reason: 'provider_call_id_missing' });
+    }
+    const provider = await getPhoneCall(localCall.retellCallId);
+    if (!provider.ok) {
+      await audit(request, {
+        action: 'receptionist.call.providerSyncFailed', resource: 'receptionistCallLog', resourceId: localCall.id,
+        metadata: { campaignId: params.campaignId, reason: provider.error },
+      });
+      return reply.code(502).send({ status: 'provider_unavailable', reason: provider.error });
+    }
+    const snapshot = provider.call;
+    const metadataTenant = typeof snapshot.metadata.tenantId === 'string' ? snapshot.metadata.tenantId : null;
+    const metadataCampaign = typeof snapshot.metadata.outboundCampaignId === 'string' ? snapshot.metadata.outboundCampaignId : null;
+    const metadataCallLog = typeof snapshot.metadata.callLogId === 'string' ? snapshot.metadata.callLogId : null;
+    const expectedAgentId = localCall.outboundCampaign?.agent?.providerAgentId ?? null;
+    const expectedAgentVersion = localCall.outboundCampaign?.agent?.providerVersion ?? null;
+    if (metadataTenant !== request.auth.tenantId
+      || metadataCampaign !== params.campaignId
+      || metadataCallLog !== localCall.id
+      || (expectedAgentId && snapshot.agentId !== expectedAgentId)
+      || (expectedAgentVersion !== null && snapshot.agentVersion !== expectedAgentVersion)) {
+      await audit(request, {
+        action: 'receptionist.call.providerSyncQuarantined', resource: 'receptionistCallLog', resourceId: localCall.id,
+        metadata: { campaignId: params.campaignId, providerStatus: snapshot.status, reason: 'provider_binding_mismatch' },
+      });
+      return reply.code(409).send({ status: 'quarantined', reason: 'provider_binding_mismatch' });
+    }
+
+    const reason = (snapshot.disconnectionReason ?? '').toLowerCase();
+    const technicallyTerminal = ['ended', 'error', 'not_connected'].includes(snapshot.status);
+    const providerTerminalOutcome = snapshot.status === 'error'
+      ? 'FAILED' as const
+      : snapshot.status === 'not_connected'
+        ? reason.includes('voicemail') ? 'VOICEMAIL' as const : 'NO_ANSWER' as const
+        : snapshot.status === 'ended'
+          ? reason.includes('voicemail')
+            ? 'VOICEMAIL' as const
+            : (reason.includes('no_answer') || reason.includes('busy') || reason.includes('unanswered'))
+              ? 'NO_ANSWER' as const
+              : 'ESCALATED' as const
+          : 'IN_PROGRESS' as const;
+    const durationSeconds = Math.max(0, Math.round(snapshot.durationMs / 1_000));
+    const startedAt = snapshot.startTimestamp ? new Date(snapshot.startTimestamp) : null;
+    const endedAt = snapshot.endTimestamp ? new Date(snapshot.endTimestamp) : technicallyTerminal ? new Date() : null;
+
+    const persisted = await db.$transaction(async tx => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-call-lifecycle:${request.auth.tenantId}:${localCall.retellCallId}`})::bigint)`;
+      const current = await tx.receptionistCallLog.findFirstOrThrow({
+        where: { id: localCall.id, tenantId: request.auth.tenantId },
+        select: { outcome: true, durationSeconds: true, endedAt: true, startedAt: true },
+      });
+      const nextOutcome = technicallyTerminal && current.outcome === 'IN_PROGRESS'
+        ? providerTerminalOutcome
+        : current.outcome;
+      const updated = await tx.receptionistCallLog.update({
+        where: { id: localCall.id },
+        data: {
+          outcome: nextOutcome,
+          durationSeconds: Math.max(current.durationSeconds, durationSeconds),
+          startedAt: current.startedAt ?? startedAt ?? undefined,
+          endedAt: technicallyTerminal ? (current.endedAt ?? endedAt ?? new Date()) : undefined,
+        },
+      });
+      if (technicallyTerminal) {
+        const priorMinutes = Math.ceil(current.durationSeconds / 60);
+        const finalMinutes = Math.ceil(updated.durationSeconds / 60);
+        const delta = Math.max(0, finalMinutes - priorMinutes);
+        if (delta > 0) {
+          await tx.tenantAiUsage.upsert({
+            where: { tenantId: request.auth.tenantId },
+            update: { receptionistMinutes: { increment: delta } },
+            create: { tenantId: request.auth.tenantId, receptionistMinutes: delta },
+          });
+          await tx.tenantUsageLimit.upsert({
+            where: { tenantId_key: { tenantId: request.auth.tenantId, key: 'voice_minutes' } },
+            update: { used: { increment: delta } },
+            create: { tenantId: request.auth.tenantId, key: 'voice_minutes', limitValue: DEFAULT_VOICE_MINUTES_LIMIT, used: delta },
+          });
+        }
+      }
+      if (technicallyTerminal && localCall.target && localCall.outboundCampaign) {
+        const targetStatus = targetStatusAfterOutcome(nextOutcome, localCall.target.attempts, localCall.outboundCampaign.maxRetryAttempts);
+        if (targetStatus) {
+          await tx.receptionistCallTarget.updateMany({
+            where: {
+              id: localCall.target.id,
+              tenantId: request.auth.tenantId,
+              campaignId: params.campaignId,
+              lastCallLogId: localCall.id,
+            },
+            data: { status: targetStatus, lastOutcome: nextOutcome },
+          });
+        }
+      }
+      // A technically ended call without a signed analyzed webhook cannot be
+      // represented as a successful appointment, consent, or campaign result.
+      // Put it in explicit staff review exactly once.
+      let reviewTaskId: string | null = null;
+      if (snapshot.status === 'ended' && current.outcome === 'IN_PROGRESS' && nextOutcome === 'ESCALATED') {
+        const existingTask = await tx.staffTask.findFirst({
+          where: {
+            tenantId: request.auth.tenantId,
+            metadata: { path: ['workflowKey'], equals: `provider_poll_review:${localCall.id}` },
+          },
+          select: { id: true },
+        });
+        const task = existingTask ?? await tx.staffTask.create({
+          data: {
+            tenantId: request.auth.tenantId,
+            branchId: localCall.outboundCampaign?.defaultBranchId ?? null,
+            title: 'Review ended AI receptionist call',
+            priority: 'HIGH',
+            metadata: {
+              workflow: 'receptionist_provider_poll_reconciliation',
+              workflowKey: `provider_poll_review:${localCall.id}`,
+              callLogId: localCall.id,
+              campaignId: params.campaignId,
+              reason: 'provider_ended_without_signed_analysis',
+            },
+          },
+          select: { id: true },
+        });
+        reviewTaskId = task.id;
+      }
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId,
+        actorUserId: request.auth.userId,
+        action: 'receptionist.call.providerSynchronized',
+        resource: 'receptionistCallLog',
+        resourceId: localCall.id,
+        requestId: request.id,
+        ipAddress: request.ip,
+        userAgent: request.headers['user-agent'],
+        metadata: {
+          campaignId: params.campaignId,
+          providerStatus: snapshot.status,
+          providerCallIdMasked: maskProviderId(snapshot.callId),
+          durationSeconds: updated.durationSeconds,
+          outcome: updated.outcome,
+          disconnectionReason: snapshot.disconnectionReason,
+          combinedCostNativeUnits: snapshot.combinedCostNativeUnits,
+          reviewTaskId,
+        },
+      } });
+      return { updated, reviewTaskId };
+    });
+    return {
+      status: 'synchronized',
+      providerStatus: snapshot.status,
+      providerCallIdMasked: maskProviderId(snapshot.callId),
+      outcome: persisted.updated.outcome,
+      durationSeconds: persisted.updated.durationSeconds,
+      endedAt: persisted.updated.endedAt,
+      destinationMasked: maskPhone(localCall.callerPhone),
+      costNativeUnits: snapshot.combinedCostNativeUnits,
+      reviewTaskId: persisted.reviewTaskId,
+      verification: snapshot.mock ? 'mock' : 'provider_poll',
+    };
   });
 
   app.get('/outbound-campaigns/:id/call-logs', { preHandler: callArtifactRead }, async request => {
@@ -2090,6 +2539,8 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     });
     return rows.map(row => ({
       ...row,
+      callerPhone: maskPhone(row.callerPhone),
+      retellCallId: maskProviderId(row.retellCallId),
       recordingAvailable: Boolean(row.recordingUrl),
       recordingUrl: canReadRecordings ? row.recordingUrl : null,
     }));

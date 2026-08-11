@@ -29,10 +29,28 @@ export interface CreatePhoneCallInput {
   agentVersion: number;
   /** Fail-safe default: provider stores metadata only, never recordings/transcripts. */
   dataStorageSetting?: 'everything' | 'everything_except_pii' | 'basic_attributes_only';
+  /** Provider-enforced upper bound for an attended live-test call. */
+  maxCallDurationMs?: number;
 }
 export type CreatePhoneCallResult =
   | { ok: true; callId: string; mock: boolean }
   | { ok: false; error: string; acceptance: 'rejected' | 'unknown'; callId?: string; providerStopApplied?: boolean; providerStopError?: string };
+
+function providerReachableWebhookUrl(value: string | undefined): string | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:') return null;
+    const host = url.hostname.toLowerCase();
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host.endsWith('.local')) return null;
+    if (/^10\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)) return null;
+    const private172 = host.match(/^172\.(\d{1,3})\./);
+    if (private172 && Number(private172[1]) >= 16 && Number(private172[1]) <= 31) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 8000) {
   const controller = new AbortController();
@@ -58,6 +76,7 @@ export async function createPhoneCall(input: CreatePhoneCallInput): Promise<Crea
   }
 
   try {
+    const providerWebhookUrl = providerReachableWebhookUrl(input.webhookUrl);
     const response = await fetchWithTimeout(`${env.RETELL_BASE_URL}/v2/create-phone-call`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${env.RETELL_API_KEY}`, 'Content-Type': 'application/json' },
@@ -72,11 +91,12 @@ export async function createPhoneCall(input: CreatePhoneCallInput): Promise<Crea
         // mutating the shared agent or relying on an account-level webhook.
         agent_override: {
           agent: {
-            ...(input.webhookUrl
-              ? { webhook_url: input.webhookUrl, webhook_events: ['call_started', 'call_ended', 'call_analyzed'] }
+            ...(providerWebhookUrl
+              ? { webhook_url: providerWebhookUrl, webhook_events: ['call_started', 'call_ended', 'call_analyzed'] }
               : {}),
             data_storage_setting: input.dataStorageSetting ?? 'basic_attributes_only',
             opt_in_signed_url: true,
+            ...(input.maxCallDurationMs ? { max_call_duration_ms: input.maxCallDurationMs } : {}),
           },
         },
         retell_llm_dynamic_variables: input.dynamicVariables,
@@ -113,6 +133,99 @@ export async function createPhoneCall(input: CreatePhoneCallInput): Promise<Crea
     return { ok: true, callId, mock: false };
   } catch {
     return { ok: false, error: 'retell_request_failed', acceptance: 'unknown' };
+  }
+}
+
+
+export type RetellCallStatus = 'registered' | 'not_connected' | 'ongoing' | 'ended' | 'error' | 'unknown';
+
+export interface RetellCallSnapshot {
+  callId: string;
+  status: RetellCallStatus;
+  agentId: string | null;
+  agentVersion: number | null;
+  direction: string | null;
+  startTimestamp: number | null;
+  endTimestamp: number | null;
+  durationMs: number;
+  disconnectionReason: string | null;
+  metadata: Record<string, unknown>;
+  combinedCostNativeUnits: number | null;
+  mock: boolean;
+}
+
+export type GetPhoneCallResult =
+  | { ok: true; call: RetellCallSnapshot }
+  | { ok: false; error: string };
+
+/**
+ * Read provider lifecycle metadata without returning transcript, recording,
+ * caller number, or free-text analysis. This is the privacy-safe polling
+ * fallback for an attended synthetic UAT when a public signed webhook is not
+ * yet available.
+ */
+export async function getPhoneCall(callId: string): Promise<GetPhoneCallResult> {
+  const status = retellConfigStatus();
+  if (!status.configured) return { ok: false, error: 'setup_required' };
+  if (!callId.trim()) return { ok: false, error: 'call_id_required' };
+  if (status.mock) {
+    return {
+      ok: true,
+      call: {
+        callId,
+        status: 'ended',
+        agentId: null,
+        agentVersion: null,
+        direction: 'outbound',
+        startTimestamp: null,
+        endTimestamp: null,
+        durationMs: 0,
+        disconnectionReason: 'mock',
+        metadata: {},
+        combinedCostNativeUnits: 0,
+        mock: true,
+      },
+    };
+  }
+  try {
+    const response = await fetchWithTimeout(`${env.RETELL_BASE_URL}/v2/get-call/${encodeURIComponent(callId)}`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${env.RETELL_API_KEY}` },
+    });
+    if (!response.ok) return { ok: false, error: `retell_error_${response.status}` };
+    const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+    if (!body) return { ok: false, error: 'retell_invalid_response' };
+    const providerCallId = typeof body.call_id === 'string' ? body.call_id : '';
+    if (!providerCallId || providerCallId !== callId) return { ok: false, error: 'retell_call_id_mismatch' };
+    const rawStatus = typeof body.call_status === 'string' ? body.call_status.toLowerCase() : 'unknown';
+    const knownStatuses: RetellCallStatus[] = ['registered', 'not_connected', 'ongoing', 'ended', 'error'];
+    const normalizedStatus: RetellCallStatus = knownStatuses.includes(rawStatus as RetellCallStatus)
+      ? rawStatus as RetellCallStatus
+      : 'unknown';
+    const callCost = body.call_cost && typeof body.call_cost === 'object' && !Array.isArray(body.call_cost)
+      ? body.call_cost as Record<string, unknown>
+      : {};
+    return {
+      ok: true,
+      call: {
+        callId: providerCallId,
+        status: normalizedStatus,
+        agentId: typeof body.agent_id === 'string' ? body.agent_id : null,
+        agentVersion: typeof body.agent_version === 'number' && Number.isSafeInteger(body.agent_version) ? body.agent_version : null,
+        direction: typeof body.direction === 'string' ? body.direction : null,
+        startTimestamp: typeof body.start_timestamp === 'number' ? body.start_timestamp : null,
+        endTimestamp: typeof body.end_timestamp === 'number' ? body.end_timestamp : null,
+        durationMs: typeof body.duration_ms === 'number' && body.duration_ms >= 0 ? Math.round(body.duration_ms) : 0,
+        disconnectionReason: typeof body.disconnection_reason === 'string' ? body.disconnection_reason.slice(0, 160) : null,
+        metadata: body.metadata && typeof body.metadata === 'object' && !Array.isArray(body.metadata)
+          ? body.metadata as Record<string, unknown>
+          : {},
+        combinedCostNativeUnits: typeof callCost.combined_cost === 'number' ? callCost.combined_cost : null,
+        mock: false,
+      },
+    };
+  } catch {
+    return { ok: false, error: 'retell_request_failed' };
   }
 }
 

@@ -430,7 +430,7 @@ export default function Scheduling() {
                           <td className="px-4 py-3 text-t2">{row.payerName}</td>
                           <td className="px-4 py-3 text-t2">{row.memberId}</td>
                           <td className="px-4 py-3">
-                            <span className={`badge ${active ? 'badge-emerald' : 'badge-amber'}`}>{active ? 'Payer reports active' : row.eligibilityStatus}</span>
+                            <span className={`badge ${active ? 'badge-emerald' : 'badge-amber'}`}>{active ? 'Eligibility active' : row.eligibilityStatus}</span>
                             <p className="mt-1 text-[11px] text-t3">{row.coverageStatus}</p>
                           </td>
                           <td className="px-4 py-3 text-t2">{active ? formatCurrency(row.copay) : '—'}</td>

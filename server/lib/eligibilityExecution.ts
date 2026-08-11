@@ -74,6 +74,8 @@ type ExecutionContext = {
   payerId?: string | null;
   policyId?: string | null;
   actorUserId?: string | null;
+  requestedServiceType?: string | null;
+  requestedServiceAt?: Date | null;
   requestId?: string;
   ipAddress?: string;
   userAgent?: string;
@@ -147,6 +149,22 @@ async function createOrLoadExecution<TOutcome, TResult>(input: RunEligibilityExe
       orderBy: { createdAt: 'desc' },
     });
     if (activeByFingerprint) return activeByFingerprint;
+    // Browser reload/process loss after a durable successful response must not
+    // invoke the payer again merely because the client generated a new key.
+    // Replay only within a bounded freshness window so staff can intentionally
+    // request a new point-in-time eligibility response later.
+    const replayAfter = new Date(Date.now() - env.ELIGIBILITY_SUCCESS_REPLAY_SECONDS * 1_000);
+    const recentCompletedByFingerprint = await tx.eligibilityExecution.findFirst({
+      where: {
+        tenantId: input.context.tenantId,
+        requestFingerprint: { in: identities.map(identity => identity.requestFingerprint) },
+        status: { in: ['SUCCEEDED', 'MANUALLY_RECONCILED'] },
+        resultVerificationId: { not: null },
+        completedAt: { gte: replayAfter },
+      },
+      orderBy: { completedAt: 'desc' },
+    });
+    if (recentCompletedByFingerprint) return recentCompletedByFingerprint;
     const created = await tx.eligibilityExecution.create({
       data: {
         tenantId: input.context.tenantId,
@@ -162,6 +180,8 @@ async function createOrLoadExecution<TOutcome, TResult>(input: RunEligibilityExe
         requestContract: input.requestContract,
         providerKey: input.providerKey,
         providerMode: input.providerMode,
+        requestedServiceType: input.context.requestedServiceType?.trim() || undefined,
+        requestedServiceAt: input.context.requestedServiceAt ?? undefined,
       },
     });
     await tx.auditEvent.create({
@@ -179,6 +199,8 @@ async function createOrLoadExecution<TOutcome, TResult>(input: RunEligibilityExe
           providerKey: input.providerKey,
           providerMode: input.providerMode,
           branchId: input.context.branchId,
+          requestedServiceType: input.context.requestedServiceType ?? null,
+          requestedServiceAt: input.context.requestedServiceAt?.toISOString() ?? null,
         },
       },
     });

@@ -11,27 +11,57 @@ import { eligibilityRequestHeaders, runEligibilityAction } from '../lib/eligibil
 interface ProviderRow { key: string; displayName: string; status: string; mode: string }
 interface EligibilityResult {
   verificationId: string; status: string; coverageActive: boolean; planName: string; payerName: string;
-  copay: number; deductibleRemaining: number; coinsurance: number; message: string; payerReference: string | null;
-  maskedMemberId: string | null; providerMode: string; checkedAt: string; effectiveFrom?: string | null; expiresAt?: string | null;
+  copay: number | null; deductibleRemaining: number | null; coinsurance: number | null; message: string; payerReference: string | null;
+  maskedMemberId: string | null; providerMode: string; simulated: boolean; decisionSource: string;
+  checkedAt: string; effectiveFrom?: string | null; expiresAt?: string | null;
 }
 interface HistoryRow {
   id: string; patientName: string; coverageStatus: string; planName: string; payerName: string;
-  copay: number; deductibleRemaining: number; coinsurance: number; providerMode: string; checkedAt: string; effectiveFrom?: string | null; expiresAt?: string | null;
+  copay: number | null; deductibleRemaining: number | null; coinsurance: number | null; providerMode: string;
+  decisionSource: string; checkedAt: string; effectiveFrom?: string | null; expiresAt?: string | null;
 }
 interface ReconciliationRow {
   id: string; patientName: string; providerKey: string; providerMode: string; status: string; operatorState: string;
   reconciliationReason: string | null; reconciliationGeneration: number; providerCallMayHaveOccurred: boolean;
   providerRetrievalSupported: boolean; noAutomaticPayerRetry: boolean; ageSeconds: number; canReconcile: boolean;
+  payerName: string; planName: string; requestedServiceType: string; requestedServiceAt: string | null;
+  requestTime: string; lastAttemptAt: string; resultSource: string | null; resultStatus: string | null;
+  resultCheckedAt: string | null; resultMessage: string | null;
+  manualEvidenceOutcome: string | null; manualEvidenceSource: string | null; manualEvidenceReference: string | null;
+  manualEvidenceVerifiedAt: string | null; manualCopay: number | null; manualDeductibleRemaining: number | null;
+  manualCoinsurance: number | null;
+  auditTrail: Array<{ action: string; occurredAt: string; actorName: string | null }>;
   reconciliationTask?: { status: string; assignedToId: string | null; assignedTo?: { displayName: string } | null } | null;
 }
 
-const STATUS: Record<string, { cls: string; icon: ElementType; label: string }> = {
-  ACTIVE: { cls: 'badge-emerald', icon: ShieldCheck, label: 'Payer reports active' },
-  INACTIVE: { cls: 'badge-red', icon: ShieldX, label: 'Payer reports inactive' },
-  NEEDS_REVIEW: { cls: 'badge-amber', icon: ShieldAlert, label: 'Needs review' },
-  ERROR: { cls: 'badge-red', icon: AlertTriangle, label: 'Error' },
+const STATUS: Record<string, { cls: string; icon: ElementType }> = {
+  ACTIVE: { cls: 'badge-emerald', icon: ShieldCheck },
+  INACTIVE: { cls: 'badge-red', icon: ShieldX },
+  NEEDS_REVIEW: { cls: 'badge-amber', icon: ShieldAlert },
+  ERROR: { cls: 'badge-red', icon: AlertTriangle },
 };
 function fmt(iso: string): string { return new Date(iso).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }); }
+function statusLabel(status: string, decisionSource?: string | null): string {
+  if (status === 'NEEDS_REVIEW') return 'Needs review';
+  if (status === 'ERROR') return 'Error';
+  const state = status === 'ACTIVE' ? 'active' : status === 'INACTIVE' ? 'inactive' : status.toLowerCase().replaceAll('_', ' ');
+  if (decisionSource === 'MANUAL_PAYER_EVIDENCE') return `Manually verified ${state}`;
+  if (decisionSource === 'SIMULATED') return `Simulated ${state}`;
+  if (decisionSource === 'PAYER_RESPONSE') return `Payer reports ${state}`;
+  return `Eligibility ${state}`;
+}
+function formatBenefit(value: number | null): string { return value === null ? 'Unknown' : formatCurrency(value); }
+function formatCoinsurance(value: number | null): string {
+  if (value === null) return 'Unknown';
+  const percent = Math.abs(value) <= 1 ? value * 100 : value;
+  return `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(percent)}%`;
+}
+function sourceLabel(source: string | null | undefined): string {
+  if (source === 'MANUAL_PAYER_EVIDENCE') return 'Manual payer evidence';
+  if (source === 'PAYER_RESPONSE') return 'Electronic payer response';
+  if (source === 'SIMULATED') return 'Sandbox simulation';
+  return source ? source.toLowerCase().replaceAll('_', ' ') : 'No result yet';
+}
 const emptyEvidence = () => ({
   outcome: 'UNCERTAIN', source: 'PAYER_PORTAL', reference: '', verifiedAt: '', effectiveFrom: '', expiresAt: '',
   copay: '', deductibleRemaining: '', coinsurance: '', notes: '',
@@ -43,7 +73,7 @@ export default function InsuranceEligibility() {
   const [patients, setPatients] = useState<CrmPatient[]>([]);
   const [history, setHistory] = useState<HistoryRow[]>([]);
   const [loading, setLoading] = useState(true);
-  const [form, setForm] = useState({ patientId: '', payerName: '', memberId: '', planName: '' });
+  const [form, setForm] = useState({ patientId: '', payerName: '', memberId: '', planName: '', serviceType: '', serviceDate: '' });
   const [result, setResult] = useState<EligibilityResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -80,7 +110,14 @@ export default function InsuranceEligibility() {
     if (!valid) return;
     setBusy(true); setError(null); setResult(null);
     try {
-      const input = { patientId: form.patientId, payerName: form.payerName.trim(), memberId: form.memberId.trim(), planName: form.planName.trim() || undefined };
+      const input = {
+        patientId: form.patientId,
+        payerName: form.payerName.trim(),
+        memberId: form.memberId.trim(),
+        planName: form.planName.trim() || undefined,
+        serviceType: form.serviceType.trim() || undefined,
+        serviceDate: form.serviceDate || undefined,
+      };
       const res = await runEligibilityAction('insurance_v1', input, key => apiRequest<EligibilityResult>('/v1/insurance/eligibility/check', {
         method: 'POST', headers: eligibilityRequestHeaders(key), body: JSON.stringify(input),
       }));
@@ -162,6 +199,8 @@ export default function InsuranceEligibility() {
             <Field label="Payer name"><input value={form.payerName} onChange={e => setForm(f => ({ ...f, payerName: e.target.value }))} placeholder="e.g. Aetna" className={inputCls} /></Field>
             <Field label="Member ID"><input value={form.memberId} onChange={e => setForm(f => ({ ...f, memberId: e.target.value }))} placeholder="e.g. AET-110293" autoComplete="off" className={inputCls} /></Field>
             <Field label="Plan name (optional)"><input value={form.planName} onChange={e => setForm(f => ({ ...f, planName: e.target.value }))} placeholder="e.g. Aetna Core Plus" className={inputCls} /></Field>
+            <Field label="Requested service (optional)"><input value={form.serviceType} onChange={e => setForm(f => ({ ...f, serviceType: e.target.value }))} placeholder="e.g. Office visit" className={inputCls} /></Field>
+            <Field label="Date of service (optional)"><input type="date" value={form.serviceDate} onChange={e => setForm(f => ({ ...f, serviceDate: e.target.value }))} className={inputCls} /></Field>
             {error && <p role="alert" className="rounded-lg bg-[var(--red-soft)] px-3 py-2 text-[12px] font-semibold text-red-v">{error}</p>}
             <button type="button" disabled={!valid || busy || !canCheck} onClick={check} className="inline-flex items-center gap-2 rounded-lg bg-[var(--indigo)] px-4 py-2 text-[13px] font-semibold text-white hover:opacity-90 disabled:opacity-50">
               {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />} Request eligibility response
@@ -179,7 +218,7 @@ export default function InsuranceEligibility() {
               return (
                 <div className="space-y-3">
                   <div className="flex items-center justify-between gap-3">
-                    <span className={`badge ${meta.cls} inline-flex items-center gap-1 text-[12px]`}><Icon className="w-3.5 h-3.5" />{meta.label}</span>
+                    <span className={`badge ${meta.cls} inline-flex items-center gap-1 text-[12px]`}><Icon className="w-3.5 h-3.5" />{statusLabel(result.status, result.decisionSource)}</span>
                     <span className="text-[11px] text-t3">{result.providerMode} · {fmt(result.checkedAt)}</span>
                   </div>
                   <p className="text-[13px] text-t2 leading-snug">{result.message}</p>
@@ -190,9 +229,10 @@ export default function InsuranceEligibility() {
                     <Row label="Member ID" value={result.maskedMemberId ?? '—'} mono />
                     <Row label="Payer" value={result.payerName} />
                     <Row label="Plan" value={result.planName} />
-                    <Row label="Copay" value={formatCurrency(result.copay)} />
-                    <Row label="Deductible remaining" value={formatCurrency(result.deductibleRemaining)} />
-                    <Row label="Coinsurance" value={`${result.coinsurance}%`} />
+                    <Row label="Evidence source" value={sourceLabel(result.decisionSource)} />
+                    <Row label="Copay" value={formatBenefit(result.copay)} />
+                    <Row label="Deductible remaining" value={formatBenefit(result.deductibleRemaining)} />
+                    <Row label="Coinsurance" value={formatCoinsurance(result.coinsurance)} />
                     <Row label="Payer reference" value={result.payerReference ?? '—'} mono />
                     <Row label="Coverage effective" value={result.effectiveFrom ? fmt(result.effectiveFrom) : 'Unknown — payer did not provide'} />
                     <Row label="Coverage end" value={result.expiresAt ? fmt(result.expiresAt) : 'Unknown — payer did not provide'} />
@@ -216,11 +256,36 @@ export default function InsuranceEligibility() {
             {reconciliations.map(row => (
               <div key={row.id} className="rounded-xl border border-[var(--b1)] p-3">
                 <div className="flex flex-wrap items-start justify-between gap-2">
-                  <div><p className="text-sm font-semibold text-t1">{row.patientName}</p><p className="text-[11px] text-t3">{row.providerKey} · {row.operatorState.replaceAll('_', ' ')} · age {Math.floor(row.ageSeconds / 60)}m</p></div>
+                  <div><p className="text-sm font-semibold text-t1">{row.patientName}</p><p className="text-[11px] text-t3">{row.payerName} · {row.planName} · {row.operatorState.replaceAll('_', ' ')} · age {Math.floor(row.ageSeconds / 60)}m</p></div>
                   <span className="badge badge-amber">{row.status.replaceAll('_', ' ')}</span>
+                </div>
+                <div className="mt-2 grid gap-1 rounded-lg bg-[var(--s2)] p-2 text-[11px] text-t2 sm:grid-cols-2 lg:grid-cols-3">
+                  <span><strong>Service:</strong> {row.requestedServiceType}</span>
+                  <span><strong>Date of service:</strong> {row.requestedServiceAt ? fmt(row.requestedServiceAt) : 'Not specified'}</span>
+                  <span><strong>Requested:</strong> {fmt(row.requestTime)}</span>
+                  <span><strong>Last attempt:</strong> {fmt(row.lastAttemptAt)}</span>
+                  <span><strong>Result source:</strong> {sourceLabel(row.resultSource)}</span>
+                  <span><strong>Result status:</strong> {row.resultStatus ? statusLabel(row.resultStatus, row.resultSource) : 'No result yet'}</span>
                 </div>
                 <p className="mt-2 text-[11px] text-t2">{row.reconciliationReason ?? 'Awaiting server scan or provider outcome.'}</p>
                 <p className="mt-1 text-[10px] text-red-v">Provider call may have occurred: {row.providerCallMayHaveOccurred ? 'yes' : 'no'} · verified response lookup: {row.providerRetrievalSupported ? 'available' : 'not supported'}</p>
+                {row.resultMessage && <p className="mt-1 text-[10px] text-t3">Last recorded result: {row.resultMessage}</p>}
+                {(row.manualEvidenceSource || row.manualEvidenceReference || row.manualEvidenceVerifiedAt) && (
+                  <div className="mt-2 rounded-lg border border-[var(--b1)] px-2.5 py-2 text-[11px] text-t2">
+                    <p className="font-semibold text-t1">Manual payer evidence</p>
+                    <p>{sourceLabel('MANUAL_PAYER_EVIDENCE')} · {row.manualEvidenceSource?.replaceAll('_', ' ').toLowerCase() ?? 'source unavailable'} · reference {row.manualEvidenceReference ?? 'not recorded'}</p>
+                    <p>Verified {row.manualEvidenceVerifiedAt ? fmt(row.manualEvidenceVerifiedAt) : 'time unavailable'} · outcome {row.manualEvidenceOutcome ?? 'unknown'}</p>
+                    <p>Copay {formatBenefit(row.manualCopay)} · deductible {formatBenefit(row.manualDeductibleRemaining)} · coinsurance {formatCoinsurance(row.manualCoinsurance)}</p>
+                  </div>
+                )}
+                {row.auditTrail.length > 0 && (
+                  <details className="mt-2 rounded-lg border border-[var(--b1)] px-2.5 py-2 text-[11px] text-t2">
+                    <summary className="cursor-pointer font-semibold text-t1">Execution audit history ({row.auditTrail.length})</summary>
+                    <ol className="mt-2 space-y-1">
+                      {row.auditTrail.map((entry, index) => <li key={`${entry.action}:${entry.occurredAt}:${index}`}><span className="font-medium">{entry.action.replaceAll('.', ' › ')}</span> · {fmt(entry.occurredAt)}{entry.actorName ? ` · ${entry.actorName}` : ''}</li>)}
+                    </ol>
+                  </details>
+                )}
                 {row.canReconcile && row.status === 'MANUAL_EVIDENCE_PENDING' && (
                   <div className="mt-3 flex flex-wrap gap-2">
                     {!row.reconciliationTask?.assignedToId ? <button type="button" onClick={() => void claimReconciliation(row)} className="rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-xs font-semibold text-white">Claim task</button> : <>
@@ -277,9 +342,9 @@ export default function InsuranceEligibility() {
                       <tr key={h.id} className="hover:bg-[var(--s2)] transition-colors">
                         <td className="px-4 py-2 text-[13px] font-semibold text-t1 whitespace-nowrap">{h.patientName}</td>
                         <td className="px-4 py-2 text-[12px] text-t2 whitespace-nowrap">{h.payerName} <span className="text-t3">· {h.planName}</span></td>
-                        <td className="px-4 py-2 whitespace-nowrap"><span className={`badge ${meta.cls}`}>{meta.label}</span></td>
-                        <td className="px-4 py-2 text-right text-[12px] text-t1 tabular-nums whitespace-nowrap">{formatCurrency(h.copay)}</td>
-                        <td className="px-4 py-2 text-right text-[12px] text-t1 tabular-nums whitespace-nowrap">{formatCurrency(h.deductibleRemaining)}</td>
+                        <td className="px-4 py-2 whitespace-nowrap"><span className={`badge ${meta.cls}`}>{statusLabel(h.coverageStatus, h.decisionSource)}</span><p className="mt-1 text-[10px] text-t3">{sourceLabel(h.decisionSource)}</p></td>
+                        <td className="px-4 py-2 text-right text-[12px] text-t1 tabular-nums whitespace-nowrap">{formatBenefit(h.copay)}</td>
+                        <td className="px-4 py-2 text-right text-[12px] text-t1 tabular-nums whitespace-nowrap">{formatBenefit(h.deductibleRemaining)}</td>
                         <td className="px-4 py-2 text-[12px] text-t3 whitespace-nowrap">{fmt(h.checkedAt)}</td>
                       </tr>
                     );

@@ -269,7 +269,42 @@ export interface RetellStatus {
   missing: string[];
   readyAgents: number;
   adhocTestCallsAllowed: boolean;
+  liveTest: {
+    enabled: boolean;
+    active: boolean;
+    executionId: string | null;
+    allowedDestinationMasked: string | null;
+    expiresAt: string | null;
+    timezone: string;
+    windowStart: string;
+    windowEnd: string;
+    maxCalls: number;
+    maxCallMinutes: number;
+    maxTotalMinutes: number;
+    maxProviderCostUsd: number;
+    projectedMaximumCostUsd: number;
+    blockingReason: string | null;
+    attemptsUsed: number;
+    callsRemaining: number;
+    minutesUsed: number;
+    minutesRemaining: number;
+    activeCalls: number;
+    admissionReason: string | null;
+  };
   checklist: Array<{ key: string; label: string; set: boolean }>;
+}
+
+export interface ProviderCallSyncResult {
+  status: string;
+  providerStatus: string;
+  providerCallIdMasked: string | null;
+  outcome: string;
+  durationSeconds: number;
+  endedAt: string | null;
+  destinationMasked: string | null;
+  costNativeUnits: number | null;
+  reviewTaskId: string | null;
+  verification: 'mock' | 'provider_poll';
 }
 
 export interface OutboundCampaign {
@@ -423,7 +458,15 @@ export type LaunchBlockReason =
   | 'clinic_inactive_or_foreign' | 'branch_inactive_or_foreign' | 'branch_not_mapped_to_clinic'
   | 'agent_scope_mismatch' | 'direct_booking_authority_inactive_or_foreign'
   | 'quiet_hours_missing' | 'quiet_hours_incomplete' | 'quiet_hours_invalid'
-  | 'quiet_hours_equal' | 'quiet_hours_timezone_invalid' | 'client_attempt_not_claimable';
+  | 'quiet_hours_equal' | 'quiet_hours_timezone_invalid' | 'client_attempt_not_claimable'
+  | 'live_test_not_authorized' | 'live_test_execution_id_missing' | 'live_test_tenant_missing'
+  | 'live_test_tenant_not_authorized' | 'live_test_recipient_invalid'
+  | 'live_test_authorization_expired' | 'live_test_outside_window' | 'live_test_limits_invalid'
+  | 'live_test_cost_cap_invalid' | 'live_test_destination_not_allowlisted'
+  | 'live_test_attempt_token_required' | 'live_test_configuration_invalid'
+  | 'live_test_attempt_replayed' | 'live_test_call_cap_reached'
+  | 'live_test_single_active_call' | 'live_test_minute_cap_reached'
+  | 'live_test_cost_cap_reached';
 
 type LaunchEvidence = {
   callId?: string;
@@ -469,6 +512,15 @@ const LAUNCH_BLOCK_REASONS = new Set<LaunchBlockReason>([
   'direct_booking_authority_inactive_or_foreign', 'quiet_hours_missing',
   'quiet_hours_incomplete', 'quiet_hours_invalid', 'quiet_hours_equal',
   'quiet_hours_timezone_invalid', 'client_attempt_not_claimable',
+  'live_test_not_authorized', 'live_test_execution_id_missing',
+  'live_test_tenant_missing', 'live_test_tenant_not_authorized',
+  'live_test_recipient_invalid', 'live_test_authorization_expired',
+  'live_test_outside_window', 'live_test_limits_invalid',
+  'live_test_cost_cap_invalid', 'live_test_destination_not_allowlisted',
+  'live_test_attempt_token_required', 'live_test_configuration_invalid',
+  'live_test_attempt_replayed', 'live_test_call_cap_reached',
+  'live_test_single_active_call', 'live_test_minute_cap_reached',
+  'live_test_cost_cap_reached',
 ]);
 
 export const TRANSPORT_AMBIGUITY_STORAGE_UNAVAILABLE = 'storage-unavailable';
@@ -545,12 +597,18 @@ function launchWords(value: string) {
   return value.replaceAll('_', ' ');
 }
 
+function maskedProviderReference(value: string | null | undefined): string {
+  if (!value) return 'the call log';
+  if (value.length <= 8) return '********';
+  return `${value.slice(0, 4)}…${value.slice(-4)}`;
+}
+
 export function presentLaunchResult(result: LaunchCallResult): LaunchPresentation {
   switch (result.status) {
     case 'launched':
       return result.trackingDegraded
-        ? { kind: 'warn', text: `Provider accepted call ${result.callId}, but local tracking or audit evidence is degraded. Do not retry; reconcile the call log.`, refresh: true }
-        : { kind: 'ok', text: `Call accepted by the provider${result.mock ? ' in mock mode' : ''} — call id ${result.callId}. Delivery/connection is not yet proven.`, refresh: true };
+        ? { kind: 'warn', text: `Provider accepted call ${maskedProviderReference(result.callId)}, but local tracking or audit evidence is degraded. Do not retry; reconcile the call log.`, refresh: true }
+        : { kind: 'ok', text: `Call accepted by the provider${result.mock ? ' in mock mode' : ''} — provider reference ${maskedProviderReference(result.callId)}. Delivery/connection is not yet proven.`, refresh: true };
     case 'setup_required':
       return { kind: 'warn', text: `No call was placed. Setup is incomplete: ${result.missing.join(', ')}.`, refresh: false };
     case 'skipped':
@@ -567,7 +625,7 @@ export function presentLaunchResult(result: LaunchCallResult): LaunchPresentatio
         result.auditRecorded === false ? 'audit event not recorded' : null,
         result.businessEventRecorded === false ? 'business event not recorded' : null,
       ].filter(Boolean).join(', ');
-      return { kind: 'err', text: `Provider acceptance is uncertain; do not retry. Reconcile call ${result.callId ?? result.callLogId ?? 'in the call log'}${result.error ? ` (${launchWords(result.error)})` : ''}.${missingEvidence ? ` Degraded evidence: ${missingEvidence}.` : ''}`, refresh: true };
+      return { kind: 'err', text: `Provider acceptance is uncertain; do not retry. Reconcile ${result.callId ? `provider reference ${maskedProviderReference(result.callId)}` : result.callLogId ? 'the durable call log' : 'the call log'}${result.error ? ` (${launchWords(result.error)})` : ''}.${missingEvidence ? ` Degraded evidence: ${missingEvidence}.` : ''}`, refresh: true };
     }
     case 'failed': {
       const degraded = [result.reviewRecorded === false ? 'review task' : null, result.signalRecorded === false ? 'operational signal' : null].filter(Boolean).join(' and ');
@@ -775,11 +833,25 @@ export const receptionistApi = {
   approveOutboundCampaign: (id: string, status: 'SCHEDULED' | 'RUNNING') => apiRequest<OutboundCampaign>(`${base}/outbound-campaigns/${id}/approve`, { method: 'POST', body: JSON.stringify({ approvalConfirmed: true, status }) }),
   listTargets: (campaignId: string) => apiRequest<CallTarget[]>(`${base}/outbound-campaigns/${campaignId}/targets`),
   listOutboundTargetCandidates: (campaignId: string, q = '') => apiRequest<OutboundTargetCandidate[]>(`${base}/outbound-target-candidates?campaignId=${encodeURIComponent(campaignId)}${q ? `&q=${encodeURIComponent(q)}` : ''}`),
-  addTargets: (campaignId: string, targets: Array<Partial<CallTarget> & { phone: string }>) =>
+  addTargets: (campaignId: string, targets: Array<Partial<CallTarget> & { patientId?: string; leadId?: string }>) =>
     apiRequest<{ added: number }>(`${base}/outbound-campaigns/${campaignId}/targets`, { method: 'POST', body: JSON.stringify({ targets }) }),
+  attachLiveTestTarget: (campaignId: string, body: {
+    firstName?: string;
+    lastName?: string;
+    scenario?: string;
+    acknowledgeAuthorizedSyntheticRecipient: true;
+    acknowledgeSyntheticConsentEvidence?: boolean;
+  }) => apiRequest<{
+    status: string;
+    targetId: string;
+    leadId: string;
+    targetStatus: string;
+    destinationMasked: string;
+    executionId: string;
+  }>(`${base}/outbound-campaigns/${campaignId}/live-test-target`, { method: 'POST', body: JSON.stringify(body) }),
   deleteTarget: (campaignId: string, id: string) =>
     apiRequest<void>(`${base}/outbound-campaigns/${campaignId}/targets/${id}`, { method: 'DELETE' }),
-  launchCall: async (campaignId: string, body: { phone: string; firstName?: string; lastName?: string; email?: string; targetId?: string }) => {
+  launchCall: async (campaignId: string, body: { phone?: string; firstName?: string; lastName?: string; email?: string; targetId?: string }) => {
     const clientAttemptToken = crypto.randomUUID();
     await apiRequest(`${base}/outbound-campaigns/${campaignId}/launch-attempts`, {
       method: 'POST', body: JSON.stringify({ token: clientAttemptToken }),
@@ -805,6 +877,7 @@ export const receptionistApi = {
     method: 'POST', body: JSON.stringify({ stopped: true, reason }),
   }),
   listOutboundCallLogs: (campaignId: string) => apiRequest<CallLog[]>(`${base}/outbound-campaigns/${campaignId}/call-logs`),
+  syncOutboundProviderCall: (campaignId: string, callLogId: string) => apiRequest<ProviderCallSyncResult>(`${base}/outbound-campaigns/${campaignId}/call-logs/${callLogId}/provider-sync`, { method: 'POST' }),
   listOutboundReconciliations: (campaignId: string) => apiRequest<OutboundReconciliationEvidence[]>(`${base}/outbound-campaigns/${campaignId}/reconciliations`),
   listBookingRequests: (status?: BookingRequestStatus) => apiRequest<BookingRequest[]>(`${base}/booking-requests${status ? `?status=${status}` : ''}`),
   listConfirmationDeliveries: (limit = 100) => apiRequest<ConfirmationDelivery[]>(`${base}/confirmation-deliveries?limit=${limit}`),

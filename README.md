@@ -194,3 +194,7 @@ The UI now authenticates against the local API and hydrates operational records 
 - `VITE_AUTH_MODE=dev-token` must stay disabled in production.
 - Refresh and logout require a CSRF header/cookie match.
 - OIDC/SSO remains the recommended long-term production identity path.
+
+## Attended live voice UAT
+
+The one-call Retell + installed-Google-Chrome acceptance harness is documented in [`docs/testing/LIVE_VOICE_UAT.md`](docs/testing/LIVE_VOICE_UAT.md). It is disabled by default and requires an expiring, process-scoped one-recipient authorization plus private Retell credentials.

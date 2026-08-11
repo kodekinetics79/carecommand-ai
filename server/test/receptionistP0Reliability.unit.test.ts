@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { env } from '../config/env';
-import { createPhoneCall, stopPhoneCall } from '../lib/retell';
+import { createPhoneCall, getPhoneCall, stopPhoneCall } from '../lib/retell';
 import { buildRetellConfig, generateSamples, generateSystemPrompt, type PromptConfig } from '../modules/receptionist/promptService';
 
 const originalRetell = {
@@ -71,6 +71,7 @@ describe('receptionist P0 reliability', () => {
       webhookUrl: 'https://api.example.test/v1/receptionist/webhooks/retell?clinicId=clinic-1',
       dynamicVariables: { first_name: 'Taylor' },
       metadata: { campaignId: 'campaign-1' },
+      maxCallDurationMs: 300_000,
     });
 
     expect(result).toEqual({ ok: true, callId: 'call-123', mock: false });
@@ -86,8 +87,30 @@ describe('receptionist P0 reliability', () => {
         webhook_events: ['call_started', 'call_ended', 'call_analyzed'],
         data_storage_setting: 'basic_attributes_only',
         opt_in_signed_url: true,
+        max_call_duration_ms: 300_000,
       },
     });
+  });
+
+  it('omits a loopback webhook so an attended local UAT can use privacy-safe provider polling', async () => {
+    env.RETELL_API_KEY = 'real-retell-key';
+    env.RETELL_FROM_NUMBER = '+12125550199';
+    const fetchMock = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+      call_id: 'call-local-poll', agent_id: 'agent-campaign', agent_version: 7,
+    }), { status: 201 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await createPhoneCall({
+      toNumber: '+12125550101', agentId: 'agent-campaign', agentVersion: 7,
+      webhookUrl: 'http://127.0.0.1:43201/v1/receptionist/webhooks/retell',
+      dynamicVariables: {}, metadata: {},
+    });
+
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    const agent = JSON.parse(String(init.body)).agent_override.agent;
+    expect(agent.webhook_url).toBeUndefined();
+    expect(agent.webhook_events).toBeUndefined();
+    expect(agent.data_storage_setting).toBe('basic_attributes_only');
   });
 
   it('still sends the mandatory metadata-only storage override when no per-call webhook is requested', async () => {
@@ -162,6 +185,61 @@ describe('receptionist P0 reliability', () => {
     await expect(createPhoneCall({
       toNumber: '+12125550101', agentId: 'agent-campaign', agentVersion: 7, dynamicVariables: {}, metadata: {},
     })).resolves.toEqual({ ok: false, error: `retell_error_${statusCode}`, acceptance });
+  });
+
+  it('polls a provider call without returning transcript, recording, phone, or analysis content', async () => {
+    env.RETELL_API_KEY = 'real-retell-key';
+    env.RETELL_FROM_NUMBER = '+12125550199';
+    env.RETELL_BASE_URL = 'https://api.retellai.com';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      call_id: 'call-poll-1',
+      call_status: 'not_connected',
+      agent_id: 'agent-campaign',
+      agent_version: 7,
+      direction: 'outbound',
+      start_timestamp: 1_723_000_000_000,
+      end_timestamp: 1_723_000_005_000,
+      duration_ms: 5_000,
+      disconnection_reason: 'dial_busy',
+      metadata: { tenantId: 'tenant-1', callLogId: 'log-1' },
+      call_cost: { combined_cost: 42 },
+      transcript: 'must not leave the adapter',
+      recording_url: 'https://secret.example/recording.wav',
+      call_analysis: { call_summary: 'must not leave the adapter', user_sentiment: 'negative' },
+    }), { status: 200 })));
+
+    const result = await getPhoneCall('call-poll-1');
+
+    expect(result).toEqual({
+      ok: true,
+      call: {
+        callId: 'call-poll-1',
+        status: 'not_connected',
+        agentId: 'agent-campaign',
+        agentVersion: 7,
+        direction: 'outbound',
+        startTimestamp: 1_723_000_000_000,
+        endTimestamp: 1_723_000_005_000,
+        durationMs: 5_000,
+        disconnectionReason: 'dial_busy',
+        metadata: { tenantId: 'tenant-1', callLogId: 'log-1' },
+        combinedCostNativeUnits: 42,
+        mock: false,
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain('transcript');
+    expect(JSON.stringify(result)).not.toContain('recording');
+    expect(JSON.stringify(result)).not.toContain('call_summary');
+  });
+
+  it('fails closed when Get Call returns a different provider call id', async () => {
+    env.RETELL_API_KEY = 'real-retell-key';
+    env.RETELL_FROM_NUMBER = '+12125550199';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      call_id: 'call-other', call_status: 'ongoing',
+    }), { status: 200 })));
+
+    await expect(getPhoneCall('call-expected')).resolves.toEqual({ ok: false, error: 'retell_call_id_mismatch' });
   });
 
   it('uses Retell stop-call for an active cancellation and never claims a mock stop was applied', async () => {

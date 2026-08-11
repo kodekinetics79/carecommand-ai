@@ -1028,6 +1028,8 @@ model EligibilityExecution {
   requestContract      String
   providerKey          String
   providerMode         String
+  requestedServiceType String?
+  requestedServiceAt   DateTime?
   providerExecutionKey String                     @default(uuid()) @db.Uuid
   status               EligibilityExecutionStatus @default(READY)
   resultVerificationId String?                    @db.Uuid
@@ -1071,6 +1073,7 @@ model EligibilityExecution {
   @@index([status, reconciliationLeaseExpiresAt, updatedAt])
   @@index([tenantId, status, reconciliationLeaseExpiresAt])
   @@index([tenantId, status, updatedAt])
+  @@index([tenantId, requestFingerprint, completedAt])
   @@index([tenantId, patientId, createdAt])
 }
 

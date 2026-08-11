@@ -115,6 +115,40 @@ describe('durable eligibility execution boundary', () => {
     expect(await fixtureDb.businessEvent.count({ where: { tenantId: f.tenantId, eventType: 'insurance.eligibility.requested' } })).toBe(1);
   });
 
+  it('replays a recent completed result across a new browser key and allows a fresh check only after the bounded window', async () => {
+    const f = await fixture();
+    let calls = 0;
+    const provider = async () => {
+      calls += 1;
+      return { coverageStatus: 'ACTIVE' };
+    };
+
+    await inTenant(f, async () => {
+      const first = await runInput(f, { key: 'browser-key-before-success-loss', provider });
+      expect(first.replayed).toBe(false);
+
+      const recovered = await runInput(f, { key: 'browser-key-after-success-loss', provider });
+      expect(recovered).toMatchObject({
+        replayed: true,
+        executionId: first.executionId,
+        result: first.result,
+      });
+
+      await fixtureDb.eligibilityExecution.update({
+        where: { id: first.executionId },
+        data: { completedAt: new Date(Date.now() - 2 * 24 * 60 * 60_000) },
+      });
+
+      const fresh = await runInput(f, { key: 'browser-key-after-freshness-window', provider });
+      expect(fresh.replayed).toBe(false);
+      expect(fresh.executionId).not.toBe(first.executionId);
+    });
+
+    expect(calls).toBe(2);
+    expect(await fixtureDb.eligibilityExecution.count({ where: { tenantId: f.tenantId } })).toBe(2);
+    expect(await fixtureDb.eligibilityVerification.count({ where: { tenantId: f.tenantId } })).toBe(2);
+  });
+
   it('rejects key reuse with a different PHI fingerprint and persists neither the raw key nor member identifier', async () => {
     const f = await fixture();
     await inTenant(f, async () => {

@@ -109,6 +109,10 @@ const baseEnvSchema = z.object({
   ELIGIBILITY_RECONCILIATION_STALE_SECONDS: z.coerce.number().int().min(300).max(86400).default(300),
   ELIGIBILITY_RECONCILIATION_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(25),
   ELIGIBILITY_RECONCILIATION_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(10).default(2),
+  // A lost HTTP response or browser restart must not invoke the payer again.
+  // A new idempotency key with the same tenant-scoped request fingerprint
+  // replays a recent completed result only within this bounded freshness window.
+  ELIGIBILITY_SUCCESS_REPLAY_SECONDS: z.coerce.number().int().min(60).max(86_400).default(900),
   // Dedicated HMAC key for tenant-scoped BullMQ envelopes. Optional for a
   // staged rollout; JWT_REFRESH_SECRET is used with domain separation if unset.
   // The secret never appears in queue payloads.
@@ -219,6 +223,27 @@ const baseEnvSchema = z.object({
   RETELL_API_KEY: z.string().optional(),
   RETELL_FROM_NUMBER: z.string().optional(),
   RETELL_BASE_URL: z.string().url().default('https://api.retellai.com'),
+  // Attended, synthetic-only live voice UAT. These controls are deliberately
+  // independent of normal tenant limits. A run needs one exact destination,
+  // a short-lived execution id, and hard call/minute/cost caps. Values belong
+  // only in the local process environment and must never be committed.
+  LIVE_TEST_CALLS_AUTHORIZED: booleanString(false),
+  LIVE_TEST_EXECUTION_ID: z.string().regex(/^[A-Za-z0-9:_-]{8,80}$/).optional(),
+  LIVE_TEST_TENANT_ID: z.string().uuid().optional(),
+  AUTHORIZED_TEST_PHONE_E164: z.string().optional(),
+  LIVE_TEST_RECIPIENT_ALLOWLIST: z.string().default(''),
+  LIVE_TEST_EXPIRES_AT: z.string().datetime({ offset: true }).optional(),
+  LIVE_TEST_TIMEZONE: z.string().min(1).max(80).default('America/New_York'),
+  LIVE_TEST_WINDOW_START: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).default('09:00'),
+  LIVE_TEST_WINDOW_END: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).default('20:00'),
+  LIVE_TEST_MAX_CALLS: z.coerce.number().int().min(0).max(12).default(0),
+  LIVE_TEST_MAX_CALL_MINUTES: z.coerce.number().int().min(1).max(10).default(5),
+  LIVE_TEST_MAX_TOTAL_MINUTES: z.coerce.number().int().min(0).max(30).default(0),
+  LIVE_TEST_MAX_PROVIDER_COST_USD: z.coerce.number().min(0).max(15).default(0),
+  // Retell's Get Call payload exposes provider-native cost units but does not
+  // define a stable USD conversion contract here. Reserve a conservative USD
+  // estimate before each dial so the wave still fails closed on spend.
+  LIVE_TEST_ESTIMATED_COST_PER_MINUTE_USD: z.coerce.number().min(0).max(5).default(0),
   // Platform control plane legacy token (separate from tenant UserRole). In
   // production this token is disabled unless PLATFORM_LEGACY_TOKEN_ENABLED=true;
   // prefer PlatformUser login + platform JWT for all real environments.
@@ -277,6 +302,68 @@ export const envSchema = baseEnvSchema.superRefine((cfg, ctx) => {
       ctx.addIssue({ code: 'custom', path: ['PLATFORM_DATABASE_URL'], message: 'PLATFORM_DATABASE_URL must be a valid PostgreSQL URL.' });
     }
   }
+  // Live voice UAT is an attended, synthetic-only exception. Fail boot closed
+  // unless every admission-control input is explicit, short-lived, and
+  // internally consistent. This gate is intentionally profile-based: a local
+  // browser harness may serve a production build while remaining a demo/UAT
+  // environment, but pilot/enterprise deployments must never enable this path.
+  if (cfg.LIVE_TEST_CALLS_AUTHORIZED) {
+    const allowlist = [
+      ...cfg.LIVE_TEST_RECIPIENT_ALLOWLIST.split(','),
+      cfg.AUTHORIZED_TEST_PHONE_E164 ?? '',
+    ].map(value => value.trim()).filter(Boolean);
+    const uniqueAllowlist = [...new Set(allowlist)];
+    const e164 = /^\+[1-9]\d{7,14}$/;
+    if (cfg.DEPLOYMENT_PROFILE !== 'demo') {
+      ctx.addIssue({ code: 'custom', path: ['LIVE_TEST_CALLS_AUTHORIZED'], message: 'Live voice UAT is permitted only in the demo deployment profile.' });
+    }
+    if (!cfg.LIVE_TEST_EXECUTION_ID) {
+      ctx.addIssue({ code: 'custom', path: ['LIVE_TEST_EXECUTION_ID'], message: 'Live voice UAT requires a run-unique execution id.' });
+    }
+    if (!cfg.LIVE_TEST_TENANT_ID) {
+      ctx.addIssue({ code: 'custom', path: ['LIVE_TEST_TENANT_ID'], message: 'Live voice UAT requires one exact tenant id.' });
+    }
+    if (uniqueAllowlist.length !== 1 || !e164.test(uniqueAllowlist[0] ?? '')) {
+      ctx.addIssue({ code: 'custom', path: ['LIVE_TEST_RECIPIENT_ALLOWLIST'], message: 'Live voice UAT requires exactly one valid E.164 recipient across AUTHORIZED_TEST_PHONE_E164 and LIVE_TEST_RECIPIENT_ALLOWLIST.' });
+    }
+    if (!cfg.RETELL_API_KEY || cfg.RETELL_API_KEY.startsWith('mock')) {
+      ctx.addIssue({ code: 'custom', path: ['RETELL_API_KEY'], message: 'Live voice UAT requires a non-mock Retell API key.' });
+    }
+    if (!cfg.RETELL_FROM_NUMBER || !e164.test(cfg.RETELL_FROM_NUMBER.trim())) {
+      ctx.addIssue({ code: 'custom', path: ['RETELL_FROM_NUMBER'], message: 'Live voice UAT requires a valid Retell outbound number in E.164 format.' });
+    }
+    if (!cfg.LIVE_TEST_EXPIRES_AT) {
+      ctx.addIssue({ code: 'custom', path: ['LIVE_TEST_EXPIRES_AT'], message: 'Live voice UAT requires an explicit expiration timestamp.' });
+    } else {
+      const expiresAt = Date.parse(cfg.LIVE_TEST_EXPIRES_AT);
+      const now = Date.now();
+      if (!Number.isFinite(expiresAt) || expiresAt <= now || expiresAt - now > 24 * 60 * 60 * 1_000) {
+        ctx.addIssue({ code: 'custom', path: ['LIVE_TEST_EXPIRES_AT'], message: 'Live voice UAT expiration must be in the future and no more than 24 hours away.' });
+      }
+    }
+    if (cfg.LIVE_TEST_WINDOW_START === cfg.LIVE_TEST_WINDOW_END) {
+      ctx.addIssue({ code: 'custom', path: ['LIVE_TEST_WINDOW_START'], message: 'Live voice UAT start and end times must differ.' });
+    }
+    if (cfg.LIVE_TEST_MAX_CALLS < 1) {
+      ctx.addIssue({ code: 'custom', path: ['LIVE_TEST_MAX_CALLS'], message: 'Live voice UAT requires a positive call cap.' });
+    }
+    if (cfg.LIVE_TEST_MAX_TOTAL_MINUTES < cfg.LIVE_TEST_MAX_CALL_MINUTES) {
+      ctx.addIssue({ code: 'custom', path: ['LIVE_TEST_MAX_TOTAL_MINUTES'], message: 'Total live-test minutes must cover at least one maximum-duration call.' });
+    }
+    if (cfg.LIVE_TEST_MAX_PROVIDER_COST_USD <= 0 || cfg.LIVE_TEST_ESTIMATED_COST_PER_MINUTE_USD <= 0) {
+      ctx.addIssue({ code: 'custom', path: ['LIVE_TEST_MAX_PROVIDER_COST_USD'], message: 'Live voice UAT requires positive provider-cost and per-minute estimate caps.' });
+    }
+    const worstCaseCost = cfg.LIVE_TEST_MAX_CALLS * cfg.LIVE_TEST_MAX_CALL_MINUTES * cfg.LIVE_TEST_ESTIMATED_COST_PER_MINUTE_USD;
+    if (worstCaseCost > cfg.LIVE_TEST_MAX_PROVIDER_COST_USD) {
+      ctx.addIssue({ code: 'custom', path: ['LIVE_TEST_MAX_PROVIDER_COST_USD'], message: 'Configured live-test call limits can exceed the provider-cost cap.' });
+    }
+    try {
+      new Intl.DateTimeFormat('en-US', { timeZone: cfg.LIVE_TEST_TIMEZONE }).format(new Date());
+    } catch {
+      ctx.addIssue({ code: 'custom', path: ['LIVE_TEST_TIMEZONE'], message: 'Live voice UAT requires a valid IANA time zone.' });
+    }
+  }
+
   // PORTAL_TOKEN_OUTBOX_PATH writes RAW patient magic-login tokens to disk —
   // a PHI/credential leak on any real production host. Fail the boot closed
   // unless the E2E harness explicitly opted in.

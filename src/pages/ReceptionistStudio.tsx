@@ -50,6 +50,19 @@ function formatEnumLabel(value: string): string {
   return words ? words[0].toUpperCase() + words.slice(1) : 'Unknown';
 }
 
+function maskedPhone(value: string | null | undefined): string {
+  if (!value) return '—';
+  if (value.includes('*')) return value;
+  const digits = value.replace(/\D/g, '');
+  return digits.length >= 4 ? `***-***-${digits.slice(-4)}` : '***-***-****';
+}
+
+function maskedProviderId(value: string | null | undefined): string {
+  if (!value) return 'no provider id';
+  if (value.includes('…') || value.includes('*')) return value;
+  return value.length > 8 ? `${value.slice(0, 4)}…${value.slice(-4)}` : '********';
+}
+
 const outcomeBadge: Record<string, string> = {
   BOOKED: 'badge badge-emerald', NOT_INTERESTED: 'badge badge-amber', NO_ANSWER: 'badge badge-blue',
   VOICEMAIL: 'badge badge-blue', ESCALATED: 'badge badge-red', OPTED_OUT: 'badge badge-violet',
@@ -1332,7 +1345,7 @@ function ActivityPanel({ clinicId }: { clinicId: string }) {
             <button key={call.id} type="button" onClick={() => void openCall(call.id)} className="w-full flex items-start justify-between gap-3 rounded-xl border border-[var(--b1)] px-3 py-2.5 text-left hover:bg-[var(--s3)]">
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
-                  <p className="text-sm font-semibold text-t1 truncate">{call.callerName ?? call.callerPhone ?? 'Unknown caller'}</p>
+                  <p className="text-sm font-semibold text-t1 truncate">{call.callerName ?? maskedPhone(call.callerPhone)}</p>
                   <span className={outcomeBadge[call.outcome] ?? 'badge badge-blue'}>{formatEnumLabel(call.outcome)}</span>
                 </div>
                 <p className="text-[11px] text-t3 truncate mt-0.5">{call.transcriptSummary ?? '—'}</p>
@@ -1361,7 +1374,7 @@ function ActivityPanel({ clinicId }: { clinicId: string }) {
                 <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
                   <p className="text-[10px] font-bold uppercase tracking-wide text-t3">Provider call analysis</p>
                   <p className="mt-1 text-xs text-t2">{selectedCall.providerSummary?.text ?? 'No provider-derived summary is stored.'}</p>
-                  <p className="mt-2 text-[10px] text-t3">Source: {selectedCall.providerSummary ? 'provider call analysis' : 'not available'}{selectedCall.providerSummary?.sourceCallId ? ` · call ${selectedCall.providerSummary.sourceCallId}` : ''}</p>
+                  <p className="mt-2 text-[10px] text-t3">Source: {selectedCall.providerSummary ? 'provider call analysis' : 'not available'}{selectedCall.providerSummary?.sourceCallId ? ` · call ${maskedProviderId(selectedCall.providerSummary.sourceCallId)}` : ''}</p>
                 </div>
                 <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
                   <p className="text-[10px] font-bold uppercase tracking-wide text-t3">Recording access</p>
@@ -1908,6 +1921,9 @@ function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { camp
   const [transportAmbiguityToken, setTransportAmbiguityToken] = useState<string | null>(() => readTransportAmbiguityToken(window.localStorage, transportAmbiguityKey));
   const [launching, setLaunching] = useState(false);
   const [campaignActionPending, setCampaignActionPending] = useState(false);
+  const [attachingLiveTarget, setAttachingLiveTarget] = useState(false);
+  const [syncingCallId, setSyncingCallId] = useState<string | null>(null);
+  const [providerStatusByCall, setProviderStatusByCall] = useState<Record<string, string>>({});
   const [detailErrors, setDetailErrors] = useState<string[]>([]);
 
   const reloadDetail = useCallback(async () => {
@@ -1967,10 +1983,14 @@ function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { camp
 
   async function launch(targetId?: string, toPhone?: string) {
     const dial = toPhone ?? phone;
-    if (!dial) return;
+    if (!targetId && !dial) return;
     setLaunching(true); setLaunchMsg(null);
     try {
-      const res = await api.launchCall(campaign.id, { phone: dial, firstName: firstName || undefined, targetId });
+      const res = await api.launchCall(campaign.id, {
+        ...(dial ? { phone: dial } : {}),
+        firstName: firstName || undefined,
+        targetId,
+      });
       const presentation = presentLaunchResult(res);
       setLaunchMsg({ kind: presentation.kind, text: presentation.text });
       if (res.status === 'transport_ambiguous') persistTransportAmbiguity(res.clientAttemptToken);
@@ -1987,6 +2007,44 @@ function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { camp
       await reloadDetail();
     } finally {
       setLaunching(false);
+    }
+  }
+
+  async function attachAuthorizedLiveTestTarget() {
+    setAttachingLiveTarget(true); setLaunchMsg(null);
+    try {
+      const attached = await api.attachLiveTestTarget(campaign.id, {
+        firstName: 'Jordan',
+        lastName: 'Test',
+        scenario: 'attended synthetic live voice UAT',
+        acknowledgeAuthorizedSyntheticRecipient: true,
+        acknowledgeSyntheticConsentEvidence: true,
+      });
+      setLaunchMsg({ kind: 'ok', text: `Authorized synthetic recipient ${attached.destinationMasked} is attached to this campaign.` });
+      await reloadDetail();
+    } catch (error) {
+      setLaunchMsg({ kind: 'err', text: error instanceof Error ? error.message : 'The authorized synthetic recipient could not be attached.' });
+    } finally {
+      setAttachingLiveTarget(false);
+    }
+  }
+
+  async function syncProviderCall(callLogId: string) {
+    setSyncingCallId(callLogId); setLaunchMsg(null);
+    try {
+      const result = await api.syncOutboundProviderCall(campaign.id, callLogId);
+      setProviderStatusByCall(current => ({ ...current, [callLogId]: `${formatEnumLabel(result.providerStatus)} · ${result.durationSeconds}s${result.costNativeUnits === null ? '' : ' · provider cost recorded'}` }));
+      setLaunchMsg({
+        kind: result.outcome === 'ESCALATED' ? 'warn' : 'ok',
+        text: result.outcome === 'ESCALATED'
+          ? 'The provider call ended without signed analyzed-webhook evidence. CareCommand created a staff review task instead of fabricating a successful outcome.'
+          : `Provider lifecycle synchronized as ${formatEnumLabel(result.providerStatus)}.`,
+      });
+      await reloadDetail();
+    } catch (error) {
+      setLaunchMsg({ kind: 'err', text: error instanceof Error ? error.message : 'Provider lifecycle could not be synchronized.' });
+    } finally {
+      setSyncingCallId(null);
     }
   }
 
@@ -2039,7 +2097,7 @@ function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { camp
             {reconciliations.map(row => (
               <div key={row.localCallLogId} className="rounded-lg border border-red-v/30 bg-[var(--red-soft)] p-2 text-[11px] text-t2">
                 <p><span className="font-semibold">Local call log ID:</span> <span className="font-mono">{row.localCallLogId}</span></p>
-                <p><span className="font-semibold">Provider call ID:</span> <span className="font-mono">{row.providerCallId ?? 'not recorded—provider acceptance may still be possible'}</span></p>
+                <p><span className="font-semibold">Provider call ID:</span> <span className="font-mono">{maskedProviderId(row.providerCallId)}</span></p>
                 <p className="text-t3">Evidence: {row.triggerSources.join(', ')}{row.signalIds.length ? ` · signals ${row.signalIds.join(', ')}` : ''}{row.reviewTaskIds.length ? ` · review tasks ${row.reviewTaskIds.join(', ')}` : ''}</p>
               </div>
             ))}
@@ -2075,6 +2133,34 @@ function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { camp
         </div>
       </div>
 
+      {status?.liveTest?.enabled && (
+        <div className={`cc-card border-l-4 p-4 ${status.liveTest.active ? 'border-l-emerald-v' : 'border-l-amber-v'}`}>
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p className="text-sm font-bold text-t1">Attended synthetic live voice UAT</p>
+              <p className="mt-1 text-xs text-t2">
+                Destination {status.liveTest.allowedDestinationMasked ?? 'not configured'} · {status.liveTest.callsRemaining} calls remaining · {status.liveTest.minutesRemaining} minutes remaining · one active call at a time.
+              </p>
+              <p className="mt-1 text-[11px] text-t3">
+                Window {status.liveTest.windowStart}–{status.liveTest.windowEnd} {status.liveTest.timezone}. Authorization expires {status.liveTest.expiresAt ? new Date(status.liveTest.expiresAt).toLocaleString() : 'not configured'}.
+              </p>
+              {!status.liveTest.active && <p role="alert" className="mt-2 text-xs font-semibold text-amber-v">Blocked: {formatEnumLabel(status.liveTest.blockingReason ?? status.liveTest.admissionReason ?? 'live test not ready')}</p>}
+            </div>
+            <ConfirmedButton
+              dialogTitle="Attach the environment-authorized synthetic recipient?"
+              message="This creates or reuses a clearly synthetic lead and campaign target for the one masked destination authorized in the local process environment. It does not expose or accept a phone number from the browser."
+              confirmLabel="Attach synthetic recipient"
+              tone="amber"
+              disabled={!status.liveTest.active || attachingLiveTarget}
+              onConfirm={attachAuthorizedLiveTestTarget}
+              className="rounded-lg border border-emerald-v/40 px-3 py-1.5 text-xs font-semibold text-emerald-v disabled:opacity-50"
+            >
+              {attachingLiveTarget ? 'Attaching…' : 'Attach authorized synthetic recipient'}
+            </ConfirmedButton>
+          </div>
+        </div>
+      )}
+
       {/* Launch test call */}
       <div className="cc-card p-5 space-y-3">
         <h4 className="text-sm font-bold text-t1 flex items-center gap-2"><PhoneCall className="w-4 h-4 text-indigo" /> Launch a call</h4>
@@ -2104,14 +2190,14 @@ function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { camp
               {launching ? <Loader2 className="w-4 h-4 animate-spin" /> : <PhoneOutgoing className="w-4 h-4" />} Place test call
             </ConfirmedButton>
           </div>
-        ) : <p className="text-xs text-t3">Production calls must use an authorized patient or lead target below.</p>}
+        ) : <p className="text-xs text-t3">Calls must use an authorized patient or lead target below. During live UAT, attach the environment-authorized synthetic recipient and launch it from the target row; the browser cannot supply or change the number.</p>}
         {launchMsg && (
           <p role={launchMsg.kind === 'err' ? 'alert' : 'status'} aria-live={launchMsg.kind === 'err' ? 'assertive' : 'polite'} className={`text-xs ${launchMsg.kind === 'ok' ? 'text-emerald-v' : launchMsg.kind === 'warn' ? 'text-amber-v' : 'text-red-v'}`}>{launchMsg.text}</p>
         )}
       </div>
 
       {/* Targets */}
-      <TargetList campaign={campaign} targets={targets} onAdded={reloadDetail} onCall={(t) => launch(t.id, t.phone)} canCall={!launching && !outboundStopped && !reconciliationBlocksLaunch && configured && campaign.status === 'RUNNING'} />
+      <TargetList campaign={campaign} targets={targets} onAdded={reloadDetail} onCall={(t) => launch(t.id)} canCall={!launching && !outboundStopped && !reconciliationBlocksLaunch && configured && campaign.status === 'RUNNING'} />
 
       {/* Call logs */}
       <div className="cc-card p-5">
@@ -2119,12 +2205,23 @@ function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { camp
         {logs.length === 0 ? <p className="text-xs text-t3">No calls placed yet.</p> : (
           <div className="space-y-1.5">
             {logs.map(l => (
-              <div key={l.id} className="flex items-center justify-between rounded-lg border border-[var(--b1)] px-3 py-2 text-xs">
-                <div className="flex items-center gap-2">
-                  <span className={outcomeBadge[l.outcome] ?? 'badge badge-blue'}>{formatEnumLabel(l.outcome)}</span>
-                  <span className="text-t2">{l.callerName || l.callerPhone || '—'}</span>
+              <div key={l.id} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[var(--b1)] px-3 py-2 text-xs">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className={outcomeBadge[l.outcome] ?? 'badge badge-blue'}>{formatEnumLabel(l.outcome)}</span>
+                    <span className="text-t2">{l.callerName || maskedPhone(l.callerPhone)}</span>
+                    <span className="text-t3">{maskedPhone(l.callerPhone)}</span>
+                  </div>
+                  <p className="mt-1 text-[10px] text-t3 font-mono">{maskedProviderId(l.retellCallId)}{providerStatusByCall[l.id] ? ` · ${providerStatusByCall[l.id]}` : ''}</p>
                 </div>
-                <span className="text-t3 font-mono text-[10px]">{l.retellCallId ?? 'no call id'}</span>
+                <button
+                  type="button"
+                  disabled={!l.retellCallId || syncingCallId === l.id}
+                  onClick={() => void syncProviderCall(l.id)}
+                  className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-indigo disabled:opacity-50"
+                >
+                  {syncingCallId === l.id ? 'Refreshing…' : 'Refresh provider status'}
+                </button>
               </div>
             ))}
           </div>
@@ -2136,6 +2233,10 @@ function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { camp
 
 function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign: OutboundCampaign; targets: CallTarget[]; onAdded: () => void; onCall: (t: CallTarget) => void; canCall: boolean }) {
   const [candidates, setCandidates] = useState<OutboundTargetCandidate[]>([]);
+  const targetIdentityKey = targets
+    .map(target => target.patientId ?? target.leadId ?? target.id)
+    .sort()
+    .join(',');
   const [selectedCandidate, setSelectedCandidate] = useState('');
   const [busy, setBusy] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -2157,7 +2258,7 @@ function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign:
       if (active) setCandidateError('Authorized target candidates could not be loaded. Existing rows are preserved; do not infer that no candidates exist.');
     });
     return () => { active = false; };
-  }, [campaign.id]);
+  }, [campaign.id, targetIdentityKey]);
 
   async function add() {
     const candidate = candidates.find(item => `${item.type}:${item.id}` === selectedCandidate);
@@ -2165,7 +2266,6 @@ function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign:
     setBusy(true);
     try {
       await api.addTargets(campaign.id, [{
-        phone: candidate.phone,
         ...(candidate.type === 'patient' ? { patientId: candidate.id } : { leadId: candidate.id }),
       }]);
       setSelectedCandidate('');
@@ -2193,7 +2293,7 @@ function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign:
         <Field label="Authorized patient or lead">
           <Select aria-label="Authorized outbound target" value={selectedCandidate} onChange={e => setSelectedCandidate(e.target.value)}>
             <option value="">Select an identity with a canonical phone</option>
-            {candidates.filter(candidate => candidate.voiceAuthorizationReady).map(candidate => <option key={`${candidate.type}:${candidate.id}`} value={`${candidate.type}:${candidate.id}`}>{candidate.name} · {candidate.phone} · {candidate.voiceAuthorizationReason === 'compatible_immutable_consent' ? 'compatible consent evidence' : 'treatment/operations authority'}</option>)}
+            {candidates.filter(candidate => candidate.voiceAuthorizationReady).map(candidate => <option key={`${candidate.type}:${candidate.id}`} value={`${candidate.type}:${candidate.id}`}>{candidate.name} · {maskedPhone(candidate.phone)} · {candidate.voiceAuthorizationReason === 'compatible_immutable_consent' ? 'compatible consent evidence' : 'treatment/operations authority'}</option>)}
           </Select>
         </Field>
         <button type="button" disabled={busy || !selectedCandidate} onClick={add} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50 h-[38px]"><Plus className="w-4 h-4" /> Add</button>
@@ -2208,8 +2308,8 @@ function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign:
                 <div key={t.id} className="flex items-center justify-between rounded-lg border border-[var(--b1)] px-3 py-2 text-xs">
                   <div className="flex items-center gap-2">
                     <span className="badge badge-blue">{formatEnumLabel(t.status)}</span>
-                    <span className="text-t2">{[t.firstName, t.lastName].filter(Boolean).join(' ') || t.phone}</span>
-                    <span className="text-t3">{t.phone}</span>
+                    <span className="text-t2">{[t.firstName, t.lastName].filter(Boolean).join(' ') || maskedPhone(t.phone)}</span>
+                    <span className="text-t3">{maskedPhone(t.phone)}</span>
                   </div>
                   <div className="flex items-center gap-2">
                     <button type="button" disabled={!canCall || t.status !== 'PENDING' || !consentReady} title={!consentReady ? `Target is not authorized for this exact campaign (${candidate?.voiceAuthorizationReason ?? 'authorization evidence unavailable'})` : !canCall ? 'Campaign must be running, provider-ready, and not emergency-stopped' : t.status !== 'PENDING' ? `Target is ${t.status}` : 'Call target'} onClick={() => onCall(t)} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 font-semibold text-indigo hover:bg-[var(--s2)] disabled:opacity-50">

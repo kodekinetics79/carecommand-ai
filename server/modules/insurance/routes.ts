@@ -353,7 +353,9 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
       payerName: z.string().trim().min(2).max(120),
       memberId: z.string().trim().min(2).max(60),
       planName: z.string().trim().max(120).optional(),
-      serviceType: z.string().trim().max(40).optional(),
+      serviceType: z.string().trim().max(80).optional(),
+      serviceDate: z.coerce.date().optional(),
+      appointmentId: uuid.optional(),
       providerKey: z.enum(['stedi']).default('stedi'),
       policyId: uuid.optional(),
     }).parse(request.body);
@@ -369,6 +371,17 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
     assertBranchAccess(request, patient.branchId);
 
     const now = new Date();
+    const appointment = input.appointmentId
+      ? await db.appointment.findFirst({
+        where: {
+          id: input.appointmentId, tenantId, patientId: patient.id, branchId: patient.branchId, deletedAt: null,
+        },
+        select: { id: true, startsAt: true, service: true },
+      })
+      : null;
+    if (input.appointmentId && !appointment) throw app.httpErrors.badRequest('Appointment does not belong to the selected patient and branch');
+    const requestedServiceAt = appointment?.startsAt ?? input.serviceDate ?? now;
+    const requestedServiceType = input.serviceType?.trim() || appointment?.service || null;
     const policies = await db.patientInsurancePolicy.findMany({
       where: {
         tenantId, patientId: patient.id, branchId: patient.branchId, active: true,
@@ -413,6 +426,7 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
         providerMode: row.providerMode,
         mode: row.providerMode,
         simulated,
+        decisionSource: row.decisionSource,
         checkedAt: row.checkedAt,
         effectiveFrom: row.effectiveFrom,
         expiresAt: row.expiresAt,
@@ -425,9 +439,12 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
           tenantId,
           branchId: patient.branchId,
           patientId: patient.id,
+          appointmentId: appointment?.id ?? null,
           payerId: policyPayer.id,
           policyId: policy.id,
           actorUserId: request.auth.userId,
+          requestedServiceType,
+          requestedServiceAt,
           requestId: request.id,
           ipAddress: request.ip,
           userAgent: request.headers['user-agent'],
@@ -437,11 +454,17 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
           contract: 'insurance_v1',
           branchId: patient.branchId,
           patientId: patient.id,
+          appointmentId: appointment?.id ?? null,
           policyId: policy.id,
           payerId: policyPayer.id,
           memberId: input.memberId,
           providerKey: input.providerKey,
-          serviceType: input.serviceType ?? null,
+          serviceType: requestedServiceType,
+          // The date of service is the logical request boundary. Do not put a
+          // wall-clock request timestamp into the fingerprint: a lost response
+          // followed by a browser restart would otherwise look like a new payer
+          // transaction and could be submitted twice.
+          requestedServiceAt: requestedServiceAt.toISOString().slice(0, 10),
         },
         requestContract: 'insurance_v1',
         providerKey: input.providerKey,
@@ -454,7 +477,7 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
               providerExecutionKey,
               payer: policyPayer,
               policy: { id: policy.id, planName: policy.planName, memberId: policy.memberId },
-              serviceType: input.serviceType,
+              serviceType: requestedServiceType ?? undefined,
             });
             const n: NormalizedEligibility = {
               status: outcome.coverageActive ? (outcome.coverageStatus === 'uncertain' ? 'NEEDS_REVIEW' : 'ACTIVE') : 'INACTIVE',
@@ -478,7 +501,7 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
             };
           }
           const result = runStediEligibility(
-            { memberId: input.memberId, payerName: input.payerName, planName: input.planName, serviceType: input.serviceType },
+            { memberId: input.memberId, payerName: input.payerName, planName: input.planName, serviceType: requestedServiceType ?? undefined },
             'sandbox',
           );
           return { n: result.normalized, providerMode: 'sandbox', simulated: true, raw: result.raw };
@@ -490,6 +513,7 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
               tenantId,
               branchId: patient.branchId,
               patientId: patient.id,
+              appointmentId: appointment?.id ?? undefined,
               providerMode: outcome.providerMode,
               payerId: policy.payerId,
               policyId: policy.id,
@@ -508,9 +532,18 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
               normalizedResponse: { ...outcome.n, simulated: outcome.simulated } as unknown as Prisma.InputJsonValue,
             },
           });
-          await tx.patientInsurancePolicy.update({ where: { id: policy.id }, data: { verificationStatus: outcome.n.coverageActive ? 'verified' : 'inactive', verifiedAt } });
+          const verificationStatus = outcome.n.status === 'NEEDS_REVIEW'
+            ? 'needs_review'
+            : outcome.n.coverageActive ? 'verified' : 'inactive';
+          const eligibilityStatus = outcome.n.status === 'NEEDS_REVIEW'
+            ? 'NEEDS_REVIEW'
+            : outcome.n.coverageActive ? 'ACTIVE' : 'INACTIVE';
+          await tx.patientInsurancePolicy.update({ where: { id: policy.id }, data: { verificationStatus, verifiedAt } });
           if (policy.coverageOrder === 1) {
-            await tx.patient.update({ where: { id: patient.id }, data: { eligibilityStatus: outcome.n.coverageActive ? 'ACTIVE' : 'INACTIVE', eligibilityLastVerifiedAt: verifiedAt } });
+            await tx.patient.update({ where: { id: patient.id }, data: { eligibilityStatus, eligibilityLastVerifiedAt: verifiedAt } });
+          }
+          if (appointment) {
+            await tx.appointment.update({ where: { id: appointment.id }, data: { eligibilityStatus, eligibilityLastVerifiedAt: verifiedAt } });
           }
           await tx.businessEvent.create({
             data: {
@@ -539,6 +572,7 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
               providerMode: outcome.providerMode,
               mode: outcome.providerMode,
               simulated: outcome.simulated,
+              decisionSource: outcome.simulated ? 'SIMULATED' : 'PAYER_RESPONSE',
               checkedAt: created.checkedAt,
               effectiveFrom: created.effectiveFrom,
               expiresAt: created.expiresAt,
@@ -569,7 +603,7 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
     const rows = await db.eligibilityVerification.findMany({
       where: { tenantId: request.auth.tenantId, ...branchScope(request), ...(q.patientId ? { patientId: q.patientId } : {}) },
       orderBy: { checkedAt: 'desc' }, take: q.limit,
-      select: { id: true, patientId: true, coverageStatus: true, coverageActive: true, planName: true, payerName: true, copay: true, deductibleRemaining: true, coinsurance: true, eligibilityMessage: true, providerMode: true, checkedAt: true, effectiveFrom: true, expiresAt: true },
+      select: { id: true, patientId: true, coverageStatus: true, coverageActive: true, planName: true, payerName: true, copay: true, deductibleRemaining: true, coinsurance: true, eligibilityMessage: true, providerMode: true, decisionSource: true, checkedAt: true, effectiveFrom: true, expiresAt: true },
     });
     const pIds = [...new Set(rows.map(r => r.patientId))];
     const patients = pIds.length ? await db.patient.findMany({ where: { id: { in: pIds }, tenantId: request.auth.tenantId }, select: { id: true, firstName: true, lastName: true } }) : [];
@@ -621,14 +655,46 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
         manualEvidenceSource: true,
         manualEvidenceReference: true,
         manualEvidenceVerifiedAt: true,
+        manualCopay: true,
+        manualDeductibleRemaining: true,
+        manualCoinsurance: true,
+        requestedServiceType: true,
+        requestedServiceAt: true,
         providerStartedAt: true,
+        providerCompletedAt: true,
+        completedAt: true,
         createdAt: true,
         updatedAt: true,
         patient: { select: { firstName: true, lastName: true } },
+        payer: { select: { name: true } },
+        policy: { select: { planName: true } },
+        appointment: { select: { service: true, startsAt: true } },
+        resultVerification: {
+          select: { decisionSource: true, coverageStatus: true, checkedAt: true, eligibilityMessage: true },
+        },
       },
     });
+    const rowIds = rows.map(row => row.id);
+    const auditRows = rowIds.length ? await db.auditEvent.findMany({
+      where: {
+        tenantId: request.auth.tenantId,
+        resource: 'eligibilityExecution',
+        resourceId: { in: rowIds },
+      },
+      orderBy: { occurredAt: 'desc' },
+      take: Math.min(500, rowIds.length * 10),
+      select: { resourceId: true, action: true, occurredAt: true, actorUser: { select: { displayName: true } } },
+    }) : [];
+    const auditsByExecution = new Map<string, Array<{ action: string; occurredAt: Date; actorName: string | null }>>();
+    for (const auditRow of auditRows) {
+      if (!auditRow.resourceId) continue;
+      const bucket = auditsByExecution.get(auditRow.resourceId) ?? [];
+      if (bucket.length >= 10) continue;
+      bucket.push({ action: auditRow.action, occurredAt: auditRow.occurredAt, actorName: auditRow.actorUser?.displayName ?? null });
+      auditsByExecution.set(auditRow.resourceId, bucket);
+    }
     await audit(request, { action: 'eligibility.execution.reconciliation.list', resource: 'eligibilityExecution', metadata: { count: rows.length } });
-    return rows.map(({ patient, ...row }) => {
+    return rows.map(({ patient, payer, policy, appointment, resultVerification, ...row }) => {
       const capability = eligibilityProviderReconciliationCapability(row.providerKey);
       const staleBefore = Date.now() - env.ELIGIBILITY_RECONCILIATION_STALE_SECONDS * 1000;
       const stale = row.status === 'READY'
@@ -636,7 +702,21 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
         : row.status === 'PROVIDER_IN_FLIGHT' && Boolean(row.providerStartedAt && row.providerStartedAt.getTime() < staleBefore);
       return {
         ...row,
+        manualCopay: row.manualCopay === null ? null : Number(row.manualCopay),
+        manualDeductibleRemaining: row.manualDeductibleRemaining === null ? null : Number(row.manualDeductibleRemaining),
+        manualCoinsurance: row.manualCoinsurance === null ? null : Number(row.manualCoinsurance),
         patientName: `${patient.firstName} ${patient.lastName}`,
+        payerName: payer?.name ?? 'Payer unavailable',
+        planName: policy?.planName ?? 'Plan unavailable',
+        requestedServiceType: row.requestedServiceType ?? appointment?.service ?? 'Not specified',
+        requestedServiceAt: row.requestedServiceAt ?? appointment?.startsAt ?? null,
+        requestTime: row.createdAt,
+        lastAttemptAt: row.providerStartedAt ?? row.updatedAt,
+        resultSource: resultVerification?.decisionSource ?? null,
+        resultStatus: resultVerification?.coverageStatus ?? null,
+        resultCheckedAt: resultVerification?.checkedAt ?? null,
+        resultMessage: resultVerification?.eligibilityMessage ?? null,
+        auditTrail: auditsByExecution.get(row.id) ?? [],
         operatorState: row.status === 'MANUALLY_RECONCILED' ? 'reconciled'
           : row.status === 'FAILED_DEFINITIVE' || row.status === 'SUCCEEDED' ? 'terminal'
             : row.status === 'PROVIDER_IN_FLIGHT' ? stale ? 'stale_provider_in_flight' : 'provider_in_flight'
@@ -716,7 +796,7 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
       });
       if (current.status !== 'MANUAL_EVIDENCE_PENDING' || current.reconciliationGeneration !== body.expectedGeneration) throw app.httpErrors.conflict('Eligibility reconciliation changed; reload before resolving');
       if (body.resolution === 'confirmed_succeeded') {
-        const serviceAt = current.appointment?.startsAt ?? current.createdAt;
+        const serviceAt = current.requestedServiceAt ?? current.appointment?.startsAt ?? current.createdAt;
         const outsideCoverageDates = Boolean(
           (body.evidence.effectiveFrom && serviceAt < body.evidence.effectiveFrom)
           || (body.evidence.expiresAt && serviceAt >= body.evidence.expiresAt),
