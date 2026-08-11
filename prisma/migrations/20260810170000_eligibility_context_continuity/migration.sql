@@ -2,7 +2,7 @@ ALTER TABLE "EligibilityExecution"
   ADD COLUMN "requestedServiceType" TEXT,
   ADD COLUMN "requestedServiceAt" TIMESTAMP(3);
 
-CREATE INDEX "EligibilityExecution_tenantId_requestFingerprint_completed_idx"
+CREATE INDEX "EligibilityExecution_tenantId_requestFingerprint_completedA_idx"
   ON "EligibilityExecution"("tenantId", "requestFingerprint", "completedAt");
 
 -- Preserve the request context that staff must attest against. These fields are

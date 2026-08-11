@@ -1353,7 +1353,10 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
     expect(['FAILED', 'ESCALATED']).toContain(finalCallLog.outcome);
     if (sawSecondStop) {
       expect(await db.receptionistCallTarget.findUniqueOrThrow({ where: { id: target.id } })).toMatchObject({
-        status: 'FAILED', lastOutcome: 'RECONCILIATION_REQUIRED',
+        // The scenario's durable evidence, not which concurrent request
+        // returned first, determines whether cancellation is confirmed or
+        // requires reconciliation.
+        status: 'FAILED', lastOutcome: expectedOutcome,
       });
     } else {
       expect(await db.receptionistCallTarget.findUniqueOrThrow({ where: { id: target.id } })).toMatchObject({
