@@ -166,6 +166,107 @@ async function lockOutboundDispatch(tx: Prisma.TransactionClient, tenantId: stri
   await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`receptionist-outbound-dispatch:${tenantId}`}::text, 0))::text AS locked`;
 }
 
+type ProviderStopIdentity = {
+  tenantId: string;
+  campaignId: string;
+  targetId: string;
+  callLogId: string;
+  providerCallId: string;
+};
+
+async function applyConfirmedProviderStopTx(
+  tx: Prisma.TransactionClient,
+  identity: ProviderStopIdentity,
+  request: FastifyRequest,
+) {
+  const call = await tx.receptionistCallLog.findFirst({
+    where: {
+      id: identity.callLogId,
+      tenantId: identity.tenantId,
+      outboundCampaignId: identity.campaignId,
+      targetId: identity.targetId,
+      retellCallId: identity.providerCallId,
+      outcome: { in: ['IN_PROGRESS', 'ESCALATED', 'FAILED'] },
+    },
+    select: { id: true, outcome: true, endedAt: true },
+  });
+  const target = await tx.receptionistCallTarget.findFirst({
+    where: {
+      id: identity.targetId,
+      tenantId: identity.tenantId,
+      campaignId: identity.campaignId,
+      lastCallLogId: identity.callLogId,
+      OR: [
+        { status: 'CALLING' },
+        { status: 'FAILED', lastOutcome: { in: ['RECONCILIATION_REQUIRED', 'OUTBOUND_STOPPED'] } },
+      ],
+    },
+    select: { lastOutcome: true },
+  });
+  if (!call || !target) return { applied: false, upgraded: false, signalsResolved: 0, tasksResolved: 0 };
+
+  const upgraded = target.lastOutcome !== 'OUTBOUND_STOPPED';
+  if (call.outcome === 'IN_PROGRESS') {
+    await tx.receptionistCallLog.update({
+      where: { id: call.id },
+      data: { outcome: 'FAILED', endedAt: call.endedAt ?? new Date() },
+    });
+  }
+  await tx.receptionistCallTarget.update({
+    where: { id: identity.targetId },
+    data: { status: 'FAILED', lastOutcome: 'OUTBOUND_STOPPED', lastCallLogId: identity.callLogId },
+  });
+
+  const signals = await tx.operationalSignal.updateMany({
+    where: {
+      tenantId: identity.tenantId,
+      entityType: 'receptionistCallLog',
+      entityId: identity.callLogId,
+      signalType: 'receptionist_outbound_stop_unconfirmed_after_acceptance',
+      status: 'open',
+    },
+    data: {
+      status: 'resolved',
+      reason: 'Superseded by durable confirmation that the provider call was stopped.',
+    },
+  });
+  const candidateTasks = await tx.staffTask.findMany({
+    where: {
+      tenantId: identity.tenantId,
+      status: { in: ['OPEN', 'IN_PROGRESS'] },
+      metadata: { path: ['callLogId'], equals: identity.callLogId },
+    },
+    select: { id: true, metadata: true },
+  });
+  const taskIds = candidateTasks.flatMap(task => {
+    const metadata = task.metadata && typeof task.metadata === 'object' && !Array.isArray(task.metadata)
+      ? task.metadata as Prisma.JsonObject
+      : null;
+    return metadata?.workflow === 'receptionist_outbound_stop_reconciliation' ? [task.id] : [];
+  });
+  const tasks = taskIds.length
+    ? await tx.staffTask.updateMany({ where: { id: { in: taskIds }, tenantId: identity.tenantId }, data: { status: 'CANCELED' } })
+    : { count: 0 };
+
+  if (upgraded) {
+    await auditOutboundMutation(tx, request, {
+      action: 'receptionist.call.providerStopConfirmed',
+      resource: 'receptionistCallLog',
+      resourceId: identity.callLogId,
+      metadata: {
+        campaignId: identity.campaignId,
+        targetId: identity.targetId,
+        evidenceTransition: target.lastOutcome === 'RECONCILIATION_REQUIRED'
+          ? 'provider_stop_uncertain_to_provider_stop_confirmed'
+          : 'provider_stop_pending_to_provider_stop_confirmed',
+        signalsResolved: signals.count,
+        tasksResolved: tasks.count,
+      },
+    });
+  }
+  return { applied: true, upgraded, signalsResolved: signals.count, tasksResolved: tasks.count };
+}
+
 async function auditOutboundMutation(
   tx: Prisma.TransactionClient,
   request: FastifyRequest,
@@ -452,16 +553,15 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     if (confirmed.length > 0) {
       await db.$transaction(async tx => {
         await lockOutboundDispatch(tx, request.auth.tenantId);
-        await tx.receptionistCallLog.updateMany({
-          where: { id: { in: confirmed.map(row => row.call.id) }, tenantId: request.auth.tenantId, endedAt: null },
-          data: { outcome: 'FAILED', endedAt: new Date() },
-        });
         for (const row of confirmed) {
           if (!row.call.targetId || !row.call.outboundCampaignId) continue;
-          await tx.receptionistCallTarget.updateMany({
-            where: { id: row.call.targetId, tenantId: request.auth.tenantId, campaignId: row.call.outboundCampaignId, status: 'CALLING' },
-            data: { status: 'FAILED', lastOutcome: 'OUTBOUND_STOPPED', lastCallLogId: row.call.id },
-          });
+          await applyConfirmedProviderStopTx(tx, {
+            tenantId: request.auth.tenantId,
+            campaignId: row.call.outboundCampaignId,
+            targetId: row.call.targetId,
+            callLogId: row.call.id,
+            providerCallId: row.call.retellCallId,
+          }, request);
         }
       });
     }
@@ -476,23 +576,46 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       await db.$transaction(async tx => {
         await lockOutboundDispatch(tx, request.auth.tenantId);
         for (const row of reconciliationCandidates) {
-          const changed = await tx.receptionistCallLog.updateMany({
-            where: { id: row.call.id, tenantId: request.auth.tenantId, outcome: 'IN_PROGRESS', endedAt: null },
+          await tx.receptionistCallLog.updateMany({
+            where: {
+              id: row.call.id, tenantId: request.auth.tenantId,
+              outboundCampaignId: row.call.outboundCampaignId,
+              targetId: row.call.targetId,
+              retellCallId: row.call.retellCallId,
+              outcome: 'IN_PROGRESS', endedAt: null,
+            },
             data: { outcome: 'ESCALATED', endedAt: new Date() },
           });
-          const latest = changed.count === 1
-            ? { outcome: 'ESCALATED' }
-            : await tx.receptionistCallLog.findFirst({
-              where: { id: row.call.id, tenantId: request.auth.tenantId }, select: { outcome: true },
+          const latest = await tx.receptionistCallLog.findFirst({
+              where: {
+                id: row.call.id, tenantId: request.auth.tenantId,
+                outboundCampaignId: row.call.outboundCampaignId,
+                targetId: row.call.targetId,
+                retellCallId: row.call.retellCallId,
+              },
+              select: {
+                outcome: true,
+                target: { select: { id: true, campaignId: true, lastCallLogId: true, lastOutcome: true } },
+              },
             });
           // Another concurrent stop may already have confirmed cancellation
           // and committed FAILED/OUTBOUND_STOPPED. Never downgrade that stronger
           // terminal evidence because this provider request returned 503.
-          if (latest?.outcome !== 'ESCALATED') continue;
+          if (latest?.outcome !== 'ESCALATED'
+            || latest.target?.campaignId !== row.call.outboundCampaignId
+            || latest.target.lastCallLogId !== row.call.id
+            || latest.target.lastOutcome === 'OUTBOUND_STOPPED') continue;
           reconciliationIds.add(row.call.id);
           if (!row.call.targetId || !row.call.outboundCampaignId) continue;
           await tx.receptionistCallTarget.updateMany({
-            where: { id: row.call.targetId, tenantId: request.auth.tenantId, campaignId: row.call.outboundCampaignId },
+            where: {
+              id: row.call.targetId, tenantId: request.auth.tenantId,
+              campaignId: row.call.outboundCampaignId, lastCallLogId: row.call.id,
+              OR: [
+                { status: 'CALLING' },
+                { status: 'FAILED', lastOutcome: 'RECONCILIATION_REQUIRED' },
+              ],
+            },
             data: { status: 'FAILED', lastOutcome: 'RECONCILIATION_REQUIRED', lastCallLogId: row.call.id },
           });
         }
@@ -503,36 +626,54 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     let reviewRecorded = 0;
     for (const row of reconciliationRequired) {
       try {
-        await runWithTenantContext(request.auth.tenantId, tx => tx.operationalSignal.upsert({
-          where: { tenantId_signalType_entityType_entityId: {
+        const recorded = await runWithTenantContext(request.auth.tenantId, async tx => {
+          await lockOutboundDispatch(tx, request.auth.tenantId);
+          const stillUncertain = row.call.targetId && row.call.outboundCampaignId
+            ? await tx.receptionistCallTarget.findFirst({
+              where: {
+                id: row.call.targetId, tenantId: request.auth.tenantId,
+                campaignId: row.call.outboundCampaignId, lastCallLogId: row.call.id,
+                status: 'FAILED', lastOutcome: 'RECONCILIATION_REQUIRED',
+              },
+              select: { id: true },
+            })
+            : null;
+          if (!stillUncertain) return { signal: false, task: false };
+          await tx.operationalSignal.upsert({
+            where: { tenantId_signalType_entityType_entityId: {
+              tenantId: request.auth.tenantId,
+              signalType: 'receptionist_outbound_stop_unconfirmed_after_acceptance',
+              entityType: 'receptionistCallLog', entityId: row.call.id,
+            } },
+            update: { severity: 'critical', score: 100, status: 'open', reason: 'Provider cancellation could not be confirmed after the outbound kill switch was activated.' },
+            create: {
+              tenantId: request.auth.tenantId,
+              signalType: 'receptionist_outbound_stop_unconfirmed_after_acceptance',
+              entityType: 'receptionistCallLog', entityId: row.call.id,
+              severity: 'critical', score: 100,
+              reason: 'Provider cancellation could not be confirmed after the outbound kill switch was activated.',
+            },
+          });
+          const existingTask = await tx.staffTask.findFirst({
+            where: {
+              tenantId: request.auth.tenantId,
+              metadata: { path: ['callLogId'], equals: row.call.id },
+            },
+            select: { id: true },
+          });
+          if (!existingTask) await tx.staffTask.create({ data: {
             tenantId: request.auth.tenantId,
-            signalType: 'receptionist_outbound_stop_unconfirmed_after_acceptance',
-            entityType: 'receptionistCallLog', entityId: row.call.id,
-          } },
-          update: { severity: 'critical', score: 100, status: 'open', reason: 'Provider cancellation could not be confirmed after the outbound kill switch was activated.' },
-          create: {
-            tenantId: request.auth.tenantId,
-            signalType: 'receptionist_outbound_stop_unconfirmed_after_acceptance',
-            entityType: 'receptionistCallLog', entityId: row.call.id,
-            severity: 'critical', score: 100,
-            reason: 'Provider cancellation could not be confirmed after the outbound kill switch was activated.',
-          },
-        }));
-        signalRecorded += 1;
-      } catch {
-        // Primary ESCALATED/non-dialable state is already committed.
-      }
-      try {
-        await runWithTenantContext(request.auth.tenantId, tx => tx.staffTask.create({ data: {
-          tenantId: request.auth.tenantId,
-          title: 'Urgent: reconcile outbound call after unconfirmed stop', priority: 'CRITICAL',
-          metadata: {
-            workflow: 'receptionist_outbound_stop_reconciliation', callLogId: row.call.id,
-            providerCallId: row.call.retellCallId, providerStopApplied: false,
-            providerStopError: row.result.ok ? 'provider_stop_unconfirmed' : row.result.error,
-          },
-        } }));
-        reviewRecorded += 1;
+            title: 'Urgent: reconcile outbound call after unconfirmed stop', priority: 'CRITICAL',
+            metadata: {
+              workflow: 'receptionist_outbound_stop_reconciliation', callLogId: row.call.id,
+              providerCallId: row.call.retellCallId, providerStopApplied: false,
+              providerStopError: row.result.ok ? 'provider_stop_unconfirmed' : row.result.error,
+            },
+          } });
+          return { signal: true, task: !existingTask };
+        });
+        if (recorded.signal) signalRecorded += 1;
+        if (recorded.task) reviewRecorded += 1;
       } catch {
         // Primary ESCALATED/non-dialable state is already committed.
       }
@@ -1534,6 +1675,18 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
             }
           }
           const reservedCall = await tx.receptionistCallLog.create({ data: callLogData });
+          if (target) {
+            const linkedAttempt = await tx.receptionistCallTarget.updateMany({
+              where: {
+                id: target.id,
+                tenantId: request.auth.tenantId,
+                campaignId: campaign.id,
+                status: 'CALLING',
+              },
+              data: { lastCallLogId: reservedCall.id },
+            });
+            if (linkedAttempt.count !== 1) throw new Error('target_attempt_binding_lost');
+          }
           if (liveAttempt) {
             await tx.idempotencyKey.create({
               data: {
@@ -1915,14 +2068,41 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         const nextRetellCallId = existing.retellCallId === null && conflictingRetellCall === null
           ? providerCallId
           : existing.retellCallId;
-        await tx.receptionistCallLog.update({
-          where: { id: callLog.id },
-          data: { retellCallId: nextRetellCallId, outcome: nextOutcome, endedAt: existing.endedAt ?? new Date() },
-        });
-        if (target) await tx.receptionistCallTarget.updateMany({
-          where: { id: target.id, tenantId: request.auth.tenantId, campaignId: campaign.id },
-          data: { status: 'FAILED', lastOutcome: effectiveProviderStopApplied ? 'OUTBOUND_STOPPED' : 'RECONCILIATION_REQUIRED', lastCallLogId: callLog.id },
-        });
+        if (effectiveProviderStopApplied && target && nextRetellCallId === providerCallId) {
+          if (existing.retellCallId === null) {
+            await tx.receptionistCallLog.updateMany({
+              where: {
+                id: callLog.id, tenantId: request.auth.tenantId,
+                outboundCampaignId: campaign.id, targetId: target.id,
+                retellCallId: null, outcome: { in: ['IN_PROGRESS', 'ESCALATED', 'FAILED'] },
+              },
+              data: { retellCallId: providerCallId },
+            });
+          }
+          await applyConfirmedProviderStopTx(tx, {
+            tenantId: request.auth.tenantId,
+            campaignId: campaign.id,
+            targetId: target.id,
+            callLogId: callLog.id,
+            providerCallId,
+          }, request);
+        } else {
+          await tx.receptionistCallLog.update({
+            where: { id: callLog.id },
+            data: { retellCallId: nextRetellCallId, outcome: nextOutcome, endedAt: existing.endedAt ?? new Date() },
+          });
+          if (target) await tx.receptionistCallTarget.updateMany({
+            where: {
+              id: target.id, tenantId: request.auth.tenantId, campaignId: campaign.id,
+              lastCallLogId: callLog.id,
+              OR: [
+                { status: 'CALLING' },
+                { status: 'FAILED', lastOutcome: 'RECONCILIATION_REQUIRED' },
+              ],
+            },
+            data: { status: 'FAILED', lastOutcome: 'RECONCILIATION_REQUIRED', lastCallLogId: callLog.id },
+          });
+        }
         return { effectiveProviderStopApplied };
       });
 
@@ -1932,36 +2112,66 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       let reviewTaskId: string | null = null;
       if (!effectiveProviderStopApplied) {
         try {
-          const signal = await runWithTenantContext(request.auth.tenantId, tx => tx.operationalSignal.upsert({
-            where: { tenantId_signalType_entityType_entityId: {
-              tenantId: request.auth.tenantId,
-              signalType: 'receptionist_outbound_stop_unconfirmed_after_acceptance',
-              entityType: 'receptionistCallLog', entityId: callLog.id,
-            } },
-            update: { severity: 'critical', score: 100, status: 'open', reason: 'Provider accepted an outbound call after a stop request, but provider cancellation was not confirmed.' },
-            create: {
-              tenantId: request.auth.tenantId,
-              signalType: 'receptionist_outbound_stop_unconfirmed_after_acceptance',
-              entityType: 'receptionistCallLog', entityId: callLog.id,
-              severity: 'critical', score: 100,
-              reason: 'Provider accepted an outbound call after a stop request, but provider cancellation was not confirmed.',
-            },
-          }));
-          signalId = signal.id;
+          const signal = await runWithTenantContext(request.auth.tenantId, async tx => {
+            await lockOutboundDispatch(tx, request.auth.tenantId);
+            const stillUncertain = target
+              ? await tx.receptionistCallTarget.findFirst({
+                where: {
+                  id: target.id, tenantId: request.auth.tenantId, campaignId: campaign.id,
+                  lastCallLogId: callLog.id, status: 'FAILED', lastOutcome: 'RECONCILIATION_REQUIRED',
+                },
+                select: { id: true },
+              })
+              : null;
+            if (!stillUncertain) return null;
+            return tx.operationalSignal.upsert({
+              where: { tenantId_signalType_entityType_entityId: {
+                tenantId: request.auth.tenantId,
+                signalType: 'receptionist_outbound_stop_unconfirmed_after_acceptance',
+                entityType: 'receptionistCallLog', entityId: callLog.id,
+              } },
+              update: { severity: 'critical', score: 100, status: 'open', reason: 'Provider accepted an outbound call after a stop request, but provider cancellation was not confirmed.' },
+              create: {
+                tenantId: request.auth.tenantId,
+                signalType: 'receptionist_outbound_stop_unconfirmed_after_acceptance',
+                entityType: 'receptionistCallLog', entityId: callLog.id,
+                severity: 'critical', score: 100,
+                reason: 'Provider accepted an outbound call after a stop request, but provider cancellation was not confirmed.',
+              },
+            });
+          });
+          signalId = signal?.id ?? null;
         } catch {
           signalId = null;
         }
         try {
-          const task = await runWithTenantContext(request.auth.tenantId, tx => tx.staffTask.create({ data: {
-            tenantId: request.auth.tenantId, branchId: campaign.defaultBranchId,
-            title: 'Urgent: reconcile outbound call accepted after stop', priority: 'CRITICAL',
-            metadata: {
-              workflow: 'receptionist_outbound_stop_reconciliation', callLogId: callLog.id,
-              providerCallId, providerStopApplied: false,
-              providerStopError: providerStop.ok ? 'provider_stop_unconfirmed' : providerStop.error,
-            },
-          } }));
-          reviewTaskId = task.id;
+          const task = await runWithTenantContext(request.auth.tenantId, async tx => {
+            await lockOutboundDispatch(tx, request.auth.tenantId);
+            const stillUncertain = target
+              ? await tx.receptionistCallTarget.findFirst({
+                where: {
+                  id: target.id, tenantId: request.auth.tenantId, campaignId: campaign.id,
+                  lastCallLogId: callLog.id, status: 'FAILED', lastOutcome: 'RECONCILIATION_REQUIRED',
+                },
+                select: { id: true },
+              })
+              : null;
+            if (!stillUncertain) return null;
+            const existingTask = await tx.staffTask.findFirst({
+              where: { tenantId: request.auth.tenantId, metadata: { path: ['callLogId'], equals: callLog.id } },
+              select: { id: true },
+            });
+            return existingTask ?? tx.staffTask.create({ data: {
+              tenantId: request.auth.tenantId, branchId: campaign.defaultBranchId,
+              title: 'Urgent: reconcile outbound call accepted after stop', priority: 'CRITICAL',
+              metadata: {
+                workflow: 'receptionist_outbound_stop_reconciliation', callLogId: callLog.id,
+                providerCallId, providerStopApplied: false,
+                providerStopError: providerStop.ok ? 'provider_stop_unconfirmed' : providerStop.error,
+              },
+            } });
+          });
+          reviewTaskId = task?.id ?? null;
         } catch {
           reviewTaskId = null;
         }
@@ -2285,32 +2495,92 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       }
     } catch {
       const stopped = await stopPhoneCall(result.callId).catch(() => ({ ok: false, applied: false, error: 'provider_stop_failed' as const }));
-      await db.receptionistCallLog.updateMany({
-        where: { id: callLog.id, tenantId: request.auth.tenantId },
-        // A provider ID already bound to another local call can never be
-        // attached here. The durable provider intent and manual-review task
-        // correlate this accepted-but-quarantined call instead.
-        data: { outcome: 'ESCALATED', endedAt: new Date() },
-      }).catch(() => undefined);
-      if (target) await db.receptionistCallTarget.updateMany({
-        where: { id: target.id, tenantId: request.auth.tenantId, campaignId: campaign.id },
-        data: { status: 'FAILED', lastOutcome: 'RECONCILIATION_REQUIRED', lastCallLogId: callLog.id },
+      await db.$transaction(async tx => {
+        await lockOutboundDispatch(tx, request.auth.tenantId);
+        const exactBoundCall = target ? await tx.receptionistCallLog.findFirst({
+          where: {
+            id: callLog.id, tenantId: request.auth.tenantId, outboundCampaignId: campaign.id,
+            targetId: target.id, retellCallId: result.callId,
+          },
+          select: { id: true },
+        }) : null;
+        if (stopped.ok && stopped.applied && target && exactBoundCall) {
+          await applyConfirmedProviderStopTx(tx, {
+            tenantId: request.auth.tenantId,
+            campaignId: campaign.id,
+            targetId: target.id,
+            callLogId: callLog.id,
+            providerCallId: result.callId,
+          }, request);
+          return;
+        }
+        const confirmedTarget = target ? await tx.receptionistCallTarget.findFirst({
+          where: {
+            id: target.id, tenantId: request.auth.tenantId, campaignId: campaign.id,
+            lastCallLogId: callLog.id, status: 'FAILED', lastOutcome: 'OUTBOUND_STOPPED',
+          },
+          select: { id: true },
+        }) : null;
+        if (confirmedTarget) return;
+        await tx.receptionistCallLog.updateMany({
+          where: {
+            id: callLog.id, tenantId: request.auth.tenantId,
+            outboundCampaignId: campaign.id, targetId: target?.id,
+            outcome: { in: ['IN_PROGRESS', 'ESCALATED'] },
+          },
+          // A provider ID already bound to another local call can never be
+          // attached here. The durable provider intent and manual-review task
+          // correlate this accepted-but-quarantined call instead.
+          data: { outcome: 'ESCALATED', endedAt: new Date() },
+        });
+        if (target) await tx.receptionistCallTarget.updateMany({
+          where: {
+            id: target.id, tenantId: request.auth.tenantId, campaignId: campaign.id,
+            lastCallLogId: callLog.id,
+            OR: [{ status: 'CALLING' }, { status: 'FAILED', lastOutcome: 'RECONCILIATION_REQUIRED' }],
+          },
+          data: { status: 'FAILED', lastOutcome: 'RECONCILIATION_REQUIRED', lastCallLogId: callLog.id },
+        });
       }).catch(() => undefined);
       let reviewRecorded = false;
       try {
         await runWithTenantContext(request.auth.tenantId, async tx => {
-          await tx.operationalSignal.create({ data: {
+          await lockOutboundDispatch(tx, request.auth.tenantId);
+          const stillUncertain = target ? await tx.receptionistCallTarget.findFirst({
+            where: {
+              id: target.id, tenantId: request.auth.tenantId, campaignId: campaign.id,
+              lastCallLogId: callLog.id, status: 'FAILED', lastOutcome: 'RECONCILIATION_REQUIRED',
+            },
+            select: { id: true },
+          }) : null;
+          if (!stillUncertain) return;
+          await tx.operationalSignal.upsert({
+            where: { tenantId_signalType_entityType_entityId: {
+              tenantId: request.auth.tenantId,
+              signalType: 'receptionist_outbound_local_binding_failed',
+              entityType: 'receptionistCallLog', entityId: callLog.id,
+            } },
+            update: {
+              severity: 'critical', score: 100, status: 'open',
+              reason: 'Provider accepted the call but local binding failed; provider stop was attempted and staff reconciliation is required.',
+            },
+            create: {
             tenantId: request.auth.tenantId, signalType: 'receptionist_outbound_local_binding_failed',
             entityType: 'receptionistCallLog', entityId: callLog.id, severity: 'critical', score: 100,
             reason: 'Provider accepted the call but local binding failed; provider stop was attempted and staff reconciliation is required.',
-          } });
-          await tx.staffTask.create({ data: {
-            tenantId: request.auth.tenantId, branchId: campaign.defaultBranchId,
-            title: 'Reconcile provider-accepted outbound call', priority: 'CRITICAL',
-            metadata: { workflow: 'receptionist_outbound_reconciliation', callLogId: callLog.id, providerCallId: result.callId, providerStopApplied: stopped.ok && stopped.applied },
-          } });
+            },
+          });
+          const existingTask = await tx.staffTask.findFirst({
+            where: { tenantId: request.auth.tenantId, metadata: { path: ['callLogId'], equals: callLog.id } },
+            select: { id: true },
+          });
+          if (!existingTask) await tx.staffTask.create({ data: {
+              tenantId: request.auth.tenantId, branchId: campaign.defaultBranchId,
+              title: 'Reconcile provider-accepted outbound call', priority: 'CRITICAL',
+              metadata: { workflow: 'receptionist_outbound_reconciliation', callLogId: callLog.id, providerCallId: result.callId, providerStopApplied: stopped.ok && stopped.applied },
+            } });
+          reviewRecorded = true;
         });
-        reviewRecorded = true;
       } catch {
         // ESCALATED and non-dialable state are the primary durable controls.
       }

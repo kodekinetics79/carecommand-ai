@@ -136,3 +136,26 @@ Logical attributed commits are recorded in `CHANGE_ATTRIBUTION.md`. The committe
 
 No passing mock/contract test is represented as evidence of a live Retell, Twilio, Stripe, Stedi, email, or device-provider transaction.
 The in-app browser bootstrap was unavailable at this checkpoint (`sandboxPolicy` metadata failure before navigation), so the Studio UI is supported by typecheck/lint/build and API integration evidence, not a claimed live browser or Retell walkthrough.
+
+## 2026-08-11 provider-stop race closure
+
+Environment: `fix/release-hardening-retell-eligibility-20260811`, guarded disposable PostgreSQL databases, isolated Redis namespace, installed Google Chrome, and synthetic data only. No live Retell call, production deployment, production migration, phone number, credential, PHI, recording, or transcript was used.
+
+| Gate | Result |
+|---|---|
+| Deterministic provider-stop matrix | PASS: 11/11; confirmed stop remains `OUTBOUND_STOPPED`, no-evidence failures remain `RECONCILIATION_REQUIRED`, stale/cross-identity attempts are fenced, and matching open reconciliation artifacts are resolved exactly once |
+| Exact concurrent race repetition | PASS: 20/20 consecutive runs using deterministic barriers and the disposable database wrapper |
+| Complete outbound-target suite | PASS: 66/66 |
+| Adjacent receptionist/queue suite | PASS: 8 files, 54/54 |
+| `npm run check` | PASS: Prisma validation, API typecheck, lint, client typecheck, and production build |
+| `npm run verify:no-production-demo-artifacts` | PASS |
+| Full disposable `npm test` | PASS: 120/120 files, 1,986/1,986 tests, default timeouts |
+| Full RLS behavioral suite | PASS: 1,002/1,002 |
+| RLS catalog/runtime role | PASS: 132 application tables, 124 protected, 526 policies, ENABLE/FORCE 124/124; restricted runtime role |
+| Prisma drift | PASS: 123 migration-owned composite FKs and 135 migration-owned indexes |
+| Zero-to-head migration | PASS: all 89 migrations applied to the disposable E2E database |
+| Installed Chrome E2E | PASS for every authorized scenario: 14/14 across desktop Chrome and Pixel 7; real local frontend/backend; live-call case gated off once per project because authorization and provider credentials were absent |
+| Dependency audits | PASS: production and complete dependency trees report zero vulnerabilities after compatible patch updates |
+| `git diff --check` | PASS |
+
+Evidence logs: `/tmp/provider-stop-repeat20-summary.log` SHA-256 `4c64f101d5652e5329b101f6eedb240ca3a3e0ea9f1d235dea52473cf8a48e48`; `/tmp/provider-stop-full-regression-final.log` SHA-256 `d592f3649a99fcda96d076620c459e2e40e8565e0b758a9acce5793f057b6d4d`; `/tmp/provider-stop-chrome.log` SHA-256 `183aa5897436302358b7fe03e3422ad92abece4da5100df2692ad8897b4f9c80`. The installed-Chrome result is not live-call evidence.

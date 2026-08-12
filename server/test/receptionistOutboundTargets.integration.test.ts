@@ -1252,9 +1252,10 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
   }, 30_000);
 
   it.each([
-    { label: 'with durable target stop evidence', targetEvidence: true, expectedCode: 200, expectedApplied: true, expectedOutcome: 'OUTBOUND_STOPPED' },
-    { label: 'without durable target stop evidence', targetEvidence: false, expectedCode: 202, expectedApplied: false, expectedOutcome: 'RECONCILIATION_REQUIRED' },
-  ])('handles a concurrent duplicate provider stop failure $label', async ({ targetEvidence, expectedCode, expectedApplied, expectedOutcome }) => {
+    { label: 'with durable target stop evidence', targetEvidence: true, firstStopStatus: 204, secondStopStatus: 503, expectedCode: 200, expectedApplied: true, expectedOutcome: 'OUTBOUND_STOPPED' },
+    { label: 'without durable target stop evidence', targetEvidence: false, firstStopStatus: 503, secondStopStatus: 503, expectedCode: 202, expectedApplied: false, expectedOutcome: 'RECONCILIATION_REQUIRED' },
+    { label: 'when both provider stop requests succeed', targetEvidence: true, firstStopStatus: 204, secondStopStatus: 204, expectedCode: 200, expectedApplied: true, expectedOutcome: 'OUTBOUND_STOPPED' },
+  ])('handles a concurrent duplicate provider stop failure $label', async ({ targetEvidence, firstStopStatus, secondStopStatus, expectedCode, expectedApplied, expectedOutcome }) => {
     const tenant = await makeTenant();
     const campaignId = await createCampaign(tenant, { status: 'RUNNING' });
     const target = await addPatientTarget(tenant, campaignId, 747);
@@ -1280,11 +1281,11 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
       if (stopRequests === 1) {
         firstStopStarted.resolve();
         await releaseFirstStop.promise;
-        return new Response(null, { status: 204 });
+        return new Response(null, { status: firstStopStatus });
       }
       secondStopStarted.resolve();
       await releaseSecondStop.promise;
-      return new Response(null, { status: 503 });
+      return new Response(null, { status: secondStopStatus });
     });
     vi.stubGlobal('fetch', providerFetch);
 
@@ -1293,11 +1294,6 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
       payload: { targetId: target.id, phone: target.phone },
     });
     await bindingCommitted.promise;
-    if (!targetEvidence) {
-      await db.receptionistCallTarget.update({
-        where: { id: target.id }, data: { status: 'FAILED', lastOutcome: 'RECONCILIATION_REQUIRED' },
-      });
-    }
     const stop = app.inject({
       method: 'POST', url: '/v1/receptionist/outbound-control', headers: auth(tenant),
       payload: { stopped: true, reason: 'Concurrent contradictory provider stop test' },
@@ -1326,7 +1322,9 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
     }
     const stopResponse = await stop;
     expect(stopResponse.statusCode).toBe(200);
-    expect(stopResponse.json()).toMatchObject({ activeCancellation: { confirmed: 1, failed: 0 } });
+    expect(stopResponse.json()).toMatchObject({ activeCancellation: targetEvidence
+      ? { confirmed: 1, failed: 0 }
+      : { confirmed: 0, failed: 1, reconciliationRequired: 1 } });
     const response = await call;
     if (sawSecondStop) {
       const responseBody = response.json();
@@ -1368,6 +1366,95 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
     } else {
       expect(providerFetch).toHaveBeenCalledTimes(2);
     }
+    const [openSignals, openTasks, transitionAudits] = await Promise.all([
+      db.operationalSignal.count({ where: {
+        tenantId: tenant.id, entityType: 'receptionistCallLog', entityId: finalCallLog.id,
+        signalType: 'receptionist_outbound_stop_unconfirmed_after_acceptance', status: 'open',
+      } }),
+      db.staffTask.count({ where: {
+        tenantId: tenant.id, status: { in: ['OPEN', 'IN_PROGRESS'] },
+        metadata: { path: ['callLogId'], equals: finalCallLog.id },
+      } }),
+      db.auditEvent.count({ where: {
+        tenantId: tenant.id, resource: 'receptionistCallLog', resourceId: finalCallLog.id,
+        action: 'receptionist.call.providerStopConfirmed',
+      } }),
+    ]);
+    if (targetEvidence) {
+      expect({ openSignals, openTasks, transitionAudits }).toEqual({ openSignals: 0, openTasks: 0, transitionAudits: 1 });
+      const repeatedStop = await app.inject({
+        method: 'POST', url: '/v1/receptionist/outbound-control', headers: auth(tenant),
+        payload: { stopped: true, reason: 'Idempotent repeated confirmed provider stop' },
+      });
+      expect(repeatedStop.statusCode).toBe(200);
+      expect(repeatedStop.json()).toMatchObject({ activeCancellation: { requested: 0 } });
+      expect(await db.auditEvent.count({ where: {
+        tenantId: tenant.id, resourceId: finalCallLog.id, action: 'receptionist.call.providerStopConfirmed',
+      } })).toBe(1);
+    } else {
+      expect({ openSignals, openTasks, transitionAudits }).toEqual({ openSignals: 1, openTasks: 1, transitionAudits: 0 });
+    }
+  }, 30_000);
+
+  it('does not apply a confirmed stale stop result to a newer target attempt', async () => {
+    const tenant = await makeTenant();
+    const campaignId = await createCampaign(tenant, { status: 'RUNNING' });
+    const target = await addPatientTarget(tenant, campaignId, 746);
+    const bindingCommitted = deferred();
+    const releaseBinding = deferred();
+    const endpointStopStarted = deferred();
+    const releaseEndpointStop = deferred();
+    setProviderBoundaryTestHookForTests(async stage => {
+      if (stage === 'provider_binding_committed') {
+        bindingCommitted.resolve();
+        await releaseBinding.promise;
+      }
+    });
+    const oldProviderCallId = randomRetellCallId('retell_stale_stop_old');
+    let stopRequests = 0;
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>(async url => {
+      if (String(url).includes('/v2/create-phone-call')) return new Response(JSON.stringify({
+        call_id: oldProviderCallId, agent_id: tenant.providerAgentId, agent_version: 1,
+      }), { status: 201, headers: { 'content-type': 'application/json' } });
+      stopRequests += 1;
+      if (stopRequests === 1) {
+        endpointStopStarted.resolve();
+        await releaseEndpointStop.promise;
+        return new Response(null, { status: 204 });
+      }
+      return new Response(null, { status: 503 });
+    }));
+
+    const oldCallRequest = app.inject({
+      method: 'POST', url: `/v1/receptionist/outbound-campaigns/${campaignId}/call`, headers: auth(tenant),
+      payload: { targetId: target.id, phone: target.phone },
+    });
+    await bindingCommitted.promise;
+    const stop = app.inject({
+      method: 'POST', url: '/v1/receptionist/outbound-control', headers: auth(tenant),
+      payload: { stopped: true, reason: 'Stale provider stop generation fence' },
+    });
+    await endpointStopStarted.promise;
+    const newerCall = await db.receptionistCallLog.create({ data: {
+      tenantId: tenant.id, clinicId: tenant.clinicId, outboundCampaignId: campaignId,
+      targetId: target.id, retellCallId: randomRetellCallId('retell_stale_stop_new'),
+      callerPhone: target.phone, direction: 'outbound', outcome: 'IN_PROGRESS',
+    } });
+    await db.receptionistCallTarget.update({
+      where: { id: target.id },
+      data: { status: 'CALLING', lastOutcome: null, lastCallLogId: newerCall.id },
+    });
+    releaseEndpointStop.resolve();
+    expect((await stop).statusCode).toBe(200);
+    releaseBinding.resolve();
+    await oldCallRequest;
+
+    expect(await db.receptionistCallTarget.findUniqueOrThrow({ where: { id: target.id } })).toMatchObject({
+      status: 'CALLING', lastOutcome: null, lastCallLogId: newerCall.id,
+    });
+    expect(await db.auditEvent.count({ where: {
+      tenantId: tenant.id, resourceId: newerCall.id, action: 'receptionist.call.providerStopConfirmed',
+    } })).toBe(0);
   }, 30_000);
 
   it('preserves handler-confirmed cancellation when the endpoint provider stop fails later', async () => {
