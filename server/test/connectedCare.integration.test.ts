@@ -702,10 +702,24 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
       signoffRpm(t.patientId, provider),
     ]);
     expect(raceDetection.flipped).toBe(1);
-    expect(raceSignoff.statusCode).toBe(200);
+    // Both lock orderings are safe. A signoff that acquires the evidence lock
+    // first may succeed and is then either retained or invalidated by the
+    // detector. A signoff whose preview was read before the detector mutation
+    // but whose write acquires the lock afterward must fail closed with an
+    // optimistic-concurrency conflict rather than signing changed evidence.
+    expect([200, 409]).toContain(raceSignoff.statusCode);
+    if (raceSignoff.statusCode === 409) {
+      expect(raceSignoff.json().message).toContain('RPM evidence changed after review');
+    }
     const finalRow = await db.rPMBillingReadiness.findUniqueOrThrow({ where: { tenantId_patientId_periodStart: { tenantId: t.id, patientId: t.patientId, periodStart: period.start } } });
     const finalEvidence = await inTenant(t, () => db.$transaction(tx => buildRpmEvidenceSnapshot(tx, t.id, t.patientId, rpmPeriodBounds())));
-    if (finalRow.providerSignoffAt) {
+    if (raceSignoff.statusCode === 409) {
+      expect(finalRow).toMatchObject({
+        status: 'NEEDS_REVIEW',
+        providerSignoffAt: null,
+        providerSignoffEvidenceHash: null,
+      });
+    } else if (finalRow.providerSignoffAt) {
       expect(finalRow.status).toBe('READY');
       expect(finalRow.providerSignoffEvidenceHash).toBe(finalEvidence.hash);
     } else {
