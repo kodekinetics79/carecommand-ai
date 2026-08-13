@@ -99,6 +99,15 @@ jobs:
       - run: npm run api:typecheck
       - run: npm run lint
       - run: npm test
+      - name: Run disposable-only receptionist integrity suites
+        env:
+          NODE_ENV: test
+          RLS_DISPOSABLE_DB_ACK: CREATE_AND_DROP_LOCAL_RLS_TEST_DATABASE
+        run: >-
+          npx tsx server/scripts/withDisposableRlsDatabase.ts --
+          npx vitest run
+          server/test/receptionistConfirmationOutbox.integration.test.ts
+          server/test/receptionistDeliveryConsentIntegrity.integration.test.ts
       - run: npm run build
       - name: Reject production demo, fixture, credential, and dead-action artifacts
         run: npm run verify:no-production-demo-artifacts

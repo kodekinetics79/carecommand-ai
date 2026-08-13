@@ -38,8 +38,8 @@ Local final evidence on the PR head plus this correction:
 - Startup reproduction before correction: API env validation failed and no browser test was collected.
 - Focused environment regression: 2/2 passed.
 - Real-backend staff eligibility journey with both values absent at the command boundary: 3/3 independent disposable runs passed.
-- Normal full regression: 119 files and 954 tests passed; the two suites intentionally disabled outside disposable mode were then run through the guarded wrapper and passed 33/33.
+- Normal full regression: 119 files and 954 tests passed. The two suites intentionally disabled outside disposable mode are also enforced by a dedicated guarded CI step and passed 33/33 locally.
 - Full real-backend browser certification: 14/14 authorized desktop/mobile scenarios passed. The two live-call cases remained gated because external credentials and an authorized destination were absent.
 - RLS behavior: 1,002/1,002; catalog 132 application tables, 124 protected tables, 526 policies, ENABLE/FORCE 124/124.
 - Release database lifecycle: PASS with 89 migrations, deterministic seed, backup/restore parity, 124 forced-RLS tables, and 123 tenant-integrity FKs.
-- Prisma drift, API typecheck, lint, production build, production-artifact scan, 576 registry signatures, 194 attestations, and production high-severity dependency audit: PASS.
+- Prisma drift, API typecheck, lint, production build, production-artifact scan, 570 registry signatures, 191 attestations, and production high-severity dependency audit: PASS.
