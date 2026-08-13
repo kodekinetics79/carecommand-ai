@@ -105,6 +105,9 @@ jobs:
       - name: Install Chromium for real-backend route/action tests
         run: npx playwright install --with-deps chromium
       - name: Real-backend desktop and mobile route/action certification
+        env:
+          NODE_ENV: test
+          RLS_DISPOSABLE_DB_ACK: CREATE_AND_DROP_LOCAL_RLS_TEST_DATABASE
         run: npm run test:e2e
       - name: Upload browser evidence on failure
         if: failure()
