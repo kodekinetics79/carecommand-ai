@@ -26,3 +26,20 @@ This checkpoint records repository-side CI remediation only. It does not represe
 ## Live voice boundary
 
 The Retell adapter, live-UAT controls, installed-Chrome harness, call-ID fencing, DNC/consent controls, polling fallback, audit, and usage paths are present on this branch. No live call has been placed from this checkpoint. Live acceptance requires private Retell credentials and the explicitly authorized, runtime-only test destination; neither belongs in Git history or CI logs.
+
+## Final real-backend browser startup correction
+
+CI run `31657657314` passed every quality step through browser installation, but the Playwright web server exited before test collection. The disposable runner had applied all 89 migrations; the child API then started with `NODE_ENV=production` while CI supplied neither the production-required deployment queue namespace nor the stable eligibility HMAC key.
+
+The guarded Playwright runner now generates per-run ephemeral values only after `RLS_DISPOSABLE_DB` proves it is inside the repository's authorized local disposable lifecycle. Explicit valid values remain authoritative, the unsafe `carecommand-local` namespace is rejected, and normal production startup remains fail-closed. No value is hardcoded or logged.
+
+Local final evidence on the PR head plus this correction:
+
+- Startup reproduction before correction: API env validation failed and no browser test was collected.
+- Focused environment regression: 2/2 passed.
+- Real-backend staff eligibility journey with both values absent at the command boundary: 3/3 independent disposable runs passed.
+- Normal full regression: 119 files and 954 tests passed; the two suites intentionally disabled outside disposable mode were then run through the guarded wrapper and passed 33/33.
+- Full real-backend browser certification: 14/14 authorized desktop/mobile scenarios passed. The two live-call cases remained gated because external credentials and an authorized destination were absent.
+- RLS behavior: 1,002/1,002; catalog 132 application tables, 124 protected tables, 526 policies, ENABLE/FORCE 124/124.
+- Release database lifecycle: PASS with 89 migrations, deterministic seed, backup/restore parity, 124 forced-RLS tables, and 123 tenant-integrity FKs.
+- Prisma drift, API typecheck, lint, production build, production-artifact scan, 576 registry signatures, 194 attestations, and production high-severity dependency audit: PASS.
