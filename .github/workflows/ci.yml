@@ -5,6 +5,10 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   quality:
     runs-on: ubuntu-latest
@@ -45,6 +49,30 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - name: Install PostgreSQL 17 client
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor --yes -o /etc/apt/keyrings/postgresql.gpg
+          . /etc/os-release
+          echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+      - name: Verify PostgreSQL client and server majors
+        env:
+          PGPASSWORD: carecommand
+        shell: bash
+        run: |
+          set -euo pipefail
+          pg_dump --version
+          pg_restore --version
+          psql -h localhost -U carecommand -d carecommand -Atqc "SHOW server_version;"
+          test "$(pg_dump --version | sed -E 's/.* ([0-9]+).*/\1/')" = "17"
+          test "$(psql -h localhost -U carecommand -d carecommand -Atqc "SHOW server_version_num;" | cut -c1-2)" = "17"
       - run: npm ci
       - run: npm run db:generate
       - run: npm run db:deploy
@@ -95,6 +123,7 @@ jobs:
       - name: Secret scan (gitleaks)
         uses: gitleaks/gitleaks-action@v2
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
       - uses: actions/setup-node@v4
         with:
