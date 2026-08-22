@@ -625,60 +625,116 @@ button, a, [role="button"] {
     radial-gradient(circle at 10% 90%, rgba(99,102,241,0.05), transparent 40%);
 }
 
-/* ── Login brand panel — light, premium, on-theme ─────────────────── */
-.login-panel {
-  background: linear-gradient(155deg, #ECEFFE 0%, #F4F6FD 48%, #FFFFFF 100%);
+/* ═══════════════════════════════════════════════════════
+   AUTH — "Ink & Paper"
+   Two committed fields instead of one decorated one: a deep
+   ink brand panel and a warm paper form panel, joined by a
+   seam that reads as depth. The only ornament is the brand
+   mark itself, drawn enormous and cropped — no ambient orbs,
+   dot grids, or decorative waveforms.
+   ═══════════════════════════════════════════════════════ */
+:root {
+  --ink:        #12142E;
+  --ink-line:   rgba(255,255,255,0.11);
+  --ink-line-2: rgba(255,255,255,0.06);
+  --ink-t1:     rgba(255,255,255,0.97);
+  --ink-t2:     rgba(214,219,255,0.70);
+  --ink-t3:     rgba(198,204,247,0.46);
+  --ink-accent: #A5B4FC;
+  --paper:      #F3F4F8;
 }
-.login-panel-accent {
+
+/* ── Ink field ─────────────────────────────────────────── */
+.auth-ink {
+  color: var(--ink-t1);
   background:
-    radial-gradient(640px 420px at 14% 6%, rgba(99,102,241,0.16), transparent 60%),
-    radial-gradient(560px 440px at 94% 98%, rgba(124,58,237,0.12), transparent 62%);
+    radial-gradient(110% 80% at 6% -6%, #2A2E68 0%, transparent 58%),
+    linear-gradient(168deg, #1C2050 0%, #15183B 54%, #101229 100%);
 }
-.login-orb { position: absolute; border-radius: 50%; filter: blur(64px); pointer-events: none; opacity: 0.5; will-change: transform; }
-.login-orb-1 { width: 320px; height: 320px; top: -70px; left: -50px; background: radial-gradient(circle, #A5B4FC, transparent 70%); animation: loginFloat 18s ease-in-out infinite; }
-.login-orb-2 { width: 300px; height: 300px; bottom: -60px; right: -40px; background: radial-gradient(circle, #C4B5FD, transparent 70%); animation: loginFloat 23s ease-in-out infinite reverse; }
-.login-grid {
-  position: absolute; inset: 0; pointer-events: none;
-  background-image: linear-gradient(rgba(79,70,229,0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(79,70,229,0.05) 1px, transparent 1px);
-  background-size: 40px 40px;
-  -webkit-mask-image: radial-gradient(ellipse at 50% 32%, #000 18%, transparent 72%);
-  mask-image: radial-gradient(ellipse at 50% 32%, #000 18%, transparent 72%);
+/* The brand mark itself, drafted at ~25x and cropped by the corner — an
+   outline, not a fill, so it reads as construction geometry rather than a
+   watermark sticker. Anchored opposite the text column so nothing collides. */
+.auth-mark {
+  position: absolute;
+  right: -20%; bottom: -30%; width: 76%;
+  pointer-events: none;
 }
-@keyframes loginFloat { 0%, 100% { transform: translate(0,0) scale(1); } 50% { transform: translate(24px,-18px) scale(1.07); } }
+.auth-mark [data-part="badge"] { fill: none; stroke: #fff; stroke-opacity: 0.05; stroke-width: 0.22; }
+.auth-mark [data-part="pulse"] { fill: none; stroke: #fff; stroke-opacity: 0.085; stroke-width: 0.45; stroke-linecap: round; stroke-linejoin: round; }
+/* Hairline rules carry the module index — no cards, no pastel chips. */
+.auth-rule { border-top: 1px solid var(--ink-line); }
+.auth-module { transition: color 0.15s; }
+.auth-module:hover .auth-module-name { color: var(--ink-accent); }
 
-/* Live ECG / heart-monitor trace — a seamlessly scrolling tiled waveform. */
-.login-ecg {
-  position: absolute; left: 0; right: 0; bottom: 44px; top: auto;
-  height: 64px; opacity: 0.32; pointer-events: none;
-  -webkit-mask-image: linear-gradient(90deg, transparent, #000 14%, #000 86%, transparent);
-  mask-image: linear-gradient(90deg, transparent, #000 14%, #000 86%, transparent);
+/* ── Paper field ───────────────────────────────────────── */
+/* The paper is tinted so the form card can be true white and read as a
+   raised object — the right half gets figure/ground of its own instead of
+   leaving the form floating in an undifferentiated void. */
+.auth-paper { background: var(--paper); }
+.auth-card {
+  background: #FFFFFF;
+  border: 1px solid var(--b1);
+  border-radius: 18px;
+  box-shadow:
+    0 1px 2px rgba(15,23,42,0.04),
+    0 12px 28px -12px rgba(15,23,42,0.14),
+    0 32px 64px -32px rgba(15,23,42,0.16);
 }
-.login-ecg-svg { width: 1320px; height: 100%; display: block; }
-.login-ecg-svg path { fill: none; stroke: var(--indigo); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-.ecg-scroll { animation: ecgScroll 5s linear infinite; }
-@keyframes ecgScroll { from { transform: translateX(0); } to { transform: translateX(-440px); } }
-@media (prefers-reduced-motion: reduce) {
-  .login-orb, .ecg-scroll { animation: none !important; }
+/* The paper sits above the ink; a soft inner edge makes the seam depth,
+   not a butt joint between two flat colors. */
+@media (min-width: 1024px) {
+  .auth-paper::before {
+    content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 56px; z-index: 1;
+    background: linear-gradient(90deg, rgba(12,14,38,0.20), rgba(12,14,38,0.05) 45%, transparent);
+    pointer-events: none;
+  }
 }
+.auth-band { background: linear-gradient(120deg, #1C2050 0%, #12142E 100%); color: var(--ink-t1); }
 
-/* Login feature cards — staggered entrance + lift on hover. */
-.login-rise-1 { animation-delay: 0.08s; }
-.login-rise-2 { animation-delay: 0.14s; }
-.feature-card { transition: transform 0.2s cubic-bezier(0.4,0,0.2,1), box-shadow 0.2s, border-color 0.2s; }
-.feature-card:hover {
-  transform: translateY(-3px);
-  border-color: var(--b2);
-  box-shadow: 0 14px 30px rgba(15,23,42,0.10), 0 2px 6px rgba(15,23,42,0.05);
+/* ── Controls ──────────────────────────────────────────── */
+.auth-field {
+  display: flex; align-items: center; gap: 10px;
+  height: 46px; padding: 0 13px;
+  border: 1px solid var(--b1); border-radius: 10px;
+  background: #FFFFFF;
+  box-shadow: 0 1px 2px rgba(15,23,42,0.04);
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
-.feature-card:nth-child(1) { animation-delay: 0.20s; }
-.feature-card:nth-child(2) { animation-delay: 0.27s; }
-.feature-card:nth-child(3) { animation-delay: 0.34s; }
-.feature-card:nth-child(4) { animation-delay: 0.41s; }
-.feature-card:nth-child(5) { animation-delay: 0.48s; }
-.feature-card:nth-child(6) { animation-delay: 0.55s; }
+.auth-field:focus-within {
+  border-color: var(--indigo);
+  box-shadow: 0 0 0 3px var(--indigo-soft), 0 1px 2px rgba(15,23,42,0.04);
+}
+.auth-input { width: 100%; height: 100%; background: transparent; border: 0; outline: none; font-size: 14px; color: var(--t1); }
+.auth-input::placeholder { color: var(--t3); }
+
+.auth-submit {
+  width: 100%; height: 46px; border-radius: 10px;
+  background: linear-gradient(180deg, #5B53EA 0%, #4F46E5 100%);
+  color: #fff; font-size: 14px; font-weight: 600; letter-spacing: -0.01em;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.18), 0 8px 18px -8px rgba(79,70,229,0.62);
+  transition: filter 0.15s, box-shadow 0.15s, transform 0.1s;
+}
+.auth-submit:hover:not(:disabled) { filter: brightness(1.06); box-shadow: inset 0 1px 0 rgba(255,255,255,0.2), 0 12px 24px -10px rgba(79,70,229,0.72); }
+.auth-submit:active:not(:disabled) { transform: translateY(1px); }
+.auth-submit:disabled { filter: saturate(0.5); opacity: 0.62; box-shadow: none; cursor: not-allowed; }
+
+/* Two-segment rail: the multi-step flows (sign in → verify) now say where
+   you are instead of silently swapping the panel out from under you. */
+.auth-rail span { display: block; height: 3px; width: 22px; border-radius: 99px; background: var(--b2); transition: background 0.2s; }
+.auth-rail span.on { background: var(--indigo); }
+
+.auth-spin { animation: authSpin 0.7s linear infinite; }
+@keyframes authSpin { to { transform: rotate(360deg); } }
+
+/* Motion: one entrance, two beats. Nothing loops forever. */
+.auth-in { animation: fadeUp 0.4s cubic-bezier(0.16,1,0.3,1) both; }
+.auth-d1 { animation-delay: 0.06s; }
+.auth-d2 { animation-delay: 0.12s; }
+.auth-d3 { animation-delay: 0.18s; }
 @media (prefers-reduced-motion: reduce) {
-  .feature-card { animation: none !important; }
-  .feature-card:hover { transform: none !important; }
+  .auth-in { animation: none !important; }
+  .auth-spin { animation-duration: 2s; }
+  .auth-submit:active:not(:disabled) { transform: none; }
 }
 .platform-topbar {
   background: linear-gradient(180deg, #FFFFFF 0%, #FBFBFE 100%);
