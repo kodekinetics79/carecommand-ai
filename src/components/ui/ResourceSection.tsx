@@ -95,11 +95,14 @@ export function ResourceErrorNotice({
         {title}
       </p>
       <p className={`mt-1 text-t2 ${compact ? 'text-[10px] leading-snug' : 'text-xs'}`}>{failure.message}</p>
-      {!compact && (
-        <p className="mt-1 text-[11px] text-t3">
-          Nothing on this panel loaded, so no figure here should be read as zero, empty or healthy.
-        </p>
-      )}
+      {/* The caution is the point of the panel, so it survives the compact
+          variant too — a KPI-sized slot is exactly where a blank is most
+          likely to be taken for a real zero. Only its length changes. */}
+      <p className={`mt-1 text-t3 ${compact ? 'text-[10px] leading-snug' : 'text-[11px]'}`}>
+        {compact
+          ? 'Not loaded — do not read as zero.'
+          : 'Nothing on this panel loaded, so no figure here should be read as zero, empty or healthy.'}
+      </p>
       {!compact && failure.permissionDenied && (
         <p className="mt-1 text-[11px] text-t3">Trying again will only succeed once an administrator grants you access.</p>
       )}

@@ -54,9 +54,21 @@ describe('general app content integrity', () => {
   it('keeps successful dashboard panels visible when an optional module is unavailable', () => {
     const dashboard = source('src/pages/Dashboard.tsx');
 
-    expect(dashboard).toContain('Promise.allSettled');
-    expect(dashboard).toContain('summaryResult.status');
-    expect(dashboard).toContain('campaignsResult.status');
+    // The property under test is panel independence, not the mechanism that
+    // delivers it. That mechanism changed: a single Promise.allSettled batch
+    // whose results were switched on per panel became one resource hook per
+    // feed. The guarantee is now stronger — there is no shared await left for a
+    // single failing module to poison — so assert it at the new seam.
+    const feeds = dashboard.match(/useResource</g) ?? [];
+    expect(feeds.length).toBeGreaterThanOrEqual(5);
+
+    // Every panel is bound to its own state, never to one page-wide result.
+    const boundStates = new Set(dashboard.match(/state=\{(\w+)\.state\}/g) ?? []);
+    expect(boundStates.size).toBeGreaterThanOrEqual(5);
+
+    // No panel may be gated behind another panel's request settling, and no
+    // single message may stand in for the whole page.
+    expect(dashboard).not.toMatch(/Promise\.all\(/);
     expect(dashboard).not.toContain('Dashboard summary and operational panels are unavailable');
   });
 

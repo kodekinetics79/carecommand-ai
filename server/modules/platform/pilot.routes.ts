@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { buildPilotChecklist, createPilotShareToken } from '../../lib/pilotStatus';
 import { platformAuditEvent, requirePlatformAccess } from '../../lib/platformAuth';
+import { enterTenantContext, type TenantTxClient } from '../../lib/tenantContext';
 import {
   analyzePilotImport,
   buildPreviewSample,
@@ -58,16 +59,18 @@ function rowHasFatalIssues(row: PilotImportRow): boolean {
   return row.status === 'error';
 }
 
-async function loadOrCreateBranch(tenantId: string, branchName: string | null | undefined) {
+// Takes the commit's transaction client: a branch invented for row 400 must
+// disappear with the rest of the import if row 900 brings it down.
+async function loadOrCreateBranch(tx: TenantTxClient, tenantId: string, branchName: string | null | undefined) {
   const normalized = branchName?.trim();
   if (!normalized) {
-    const existing = await db.branch.findFirst({ where: { tenantId }, orderBy: { createdAt: 'asc' } });
+    const existing = await tx.branch.findFirst({ where: { tenantId }, orderBy: { createdAt: 'asc' } });
     if (!existing) throw new Error('Tenant has no branch yet');
     return existing;
   }
-  const existing = await db.branch.findFirst({ where: { tenantId, name: { equals: normalized, mode: 'insensitive' } } });
+  const existing = await tx.branch.findFirst({ where: { tenantId, name: { equals: normalized, mode: 'insensitive' } } });
   if (existing) return existing;
-  return db.branch.create({ data: { tenantId, name: normalized, location: normalized } });
+  return tx.branch.create({ data: { tenantId, name: normalized, location: normalized } });
 }
 
 function fieldSpecs(entityType: PilotEntityType): PilotFieldSpec[] {
@@ -84,6 +87,57 @@ async function loadPresetMapping(tenantId: string, entityType: PilotEntityType) 
 
 export const pilotRoutes: FastifyPluginAsync = async app => {
   app.addHook('preHandler', pilotAdmin);
+
+  // Every route below is scoped to /tenants/:tenantId and reads or writes TENANT
+  // tables — Tenant, Branch, Patient, Appointment, InsurancePayer,
+  // PatientInsurancePolicy — through the RLS runtime client (lib/db.ts), which
+  // only sets app.current_tenant_id inside a tenant context. These routes ran
+  // without one, and both tables carry FORCE ROW LEVEL SECURITY while neither
+  // app_rls nor app_platform holds BYPASSRLS, so the plugin failed two ways at
+  // once: the CSV commit died on `42501 new row violates row-level security
+  // policy for table "Branch"` before a single row landed, and every route that
+  // first resolves the workspace matched zero Tenant rows and returned 404 for
+  // tenants that plainly exist.
+  //
+  // The database already models this exact caller. app_rls_tenant_allowed() has
+  // a `source = 'platform'` branch that admits a tenant-scoped query when the
+  // actor is an ACTIVE PlatformUser, so a platform admin gets in on their own
+  // identity while every row stays inside the tenant they named. That branch
+  // matches the actor id against a bare UUID — a decorated value like
+  // "platform:<id>" fails the pattern and the policy denies the read — so the
+  // platform user id is passed through unadorned, and the legacy static token
+  // (a synthetic actor backed by no PlatformUser row) is denied, as it should be
+  // on a route that writes real clinic data.
+  app.addHook('preHandler', async (request, reply) => {
+    const params = request.params as { tenantId?: string } | undefined;
+    const parsed = uuid.safeParse(params?.tenantId);
+    if (!parsed.success) return; // the route's own parse answers with a 400
+
+    const actor = request.platformUser;
+    enterTenantContext({
+      tenantId: parsed.data,
+      // Bare id: app_rls_tenant_allowed() requires a UUID that resolves to an
+      // active PlatformUser. platformAuditEvent() records who acted separately.
+      actorId: actor?.id ?? 'platform:unidentified',
+      actorRole: actor?.role ?? 'PLATFORM_ADMIN',
+      source: 'platform',
+      requestId: request.id,
+    });
+
+    // One cheap read inside the context just entered. A live workspace returns
+    // its row; an unknown, suspended or archived one makes the context check
+    // fail closed. Either way the caller gets a workspace-shaped answer instead
+    // of an internal error surfacing from somewhere deeper in the import.
+    const known = await db.tenant
+      .findUnique({ where: { id: parsed.data }, select: { id: true } })
+      .catch(() => null);
+    if (!known) {
+      return reply.code(404).send({
+        error: 'tenant_not_found',
+        message: 'That workspace could not be found, or is no longer active.',
+      });
+    }
+  });
 
   app.get('/tenants/:tenantId/pilot-checklist', async (request, reply) => {
     const { tenantId } = z.object({ tenantId: uuid }).parse(request.params);
@@ -248,101 +302,145 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
     const validRows = analysis.rows.filter(row => !rowHasFatalIssues(row));
     if (validRows.length === 0) return reply.code(400).send({ error: 'no_valid_rows', message: 'No rows are ready to import.' });
 
-    const results = { created: 0, updated: 0, skipped: 0, warnings: analysis.summary.warnings };
+    // Durable intent on the platform plane, recorded BEFORE the work and in the
+    // past-conditional: ".requested", not ".committed". The platform plane sits
+    // on a different connection from the tenant transaction below, so it cannot
+    // be atomic with it — a plane that cannot guarantee the outcome must not
+    // assert one. The route previously wrote "pilot.import.committed" here after
+    // the fact, which claimed an import that a later rollback could erase. The
+    // outcome is recorded on the tenant plane, inside the same transaction as
+    // the rows. Same order the public pilot-share route uses.
+    await platformAuditEvent(
+      request,
+      'pilot.import.committed.requested',
+      { type: 'tenant', id: tenantId, tenantId },
+      { entityType, totalRows: analysis.summary.total, validRows: validRows.length },
+    );
 
-    for (const row of validRows) {
-      if (entityType === 'patients') {
-        const branch = await loadOrCreateBranch(tenantId, row.values.branchName);
-        const firstName = row.values.firstName?.trim();
-        const lastName = row.values.lastName?.trim();
-        if (!firstName || !lastName) { results.skipped++; continue; }
-        const email = row.values.email?.trim() || null;
-        const phone = row.values.phone?.trim() || null;
-        const lifecycleStage = safeEnumValue(row.values.lifecycleStage, patientLifecycleStages, 'NEW') as never;
-        const tags = row.values.tags ? row.values.tags.split(/[;,|]/).map(v => v.trim()).filter(Boolean) : [];
-        const externalRef = row.values.externalRef?.trim() || null;
-        const existing = externalRef ? await db.patient.findUnique({ where: { tenantId_externalRef: { tenantId, externalRef } } }) : null;
-        if (existing) {
-          await db.patient.update({
-            where: { id: existing.id },
-            data: { branchId: branch.id, firstName, lastName, ...(email ? { email } : {}), ...(phone ? { phone } : {}), lifecycleStage, tags },
-          });
-          results.updated++;
-        } else {
-          await db.patient.create({ data: { tenantId, branchId: branch.id, firstName, lastName, ...(externalRef ? { externalRef } : {}), ...(email ? { email } : {}), ...(phone ? { phone } : {}), lifecycleStage, tags } });
-          results.created++;
+    // One transaction for the whole commit, tenant audit evidence included.
+    // A pilot import carries a customer's real clinic data: applying it in
+    // pieces leaves a half-populated workspace nobody can reconcile against the
+    // source file, and evidence written separately can survive rows that were
+    // rolled back — or describe rows that never landed. Both go in together or
+    // neither does. Generous timeout: the CSV ceiling is 2MB of rows.
+    const results = await db.$transaction(async tx => {
+      const tally = { created: 0, updated: 0, skipped: 0, warnings: analysis.summary.warnings };
+
+      for (const row of validRows) {
+        if (entityType === 'patients') {
+          const branch = await loadOrCreateBranch(tx, tenantId, row.values.branchName);
+          const firstName = row.values.firstName?.trim();
+          const lastName = row.values.lastName?.trim();
+          if (!firstName || !lastName) { tally.skipped++; continue; }
+          const email = row.values.email?.trim() || null;
+          const phone = row.values.phone?.trim() || null;
+          const lifecycleStage = safeEnumValue(row.values.lifecycleStage, patientLifecycleStages, 'NEW') as never;
+          const tags = row.values.tags ? row.values.tags.split(/[;,|]/).map(v => v.trim()).filter(Boolean) : [];
+          const externalRef = row.values.externalRef?.trim() || null;
+          const existing = externalRef ? await tx.patient.findUnique({ where: { tenantId_externalRef: { tenantId, externalRef } } }) : null;
+          if (existing) {
+            await tx.patient.update({
+              where: { id: existing.id },
+              data: { branchId: branch.id, firstName, lastName, ...(email ? { email } : {}), ...(phone ? { phone } : {}), lifecycleStage, tags },
+            });
+            tally.updated++;
+          } else {
+            await tx.patient.create({ data: { tenantId, branchId: branch.id, firstName, lastName, ...(externalRef ? { externalRef } : {}), ...(email ? { email } : {}), ...(phone ? { phone } : {}), lifecycleStage, tags } });
+            tally.created++;
+          }
+          continue;
         }
-        continue;
+
+        if (entityType === 'appointments') {
+          const patientRef = row.values.patientExternalRef?.trim();
+          const service = row.values.service?.trim();
+          const startsAt = row.values.startsAt ? new Date(row.values.startsAt) : null;
+          const endsAt = row.values.endsAt ? new Date(row.values.endsAt) : null;
+          if (!patientRef || !service || !startsAt || !endsAt) { tally.skipped++; continue; }
+          const patient = await tx.patient.findUnique({ where: { tenantId_externalRef: { tenantId, externalRef: patientRef } }, select: { id: true, branchId: true } });
+          if (!patient) { tally.skipped++; continue; }
+          const branch = await loadOrCreateBranch(tx, tenantId, row.values.branchName);
+          const status = safeEnumValue(row.values.status, appointmentStatuses, 'CONFIRMED') as never;
+          const channel = safeEnumValue(row.values.channel, appointmentChannels, 'EMAIL') as never;
+          const value = safeNumberValue(row.values.value, 0);
+          const providerRef = row.values.providerRef?.trim() || null;
+          const notes = row.values.notes?.trim() || null;
+          const existing = await tx.appointment.findFirst({ where: { tenantId, patientId: patient.id, startsAt, service } });
+          if (existing) {
+            await tx.appointment.update({
+              where: { id: existing.id },
+              data: { branchId: branch.id, endsAt, status, channel, value, ...(providerRef ? { providerRef } : { providerRef: null }), ...(notes ? { notes } : { notes: null }) },
+            });
+            tally.updated++;
+          } else {
+            await tx.appointment.create({
+              data: { tenantId, branchId: branch.id, patientId: patient.id, service, startsAt, endsAt, status, channel, value, ...(providerRef ? { providerRef } : {}), ...(notes ? { notes } : {}) },
+            });
+            tally.created++;
+          }
+          continue;
+        }
+
+        if (entityType === 'insurance') {
+          const patientRef = row.values.patientExternalRef?.trim();
+          const planName = row.values.planName?.trim();
+          const memberId = row.values.memberId?.trim();
+          if (!patientRef || !planName || !memberId) { tally.skipped++; continue; }
+          const patient = await tx.patient.findUnique({ where: { tenantId_externalRef: { tenantId, externalRef: patientRef } }, select: { id: true, branchId: true } });
+          if (!patient) { tally.skipped++; continue; }
+          const branch = await loadOrCreateBranch(tx, tenantId, row.values.branchName);
+          const payerName = row.values.payerName?.trim() || 'Imported Payer';
+          const payer = await tx.insurancePayer.upsert({
+            where: { tenantId_name: { tenantId, name: payerName } },
+            create: { tenantId, name: payerName, active: true, sourceProvider: 'import' },
+            update: { active: true },
+          });
+          const verificationStatus = row.values.verificationStatus?.trim() || 'pending';
+          const subscriberName = row.values.subscriberName?.trim() || null;
+          const relationship = row.values.relationship?.trim() || null;
+          const groupNumber = row.values.groupNumber?.trim() || null;
+          const payerReference = row.values.payerReference?.trim() || null;
+          const active = safeBoolValue(row.values.active, true);
+          const existing = await tx.patientInsurancePolicy.findFirst({ where: { tenantId, patientId: patient.id, memberId, planName }, orderBy: { updatedAt: 'desc' } });
+          if (existing) {
+            await tx.patientInsurancePolicy.update({
+              where: { id: existing.id },
+              data: { branchId: branch.id, payerId: payer.id, verificationStatus, active, ...(subscriberName ? { subscriberName } : {}), ...(relationship ? { relationship } : {}), ...(groupNumber ? { groupNumber } : {}), ...(payerReference ? { payerReference } : {}) },
+            });
+            tally.updated++;
+          } else {
+            await tx.patientInsurancePolicy.create({
+              data: { tenantId, branchId: branch.id, patientId: patient.id, payerId: payer.id, planName, memberId, verificationStatus, active, ...(subscriberName ? { subscriberName } : {}), ...(relationship ? { relationship } : {}), ...(groupNumber ? { groupNumber } : {}), ...(payerReference ? { payerReference } : {}) },
+            });
+            tally.created++;
+          }
+          continue;
+        }
       }
 
-      if (entityType === 'appointments') {
-        const patientRef = row.values.patientExternalRef?.trim();
-        const service = row.values.service?.trim();
-        const startsAt = row.values.startsAt ? new Date(row.values.startsAt) : null;
-        const endsAt = row.values.endsAt ? new Date(row.values.endsAt) : null;
-        if (!patientRef || !service || !startsAt || !endsAt) { results.skipped++; continue; }
-        const patient = await db.patient.findUnique({ where: { tenantId_externalRef: { tenantId, externalRef: patientRef } }, select: { id: true, branchId: true } });
-        if (!patient) { results.skipped++; continue; }
-        const branch = await loadOrCreateBranch(tenantId, row.values.branchName);
-        const status = safeEnumValue(row.values.status, appointmentStatuses, 'CONFIRMED') as never;
-        const channel = safeEnumValue(row.values.channel, appointmentChannels, 'EMAIL') as never;
-        const value = safeNumberValue(row.values.value, 0);
-        const providerRef = row.values.providerRef?.trim() || null;
-        const notes = row.values.notes?.trim() || null;
-        const existing = await db.appointment.findFirst({ where: { tenantId, patientId: patient.id, startsAt, service } });
-        if (existing) {
-          await db.appointment.update({
-            where: { id: existing.id },
-            data: { branchId: branch.id, endsAt, status, channel, value, ...(providerRef ? { providerRef } : { providerRef: null }), ...(notes ? { notes } : { notes: null }) },
-          });
-          results.updated++;
-        } else {
-          await db.appointment.create({
-            data: { tenantId, branchId: branch.id, patientId: patient.id, service, startsAt, endsAt, status, channel, value, ...(providerRef ? { providerRef } : {}), ...(notes ? { notes } : {}) },
-          });
-          results.created++;
-        }
-        continue;
-      }
 
-      if (entityType === 'insurance') {
-        const patientRef = row.values.patientExternalRef?.trim();
-        const planName = row.values.planName?.trim();
-        const memberId = row.values.memberId?.trim();
-        if (!patientRef || !planName || !memberId) { results.skipped++; continue; }
-        const patient = await db.patient.findUnique({ where: { tenantId_externalRef: { tenantId, externalRef: patientRef } }, select: { id: true, branchId: true } });
-        if (!patient) { results.skipped++; continue; }
-        const branch = await loadOrCreateBranch(tenantId, row.values.branchName);
-        const payerName = row.values.payerName?.trim() || 'Imported Payer';
-        const payer = await db.insurancePayer.upsert({
-          where: { tenantId_name: { tenantId, name: payerName } },
-          create: { tenantId, name: payerName, active: true, sourceProvider: 'import' },
-          update: { active: true },
-        });
-        const verificationStatus = row.values.verificationStatus?.trim() || 'pending';
-        const subscriberName = row.values.subscriberName?.trim() || null;
-        const relationship = row.values.relationship?.trim() || null;
-        const groupNumber = row.values.groupNumber?.trim() || null;
-        const payerReference = row.values.payerReference?.trim() || null;
-        const active = safeBoolValue(row.values.active, true);
-        const existing = await db.patientInsurancePolicy.findFirst({ where: { tenantId, patientId: patient.id, memberId, planName }, orderBy: { updatedAt: 'desc' } });
-        if (existing) {
-          await db.patientInsurancePolicy.update({
-            where: { id: existing.id },
-            data: { branchId: branch.id, payerId: payer.id, verificationStatus, active, ...(subscriberName ? { subscriberName } : {}), ...(relationship ? { relationship } : {}), ...(groupNumber ? { groupNumber } : {}), ...(payerReference ? { payerReference } : {}) },
-          });
-          results.updated++;
-        } else {
-          await db.patientInsurancePolicy.create({
-            data: { tenantId, branchId: branch.id, patientId: patient.id, payerId: payer.id, planName, memberId, verificationStatus, active, ...(subscriberName ? { subscriberName } : {}), ...(relationship ? { relationship } : {}), ...(groupNumber ? { groupNumber } : {}), ...(payerReference ? { payerReference } : {}) },
-          });
-          results.created++;
-        }
-        continue;
-      }
-    }
+      // Tenant-plane evidence, written on the same connection as the rows it
+      // describes. actorUserId stays null because the importer is a platform
+      // operator, not a member of this workspace — AuditEvent.actorUserId only
+      // references tenant Users. Who acted is recorded on the platform plane by
+      // platformAuditEvent below.
+      await tx.auditEvent.create({
+        data: {
+          tenantId,
+          actorUserId: null,
+          action: 'pilot.import.committed',
+          resource: 'pilotImport',
+          resourceId: tenantId,
+          requestId: request.id,
+          ipAddress: request.ip,
+          userAgent: request.headers['user-agent'],
+          metadata: { entityType, summary: tally, totalRows: analysis.summary.total, validRows: validRows.length },
+        },
+      });
 
-    await platformAuditEvent(request, 'pilot.import.committed', { type: 'tenant', id: tenantId, tenantId }, { entityType, summary: results, totalRows: analysis.summary.total, validRows: validRows.length });
+      return tally;
+    }, { timeout: 120_000, maxWait: 15_000 });
+
     return {
       entityType,
       preset: preset.preset ? { id: preset.preset.id, name: preset.preset.name, isDefault: preset.preset.isDefault } : null,

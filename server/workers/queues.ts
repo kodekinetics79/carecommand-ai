@@ -41,6 +41,11 @@ function disabledQueue<R, V, N extends string>(name: string): Queue<R, V, N> {
     name,
     client: Promise.resolve(undefined),
     add: async () => undefined,
+    // enqueueAutopilotExecution() probes getJob() for an in-flight duplicate
+    // before adding. Omitting it made the documented QUEUES_ENABLED=false path
+    // throw "getJob is not a function" — approving an Autopilot action answered
+    // 500 instead of the { state: 'disabled' } the caller is written to expect.
+    getJob: async () => undefined,
     close: async () => undefined,
     upsertJobScheduler: async () => undefined,
     // Zeroed backlog so metrics sampling is a safe no-op when queues are disabled.
