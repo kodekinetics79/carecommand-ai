@@ -19,7 +19,7 @@ vi.mock('../workers/queues', () => ({
 }));
 
 const { buildApp } = await import('../app');
-const { db } = await import('../lib/db');
+const { fixtureDb: db } = await import('./helpers/fixtureDb');
 
 let app: FastifyInstance;
 const createdTenantIds: string[] = [];
@@ -50,7 +50,7 @@ async function setOverride(tenantId: string, name: string, permissions: string[]
   });
 }
 
-const tok = (tenantId: string, userId: string) => app.jwt.sign({ userId, tenantId, type: 'access' });
+const tok = (tenantId: string, userId: string) => app.jwt.sign({ userId, tenantId, role: 'OWNER', type: 'access' });
 const auth = (t: string) => ({ authorization: `Bearer ${t}`, 'x-forwarded-for': '203.0.113.9' });
 
 const createPatient = (t: { id: string; branchId: string }, userId: string) =>
@@ -94,6 +94,15 @@ describe('permission/action RBAC — backend-enforced, tenant-customisable', () 
     expect((await createPatient(t, t.users.FRONT_DESK)).statusCode).toBe(201); // default
     await setOverride(t.id, 'Front Desk', ['patient:read']); // strip write
     expect((await createPatient(t, t.users.FRONT_DESK)).statusCode).toBe(403); // enforced revocation
+  });
+
+  it('an explicit empty override is deny-all and deleting it restores code defaults', async () => {
+    const t = await makeTenant();
+    expect((await createPatient(t, t.users.FRONT_DESK)).statusCode).toBe(201);
+    await setOverride(t.id, 'Front Desk', []);
+    expect((await createPatient(t, t.users.FRONT_DESK)).statusCode).toBe(403);
+    await db.roleDefinition.delete({ where: { tenantId_name: { tenantId: t.id, name: 'Front Desk' } } });
+    expect((await createPatient(t, t.users.FRONT_DESK)).statusCode).toBe(201);
   });
 
   it('overrides are tenant-scoped: a grant in tenant A does not leak to tenant B', async () => {

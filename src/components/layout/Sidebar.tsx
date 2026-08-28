@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useLocation, Link, useNavigate } from 'react-router-dom';
+import { useLocation, Link, useNavigate } from 'react-router';
 import {
   LayoutDashboard, Radar, Users2, Megaphone, TrendingUp,
   CalendarDays, ClipboardList, Puzzle, Settings,
@@ -37,7 +37,6 @@ interface NavItem {
   icon: React.ElementType;
   badge?: string | number;
   badgeColor?: 'red' | 'amber' | 'indigo';
-  live?: boolean;
 }
 
 interface NavSection {
@@ -47,12 +46,12 @@ interface NavSection {
 
 // Domain-grouped IA. Badges are intentionally NOT pre-populated with "New"/fake
 // counts — the product's ethos is no fabricated data; real counts get wired per
-// item when the data exists. `live` marks a genuinely running surface (Autopilot).
+// item when the data exists.
 const nav: NavSection[] = [
   {
     label: 'Command Center',
     items: [
-      { label: 'Dashboard', path: '/', icon: LayoutDashboard },
+      { label: 'Command Center', path: '/', icon: LayoutDashboard },
       { label: 'Advisory Room', path: '/advisory', icon: Sparkles },
       { label: 'Opportunity Center', path: '/opportunities', icon: Target },
     ],
@@ -65,7 +64,7 @@ const nav: NavSection[] = [
       { label: 'Patient Intake', path: '/patient-intake', icon: ClipboardList },
       { label: 'AI Receptionist', path: '/ai-receptionist', icon: Bot },
       { label: 'Receptionist Studio', path: '/receptionist-studio', icon: Bot },
-      { label: 'Staff', path: '/staff', icon: ClipboardList },
+      { label: 'Staff Tasks', path: '/staff', icon: ClipboardList },
     ],
   },
   {
@@ -74,9 +73,9 @@ const nav: NavSection[] = [
       { label: 'CRM', path: '/crm', icon: Users2 },
       { label: 'Campaigner', path: '/campaigner', icon: Megaphone },
       { label: 'Reactivation', path: '/reactivation', icon: Megaphone },
-      { label: 'Autopilot', path: '/autopilot', icon: Orbit, live: true },
+      { label: 'Autopilot', path: '/autopilot', icon: Orbit },
       { label: 'Reviews', path: '/reviews', icon: Star },
-      { label: 'Clinic Radar', path: '/clinic-radar', icon: Radar },
+      { label: 'ClinicRadar', path: '/clinic-radar', icon: Radar },
     ],
   },
   {
@@ -131,7 +130,7 @@ function isPathActive(pathname: string, path: string): boolean {
   return pathname === path || pathname.startsWith(path + '/');
 }
 
-export default function Sidebar() {
+export default function Sidebar({ mobileOpen = false, onNavigate }: { mobileOpen?: boolean; onNavigate?: () => void }) {
   const { pathname } = useLocation();
   const navigate = useNavigate();
   const { user } = useSession();
@@ -139,8 +138,7 @@ export default function Sidebar() {
   const { collapsed, collapsedSections, setCollapsed, toggleSection } = useUiPrefs();
   const [filter, setFilter] = useState('');
 
-  const isAdmin = user ? ['OWNER', 'ADMIN'].includes(user.role) : false;
-  const canCompliance = user ? ['OWNER', 'ADMIN', 'COMPLIANCE_OFFICER', 'AUDITOR'].includes(user.role) : false;
+  const permissions = new Set(user?.effectivePermissions ?? []);
   const q = filter.trim().toLowerCase();
   const collapsedSet = new Set(collapsedSections);
 
@@ -148,8 +146,10 @@ export default function Sidebar() {
     .map(section => ({
       ...section,
       items: section.items.filter(item =>
-        (item.path !== '/control-plane' || isAdmin) &&
-        (item.path !== '/compliance' || canCompliance) &&
+        (item.path !== '/control-plane' || permissions.has('admin:manage')) &&
+        (item.path !== '/compliance' || permissions.has('compliance:read')) &&
+        (item.path !== '/receptionist-studio' || permissions.has('receptionist:manage')) &&
+        (item.path !== '/ai-receptionist' || permissions.has('receptionist:call-artifacts:read')) &&
         (!q || item.label.toLowerCase().includes(q))),
     }))
     .filter(section => section.items.length > 0);
@@ -157,7 +157,7 @@ export default function Sidebar() {
   const roleLabel = user?.role ? user.role.toLowerCase().replace(/_/g, ' ') : '';
 
   return (
-    <aside className={`sidebar ${collapsed ? 'sidebar--collapsed' : ''}`}>
+    <aside id="staff-navigation" className={`sidebar ${collapsed ? 'sidebar--collapsed' : ''} ${mobileOpen ? 'sidebar--mobile-open' : ''}`}>
       {/* Brand */}
       <div className="px-4 pt-4 pb-3 border-b-b1">
         <div className="brand-row flex items-center justify-between gap-2">
@@ -192,7 +192,9 @@ export default function Sidebar() {
       )}
 
       {/* Navigation */}
-      <nav className="flex-1 overflow-y-auto px-3 py-2">
+      <nav className="flex-1 overflow-y-auto px-3 py-2" onClick={event => {
+        if ((event.target as Element).closest('a')) onNavigate?.();
+      }}>
         {visibleNav.length === 0 && (
           <p className="px-2 py-6 text-center text-[12px] text-t3">No modules match “{filter}”.</p>
         )}
@@ -231,8 +233,7 @@ export default function Sidebar() {
                   <Link key={item.path} to={item.path} title={item.label} className={`nav-item ${active ? 'active' : ''}`}>
                     <Icon className={`w-[15px] h-[15px] shrink-0 ${active ? 'text-indigo' : 'text-t3'}`} />
                     <span className="flex-1 truncate">{item.label}</span>
-                    {item.live && <span className="w-1.5 h-1.5 rounded-full shrink-0 live-dot pf-emerald" />}
-                    {item.badge !== undefined && !item.live && (
+                    {item.badge !== undefined && (
                       <span className={`${badgeCls[item.badgeColor ?? 'indigo']} shrink-0`}>{item.badge}</span>
                     )}
                   </Link>
@@ -254,7 +255,7 @@ export default function Sidebar() {
 
       {/* User profile — the real signed-in user */}
       <div className="px-3 py-3 border-t-b1">
-        <button type="button" onClick={() => navigate('/settings')} title="Account & settings"
+        <button type="button" onClick={() => { onNavigate?.(); navigate('/settings'); }} title="Account & settings"
           className="w-full flex items-center gap-2.5 px-2 py-2 rounded-lg transition-colors hover:bg-[rgba(255,255,255,0.04)]">
           <div className="logo-user w-6 h-6 rounded-full flex items-center justify-center text-[9px] font-bold text-white shrink-0">{initials(user?.displayName)}</div>
           <div className="flex-1 text-left min-w-0 collapse-hide">

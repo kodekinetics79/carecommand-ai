@@ -18,8 +18,9 @@ vi.mock('../workers/queues', () => ({
 }));
 
 const { buildApp } = await import('../app');
-const { db } = await import('../lib/db');
+const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { recomputeEntitlements } = await import('../lib/entitlements');
+const { issuePortalSession } = await import('../lib/portalAuth');
 
 let app: FastifyInstance;
 const createdTenantIds: string[] = [];
@@ -40,7 +41,7 @@ async function makeTenant() {
   createdTenantIds.push(id);
   const plan = await db.subscriptionPlan.findUnique({ where: { key: 'enterprise' } });
   await db.tenantSubscription.create({ data: { tenantId: id, planId: plan!.id, status: 'ACTIVE', startedAt: new Date() } });
-  await recomputeEntitlements(id);
+  await recomputeEntitlements(id, db);
   const branch = await db.branch.create({ data: { tenantId: id, name: 'b', location: 'x' } });
   const provUser = await db.user.create({ data: { tenantId: id, role: 'PROVIDER', active: true, email: `pv-${id.slice(0, 8)}@pol.test`, displayName: 'Dr' } });
   const provider = await db.providerProfile.create({ data: { tenantId: id, branchId: branch.id, userId: provUser.id, specialty: 'Primary Care' } });
@@ -49,12 +50,13 @@ async function makeTenant() {
   const account = await db.patientPortalAccount.create({ data: { tenantId: id, patientId: patient.id, status: 'active', email: `pa-${id.slice(0, 8)}@pol.test` } });
   const admin = await db.user.create({ data: { tenantId: id, role: 'ADMIN', active: true, email: `ad-${id.slice(0, 8)}@pol.test`, displayName: 'Admin' } });
   const analyst = await db.user.create({ data: { tenantId: id, role: 'ANALYST', active: true, email: `an-${id.slice(0, 8)}@pol.test`, displayName: 'Analyst' } });
-  return { id, branchId: branch.id, providerId: provider.id, patientId: patient.id, accountId: account.id, adminId: admin.id, analystId: analyst.id };
+  const portalToken = await issuePortalSession(app, account, db);
+  return { id, branchId: branch.id, providerId: provider.id, patientId: patient.id, accountId: account.id, adminId: admin.id, analystId: analyst.id, portalToken };
 }
 
 type T = Awaited<ReturnType<typeof makeTenant>>;
-const staff = (t: T, userId: string) => ({ authorization: `Bearer ${app.jwt.sign({ userId, tenantId: t.id, type: 'access' })}` });
-const portal = (t: T) => ({ authorization: `Bearer ${app.jwt.sign({ portalAccountId: t.accountId, patientId: t.patientId, tenantId: t.id, type: 'portal' })}` });
+const staff = (t: T, userId: string) => ({ authorization: `Bearer ${app.jwt.sign({ userId, tenantId: t.id, role: 'OWNER', type: 'access' })}` });
+const portal = (t: T) => ({ authorization: `Bearer ${t.portalToken}` });
 const setPolicy = (t: T, body: Record<string, unknown>, userId = t.adminId) => app.inject({ method: 'PUT', url: '/v1/scheduling/policy', headers: staff(t, userId), payload: body });
 const book = (t: T, time = '09:00') => app.inject({ method: 'POST', url: `/v1/portal/booking/providers/${t.providerId}/book`, headers: portal(t), payload: { startsAt: at(time), durationMin: 30, reason: 'Annual physical' } });
 

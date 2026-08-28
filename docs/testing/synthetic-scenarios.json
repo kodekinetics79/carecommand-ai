@@ -1,0 +1,1291 @@
+{
+  "generatedAt": "2026-07-30",
+  "profiles": {
+    "FUNCTIONAL": {
+      "profile": "FUNCTIONAL",
+      "fixedSeed": 20260730,
+      "controlledClock": "2026-07-15T14:00:00.000Z",
+      "tenants": 2,
+      "clinics": 3,
+      "users": 12,
+      "portalAccounts": 2,
+      "patients": 24,
+      "appointments": 48,
+      "calls": 16,
+      "paymentRequests": 12,
+      "documents": 12,
+      "notifications": 24,
+      "auditEvents": 48,
+      "description": "Small deterministic dataset for unit, integration and browser journeys."
+    },
+    "PILOT": {
+      "profile": "PILOT",
+      "fixedSeed": 20260730,
+      "controlledClock": "2026-07-15T14:00:00.000Z",
+      "tenants": 4,
+      "clinics": 8,
+      "users": 40,
+      "portalAccounts": 4,
+      "patients": 2000,
+      "appointments": 4000,
+      "calls": 1000,
+      "paymentRequests": 500,
+      "documents": 1000,
+      "notifications": 2000,
+      "auditEvents": 5000,
+      "description": "Realistic concentrated multi-clinic volume for supervised demonstrations and local performance evidence."
+    },
+    "EDGE": {
+      "profile": "EDGE",
+      "fixedSeed": 20260730,
+      "controlledClock": "2026-07-15T14:00:00.000Z",
+      "tenants": 5,
+      "clinics": 6,
+      "users": 20,
+      "portalAccounts": 5,
+      "patients": 40,
+      "appointments": 60,
+      "calls": 40,
+      "paymentRequests": 24,
+      "documents": 24,
+      "notifications": 40,
+      "auditEvents": 80,
+      "description": "Boundary, denial, suspended, archived, ambiguous-identity and provider-failure cases."
+    }
+  },
+  "scenarios": [
+    {
+      "scenarioId": "AUTH-001",
+      "profile": "FUNCTIONAL",
+      "tenant": "functional-family",
+      "actors": [
+        "clinic-owner"
+      ],
+      "preconditions": [
+        "active tenant",
+        "active owner"
+      ],
+      "inputEvent": "Password login and browser reload",
+      "expectedDatabaseState": "One active refresh-token family",
+      "expectedApiResult": "200 login and refresh",
+      "expectedUiResult": "Authenticated dashboard remains visible",
+      "expectedAuditEvents": [
+        "auth.login.succeeded"
+      ],
+      "expectedAuthorization": "Only the matching tenant owner is admitted",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/authSession.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "AUTH-002",
+      "profile": "EDGE",
+      "tenant": "edge-suspended",
+      "actors": [
+        "suspended-owner"
+      ],
+      "preconditions": [
+        "suspended tenant"
+      ],
+      "inputEvent": "Attempt password login",
+      "expectedDatabaseState": "No active session created",
+      "expectedApiResult": "403 inactive tenant",
+      "expectedUiResult": "Neutral access-denied message",
+      "expectedAuditEvents": [
+        "auth.login.denied"
+      ],
+      "expectedAuthorization": "Suspended tenant actors are denied",
+      "evidenceStatus": "SPECIFICATION_ONLY",
+      "executableEvidence": [],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "AUTH-003",
+      "profile": "EDGE",
+      "tenant": "edge-archived",
+      "actors": [
+        "archived-owner"
+      ],
+      "preconditions": [
+        "archived tenant"
+      ],
+      "inputEvent": "Attempt API and object access",
+      "expectedDatabaseState": "No mutation",
+      "expectedApiResult": "401 or 403",
+      "expectedUiResult": "Session is cleared",
+      "expectedAuditEvents": [
+        "auth.access.denied"
+      ],
+      "expectedAuthorization": "Archived actors are denied",
+      "evidenceStatus": "SPECIFICATION_ONLY",
+      "executableEvidence": [],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "PAT-001",
+      "profile": "FUNCTIONAL",
+      "tenant": "functional-family",
+      "actors": [
+        "front-desk",
+        "new-adult"
+      ],
+      "preconditions": [
+        "active clinic"
+      ],
+      "inputEvent": "Register new adult patient",
+      "expectedDatabaseState": "One patient in selected branch",
+      "expectedApiResult": "201 patient",
+      "expectedUiResult": "Patient profile opens",
+      "expectedAuditEvents": [
+        "patient.created"
+      ],
+      "expectedAuthorization": "Front desk may create within its tenant",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/clinicalWorkflowHardening.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "PAT-002",
+      "profile": "EDGE",
+      "tenant": "edge-multitenant",
+      "actors": [
+        "front-desk-a",
+        "matching-patient-a",
+        "matching-patient-b"
+      ],
+      "preconditions": [
+        "same email and phone across tenants"
+      ],
+      "inputEvent": "Search and open by known foreign ID",
+      "expectedDatabaseState": "No cross-tenant change",
+      "expectedApiResult": "404 or empty result",
+      "expectedUiResult": "No foreign patient shown",
+      "expectedAuditEvents": [
+        "patient.access.denied"
+      ],
+      "expectedAuthorization": "Tenant A cannot observe Tenant B",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/rlsBehavioralCoverage.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "PAT-003",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "front-desk",
+        "duplicate-name-1",
+        "duplicate-name-2"
+      ],
+      "preconditions": [
+        "same legal name",
+        "different DOB"
+      ],
+      "inputEvent": "Run duplicate detection",
+      "expectedDatabaseState": "Both identities retained",
+      "expectedApiResult": "200 with bounded candidates",
+      "expectedUiResult": "Requires operator disambiguation",
+      "expectedAuditEvents": [
+        "patient.duplicate.checked"
+      ],
+      "expectedAuthorization": "Authorized staff only",
+      "evidenceStatus": "SPECIFICATION_ONLY",
+      "executableEvidence": [],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "PAT-004",
+      "profile": "FUNCTIONAL",
+      "tenant": "functional-family",
+      "actors": [
+        "guardian-contact",
+        "minor-patient"
+      ],
+      "preconditions": [
+        "unique contact match",
+        "patient is minor or age is unknown"
+      ],
+      "inputEvent": "Attempt self-signup for the minor record",
+      "expectedDatabaseState": "Pending access request only; no portal account or token",
+      "expectedApiResult": "200 generic review response",
+      "expectedUiResult": "No PHI is displayed; staff-review message remains generic",
+      "expectedAuditEvents": [
+        "portal.signup.unmatched"
+      ],
+      "expectedAuthorization": "Automatic access is denied until a reviewed guardian/proxy authority model is implemented",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/portalSignup.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "PAT-005",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "patient-restricted-consent"
+      ],
+      "preconditions": [
+        "consent restriction"
+      ],
+      "inputEvent": "Request restricted communication",
+      "expectedDatabaseState": "No outbound delivery",
+      "expectedApiResult": "409 suppressed",
+      "expectedUiResult": "Restriction explanation displayed",
+      "expectedAuditEvents": [
+        "communication.suppressed"
+      ],
+      "expectedAuthorization": "Consent policy overrides workflow role",
+      "evidenceStatus": "SPECIFICATION_ONLY",
+      "executableEvidence": [],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "SCH-001",
+      "profile": "FUNCTIONAL",
+      "tenant": "functional-family",
+      "actors": [
+        "front-desk",
+        "existing-patient",
+        "provider"
+      ],
+      "preconditions": [
+        "available provider slot"
+      ],
+      "inputEvent": "Book new-patient appointment",
+      "expectedDatabaseState": "One confirmed appointment",
+      "expectedApiResult": "201 appointment",
+      "expectedUiResult": "Calendar shows persisted booking",
+      "expectedAuditEvents": [
+        "appointment.created"
+      ],
+      "expectedAuthorization": "Front desk may book in assigned clinic",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/appointmentCorrectness.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "SCH-002",
+      "profile": "FUNCTIONAL",
+      "tenant": "functional-family",
+      "actors": [
+        "patient",
+        "provider"
+      ],
+      "preconditions": [
+        "portal self-service enabled"
+      ],
+      "inputEvent": "Book through patient portal",
+      "expectedDatabaseState": "One patient-owned appointment",
+      "expectedApiResult": "201 appointment",
+      "expectedUiResult": "Confirmation shown after reload",
+      "expectedAuditEvents": [
+        "appointment.created"
+      ],
+      "expectedAuthorization": "Patient may book only for self",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/portalBooking.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "SCH-003",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "front-desk",
+        "provider"
+      ],
+      "preconditions": [
+        "occupied provider slot"
+      ],
+      "inputEvent": "Attempt double booking",
+      "expectedDatabaseState": "Original appointment unchanged",
+      "expectedApiResult": "409 already_booked",
+      "expectedUiResult": "Conflict message and alternatives",
+      "expectedAuditEvents": [
+        "appointment.conflict"
+      ],
+      "expectedAuthorization": "No bypass of provider conflict guard",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/crossPathBooking.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "SCH-004",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "front-desk",
+        "provider"
+      ],
+      "preconditions": [
+        "provider time off"
+      ],
+      "inputEvent": "Attempt unavailable booking",
+      "expectedDatabaseState": "No appointment created",
+      "expectedApiResult": "409 unavailable",
+      "expectedUiResult": "Unavailable state shown",
+      "expectedAuditEvents": [
+        "appointment.unavailable"
+      ],
+      "expectedAuthorization": "No role may override without explicit workflow",
+      "evidenceStatus": "SPECIFICATION_ONLY",
+      "executableEvidence": [],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "SCH-005",
+      "profile": "FUNCTIONAL",
+      "tenant": "functional-family",
+      "actors": [
+        "front-desk",
+        "patient"
+      ],
+      "preconditions": [
+        "confirmed appointment"
+      ],
+      "inputEvent": "Reschedule appointment",
+      "expectedDatabaseState": "Same appointment receives new slot",
+      "expectedApiResult": "200 appointment",
+      "expectedUiResult": "Calendar reflects new slot",
+      "expectedAuditEvents": [
+        "appointment.rescheduled"
+      ],
+      "expectedAuthorization": "Clinic-scoped staff only",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/clinicalWorkflowHardening.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "SCH-006",
+      "profile": "FUNCTIONAL",
+      "tenant": "functional-family",
+      "actors": [
+        "patient"
+      ],
+      "preconditions": [
+        "patient-owned future appointment"
+      ],
+      "inputEvent": "Cancel in portal",
+      "expectedDatabaseState": "Appointment becomes canceled",
+      "expectedApiResult": "200 canceled",
+      "expectedUiResult": "Canceled badge shown",
+      "expectedAuditEvents": [
+        "appointment.canceled"
+      ],
+      "expectedAuthorization": "Patient cannot cancel another patient appointment",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/portalAppointmentSelfService.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "SCH-007",
+      "profile": "EDGE",
+      "tenant": "edge-dst",
+      "actors": [
+        "front-desk",
+        "provider"
+      ],
+      "preconditions": [
+        "America/New_York DST boundary"
+      ],
+      "inputEvent": "Book ambiguous/nonexistent local time",
+      "expectedDatabaseState": "No invalid instant stored",
+      "expectedApiResult": "400 with timezone detail",
+      "expectedUiResult": "Corrective time guidance",
+      "expectedAuditEvents": [
+        "appointment.validation.failed"
+      ],
+      "expectedAuthorization": "Authorized actor remains subject to time validation",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/schedulingTimezone.unit.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-001",
+      "profile": "FUNCTIONAL",
+      "tenant": "functional-family",
+      "actors": [
+        "verified-caller",
+        "receptionist-agent"
+      ],
+      "preconditions": [
+        "signed call",
+        "stored call mapping"
+      ],
+      "inputEvent": "Existing caller verifies identity",
+      "expectedDatabaseState": "Call-scoped identity evidence stored",
+      "expectedApiResult": "200 tool result",
+      "expectedUiResult": "Verified flow continues",
+      "expectedAuditEvents": [
+        "receptionist.identity.verified"
+      ],
+      "expectedAuthorization": "Protected actions require call-scoped proof",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistSafety.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-002",
+      "profile": "FUNCTIONAL",
+      "tenant": "functional-family",
+      "actors": [
+        "new-caller",
+        "receptionist-agent"
+      ],
+      "preconditions": [
+        "signed inbound number mapping"
+      ],
+      "inputEvent": "First inbound call starts",
+      "expectedDatabaseState": "Idempotent call mapping created",
+      "expectedApiResult": "200 safe call bootstrap",
+      "expectedUiResult": "Approved new-caller intake begins",
+      "expectedAuditEvents": [
+        "receptionist.call.mapped"
+      ],
+      "expectedAuthorization": "Tenant derives only from trusted provider destination",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistInboundBootstrap.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-003",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "unknown-caller"
+      ],
+      "preconditions": [
+        "valid signature",
+        "unknown destination"
+      ],
+      "inputEvent": "First inbound call has no unique mapping",
+      "expectedDatabaseState": "Configuration alert only; no patient mutation",
+      "expectedApiResult": "202 manual handling",
+      "expectedUiResult": "Supervised fallback indicated",
+      "expectedAuditEvents": [
+        "receptionist.mapping.unresolved"
+      ],
+      "expectedAuthorization": "No tenant guessing or autonomous action",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistInboundBootstrap.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-004",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "caller"
+      ],
+      "preconditions": [
+        "invalid raw-body HMAC"
+      ],
+      "inputEvent": "Send forged webhook",
+      "expectedDatabaseState": "No call or patient record created",
+      "expectedApiResult": "401 invalid signature",
+      "expectedUiResult": "No action",
+      "expectedAuditEvents": [
+        "receptionist.signature.denied"
+      ],
+      "expectedAuthorization": "Unauthenticated ingress denied",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistSecurity.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-005",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "dnc-patient"
+      ],
+      "preconditions": [
+        "active DNC"
+      ],
+      "inputEvent": "Request outbound or continued call action",
+      "expectedDatabaseState": "No autonomous contact",
+      "expectedApiResult": "409 suppressed",
+      "expectedUiResult": "DNC confirmation and stop",
+      "expectedAuditEvents": [
+        "receptionist.dnc.enforced"
+      ],
+      "expectedAuthorization": "DNC cannot be overridden by AI",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistSafety.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-006",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "caller"
+      ],
+      "preconditions": [
+        "emergency-language phrase"
+      ],
+      "inputEvent": "Caller describes urgent emergency",
+      "expectedDatabaseState": "Escalation record only",
+      "expectedApiResult": "200 escalation directive",
+      "expectedUiResult": "Emergency disclaimer and transfer guidance",
+      "expectedAuditEvents": [
+        "receptionist.emergency.escalated"
+      ],
+      "expectedAuthorization": "No clinical diagnosis or booking continuation",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistSafety.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-007",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "caller"
+      ],
+      "preconditions": [
+        "three failed verification attempts"
+      ],
+      "inputEvent": "Retry identity proof",
+      "expectedDatabaseState": "Call verification locked",
+      "expectedApiResult": "423 locked",
+      "expectedUiResult": "Human fallback offered",
+      "expectedAuditEvents": [
+        "receptionist.identity.locked"
+      ],
+      "expectedAuthorization": "Protected actions denied",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistSafety.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-008",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "receptionist-agent"
+      ],
+      "preconditions": [
+        "kill switch enabled"
+      ],
+      "inputEvent": "Attempt inbound tool action",
+      "expectedDatabaseState": "No protected mutation; durable review signal",
+      "expectedApiResult": "202 supervised fallback",
+      "expectedUiResult": "Human fallback only",
+      "expectedAuditEvents": [
+        "RECEPTIONIST_INGRESS_REVIEW"
+      ],
+      "expectedAuthorization": "Kill switch is authoritative",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistInboundBootstrap.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-009",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "receptionist-agent"
+      ],
+      "preconditions": [
+        "concurrency limit reached"
+      ],
+      "inputEvent": "Admit another call",
+      "expectedDatabaseState": "No reservation added; durable review signal",
+      "expectedApiResult": "202 supervised fallback",
+      "expectedUiResult": "Human fallback only",
+      "expectedAuditEvents": [
+        "RECEPTIONIST_INGRESS_REVIEW"
+      ],
+      "expectedAuthorization": "Atomic capacity control enforced",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistOutboundTargets.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-010",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "provider-webhook"
+      ],
+      "preconditions": [
+        "previously processed event"
+      ],
+      "inputEvent": "Replay duplicate/out-of-order webhook",
+      "expectedDatabaseState": "Single canonical event state",
+      "expectedApiResult": "200 idempotent or 409 conflict",
+      "expectedUiResult": "No duplicate activity",
+      "expectedAuditEvents": [
+        "receptionist.webhook.deduplicated"
+      ],
+      "expectedAuthorization": "Signed webhook remains tenant-scoped",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistLifecycle.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-011",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "receptionist-agent"
+      ],
+      "preconditions": [
+        "provider simulator outage"
+      ],
+      "inputEvent": "Start provider operation",
+      "expectedDatabaseState": "No fabricated success",
+      "expectedApiResult": "503 provider unavailable",
+      "expectedUiResult": "Retry/manual state",
+      "expectedAuditEvents": [
+        "receptionist.provider.failed"
+      ],
+      "expectedAuthorization": "No local bypass",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistP0Reliability.unit.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-012",
+      "profile": "FUNCTIONAL",
+      "tenant": "functional-family",
+      "actors": [
+        "receptionist-manager"
+      ],
+      "preconditions": [
+        "published Retell agent",
+        "production tag assigned",
+        "approved webhook and privacy controls"
+      ],
+      "inputEvent": "Verify production agent deployment",
+      "expectedDatabaseState": "Immutable provider version and safe readiness snapshot persisted",
+      "expectedApiResult": "200 verified agent",
+      "expectedUiResult": "Verified badge and pinned version shown",
+      "expectedAuditEvents": [
+        "RECEPTIONIST_AGENT_PROVIDER_VERIFIED"
+      ],
+      "expectedAuthorization": "Receptionist managers may verify only agents in their clinic and tenant",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistAgentProvider.unit.test.ts",
+        "server/test/receptionistConfiguration.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-013",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "receptionist-manager"
+      ],
+      "preconditions": [
+        "Retell agent missing requested environment tag or required privacy control"
+      ],
+      "inputEvent": "Verify unsafe provider deployment",
+      "expectedDatabaseState": "Agent remains invalid or unverified; no runnable deployment created",
+      "expectedApiResult": "422 provider configuration rejected",
+      "expectedUiResult": "Safe corrective checklist shown without provider secret or prompt",
+      "expectedAuditEvents": [
+        "RECEPTIONIST_AGENT_PROVIDER_VERIFICATION_FAILED"
+      ],
+      "expectedAuthorization": "Provider response cannot bypass production readiness controls",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistAgentProvider.unit.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-014",
+      "profile": "EDGE",
+      "tenant": "edge-multitenant",
+      "actors": [
+        "tenant-a-manager"
+      ],
+      "preconditions": [
+        "Tenant B clinic and agent identifiers known"
+      ],
+      "inputEvent": "Bind foreign agent to campaign",
+      "expectedDatabaseState": "No cross-tenant or cross-clinic relationship stored",
+      "expectedApiResult": "404 or database foreign-key denial",
+      "expectedUiResult": "No foreign agent shown",
+      "expectedAuditEvents": [
+        "security.cross_tenant.denied"
+      ],
+      "expectedAuthorization": "Tenant and clinic ownership are enforced by API and composite database constraints",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistConfiguration.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-015",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "receptionist-manager"
+      ],
+      "preconditions": [
+        "previously verified agent",
+        "provider timeout",
+        "verification freshness expires"
+      ],
+      "inputEvent": "Retry provider verification then activate campaign",
+      "expectedDatabaseState": "Last safe snapshot retained with failed probe evidence; stale deployment remains non-runnable",
+      "expectedApiResult": "503 verify failure then 409 activation blocked",
+      "expectedUiResult": "Previous snapshot and safe failure state shown",
+      "expectedAuditEvents": [
+        "RECEPTIONIST_AGENT_PROVIDER_VERIFICATION_FAILED"
+      ],
+      "expectedAuthorization": "A transient provider failure never silently authorizes a stale deployment",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistConfiguration.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-016",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "receptionist-manager"
+      ],
+      "preconditions": [
+        "verification in flight",
+        "agent relinked concurrently"
+      ],
+      "inputEvent": "Complete stale provider verification response",
+      "expectedDatabaseState": "Relinked configuration remains unchanged",
+      "expectedApiResult": "409 configuration changed",
+      "expectedUiResult": "Operator is prompted to verify the current link",
+      "expectedAuditEvents": [
+        "RECEPTIONIST_AGENT_UPDATED"
+      ],
+      "expectedAuthorization": "Optimistic revision prevents stale verification overwrite",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistConfiguration.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "REC-017",
+      "profile": "FUNCTIONAL",
+      "tenant": "functional-family",
+      "actors": [
+        "receptionist-manager"
+      ],
+      "preconditions": [
+        "fresh verified immutable agent",
+        "eligible outbound target"
+      ],
+      "inputEvent": "Activate and launch outbound campaign",
+      "expectedDatabaseState": "Campaign audit commits atomically and call binds the verified agent version",
+      "expectedApiResult": "201/200 with exact provider ID and numeric version override",
+      "expectedUiResult": "Runnable campaign and truthful call state shown",
+      "expectedAuditEvents": [
+        "RECEPTIONIST_CAMPAIGN_CREATED",
+        "RECEPTIONIST_OUTBOUND_CALL_STARTED"
+      ],
+      "expectedAuthorization": "Every activation and dial rechecks same-tenant, same-clinic, fresh verified readiness",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/receptionistConfiguration.integration.test.ts",
+        "server/test/receptionistOutboundTargets.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "FIN-001",
+      "profile": "FUNCTIONAL",
+      "tenant": "functional-family",
+      "actors": [
+        "billing-user",
+        "insured-patient"
+      ],
+      "preconditions": [
+        "active synthetic policy"
+      ],
+      "inputEvent": "Run eligibility simulator",
+      "expectedDatabaseState": "Verification and estimate persisted",
+      "expectedApiResult": "200 simulated eligibility",
+      "expectedUiResult": "Clearly labeled simulator result",
+      "expectedAuditEvents": [
+        "insurance.eligibility.checked"
+      ],
+      "expectedAuthorization": "Billing role within tenant only",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/insurancePolicyIntegrity.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "FIN-002",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "billing-user",
+        "uninsured-patient"
+      ],
+      "preconditions": [
+        "no policy"
+      ],
+      "inputEvent": "Request eligibility",
+      "expectedDatabaseState": "No fabricated policy",
+      "expectedApiResult": "422 insurance required",
+      "expectedUiResult": "Self-pay option shown",
+      "expectedAuditEvents": [
+        "insurance.eligibility.skipped"
+      ],
+      "expectedAuthorization": "No payer call without policy",
+      "evidenceStatus": "SPECIFICATION_ONLY",
+      "executableEvidence": [],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "FIN-003",
+      "profile": "FUNCTIONAL",
+      "tenant": "functional-family",
+      "actors": [
+        "patient",
+        "billing-user"
+      ],
+      "preconditions": [
+        "synthetic payment request"
+      ],
+      "inputEvent": "Complete simulator payment",
+      "expectedDatabaseState": "One successful transaction",
+      "expectedApiResult": "200 paid",
+      "expectedUiResult": "Receipt state after reload",
+      "expectedAuditEvents": [
+        "payment.succeeded"
+      ],
+      "expectedAuthorization": "Opaque public token is resource-bound",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/payments.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "FIN-004",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "provider-webhook"
+      ],
+      "preconditions": [
+        "successful callback already applied"
+      ],
+      "inputEvent": "Replay payment callback",
+      "expectedDatabaseState": "No duplicate transaction",
+      "expectedApiResult": "200 idempotent",
+      "expectedUiResult": "Single receipt",
+      "expectedAuditEvents": [
+        "payment.webhook.deduplicated"
+      ],
+      "expectedAuthorization": "Signature and provider reference required",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/moneyPathHardening.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "FIN-005",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "patient"
+      ],
+      "preconditions": [
+        "simulator failure configured"
+      ],
+      "inputEvent": "Submit payment",
+      "expectedDatabaseState": "Request remains unpaid/failed",
+      "expectedApiResult": "402 simulated failure",
+      "expectedUiResult": "Truthful retry state",
+      "expectedAuditEvents": [
+        "payment.failed"
+      ],
+      "expectedAuthorization": "No fabricated success",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/providerFailureHonesty.unit.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "INT-001",
+      "profile": "FUNCTIONAL",
+      "tenant": "functional-family",
+      "actors": [
+        "tenant-admin"
+      ],
+      "preconditions": [
+        "integration disconnected"
+      ],
+      "inputEvent": "Open integration status",
+      "expectedDatabaseState": "Configuration unchanged",
+      "expectedApiResult": "200 unconfigured",
+      "expectedUiResult": "Setup-required state",
+      "expectedAuditEvents": [
+        "integration.status.viewed"
+      ],
+      "expectedAuthorization": "Secrets never returned",
+      "evidenceStatus": "SPECIFICATION_ONLY",
+      "executableEvidence": [],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "INT-002",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "provider-simulator"
+      ],
+      "preconditions": [
+        "rate limit enabled"
+      ],
+      "inputEvent": "Invoke integration",
+      "expectedDatabaseState": "Retry metadata recorded",
+      "expectedApiResult": "429 rate limited",
+      "expectedUiResult": "Recoverable retry state",
+      "expectedAuditEvents": [
+        "integration.rate_limited"
+      ],
+      "expectedAuthorization": "No silent fallback",
+      "evidenceStatus": "SPECIFICATION_ONLY",
+      "executableEvidence": [],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "INT-003",
+      "profile": "EDGE",
+      "tenant": "functional-family",
+      "actors": [
+        "worker"
+      ],
+      "preconditions": [
+        "deterministic timeout"
+      ],
+      "inputEvent": "Process integration job",
+      "expectedDatabaseState": "Job retained for bounded retry",
+      "expectedApiResult": "retry scheduled",
+      "expectedUiResult": "Pending state",
+      "expectedAuditEvents": [
+        "integration.timeout"
+      ],
+      "expectedAuthorization": "Worker reestablishes tenant context",
+      "evidenceStatus": "SPECIFICATION_ONLY",
+      "executableEvidence": [],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "PLAT-001",
+      "profile": "PILOT",
+      "tenant": "pilot-multispecialty",
+      "actors": [
+        "platform-admin"
+      ],
+      "preconditions": [
+        "app_platform session"
+      ],
+      "inputEvent": "Create tenant and owner",
+      "expectedDatabaseState": "Tenant, branch and owner persisted",
+      "expectedApiResult": "201 tenant",
+      "expectedUiResult": "Tenant appears in platform list",
+      "expectedAuditEvents": [
+        "platform.tenant.created"
+      ],
+      "expectedAuthorization": "Platform admin only; no PHI access",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/platformDatabasePlane.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "PLAT-002",
+      "profile": "PILOT",
+      "tenant": "pilot-multispecialty",
+      "actors": [
+        "platform-admin"
+      ],
+      "preconditions": [
+        "existing subscription"
+      ],
+      "inputEvent": "Change plan and features",
+      "expectedDatabaseState": "Entitlements recomputed",
+      "expectedApiResult": "200 subscription",
+      "expectedUiResult": "Accurate feature state",
+      "expectedAuditEvents": [
+        "platform.subscription.updated"
+      ],
+      "expectedAuthorization": "Platform billing permission required",
+      "evidenceStatus": "SPECIFICATION_ONLY",
+      "executableEvidence": [],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "PLAT-003",
+      "profile": "PILOT",
+      "tenant": "pilot-multispecialty",
+      "actors": [
+        "platform-admin"
+      ],
+      "preconditions": [
+        "active tenant"
+      ],
+      "inputEvent": "Suspend then reactivate tenant",
+      "expectedDatabaseState": "Lifecycle transitions persisted",
+      "expectedApiResult": "200 each transition",
+      "expectedUiResult": "Status and analytics update",
+      "expectedAuditEvents": [
+        "platform.tenant.suspended",
+        "platform.tenant.reactivated"
+      ],
+      "expectedAuthorization": "Tenant sessions denied while suspended",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/identityPlaneIsolation.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "PLAT-004",
+      "profile": "EDGE",
+      "tenant": "pilot-multispecialty",
+      "actors": [
+        "platform-support"
+      ],
+      "preconditions": [
+        "time-bound support grant"
+      ],
+      "inputEvent": "Impersonate selected tenant",
+      "expectedDatabaseState": "Audited scoped support session",
+      "expectedApiResult": "200 tenant-scoped session",
+      "expectedUiResult": "Impersonation banner",
+      "expectedAuditEvents": [
+        "platform.support.started"
+      ],
+      "expectedAuthorization": "No platform-wide PHI connection",
+      "evidenceStatus": "SPECIFICATION_ONLY",
+      "executableEvidence": [],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "PLAT-005",
+      "profile": "EDGE",
+      "tenant": "pilot-multispecialty",
+      "actors": [
+        "expired-platform-support"
+      ],
+      "preconditions": [
+        "ended support grant"
+      ],
+      "inputEvent": "Reuse ended impersonation",
+      "expectedDatabaseState": "No mutation",
+      "expectedApiResult": "401 or 403",
+      "expectedUiResult": "Access-denied state",
+      "expectedAuditEvents": [
+        "platform.support.denied"
+      ],
+      "expectedAuthorization": "Ended grant cannot reenter tenant",
+      "evidenceStatus": "SPECIFICATION_ONLY",
+      "executableEvidence": [],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "RLS-001",
+      "profile": "EDGE",
+      "tenant": "edge-multitenant",
+      "actors": [
+        "tenant-a-user"
+      ],
+      "preconditions": [
+        "known Tenant B object IDs"
+      ],
+      "inputEvent": "SELECT/list/aggregate/export Tenant B",
+      "expectedDatabaseState": "Zero foreign rows",
+      "expectedApiResult": "404 or empty response",
+      "expectedUiResult": "No foreign data",
+      "expectedAuditEvents": [
+        "security.cross_tenant.denied"
+      ],
+      "expectedAuthorization": "Restricted role and RLS deny access",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/rlsBehavioralCoverage.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "RLS-002",
+      "profile": "EDGE",
+      "tenant": "edge-multitenant",
+      "actors": [
+        "tenant-a-user"
+      ],
+      "preconditions": [
+        "Tenant B parent ID"
+      ],
+      "inputEvent": "INSERT/update/reassign using foreign parent",
+      "expectedDatabaseState": "No invalid relationship",
+      "expectedApiResult": "database denial",
+      "expectedUiResult": "Safe validation error",
+      "expectedAuditEvents": [
+        "security.cross_tenant.denied"
+      ],
+      "expectedAuthorization": "Composite tenant relationship enforced",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/rlsBehavioralCoverage.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "RLS-003",
+      "profile": "EDGE",
+      "tenant": "edge-multitenant",
+      "actors": [
+        "unscoped-runtime"
+      ],
+      "preconditions": [
+        "no tenant GUC"
+      ],
+      "inputEvent": "Run model and raw query",
+      "expectedDatabaseState": "No read or mutation",
+      "expectedApiResult": "fail closed",
+      "expectedUiResult": "No user-visible leakage",
+      "expectedAuditEvents": [
+        "security.context.denied"
+      ],
+      "expectedAuthorization": "No-context runtime cannot access protected tables",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/rlsBehavioralCoverage.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "OPS-001",
+      "profile": "PILOT",
+      "tenant": "pilot-multispecialty",
+      "actors": [
+        "worker"
+      ],
+      "preconditions": [
+        "signed tenant job envelope"
+      ],
+      "inputEvent": "Retry completed job",
+      "expectedDatabaseState": "Single idempotent result",
+      "expectedApiResult": "completed/idempotent",
+      "expectedUiResult": "No duplicate activity",
+      "expectedAuditEvents": [
+        "worker.job.completed"
+      ],
+      "expectedAuthorization": "Worker context derives from verified envelope",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/worker.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "OPS-002",
+      "profile": "EDGE",
+      "tenant": "pilot-multispecialty",
+      "actors": [
+        "browser-user"
+      ],
+      "preconditions": [
+        "network simulator failure"
+      ],
+      "inputEvent": "API request fails",
+      "expectedDatabaseState": "No fabricated database state",
+      "expectedApiResult": "network error",
+      "expectedUiResult": "Truthful retry UI",
+      "expectedAuditEvents": [
+        "client.request.failed"
+      ],
+      "expectedAuthorization": "No authorization fallback",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "tests/e2e/role-route-action-crawl.spec.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    },
+    {
+      "scenarioId": "OPS-003",
+      "profile": "PILOT",
+      "tenant": "pilot-multispecialty",
+      "actors": [
+        "auditor"
+      ],
+      "preconditions": [
+        "months of synthetic audit data"
+      ],
+      "inputEvent": "Search and paginate audit events",
+      "expectedDatabaseState": "No mutation",
+      "expectedApiResult": "200 bounded page",
+      "expectedUiResult": "Stable pagination",
+      "expectedAuditEvents": [
+        "audit.search.performed"
+      ],
+      "expectedAuthorization": "Auditor reads only permitted tenant events",
+      "evidenceStatus": "EXECUTABLE",
+      "executableEvidence": [
+        "server/test/rlsBehavioralCoverage.integration.test.ts"
+      ],
+      "resetStrategy": "DROP_DISPOSABLE_DATABASE"
+    }
+  ]
+}

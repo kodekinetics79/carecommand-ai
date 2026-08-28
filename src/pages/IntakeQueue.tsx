@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useState } from 'react';
-import { ClipboardList, Loader2, CheckCircle2, AlertCircle, Copy, Check, RefreshCw, FileText } from 'lucide-react';
+import { ClipboardList, Loader2, CheckCircle2, AlertCircle, Copy, Check, RefreshCw, FileText, Send } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
+import ModuleTabs from '../components/ui/ModuleTabs';
+import { apiRequest } from '../lib/api';
+import { mapPatient, type ApiPatient } from '../lib/apiAdapters';
 import {
   intakeApi, INTAKE_STATUS_META, SECTION_LABEL,
   type IntakePacket, type IntakePacketDetail,
@@ -12,6 +15,11 @@ export default function IntakeQueue() {
   const [error, setError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string>('');
   const [tab, setTab] = useState<'queue' | 'all'>('queue');
+  // Originate a new intake for a patient (createPacket) directly from the queue.
+  const [patients, setPatients] = useState<ReturnType<typeof mapPatient>[]>([]);
+  const [originatePatientId, setOriginatePatientId] = useState('');
+  const [originating, setOriginating] = useState(false);
+  const [originateNotice, setOriginateNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
 
   const reload = useCallback(async () => {
     try {
@@ -43,17 +51,62 @@ export default function IntakeQueue() {
     return () => { active = false; };
   }, [tab]);
 
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      try {
+        const res = await apiRequest<{ data: ApiPatient[] } | ApiPatient[]>('/v1/patients?limit=200');
+        const rows = Array.isArray(res) ? res : res.data;
+        if (active) setPatients(rows.map(mapPatient));
+      } catch { /* patient list is optional for the queue */ }
+    })();
+    return () => { active = false; };
+  }, []);
+
+  async function originateIntake() {
+    if (!originatePatientId) return;
+    setOriginating(true);
+    setOriginateNotice(null);
+    try {
+      const packet = await intakeApi.createPacket({ patientId: originatePatientId, source: 'staff' });
+      const link = packet.publicUrl || (packet.publicToken ? `/intake/${packet.publicToken}` : null);
+      if (link) await navigator.clipboard.writeText(link).catch(() => undefined);
+      setOriginateNotice({ kind: 'ok', text: link ? 'Intake link created and copied to clipboard.' : 'Intake packet created.' });
+      setOriginatePatientId('');
+      await reload();
+      if (packet.intakePacketId) { setTab('all'); setSelectedId(packet.intakePacketId); }
+    } catch (e) {
+      setOriginateNotice({ kind: 'error', text: e instanceof Error ? e.message : 'Failed to create intake' });
+    } finally {
+      setOriginating(false);
+    }
+  }
+
   return (
     <div className="space-y-6 pb-8">
-      <PageHeader title="Patient Intake" subtitle="Pre-visit intake packets, consent capture, and the staff review queue." badge="New" badgeColor="violet" />
-      <div className="flex items-center gap-1 bg-[var(--s2)] border border-[var(--b1)] p-1 rounded-xl w-max">
-        {(['queue', 'all'] as const).map(t => (
-          <button key={t} type="button" onClick={() => setTab(t)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${tab === t ? 'bg-[var(--indigo)] text-white' : 'text-t3 hover:text-t1'}`}>{t === 'queue' ? 'Review queue' : 'All packets'}</button>
-        ))}
+      <PageHeader title="Patient Intake" subtitle="Pre-visit intake packets, consent capture, and the staff review queue." />
+      <div className="flex items-center gap-3 flex-wrap">
+        <ModuleTabs
+          tabs={[{ id: 'queue', label: 'Review queue' }, { id: 'all', label: 'All packets' }]}
+          activeTab={tab}
+          onChange={id => setTab(id as 'queue' | 'all')}
+          ariaLabel="Intake packet views"
+        />
+        {/* Originate a new intake for a patient (createPacket). */}
+        <div className="flex items-center gap-2 bg-[var(--s2)] border border-[var(--b1)] p-1 rounded-xl">
+          <select aria-label="Patient for new intake" value={originatePatientId} onChange={e => setOriginatePatientId(e.target.value)} className="px-2.5 py-1.5 rounded-lg bg-transparent text-xs text-t1 outline-none max-w-[200px]">
+            <option value="">Send intake to…</option>
+            {patients.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+          <button type="button" disabled={!originatePatientId || originating} onClick={() => void originateIntake()} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-40">
+            <Send className="w-3.5 h-3.5" /> {originating ? 'Sending…' : 'Send intake'}
+          </button>
+        </div>
       </div>
-      {error && <p className="text-sm text-red-v">{error}</p>}
+      {originateNotice && <p role={originateNotice.kind === 'error' ? 'alert' : 'status'} className={`text-xs font-semibold ${originateNotice.kind === 'ok' ? 'text-emerald-v' : 'text-red-v'}`}>{originateNotice.text}</p>}
+      {error && <p role="alert" className="text-sm text-red-v">{error}</p>}
       {loading ? (
-        <div className="cc-card p-10 text-center text-sm text-t3"><Loader2 className="inline w-5 h-5 animate-spin" /></div>
+        <div className="cc-card p-10 text-center text-sm text-t3" role="status" aria-label="Loading intake packets"><Loader2 className="inline w-5 h-5 animate-spin" /></div>
       ) : (
         <div className="grid lg:grid-cols-[320px_1fr] gap-5">
           <div className="cc-card p-3 space-y-1.5 h-max">

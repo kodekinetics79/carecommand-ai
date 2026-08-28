@@ -3,7 +3,7 @@
  * Auth Hardening Phase A verification.
  *   npx tsx server/modules/auth/auth.verify.ts
  * Proves lockout, no-leak, password reset (hashed/single-use/expiry), MFA TOTP,
- * requireMfa login gating, session timeout, audit writes, truthful reports,
+ * requireMfa login gating, access-token lifetime, audit writes, truthful reports,
  * and that existing login still works.
  */
 import 'dotenv/config';
@@ -127,9 +127,9 @@ async function main() {
   const forcedVerify = await post('/mfa/verify', { code: generateTotp(forcedSetup.secret) }, bearer(setupReqBody.mfaToken));
   check('forced MFA setup → verify issues session', forcedVerify.statusCode === 200 && !!JSON.parse(forcedVerify.body).accessToken);
 
-  // 9) Session timeout honoured (tenant A = 30 min)
+  // 9) Access-token lifetime honoured (tenant A = 30 min)
   const sessInfo = JSON.parse((await get('/session-info', bearer(accessToken))).body);
-  check('session timeout reflects tenant policy (30 min)', sessInfo.accessTokenTtlMinutes === 30 && sessInfo.accountLockoutEnabled === true);
+  check('access-token lifetime reflects tenant policy (30 min)', sessInfo.accessTokenTtlMinutes === 30 && sessInfo.accountLockoutEnabled === true);
 
   // 10) Audit events recorded
   const actions = (await ownerDb.auditEvent.findMany({ where: { tenantId: { in: [tA, tB] } }, select: { action: true } })).map(a => a.action);

@@ -9,15 +9,56 @@ export interface ThresholdBand { min: number; max: number; critMin: number; crit
 export const DEFAULT_THRESHOLDS: Record<string, ThresholdBand> = {
   glucose:        { min: 70,  max: 180, critMin: 54,  critMax: 300, unit: 'mg/dL', label: 'Glucose' },
   blood_pressure: { min: 90,  max: 140, critMin: 80,  critMax: 180, unit: 'mmHg',  label: 'Blood pressure (systolic)' },
+  // Diastolic bands mirror standard hypertensive-crisis thresholds: ≥120 is a
+  // crisis (critical), 90–119 is elevated/stage-2 (high), <60 is hypotensive.
+  // Evaluated ALONGSIDE systolic — the worst of the two wins for blood_pressure.
+  blood_pressure_diastolic: { min: 60, max: 90, critMin: 40, critMax: 120, unit: 'mmHg', label: 'Blood pressure (diastolic)' },
   oxygen:         { min: 92,  max: 100, critMin: 88,  critMax: 101, unit: '%',     label: 'Oxygen saturation' },
   heart_rate:     { min: 50,  max: 110, critMin: 40,  critMax: 130, unit: 'bpm',   label: 'Heart rate' },
   temperature:    { min: 35.5, max: 38, critMin: 35,  critMax: 39.5, unit: '°C',   label: 'Temperature' },
 };
 
+// ── Weight change bands (CHF fluid-overload early warning) ───────────────────
+// Congestive-heart-failure guidance treats rapid weight gain as a fluid-overload
+// signal. Standard patient-education thresholds: ≥3 lb (1.4 kg) in a day or ≥5 lb
+// (2.3 kg) in a week over the patient's recent baseline warrants clinical review.
+// LIMITATION: weight has no single absolute "safe band" — a reading is only
+// meaningful as a DELTA vs the patient's own recent readings, so this requires a
+// baseline. With no baseline we record for trend tracking (no alert). Absolute
+// values are compared in kg; readings in lb are converted before comparison.
+export const WEIGHT_DAILY_GAIN_KG = 1.4;   // ~3 lb / 24h
+export const WEIGHT_WEEKLY_GAIN_KG = 2.3;  // ~5 lb / 7d
+export const WEIGHT_DAILY_WINDOW_HOURS = 36;   // "recent" baseline must be within ~1.5 days
+export const WEIGHT_WEEKLY_WINDOW_HOURS = 8 * 24; // weekly baseline drawn from up to 8 days back
+
+// ── ECG abnormal classifications ─────────────────────────────────────────────
+// ECG has no numeric band — it alerts on the device-supplied rhythm
+// classification. AFib / flutter are the highest-acuity single-lead findings and
+// route as critical; other irregular rhythms route as high for nurse review.
+const ECG_CRITICAL = ['afib', 'atrial fibrillation', 'a-fib', 'flutter', 'vfib', 'v-fib', 'ventricular fibrillation', 'vtach', 'ventricular tachycardia'];
+const ECG_HIGH = ['irregular', 'abnormal', 'bradycardia', 'brady', 'tachycardia', 'tachy', 'pause', 'pvc', 'ectopic', 'inconclusive'];
+const ECG_NORMAL = ['normal', 'sinus', 'sinus rhythm', 'nsr', 'ok', 'regular'];
+
 export type Severity = 'normal' | 'warning' | 'high' | 'critical';
 
 export interface RuleLike {
   minValue: number | null; maxValue: number | null; criticalMin: number | null; criticalMax: number | null;
+}
+
+// Optional per-reading context the callers assemble (diastolic value, ECG rhythm
+// classification, weight baselines). Keeps evaluateSeverity a pure function while
+// letting it evaluate the reading types that need more than a single number.
+export interface EvalContext {
+  valueSecondary?: number | null;        // diastolic (mmHg) for blood_pressure
+  ecgClassification?: string | null;     // rhythm label/flag for ecg
+  unit?: string | null;                  // source unit (used to normalize weight)
+  weight?: { recentKg?: number | null; weekAgoKg?: number | null } | null;
+}
+
+function toKg(value: number, unit: string | null | undefined): number {
+  const u = (unit ?? '').toLowerCase();
+  if (u === 'lb' || u === 'lbs' || u === 'pound' || u === 'pounds') return value * 0.45359237;
+  return value; // assume kg (canonical)
 }
 
 /**
@@ -41,37 +82,129 @@ export async function resolveRule(tenantId: string, opts: { readingType: string;
     .sort((a, b) => b.s - a.s || b.r.priority - a.r.priority)[0]?.r ?? null;
 }
 
+const WORSE = (a: Severity, b: Severity): Severity => (SEVERITY_RANK[a] >= SEVERITY_RANK[b] ? a : b);
+
 /**
- * Decide severity for a numeric reading. Backend-only — the frontend never
- * computes this. Returns severity + a human-readable operational reason.
+ * Score a single numeric value against a named default band (optionally
+ * overridden by a patient/branch/org rule). Pure. Used for every scalar reading
+ * type and for each half of a blood-pressure reading.
  */
-export function evaluateSeverity(readingType: string, numericValue: number | null, rule: RuleLike | null): { severity: Severity; reason: string } {
-  const band = DEFAULT_THRESHOLDS[readingType];
-  if (numericValue == null || (!band && !rule)) {
-    return { severity: 'normal', reason: 'No threshold configured — recorded for trend tracking.' };
-  }
+function scoreNumericBand(bandKey: string, value: number, rule: RuleLike | null): { severity: Severity; reason: string } {
+  const band = DEFAULT_THRESHOLDS[bandKey];
   const min = rule?.minValue ?? band?.min ?? -Infinity;
   const max = rule?.maxValue ?? band?.max ?? Infinity;
   const critMin = rule?.criticalMin ?? band?.critMin ?? -Infinity;
   const critMax = rule?.criticalMax ?? band?.critMax ?? Infinity;
   const unit = band?.unit ?? '';
-  const label = band?.label ?? readingType;
+  const label = band?.label ?? bandKey;
 
-  if (numericValue <= critMin || numericValue >= critMax) {
-    return { severity: 'critical', reason: `${label} ${numericValue}${unit} is in the critical range (safe band ${min}–${max}${unit}). Doctor review needed.` };
+  if (value <= critMin || value >= critMax) {
+    return { severity: 'critical', reason: `${label} ${value}${unit} is in the critical range (safe band ${min}–${max}${unit}). Doctor review needed.` };
   }
-  if (numericValue < min || numericValue > max) {
-    return { severity: 'high', reason: `${label} ${numericValue}${unit} is outside the expected range (${min}–${max}${unit}). Nurse follow-up recommended.` };
+  if (value < min || value > max) {
+    return { severity: 'high', reason: `${label} ${value}${unit} is outside the expected range (${min}–${max}${unit}). Nurse follow-up recommended.` };
   }
-  // Borderline within 5% of a bound → warning.
   const span = (max - min) || 1;
-  if (numericValue - min < span * 0.05 || max - numericValue < span * 0.05) {
-    return { severity: 'warning', reason: `${label} ${numericValue}${unit} is near the edge of the expected range (${min}–${max}${unit}). Monitor next reading.` };
+  if (value - min < span * 0.05 || max - value < span * 0.05) {
+    return { severity: 'warning', reason: `${label} ${value}${unit} is near the edge of the expected range (${min}–${max}${unit}). Monitor next reading.` };
   }
-  return { severity: 'normal', reason: `${label} ${numericValue}${unit} within expected range.` };
+  return { severity: 'normal', reason: `${label} ${value}${unit} within expected range.` };
+}
+
+/**
+ * Score an ECG reading from its device-supplied rhythm classification. AFib /
+ * flutter → critical; other irregular findings → high; normal/sinus → normal.
+ * An unrecognized/absent classification is not scored (recorded for trend).
+ */
+export function evaluateEcg(classification: string | null | undefined): { severity: Severity; reason: string } {
+  const c = (classification ?? '').trim().toLowerCase();
+  if (!c) return { severity: 'normal', reason: 'ECG recorded — no rhythm classification supplied, held for clinician review.' };
+  if (ECG_CRITICAL.some(k => c.includes(k))) return { severity: 'critical', reason: `ECG rhythm "${classification}" is a high-acuity finding (AFib/flutter class). Doctor review needed.` };
+  if (ECG_HIGH.some(k => c.includes(k))) return { severity: 'high', reason: `ECG rhythm "${classification}" is abnormal/irregular. Nurse follow-up recommended.` };
+  if (ECG_NORMAL.some(k => c.includes(k))) return { severity: 'normal', reason: `ECG rhythm "${classification}" within normal sinus range.` };
+  // Unknown label — do not fabricate a normal result; flag for a human to read.
+  return { severity: 'warning', reason: `ECG rhythm "${classification}" unrecognized — monitor and confirm.` };
+}
+
+/**
+ * Score a weight reading as a CHF fluid-overload delta vs the patient's recent
+ * baseline. Rapid gain (≥1.4 kg/day or ≥2.3 kg/week) → high; rapid loss over the
+ * weekly window → high (dehydration/over-diuresis). No baseline → normal.
+ */
+export function evaluateWeight(currentKg: number, ctx: { recentKg?: number | null; weekAgoKg?: number | null } | null | undefined): { severity: Severity; reason: string } {
+  const r1 = Math.round(currentKg * 10) / 10;
+  if (ctx?.recentKg != null) {
+    const delta = currentKg - ctx.recentKg;
+    if (delta >= WEIGHT_DAILY_GAIN_KG) return { severity: 'high', reason: `Weight ${r1}kg is up ${(Math.round(delta * 10) / 10)}kg since the last reading (≥${WEIGHT_DAILY_GAIN_KG}kg/day) — possible fluid overload. Nurse follow-up recommended.` };
+  }
+  if (ctx?.weekAgoKg != null) {
+    const delta = currentKg - ctx.weekAgoKg;
+    if (delta >= WEIGHT_WEEKLY_GAIN_KG) return { severity: 'high', reason: `Weight ${r1}kg is up ${(Math.round(delta * 10) / 10)}kg over the past week (≥${WEIGHT_WEEKLY_GAIN_KG}kg/week) — possible fluid overload. Nurse follow-up recommended.` };
+    if (delta <= -WEIGHT_WEEKLY_GAIN_KG) return { severity: 'high', reason: `Weight ${r1}kg is down ${(Math.round(-delta * 10) / 10)}kg over the past week (≥${WEIGHT_WEEKLY_GAIN_KG}kg/week) — possible dehydration/over-diuresis. Nurse follow-up recommended.` };
+  }
+  return { severity: 'normal', reason: ctx?.recentKg != null || ctx?.weekAgoKg != null ? `Weight ${r1}kg stable vs recent baseline.` : `Weight ${r1}kg recorded — no baseline yet, held for trend tracking.` };
+}
+
+/**
+ * Decide severity for a reading. Backend-only — the frontend never computes
+ * this. Dispatches by reading type: blood_pressure evaluates systolic AND
+ * diastolic (worst wins), ecg uses rhythm classification, weight uses a baseline
+ * delta, everything else is a single numeric band. Returns severity + reason.
+ */
+export function evaluateSeverity(readingType: string, numericValue: number | null, rule: RuleLike | null, ctx?: EvalContext): { severity: Severity; reason: string } {
+  if (readingType === 'ecg') {
+    // ECG carries no numeric band; the classification (or the raw value string) is the signal.
+    return evaluateEcg(ctx?.ecgClassification);
+  }
+  if (readingType === 'weight') {
+    if (numericValue == null) return { severity: 'normal', reason: 'No weight value — recorded for trend tracking.' };
+    return evaluateWeight(toKg(numericValue, ctx?.unit), ctx?.weight);
+  }
+  if (readingType === 'blood_pressure') {
+    if (numericValue == null && ctx?.valueSecondary == null) {
+      return { severity: 'normal', reason: 'No blood-pressure value — recorded for trend tracking.' };
+    }
+    const systolic = numericValue != null ? scoreNumericBand('blood_pressure', numericValue, rule) : { severity: 'normal' as Severity, reason: '' };
+    // Diastolic uses the dedicated default band (rule min/max target systolic).
+    const diastolic = ctx?.valueSecondary != null ? scoreNumericBand('blood_pressure_diastolic', ctx.valueSecondary, null) : { severity: 'normal' as Severity, reason: '' };
+    const worst = WORSE(systolic.severity, diastolic.severity);
+    if (worst === 'normal') return { severity: 'normal', reason: 'Blood pressure within expected range.' };
+    // Surface whichever half drove the severity (prefer the worse; tie → mention both).
+    const reason = systolic.severity === worst && diastolic.severity === worst && systolic.reason && diastolic.reason
+      ? `${systolic.reason} ${diastolic.reason}`
+      : (systolic.severity === worst ? systolic.reason : diastolic.reason);
+    return { severity: worst, reason };
+  }
+
+  const band = DEFAULT_THRESHOLDS[readingType];
+  if (numericValue == null || (!band && !rule)) {
+    return { severity: 'normal', reason: 'No threshold configured — recorded for trend tracking.' };
+  }
+  return scoreNumericBand(readingType, numericValue, rule);
 }
 
 export const SEVERITY_RANK: Record<string, number> = { normal: 0, warning: 1, high: 2, critical: 3 };
+
+/**
+ * Assemble the recent weight baselines (in kg) for a patient so evaluateWeight
+ * can compute a CHF delta. Returns the most recent prior valid weight reading
+ * within the daily window and the oldest within the weekly window. Prior
+ * readings only (strictly before `before`) so a reading never compares to itself.
+ */
+export async function weightBaselines(tenantId: string, patientId: string, before: Date): Promise<{ recentKg: number | null; weekAgoKg: number | null }> {
+  const weekStart = new Date(before.getTime() - WEIGHT_WEEKLY_WINDOW_HOURS * 36e5);
+  const dayStart = new Date(before.getTime() - WEIGHT_DAILY_WINDOW_HOURS * 36e5);
+  const rows = await db.deviceReading.findMany({
+    where: { tenantId, patientId, readingType: 'weight', validationStatus: 'valid', numericValue: { not: null }, capturedAt: { gte: weekStart, lt: before } },
+    orderBy: { capturedAt: 'desc' },
+    select: { numericValue: true, unit: true, capturedAt: true },
+  });
+  if (!rows.length) return { recentKg: null, weekAgoKg: null };
+  const kg = (r: { numericValue: number | null; unit: string | null }) => (r.numericValue == null ? null : toKg(r.numericValue, r.unit));
+  const recent = rows.find(r => r.capturedAt >= dayStart) ?? null; // most recent within ~1.5 days
+  const weekAgo = rows[rows.length - 1]; // oldest in the weekly window
+  return { recentKg: recent ? kg(recent) : null, weekAgoKg: kg(weekAgo) };
+}
 
 /**
  * Aggregate operational risk per patient from open alerts + recent readings +

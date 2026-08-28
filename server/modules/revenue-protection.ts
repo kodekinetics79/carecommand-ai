@@ -5,12 +5,19 @@ import { env } from '../config/env';
 import { db } from '../lib/db';
 import { audit } from '../lib/audit';
 import { assertBranchAccess } from '../lib/scope';
-import { requireRoles } from '../plugins/roles';
+import { requirePermission } from '../lib/permissions';
 import { requireFeature } from '../lib/entitlements';
-import { runWithTenantContext } from '../lib/tenantContext';
+import { enterTenantContext, runWithTenantContext } from '../lib/tenantContext';
+import { resolveIngressTenant } from '../lib/tenantIngressResolvers';
 import { recordWorkflowEvent, emitBusinessEvent } from '../lib/intelligence';
 import { eligibilityProviderStatus, runDenialPreventionForAppointment } from '../lib/insuranceIntelligence';
+import { paymentProviderStatus } from '../lib/deposits';
 import type { Prisma } from '../generated/prisma/client';
+import {
+  EligibilityExecutionConflictError,
+  eligibilityIdempotencyKey,
+  runEligibilityExecution,
+} from '../lib/eligibilityExecution';
 
 // --- Idempotency -----------------------------------------------------------
 // Claims a unique (scope,key). Returns claimed=false on redelivery, exposing
@@ -31,6 +38,25 @@ export async function claimIdempotency(scope: string, key: string, tenantId?: st
 
 async function recordIdempotencyResult(scope: string, key: string, resultId: string) {
   await db.idempotencyKey.updateMany({ where: { scope, key }, data: { resultId } });
+}
+
+async function lockStripeReconciliation(
+  tx: Prisma.TransactionClient,
+  eventId: string,
+  paymentRequestId: string,
+): Promise<{ eventComplete: boolean; paymentStatus: string | null }> {
+  // Event serialization prevents simultaneous delivery of the same Stripe event
+  // from treating an in-progress claim as a crashed attempt. Request serialization
+  // also collapses related Stripe event types (for example Checkout Session and
+  // PaymentIntent success events) onto one payment state-machine transition.
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${'stripe.webhook:' + eventId}, 0))`;
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${'payment.request:' + paymentRequestId}, 0))`;
+  const claim = await tx.idempotencyKey.findUnique({
+    where: { scope_key: { scope: 'stripe.webhook', key: eventId } },
+    select: { resultId: true },
+  });
+  const payment = await tx.paymentRequest.findUnique({ where: { id: paymentRequestId }, select: { status: true } });
+  return { eventComplete: Boolean(claim?.resultId), paymentStatus: payment?.status ?? null };
 }
 
 // --- Stripe signature verification (no SDK; manual HMAC per Stripe spec) ----
@@ -57,6 +83,12 @@ function verifyStripeSignature(rawBody: Buffer | undefined, signatureHeader: str
 }
 
 export type ProviderMode = 'mock' | 'sandbox' | 'live';
+export class ProviderOperationError extends Error {
+  constructor(public readonly provider: string, operation: string) {
+    super(`${provider} ${operation} is unavailable`);
+    this.name = 'ProviderOperationError';
+  }
+}
 type EligibilityPayload = {
   [key: string]: unknown;
   benefitsInformation?: Record<string, unknown> | Record<string, unknown>[];
@@ -87,13 +119,20 @@ const listLimit = z.object({
   appointmentId: uuid.optional(),
 });
 
-const editRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK');
-const adminRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
+const billingRead = requirePermission('billing:read');
+const billingWrite = requirePermission('billing:write');
+// Segregation of duties: marking money as COLLECTED (which mints a succeeded
+// transaction / settles a deposit with no real money movement) is a controller
+// action. FRONT_DESK may edit non-financial status but must NOT self-attest a
+// collection — mirrors the deposit-waiver gate, which also excludes FRONT_DESK.
+const COLLECT_PRIVILEGED_ROLES = ['OWNER', 'ADMIN', 'MANAGER', 'BILLING'] as const;
+// Constrained, auditable status vocabularies (no unvalidated free-string status).
+const PAYMENT_REQUEST_STATUSES = ['pending', 'link_sent', 'collected', 'failed', 'expired', 'cancelled', 'refunded'] as const;
+const DEPOSIT_REQUIREMENT_STATUSES = ['required', 'requested', 'link_sent', 'collected', 'waived', 'cancelled', 'failed', 'expired', 'refunded'] as const;
 // Payments & deposits routes additionally require the payments_deposits entitlement.
 const paymentsFeature = requireFeature('payments_deposits');
 // Insurance/eligibility routes require the insurance_eligibility entitlement.
 const insuranceFeature = requireFeature('insurance_eligibility');
-const insuranceWriteRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'FRONT_DESK');
 
 type RevenueContext = {
   tenantId: string;
@@ -101,6 +140,7 @@ type RevenueContext = {
 };
 
 type EligibilityCheckContext = RevenueContext & {
+  providerExecutionKey?: string;
   serviceType?: string;
   patient?: {
     id: string;
@@ -200,6 +240,8 @@ type EligibilityOutcome = {
   eligibilityMessage: string;
   payerReference: string;
   checkedAt: string;
+  effectiveFrom: string | null;
+  expiresAt: string | null;
   providerMode: ProviderMode;
   providerName: string;
   needsPriorAuth: boolean;
@@ -208,8 +250,18 @@ type EligibilityOutcome = {
   riskLevel: 'LOW' | 'MEDIUM' | 'HIGH';
   recommendedAction: string;
   revenueAtRisk: number;
+  // Honesty flags: when the live payer 271 omits a benefit field we do NOT invent a
+  // number. `missingBenefitFields` names the omitted fields and `benefitDataIncomplete`
+  // marks the estimate as incomplete so no fabricated dollar figure is shown as real.
+  benefitDataIncomplete: boolean;
+  missingBenefitFields: string[];
   rawResponse?: unknown;
   storeRawResponse: boolean;
+};
+
+export type EligibilityReconciliationCapability = {
+  verifiedResponseLookupSupported: boolean;
+  resolutionPath: 'provider_lookup' | 'manual_payer_evidence';
 };
 
 export type PaymentOutcome = {
@@ -239,6 +291,27 @@ function toNumber(value: unknown) {
 
 function asRecord(value: unknown) {
   return value && typeof value === 'object' ? value as Record<string, unknown> : {};
+}
+
+// --- Money helpers ---------------------------------------------------------
+// Preserve cents. `Math.round(amount)` (whole dollars) silently overbills — a
+// $45.50 charge became $46 and a 15%-of-$150 = $22.50 deposit became $23. Money
+// amounts are rounded to 2 decimals; Stripe minor units are the exact integer
+// cents (`Math.round(amount * 100)`), never `roundedDollars * 100`.
+export function roundMoney(amount: number): number {
+  const value = Number.isFinite(amount) ? amount : 0;
+  return Math.max(0, Math.round(value * 100) / 100);
+}
+export function toMinorUnits(amount: number): string {
+  const value = Number.isFinite(amount) ? amount : 0;
+  return String(Math.max(0, Math.round(value * 100)));
+}
+
+// Decrement a patient's outstanding balance by a collected amount, clamped at 0
+// (the column has a non-negative CHECK constraint). Tenant-scoped. Returns a
+// Runs on the caller's transaction client when atomic with a collection.
+function decrementOutstandingBalance(tenantId: string, patientId: string, amount: number, client: Prisma.TransactionClient = db) {
+  return client.$executeRaw`UPDATE "Patient" SET "outstandingBalance" = GREATEST(0, "outstandingBalance" - ${amount}::numeric) WHERE "id" = ${patientId}::uuid AND "tenantId" = ${tenantId}::uuid`;
 }
 
 async function fetchJsonWithTimeout(url: string, init: RequestInit, timeoutMs = 6000) {
@@ -348,6 +421,7 @@ async function resolveBranchIdAndEntities(request: FastifyRequest, context: Reve
     noShowRisk: number;
     providerRef?: string | null;
   };
+  let appointmentPatientId: string | null = null;
 
   if (input.patientId) {
     const row = await db.patient.findFirst({
@@ -366,6 +440,7 @@ async function resolveBranchIdAndEntities(request: FastifyRequest, context: Reve
       },
     });
     if (row) {
+      assertBranchAccess(request, row.branchId);
       patient = {
         ...row,
         outstandingBalance: toNumber(row.outstandingBalance),
@@ -390,6 +465,8 @@ async function resolveBranchIdAndEntities(request: FastifyRequest, context: Reve
     });
     if (row) {
       const { patientId: rowPatientId, ...rest } = row;
+      assertBranchAccess(request, row.branchId);
+      appointmentPatientId = rowPatientId;
       appointment = {
         ...rest,
         value: toNumber(row.value),
@@ -407,18 +484,52 @@ async function resolveBranchIdAndEntities(request: FastifyRequest, context: Reve
     }
   }
 
+  if (patient && appointment && appointmentPatientId && patient.id !== appointmentPatientId) {
+    throw request.server.httpErrors.badRequest('Patient and appointment do not belong together');
+  }
+  if (patient && appointment && patient.branchId !== appointment.branchId) {
+    throw request.server.httpErrors.badRequest('Patient and appointment must belong to the same branch');
+  }
+  if (input.branchId && patient && input.branchId !== patient.branchId) {
+    throw request.server.httpErrors.badRequest('Patient does not belong to the selected branch');
+  }
+  if (input.branchId && appointment && input.branchId !== appointment.branchId) {
+    throw request.server.httpErrors.badRequest('Appointment does not belong to the selected branch');
+  }
+
   const resolvedBranchId = branchId ?? appointment?.branchId ?? patient?.branchId;
   if (!resolvedBranchId) {
     return { branchId: context.branchId ?? request.auth.branchId ?? input.branchId ?? '', patient, appointment };
   }
+  assertBranchAccess(request, resolvedBranchId);
   return { branchId: resolvedBranchId, patient, appointment };
 }
 
-async function ensurePolicy(context: RevenueContext, entities: Awaited<ReturnType<typeof resolveBranchIdAndEntities>>, payerId?: string) {
-  if (!entities.patient) return null;
+async function resolveDepositRuleForBranch(request: FastifyRequest, depositRuleId: string | undefined, branchId: string) {
+  if (!depositRuleId) return null;
+  const rule = await runWithTenantContext(request.auth.tenantId, tx => tx.depositRule.findFirst({
+    where: { id: depositRuleId, tenantId: request.auth.tenantId },
+  }));
+  if (!rule) throw request.server.httpErrors.notFound('Deposit rule not found');
+  if (rule.branchId) {
+    assertBranchAccess(request, rule.branchId);
+    if (rule.branchId !== branchId) {
+      throw request.server.httpErrors.badRequest('Deposit rule does not belong to the selected branch');
+    }
+  }
+  return rule;
+}
 
+async function ensurePolicy(context: RevenueContext, entities: Awaited<ReturnType<typeof resolveBranchIdAndEntities>>, payerId?: string, policyId?: string) {
+  if (!entities.patient) return null;
+  const now = new Date();
   const existing = await db.patientInsurancePolicy.findFirst({
-    where: { tenantId: context.tenantId, patientId: entities.patient.id, active: true },
+    where: {
+      tenantId: context.tenantId, branchId: entities.branchId, patientId: entities.patient.id, active: true,
+      effectiveFrom: { lte: now }, OR: [{ effectiveTo: null }, { effectiveTo: { gt: now } }],
+      ...(policyId ? { id: policyId } : payerId ? { payerId } : { coverageOrder: 1 }),
+    },
+    orderBy: [{ coverageOrder: 'asc' }, { effectiveFrom: 'desc' }],
     include: { payer: { select: { id: true, name: true, tradingPartnerServiceId: true, sourceProvider: true } } },
   });
 
@@ -433,36 +544,7 @@ async function ensurePolicy(context: RevenueContext, entities: Awaited<ReturnTyp
     };
   }
 
-  const payer = payerId
-    ? await db.insurancePayer.findFirst({ where: { id: payerId, tenantId: context.tenantId, active: true } })
-    : await db.insurancePayer.findFirst({ where: { tenantId: context.tenantId, active: true }, orderBy: { sortOrder: 'asc' } });
-
-  const created = await db.patientInsurancePolicy.create({
-    data: {
-      tenantId: context.tenantId,
-      branchId: entities.branchId,
-      patientId: entities.patient.id,
-      payerId: payer?.id,
-      planName: payer?.name ? `${payer.name} Standard` : 'Demo Health Plan',
-      memberId: `TEST-${entities.patient.id.slice(0, 8).toUpperCase()}`,
-      groupNumber: 'GRP-TEST-001',
-      relationship: 'self',
-      subscriberName: `${entities.patient.firstName} ${entities.patient.lastName}`,
-      payerReference: payer?.tradingPartnerServiceId ?? `TEST-${randomUUID().slice(0, 8).toUpperCase()}`,
-      verificationStatus: 'pending',
-      active: true,
-    },
-    include: { payer: { select: { id: true, name: true, tradingPartnerServiceId: true, sourceProvider: true } } },
-  });
-
-  return {
-    id: created.id,
-    planName: created.planName,
-    memberId: created.memberId,
-    groupNumber: created.groupNumber,
-    subscriberName: created.subscriberName,
-    payer: created.payer,
-  };
+  return null;
 }
 
 function mapPayer(row: {
@@ -487,6 +569,10 @@ class MockEligibilityProvider {
   providerKey = 'mock';
   displayName = 'Mock Eligibility';
   mode: ProviderMode = 'mock';
+  reconciliationCapability: EligibilityReconciliationCapability = {
+    verifiedResponseLookupSupported: false,
+    resolutionPath: 'manual_payer_evidence',
+  };
 
   async getPayerList(context: RevenueContext) {
     const rows = await db.insurancePayer.findMany({
@@ -530,6 +616,8 @@ class MockEligibilityProvider {
       eligibilityMessage: deriveCoverageMessage({ coverageActive, copay, deductibleRemaining, needsPriorAuth, benefitUncertainty }),
       payerReference: context.policy?.memberId ? `${payerName}-${context.policy.memberId}` : inferPayerReference({ payerName, patientId: patient?.id, appointmentId: appointment?.id }),
       checkedAt: new Date().toISOString(),
+      effectiveFrom: null,
+      expiresAt: null,
       providerMode: this.mode,
       providerName: this.displayName,
       needsPriorAuth,
@@ -538,6 +626,8 @@ class MockEligibilityProvider {
       riskLevel,
       recommendedAction,
       revenueAtRisk,
+      benefitDataIncomplete: false,
+      missingBenefitFields: [],
       storeRawResponse: false,
     };
   }
@@ -547,14 +637,34 @@ class MockEligibilityProvider {
   }
 }
 
-class StediEligibilityProvider extends MockEligibilityProvider {
+const manualEvidenceOnlyCapability = Object.freeze<EligibilityReconciliationCapability>({
+  verifiedResponseLookupSupported: false,
+  resolutionPath: 'manual_payer_evidence',
+});
+
+const eligibilityReconciliationCapabilities = {
+  mock: manualEvidenceOnlyCapability,
+  stedi: manualEvidenceOnlyCapability,
+  availity: manualEvidenceOnlyCapability,
+  pverify: manualEvidenceOnlyCapability,
+  optum: manualEvidenceOnlyCapability,
+} satisfies Record<string, EligibilityReconciliationCapability>;
+
+export function eligibilityProviderReconciliationCapability(providerKey: string): EligibilityReconciliationCapability {
+  // Each shipped adapter declares whether it has a verified response retrieval
+  // API. Unknown/historical adapters fail closed to durable manual evidence.
+  return eligibilityReconciliationCapabilities[providerKey as keyof typeof eligibilityReconciliationCapabilities]
+    ?? manualEvidenceOnlyCapability;
+}
+
+export class StediEligibilityProvider extends MockEligibilityProvider {
   providerKey = 'stedi';
   displayName = 'Stedi Eligibility';
   mode: ProviderMode = env.STEDI_TEST_MODE ? 'sandbox' : 'live';
 
   async runEligibilityCheck(context: EligibilityCheckContext): Promise<EligibilityOutcome> {
     if (!env.STEDI_API_KEY) {
-      return super.runEligibilityCheck(context);
+      throw new Error('Stedi eligibility is not configured');
     }
 
     try {
@@ -569,7 +679,7 @@ class StediEligibilityProvider extends MockEligibilityProvider {
         memberId: context.policy?.memberId ?? `TEST-${randomUUID().slice(0, 8).toUpperCase()}`,
       };
       const requestBody = {
-        controlNumber: randomUUID().replace(/-/g, '').slice(0, 12),
+        controlNumber: (context.providerExecutionKey ?? randomUUID()).replace(/-/g, '').slice(0, 12),
         tradingPartnerServiceId: payer?.tradingPartnerServiceId ?? 'TEST',
         provider: {
           organizationName: 'CareCommand Clinic',
@@ -590,12 +700,12 @@ class StediEligibilityProvider extends MockEligibilityProvider {
         body: JSON.stringify(requestBody),
       });
       if (!response.ok) {
-        return super.runEligibilityCheck(context);
+        throw new Error(`Stedi eligibility request failed with status ${response.status}`);
       }
 
       return this.normalizeEligibilityResponse(payload, context);
-    } catch {
-      return super.runEligibilityCheck(context);
+    } catch (error) {
+      throw error instanceof Error ? error : new Error('Stedi eligibility request failed');
     }
   }
 
@@ -607,45 +717,63 @@ class StediEligibilityProvider extends MockEligibilityProvider {
     const deductible = asRecord(benefits.deductible);
     const officeVisit = asRecord(benefits.officeVisit);
     const benefitsSummary = asRecord(benefits.benefits);
-    const statusText = String(
+    const rawStatus =
       benefits.coverageStatus ??
       benefits.eligibilityStatus ??
       payload.coverageStatus ??
-      payload.status ??
-      'active',
-    ).toLowerCase();
-    const coverageActive = statusText.includes('active') || statusText.includes('verified') || statusText.includes('covered');
+      payload.status;
+    const statusText = typeof rawStatus === 'string' ? rawStatus.trim().toLowerCase() : '';
+    const explicitlyInactive = /(^|\b)(inactive|terminated|invalid|not covered|denied)(\b|$)/.test(statusText);
+    const coverageActive = !explicitlyInactive && /(^|\b)(active|verified|covered)(\b|$)/.test(statusText);
+    const coverageStatusUncertain = !coverageActive && !explicitlyInactive;
     const planName = String(benefits.planName ?? benefits.planDescription ?? context.policy?.planName ?? 'Stedi Health Plan');
     const payerName = String(benefits.payerName ?? benefits.payer ?? context.payer?.name ?? 'Stedi Test Payer');
     const memberId = String(benefits.memberId ?? context.policy?.memberId ?? inferPayerReference({ payerName, patientId: context.patient?.id, appointmentId: context.appointment?.id }));
-    const copay = toNumber(
+    // Honesty (P0): do NOT invent coverage numbers. A real 271 that omits copay /
+    // deductible / coinsurance is reported as UNKNOWN — never backfilled with a
+    // fabricated dollar figure (previously 25 / 850 / 0.2) presented as real coverage.
+    const copayRaw =
       benefits.copay ??
       benefits.copayAmount ??
       patientResponsibility.copay ??
       asRecord(benefits.financialResponsibility).copayAmount ??
       officeVisit.copay ??
-      25,
-    );
-    const deductibleRemaining = toNumber(
+      null;
+    const deductibleRaw =
       benefits.deductibleRemaining ??
       deductible.remaining ??
       deductible.remainingAmount ??
       benefitsSummary.deductibleRemaining ??
-      850,
-    );
-    const coinsurance = toNumber(
+      null;
+    const coinsuranceRaw =
       benefits.coinsurance ??
       benefits.coInsurance ??
       patientResponsibility.coinsurance ??
-      0.2,
-    );
+      null;
+    const missingBenefitFields: string[] = [];
+    if (copayRaw == null) missingBenefitFields.push('copay');
+    if (deductibleRaw == null) missingBenefitFields.push('deductibleRemaining');
+    if (coinsuranceRaw == null) missingBenefitFields.push('coinsurance');
+    const benefitDataIncomplete = missingBenefitFields.length > 0;
+    // For internal risk math an unknown field is treated as 0 (a conservative,
+    // non-fabricated placeholder), but it is flagged unknown to every consumer.
+    const copay = toNumber(copayRaw ?? 0);
+    const deductibleRemaining = toNumber(deductibleRaw ?? 0);
+    const coinsurance = toNumber(coinsuranceRaw ?? 0);
     const needsPriorAuth = String(
       benefits.authorizationRequired ??
       benefits.priorAuthorizationRequired ??
       payload.authorizationRequired ??
       '',
     ).toLowerCase().includes('true') || deductibleRemaining > 1600 || /surgery|injection|procedure|botox|laser|consultation/i.test(serviceName);
-    const benefitUncertainty = !response || !Object.keys(payload).length || Boolean(payload.warnings?.length);
+    const benefitUncertainty = !response || !Object.keys(payload).length || Boolean(payload.warnings?.length) || benefitDataIncomplete || coverageStatusUncertain;
+    const parsePayerDate = (value: unknown): string | null => {
+      if (typeof value !== 'string' || !value.trim()) return null;
+      const parsed = new Date(value);
+      return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+    };
+    const effectiveFrom = parsePayerDate(benefits.effectiveFrom ?? benefits.effectiveDate ?? payload.effectiveFrom ?? payload.effectiveDate);
+    const expiresAt = parsePayerDate(benefits.expiresAt ?? benefits.terminationDate ?? benefits.endDate ?? payload.expiresAt ?? payload.terminationDate ?? payload.endDate);
     const payerReference = String(
       benefits.payerReference ??
       payload.id ??
@@ -655,10 +783,14 @@ class StediEligibilityProvider extends MockEligibilityProvider {
     const riskLevel = buildEligibilityRiskLevel({ coverageActive, copay, deductibleRemaining, needsPriorAuth, benefitUncertainty });
     const recommendedAction = buildRecommendedAction({ coverageActive, copay, deductibleRemaining, needsPriorAuth });
     const revenueAtRisk = coverageActive ? 0 : Math.max(185, Math.round((context.patient?.outstandingBalance ?? 0) * 0.4 + copay));
-    const eligibilityMessage = deriveCoverageMessage({ coverageActive, copay, deductibleRemaining, needsPriorAuth, benefitUncertainty });
+    const eligibilityMessage = coverageStatusUncertain
+      ? 'Payer response did not contain a recognized coverage status; coverage is not confirmed and requires manual review.'
+      : benefitDataIncomplete
+      ? `Payer response did not include ${missingBenefitFields.join(', ')}; benefit estimate is incomplete and must be verified manually before quoting the patient.`
+      : deriveCoverageMessage({ coverageActive, copay, deductibleRemaining, needsPriorAuth, benefitUncertainty });
 
     return {
-      coverageStatus: coverageActive ? (benefitUncertainty ? 'uncertain' : 'active') : 'inactive',
+      coverageStatus: coverageStatusUncertain ? 'uncertain' : coverageActive ? (benefitUncertainty ? 'uncertain' : 'active') : 'inactive',
       memberId,
       planName,
       payerName,
@@ -669,6 +801,8 @@ class StediEligibilityProvider extends MockEligibilityProvider {
       eligibilityMessage,
       payerReference,
       checkedAt: new Date().toISOString(),
+      effectiveFrom,
+      expiresAt,
       providerMode: this.mode,
       providerName: this.displayName,
       needsPriorAuth,
@@ -677,15 +811,21 @@ class StediEligibilityProvider extends MockEligibilityProvider {
       riskLevel,
       recommendedAction,
       revenueAtRisk,
+      benefitDataIncomplete,
+      missingBenefitFields,
       rawResponse: payload as Prisma.InputJsonValue,
       storeRawResponse: true,
     };
   }
 }
 
-class PlaceholderEligibilityProvider extends MockEligibilityProvider {
+class UnavailableEligibilityProvider extends MockEligibilityProvider {
   constructor(public providerKey: string, public displayName: string) {
     super();
+  }
+
+  override async runEligibilityCheck(): Promise<EligibilityOutcome> {
+    throw new ProviderOperationError(this.displayName, 'eligibility check');
   }
 }
 
@@ -695,7 +835,7 @@ class MockPaymentProvider {
   mode: ProviderMode = 'mock';
 
   async createPaymentRequest(input: PaymentRequestContext): Promise<PaymentOutcome> {
-    const amount = Math.max(0, Math.round(input.amount));
+    const amount = roundMoney(input.amount);
     const providerReference = `mock_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
     return {
       amount,
@@ -735,7 +875,7 @@ class MockPaymentProvider {
   normalizePaymentResponse(response: unknown, input: PaymentRequestContext): PaymentOutcome {
     const payload = asRecord(response);
     return {
-      amount: Math.max(0, Math.round(input.amount)),
+      amount: roundMoney(input.amount),
       currency: 'USD',
       status: 'pending',
       provider: this.displayName,
@@ -749,7 +889,7 @@ class MockPaymentProvider {
   }
 }
 
-class StripePaymentProvider extends MockPaymentProvider {
+export class StripePaymentProvider extends MockPaymentProvider {
   providerKey = 'stripe';
   displayName = 'Stripe Payments';
   mode: ProviderMode = env.STRIPE_SECRET_KEY?.startsWith('sk_test_') || env.NODE_ENV !== 'production' ? 'sandbox' : 'live';
@@ -770,10 +910,10 @@ class StripePaymentProvider extends MockPaymentProvider {
   }
 
   async createPaymentRequest(input: PaymentRequestContext): Promise<PaymentOutcome> {
-    if (!env.STRIPE_SECRET_KEY) return super.createPaymentRequest(input);
+    if (!env.STRIPE_SECRET_KEY) throw new ProviderOperationError(this.displayName, 'checkout session creation');
 
     try {
-      const amount = Math.max(0, Math.round(input.amount));
+      const amount = roundMoney(input.amount);
       const payload = await this.stripeForm('/v1/checkout/sessions', {
         mode: 'payment',
         success_url: env.STRIPE_SUCCESS_URL,
@@ -782,13 +922,13 @@ class StripePaymentProvider extends MockPaymentProvider {
         'line_items[0][price_data][currency]': 'usd',
         'line_items[0][price_data][product_data][name]': input.reason || 'CareCommand Payment Request',
         'line_items[0][price_data][product_data][description]': input.patient ? `${input.patient.firstName} ${input.patient.lastName}` : 'Patient payment request',
-        'line_items[0][price_data][unit_amount]': String(amount * 100),
+        'line_items[0][price_data][unit_amount]': toMinorUnits(amount),
         'line_items[0][quantity]': '1',
         'metadata[tenantId]': input.tenantId,
         'metadata[branchId]': input.branchId ?? '',
         'metadata[reason]': input.reason,
       });
-      if (!payload) return super.createPaymentRequest(input);
+      if (!payload) throw new ProviderOperationError(this.displayName, 'checkout session creation');
       return {
         amount,
         currency: 'USD',
@@ -802,20 +942,20 @@ class StripePaymentProvider extends MockPaymentProvider {
         storeRawResponse: true,
       };
     } catch {
-      return super.createPaymentRequest(input);
+      throw new ProviderOperationError(this.displayName, 'checkout session creation');
     }
   }
 
   async createPaymentLink(input: PaymentRequestContext): Promise<PaymentOutcome> {
-    if (!env.STRIPE_SECRET_KEY) return super.createPaymentLink(input);
+    if (!env.STRIPE_SECRET_KEY) throw new ProviderOperationError(this.displayName, 'payment link creation');
 
     try {
-      const amount = Math.max(0, Math.round(input.amount));
+      const amount = roundMoney(input.amount);
       const payload = await this.stripeForm('/v1/payment_links', {
         'line_items[0][price_data][currency]': 'usd',
         'line_items[0][price_data][product_data][name]': input.reason || 'CareCommand Deposit',
         'line_items[0][price_data][product_data][description]': input.patient ? `${input.patient.firstName} ${input.patient.lastName}` : 'Patient deposit request',
-        'line_items[0][price_data][unit_amount]': String(amount * 100),
+        'line_items[0][price_data][unit_amount]': toMinorUnits(amount),
         'line_items[0][quantity]': '1',
         'after_completion[type]': 'redirect',
         'after_completion[redirect][url]': env.STRIPE_SUCCESS_URL,
@@ -823,7 +963,7 @@ class StripePaymentProvider extends MockPaymentProvider {
         'metadata[branchId]': input.branchId ?? '',
         'metadata[reason]': input.reason,
       });
-      if (!payload) return super.createPaymentLink(input);
+      if (!payload) throw new ProviderOperationError(this.displayName, 'payment link creation');
       return {
         amount,
         currency: 'USD',
@@ -837,18 +977,18 @@ class StripePaymentProvider extends MockPaymentProvider {
         storeRawResponse: true,
       };
     } catch {
-      return super.createPaymentLink(input);
+      throw new ProviderOperationError(this.displayName, 'payment link creation');
     }
   }
 
   async getPaymentStatus(reference: string) {
-    if (!env.STRIPE_SECRET_KEY) return super.getPaymentStatus(reference);
+    if (!env.STRIPE_SECRET_KEY) throw new ProviderOperationError(this.displayName, 'status lookup');
     try {
       const path = reference.startsWith('plink_') ? `/v1/payment_links/${reference}` : `/v1/checkout/sessions/${reference}`;
       const { response, body: payload } = await fetchJsonWithTimeout(`https://api.stripe.com${path}`, {
         headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` },
       });
-      if (!response.ok || !payload) return super.getPaymentStatus(reference);
+      if (!response.ok || !payload) throw new ProviderOperationError(this.displayName, 'status lookup');
       const status = String(payload.payment_status ?? payload.active ?? 'pending');
       return {
         amount: toNumber(payload.amount_total ?? payload.amount_subtotal ?? 0) / 100,
@@ -863,27 +1003,39 @@ class StripePaymentProvider extends MockPaymentProvider {
         storeRawResponse: true,
       };
     } catch {
-      return super.getPaymentStatus(reference);
+      throw new ProviderOperationError(this.displayName, 'status lookup');
     }
   }
 }
 
-class PlaceholderPaymentProvider extends MockPaymentProvider {
+class UnavailablePaymentProvider extends MockPaymentProvider {
   constructor(public providerKey: string, public displayName: string) {
     super();
   }
+
+  override async createPaymentRequest(): Promise<PaymentOutcome> {
+    throw new ProviderOperationError(this.displayName, 'payment request creation');
+  }
+
+  override async createPaymentLink(): Promise<PaymentOutcome> {
+    throw new ProviderOperationError(this.displayName, 'payment link creation');
+  }
+
+  override async getPaymentStatus(): Promise<never> {
+    throw new ProviderOperationError(this.displayName, 'status lookup');
+  }
 }
 
-function createInsuranceProvider() {
+export function createInsuranceProvider() {
   switch (env.INSURANCE_PROVIDER) {
     case 'stedi':
-      return env.STEDI_API_KEY ? new StediEligibilityProvider() : new MockEligibilityProvider();
+      return env.STEDI_API_KEY ? new StediEligibilityProvider() : new UnavailableEligibilityProvider('stedi', 'Stedi Eligibility');
     case 'availity':
-      return new PlaceholderEligibilityProvider('availity', 'Availity Eligibility');
+      return new UnavailableEligibilityProvider('availity', 'Availity Eligibility');
     case 'pverify':
-      return new PlaceholderEligibilityProvider('pverify', 'pVerify Eligibility');
+      return new UnavailableEligibilityProvider('pverify', 'pVerify Eligibility');
     case 'optum':
-      return new PlaceholderEligibilityProvider('optum', 'Optum Eligibility');
+      return new UnavailableEligibilityProvider('optum', 'Optum Eligibility');
     case 'mock':
     default:
       return new MockEligibilityProvider();
@@ -893,15 +1045,15 @@ function createInsuranceProvider() {
 export function createPaymentProvider() {
   switch (env.PAYMENT_PROVIDER) {
     case 'stripe':
-      return env.STRIPE_SECRET_KEY ? new StripePaymentProvider() : new MockPaymentProvider();
+      return env.STRIPE_SECRET_KEY ? new StripePaymentProvider() : new UnavailablePaymentProvider('stripe', 'Stripe Payments');
     case 'square':
-      return new PlaceholderPaymentProvider('square', 'Square Payments');
+      return new UnavailablePaymentProvider('square', 'Square Payments');
     case 'authorize_net':
-      return new PlaceholderPaymentProvider('authorize_net', 'Authorize.Net Payments');
+      return new UnavailablePaymentProvider('authorize_net', 'Authorize.Net Payments');
     case 'clover':
-      return new PlaceholderPaymentProvider('clover', 'Clover Payments');
+      return new UnavailablePaymentProvider('clover', 'Clover Payments');
     case 'paypal':
-      return new PlaceholderPaymentProvider('paypal', 'PayPal Payments');
+      return new UnavailablePaymentProvider('paypal', 'PayPal Payments');
     case 'mock':
     default:
       return new MockPaymentProvider();
@@ -915,12 +1067,12 @@ async function selectDefaultPayer(context: RevenueContext) {
   });
 }
 
-async function createEligibilityAlert(context: RevenueContext, branchId: string, patientId: string | null, appointmentId: string | null, outcome: EligibilityOutcome, verificationId: string) {
+async function createEligibilityAlert(context: RevenueContext, branchId: string, patientId: string | null, appointmentId: string | null, outcome: EligibilityOutcome, verificationId: string, client?: Prisma.TransactionClient) {
   const riskThemes = deriveEligibilityRisk(outcome);
   if (!riskThemes.length) return null;
   const [primaryTheme, ...rest] = riskThemes;
   // RLS (B-3): RevenueProtectionAlert is tenant-isolated; create under context.
-  return runWithTenantContext(context.tenantId, tx => tx.revenueProtectionAlert.create({
+  const create = (tx: Prisma.TransactionClient) => tx.revenueProtectionAlert.create({
     data: {
       tenantId: context.tenantId,
       branchId,
@@ -947,17 +1099,18 @@ async function createEligibilityAlert(context: RevenueContext, branchId: string,
         : 'Collect deposit or route to front desk follow-up.',
       actionLink: '/revenue-protection',
     },
-  }));
+  });
+  return client ? create(client) : runWithTenantContext(context.tenantId, create);
 }
 
-async function buildResponsibilityEstimate(context: RevenueContext, branchId: string, patientId: string, appointmentId: string | null, verificationId: string, outcome: EligibilityOutcome) {
+async function buildResponsibilityEstimate(context: RevenueContext, branchId: string, patientId: string, appointmentId: string | null, verificationId: string, outcome: EligibilityOutcome, client: Prisma.TransactionClient = db) {
   const appointment = appointmentId
-    ? await db.appointment.findFirst({
+    ? await client.appointment.findFirst({
         where: { id: appointmentId, tenantId: context.tenantId },
         select: { value: true, noShowRisk: true, service: true },
       })
     : null;
-  const patient = await db.patient.findFirst({
+  const patient = await client.patient.findFirst({
     where: { id: patientId, tenantId: context.tenantId },
     select: { outstandingBalance: true, churnRisk: true, lifecycleStage: true },
   });
@@ -970,7 +1123,7 @@ async function buildResponsibilityEstimate(context: RevenueContext, branchId: st
     Math.min(responsibility, appointmentValue * 0.4),
   );
 
-  return db.patientResponsibilityEstimate.create({
+  return client.patientResponsibilityEstimate.create({
     data: {
       tenantId: context.tenantId,
       branchId,
@@ -1039,6 +1192,55 @@ function mapVerification(row: {
       : 'Request updated insurance before appointment.',
     riskLevel: row.coverageActive ? (toNumber(row.deductibleRemaining) > 1000 ? 'MEDIUM' : 'LOW') : 'HIGH',
     revenueAtRisk: row.coverageActive ? 0 : Math.max(185, Math.round(toNumber(row.deductibleRemaining) * 0.18 + toNumber(row.copay))),
+  };
+}
+
+async function buildRevenueEligibilityResponse(tenantId: string, verificationId: string, client: Prisma.TransactionClient = db) {
+  const verification = await client.eligibilityVerification.findFirst({
+    where: { id: verificationId, tenantId },
+    include: {
+      branch: { select: { name: true } },
+      patient: { select: { firstName: true, lastName: true } },
+      payer: { select: { name: true } },
+      policy: { select: { memberId: true } },
+    },
+  });
+  if (!verification) throw new Error('Eligibility result is unavailable');
+  const outcome = verification.normalizedResponse as unknown as EligibilityOutcome;
+  const alert = await client.revenueProtectionAlert.findFirst({
+    where: { tenantId, sourceType: 'eligibility', evidence: { path: ['verificationId'], equals: verificationId } },
+    select: { id: true, estimatedValue: true },
+  });
+  return {
+    verificationId: verification.id,
+    id: verification.id,
+    branchId: verification.branchId,
+    branchName: verification.branch.name,
+    patientId: verification.patientId,
+    patientName: `${verification.patient.firstName} ${verification.patient.lastName}`,
+    appointmentId: verification.appointmentId ?? null,
+    payerId: verification.payerId ?? null,
+    payerName: verification.payer?.name ?? verification.payerName,
+    policyId: verification.policyId ?? null,
+    memberId: verification.policy?.memberId ?? null,
+    planName: verification.planName,
+    coverageStatus: verification.coverageStatus.toUpperCase(),
+    coverageActive: verification.coverageActive,
+    copay: verification.copay === null ? null : toNumber(verification.copay),
+    deductibleRemaining: verification.deductibleRemaining === null ? null : toNumber(verification.deductibleRemaining),
+    coinsurance: verification.coinsurance === null ? null : toNumber(verification.coinsurance),
+    benefitDataIncomplete: outcome.benefitDataIncomplete,
+    missingBenefitFields: outcome.missingBenefitFields,
+    eligibilityMessage: verification.eligibilityMessage,
+    payerReference: verification.payerReference ?? outcome.payerReference,
+    checkedAt: verification.checkedAt.toISOString(),
+    providerMode: verification.providerMode,
+    alertId: alert?.id ?? null,
+    priorAuthRequired: outcome.priorAuthRequired,
+    recommendedAction: outcome.recommendedAction,
+    riskLevel: outcome.riskLevel,
+    revenueAtRisk: toNumber(alert?.estimatedValue ?? outcome.revenueAtRisk),
+    benefitUncertainty: outcome.benefitUncertainty,
   };
 }
 
@@ -1430,15 +1632,65 @@ async function loadOverview(context: RevenueContext, branchId?: string) {
     }),
   ]);
 
+  // Headline financial totals MUST be computed with DB aggregates, not by summing
+  // the truncated `take: 50` collections above — otherwise the dashboard silently
+  // under-reports past 50 contributing rows. All numbers are tenant-scoped (and,
+  // for RLS tables, read under tenant context). The returned shape is unchanged.
+  const { start: dueStart, end: dueEnd } = todayRange();
+  // Statuses that are NOT genuinely-open AR. `expired`/`failed`/`cancelled` requests
+  // are dead (and expiry spawns a fresh row, so the same balance would otherwise be
+  // counted twice); `collected`/`refunded` are settled. Only truly-open requests are
+  // owed money. This prevents the stale-AR over-count.
+  const NON_OPEN_REQUEST_STATUSES = ['collected', 'failed', 'expired', 'cancelled', 'refunded'];
+  const [
+    paymentsDueTodayCount,
+    unpaidBalancesAgg,
+    depositsCollectedAgg,
+    failedPaymentsCount,
+    succeededTransactionsAgg,
+    refundedTransactionsAgg,
+    revenueAtRiskAgg,
+    collectedDeposits,
+    succeededTxnRequestRows,
+  ] = await Promise.all([
+    db.paymentRequest.count({ where: { tenantId: context.tenantId, ...filter, status: 'pending', dueAt: { gte: dueStart, lt: dueEnd } } }),
+    db.paymentRequest.aggregate({ _sum: { amount: true }, where: { tenantId: context.tenantId, ...filter, status: { notIn: NON_OPEN_REQUEST_STATUSES } } }),
+    runWithTenantContext(context.tenantId, tx => tx.depositRequirement.aggregate({ _sum: { collectedAmount: true }, where: { tenantId: context.tenantId, ...filter, status: 'collected' } })),
+    db.paymentTransaction.count({ where: { tenantId: context.tenantId, ...filter, status: 'failed' } }),
+    db.paymentTransaction.aggregate({ _sum: { amount: true }, where: { tenantId: context.tenantId, ...filter, status: { in: ['succeeded', 'paid'] } } }),
+    db.paymentTransaction.aggregate({ _sum: { amount: true }, where: { tenantId: context.tenantId, ...filter, status: 'refunded' } }),
+    runWithTenantContext(context.tenantId, tx => tx.revenueProtectionAlert.aggregate({ _sum: { estimatedValue: true }, where: { tenantId: context.tenantId, ...filter, status: { not: 'resolved' } } })),
+    // Collected deposits (to add manually-collected ones that have no transaction).
+    runWithTenantContext(context.tenantId, tx => tx.depositRequirement.findMany({ where: { tenantId: context.tenantId, ...filter, status: 'collected' }, select: { paymentRequestId: true, collectedAmount: true } })),
+    // Payment requests that already have a succeeded/paid transaction — a collected
+    // deposit linked to one of these is ALREADY counted in the transaction total.
+    db.paymentTransaction.findMany({ where: { tenantId: context.tenantId, ...filter, status: { in: ['succeeded', 'paid'] }, paymentRequestId: { not: null } }, select: { paymentRequestId: true } }),
+  ]);
+
+  const unpaidBalancesTotal = toNumber(unpaidBalancesAgg._sum.amount);
+  const depositsCollectedTotal = toNumber(depositsCollectedAgg._sum.collectedAmount);
+  // revenueProtected must count each economic event ONCE. A webhook-settled deposit is
+  // written as BOTH a succeeded paymentTransaction AND a collected DepositRequirement,
+  // so naively adding both aggregates double-counts it. The money-movement truth is the
+  // net of transactions (succeeded/paid minus refunded); to that we add only the
+  // manually-collected deposits that have NO linked transaction. Refunds reduce the
+  // total via the refunded transactions (and their deposit flips out of 'collected').
+  const succeededTxnRequestIds = new Set(
+    succeededTxnRequestRows.map(r => r.paymentRequestId).filter((x): x is string => Boolean(x)),
+  );
+  const manualDepositsTotal = collectedDeposits
+    .filter(d => !d.paymentRequestId || !succeededTxnRequestIds.has(d.paymentRequestId))
+    .reduce((sum, d) => sum + toNumber(d.collectedAmount), 0);
+  const netTransactionsTotal = toNumber(succeededTransactionsAgg._sum.amount) - toNumber(refundedTransactionsAgg._sum.amount);
   const summary = {
-    paymentsDueToday: paymentRequests.filter(request => request.status === 'pending' && request.dueAt && request.dueAt >= todayRange().start && request.dueAt < todayRange().end).length,
-    copaysExpected: paymentRequests.filter(request => request.status !== 'collected').reduce((sum, request) => sum + toNumber(request.amount), 0),
-    depositsCollected: depositRequirements.filter(requirement => requirement.status === 'collected').reduce((sum, requirement) => sum + toNumber(requirement.collectedAmount), 0),
-    unpaidBalances: paymentRequests.filter(request => request.status !== 'collected').reduce((sum, request) => sum + toNumber(request.amount), 0),
-    failedPayments: paymentTransactions.filter(transaction => transaction.status === 'failed').length,
-    revenueProtected: depositRequirements.filter(requirement => requirement.status === 'collected').reduce((sum, requirement) => sum + toNumber(requirement.collectedAmount), 0)
-      + paymentTransactions.filter(transaction => transaction.status === 'succeeded' || transaction.status === 'paid').reduce((sum, transaction) => sum + toNumber(transaction.amount), 0),
-    revenueAtRisk: revenueProtectionAlerts.filter(alert => alert.status !== 'resolved').reduce((sum, alert) => sum + toNumber(alert.estimatedValue), 0),
+    paymentsDueToday: paymentsDueTodayCount,
+    // copaysExpected and unpaidBalances share the same definition (genuinely-open requests).
+    copaysExpected: unpaidBalancesTotal,
+    depositsCollected: depositsCollectedTotal,
+    unpaidBalances: unpaidBalancesTotal,
+    failedPayments: failedPaymentsCount,
+    revenueProtected: netTransactionsTotal + manualDepositsTotal,
+    revenueAtRisk: toNumber(revenueAtRiskAgg._sum.estimatedValue),
   };
 
   return {
@@ -1501,12 +1753,15 @@ async function loadOverview(context: RevenueContext, branchId?: string) {
 }
 
 export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
-  app.get('/overview', async request => {
+  app.get('/overview', { preHandler: billingRead }, async request => {
     const query = listLimit.parse(request.query);
-    return loadOverview({ tenantId: request.auth.tenantId, branchId: request.auth.branchId ?? undefined }, query.branchId);
+    branchFilter(request, query.branchId);
+    const result = await loadOverview({ tenantId: request.auth.tenantId, branchId: request.auth.branchId ?? undefined }, query.branchId);
+    await audit(request, { action: 'revenueProtection.overview.read', resource: 'revenueProtection', metadata: { branchId: request.auth.branchId ?? query.branchId ?? null } });
+    return result;
   });
 
-  app.get('/integration-status', async request => {
+  app.get('/integration-status', { preHandler: billingRead }, async request => {
     const insuranceProvider = createInsuranceProvider();
     const paymentProvider = createPaymentProvider();
     const insuranceConfigured = env.INSURANCE_PROVIDER === 'mock' || (env.INSURANCE_PROVIDER === 'stedi' && Boolean(env.STEDI_API_KEY));
@@ -1520,7 +1775,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
       insuranceProvider.getPayerList({ tenantId: request.auth.tenantId, branchId: request.auth.branchId ?? undefined }),
     ]);
 
-    return {
+    const result = {
       insurance: {
         provider: env.INSURANCE_PROVIDER,
         providerName: insuranceProvider.displayName,
@@ -1547,9 +1802,11 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
       recentRuns: recentRuns.length,
       latestRun: recentRuns[0] ?? null,
     };
+    await audit(request, { action: 'revenueProtection.integrationStatus.read', resource: 'integrationStatus', metadata: { recentRunCount: recentRuns.length } });
+    return result;
   });
 
-  app.get('/eligibility', { preHandler: insuranceFeature }, async request => {
+  app.get('/eligibility', { preHandler: [insuranceFeature, billingRead] }, async request => {
     const query = listLimit.parse(request.query);
     const filter = { ...branchFilter(request, query.branchId), ...(query.patientId ? { patientId: query.patientId } : {}), ...(query.appointmentId ? { appointmentId: query.appointmentId } : {}) };
     const [insurancePayers, patientInsurancePolicies, eligibilityVerifications, patientResponsibilityEstimates] = await Promise.all([
@@ -1573,7 +1830,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
         include: { branch: { select: { name: true } }, patient: { select: { firstName: true, lastName: true } }, appointment: { select: { service: true } }, eligibilityVerification: { select: { id: true } } },
       }),
     ]);
-    return {
+    const result = {
       insurancePayers: insurancePayers.map(mapPayer),
       patientInsurancePolicies: patientInsurancePolicies.map(row => ({
         id: row.id,
@@ -1610,9 +1867,11 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
         createdAt: row.createdAt.toISOString(),
       })),
     };
+    await audit(request, { action: 'eligibility.list', resource: 'eligibilityVerification', metadata: { count: eligibilityVerifications.length, branchId: request.auth.branchId ?? query.branchId ?? null } });
+    return result;
   });
 
-  app.get('/appointment-queue', { preHandler: insuranceFeature }, async request => {
+  app.get('/appointment-queue', { preHandler: [insuranceFeature, billingRead] }, async request => {
     const query = listLimit.parse(request.query);
     const filter = branchFilter(request, query.branchId);
     const rows = await db.appointment.findMany({
@@ -1639,7 +1898,10 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
             eligibilityVerifications: {
               where: { tenantId: request.auth.tenantId },
               orderBy: { checkedAt: 'desc' },
-              take: 1,
+              // Widened from 1 so the appointment-scoping below can still find a
+              // check that belongs to THIS appointment when the patient's most
+              // recent check belongs to a different one.
+              take: 10,
               include: { payer: { select: { name: true } }, policy: { select: { memberId: true, groupNumber: true } } },
             },
             priorAuthorizations: {
@@ -1652,15 +1914,27 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
       },
     });
 
+    // An eligibility check performed for a DIFFERENT appointment must never be
+    // presented as this appointment's coverage. The nested include cannot
+    // reference the outer row, so scope it here: keep checks tied to this
+    // appointment, plus patient-level checks that name no appointment at all.
+    for (const row of rows) {
+      row.patient.eligibilityVerifications = row.patient.eligibilityVerifications
+        .filter(verification => verification.appointmentId === null || verification.appointmentId === row.id)
+        .slice(0, 1);
+    }
+
+    await audit(request, { action: 'eligibility.appointmentQueue.list', resource: 'appointment', metadata: { count: rows.length, branchId: request.auth.branchId ?? query.branchId ?? null } });
     return { appointments: rows.map(mapAppointmentQueueRow) };
   });
 
-  app.post('/eligibility/check', { preHandler: [insuranceFeature, insuranceWriteRoles] }, async (request, reply) => {
+  app.post('/eligibility/check', { preHandler: [insuranceFeature, billingWrite] }, async (request, reply) => {
     const body = z.object({
       branchId: uuid.optional(),
       patientId: uuid.optional(),
       appointmentId: uuid.optional(),
       payerId: uuid.optional(),
+      policyId: uuid.optional(),
       serviceType: z.string().trim().min(2).max(120).optional(),
     }).parse(request.body);
 
@@ -1674,204 +1948,225 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     if (providerStatus.setupRequired) {
       return reply.code(200).send({ status: 'setup_required', setupRequired: true, provider: providerStatus.provider, missing: providerStatus.missing, message: `Configure the ${providerStatus.provider} eligibility provider to run real checks.` });
     }
-    await emitBusinessEvent(request.auth.tenantId, { eventType: 'insurance.eligibility.requested', entityType: 'appointment', entityId: body.appointmentId ?? body.patientId ?? null, sourceModule: 'insurance', payload: { provider: providerStatus.provider } }).catch(() => {});
-
     const entities = await resolveBranchIdAndEntities(request, { tenantId: request.auth.tenantId, branchId: request.auth.branchId ?? undefined }, body);
     if (body.patientId && !entities.patient) throw app.httpErrors.notFound('Patient not found');
     if (body.appointmentId && !entities.appointment) throw app.httpErrors.notFound('Appointment not found');
     const payer = body.payerId
       ? await db.insurancePayer.findFirst({ where: { id: body.payerId, tenantId: request.auth.tenantId, active: true } })
       : await selectDefaultPayer({ tenantId: request.auth.tenantId, branchId: entities.branchId });
-    const policy = await ensurePolicy({ tenantId: request.auth.tenantId, branchId: entities.branchId }, entities, payer?.id);
+    const policy = await ensurePolicy({ tenantId: request.auth.tenantId, branchId: entities.branchId }, entities, payer?.id, body.policyId);
+    if (!policy || !policy.payer) throw app.httpErrors.badRequest('Select an active patient policy with a configured payer before checking eligibility');
+    if (payer && policy.payer.id !== payer.id) throw app.httpErrors.badRequest('Selected payer does not match the policy');
+    const selectedPayer = payer ?? policy.payer;
     const provider = createInsuranceProvider();
+    const patientId = entities.patient?.id ?? body.patientId!;
+    const appointmentId = entities.appointment?.id ?? body.appointmentId ?? null;
+    const rawIdempotencyKey = eligibilityIdempotencyKey(request);
+    const requestedServiceType = body.serviceType ?? entities.appointment?.service ?? null;
+    const requestedServiceAt = entities.appointment?.startsAt ?? new Date();
 
-    const outcome = await provider.runEligibilityCheck({
-      tenantId: request.auth.tenantId,
-      branchId: entities.branchId,
-      patient: entities.patient ?? undefined,
-      appointment: entities.appointment ?? undefined,
-      payer: payer ? { id: payer.id, name: payer.name, tradingPartnerServiceId: payer.tradingPartnerServiceId, sourceProvider: payer.sourceProvider } : undefined,
-      policy: policy ? {
-        id: policy.id,
-        planName: policy.planName,
-        memberId: policy.memberId,
-        groupNumber: policy.groupNumber,
-        subscriberName: policy.subscriberName,
-      } : undefined,
-      serviceType: body.serviceType ?? entities.appointment?.service,
-    });
-
-    const verification = await db.eligibilityVerification.create({
-      data: {
-        tenantId: request.auth.tenantId,
-        branchId: entities.branchId,
-        patientId: entities.patient?.id ?? body.patientId!,
-        appointmentId: entities.appointment?.id ?? body.appointmentId ?? undefined,
-        payerId: payer?.id ?? undefined,
-        policyId: policy?.id ?? undefined,
-        providerMode: outcome.providerMode,
-        coverageStatus: outcome.coverageStatus,
-        planName: outcome.planName,
-        payerName: outcome.payerName,
-        copay: outcome.copay,
-        deductibleRemaining: outcome.deductibleRemaining,
-        coinsurance: outcome.coinsurance,
-        coverageActive: outcome.coverageActive,
-        eligibilityMessage: outcome.eligibilityMessage,
-        payerReference: outcome.payerReference,
-        normalizedResponse: {
-          ...outcome,
-          providerMode: outcome.providerMode,
-          providerName: outcome.providerName,
-        } as Prisma.InputJsonValue,
-        ...(outcome.storeRawResponse && outcome.rawResponse ? { rawResponse: outcome.rawResponse as Prisma.InputJsonValue } : {}),
-      },
-    });
-
-    await Promise.all([
-      db.patient.updateMany({
-        where: { id: entities.patient?.id ?? body.patientId!, tenantId: request.auth.tenantId },
-        data: {
-          eligibilityStatus: outcome.coverageActive ? 'ACTIVE' : 'INACTIVE',
-          eligibilityLastVerifiedAt: new Date(),
+    try {
+      const execution = await runEligibilityExecution({
+        context: {
+          tenantId: request.auth.tenantId,
+          branchId: entities.branchId,
+          patientId,
+          appointmentId,
+          payerId: selectedPayer.id,
+          policyId: policy.id,
+          actorUserId: request.auth.userId,
+          requestedServiceType,
+          requestedServiceAt,
+          requestId: request.id,
+          ipAddress: request.ip,
+          userAgent: request.headers['user-agent'],
         },
-      }),
-      entities.appointment
-        ? db.appointment.updateMany({
-            where: { id: entities.appointment.id, tenantId: request.auth.tenantId },
+        rawIdempotencyKey,
+        fingerprintParts: {
+          contract: 'revenue_protection_v1',
+          branchId: entities.branchId,
+          patientId,
+          appointmentId,
+          payerId: selectedPayer.id,
+          policyId: policy.id,
+          memberId: policy.memberId,
+          providerKey: provider.providerKey,
+          serviceType: requestedServiceType,
+          // Keep same-day retry/reload identity stable while retaining the
+          // precise requested instant on the durable EligibilityExecution.
+          requestedServiceAt: requestedServiceAt.toISOString().slice(0, 10),
+        },
+        requestContract: 'revenue_protection_v1',
+        providerKey: provider.providerKey,
+        providerMode: provider.mode,
+        executeProvider: providerExecutionKey => provider.runEligibilityCheck({
+          tenantId: request.auth.tenantId,
+          branchId: entities.branchId,
+          providerExecutionKey,
+          patient: entities.patient ?? undefined,
+          appointment: entities.appointment ?? undefined,
+          payer: { id: selectedPayer.id, name: selectedPayer.name, tradingPartnerServiceId: selectedPayer.tradingPartnerServiceId, sourceProvider: selectedPayer.sourceProvider },
+          policy: {
+            id: policy.id,
+            planName: policy.planName,
+            memberId: policy.memberId,
+            groupNumber: policy.groupNumber,
+            subscriberName: policy.subscriberName,
+          },
+          serviceType: body.serviceType ?? entities.appointment?.service,
+        }),
+        finalize: async (tx, outcome, executionId) => {
+          const verifiedAt = new Date();
+          const missing = new Set(outcome.missingBenefitFields);
+          const payerReference = outcome.payerReference.includes(policy.memberId) ? null : outcome.payerReference;
+          const verification = await tx.eligibilityVerification.create({
             data: {
-              eligibilityStatus: outcome.coverageActive ? 'ACTIVE' : 'INACTIVE',
-              eligibilityLastVerifiedAt: new Date(),
+              tenantId: request.auth.tenantId,
+              branchId: entities.branchId,
+              patientId,
+              appointmentId: appointmentId ?? undefined,
+              payerId: selectedPayer.id,
+              policyId: policy.id,
+              providerMode: outcome.providerMode,
+              coverageStatus: outcome.coverageStatus,
+              planName: outcome.planName,
+              payerName: outcome.payerName,
+              copay: missing.has('copay') ? null : outcome.copay,
+              deductibleRemaining: missing.has('deductibleRemaining') ? null : outcome.deductibleRemaining,
+              coinsurance: missing.has('coinsurance') ? null : outcome.coinsurance,
+              coverageActive: outcome.coverageActive,
+              eligibilityMessage: outcome.eligibilityMessage,
+              payerReference,
+              decisionSource: outcome.providerMode === 'live' ? 'PAYER_RESPONSE' : 'SIMULATED',
+              effectiveFrom: outcome.effectiveFrom ? new Date(outcome.effectiveFrom) : null,
+              expiresAt: outcome.expiresAt ? new Date(outcome.expiresAt) : null,
+              normalizedResponse: {
+                coverageStatus: outcome.coverageStatus,
+                planName: outcome.planName,
+                payerName: outcome.payerName,
+                copay: missing.has('copay') ? null : outcome.copay,
+                deductibleRemaining: missing.has('deductibleRemaining') ? null : outcome.deductibleRemaining,
+                coinsurance: missing.has('coinsurance') ? null : outcome.coinsurance,
+                coverageActive: outcome.coverageActive,
+                eligibilityMessage: outcome.eligibilityMessage,
+                payerReference,
+                checkedAt: outcome.checkedAt,
+                effectiveFrom: outcome.effectiveFrom,
+                expiresAt: outcome.expiresAt,
+                providerMode: outcome.providerMode,
+                providerName: outcome.providerName,
+                needsPriorAuth: outcome.needsPriorAuth,
+                priorAuthRequired: outcome.priorAuthRequired,
+                benefitUncertainty: outcome.benefitUncertainty,
+                riskLevel: outcome.riskLevel,
+                recommendedAction: outcome.recommendedAction,
+                revenueAtRisk: outcome.revenueAtRisk,
+                benefitDataIncomplete: outcome.benefitDataIncomplete,
+                missingBenefitFields: outcome.missingBenefitFields,
+              } as Prisma.InputJsonValue,
             },
-          })
-        : Promise.resolve(),
-      policy
-        ? db.patientInsurancePolicy.update({
+          });
+          await tx.patient.updateMany({
+            where: { id: patientId, tenantId: request.auth.tenantId },
+            data: { eligibilityStatus: outcome.coverageActive ? 'ACTIVE' : 'INACTIVE', eligibilityLastVerifiedAt: verifiedAt },
+          });
+          if (appointmentId) {
+            await tx.appointment.updateMany({
+              where: { id: appointmentId, tenantId: request.auth.tenantId },
+              data: { eligibilityStatus: outcome.coverageActive ? 'ACTIVE' : 'INACTIVE', eligibilityLastVerifiedAt: verifiedAt },
+            });
+          }
+          await tx.patientInsurancePolicy.update({
             where: { id: policy.id },
+            data: { verificationStatus: outcome.coverageActive ? 'verified' : 'inactive', verifiedAt },
+          });
+          await tx.benefitSnapshot.create({
             data: {
-              verificationStatus: outcome.coverageActive ? 'verified' : 'inactive',
-              verifiedAt: new Date(),
+              tenantId: request.auth.tenantId,
+              branchId: entities.branchId,
+              verificationId: verification.id,
+              summary: outcome.eligibilityMessage,
+              details: {
+                coverageStatus: outcome.coverageStatus,
+                payerName: outcome.payerName,
+                planName: outcome.planName,
+                copay: missing.has('copay') ? null : outcome.copay,
+                deductibleRemaining: missing.has('deductibleRemaining') ? null : outcome.deductibleRemaining,
+                coinsurance: missing.has('coinsurance') ? null : outcome.coinsurance,
+                needsPriorAuth: outcome.needsPriorAuth,
+                benefitUncertainty: outcome.benefitUncertainty,
+              },
             },
-          })
-        : Promise.resolve(),
-    ]);
-
-    const verificationDetails = await db.eligibilityVerification.findUnique({
-      where: { id: verification.id },
-      include: {
-        branch: { select: { name: true } },
-        patient: { select: { firstName: true, lastName: true } },
-        payer: { select: { name: true } },
-        policy: { select: { memberId: true, planName: true, groupNumber: true } },
-      },
-    });
-    if (!verificationDetails) {
-      throw app.httpErrors.internalServerError('Unable to load verification details');
-    }
-
-    await db.benefitSnapshot.create({
-      data: {
-        tenantId: request.auth.tenantId,
-        branchId: entities.branchId,
-        verificationId: verification.id,
-        summary: outcome.eligibilityMessage,
-        details: {
-          coverageStatus: outcome.coverageStatus,
-          payerName: outcome.payerName,
-          planName: outcome.planName,
-          copay: outcome.copay,
-          deductibleRemaining: outcome.deductibleRemaining,
-          coinsurance: outcome.coinsurance,
-          needsPriorAuth: outcome.needsPriorAuth,
-          benefitUncertainty: outcome.benefitUncertainty,
+          });
+          if (entities.patient) {
+            await buildResponsibilityEstimate(
+              { tenantId: request.auth.tenantId, branchId: entities.branchId },
+              entities.branchId,
+              entities.patient.id,
+              appointmentId,
+              verification.id,
+              outcome,
+              tx,
+            );
+          }
+          await createEligibilityAlert(
+            { tenantId: request.auth.tenantId, branchId: entities.branchId },
+            entities.branchId,
+            patientId,
+            appointmentId,
+            outcome,
+            verification.id,
+            tx,
+          );
+          await tx.integrationRunLog.create({
+            data: {
+              tenantId: request.auth.tenantId,
+              branchId: entities.branchId,
+              provider: provider.providerKey,
+              providerMode: outcome.providerMode,
+              operation: 'eligibility.check',
+              status: 'success',
+              requestSummary: { executionId, patientId, appointmentId, payerId: selectedPayer.id },
+              responseSummary: { coverageStatus: outcome.coverageStatus, benefitDataIncomplete: outcome.benefitDataIncomplete },
+            },
+          });
+          const eligEvent = !outcome.coverageActive ? 'insurance.eligibility.failed' : outcome.benefitUncertainty ? 'insurance.eligibility.needs_review' : 'insurance.eligibility.completed';
+          await tx.businessEvent.create({
+            data: {
+              tenantId: request.auth.tenantId,
+              eventType: eligEvent,
+              entityType: 'eligibilityVerification',
+              entityId: verification.id,
+              sourceModule: 'insurance',
+              payload: { coverageStatus: outcome.coverageStatus, appointmentId, executionId },
+            },
+          });
+          return {
+            verificationId: verification.id,
+            result: await buildRevenueEligibilityResponse(request.auth.tenantId, verification.id, tx),
+            auditMetadata: { branchId: entities.branchId, providerMode: outcome.providerMode, coverageStatus: outcome.coverageStatus },
+          };
         },
-      },
-    });
-
-    if (entities.patient) {
-      await buildResponsibilityEstimate(
-        { tenantId: request.auth.tenantId, branchId: entities.branchId },
-        entities.branchId,
-        entities.patient.id,
-        entities.appointment?.id ?? body.appointmentId ?? null,
-        verification.id,
-        outcome,
-      );
+        replay: verificationId => buildRevenueEligibilityResponse(request.auth.tenantId, verificationId),
+      });
+      if (!execution.replayed && execution.result.appointmentId) {
+        await runDenialPreventionForAppointment(request.auth.tenantId, execution.result.appointmentId, { actorUserId: request.auth.userId, branchId: entities.branchId }).catch(() => {});
+      }
+      return reply.send({ ...execution.result, executionId: execution.executionId, replayed: execution.replayed });
+    } catch (error) {
+      if (!(error instanceof EligibilityExecutionConflictError)) throw error;
+      return reply.code(409).send({
+        status: error.code,
+        executionId: error.executionId,
+        retryable: false,
+        message: error.code === 'reconciliation_required'
+          ? 'The payer outcome is ambiguous and requires staff reconciliation. The provider was not called again.'
+          : 'This eligibility execution cannot be repeated with the supplied idempotency key.',
+      });
     }
-
-    const alert = await createEligibilityAlert(
-      { tenantId: request.auth.tenantId, branchId: entities.branchId },
-      entities.branchId,
-      entities.patient?.id ?? body.patientId ?? null,
-      entities.appointment?.id ?? body.appointmentId ?? null,
-      outcome,
-      verification.id,
-    );
-
-    await db.integrationRunLog.create({
-      data: {
-        tenantId: request.auth.tenantId,
-        branchId: entities.branchId,
-        provider: provider.providerKey,
-        providerMode: outcome.providerMode,
-        operation: 'eligibility.check',
-        status: 'success',
-        requestSummary: {
-          patientId: body.patientId ?? entities.patient?.id ?? null,
-          appointmentId: body.appointmentId ?? entities.appointment?.id ?? null,
-          payerId: payer?.id ?? null,
-        },
-        responseSummary: {
-          coverageStatus: outcome.coverageStatus,
-          payerName: outcome.payerName,
-          planName: outcome.planName,
-          copay: outcome.copay,
-          deductibleRemaining: outcome.deductibleRemaining,
-          coinsurance: outcome.coinsurance,
-        },
-      },
-    });
-
-    // Intelligence: completion/needs-review/failed event + rule-based denial
-    // prevention for the linked appointment (creates signals/tasks/alerts).
-    const eligEvent = !outcome.coverageActive ? 'insurance.eligibility.failed' : outcome.benefitUncertainty ? 'insurance.eligibility.needs_review' : 'insurance.eligibility.completed';
-    await emitBusinessEvent(request.auth.tenantId, { eventType: eligEvent as 'insurance.eligibility.completed', entityType: 'eligibilityVerification', entityId: verification.id, sourceModule: 'insurance', payload: { coverageStatus: outcome.coverageStatus, appointmentId: verification.appointmentId } }).catch(() => {});
-    if (verification.appointmentId) {
-      await runDenialPreventionForAppointment(request.auth.tenantId, verification.appointmentId, { actorUserId: request.auth.userId, branchId: entities.branchId }).catch(() => {});
-    }
-
-    return reply.send({
-      verificationId: verification.id,
-      id: verification.id,
-      branchId: verificationDetails.branchId,
-      branchName: verificationDetails.branch.name,
-      patientId: verificationDetails.patientId,
-      patientName: `${verificationDetails.patient.firstName} ${verificationDetails.patient.lastName}`,
-      appointmentId: verificationDetails.appointmentId ?? null,
-      payerId: verificationDetails.payerId ?? null,
-      payerName: verificationDetails.payer?.name ?? outcome.payerName,
-      policyId: verificationDetails.policyId ?? null,
-      memberId: verificationDetails.policy?.memberId ?? outcome.memberId,
-      planName: verificationDetails.planName,
-      coverageStatus: verificationDetails.coverageStatus.toUpperCase(),
-      coverageActive: verificationDetails.coverageActive,
-      copay: toNumber(verificationDetails.copay),
-      deductibleRemaining: toNumber(verificationDetails.deductibleRemaining),
-      coinsurance: toNumber(verificationDetails.coinsurance),
-      eligibilityMessage: verificationDetails.eligibilityMessage,
-      payerReference: verificationDetails.payerReference ?? outcome.payerReference,
-      checkedAt: verificationDetails.checkedAt.toISOString(),
-      providerMode: verificationDetails.providerMode === 'mock' ? 'mock' : 'stedi-sandbox',
-      alertId: alert?.id ?? null,
-      priorAuthRequired: outcome.priorAuthRequired,
-      recommendedAction: outcome.recommendedAction,
-      riskLevel: outcome.riskLevel,
-      revenueAtRisk: toNumber(alert?.estimatedValue ?? outcome.revenueAtRisk),
-      benefitUncertainty: outcome.benefitUncertainty,
-    });
   });
 
-  app.patch('/eligibility/:id/status', { preHandler: [insuranceFeature, insuranceWriteRoles] }, async (request, reply) => {
+  app.patch('/eligibility/:id/status', { preHandler: [insuranceFeature, billingWrite] }, async (request, reply) => {
     const params = z.object({ id: uuid }).parse(request.params);
     const body = z.object({ coverageStatus: z.string().min(2).max(80) }).parse(request.body);
     const existing = await db.eligibilityVerification.findFirst({
@@ -1914,7 +2209,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     });
   });
 
-  app.get('/prior-auth', { preHandler: insuranceFeature }, async request => {
+  app.get('/prior-auth', { preHandler: [insuranceFeature, billingRead] }, async request => {
     const query = listLimit.parse(request.query);
     const filter = branchFilter(request, query.branchId);
     const rows = await db.priorAuthorization.findMany({
@@ -1923,10 +2218,11 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
       take: query.limit,
       include: { branch: { select: { name: true } }, patient: { select: { firstName: true, lastName: true } }, payer: { select: { name: true } } },
     });
+    await audit(request, { action: 'priorAuth.list', resource: 'priorAuthorization', metadata: { count: rows.length, branchId: request.auth.branchId ?? query.branchId ?? null } });
     return { priorAuthorizations: rows.map(mapPriorAuth) };
   });
 
-  app.patch('/prior-auth/:id/status', { preHandler: [insuranceFeature, insuranceWriteRoles] }, async (request, reply) => {
+  app.patch('/prior-auth/:id/status', { preHandler: [insuranceFeature, billingWrite] }, async (request, reply) => {
     const params = z.object({ id: uuid }).parse(request.params);
     const body = z.object({
       status: z.string().min(2).max(80),
@@ -1959,7 +2255,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     });
   });
 
-  app.get('/payments', { preHandler: paymentsFeature }, async request => {
+  app.get('/payments', { preHandler: [paymentsFeature, billingRead] }, async request => {
     const query = listLimit.parse(request.query);
     const filter = branchFilter(request, query.branchId);
     const [paymentRequests, paymentTransactions, depositRequirements] = await Promise.all([
@@ -1984,14 +2280,16 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
         include: { branch: { select: { name: true } }, patient: { select: { firstName: true, lastName: true } }, appointment: { select: { service: true } }, depositRule: { select: { name: true } } },
       })),
     ]);
-    return {
+    const result = {
       paymentRequests: paymentRequests.map(mapPaymentRequest),
       paymentTransactions: paymentTransactions.map(mapTransaction),
       depositRequirements: depositRequirements.map(mapDepositRequirement),
     };
+    await audit(request, { action: 'payment.list', resource: 'paymentRequest', metadata: { requestCount: paymentRequests.length, transactionCount: paymentTransactions.length, branchId: request.auth.branchId ?? query.branchId ?? null } });
+    return result;
   });
 
-  app.post('/payment/request', { preHandler: [paymentsFeature, editRoles] }, async (request, reply) => {
+  app.post('/payment/request', { preHandler: [paymentsFeature, billingWrite] }, async (request, reply) => {
     const body = z.object({
       branchId: uuid.optional(),
       patientId: uuid.optional(),
@@ -2005,6 +2303,15 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
 
     if (!body.patientId && !body.appointmentId) {
       throw app.httpErrors.badRequest('A patient or appointment context is required');
+    }
+
+    // Truthful provider gating (matches checkout.ts): a placeholder/unconfigured
+    // provider (square/paypal/clover/authorize_net, or Stripe without a key) must
+    // NOT issue a "real" payment request. Fail fast BEFORE claiming idempotency or
+    // persisting anything so no fabricated request is created in a pilot posture.
+    const paymentStatus = paymentProviderStatus();
+    if (paymentStatus.setupRequired) {
+      return reply.code(200).send({ status: 'setup_required', setupRequired: true, provider: paymentStatus.provider, message: `Connect ${paymentStatus.provider} to issue real payment requests.` });
     }
 
     // Optional client idempotency: replays with the same Idempotency-Key return
@@ -2027,6 +2334,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
             },
           });
           if (existing) {
+            assertBranchAccess(request, existing.branchId);
             return reply.code(200).send({ ...mapPaymentRequest(existing), depositRequirementId: existing.depositRequirements[0]?.id ?? null });
           }
         }
@@ -2037,30 +2345,30 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     const entities = await resolveBranchIdAndEntities(request, { tenantId: request.auth.tenantId, branchId: request.auth.branchId ?? undefined }, body);
     if (body.patientId && !entities.patient) throw app.httpErrors.notFound('Patient not found');
     if (body.appointmentId && !entities.appointment) throw app.httpErrors.notFound('Appointment not found');
+    const depositRule = await resolveDepositRuleForBranch(request, body.depositRuleId, entities.branchId);
     const provider = createPaymentProvider();
-    const outcome = provider.mode === 'mock'
-      ? await provider.createPaymentRequest({
+    let outcome: PaymentOutcome;
+    try {
+      outcome = await provider.createPaymentRequest({
           tenantId: request.auth.tenantId,
           branchId: entities.branchId,
           patient: entities.patient ?? undefined,
           appointment: entities.appointment ?? undefined,
           amount: body.amount,
           reason: body.reason,
-          depositRule: body.depositRuleId
-            ? { id: body.depositRuleId, name: body.reason, ruleType: 'manual', depositRequired: true, amountType: 'fixed', amountValue: body.amount, refundable: true, cancellationWindowHours: 24 }
+          depositRule: depositRule
+            ? { id: depositRule.id, name: depositRule.name, ruleType: depositRule.ruleType, depositRequired: depositRule.depositRequired, amountType: depositRule.amountType, amountValue: toNumber(depositRule.amountValue), refundable: depositRule.refundable, cancellationWindowHours: depositRule.cancellationWindowHours }
             : undefined,
-        })
-      : await provider.createPaymentRequest({
-          tenantId: request.auth.tenantId,
-          branchId: entities.branchId,
-          patient: entities.patient ?? undefined,
-          appointment: entities.appointment ?? undefined,
-          amount: body.amount,
-          reason: body.reason,
-          depositRule: body.depositRuleId
-            ? { id: body.depositRuleId, name: body.reason, ruleType: 'manual', depositRequired: true, amountType: 'fixed', amountValue: body.amount, refundable: true, cancellationWindowHours: 24 }
-            : undefined,
-        });
+      });
+    } catch (error) {
+      if (!(error instanceof ProviderOperationError)) throw error;
+      await emitBusinessEvent(request.auth.tenantId, { eventType: 'payment.failed', entityType: 'appointment', entityId: body.appointmentId ?? body.patientId ?? null, sourceModule: 'revenue-protection', payload: { provider: paymentStatus.provider, reason: 'provider_unavailable' } }).catch(() => {});
+      return reply.code(503).send({
+        status: 'provider_unavailable', retryable: false, reconciliationRequired: true,
+        provider: paymentStatus.provider,
+        message: 'The payment provider did not confirm the outcome. No local payment request was created; reconcile with the provider before retrying.',
+      });
+    }
 
     const requestRow = await db.paymentRequest.create({
       data: {
@@ -2153,7 +2461,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     });
   });
 
-  app.post('/payment-link', { preHandler: [paymentsFeature, editRoles] }, async (request, reply) => {
+  app.post('/payment-link', { preHandler: [paymentsFeature, billingWrite] }, async (request, reply) => {
     const body = z.object({
       branchId: uuid.optional(),
       patientId: uuid.optional(),
@@ -2169,21 +2477,40 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
       throw app.httpErrors.badRequest('A patient or appointment context is required');
     }
 
+    // Truthful provider gating (matches checkout.ts): never fabricate a payment
+    // link from a placeholder/unconfigured provider.
+    const linkProviderStatus = paymentProviderStatus();
+    if (linkProviderStatus.setupRequired) {
+      return reply.code(200).send({ status: 'setup_required', setupRequired: true, provider: linkProviderStatus.provider, message: `Connect ${linkProviderStatus.provider} to generate real payment links.` });
+    }
+
     const entities = await resolveBranchIdAndEntities(request, { tenantId: request.auth.tenantId, branchId: request.auth.branchId ?? undefined }, body);
     if (body.patientId && !entities.patient) throw app.httpErrors.notFound('Patient not found');
     if (body.appointmentId && !entities.appointment) throw app.httpErrors.notFound('Appointment not found');
+    const depositRule = await resolveDepositRuleForBranch(request, body.depositRuleId, entities.branchId);
     const provider = createPaymentProvider();
-    const outcome = await provider.createPaymentLink({
-      tenantId: request.auth.tenantId,
-      branchId: entities.branchId,
-      patient: entities.patient ?? undefined,
-      appointment: entities.appointment ?? undefined,
-      amount: body.amount,
-      reason: body.reason,
-      depositRule: body.depositRuleId
-        ? { id: body.depositRuleId, name: body.reason, ruleType: 'manual', depositRequired: true, amountType: 'fixed', amountValue: body.amount, refundable: true, cancellationWindowHours: 24 }
-        : undefined,
-    });
+    let outcome: PaymentOutcome;
+    try {
+      outcome = await provider.createPaymentLink({
+        tenantId: request.auth.tenantId,
+        branchId: entities.branchId,
+        patient: entities.patient ?? undefined,
+        appointment: entities.appointment ?? undefined,
+        amount: body.amount,
+        reason: body.reason,
+        depositRule: depositRule
+          ? { id: depositRule.id, name: depositRule.name, ruleType: depositRule.ruleType, depositRequired: depositRule.depositRequired, amountType: depositRule.amountType, amountValue: toNumber(depositRule.amountValue), refundable: depositRule.refundable, cancellationWindowHours: depositRule.cancellationWindowHours }
+          : undefined,
+      });
+    } catch (error) {
+      if (!(error instanceof ProviderOperationError)) throw error;
+      await emitBusinessEvent(request.auth.tenantId, { eventType: 'payment.failed', entityType: 'appointment', entityId: body.appointmentId ?? body.patientId ?? null, sourceModule: 'revenue-protection', payload: { provider: linkProviderStatus.provider, reason: 'provider_unavailable' } }).catch(() => {});
+      return reply.code(503).send({
+        status: 'provider_unavailable', retryable: false, reconciliationRequired: true,
+        provider: linkProviderStatus.provider,
+        message: 'The payment provider did not confirm the link. No local payment request was created; reconcile with the provider before retrying.',
+      });
+    }
 
     const requestRow = await db.paymentRequest.create({
       data: {
@@ -2271,42 +2598,57 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     });
   });
 
-  app.patch('/payment/:id/status', { preHandler: [paymentsFeature, editRoles] }, async (request, reply) => {
+  app.patch('/payment/:id/status', { preHandler: [paymentsFeature, billingWrite] }, async (request, reply) => {
     const params = z.object({ id: uuid }).parse(request.params);
     const body = z.object({
-      status: z.string().min(2).max(80),
+      status: z.enum(PAYMENT_REQUEST_STATUSES),
       providerReference: z.string().max(120).optional(),
     }).parse(request.body);
+    // Segregation of duties: FRONT_DESK cannot manually attest a collection.
+    if (body.status === 'collected' && !COLLECT_PRIVILEGED_ROLES.includes(request.auth.role as typeof COLLECT_PRIVILEGED_ROLES[number])) {
+      throw app.httpErrors.forbidden('Your role cannot manually mark a payment as collected');
+    }
     const existing = await db.paymentRequest.findFirst({
       where: { id: params.id, tenantId: request.auth.tenantId },
     });
     if (!existing) throw app.httpErrors.notFound('Payment request not found');
     assertBranchAccess(request, existing.branchId);
 
+    const isNewCollection = body.status === 'collected' && existing.status !== 'collected';
+    const collectedAmount = toNumber(existing.amount);
+
     const row = await db.paymentRequest.update({
       where: { id: params.id },
       data: { status: body.status, providerReference: body.providerReference ?? existing.providerReference },
     });
 
-    if (body.status === 'collected') {
-      await db.paymentTransaction.create({
-        data: {
-          tenantId: request.auth.tenantId,
-          branchId: row.branchId,
-          patientId: row.patientId ?? undefined,
-          appointmentId: row.appointmentId ?? undefined,
-          paymentRequestId: row.id,
-          amount: row.amount,
-          currency: row.currency,
-          status: 'succeeded',
-          mode: row.mode,
-          providerReference: body.providerReference ?? row.providerReference ?? undefined,
-          receivedAt: new Date(),
-          rawResponse: {
+    if (isNewCollection) {
+      await db.$transaction(async tx => {
+        await tx.paymentTransaction.create({
+          data: {
+            tenantId: request.auth.tenantId,
+            branchId: row.branchId,
+            patientId: row.patientId ?? undefined,
+            appointmentId: row.appointmentId ?? undefined,
+            paymentRequestId: row.id,
+            amount: row.amount,
+            currency: row.currency,
             status: 'succeeded',
-            source: 'manual',
+            mode: row.mode,
+            providerReference: body.providerReference ?? row.providerReference ?? undefined,
+            receivedAt: new Date(),
+            rawResponse: {
+              status: 'succeeded',
+              source: 'manual',
+              actorUserId: request.auth.userId,
+            },
           },
-        },
+        });
+        // AR reconciliation: a real collection reduces the patient's outstanding
+        // balance (clamped at 0 — the column is non-negative by constraint).
+        if (row.patientId) {
+          await decrementOutstandingBalance(request.auth.tenantId, row.patientId, collectedAmount, tx);
+        }
       });
     }
 
@@ -2328,7 +2670,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
   // `revenueProtectionWebhookRoutes` (registered outside the authenticated
   // scope, since Stripe cannot present a JWT).
 
-  app.get('/deposit-rules', { preHandler: paymentsFeature }, async request => {
+  app.get('/deposit-rules', { preHandler: [paymentsFeature, billingRead] }, async request => {
     const query = listLimit.parse(request.query);
     const filter = branchFilter(request, query.branchId);
     const rows = await runWithTenantContext(request.auth.tenantId, tx => tx.depositRule.findMany({
@@ -2337,10 +2679,11 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
       take: query.limit,
       include: { branch: { select: { name: true } } },
     }));
+    await audit(request, { action: 'depositRule.list', resource: 'depositRule', metadata: { count: rows.length, branchId: request.auth.branchId ?? query.branchId ?? null } });
     return { depositRules: rows.map(mapDepositRule) };
   });
 
-  app.post('/deposit-rules', { preHandler: [paymentsFeature, adminRoles] }, async (request, reply) => {
+  app.post('/deposit-rules', { preHandler: [paymentsFeature, billingWrite] }, async (request, reply) => {
     const body = z.object({
       branchId: uuid.optional(),
       name: z.string().min(2).max(160),
@@ -2387,7 +2730,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     return reply.code(201).send(mapDepositRule(row));
   });
 
-  app.patch('/deposit-rules/:id', { preHandler: [paymentsFeature, adminRoles] }, async (request, reply) => {
+  app.patch('/deposit-rules/:id', { preHandler: [paymentsFeature, billingWrite] }, async (request, reply) => {
     const params = z.object({ id: uuid }).parse(request.params);
     const body = z.object({
       branchId: uuid.optional(),
@@ -2411,11 +2754,16 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
       const existing = await tx.depositRule.findFirst({ where: { id: params.id, tenantId: request.auth.tenantId } });
       if (!existing) throw app.httpErrors.notFound('Deposit rule not found');
       assertBranchAccess(request, existing.branchId ?? request.auth.branchId ?? existing.branchId ?? '');
+      if (request.auth.branchId && !existing.branchId) {
+        throw app.httpErrors.forbidden('Branch-restricted accounts cannot modify tenant-wide deposit rules');
+      }
+      const targetBranchId = body.branchId === undefined ? existing.branchId : branchIdForWrite(request, body.branchId);
+      if (targetBranchId) assertBranchAccess(request, targetBranchId);
       return tx.depositRule.update({
         where: { id: params.id },
         data: {
           ...body,
-          branchId: body.branchId ?? existing.branchId ?? undefined,
+          branchId: targetBranchId ?? existing.branchId ?? undefined,
         },
         include: { branch: { select: { name: true } } },
       });
@@ -2424,30 +2772,49 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     return reply.send(mapDepositRule(row));
   });
 
-  app.patch('/deposit-requirements/:id/status', { preHandler: [paymentsFeature, editRoles] }, async (request, reply) => {
+  app.patch('/deposit-requirements/:id/status', { preHandler: [paymentsFeature, billingWrite] }, async (request, reply) => {
     const params = z.object({ id: uuid }).parse(request.params);
     const body = z.object({
-      status: z.string().min(2).max(80),
+      status: z.enum(DEPOSIT_REQUIREMENT_STATUSES),
       reason: z.string().max(240).optional(),
       collectedAmount: z.coerce.number().min(0).optional(),
       waiverReason: z.string().max(240).optional(),
     }).parse(request.body);
+    // Segregation of duties: FRONT_DESK cannot manually attest a collection.
+    if (body.status === 'collected' && !COLLECT_PRIVILEGED_ROLES.includes(request.auth.role as typeof COLLECT_PRIVILEGED_ROLES[number])) {
+      throw app.httpErrors.forbidden('Your role cannot manually mark a deposit as collected');
+    }
     const existing = await db.depositRequirement.findFirst({
       where: { id: params.id, tenantId: request.auth.tenantId },
     });
     if (!existing) throw app.httpErrors.notFound('Deposit requirement not found');
     assertBranchAccess(request, existing.branchId);
 
+    // Integrity: a manual collectedAmount can never exceed the required amount —
+    // otherwise revenue is fabricated beyond what was ever owed.
+    const requiredAmount = toNumber(existing.requiredAmount);
+    if (body.collectedAmount != null && body.collectedAmount > requiredAmount) {
+      throw app.httpErrors.badRequest('collectedAmount cannot exceed the required amount');
+    }
+    const isNewCollection = body.status === 'collected' && existing.status !== 'collected';
+    const collectedAmount = body.collectedAmount ?? (isNewCollection ? requiredAmount : toNumber(existing.collectedAmount));
+
     const row = await db.depositRequirement.update({
       where: { id: params.id },
       data: {
         status: body.status,
-        collectedAmount: body.collectedAmount ?? existing.collectedAmount,
+        collectedAmount,
         waiverReason: body.waiverReason ?? existing.waiverReason,
         collectedAt: body.status === 'collected' ? new Date() : existing.collectedAt,
         reason: body.reason ?? existing.reason,
       },
     });
+
+    // AR reconciliation: a fresh manual deposit collection reduces the patient's
+    // outstanding balance (tenant-scoped, clamped at 0).
+    if (isNewCollection && existing.patientId) {
+      await decrementOutstandingBalance(request.auth.tenantId, existing.patientId, collectedAmount);
+    }
 
     await audit(request, {
       action: 'depositRequirement.status.updated',
@@ -2466,7 +2833,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     });
   });
 
-  app.get('/leaks', async request => {
+  app.get('/leaks', { preHandler: billingRead }, async request => {
     const query = listLimit.parse(request.query);
     const filter = branchFilter(request, query.branchId);
     const rows = await runWithTenantContext(request.auth.tenantId, tx => tx.revenueProtectionAlert.findMany({
@@ -2479,10 +2846,11 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
         appointment: { select: { service: true } },
       },
     }));
+    await audit(request, { action: 'revenueProtectionAlert.list', resource: 'revenueProtectionAlert', metadata: { count: rows.length, branchId: request.auth.branchId ?? query.branchId ?? null } });
     return { revenueProtectionAlerts: rows.map(mapAlert) };
   });
 
-  app.patch('/leaks/:id/status', { preHandler: editRoles }, async (request, reply) => {
+  app.patch('/leaks/:id/status', { preHandler: billingWrite }, async (request, reply) => {
     const params = z.object({ id: uuid }).parse(request.params);
     const body = z.object({
       status: z.string().min(2).max(80),
@@ -2551,12 +2919,11 @@ export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
         request.log.warn({ ip: request.ip }, 'Stripe webhook signature verification failed');
         return reply.code(400).send({ error: 'INVALID_SIGNATURE' });
       }
-    } else if (env.NODE_ENV === 'production') {
-      // Never accept unsigned payment webhooks in production.
-      request.log.error('Stripe webhook rejected: STRIPE_WEBHOOK_SECRET not configured in production');
-      return reply.code(503).send({ error: 'WEBHOOK_NOT_CONFIGURED' });
     } else {
-      request.log.warn('Stripe webhook accepted WITHOUT verification (non-production; set STRIPE_WEBHOOK_SECRET to enforce)');
+      // A webhook without a configured verifier cannot establish tenant
+      // authority in any environment.
+      request.log.error('Stripe webhook rejected: STRIPE_WEBHOOK_SECRET not configured');
+      return reply.code(503).send({ error: 'WEBHOOK_NOT_CONFIGURED' });
     }
 
     const event = z.object({
@@ -2565,56 +2932,98 @@ export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
       data: z.object({ object: z.record(z.string(), z.unknown()).optional() }).partial().optional(),
     }).partial().parse(request.body ?? {});
     if (!event.id || !event.type) return reply.code(400).send({ error: 'INVALID_EVENT' });
-
-    // Idempotent on the Stripe event id: redelivery is acknowledged, not reprocessed.
-    const claim = await claimIdempotency('stripe.webhook', event.id);
-    if (!claim.claimed) return reply.code(200).send({ received: true, duplicate: true });
+    const eventId = event.id;
 
     const object = (event.data?.object ?? {}) as Record<string, unknown>;
-    const candidates = [object.id, object.payment_intent, object.client_reference_id].filter(
+    const candidates = [...new Set([object.id, object.payment_intent, object.client_reference_id].filter(
       (value): value is string => typeof value === 'string',
-    );
-    if (candidates.length === 0) return reply.code(200).send({ received: true });
-
-    const paymentRequest = await db.paymentRequest.findFirst({ where: { providerReference: { in: candidates } } });
-    if (!paymentRequest) {
-      request.log.info({ eventId: event.id, type: event.type }, 'Stripe webhook: no matching payment request');
+    ))];
+    if (candidates.length === 0) {
       return reply.code(200).send({ received: true });
     }
 
+    // The Stripe signature is verified above. Only then may the opaque provider
+    // reference cross the narrow bootstrap resolver. Multiple distinct matches
+    // fail closed instead of selecting an arbitrary tenant.
+    const resolvedMatches = (await Promise.all(candidates.map(candidate =>
+      resolveIngressTenant('stripe_provider_reference', candidate),
+    ))).filter((row): row is NonNullable<typeof row> => row !== null);
+    const distinctMatches = [...new Map(resolvedMatches.map(row => [`${row.tenantId}:${row.resourceId}`, row])).values()];
+    if (distinctMatches.length !== 1) {
+      request.log.info({ eventId: event.id, type: event.type }, 'Stripe webhook: no matching payment request');
+      return reply.code(200).send({ received: true });
+    }
+    const resolved = distinctMatches[0];
+    enterTenantContext({ tenantId: resolved.tenantId, actorId: `webhook:stripe:${resolved.resourceId}`, actorRole: 'WEBHOOK', source: 'webhook', requestId: request.id });
+
+    // Idempotent on the Stripe event id, but crash-safe: a claimed key is only a
+    // true DUPLICATE once processing has COMPLETED (recorded a resultId). A
+    // claimed-but-not-completed key means a prior attempt threw before finishing.
+    const claim = await claimIdempotency('stripe.webhook', event.id, resolved.tenantId);
+    if (!claim.claimed && claim.resultId) {
+      return reply.code(200).send({ received: true, duplicate: true });
+    }
+
+    const paymentRequest = await db.paymentRequest.findFirst({ where: { id: resolved.resourceId, providerReference: { in: candidates } } });
+    if (!paymentRequest) return reply.code(200).send({ received: true, matched: false });
+
     // Audit receipt of the verified webhook (no PHI — ids + event type only).
-    await db.auditEvent.create({ data: { tenantId: paymentRequest.tenantId, action: 'payment.webhook.received', resource: 'paymentRequest', resourceId: paymentRequest.id, ipAddress: request.ip, metadata: { eventId: event.id, type: event.type } } }).catch(() => {});
+    await db.auditEvent.create({ data: { tenantId: paymentRequest.tenantId, action: 'payment.webhook.received', resource: 'paymentRequest', resourceId: paymentRequest.id, ipAddress: request.ip, metadata: { eventId: event.id, type: event.type } } });
 
     const succeeded = ['checkout.session.completed', 'payment_intent.succeeded', 'charge.succeeded'].includes(event.type)
       || object.payment_status === 'paid';
+    const refunded = event.type === 'charge.refunded';
+    const disputed = event.type === 'charge.dispute.created';
     const failed = ['payment_intent.payment_failed', 'charge.failed'].includes(event.type);
     const expired = ['checkout.session.expired', 'payment_link.expired'].includes(event.type);
 
+    // Reconcile against the ACTUAL settled amount reported by Stripe (minor units),
+    // not the requested amount — a partial/adjusted settlement must be recorded truthfully.
+    const eventMinorUnits = toNumber(object.amount_total ?? object.amount_received ?? object.amount);
+    const settledAmount = eventMinorUnits > 0 ? eventMinorUnits / 100 : toNumber(paymentRequest.amount);
+    const refundMinorUnits = toNumber(object.amount_refunded ?? object.amount);
+    const refundAmount = refundMinorUnits > 0 ? refundMinorUnits / 100 : toNumber(paymentRequest.amount);
+
     if (succeeded) {
-      await db.$transaction([
-        db.paymentTransaction.create({
+      const successResult = await db.$transaction(async tx => {
+        const locked = await lockStripeReconciliation(tx, eventId, paymentRequest.id);
+        if (locked.eventComplete) return 'duplicate' as const;
+        // A provider may deliver a failure/expiry before the eventual success
+        // for the same payment intent/session. Those states describe the last
+        // observed attempt, not proof that money can never settle later.
+        if (!['pending', 'link_sent', 'provider_pending', 'reconciliation_required', 'reconciliation_required_paid', 'failed', 'expired'].includes(locked.paymentStatus ?? '')) {
+          await tx.idempotencyKey.updateMany({ where: { scope: 'stripe.webhook', key: event.id }, data: { resultId: paymentRequest.id } });
+          return 'terminal_state' as const;
+        }
+        await tx.paymentTransaction.create({
           data: {
             tenantId: paymentRequest.tenantId,
             branchId: paymentRequest.branchId,
             patientId: paymentRequest.patientId ?? undefined,
             appointmentId: paymentRequest.appointmentId ?? undefined,
             paymentRequestId: paymentRequest.id,
-            amount: paymentRequest.amount,
+            amount: settledAmount,
             currency: paymentRequest.currency,
             status: 'succeeded',
             mode: paymentRequest.mode,
             providerReference: typeof object.id === 'string' ? object.id : paymentRequest.providerReference ?? undefined,
             receivedAt: new Date(),
-            rawResponse: { eventId: event.id, type: event.type, source: 'stripe-webhook' },
+            rawResponse: { eventId: event.id, type: event.type, source: 'stripe-webhook', settledAmount },
           },
-        }),
-        db.paymentRequest.update({ where: { id: paymentRequest.id }, data: { status: 'collected' } }),
-        // Appointment Checkout: settle the linked deposit requirement(s).
-        db.depositRequirement.updateMany({
+        });
+        await tx.paymentRequest.update({ where: { id: paymentRequest.id }, data: { status: 'collected' } });
+        // Appointment Checkout: settle the linked deposit requirement(s) at the
+        // actually-settled amount.
+        await tx.depositRequirement.updateMany({
           where: { tenantId: paymentRequest.tenantId, paymentRequestId: paymentRequest.id, status: { notIn: ['collected', 'waived'] } },
-          data: { status: 'collected', collectedAmount: paymentRequest.amount, collectedAt: new Date() },
-        }),
-        db.integrationRunLog.create({
+          data: { status: 'collected', collectedAmount: settledAmount, collectedAt: new Date() },
+        });
+        // AR reconciliation (#7): a real settlement reduces the patient's outstanding
+        // balance (clamped at 0 — the column is non-negative by constraint).
+        if (paymentRequest.patientId) {
+          await tx.$executeRaw`UPDATE "Patient" SET "outstandingBalance" = GREATEST(0, "outstandingBalance" - ${settledAmount}::numeric) WHERE "id" = ${paymentRequest.patientId}::uuid AND "tenantId" = ${paymentRequest.tenantId}::uuid`;
+        }
+        await tx.integrationRunLog.create({
           data: {
             tenantId: paymentRequest.tenantId,
             branchId: paymentRequest.branchId,
@@ -2623,53 +3032,252 @@ export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
             operation: 'webhook.payment',
             status: 'success',
             requestSummary: { eventId: event.id, type: event.type },
-            responseSummary: { paymentRequestId: paymentRequest.id },
+            responseSummary: { paymentRequestId: paymentRequest.id, settledAmount },
           },
-        }),
-      ]);
-      await db.auditEvent.create({ data: { tenantId: paymentRequest.tenantId, action: 'payment.succeeded', resource: 'paymentRequest', resourceId: paymentRequest.id, metadata: { eventId: event.id, appointmentId: paymentRequest.appointmentId } } }).catch(() => {});
-      await recordWorkflowEvent(paymentRequest.tenantId, { eventType: 'payment.succeeded', entityType: 'paymentRequest', entityId: paymentRequest.id, sourceModule: 'payments', payload: { appointmentId: paymentRequest.appointmentId } });
+        });
+        await tx.auditEvent.create({
+          data: {
+            tenantId: paymentRequest.tenantId,
+            action: 'payment.succeeded',
+            resource: 'paymentRequest',
+            resourceId: paymentRequest.id,
+            metadata: { eventId: event.id, appointmentId: paymentRequest.appointmentId, settledAmount },
+          },
+        });
+        // Mark the webhook idempotency key COMPLETED atomically with the money
+        // movement: only now is a redelivery a true duplicate. If any step above
+        // fails, this update rolls back too, leaving the key reprocessable.
+        await tx.idempotencyKey.updateMany({ where: { scope: 'stripe.webhook', key: event.id }, data: { resultId: paymentRequest.id } });
+        return 'processed' as const;
+      });
+      if (successResult === 'duplicate') return reply.code(200).send({ received: true, duplicate: true });
+      if (successResult === 'terminal_state') return reply.code(200).send({ received: true, ignored: 'terminal_payment_state' });
+      // The money movement, mandatory audit, and idempotency completion above
+      // are already committed. Workflow propagation is optional downstream
+      // fan-out: its failure must never turn a durably processed Stripe event
+      // into a 500 that invites needless provider redelivery.
+      try {
+        await recordWorkflowEvent(paymentRequest.tenantId, { eventType: 'payment.succeeded', entityType: 'paymentRequest', entityId: paymentRequest.id, sourceModule: 'payments', payload: { appointmentId: paymentRequest.appointmentId } });
+      } catch (error) {
+        request.log.warn({ err: error, eventId: event.id, operation: 'payment_success_workflow_event' }, 'Optional payment success workflow event fan-out failed');
+      }
+    } else if (refunded) {
+      // Stripe's amount_refunded is cumulative. Persist only the delta beyond
+      // refunds already recorded for this request, keep a partial refund in the
+      // collected state, and restore AR by exactly that delta.
+      const refundResult = await db.$transaction(async tx => {
+        const locked = await lockStripeReconciliation(tx, eventId, paymentRequest.id);
+        if (locked.eventComplete) return 'duplicate' as const;
+        const [settled, refundedSoFar] = await Promise.all([
+          tx.paymentTransaction.aggregate({
+            _sum: { amount: true },
+            where: { tenantId: paymentRequest.tenantId, paymentRequestId: paymentRequest.id, status: { in: ['succeeded', 'paid'] } },
+          }),
+          tx.paymentTransaction.aggregate({
+            _sum: { amount: true },
+            where: { tenantId: paymentRequest.tenantId, paymentRequestId: paymentRequest.id, status: 'refunded' },
+          }),
+        ]);
+        const settledTotal = roundMoney(toNumber(settled._sum.amount));
+        const priorRefundTotal = roundMoney(toNumber(refundedSoFar._sum.amount));
+
+        // Do not consume an out-of-order refund. Leaving resultId null makes the
+        // durable webhook claim reprocessable after the success event arrives.
+        if (settledTotal <= 0 || (locked.paymentStatus !== 'collected' && locked.paymentStatus !== 'refunded')) {
+          return 'awaiting_success' as const;
+        }
+        const cumulativeRefundTotal = roundMoney(refundAmount);
+        if (cumulativeRefundTotal > settledTotal) return 'invalid_refund_total' as const;
+        const refundDelta = roundMoney(Math.max(0, cumulativeRefundTotal - priorRefundTotal));
+        if (refundDelta === 0) {
+          await tx.idempotencyKey.updateMany({ where: { scope: 'stripe.webhook', key: event.id }, data: { resultId: paymentRequest.id } });
+          return 'no_change' as const;
+        }
+        const fullyRefunded = cumulativeRefundTotal >= settledTotal;
+        const remainingCollected = roundMoney(settledTotal - cumulativeRefundTotal);
+        await tx.paymentTransaction.create({
+          data: {
+            tenantId: paymentRequest.tenantId,
+            branchId: paymentRequest.branchId,
+            patientId: paymentRequest.patientId ?? undefined,
+            appointmentId: paymentRequest.appointmentId ?? undefined,
+            paymentRequestId: paymentRequest.id,
+            amount: refundDelta,
+            currency: paymentRequest.currency,
+            status: 'refunded',
+            mode: paymentRequest.mode,
+            providerReference: typeof object.id === 'string' ? object.id : paymentRequest.providerReference ?? undefined,
+            receivedAt: new Date(),
+            rawResponse: { eventId: event.id, type: event.type, source: 'stripe-webhook', refundAmount: refundDelta, cumulativeRefundTotal },
+          },
+        });
+        await tx.paymentRequest.update({ where: { id: paymentRequest.id }, data: { status: fullyRefunded ? 'refunded' : 'collected' } });
+        await tx.depositRequirement.updateMany({
+          where: { tenantId: paymentRequest.tenantId, paymentRequestId: paymentRequest.id, status: { in: ['collected', 'refunded'] } },
+          data: { status: fullyRefunded ? 'refunded' : 'collected', collectedAmount: remainingCollected },
+        });
+        // AR reconciliation: a refund restores the previously-reduced outstanding balance.
+        if (paymentRequest.patientId) {
+          await tx.patient.updateMany({ where: { id: paymentRequest.patientId, tenantId: paymentRequest.tenantId }, data: { outstandingBalance: { increment: refundDelta } } });
+        }
+        await tx.integrationRunLog.create({
+          data: {
+            tenantId: paymentRequest.tenantId,
+            branchId: paymentRequest.branchId,
+            provider: 'stripe',
+            providerMode: paymentRequest.mode,
+            operation: 'webhook.refund',
+            status: 'success',
+            requestSummary: { eventId: event.id, type: event.type },
+            responseSummary: { paymentRequestId: paymentRequest.id, refundAmount: refundDelta, cumulativeRefundTotal },
+          },
+        });
+        await tx.auditEvent.create({
+          data: {
+            tenantId: paymentRequest.tenantId,
+            action: 'payment.refunded',
+            resource: 'paymentRequest',
+            resourceId: paymentRequest.id,
+            metadata: { eventId: event.id, appointmentId: paymentRequest.appointmentId, refundAmount: refundDelta, cumulativeRefundTotal, fullyRefunded },
+          },
+        });
+        // A refund is complete only when its money state and mandatory audit
+        // evidence are durable together. An audit failure rolls this whole
+        // transaction back and leaves the original claim reprocessable.
+        await tx.idempotencyKey.updateMany({ where: { scope: 'stripe.webhook', key: event.id }, data: { resultId: paymentRequest.id } });
+        return 'processed' as const;
+      });
+      if (refundResult === 'duplicate') return reply.code(200).send({ received: true, duplicate: true });
+      if (refundResult === 'awaiting_success') return reply.code(409).send({ received: false, retryable: true, deferred: 'awaiting_success' });
+      if (refundResult === 'invalid_refund_total') return reply.code(409).send({ received: false, retryable: false, error: 'refund_exceeds_settled_amount' });
+      if (refundResult === 'no_change') return reply.code(200).send({ received: true, duplicateEconomicEffect: true });
+    } else if (disputed) {
+      // The durable dispute fact, its mandatory audit evidence, and webhook
+      // completion are one unit. The operational alert is downstream fan-out:
+      // useful, but it must never decide whether Stripe receives an ACK.
+      const disputeResult = await db.$transaction(async tx => {
+        const locked = await lockStripeReconciliation(tx, eventId, paymentRequest.id);
+        if (locked.eventComplete) return 'duplicate' as const;
+        await tx.integrationRunLog.create({
+          data: {
+            tenantId: paymentRequest.tenantId, branchId: paymentRequest.branchId,
+            provider: 'stripe', providerMode: paymentRequest.mode, operation: 'webhook.dispute',
+            status: 'success', requestSummary: { eventId: event.id, type: event.type }, responseSummary: { paymentRequestId: paymentRequest.id },
+          },
+        });
+        await tx.auditEvent.create({
+          data: {
+            tenantId: paymentRequest.tenantId,
+            action: 'payment.dispute.created',
+            resource: 'paymentRequest',
+            resourceId: paymentRequest.id,
+            metadata: { eventId: event.id, appointmentId: paymentRequest.appointmentId },
+          },
+        });
+        await tx.idempotencyKey.updateMany({ where: { scope: 'stripe.webhook', key: event.id }, data: { resultId: paymentRequest.id } });
+        return 'processed' as const;
+      });
+      if (disputeResult === 'duplicate') return reply.code(200).send({ received: true, duplicate: true });
+      try {
+        await runWithTenantContext(paymentRequest.tenantId, tx => tx.revenueProtectionAlert.create({
+          data: {
+            tenantId: paymentRequest.tenantId, branchId: paymentRequest.branchId,
+            patientId: paymentRequest.patientId ?? undefined, appointmentId: paymentRequest.appointmentId ?? undefined,
+            sourceType: 'payment_dispute', severity: 'high',
+            title: 'Payment dispute opened',
+            description: 'A patient (or their bank) opened a dispute/chargeback on a collected payment. Respond before the evidence deadline.',
+            estimatedValue: refundAmount, status: 'open',
+            recommendedAction: 'Review the dispute in Stripe and submit evidence before the deadline.',
+            actionLink: paymentRequest.appointmentId ? `appointment/${paymentRequest.appointmentId}` : null,
+          },
+        }));
+      } catch (error) {
+        request.log.warn({ err: error, eventId: event.id, operation: 'payment_dispute_alert' }, 'Optional payment dispute alert fan-out failed');
+      }
     } else if (failed || expired) {
       const newStatus = failed ? 'failed' : 'expired';
-      // Never regress an already-paid request from a late/out-of-order failure
-      // or expiry event — acknowledge and stop.
-      if (paymentRequest.status === 'collected') {
-        return reply.code(200).send({ received: true, ignored: 'already_paid' });
+      // Commit the guarded terminal transition, mandatory evidence, and webhook
+      // completion together. The conditional update prevents an out-of-order
+      // failure/expiry event from regressing a concurrently collected request.
+      const terminal = await db.$transaction(async tx => {
+        const locked = await lockStripeReconciliation(tx, eventId, paymentRequest.id);
+        if (locked.eventComplete) return { duplicate: true, ignored: false };
+        if (locked.paymentStatus !== 'pending' && locked.paymentStatus !== 'link_sent') {
+          await tx.idempotencyKey.updateMany({ where: { scope: 'stripe.webhook', key: event.id }, data: { resultId: paymentRequest.id } });
+          return { duplicate: false, ignored: true };
+        }
+        const updated = await tx.paymentRequest.updateMany({
+          where: { id: paymentRequest.id, status: { in: ['pending', 'link_sent'] } },
+          data: { status: newStatus },
+        });
+        if (updated.count === 0) {
+          await tx.idempotencyKey.updateMany({ where: { scope: 'stripe.webhook', key: event.id }, data: { resultId: paymentRequest.id } });
+          return { duplicate: false, ignored: true };
+        }
+        await tx.auditEvent.create({
+          data: {
+            tenantId: paymentRequest.tenantId,
+            action: failed ? 'payment.failed' : 'payment.expired',
+            resource: 'paymentRequest',
+            resourceId: paymentRequest.id,
+            metadata: { eventId: event.id, type: event.type },
+          },
+        });
+        await tx.idempotencyKey.updateMany({ where: { scope: 'stripe.webhook', key: event.id }, data: { resultId: paymentRequest.id } });
+        return { duplicate: false, ignored: false };
+      });
+      if (terminal.duplicate) return reply.code(200).send({ received: true, duplicate: true });
+      if (terminal.ignored) {
+        return reply.code(200).send({ received: true, ignored: 'terminal_payment_state' });
       }
-      // Only move OUT of a non-terminal state; the guard prevents clobbering a
-      // collected request even under a race.
-      await db.paymentRequest.updateMany({ where: { id: paymentRequest.id, status: { not: 'collected' } }, data: { status: newStatus } });
+
       // Dedupe the follow-up task/alert per (request,outcome) so distinct
       // provider failure events don't spam revenue protection.
       const failureClaim = await claimIdempotency('payment.failure', `${paymentRequest.tenantId}:${paymentRequest.id}:${newStatus}`, paymentRequest.tenantId);
       if (failureClaim.claimed) {
-        await db.staffTask.create({
-          data: {
-            tenantId: paymentRequest.tenantId, branchId: paymentRequest.branchId,
-            title: failed ? 'Review failed deposit payment' : 'Resend expired deposit link',
-            priority: failed ? 'high' : 'normal', status: 'OPEN',
-            metadata: { source: 'payment_webhook', paymentRequestId: paymentRequest.id, appointmentId: paymentRequest.appointmentId, event: event.type },
-          },
-        }).catch(() => {});
-        if (paymentRequest.appointmentId || paymentRequest.patientId) {
-          await runWithTenantContext(paymentRequest.tenantId, tx => tx.revenueProtectionAlert.create({
+        try {
+          await db.staffTask.create({
             data: {
               tenantId: paymentRequest.tenantId, branchId: paymentRequest.branchId,
-              patientId: paymentRequest.patientId ?? undefined, appointmentId: paymentRequest.appointmentId ?? undefined,
-              sourceType: 'deposit_payment', severity: failed ? 'high' : 'medium',
-              title: failed ? 'Deposit payment failed' : 'Deposit link expired unpaid',
-              description: failed ? 'A patient deposit payment failed and needs follow-up.' : 'A deposit payment link expired before payment.',
-              estimatedValue: paymentRequest.amount, status: 'open',
-              recommendedAction: failed ? 'Contact the patient and resend a payment link.' : 'Resend a fresh deposit payment link.',
-              actionLink: paymentRequest.appointmentId ? `appointment/${paymentRequest.appointmentId}` : null,
+              title: failed ? 'Review failed deposit payment' : 'Resend expired deposit link',
+              priority: failed ? 'high' : 'normal', status: 'OPEN',
+              metadata: { source: 'payment_webhook', paymentRequestId: paymentRequest.id, appointmentId: paymentRequest.appointmentId, event: event.type },
             },
-          })).catch(() => {});
+          });
+        } catch (error) {
+          request.log.warn({ err: error, eventId: event.id, operation: 'payment_failure_task' }, 'Optional payment failure task fan-out failed');
         }
-        await recordWorkflowEvent(paymentRequest.tenantId, { eventType: failed ? 'payment.failed' : 'payment.expired', entityType: 'paymentRequest', entityId: paymentRequest.id, sourceModule: 'payments', payload: { appointmentId: paymentRequest.appointmentId } });
+        if (paymentRequest.appointmentId || paymentRequest.patientId) {
+          try {
+            await runWithTenantContext(paymentRequest.tenantId, tx => tx.revenueProtectionAlert.create({
+              data: {
+                tenantId: paymentRequest.tenantId, branchId: paymentRequest.branchId,
+                patientId: paymentRequest.patientId ?? undefined, appointmentId: paymentRequest.appointmentId ?? undefined,
+                sourceType: 'deposit_payment', severity: failed ? 'high' : 'medium',
+                title: failed ? 'Deposit payment failed' : 'Deposit link expired unpaid',
+                description: failed ? 'A patient deposit payment failed and needs follow-up.' : 'A deposit payment link expired before payment.',
+                estimatedValue: paymentRequest.amount, status: 'open',
+                recommendedAction: failed ? 'Contact the patient and resend a payment link.' : 'Resend a fresh deposit payment link.',
+                actionLink: paymentRequest.appointmentId ? `appointment/${paymentRequest.appointmentId}` : null,
+              },
+            }));
+          } catch (error) {
+            request.log.warn({ err: error, eventId: event.id, operation: 'payment_failure_alert' }, 'Optional payment failure alert fan-out failed');
+          }
+        }
+        try {
+          await recordWorkflowEvent(paymentRequest.tenantId, { eventType: failed ? 'payment.failed' : 'payment.expired', entityType: 'paymentRequest', entityId: paymentRequest.id, sourceModule: 'payments', payload: { appointmentId: paymentRequest.appointmentId } });
+        } catch (error) {
+          request.log.warn({ err: error, eventId: event.id, operation: 'payment_failure_workflow_event' }, 'Optional payment workflow event fan-out failed');
+        }
       }
-      await db.auditEvent.create({ data: { tenantId: paymentRequest.tenantId, action: failed ? 'payment.failed' : 'payment.expired', resource: 'paymentRequest', resourceId: paymentRequest.id, metadata: { eventId: event.id, type: event.type } } }).catch(() => {});
     }
 
+    // Terminal completion for every reconciled path (success already recorded the
+    // result atomically above; this also covers failed/expired and unhandled event
+    // types). Recording a resultId marks the event fully processed so a later
+    // redelivery is acknowledged as a duplicate rather than reprocessed.
+    await recordIdempotencyResult('stripe.webhook', event.id, paymentRequest.id);
     return reply.code(200).send({ received: true });
   });
 };

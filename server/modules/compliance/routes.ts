@@ -1,16 +1,22 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { db } from '../../lib/db';
+import { requirePermission } from '../../lib/permissions';
 
 const logQuery = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(20),
 });
 
+// The audit trail is itself sensitive (who accessed what); gate it behind
+// `audit:read` (OWNER/ADMIN/ANALYST/COMPLIANCE_OFFICER/AUDITOR by default)
+// rather than leaving it open to any authenticated user.
+const canReadAuditLog = requirePermission('audit:read');
+
 const CONSENT_PURPOSES = ['WHATSAPP', 'SMS', 'EMAIL', 'MARKETING'] as const;
 
 export const complianceRoutes: FastifyPluginAsync = async app => {
   // Recent compliance/audit events for the tenant.
-  app.get('/audit-log', async request => {
+  app.get('/audit-log', { preHandler: canReadAuditLog }, async request => {
     const query = logQuery.parse(request.query);
     const rows = await db.auditEvent.findMany({
       where: { tenantId: request.auth.tenantId },

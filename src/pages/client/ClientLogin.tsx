@@ -1,14 +1,15 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { Loader2, Mail, Building2, KeyRound } from 'lucide-react';
 import Logo from '../../components/ui/Logo';
 import { portalClient, setPortalToken } from '../../lib/portalClient';
 
 export default function ClientLogin() {
   const navigate = useNavigate();
+  const defaultClinicSlug = import.meta.env.VITE_DEFAULT_CLINIC_SLUG ?? (import.meta.env.DEV ? 'harley-street-medical' : '');
   const [step, setStep] = useState<'request' | 'verify'>('request');
   const [mode, setMode] = useState<'signin' | 'signup'>('signin');
-  const [clinicSlug, setClinicSlug] = useState('harley-street-medical');
+  const [clinicSlug, setClinicSlug] = useState(defaultClinicSlug);
   const [email, setEmail] = useState('');
   const [token, setToken] = useState('');
   const [busy, setBusy] = useState(false);
@@ -24,7 +25,7 @@ export default function ClientLogin() {
       setMsg(r.message);
       if (r.devToken) { setToken(r.devToken); } // dev convenience only
       setStep('verify');
-    } catch (e) { setError(e instanceof Error ? e.message : 'Something went wrong'); }
+    } catch (e) { setError(e instanceof Error ? e.message : 'The sign-in link could not be requested. Check the clinic and email, then try again.'); }
     finally { setBusy(false); }
   }
   async function verify() {
@@ -56,10 +57,10 @@ export default function ClientLogin() {
             </p>
           </div>
           <h1 className="text-lg font-bold text-t1">{step === 'verify' ? 'Enter your link code' : mode === 'signup' ? 'Create your account' : 'Sign in'}</h1>
-          <p className="text-[13px] text-t3 mt-1">{step === 'verify' ? 'Paste the code from your sign-in link.' : mode === 'signup' ? 'Enter the email your clinic has on file. We’ll send a one-time code to confirm it’s you.' : 'We’ll send a secure sign-in link to the email on file.'}</p>
+          <p className="text-[13px] text-t3 mt-1">{step === 'verify' ? 'Paste the code from your sign-in link.' : mode === 'signup' ? 'Enter the email your clinic has on file. We’ll send a one-time code to confirm it’s you.' : 'We’ll send a one-time sign-in link to the email on file.'}</p>
 
-          {error && <div className="mt-4 rounded-xl bg-red-soft border border-[rgba(220,38,38,0.18)] px-3.5 py-2.5 text-[13px] text-red-v">{error}</div>}
-          {msg && step === 'verify' && <div className="mt-4 rounded-xl bg-[var(--blue-soft)] border border-[var(--b1)] px-3.5 py-2.5 text-[12px] text-blue-v">{msg}</div>}
+          {error && <div role="alert" aria-live="assertive" className="mt-4 rounded-xl bg-red-soft border border-[rgba(220,38,38,0.18)] px-3.5 py-2.5 text-[13px] text-red-v">{error}</div>}
+          {msg && step === 'verify' && <div role="status" aria-live="polite" className="mt-4 rounded-xl bg-[var(--blue-soft)] border border-[var(--b1)] px-3.5 py-2.5 text-[12px] text-blue-v">{msg}</div>}
 
           {step === 'request' ? (
             <div className="mt-5 space-y-3">
@@ -81,7 +82,7 @@ export default function ClientLogin() {
               <label className="block space-y-1.5"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">Sign-in code</span>
                 <div className={field}><KeyRound className="w-4 h-4 text-t3" /><input className={input} value={token} onChange={e => setToken(e.target.value)} onKeyDown={e => e.key === 'Enter' && token && verify()} placeholder="paste your code" autoFocus /></div></label>
               <button type="button" disabled={busy || !token.trim()} onClick={verify} className="w-full rounded-xl bg-[var(--indigo)] px-4 py-3 text-sm font-semibold text-white shadow-sm hover:opacity-90 active:scale-[0.99] transition disabled:opacity-50">
-                {busy ? <Loader2 className="inline w-4 h-4 animate-spin" /> : 'Continue'}
+                {busy ? <Loader2 className="inline w-4 h-4 animate-spin" /> : 'Verify and sign in'}
               </button>
               <button type="button" onClick={() => { setStep('request'); setToken(''); setError(null); }} className="w-full text-center text-xs font-semibold text-t3 hover:text-t1 transition">Use a different email</button>
             </div>

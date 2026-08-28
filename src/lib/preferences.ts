@@ -38,6 +38,10 @@ export function getLanguage(): string {
 export function getCurrencyLocale(): string {
   return CURRENCIES.find(c => c.code === getCurrency())?.locale ?? 'en-US';
 }
+export function getLocale(): string {
+  const language = getLanguage();
+  return language === 'en' ? getCurrencyLocale() : language;
+}
 
 export function setCurrency(code: string) {
   localStorage.setItem(CURRENCY_KEY, code);

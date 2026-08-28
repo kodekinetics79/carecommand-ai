@@ -1,7 +1,7 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { timingSafeEqual } from 'node:crypto';
 import { env } from '../config/env';
-import { db } from './db';
+import { platformDb } from './platformDb';
 import type { Prisma } from '../generated/prisma/client';
 
 // ===========================================================================
@@ -17,9 +17,9 @@ import type { Prisma } from '../generated/prisma/client';
 const DEV_PLATFORM_TOKEN = 'dev-platform-operator-token';
 
 export function effectivePlatformToken(): string | null {
-  if (env.PLATFORM_API_TOKEN) return env.PLATFORM_API_TOKEN;
+  if (env.PLATFORM_API_TOKEN && (env.NODE_ENV !== 'production' || env.PLATFORM_LEGACY_TOKEN_ENABLED)) return env.PLATFORM_API_TOKEN;
   if (env.NODE_ENV !== 'production') return DEV_PLATFORM_TOKEN;
-  return null; // production without a configured token → platform disabled
+  return null; // production without an explicit legacy-token break-glass opt-in
 }
 
 export async function requirePlatformOperator(request: FastifyRequest, reply: FastifyReply) {
@@ -44,7 +44,7 @@ export async function requirePlatformOperator(request: FastifyRequest, reply: Fa
 
 // Platform actions have no tenant session, so audit directly (system actor).
 export async function platformAudit(tenantId: string, action: string, resourceId: string | null, metadata?: Prisma.InputJsonObject) {
-  await db.auditEvent.create({
-    data: { tenantId, actorUserId: null, action, resource: 'platform', resourceId: resourceId ?? undefined, userAgent: 'platform-operator', metadata },
+  await platformDb.platformAuditEvent.create({
+    data: { tenantId, action, targetType: 'platform', targetId: resourceId ?? undefined, metadata },
   });
 }

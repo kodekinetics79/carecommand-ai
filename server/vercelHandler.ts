@@ -12,11 +12,18 @@ async function getApp(): Promise<App> {
   if (!appPromise) {
     appPromise = buildApp().then(async app => {
       await app.ready();
-      // Boot-time RLS runtime-role guard (see server/lib/rlsGuard.ts). On a
-      // cold start this loudly surfaces — or, when enforced, rejects — a DB role
-      // that can bypass tenant RLS.
+      // Boot-time RLS runtime-role guard. Production always fails closed; dev
+      // can opt in via RLS_ENFORCE_RUNTIME_ROLE.
       await assertRlsRuntimeRole({ logger: app.log });
       return app;
+    }).catch((error: unknown) => {
+      // A rejected boot must not stay memoised. Without this, one transient
+      // failure (a database or Redis hiccup during cold start) is cached for
+      // the life of the instance, and every subsequent request on that lambda
+      // re-awaits the same rejection and returns 500 — permanently, until the
+      // instance is recycled. Clearing the memo lets the next request retry.
+      appPromise = null;
+      throw error;
     });
   }
   return appPromise;

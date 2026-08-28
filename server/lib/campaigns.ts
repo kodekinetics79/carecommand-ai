@@ -1,5 +1,8 @@
 import { db } from './db';
 import { env } from '../config/env';
+import { runWithTenantContext } from './tenantContext';
+import type { ReceptionistOptOutChannel } from '../generated/prisma/client';
+import { canonicalDncDestination } from './receptionist/dncFence';
 
 // ===========================================================================
 // CRM Campaign / Reactivation engine helpers. Deterministic, tenant-scoped
@@ -27,6 +30,82 @@ export const STAFF_FACING_AUDIENCES = new Set(['prior_auth_followup']);
 
 export type CommChannel = 'sms' | 'email' | 'voice' | 'whatsapp';
 const INACTIVE_DAYS_DEFAULT = 180;
+
+export const NON_VOICE_OUTREACH_AUTHORITY_VERSION = 1 as const;
+export interface NonVoiceOutreachAuthorityMetadata {
+  authorityVersion: typeof NON_VOICE_OUTREACH_AUTHORITY_VERSION;
+  outreachPurpose: string;
+  policyVersion: string;
+  disclosureTextHash: string;
+  evidenceReference: string;
+  captureMethod: string;
+  evidenceSource: string;
+  jurisdiction: string;
+  expiresAt?: string | null;
+}
+
+function nonVoiceConsentPurpose(channel: CommChannel): 'SMS' | 'EMAIL' | 'WHATSAPP' | null {
+  if (channel === 'sms') return 'SMS';
+  if (channel === 'email') return 'EMAIL';
+  if (channel === 'whatsapp') return 'WHATSAPP';
+  return null;
+}
+
+function validAuthorityMetadata(value: unknown, outreachPurpose: string): value is NonVoiceOutreachAuthorityMetadata {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const metadata = value as Record<string, unknown>;
+  return metadata.authorityVersion === NON_VOICE_OUTREACH_AUTHORITY_VERSION
+    && metadata.outreachPurpose === outreachPurpose
+    && typeof metadata.policyVersion === 'string' && metadata.policyVersion.trim().length > 0
+    && typeof metadata.disclosureTextHash === 'string' && /^[0-9a-f]{64}$/.test(metadata.disclosureTextHash)
+    && typeof metadata.evidenceReference === 'string' && metadata.evidenceReference.trim().length >= 3
+    && typeof metadata.captureMethod === 'string' && metadata.captureMethod.trim().length > 0
+    && typeof metadata.evidenceSource === 'string' && metadata.evidenceSource.trim().length > 0
+    && typeof metadata.jurisdiction === 'string' && metadata.jurisdiction.trim().length >= 2
+    && (metadata.expiresAt == null || (typeof metadata.expiresAt === 'string'
+      && Number.isFinite(Date.parse(metadata.expiresAt)) && Date.parse(metadata.expiresAt) > Date.now()));
+}
+
+/**
+ * Live non-voice outreach requires an exact, append-only patient authority
+ * event for the channel and purpose being submitted. Lead authority remains
+ * fail-closed until the data model has an equivalent immutable lead event.
+ */
+export async function hasAffirmativeNonVoiceOutreachAuthority(
+  tenantId: string,
+  target: { patientId?: string | null; leadId?: string | null },
+  channel: CommChannel,
+  outreachPurpose: string,
+): Promise<boolean> {
+  const purpose = nonVoiceConsentPurpose(channel);
+  if (!purpose || !target.patientId || target.leadId) return false;
+  return (await affirmativelyAuthorizedPatientIds(tenantId, [target.patientId], channel, outreachPurpose)).has(target.patientId);
+}
+
+export async function affirmativelyAuthorizedPatientIds(
+  tenantId: string,
+  patientIds: string[],
+  channel: CommChannel,
+  outreachPurpose: string,
+): Promise<Set<string>> {
+  const purpose = nonVoiceConsentPurpose(channel);
+  if (!purpose || patientIds.length === 0) return new Set();
+  return runWithTenantContext(tenantId, async tx => {
+    const events = await tx.consentEvent.findMany({
+      where: { tenantId, patientId: { in: [...new Set(patientIds)] }, purpose },
+      orderBy: [{ occurredAt: 'desc' }, { id: 'desc' }],
+      select: { patientId: true, granted: true, metadata: true },
+    });
+    const decided = new Set<string>();
+    const authorized = new Set<string>();
+    for (const event of events) {
+      if (decided.has(event.patientId)) continue;
+      decided.add(event.patientId);
+      if (event.granted === true && validAuthorityMetadata(event.metadata, outreachPurpose)) authorized.add(event.patientId);
+    }
+    return authorized;
+  });
+}
 
 export function maskDestination(value?: string | null): string | null {
   if (!value) return null;
@@ -84,6 +163,8 @@ export interface ProviderReadiness {
   unsupportedChannels: CommChannel[];
   schedulerEnforced: boolean;
   liveSendingSupported: boolean;
+  liveCampaignDispatchActivated: boolean;
+  activationNotice: string;
 }
 
 export function providerReadiness(): ProviderReadiness {
@@ -103,7 +184,12 @@ export function providerReadiness(): ProviderReadiness {
     supportedChannels,
     unsupportedChannels: channels.filter(c => !supportedChannels.includes(c)),
     schedulerEnforced: true,   // approved SCHEDULED campaigns run via the campaign-scheduler worker
-    liveSendingSupported: true, // real Twilio SMS (+ optional HTTP email) senders are wired
+    // Provider adapters exist, but regulated campaign submission stays disabled
+    // until the consent/opt-out decision and durable provider claim share one
+    // database-linearized boundary.
+    liveSendingSupported: false,
+    liveCampaignDispatchActivated: false,
+    activationNotice: 'Live campaign delivery is disabled until the required consent and last-second opt-out safety control is activated and validated.',
   };
 }
 
@@ -128,29 +214,102 @@ const CONSENT_PURPOSE: Record<CommChannel, 'SMS' | 'EMAIL' | 'WHATSAPP' | null> 
   sms: 'SMS', email: 'EMAIL', whatsapp: 'WHATSAPP', voice: null,
 };
 
-export async function isSuppressed(tenantId: string, target: { patientId?: string | null; leadId?: string | null }, channel: CommChannel): Promise<boolean> {
-  const where = { tenantId, patientId: target.patientId ?? null, leadId: target.leadId ?? null };
-  const [optedOut, suppressed] = await Promise.all([
-    db.communicationConsent.count({ where: { ...where, channel, status: 'opted_out' } }),
-    db.campaignSuppression.count({ where: { ...where, channel, active: true } }),
-  ]);
-  if (optedOut > 0 || suppressed > 0) return true;
+// --- Destination normalization + validation (E.164 / email) ----------------
+// Shared by the send-time gate in commsProvider.sendMessage so every send path
+// validates the destination before a provider call and matches opt-out rows
+// (which may be stored in a different phone format) reliably.
+export function normalizePhone(raw: string | null | undefined): string {
+  if (!raw) return '';
+  const trimmed = raw.trim();
+  const hasPlus = trimmed.startsWith('+');
+  const digits = trimmed.replace(/\D/g, '');
+  if (!digits) return '';
+  return hasPlus ? `+${digits}` : digits;
+}
 
-  // Honor an explicit legacy ConsentEvent opt-out (latest event per purpose).
-  // Never fabricates opt-in — only an explicit granted=false suppresses.
-  // A MARKETING opt-out suppresses ALL channels (cross-channel marketing consent);
-  // SMS/EMAIL/WHATSAPP opt-outs suppress their mapped channel.
-  if (target.patientId) {
-    const purpose = CONSENT_PURPOSE[channel];
-    const purposes = purpose ? [purpose, 'MARKETING' as const] : ['MARKETING' as const];
-    const events = await db.consentEvent.findMany({ where: { tenantId, patientId: target.patientId, purpose: { in: purposes } }, orderBy: { occurredAt: 'desc' } });
-    const seen = new Set<string>();
-    for (const e of events) {
-      if (seen.has(e.purpose)) continue; // latest per purpose only
-      seen.add(e.purpose);
-      if (e.granted === false) return true;
-    }
+// Best-effort E.164 coercion. Keeps an existing '+'; assumes NANP for a bare
+// 10-digit number and a leading '1' for 11 digits. Never invents a country code
+// for other lengths — isValidE164 then rejects anything still malformed.
+export function toE164(raw: string | null | undefined, defaultCountry = '1'): string {
+  const n = normalizePhone(raw);
+  if (!n) return '';
+  if (n.startsWith('+')) return n;
+  if (n.length === 10) return `+${defaultCountry}${n}`;
+  if (n.length === 11 && n.startsWith('1')) return `+${n}`;
+  return `+${n}`;
+}
+
+export function isValidE164(phone: string): boolean {
+  return /^\+[1-9]\d{7,14}$/.test(phone);
+}
+
+export function isValidEmail(email: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((email ?? '').trim());
+}
+
+// A comm channel maps to the ReceptionistOptOut channels that suppress it.
+// ALL suppresses everything; SMS/WHATSAPP -> SMS; EMAIL -> EMAIL; VOICE -> VOICE.
+const RECEPTIONIST_OPTOUT_CHANNELS: Record<CommChannel, ReceptionistOptOutChannel[]> = {
+  sms: ['ALL', 'SMS'], whatsapp: ['ALL', 'SMS'], email: ['ALL', 'EMAIL'], voice: ['ALL', 'VOICE'],
+};
+
+// Cross-module suppression: honor an opt-out captured during an AI receptionist
+// call (ReceptionistOptOut, written by the Retell webhook, channel ALL by
+// default). Matched on the destination (phone/email), tenant-scoped. This is the
+// bridge that makes a receptionist opt-out suppress SMS/CRM sends too.
+export async function isDestinationOptedOut(tenantId: string, destination: string | null | undefined, channel: CommChannel): Promise<boolean> {
+  const value = (destination ?? '').trim();
+  if (!value) return false;
+  const isEmail = value.includes('@');
+  const channels = RECEPTIONIST_OPTOUT_CHANNELS[channel];
+  const rows = await db.receptionistOptOut.findMany({
+    where: { tenantId, revokedAt: null, channel: { in: channels }, ...(isEmail ? { contactEmail: { not: null } } : { contactPhone: { not: null } }) },
+    select: { contactPhone: true, contactEmail: true },
+  });
+  if (isEmail) {
+    const target = canonicalDncDestination(value);
+    return rows.some(r => canonicalDncDestination(r.contactEmail ?? '') === target);
   }
+  return rows.some(r => canonicalDncDestination(r.contactPhone ?? '') === canonicalDncDestination(value));
+}
+
+export async function isSuppressed(tenantId: string, target: { patientId?: string | null; leadId?: string | null; destination?: string | null }, channel: CommChannel): Promise<boolean> {
+  // ConsentEvent is RLS-enrolled, so the consent reads run inside a tenant
+  // transaction (GUC set on the same connection). Without it the legacy
+  // ConsentEvent opt-out check would silently see zero rows under app_rls and
+  // fail OPEN (a real opt-out would be missed). CommunicationConsent /
+  // CampaignSuppression are not enrolled but are read here for a single context.
+  const identitySuppressed = await runWithTenantContext(tenantId, async tx => {
+    const where = { tenantId, patientId: target.patientId ?? null, leadId: target.leadId ?? null };
+    const [optedOut, suppressed] = await Promise.all([
+      tx.communicationConsent.count({ where: { ...where, channel, status: 'opted_out' } }),
+      tx.campaignSuppression.count({ where: { ...where, channel, active: true } }),
+    ]);
+    if (optedOut > 0 || suppressed > 0) return true;
+
+    // Honor an explicit legacy ConsentEvent opt-out (latest event per purpose).
+    // Never fabricates opt-in — only an explicit granted=false suppresses.
+    // A MARKETING opt-out suppresses ALL channels (cross-channel marketing consent);
+    // SMS/EMAIL/WHATSAPP opt-outs suppress their mapped channel.
+    if (target.patientId) {
+      const purpose = CONSENT_PURPOSE[channel];
+      const purposes = purpose ? [purpose, 'MARKETING' as const] : ['MARKETING' as const];
+      const events = await tx.consentEvent.findMany({ where: { tenantId, patientId: target.patientId, purpose: { in: purposes } }, orderBy: { occurredAt: 'desc' } });
+      const seen = new Set<string>();
+      for (const e of events) {
+        if (seen.has(e.purpose)) continue; // latest per purpose only
+        seen.add(e.purpose);
+        if (e.granted === false) return true;
+      }
+    }
+    return false;
+  });
+  if (identitySuppressed) return true;
+
+  // Cross-module: a receptionist-call opt-out (destination-keyed) suppresses too.
+  // ReceptionistOptOut is not RLS-enrolled, so it is read on the global client.
+  if (target.destination && await isDestinationOptedOut(tenantId, target.destination, channel)) return true;
+
   return false;
 }
 
@@ -159,58 +318,65 @@ export interface AudienceCandidate { patientId: string | null; leadId: string | 
 
 export async function buildAudience(tenantId: string, audienceType: AudienceType, opts: { inactiveDays?: number } = {}): Promise<AudienceCandidate[]> {
   const now = Date.now();
-  switch (audienceType) {
-    case 'inactive_patients': {
-      const cutoff = new Date(now - (opts.inactiveDays ?? INACTIVE_DAYS_DEFAULT) * 86400000);
-      const rows = await db.patient.findMany({
-        where: { tenantId, deletedAt: null, lifecycleStage: { not: 'LOST' }, OR: [{ lastVisitAt: { lt: cutoff } }, { lastVisitAt: null, createdAt: { lt: cutoff } }] },
-        select: { id: true, firstName: true, lastName: true, email: true, phone: true }, take: 500,
-      });
-      return rows.map(p => ({ patientId: p.id, leadId: null, name: `${p.firstName} ${p.lastName}`, email: p.email, phone: p.phone, reason: 'No recent visit' }));
+  // Audience sources read RLS-enrolled PHI tables (Patient, Appointment,
+  // PaymentRequest, DepositRequirement, EligibilityVerification). Run inside a
+  // tenant transaction so app.current_tenant_id is set on the SAME connection —
+  // otherwise, under the enforced app_rls role, these reads fail-closed to ZERO
+  // rows and every campaign would silently target nobody.
+  return runWithTenantContext(tenantId, async tx => {
+    switch (audienceType) {
+      case 'inactive_patients': {
+        const cutoff = new Date(now - (opts.inactiveDays ?? INACTIVE_DAYS_DEFAULT) * 86400000);
+        const rows = await tx.patient.findMany({
+          where: { tenantId, deletedAt: null, lifecycleStage: { not: 'LOST' }, OR: [{ lastVisitAt: { lt: cutoff } }, { lastVisitAt: null, createdAt: { lt: cutoff } }] },
+          select: { id: true, firstName: true, lastName: true, email: true, phone: true }, take: 500,
+        });
+        return rows.map(p => ({ patientId: p.id, leadId: null, name: `${p.firstName} ${p.lastName}`, email: p.email, phone: p.phone, reason: 'No recent visit' }));
+      }
+      case 'no_show_recovery': {
+        const appts = await tx.appointment.findMany({ where: { tenantId, status: 'NO_SHOW', deletedAt: null }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { startsAt: 'desc' }, take: 500 });
+        const seen = new Set<string>();
+        const out: AudienceCandidate[] = [];
+        for (const a of appts) { if (seen.has(a.patientId)) continue; seen.add(a.patientId); out.push({ patientId: a.patientId, leadId: null, name: `${a.patient.firstName} ${a.patient.lastName}`, email: a.patient.email, phone: a.patient.phone, reason: 'Missed appointment' }); }
+        return out;
+      }
+      case 'unpaid_deposit_followup': {
+        const reqs = await tx.depositRequirement.findMany({ where: { tenantId, status: { in: ['required', 'requested', 'link_sent'] }, patientId: { not: null } }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, take: 500 });
+        const seen = new Set<string>();
+        const out: AudienceCandidate[] = [];
+        for (const r of reqs) { if (!r.patientId || seen.has(r.patientId)) continue; seen.add(r.patientId); out.push({ patientId: r.patientId, leadId: null, name: r.patient ? `${r.patient.firstName} ${r.patient.lastName}` : 'Patient', email: r.patient?.email ?? null, phone: r.patient?.phone ?? null, reason: 'Unpaid deposit' }); }
+        return out;
+      }
+      case 'failed_payment_recovery': {
+        const prs = await tx.paymentRequest.findMany({ where: { tenantId, status: { in: ['failed', 'expired'] }, patientId: { not: null } }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { createdAt: 'desc' }, take: 500 });
+        const seen = new Set<string>();
+        const out: AudienceCandidate[] = [];
+        for (const r of prs) { if (!r.patientId || seen.has(r.patientId)) continue; seen.add(r.patientId); out.push({ patientId: r.patientId, leadId: null, name: r.patient ? `${r.patient.firstName} ${r.patient.lastName}` : 'Patient', email: r.patient?.email ?? null, phone: r.patient?.phone ?? null, reason: 'Failed/expired payment' }); }
+        return out;
+      }
+      case 'insurance_update_request': {
+        // Patient-facing "please update your insurance" — uses ineligible checks.
+        const vers = await tx.eligibilityVerification.findMany({ where: { tenantId, coverageActive: false }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { checkedAt: 'desc' }, take: 500 });
+        const seen = new Set<string>();
+        const out: AudienceCandidate[] = [];
+        for (const v of vers) { if (seen.has(v.patientId)) continue; seen.add(v.patientId); out.push({ patientId: v.patientId, leadId: null, name: `${v.patient.firstName} ${v.patient.lastName}`, email: v.patient.email, phone: v.patient.phone, reason: 'Insurance needs update' }); }
+        return out;
+      }
+      case 'appointment_request_followup': {
+        const reqs = await tx.appointmentRequest.findMany({ where: { tenantId, status: { in: ['PENDING_REVIEW', 'MISSING_INFO'] } }, select: { id: true, patientId: true, leadId: true, collectedName: true, collectedPhone: true, collectedEmail: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, take: 500 });
+        return reqs.map(r => ({ patientId: r.patientId, leadId: r.leadId, name: r.patient ? `${r.patient.firstName} ${r.patient.lastName}` : (r.collectedName ?? 'Lead'), email: r.patient?.email ?? r.collectedEmail, phone: r.patient?.phone ?? r.collectedPhone, reason: 'Pending appointment request' }));
+      }
+      case 'review_request': {
+        const appts = await tx.appointment.findMany({ where: { tenantId, status: 'COMPLETED', deletedAt: null }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { startsAt: 'desc' }, take: 500 });
+        const seen = new Set<string>();
+        const out: AudienceCandidate[] = [];
+        for (const a of appts) { if (seen.has(a.patientId)) continue; seen.add(a.patientId); out.push({ patientId: a.patientId, leadId: null, name: `${a.patient.firstName} ${a.patient.lastName}`, email: a.patient.email, phone: a.patient.phone, reason: 'Completed visit' }); }
+        return out;
+      }
+      default:
+        return [];
     }
-    case 'no_show_recovery': {
-      const appts = await db.appointment.findMany({ where: { tenantId, status: 'NO_SHOW', deletedAt: null }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { startsAt: 'desc' }, take: 500 });
-      const seen = new Set<string>();
-      const out: AudienceCandidate[] = [];
-      for (const a of appts) { if (seen.has(a.patientId)) continue; seen.add(a.patientId); out.push({ patientId: a.patientId, leadId: null, name: `${a.patient.firstName} ${a.patient.lastName}`, email: a.patient.email, phone: a.patient.phone, reason: 'Missed appointment' }); }
-      return out;
-    }
-    case 'unpaid_deposit_followup': {
-      const reqs = await db.depositRequirement.findMany({ where: { tenantId, status: { in: ['required', 'requested', 'link_sent'] }, patientId: { not: null } }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, take: 500 });
-      const seen = new Set<string>();
-      const out: AudienceCandidate[] = [];
-      for (const r of reqs) { if (!r.patientId || seen.has(r.patientId)) continue; seen.add(r.patientId); out.push({ patientId: r.patientId, leadId: null, name: r.patient ? `${r.patient.firstName} ${r.patient.lastName}` : 'Patient', email: r.patient?.email ?? null, phone: r.patient?.phone ?? null, reason: 'Unpaid deposit' }); }
-      return out;
-    }
-    case 'failed_payment_recovery': {
-      const prs = await db.paymentRequest.findMany({ where: { tenantId, status: { in: ['failed', 'expired'] }, patientId: { not: null } }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { createdAt: 'desc' }, take: 500 });
-      const seen = new Set<string>();
-      const out: AudienceCandidate[] = [];
-      for (const r of prs) { if (!r.patientId || seen.has(r.patientId)) continue; seen.add(r.patientId); out.push({ patientId: r.patientId, leadId: null, name: r.patient ? `${r.patient.firstName} ${r.patient.lastName}` : 'Patient', email: r.patient?.email ?? null, phone: r.patient?.phone ?? null, reason: 'Failed/expired payment' }); }
-      return out;
-    }
-    case 'insurance_update_request': {
-      // Patient-facing "please update your insurance" — uses ineligible checks.
-      const vers = await db.eligibilityVerification.findMany({ where: { tenantId, coverageActive: false }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { checkedAt: 'desc' }, take: 500 });
-      const seen = new Set<string>();
-      const out: AudienceCandidate[] = [];
-      for (const v of vers) { if (seen.has(v.patientId)) continue; seen.add(v.patientId); out.push({ patientId: v.patientId, leadId: null, name: `${v.patient.firstName} ${v.patient.lastName}`, email: v.patient.email, phone: v.patient.phone, reason: 'Insurance needs update' }); }
-      return out;
-    }
-    case 'appointment_request_followup': {
-      const reqs = await db.appointmentRequest.findMany({ where: { tenantId, status: { in: ['PENDING_REVIEW', 'MISSING_INFO'] } }, select: { id: true, patientId: true, leadId: true, collectedName: true, collectedPhone: true, collectedEmail: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, take: 500 });
-      return reqs.map(r => ({ patientId: r.patientId, leadId: r.leadId, name: r.patient ? `${r.patient.firstName} ${r.patient.lastName}` : (r.collectedName ?? 'Lead'), email: r.patient?.email ?? r.collectedEmail, phone: r.patient?.phone ?? r.collectedPhone, reason: 'Pending appointment request' }));
-    }
-    case 'review_request': {
-      const appts = await db.appointment.findMany({ where: { tenantId, status: 'COMPLETED', deletedAt: null }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { startsAt: 'desc' }, take: 500 });
-      const seen = new Set<string>();
-      const out: AudienceCandidate[] = [];
-      for (const a of appts) { if (seen.has(a.patientId)) continue; seen.add(a.patientId); out.push({ patientId: a.patientId, leadId: null, name: `${a.patient.firstName} ${a.patient.lastName}`, email: a.patient.email, phone: a.patient.phone, reason: 'Completed visit' }); }
-      return out;
-    }
-    default:
-      return [];
-  }
+  });
 }
 
 // Preview: deterministic counts after consent/suppression + contact gating.
@@ -224,7 +390,7 @@ export async function previewAudience(tenantId: string, audienceType: AudienceTy
   for (const c of candidates) {
     const contact = field === 'email' ? c.email : c.phone;
     if (!contact) { missingContact++; continue; }
-    if (await isSuppressed(tenantId, c, channel)) { suppressed++; continue; }
+    if (await isSuppressed(tenantId, { patientId: c.patientId, leadId: c.leadId, destination: contact }, channel)) { suppressed++; continue; }
     eligible++;
     if (sample.length < 5) sample.push({ name: c.name, reason: c.reason, destinationMasked: maskDestination(contact) });
   }
@@ -275,8 +441,8 @@ export async function countOpenSlots(tenantId: string, days = 7): Promise<number
 export interface CampaignDraft { subject: string; body: string; channel: CommChannel; reason: string; draftSource: 'rule_based' | 'ai'; requiresApproval: true; warnings: string[]; sourceSummary: string }
 
 const TEMPLATES: Record<string, { subject: string; body: string }> = {
-  appointment_reminder: { subject: 'Appointment reminder', body: 'Hi {{firstName}}, this is a reminder of your upcoming appointment at {{clinicName}}. Reply or call us to confirm or reschedule.' },
-  appointment_confirmation: { subject: 'Please confirm your appointment', body: 'Hi {{firstName}}, please confirm your upcoming appointment at {{clinicName}}. Reply or call us to confirm, or to reschedule if needed.' },
+  appointment_reminder: { subject: 'Appointment reminder', body: 'Hi {{firstName}}, this is a reminder of your upcoming appointment at {{clinicName}}. Contact the clinic using verified contact details to confirm or request a change. This message does not change the appointment.' },
+  appointment_confirmation: { subject: 'Please confirm your appointment', body: 'Hi {{firstName}}, contact {{clinicName}} using verified contact details to confirm or request a change to your upcoming appointment. This message does not change the appointment.' },
   no_show_recovery: { subject: 'We missed you', body: 'Hi {{firstName}}, we missed you at your recent appointment with {{clinicName}}. We’d love to help you rebook at a time that works for you.' },
   unpaid_deposit_followup: { subject: 'Complete your booking', body: 'Hi {{firstName}}, your appointment with {{clinicName}} has an outstanding deposit. You can complete payment using the secure link our team will share.' },
   failed_payment_recovery: { subject: 'Payment didn’t go through', body: 'Hi {{firstName}}, a recent payment for your visit with {{clinicName}} didn’t complete. Our team can share a fresh secure payment link whenever you’re ready.' },

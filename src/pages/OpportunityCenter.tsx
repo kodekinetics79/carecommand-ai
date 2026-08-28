@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { CircleDollarSign, AlertTriangle, Target, Gauge, TrendingUp, Sparkles } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import BentoCard from '../components/ui/BentoCard';
@@ -16,14 +16,21 @@ export default function OpportunityCenter() {
   const [leaks, setLeaks] = useState<RevenueLeak[]>([]);
   const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [selectedLeak, setSelectedLeak] = useState<string | null>(null);
   const [drawer, setDrawer] = useState<Opportunity | null>(null);
 
   useEffect(() => {
     let active = true;
     void (async () => {
-      const [l, o] = await Promise.all([opportunityService.listLeaks().catch(() => []), opportunityService.listOpportunities().catch(() => [])]);
-      if (active) { setLeaks(l); setOpportunities(o); setLoading(false); }
+      try {
+        const [l, o] = await Promise.all([opportunityService.listLeaks(), opportunityService.listOpportunities()]);
+        if (active) { setLeaks(l); setOpportunities(o); setLoadError(null); }
+      } catch {
+        if (active) setLoadError('Revenue leak and opportunity data is unavailable. Zero leaks or revenue cannot be inferred from this outage.');
+      } finally {
+        if (active) setLoading(false);
+      }
     })();
     return () => { active = false; };
   }, []);
@@ -59,21 +66,28 @@ export default function OpportunityCenter() {
       />
 
       {/* Command metrics */}
-      <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
-        <OpportunityMetricCard primary label="Recoverable revenue" value={metrics.recoverable} format={formatCurrency} subtitle="Across leaks + opportunities" icon={<CircleDollarSign className="w-4 h-4" />} accent="emerald" />
+      {loading ? <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">{Array.from({ length: 4 }).map((_, i) => <div key={i} className="skeleton-line h-24 rounded-xl" />)}</div> : !loadError && <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
+        <OpportunityMetricCard primary label="Recorded potential value" value={metrics.recoverable} format={formatCurrency} subtitle="Backend estimates; not a forecast" icon={<CircleDollarSign className="w-4 h-4" />} accent="emerald" />
         <OpportunityMetricCard label="Detected leaks" value={metrics.openLeaks} subtitle="Open problems" icon={<AlertTriangle className="w-4 h-4" />} accent="amber" />
         <OpportunityMetricCard label="Ranked opportunities" value={metrics.ranked} subtitle={`${metrics.pendingApproval} need approval`} icon={<Target className="w-4 h-4" />} accent="violet" />
-        <OpportunityMetricCard label="Avg AI confidence" value={metrics.avgConfidence} format={n => `${Math.round(n)}%`} subtitle="Across recovery actions" icon={<Gauge className="w-4 h-4" />} accent="cyan" />
-      </div>
+        <OpportunityMetricCard label="Avg recorded confidence" value={metrics.avgConfidence} format={n => `${Math.round(n)}%`} subtitle="Source-provided; not recalculated here" icon={<Gauge className="w-4 h-4" />} accent="cyan" />
+      </div>}
 
-      <div className="grid gap-4 xl:grid-cols-[400px_1fr] items-start">
+      {loadError && (
+        <div role="alert" className="rounded-xl border border-red-soft bg-red-soft p-4">
+          <p className="text-sm font-semibold text-red-v">Revenue recovery data unavailable</p>
+          <p className="mt-1 text-xs text-t2">{loadError}</p>
+        </div>
+      )}
+
+      {!loadError && <div className="grid gap-4 xl:grid-cols-[400px_1fr] items-start">
         {/* LEFT — Detected leaks (the problem) */}
         <BentoCard title="Detected Leaks" subtitle="Where revenue is escaping"
           headerRight={selectedLeak ? <button type="button" onClick={() => setSelectedLeak(null)} className="text-[11px] font-semibold text-indigo hover:opacity-80">Clear filter</button> : <span className="badge badge-amber">{metrics.openLeaks} open</span>}>
           {loading ? (
             <div className="space-y-2.5">{Array.from({ length: 4 }).map((_, i) => <div key={i} className="skeleton-line h-24 rounded-xl" />)}</div>
           ) : leaks.length === 0 ? (
-            <EmptyStatePremium icon={<AlertTriangle className="w-5 h-5" />} title="No revenue leaks detected" description="CareCommand continuously scans for missed revenue. Detected leaks will appear here." />
+            <EmptyStatePremium icon={<AlertTriangle className="w-5 h-5" />} title="No revenue leaks in the loaded records" description="The data loaded successfully and returned no detected leaks." />
           ) : (
             <div className="space-y-2.5">
               {leaks.map(l => <RevenueLeakCard key={l.id} leak={l} selected={selectedLeak === l.id} onSelect={() => setSelectedLeak(selectedLeak === l.id ? null : l.id)} />)}
@@ -83,8 +97,8 @@ export default function OpportunityCenter() {
 
         {/* RIGHT — Ranked recovery actions (opportunity → workflow) */}
         <div className="sticky-rail">
-          <BentoCard title="Ranked Recovery Actions" subtitle={leakCategory ? `Filtered to: ${leakCategory.replace(/-/g, ' ')}` : 'AI-ranked by recoverable value'}
-            headerRight={<span className="inline-flex items-center gap-1 text-[11px] font-bold text-violet-v"><Sparkles className="w-3.5 h-3.5" /> AI-ranked</span>}>
+          <BentoCard title="Ranked Recovery Actions" subtitle={leakCategory ? `Filtered to: ${leakCategory.replace(/-/g, ' ')}` : 'Ordered by backend-provided potential value'}
+            headerRight={<span className="inline-flex items-center gap-1 text-[11px] font-bold text-violet-v"><Sparkles className="w-3.5 h-3.5" /> Recorded signals</span>}>
             <OpportunityRankingPanel
               opportunities={rankedShown}
               loading={loading}
@@ -94,7 +108,7 @@ export default function OpportunityCenter() {
             />
           </BentoCard>
         </div>
-      </div>
+      </div>}
 
       {drawer && (
         <OpportunityActionDrawer
