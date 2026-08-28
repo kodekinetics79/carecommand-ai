@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any -- dev verification script */
+ 
 /**
  * Subscription commercial-layer verification.
  *   npx tsx server/modules/subscriptions/subscriptions.verify.ts

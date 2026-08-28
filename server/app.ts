@@ -4,11 +4,11 @@ import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import sensible from '@fastify/sensible';
 import swagger from '@fastify/swagger';
-import swaggerUi from '@fastify/swagger-ui';
 import { env } from './config/env';
 import { loggerOptions } from './config/logger';
 import { authPlugin } from './plugins/auth';
 import { errorPlugin } from './plugins/errors';
+import { metricsPlugin } from './plugins/metrics';
 import { healthRoutes } from './modules/health/routes';
 import { authRoutes } from './modules/auth/routes';
 import { branchRoutes } from './modules/branches/routes';
@@ -48,6 +48,8 @@ import { portalAuthRoutes } from './modules/portal/auth';
 import { portalRoutes } from './modules/portal/routes';
 import { portalAdminRoutes } from './modules/portal/admin';
 import { autopilotQueue } from './workers/queues';
+import { assertProductionRateLimitStore, skipRateLimitStoreErrors } from './lib/rateLimitPolicy';
+import { closeRetellRateStore } from './lib/receptionist/retellRateStore';
 
 // Webhook signature verification (Stripe/Retell) needs the exact bytes that were
 // signed, so we capture the raw JSON body while still parsing it normally.
@@ -58,15 +60,19 @@ declare module 'fastify' {
 }
 
 export async function buildApp() {
+  const trustedProxyCidrs = env.INGRESS_MODE === 'trusted_proxy'
+    ? env.TRUSTED_PROXY_CIDRS.split(',').map(value => value.trim()).filter(Boolean)
+    : [];
   const app = Fastify({
     logger: loggerOptions,
-    trustProxy: true,
+    trustProxy: trustedProxyCidrs.length ? trustedProxyCidrs : false,
     requestIdHeader: 'x-request-id',
     // Explicit request-body cap (defends against oversized-payload memory
     // exhaustion). 1 MiB is ample for this JSON API; webhooks/intake stay well
     // under it. Make it intentional rather than relying on the framework default.
     bodyLimit: 1_048_576,
   });
+  app.addHook('onClose', async () => { closeRetellRateStore(); });
 
   // Preserve the raw body so webhook handlers can verify HMAC signatures,
   // while still delivering parsed JSON to every other route.
@@ -86,13 +92,18 @@ export async function buildApp() {
   await app.register(cors, {
     origin: env.CORS_ORIGINS.split(',').map(origin => origin.trim()),
     credentials: true,
+    // @fastify/cors defaults to GET, HEAD and POST only. The application uses
+    // browser-originated PUT/PATCH/DELETE mutations throughout, so enumerate
+    // the complete API method set; otherwise the browser accepts the 204
+    // preflight but refuses to send the actual mutation.
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   });
   await app.register(helmet);
 
   // Redis-backed rate limiting so limits (and brute-force protection) hold
   // across multiple API instances behind a load balancer. Reuses the BullMQ
-  // Redis connection; falls back to the in-memory store if Redis is
-  // unreachable (e.g. local dev without Redis) so development is never blocked.
+  // Redis connection. Local development may use the in-memory store, but a
+  // production process must never silently downgrade this shared control.
   let rateLimitRedis: unknown;
   try {
     rateLimitRedis = await Promise.race([
@@ -102,25 +113,29 @@ export async function buildApp() {
   } catch {
     rateLimitRedis = undefined;
   }
-  if (!rateLimitRedis && env.NODE_ENV === 'production') {
-    app.log.error('Rate limiter falling back to in-memory store in production: Redis unreachable');
-  }
   const isProd = env.NODE_ENV === 'production';
+  assertProductionRateLimitStore(env.NODE_ENV, rateLimitRedis);
   await app.register(rateLimit, {
     // The app shell (sidebar badges, topbar, dashboard widgets) fans out many
     // parallel calls per navigation, so a low global ceiling trips 429s during
     // normal/demo use. Keep production strict; give dev plenty of headroom.
-    max: isProd ? 200 : 2000,
+    // The production-style browser harness intentionally exercises two full
+    // user journeys from one loopback IP. Do not let that synthetic fan-out
+    // consume the real production ceiling and turn later assertions into 429s.
+    max: env.E2E_TEST_MODE ? 5000 : isProd ? 200 : 2000,
     timeWindow: '1 minute',
     ...(rateLimitRedis ? { redis: rateLimitRedis } : {}),
     // In non-production, never rate-limit loopback (local demos/tests).
     ...(isProd ? {} : { allowList: ['127.0.0.1', '::1'] }),
-    // Never fail a request because the rate-limit store hiccups; fail open.
-    skipOnError: true,
+    // Production authentication and abuse controls fail closed when the shared
+    // store errors. Development remains available when a local Redis is absent.
+    skipOnError: skipRateLimitStoreErrors(env.NODE_ENV),
     nameSpace: 'cc-ratelimit:',
   });
 
-  // API docs must not be exposed unauthenticated in production.
+  // API docs must not be exposed unauthenticated in production. Serve the raw
+  // OpenAPI document in development instead of bundling Swagger UI's static-file
+  // server into the production dependency tree.
   if (env.NODE_ENV !== 'production') {
     await app.register(swagger, {
       openapi: {
@@ -140,9 +155,12 @@ export async function buildApp() {
         ],
       },
     });
-    await app.register(swaggerUi, { routePrefix: '/docs' });
+    app.get('/docs/json', async (_request, reply) => reply.send(app.swagger()));
   }
   await app.register(errorPlugin);
+  // Metrics before auth so its onRequest/onResponse hooks time EVERY route
+  // (including public/webhook ones) and /metrics stays outside the JWT scope.
+  await app.register(metricsPlugin);
   await app.register(authPlugin);
 
   await app.register(healthRoutes);
@@ -163,8 +181,8 @@ export async function buildApp() {
   await app.register(intakePublicRoutes, { prefix: '/v1/intake' });
   // Customer-facing pilot share link (hashed token, no auth, no PHI).
   await app.register(pilotPublicRoutes, { prefix: '/v1/pilot' });
-  // Platform operator + onboarding APIs: gated by the platform token (NOT a
-  // tenant JWT), so they live outside the tenant-authenticated scope.
+  // Retired legacy onboarding route: valid legacy operators receive a truthful
+  // 410 directing them to PlatformUser-authenticated /v1/platform/tenants.
   await app.register(onboardingRoutes, { prefix: '/v1/onboarding' });
   // Platform Admin auth (PlatformUser identity) — separate from tenant auth.
   await app.register(platformAuthRoutes, { prefix: '/v1/platform/auth' });

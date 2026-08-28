@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import {
   AlertTriangle,
   ArrowRight,
@@ -16,6 +16,8 @@ import {
 import BentoCard from '../components/ui/BentoCard';
 import StatCard from '../components/ui/StatCard';
 import ProgressBar from '../components/ui/ProgressBar';
+import ModuleTabs from '../components/ui/ModuleTabs';
+import ConfirmationModal from '../components/workflow/ConfirmationModal';
 import { formatCurrency } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
 import {
@@ -69,7 +71,7 @@ const advisorPrompts = [
   { label: 'Which appointments should require deposits?', question: 'Which appointments should require deposits?', advisorType: 'revenue' as const },
   { label: 'Which patients should pay before arrival?', question: 'Which patients should pay before arrival?', advisorType: 'revenue' as const },
   { label: 'Which patients today have insurance risk?', question: 'Which patients today have insurance risk?', advisorType: 'operations' as const },
-  { label: 'Which prior authorisations need action?', question: 'Which prior authorisations need action?', advisorType: 'operations' as const },
+  { label: 'Which prior authorizations need action?', question: 'Which prior authorizations need action?', advisorType: 'operations' as const },
   { label: 'Where are we risking denials?', question: 'Where are we risking denials?', advisorType: 'competitor' as const },
   { label: 'Which failed payments need follow-up?', question: 'Which failed payments need follow-up?', advisorType: 'front-desk' as const },
   { label: 'How much revenue can we protect today?', question: 'How much revenue can we protect today?', advisorType: 'revenue' as const },
@@ -154,6 +156,7 @@ export default function RevenueProtection() {
   const [appointmentQueue, setAppointmentQueue] = useState<AppointmentVerificationQueueRow[]>([]);
   const [queueLoading, setQueueLoading] = useState(true);
   const [queueError, setQueueError] = useState<string | null>(null);
+  const [waiverTarget, setWaiverTarget] = useState<DepositRequirement | null>(null);
   const [ruleDraft, setRuleDraft] = useState({
     name: 'Same-day deposit',
     ruleType: 'same-day',
@@ -269,9 +272,7 @@ export default function RevenueProtection() {
     await withRefresh(`followup-${row.id}`, () => updatePaymentStatus(row.id, 'follow_up_required'));
   };
 
-  const handleWaiveDeposit = async (row: DepositRequirement) => {
-    const reason = window.prompt('Why is this deposit being waived?', row.waiverReason ?? 'Clinic manager approved');
-    if (!reason) return;
+  const handleWaiveDeposit = async (row: DepositRequirement, reason: string) => {
     await withRefresh(`waive-${row.id}`, () => updateDepositRequirementStatus(row.id, { status: 'waived', waiverReason: reason, reason: row.reason }));
   };
 
@@ -358,28 +359,31 @@ export default function RevenueProtection() {
 
       <div className="grid gap-3 grid-cols-2 xl:grid-cols-7">
         <StatCard title="Payments Due Today" value={overview?.summary.paymentsDueToday ?? 0} subtitle="Copay / deposit queue" icon={<CreditCard className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Copays Expected" value={formatCurrency(overview?.summary.copaysExpected ?? 0)} subtitle="Collect before arrival" icon={<DollarSign className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Deposits Collected" value={formatCurrency(overview?.summary.depositsCollected ?? 0)} subtitle="Completed bookings" icon={<Wallet className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Open Payment Requests" value={formatCurrency(overview?.summary.copaysExpected ?? 0)} subtitle="Not final patient balances" icon={<DollarSign className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Deposits Recorded" value={formatCurrency(overview?.summary.depositsCollected ?? 0)} subtitle="Provider or staff status" icon={<Wallet className="w-4 h-4" />} accent="violet" />
         <StatCard title="Unpaid Balances" value={formatCurrency(overview?.summary.unpaidBalances ?? 0)} subtitle="At risk balances" icon={<AlertTriangle className="w-4 h-4" />} accent="red" />
         <StatCard title="Failed Payments" value={overview?.summary.failedPayments ?? 0} subtitle="Needs follow-up" icon={<FileBadge2 className="w-4 h-4" />} accent="amber" />
-        <StatCard title="Revenue Protected" value={formatCurrency(overview?.summary.revenueProtected ?? 0)} subtitle="Recovered / collected" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Net Recorded Collections" value={formatCurrency(overview?.summary.revenueProtected ?? 0)} subtitle="Transactions plus manual deposits" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
         <StatCard title="At Risk" value={formatCurrency(overview?.summary.revenueAtRisk ?? 0)} subtitle="Open alerts" icon={<AlertTriangle className="w-4 h-4" />} accent="red" />
       </div>
 
-      {/* Section tabs — view one group at a glance */}
-      <div className="flex items-center gap-1 bg-[var(--s1)] border border-[var(--b1)] p-1 rounded-xl w-fit" role="tablist" aria-label="Revenue protection sections">
-        <button type="button" role="tab" aria-selected={section === 'insurance' ? 'true' : 'false'} onClick={() => setSection('insurance')} className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition ${section === 'insurance' ? 'bg-[var(--indigo)] text-white shadow-sm' : 'text-t3 hover:text-t1 hover:bg-[var(--s3)]'}`}><ShieldCheck className="w-3.5 h-3.5" /> Insurance &amp; Eligibility</button>
-        <button type="button" role="tab" aria-selected={section === 'payments' ? 'true' : 'false'} onClick={() => setSection('payments')} className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition ${section === 'payments' ? 'bg-[var(--indigo)] text-white shadow-sm' : 'text-t3 hover:text-t1 hover:bg-[var(--s3)]'}`}><CreditCard className="w-3.5 h-3.5" /> Payments &amp; Deposits</button>
+      <div className="w-fit">
+        <ModuleTabs
+          tabs={[{ id: 'insurance', label: 'Insurance & Eligibility' }, { id: 'payments', label: 'Payments & Deposits' }]}
+          activeTab={section}
+          onChange={id => setSection(id as 'insurance' | 'payments')}
+          ariaLabel="Revenue protection sections"
+        />
       </div>
 
       <div>
         <div className={`space-y-3 ${section === 'insurance' ? '' : 'hidden'}`}>
-          <BentoCard title="Appointment Verification Queue" subtitle="Real appointments awaiting insurance checks">
+          <BentoCard title="Appointment Eligibility Queue" subtitle="Appointments awaiting a payer response or staff review">
             {queueError && <p className="mb-3 text-xs text-red-v">{queueError}</p>}
             <div className="grid gap-3 md:grid-cols-3">
               <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
                 <p className="text-xs font-bold uppercase tracking-widest text-t3">Queue status</p>
-                <p className="mt-2 text-sm font-semibold text-t1">{queueLoading ? 'Loading queue…' : `${activeCoverageCount}/${appointmentQueue.length} active`}</p>
+                <p className="mt-2 text-sm font-semibold text-t1">{queueLoading ? 'Loading queue…' : `${activeCoverageCount}/${appointmentQueue.length} with an active response`}</p>
                 <p className="mt-1 text-xs text-t3">This table reflects the same saved insurance workflow used in Scheduling and Patient Profile.</p>
               </div>
               <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
@@ -390,7 +394,7 @@ export default function RevenueProtection() {
               <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
                 <p className="text-xs font-bold uppercase tracking-widest text-t3">Open alerts</p>
                 <p className="mt-2 text-sm font-semibold text-t1">{openAlerts}</p>
-                <p className="mt-1 text-xs text-t3">Inactive coverage creates revenue protection alerts automatically.</p>
+                <p className="mt-1 text-xs text-t3">An inactive payer response creates an operational follow-up alert. It is not a final coverage or claim decision.</p>
               </div>
             </div>
 
@@ -440,7 +444,7 @@ export default function RevenueProtection() {
                                 onClick={() => void handleVerifyInsurance(row)}
                                 className="rounded-xl bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-50"
                               >
-                                {actionBusy === `verify-${row.id}` ? 'Verifying…' : 'Verify Insurance'}
+                                {actionBusy === `verify-${row.id}` ? 'Requesting…' : 'Request Payer Response'}
                               </button>
                               <button
                                 type="button"
@@ -449,7 +453,7 @@ export default function RevenueProtection() {
                               >
                                 Open Patient
                               </button>
-                              {estimate && <span className="badge badge-blue">Collect {formatCurrency(estimate.recommendedCollectAmount)}</span>}
+                              {estimate && <span className="badge badge-blue">Suggested request {formatCurrency(estimate.recommendedCollectAmount)}</span>}
                             </div>
                           </td>
                         </tr>
@@ -468,15 +472,15 @@ export default function RevenueProtection() {
             </div>
           </BentoCard>
 
-          <BentoCard title="Insurance Readiness Overview" subtitle="Payers, policies, and verification status">
+          <BentoCard title="Insurance Workflow Overview" subtitle="Payers, policy records, and latest response status">
             <div className="grid gap-3 md:grid-cols-2">
               <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
                 <div className="flex items-center justify-between gap-2 mb-2">
-                  <p className="text-xs font-bold uppercase tracking-widest text-t3">Coverage readiness</p>
-                  <span className="badge badge-emerald">{activeCoverageCount}/{overview?.eligibilityVerifications.length ?? 0} active</span>
+                  <p className="text-xs font-bold uppercase tracking-widest text-t3">Latest payer responses</p>
+                  <span className="badge badge-emerald">{activeCoverageCount}/{overview?.eligibilityVerifications.length ?? 0} active responses</span>
                 </div>
                 <ProgressBar value={Math.min(100, Math.round((activeCoverageCount / Math.max(overview?.eligibilityVerifications.length ?? 1, 1)) * 100))} color="emerald" />
-                <p className="mt-2 text-xs text-t3">Verified policies: {verifiedPolicies}</p>
+                <p className="mt-2 text-xs text-t3">Policies with a recorded verification status: {verifiedPolicies}. Eligibility is not a payment guarantee.</p>
               </div>
               <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
                 <p className="text-xs font-bold uppercase tracking-widest text-t3 mb-2">Accepted payers</p>
@@ -529,7 +533,7 @@ export default function RevenueProtection() {
             </div>
           </BentoCard>
 
-          <BentoCard title="Eligibility Work Queue" subtitle="Latest checks and next actions">
+          <BentoCard title="Eligibility Work Queue" subtitle="Point-in-time payer responses and staff actions">
             <div className="overflow-hidden rounded-2xl border border-[var(--b1)]">
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-sm">
@@ -560,17 +564,17 @@ export default function RevenueProtection() {
                           <td className="px-4 py-3">
                             <div className="flex flex-wrap gap-2">
                               <button type="button" disabled={actionBusy === `verified-${row.id}`} onClick={() => void handleMarkVerified(row)} className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition disabled:opacity-50">
-                                {actionBusy === `verified-${row.id}` ? 'Saving…' : 'Mark Verified'}
+                                {actionBusy === `verified-${row.id}` ? 'Saving…' : 'Record Staff Review'}
                               </button>
                               <button type="button" disabled={actionBusy === `deposit-${row.id}`} onClick={() => void handleRequestDeposit(row)} className="rounded-xl bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-50">
-                                {actionBusy === `deposit-${row.id}` ? 'Requesting…' : 'Request Deposit'}
+                                {actionBusy === `deposit-${row.id}` ? 'Creating…' : 'Create Payment Link'}
                               </button>
                               <button type="button" onClick={() => navigate(`/patients/${row.patientId}`)} className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition">
                                 Open Patient
                               </button>
                               {estimate && (
                                 <span className="badge badge-blue">
-                                  Recommend {formatCurrency(estimate.recommendedCollectAmount)}
+                                  Suggested request {formatCurrency(estimate.recommendedCollectAmount)}
                                 </span>
                               )}
                             </div>
@@ -584,7 +588,7 @@ export default function RevenueProtection() {
             </div>
           </BentoCard>
 
-          <BentoCard title="Prior Authorization Tracker" subtitle="Track approvals before the appointment hits the room">
+          <BentoCard title="Prior Authorization Tracker" subtitle="Track workflow and payer decisions; approval does not guarantee claim payment">
             <div className="overflow-hidden rounded-2xl border border-[var(--b1)]">
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-sm">
@@ -630,7 +634,7 @@ export default function RevenueProtection() {
             </div>
           </BentoCard>
 
-          <BentoCard title="Patient Responsibility Estimator" subtitle="Estimated insurance portion, patient responsibility, and recommended collect amount">
+          <BentoCard title="Patient Responsibility Estimates" subtitle="Planning values only; final responsibility depends on payer adjudication and clinic policy">
             <div className="overflow-hidden rounded-2xl border border-[var(--b1)]">
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-sm">
@@ -652,7 +656,7 @@ export default function RevenueProtection() {
                         <td className="px-4 py-3 text-t2 space-y-1">
                           <p>Insurance: {formatCurrency(row.estimatedInsurancePortion)}</p>
                           <p>Patient: {formatCurrency(row.estimatedPatientResponsibility)}</p>
-                          <p className="font-semibold text-emerald-v">Collect now: {formatCurrency(row.recommendedCollectAmount)}</p>
+                          <p className="font-semibold text-emerald-v">Suggested payment request: {formatCurrency(row.recommendedCollectAmount)}</p>
                         </td>
                         <td className="px-4 py-3 text-xs text-t3 leading-relaxed">{row.reason}</td>
                         <td className="px-4 py-3">
@@ -662,7 +666,7 @@ export default function RevenueProtection() {
                             onClick={() => void handleSendPaymentLink(row)}
                             className="rounded-xl bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-50"
                           >
-                            {actionBusy === `link-${row.id}` ? 'Sending…' : 'Send Payment Link'}
+                            {actionBusy === `link-${row.id}` ? 'Creating…' : 'Create Payment Link'}
                           </button>
                         </td>
                       </tr>
@@ -675,7 +679,7 @@ export default function RevenueProtection() {
         </div>
 
         <div className={`space-y-3 ${section === 'payments' ? '' : 'hidden'}`}>
-          <BentoCard title="Payment Command Center" subtitle="Collect copays, deposit payments, and follow up on failures">
+          <BentoCard title="Payment Command Center" subtitle="Create payment requests, review provider or staff-recorded status, and follow up on failures">
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
                 <p className="text-xs font-bold uppercase tracking-widest text-t3">Integration status</p>
@@ -687,8 +691,8 @@ export default function RevenueProtection() {
               <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
                 <p className="text-xs font-bold uppercase tracking-widest text-t3">Summary</p>
                 <div className="mt-2 space-y-1 text-sm text-t1">
-                  <p>{paymentLinkCount} payment links sent</p>
-                  <p>{depositCollectedCount} deposits collected</p>
+                  <p>{paymentLinkCount} payment requests with links</p>
+                  <p>{depositCollectedCount} deposits recorded as collected</p>
                   <p>{depositWaivedCount} deposits waived</p>
                 </div>
               </div>
@@ -718,7 +722,7 @@ export default function RevenueProtection() {
                       onClick={() => void handleMarkPaymentCollected(row)}
                       className="rounded-xl bg-[var(--emerald)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-50"
                     >
-                      {actionBusy === `collected-${row.id}` ? 'Saving…' : 'Mark Payment Collected'}
+                      {actionBusy === `collected-${row.id}` ? 'Saving…' : 'Record Staff-Confirmed Collection'}
                     </button>
                     <button
                       type="button"
@@ -730,7 +734,9 @@ export default function RevenueProtection() {
                     </button>
                     <button
                       type="button"
-                      onClick={() => window.open(row.paymentUrl ?? '#', '_blank', 'noopener,noreferrer')}
+                      disabled={!row.paymentUrl}
+                      title={row.paymentUrl ? 'Open secure payment page' : 'No payment page is available for this request'}
+                      onClick={() => { if (row.paymentUrl) window.open(row.paymentUrl, '_blank', 'noopener,noreferrer'); }}
                       className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition"
                     >
                       Open Link
@@ -744,12 +750,12 @@ export default function RevenueProtection() {
           <BentoCard title="Deposit Rule Engine" subtitle="Define when deposits are required and how much to collect">
             <div className="grid gap-3">
               <div className="grid gap-2 sm:grid-cols-2">
-                <input value={ruleDraft.name} onChange={e => setRuleDraft(prev => ({ ...prev, name: e.target.value }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Rule name" />
-                <input value={ruleDraft.ruleType} onChange={e => setRuleDraft(prev => ({ ...prev, ruleType: e.target.value }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Rule type" />
+                <input aria-label="Deposit rule name" value={ruleDraft.name} onChange={e => setRuleDraft(prev => ({ ...prev, name: e.target.value }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Rule name" />
+                <input aria-label="Deposit rule type" value={ruleDraft.ruleType} onChange={e => setRuleDraft(prev => ({ ...prev, ruleType: e.target.value }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Rule type" />
               </div>
-              <input value={ruleDraft.description} onChange={e => setRuleDraft(prev => ({ ...prev, description: e.target.value }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Description" />
+              <input aria-label="Deposit rule description" value={ruleDraft.description} onChange={e => setRuleDraft(prev => ({ ...prev, description: e.target.value }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Description" />
               <div className="grid gap-2 sm:grid-cols-[1fr_140px]">
-                <input type="number" value={ruleDraft.amountValue} onChange={e => setRuleDraft(prev => ({ ...prev, amountValue: Number(e.target.value) }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Amount" />
+                <input aria-label="Deposit amount" type="number" min="0" value={ruleDraft.amountValue} onChange={e => setRuleDraft(prev => ({ ...prev, amountValue: Number(e.target.value) }))} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="Amount" />
                 <button type="button" disabled={actionBusy === 'create-rule'} onClick={() => void handleCreateRule()} className="rounded-xl bg-[var(--indigo)] px-3 py-2 text-sm font-semibold text-white hover:opacity-90 transition disabled:opacity-50">
                   {actionBusy === 'create-rule' ? 'Saving…' : 'Create Rule'}
                 </button>
@@ -790,7 +796,7 @@ export default function RevenueProtection() {
             </div>
           </BentoCard>
 
-          <BentoCard title="Payment Work Queue" subtitle="Deposit requests and recovery work">
+          <BentoCard title="Payment Work Queue" subtitle="Deposit requests, staff-recorded statuses, and follow-up work">
             <div className="space-y-2">
               {(overview?.depositRequirements ?? []).map(row => (
                 <div key={row.id} className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
@@ -812,7 +818,7 @@ export default function RevenueProtection() {
                     <button
                       type="button"
                       disabled={actionBusy === `waive-${row.id}`}
-                      onClick={() => void handleWaiveDeposit(row)}
+                      onClick={() => setWaiverTarget(row)}
                       className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition disabled:opacity-50"
                     >
                       {actionBusy === `waive-${row.id}` ? 'Saving…' : 'Waive Deposit with Reason'}
@@ -839,7 +845,7 @@ export default function RevenueProtection() {
                       })}
                       className="rounded-xl bg-[var(--indigo)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition"
                     >
-                      Request Deposit
+                      Create Payment Link
                     </button>
                     <button
                       type="button"
@@ -863,7 +869,7 @@ export default function RevenueProtection() {
                       })}
                       className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition"
                     >
-                      Mark Collected
+                      Record Staff-Confirmed Collection
                     </button>
                   </div>
                 </div>
@@ -931,6 +937,18 @@ export default function RevenueProtection() {
           </BentoCard>
         </div>
       </div>
+      {waiverTarget && (
+        <ConfirmationModal
+          title="Waive this deposit?"
+          message={`Waive the ${formatCurrency(waiverTarget.requiredAmount)} deposit for ${waiverTarget.patientName}. The reason is recorded with the deposit status.`}
+          confirmLabel="Waive deposit"
+          tone="amber"
+          requireReason
+          reasonLabel="Waiver reason"
+          onClose={() => setWaiverTarget(null)}
+          onConfirm={reason => handleWaiveDeposit(waiverTarget, reason)}
+        />
+      )}
     </div>
   );
 }

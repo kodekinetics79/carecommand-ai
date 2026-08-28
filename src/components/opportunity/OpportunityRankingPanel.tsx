@@ -48,7 +48,7 @@ export default function OpportunityRankingPanel({ opportunities, loading, select
   if (loading) return <div className="space-y-2.5">{Array.from({ length: 5 }).map((_, i) => <div key={i} className="skeleton-line h-24 rounded-xl" />)}</div>;
   if (opportunities.length === 0) {
     return <EmptyStatePremium icon={<Sparkles className="w-5 h-5" />} title="No ranked opportunities"
-      description="When CareCommand detects recoverable revenue, ranked recovery actions appear here." cta={{ label: 'Launch a campaign', onClick: onCreate }} />;
+      description="The opportunity service loaded successfully and returned no ranked recovery actions." cta={{ label: 'Create campaign draft', onClick: onCreate }} />;
   }
   return (
     <div className="space-y-2.5">

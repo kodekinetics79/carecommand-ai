@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import {
   ShieldCheck, Loader2, LogOut, Building2, FileCheck2, Users2, ScrollText, Ban, Play,
   Search, CircleCheck, CircleSlash, Clock3, UserCog, Activity, ChevronRight, ChevronDown,
@@ -10,7 +10,6 @@ import {
   platformAdmin, setPlatformToken, downloadAuditCsv, TENANT_STATUS_BADGE, SUB_STATUS_BADGE, FEATURE_LABELS,
   type PlatformMe, type TenantSummary, type SystemHealth, type TenantBilling, type AiUsageView, type SecurityView, type IntegrationView,
 } from '../lib/platformAdmin';
-import { healthScore } from '../lib/platformServices';
 import PlatformPilot from './PlatformPilot';
 
 type Overview = { tenants: number; activeTenants: number; suspendedTenants: number; pendingRequests: number; platformUsers: number };
@@ -99,7 +98,6 @@ export default function PlatformConsole() {
                     <span className="flex-1 text-left truncate">{s.label}</span>
                     {s.premium && <Crown className="w-3 h-3 text-[var(--gold-ink)] shrink-0" />}
                     {badge > 0 && <span className="min-w-4 h-4 px-1 grid place-items-center rounded-full bg-[var(--red)] text-[9px] font-bold text-white">{badge}</span>}
-                    {!s.live && !s.premium && <span className="w-1.5 h-1.5 rounded-full bg-[var(--b2)] shrink-0" title="Backend pending" />}
                   </button>
                 );
               })}
@@ -123,7 +121,6 @@ export default function PlatformConsole() {
             <active.icon className="w-4 h-4 text-indigo shrink-0" />
             <h1 className="text-sm font-bold text-t1 truncate">{active.label}</h1>
             {active.premium && <span className="badge badge-gold">Premium</span>}
-            {!active.live && <span className="badge badge-amber">Backend pending</span>}
           </div>
           {/* mobile section select */}
           <select aria-label="Section" value={section} onChange={e => setSection(e.target.value as SectionId)} className="lg:hidden rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-2 py-1 text-xs">
@@ -144,7 +141,7 @@ export default function PlatformConsole() {
           {section === 'billing' && <TenantPicker title="Billing & Invoices" subtitle="Open a tenant → Billing tab to view MRR/ARR, set cycle, payment status, extend trial" hint="billing" onOpenTenant={openTenant} />}
           {section === 'ai_usage' && <TenantPicker title="AI Usage & Limits" subtitle="Open a tenant → AI Controls for credits, model tier, overage, and the emergency kill switch" hint="ai usage" onOpenTenant={openTenant} />}
           {section === 'device_usage' && <TenantPicker title="Device Usage" subtitle="Open a tenant → Usage & Limits to manage the device cap and other limits" hint="devices" onOpenTenant={openTenant} />}
-          {section === 'security' && <TenantPicker title="Security & Access" subtitle="Open a tenant → Security for MFA, session timeout, IP allowlist, and session revocation" hint="security" onOpenTenant={openTenant} />}
+          {section === 'security' && <TenantPicker title="Security & Access" subtitle="Open a tenant → Security for MFA policy, access-token lifetime, planned IP restrictions, and session revocation" hint="security" onOpenTenant={openTenant} />}
           {section === 'integrations' && <IntegrationsSection canManage={canManage} />}
           {section === 'announcements' && <AnnouncementsSection canManage={canManage} />}
           {section === 'settings' && <PlatformSettingsSection canManage={canManage} />}
@@ -175,8 +172,8 @@ function OverviewSection({ overview, onGoTenants }: { overview: Overview | null;
           <button type="button" onClick={onGoTenants} className="flex items-center gap-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-3 text-left hover:border-[var(--b2)]">
             <Building2 className="w-5 h-5 text-indigo" /><div><p className="text-sm font-semibold text-t1">Provision a company</p><p className="text-[11px] text-t3">Create a client tenant + owner login</p></div>
           </button>
-          <div className="flex items-center gap-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-3"><Gauge className="w-5 h-5 text-emerald-v" /><div><p className="text-sm font-semibold text-t1">System health</p><p className="text-[11px] text-t3">API · DB · Redis monitored live</p></div></div>
-          <div className="flex items-center gap-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-3"><ScrollText className="w-5 h-5 text-violet-v" /><div><p className="text-sm font-semibold text-t1">Audit trail</p><p className="text-[11px] text-t3">Every operator action recorded</p></div></div>
+          <div className="flex items-center gap-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-3"><Gauge className="w-5 h-5 text-emerald-v" /><div><p className="text-sm font-semibold text-t1">System health</p><p className="text-[11px] text-t3">Latest API, database, and cache status</p></div></div>
+          <div className="flex items-center gap-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-3"><ScrollText className="w-5 h-5 text-violet-v" /><div><p className="text-sm font-semibold text-t1">Audit trail</p><p className="text-[11px] text-t3">Review recorded operator events</p></div></div>
         </div>
       </Panel>
     </div>
@@ -246,7 +243,7 @@ function IntegrationsSection({ canManage }: { canManage: boolean }) {
   async function retry() { setBusy(true); setMsg(null); try { const r = await platformAdmin.retryJobs(); setMsg(`Retried ${r.retried} failed job(s).`); await load(); } catch (e) { setMsg(e instanceof Error ? e.message : 'Retry failed'); } finally { setBusy(false); } }
   const configured = rows?.filter(p => p.status === 'connected').length ?? 0;
   return (
-    <Panel title="Integrations & provider health" subtitle={rows ? `${configured}/${rows.length} providers connected · credentials encrypted at rest` : 'Provider credential management and background-job health'}
+    <Panel title="Integrations & provider health" subtitle={rows ? `${configured}/${rows.length} providers have a connected status in platform records` : 'Provider credential management and background-job health'}
       action={
         <div className="flex items-center gap-2">
           {canManage && <button type="button" onClick={() => setAdding(v => !v)} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90"><Plus className="w-3.5 h-3.5" /> Add service</button>}
@@ -278,7 +275,7 @@ function IntegrationsSection({ canManage }: { canManage: boolean }) {
             <button type="button" disabled={busy || failedJobs <= 0} onClick={retry} title={failedJobs <= 0 ? 'No failed jobs to retry' : 'Retry failed jobs'} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s1)] disabled:opacity-50"><RefreshCw className={`w-3.5 h-3.5 ${busy ? 'animate-spin' : ''}`} /> Retry failed jobs</button>
           </div>
           {msg && <p className="text-[11px] text-emerald-v">{msg}</p>}
-          <p className="text-[11px] text-t3">Credentials are stored <span className="font-semibold text-t2">encrypted (AES-256-GCM)</span> and never returned in full — only a masked preview. Server environment variables act as a fallback when nothing is saved here.</p>
+          <p className="text-[11px] text-t3">This console displays masked credential previews returned by the server. Deployment owners must separately verify encryption-key custody, rotation, and provider configuration. Server environment variables may act as a fallback when no saved credential is configured.</p>
         </div>
       )}
     </Panel>
@@ -449,8 +446,6 @@ function TenantDrawer({ tenant, canManage, onClose }: { tenant: TenantSummary; c
     { id: 'security', label: 'Security', live: true }, { id: 'audit', label: 'Audit Trail', live: true },
     { id: 'danger', label: 'Danger Zone', live: true },
   ];
-  const hs = healthScore({ status: d.tenant!.status, enabledFeatures: d.enabledFeatures, activeUsers: d.activeUsers, setupStatus: d.setupStatus });
-
   return (
     <div className="fixed inset-0 z-50 flex justify-end">
       <button type="button" aria-label="Close panel" title="Close panel" onClick={onClose} className="absolute inset-0 bg-black/40 backdrop-blur-sm animate-fade-in" />
@@ -460,7 +455,7 @@ function TenantDrawer({ tenant, canManage, onClose }: { tenant: TenantSummary; c
             <div className="w-10 h-10 rounded-xl logo-user grid place-items-center text-[13px] font-bold text-white">{d.tenant!.name.slice(0, 2).toUpperCase()}</div>
             <div>
               <p className="text-base font-bold leading-tight text-t1">{d.tenant!.name}</p>
-              <p className="text-[11px] text-t3">/{d.tenant!.slug} · {d.subscription?.planKey ?? '—'} · health {hs}</p>
+              <p className="text-[11px] text-t3">/{d.tenant!.slug} · {d.subscription?.planKey ?? '—'} · setup {d.setupStatus}</p>
             </div>
           </div>
           <button type="button" onClick={onClose} className="text-t3 hover:text-t1"><X className="w-5 h-5" /></button>
@@ -480,11 +475,11 @@ function TenantDrawer({ tenant, canManage, onClose }: { tenant: TenantSummary; c
           {tab === 'overview' && (
             <div className="grid grid-cols-2 gap-3">
               <DCard label="Status" value={d.tenant!.status} />
-              <DCard label="Health score" value={String(hs)} />
+              <DCard label="Setup status" value={d.setupStatus} />
               <DCard label="Active users" value={String(d.activeUsers)} />
               <DCard label="Branches" value={String(d.branches)} />
               <DCard label="Enabled features" value={`${d.enabledFeatures}/15`} />
-              <DCard label="Setup" value={d.setupStatus} />
+              <DCard label="Last activity" value={new Date(d.tenant!.lastActivityAt).toLocaleDateString()} />
               <DCard label="Plan" value={d.subscription?.planKey ?? '—'} />
               <DCard label="Sub status" value={d.subscription?.status ?? '—'} />
             </div>
@@ -500,7 +495,7 @@ function TenantDrawer({ tenant, canManage, onClose }: { tenant: TenantSummary; c
                   </select>
                 </label>
               )}
-              <p className="text-[11px] text-t3">Billing cycle, trial extension, grace period, renewal date & seat/limit editing are live, audited controls — <code className="font-mono">platformAdmin.getBilling / updateBilling / extendTrial</code>.</p>
+              <p className="text-[11px] text-t3">Use the Billing tab to review or change billing cycle, trial, grace-period, renewal, seat, and limit settings. Confirm the resulting state and audit event after each change.</p>
             </div>
           )}
 
@@ -717,10 +712,10 @@ function SecurityTab({ tid, canManage }: { tid: string; canManage: boolean }) {
       <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3 space-y-3">
         <label className="flex items-center justify-between"><span className="text-[12px] font-semibold text-t1">Force MFA for all users</span><Toggle on={s.forceMfa} onToggle={() => canManage && patch({ forceMfa: !s.forceMfa })} label="Force MFA" /></label>
         <label className="flex items-center justify-between"><span className="text-[12px] font-semibold text-t1">Failed-login lockout</span><Toggle on={s.failedLoginLockout} onToggle={() => canManage && patch({ failedLoginLockout: !s.failedLoginLockout })} label="Failed login lockout" /></label>
-        <div className="flex items-center justify-between"><span className="text-[12px] font-semibold text-t1">Session timeout</span>
-          <select aria-label="Session timeout" disabled={!canManage || busy} value={s.sessionTimeoutMinutes} onChange={e => patch({ sessionTimeoutMinutes: Number(e.target.value) })} className="rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-2 py-1 text-xs"><option value={15}>15 min</option><option value={30}>30 min</option><option value={60}>60 min</option><option value={120}>2 hours</option><option value={480}>8 hours</option></select>
+        <div className="flex items-center justify-between"><span className="text-[12px] font-semibold text-t1">Access-token lifetime</span>
+          <select aria-label="Access-token lifetime" disabled={!canManage || busy} value={s.sessionTimeoutMinutes} onChange={e => patch({ sessionTimeoutMinutes: Number(e.target.value) })} className="rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-2 py-1 text-xs"><option value={15}>15 min</option><option value={30}>30 min</option><option value={60}>60 min</option><option value={120}>2 hours</option><option value={480}>8 hours</option></select>
         </div>
-        <p className="text-[11px] text-t3">IP allowlist: {s.ipAllowlist.length ? s.ipAllowlist.join(', ') : 'none'}</p>
+        <p className="text-[11px] text-t3">Planned IP restrictions (record only; not enforced): {s.ipAllowlist.length ? s.ipAllowlist.join(', ') : 'none recorded'}</p>
         {canManage && <input value={reason} onChange={e => setReason(e.target.value)} placeholder="Reason for change (required, audited)…" className={fieldCls} />}
         {msg && <p className="text-[11px] text-emerald-v">{msg}</p>}
       </div>
@@ -958,7 +953,7 @@ function TenantsTab({ onOpenTenant }: { onOpenTenant?: (t: TenantSummary) => voi
                   </div>
                 </div>
                 <div className="flex items-center gap-1.5 shrink-0">
-                  {(() => { const hs = healthScore({ status: t.tenant.status, enabledFeatures: t.enabledFeatures, activeUsers: t.activeUsers, setupStatus: t.setupStatus }); const cls = hs >= 80 ? 'badge-emerald' : hs >= 50 ? 'badge-amber' : 'badge-red'; return <span className={`badge ${cls}`} title="Derived health score">♥ {hs}</span>; })()}
+                  <span className={`badge ${t.setupStatus === 'configured' ? 'badge-emerald' : 'badge-amber'}`} title="Stored setup status">setup: {t.setupStatus}</span>
                   <span className={`badge ${TENANT_STATUS_BADGE[t.tenant.status] ?? 'badge-blue'}`}>{t.tenant.status}</span>
                   {t.subscription && <span className={`badge ${SUB_STATUS_BADGE[t.subscription.status] ?? 'badge-blue'}`}>{t.subscription.planKey} · {t.subscription.status.toLowerCase()}</span>}
                 </div>
@@ -1013,9 +1008,10 @@ function CreateCompanyForm({ plans, onCancel, onCreated }: { plans: Array<{ key:
   const [ownerEmail, setOwnerEmail] = useState('');
   const [ownerPassword, setOwnerPassword] = useState('');
   const [branch, setBranch] = useState('Main Branch');
+  const [timezone, setTimezone] = useState(() => Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/New_York');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [done, setDone] = useState<{ email: string; password: string } | null>(null);
+  const [done, setDone] = useState<{ email: string } | null>(null);
 
   const autoSlug = (v: string) => v.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
   const inputCls = 'w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--indigo)]';
@@ -1023,8 +1019,9 @@ function CreateCompanyForm({ plans, onCancel, onCreated }: { plans: Array<{ key:
   async function submit() {
     setBusy(true); setError(null);
     try {
-      await platformAdmin.createTenant({ name: name.trim(), slug: slug.trim(), planKey, ownerName: ownerName.trim(), ownerEmail: ownerEmail.trim(), ownerPassword, defaultBranchName: branch.trim() || 'Main Branch' });
-      setDone({ email: ownerEmail.trim(), password: ownerPassword });
+      await platformAdmin.createTenant({ name: name.trim(), slug: slug.trim(), planKey, ownerName: ownerName.trim(), ownerEmail: ownerEmail.trim(), ownerPassword, defaultBranchName: branch.trim() || 'Main Branch', timezone });
+      setOwnerPassword('');
+      setDone({ email: ownerEmail.trim() });
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to create company');
     } finally { setBusy(false); }
@@ -1034,12 +1031,10 @@ function CreateCompanyForm({ plans, onCancel, onCreated }: { plans: Array<{ key:
     return (
       <div className="mb-4 rounded-xl border border-[rgba(5,150,105,0.25)] bg-emerald-soft p-4">
         <p className="text-sm font-bold text-emerald-v flex items-center gap-2"><CircleCheck className="w-4 h-4" /> Company created</p>
-        <p className="text-[12px] text-t2 mt-1.5">The client can now sign in at the clinic login with <span className="font-semibold">{done.email}</span> and the temporary password below.</p>
+        <p className="text-[12px] text-t2 mt-1.5">The client can now sign in at the clinic login with <span className="font-semibold">{done.email}</span>. Deliver the initial password through your approved secure channel; it is not displayed or retained here.</p>
         <div className="mt-3 rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-[12px] text-t2">
           <p><span className="font-semibold text-t1">Email:</span> {done.email}</p>
-          <p className="mt-1"><span className="font-semibold text-t1">Password:</span> {done.password}</p>
         </div>
-        <p className="mt-2 text-[11px] text-t3">Have the client change this password after first sign-in.</p>
         <button type="button" onClick={onCreated} className="mt-3 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90">Done</button>
       </div>
     );
@@ -1059,6 +1054,8 @@ function CreateCompanyForm({ plans, onCancel, onCreated }: { plans: Array<{ key:
           <select aria-label="Plan" className={inputCls} value={planKey} onChange={e => setPlanKey(e.target.value)}>{(plans.length ? plans : [{ key: 'starter', name: 'Starter' }]).map(p => <option key={p.key} value={p.key}>{p.name}</option>)}</select></label>
         <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Default branch</span>
           <input className={inputCls} value={branch} onChange={e => setBranch(e.target.value)} placeholder="Main Branch" /></label>
+        <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Clinic timezone</span>
+          <input className={inputCls} value={timezone} onChange={e => setTimezone(e.target.value)} placeholder="America/New_York" /></label>
       </div>
       <div className="border-t border-[var(--b1)] pt-3">
         <p className="text-[10px] font-semibold text-t3 mb-2">OWNER LOGIN (the client signs in with these)</p>
@@ -1067,8 +1064,8 @@ function CreateCompanyForm({ plans, onCancel, onCreated }: { plans: Array<{ key:
             <input className={inputCls} value={ownerName} onChange={e => setOwnerName(e.target.value)} placeholder="Dr. Jane Doe" /></label>
           <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Owner email</span>
             <input className={inputCls} type="email" value={ownerEmail} onChange={e => setOwnerEmail(e.target.value)} placeholder="owner@clinic.com" /></label>
-          <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Temp password (min 8)</span>
-            <input className={inputCls} type="text" value={ownerPassword} onChange={e => setOwnerPassword(e.target.value)} placeholder="Set a starter password" /></label>
+          <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Initial password (min 8)</span>
+            <input className={inputCls} type="password" autoComplete="new-password" value={ownerPassword} onChange={e => setOwnerPassword(e.target.value)} placeholder="Set an initial password" /></label>
         </div>
       </div>
       <div className="flex gap-2">
@@ -1261,7 +1258,7 @@ function AuditTab() {
   const [rows, setRows] = useState<Array<{ id: string; action: string; targetType: string; tenantId: string | null; createdAt: string }>>([]);
   useEffect(() => { let a = true; void (async () => { const r = await platformAdmin.audit(150); if (a) setRows(r); })(); return () => { a = false; }; }, []);
   return (
-    <Panel title="Audit log" subtitle="Immutable record of operator actions (no PHI, IP/agent hashed)"
+    <Panel title="Audit log" subtitle="Recorded operator events. Review exported fields before sharing them outside the authorized team."
       action={<button type="button" onClick={() => void downloadAuditCsv()} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-t2 hover:bg-[var(--s2)]"><Download className="w-3.5 h-3.5" /> Export CSV</button>}>
       {rows.length === 0 ? <EmptyState icon={Activity} text="No audit events recorded yet." /> : (
         <div className="overflow-hidden rounded-xl border border-[var(--b1)] divide-y divide-[var(--b1)]">

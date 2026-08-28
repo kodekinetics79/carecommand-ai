@@ -5,13 +5,9 @@ import { apiRequest } from './api';
 //   Leak        = a detected revenue problem (revenue-leaks)
 //   Opportunity = a ranked action to recover value (opportunities)
 //   Workflow    = the execution path (status transitions via PATCH)
-// [LIVE] = real endpoint; [TODO] = typed contract for a missing route.
+// Every callable method below is backed by a real endpoint.
 // ============================================================================
 
-export class NotImplemented extends Error {
-  contract: string;
-  constructor(contract: string) { super(`Backend pending: ${contract}`); this.name = 'NotImplemented'; this.contract = contract; }
-}
 const num = (v: unknown): number => typeof v === 'string' ? Number(v) || 0 : typeof v === 'number' ? v : 0;
 
 export type ApprovalState = 'approved' | 'pending_approval' | 'not_required';
@@ -78,12 +74,10 @@ function mapLeak(l: Record<string, unknown>): RevenueLeak {
 }
 
 // Specific workflow CTAs → concrete status transitions (server audits each PATCH).
-export type WorkflowVerb = 'approve_campaign' | 'launch_recovery' | 'assign_callback' | 'create_schedule_fill' | 'send_front_desk';
+export type WorkflowVerb = 'approve_campaign' | 'assign_callback' | 'send_front_desk';
 const VERB_STATUS: Record<WorkflowVerb, { status: string; approvalRequired?: boolean }> = {
   approve_campaign: { status: 'approved', approvalRequired: false },
-  launch_recovery: { status: 'running', approvalRequired: false },
   assign_callback: { status: 'running', approvalRequired: false },
-  create_schedule_fill: { status: 'running', approvalRequired: false },
   send_front_desk: { status: 'assigned', approvalRequired: false },
 };
 
@@ -108,11 +102,5 @@ export const opportunityService = {
   async setStatus(id: string, status: string): Promise<Opportunity> {
     const row = await apiRequest<Record<string, unknown>>(`/v1/opportunities/${id}`, { method: 'PATCH', body: JSON.stringify({ status }) });
     return mapOpportunity(row);
-  },
-  // [TODO] Per-opportunity audit trail — needs GET /v1/opportunities/:id/audit
-  // (resourceId-filtered audit events). Until then the drawer shows the known
-  // lifecycle derived from the record; this throws so the UI is honest.
-  getAuditTrail: (id: string): Promise<Array<{ action: string; at: string; actor: string; detail: string }>> => {
-    void id; throw new NotImplemented('GET /v1/opportunities/:id/audit');
   },
 };

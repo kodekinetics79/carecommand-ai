@@ -1,6 +1,9 @@
 import type { FastifyRequest } from 'fastify';
 import { db } from './db';
 import { audit } from './audit';
+import { runWithTenantContext } from './tenantContext';
+import type { UserRole } from '../generated/prisma/enums';
+import { lockClinicAccessMutation } from './clinicAccessSafety';
 
 // ===========================================================================
 // Admin role safety guards. Prevent a tenant from locking itself out of
@@ -65,4 +68,83 @@ export async function assertDeactivateSafe(request: FastifyRequest, target: { id
     await recordBlocked(request, target.id, { operation: 'deactivate', reason: 'last_admin', role: target.role });
     throw request.server.httpErrors.conflict('This is the last active administrator and cannot be deactivated. Assign another OWNER or ADMIN first.');
   }
+}
+
+function auditData(request: FastifyRequest, action: string, targetId: string, metadata: Record<string, unknown>) {
+  return {
+    tenantId: request.auth.tenantId,
+    actorUserId: request.auth.userId,
+    action,
+    resource: 'user',
+    resourceId: targetId,
+    requestId: request.id,
+    ipAddress: request.ip,
+    userAgent: request.headers['user-agent'],
+    metadata: metadata as never,
+  };
+}
+
+/** Serialize the last-admin invariant with the mutation and its audit receipt. */
+export async function setUserActiveSafely(request: FastifyRequest, targetId: string, active: boolean, action: string) {
+  const result = await runWithTenantContext(request.auth.tenantId, async tx => {
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`tenant.admin.guard:${request.auth.tenantId}`}::text, 0))::text AS locked`;
+    await lockClinicAccessMutation(tx, request.auth.tenantId);
+    const target = await tx.user.findFirst({ where: { id: targetId, tenantId: request.auth.tenantId } });
+    if (!target) return { kind: 'not_found' as const };
+    if (active && !target.active) {
+      const access = await tx.userClinicAccess.findMany({ where: { tenantId: request.auth.tenantId, userId: target.id }, select: { branchId: true } });
+      const assignedIds = [...new Set([target.branchId, ...access.map(row => row.branchId)].filter((id): id is string => Boolean(id)))];
+      const activeBranches = assignedIds.length > 0
+        ? await tx.branch.count({ where: { tenantId: request.auth.tenantId, id: { in: assignedIds }, active: true } })
+        : 0;
+      if (activeBranches !== assignedIds.length) {
+        await tx.auditEvent.create({ data: auditData(request, 'admin.user.activationBlocked', target.id, { reason: 'inactive_clinic_assignment', branchIds: assignedIds }) });
+        return { kind: 'inactive_clinic' as const, message: 'Reassign this user to active clinics before activation.' };
+      }
+    }
+    if (!active && target.active && isAdminRole(target.role)) {
+      const remaining = await tx.user.count({ where: { tenantId: request.auth.tenantId, active: true, role: { in: ['OWNER', 'ADMIN'] }, id: { not: target.id } } });
+      if (remaining < 1) {
+        await tx.auditEvent.create({ data: auditData(request, 'admin.roleSafety.blocked', target.id, { operation: 'deactivate', reason: 'last_admin', role: target.role }) });
+        return { kind: 'blocked' as const, message: 'This is the last active administrator and cannot be deactivated. Assign another OWNER or ADMIN first.' };
+      }
+    }
+    const updated = await tx.user.update({
+      where: { id: target.id },
+      data: { active, ...(active ? {} : { refreshTokenHash: null, refreshTokenExpiresAt: null }) },
+    });
+    await tx.auditEvent.create({ data: auditData(request, action, target.id, { active }) });
+    return { kind: 'updated' as const, updated };
+  });
+  if (result.kind === 'not_found') throw request.server.httpErrors.notFound('User not found');
+  if (result.kind === 'blocked') throw request.server.httpErrors.conflict(result.message);
+  if (result.kind === 'inactive_clinic') throw request.server.httpErrors.conflict(result.message);
+  return result.updated;
+}
+
+/** Serialize self-demotion/last-admin checks with the role change and audit. */
+export async function setUserRoleSafely(request: FastifyRequest, targetId: string, role: UserRole, action: string) {
+  const result = await runWithTenantContext(request.auth.tenantId, async tx => {
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`tenant.admin.guard:${request.auth.tenantId}`}::text, 0))::text AS locked`;
+    const target = await tx.user.findFirst({ where: { id: targetId, tenantId: request.auth.tenantId } });
+    if (!target) return { kind: 'not_found' as const };
+    const demotingFromAdmin = isAdminRole(target.role) && !isAdminRole(role);
+    if (demotingFromAdmin && request.auth.userId === target.id) {
+      await tx.auditEvent.create({ data: auditData(request, 'admin.roleSafety.blocked', target.id, { operation: 'roleChange', reason: 'self_demotion', fromRole: target.role, attemptedRole: role }) });
+      return { kind: 'blocked' as const, message: 'You cannot remove your own administrative access. Ask another OWNER or ADMIN to change your role.' };
+    }
+    if (demotingFromAdmin && target.active) {
+      const remaining = await tx.user.count({ where: { tenantId: request.auth.tenantId, active: true, role: { in: ['OWNER', 'ADMIN'] }, id: { not: target.id } } });
+      if (remaining < 1) {
+        await tx.auditEvent.create({ data: auditData(request, 'admin.roleSafety.blocked', target.id, { operation: 'roleChange', reason: 'last_admin', fromRole: target.role, attemptedRole: role }) });
+        return { kind: 'blocked' as const, message: 'This is the last active administrator. Assign another OWNER or ADMIN before changing this role.' };
+      }
+    }
+    const updated = await tx.user.update({ where: { id: target.id }, data: { role } });
+    await tx.auditEvent.create({ data: auditData(request, action, target.id, { fromRole: target.role, toRole: role }) });
+    return { kind: 'updated' as const, updated };
+  });
+  if (result.kind === 'not_found') throw request.server.httpErrors.notFound('User not found');
+  if (result.kind === 'blocked') throw request.server.httpErrors.conflict(result.message);
+  return result.updated;
 }

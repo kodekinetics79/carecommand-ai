@@ -45,15 +45,15 @@ export default function IntegrationSetup() {
   return (
     <div className="space-y-4 pb-6">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <p className="text-[13px] text-t3">Configure connected-care providers. Credentials are encrypted and never returned to the browser.</p>
+        <p className="text-[13px] text-t3">Configure connected-care providers. Secret values are stored using application encryption and are not displayed again in this form. Deployment owners must separately verify encryption-key custody and access.</p>
         <button type="button" onClick={() => void load()} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-[13px] font-semibold text-t1 hover:bg-[var(--s2)] transition">
           <RefreshCw className="w-3.5 h-3.5 text-t3" /> Refresh
         </button>
       </div>
 
-      {error && <div className="rounded-xl border border-[var(--b1)] bg-[var(--amber-soft)] p-3 text-[13px] text-amber-v">{error}</div>}
+      {error && <div role="alert" className="rounded-xl border border-[var(--b1)] bg-[var(--amber-soft)] p-3 text-[13px] text-amber-v">{error}</div>}
 
-      <BentoCard title="Insurance Eligibility Providers" subtitle="Real 270/271 eligibility — Stedi sandbox is available now" headerRight={<ShieldCheck className="w-4 h-4 text-t3" />}>
+      <BentoCard title="Insurance Eligibility Providers" subtitle="270/271 eligibility through a configured provider; sandbox mode is supported" headerRight={<ShieldCheck className="w-4 h-4 text-t3" />}>
         {loading ? <SkeletonRows /> : <div className="space-y-2.5">{insurance.map(p => <ProviderRow key={p.key} p={p} kind="insurance" onChanged={load} />)}</div>}
       </BentoCard>
 

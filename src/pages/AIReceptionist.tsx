@@ -1,10 +1,11 @@
 import { useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { Phone, MessageSquare, Mail, Sparkles, Clock, CheckCircle2, AlertCircle, ArrowRight, Bot, Zap, User, Calendar } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ModuleTabs from '../components/ui/ModuleTabs';
+import ConfirmationModal from '../components/workflow/ConfirmationModal';
 import { useApiResource } from '../hooks/useApiResource';
 import { apiRequest } from '../lib/api';
 import { mapConversation, type ApiConversation } from '../lib/apiAdapters';
@@ -22,8 +23,18 @@ interface ConversationCard {
   intent: string;
   suggestedSlot: string | null;
   value: string;
+  valueEvidence: string;
   lastAgentMessage?: string;
   lastAgentMessageAt?: string;
+  replyReadiness: ApiConversation['replyReadiness'];
+}
+
+interface ConversationReplyResult {
+  delivered?: boolean;
+  accepted?: boolean;
+  deliveryStatus: string;
+  providerMode: string | null;
+  message: string;
 }
 
 const channelIcon: Record<string, React.ReactNode> = {
@@ -44,7 +55,7 @@ const channelBg: Record<string, string> = {
 
 const statusConfig: Record<string, { label: string; badgeClass: string }> = {
   unread: { label: 'Unread', badgeClass: 'badge badge-blue' },
-  'ai-recovered': { label: 'AI Recovered', badgeClass: 'badge badge-emerald' },
+  'ai-recovered': { label: 'Legacy follow-up status', badgeClass: 'badge badge-amber' },
   replied: { label: 'Replied', badgeClass: 'badge badge-blue' },
   pending: { label: 'Pending', badgeClass: 'badge badge-amber' },
   escalated: { label: 'Escalate', badgeClass: 'badge badge-red' },
@@ -53,13 +64,18 @@ const statusConfig: Record<string, { label: string; badgeClass: string }> = {
 function buildReplyDraft(conversation?: ConversationCard) {
   if (!conversation) return '';
   const firstName = conversation.name.split(' ')[0];
+  const sender = conversation.replyReadiness.senderIdentity;
   if (conversation.status === 'escalated') {
-    return `Hi ${firstName}, thanks for your patience — I’ve escalated this to the manager and we’ll review it today.`;
+    return `Hi ${firstName}, this is ${sender}. Your message has been routed for staff review. A staff response is not yet confirmed.`;
   }
   if (conversation.channel === 'call') {
-    return `Hi ${firstName}, sorry we missed your call. Reply with a good time and we’ll call you straight back.`;
+    return `Hi ${firstName}, this is ${sender}. We have a record of your call. Reply with a preferred time for clinic staff to review. A callback is not yet scheduled.`;
   }
-  return `Hi ${firstName}, thanks for reaching out — we can help with ${conversation.intent.toLowerCase()}. Would you like me to reserve the next available slot?`;
+  return `Hi ${firstName}, this is ${sender}. Thanks for reaching out about ${conversation.intent.toLowerCase()}. Would you like clinic staff to review a scheduling request?`;
+}
+
+function humanizeToken(value: string) {
+  return value.replaceAll('_', ' ').replace(/^\w/, character => character.toUpperCase());
 }
 
 export default function AIReceptionist() {
@@ -69,6 +85,9 @@ export default function AIReceptionist() {
   const [replyText, setReplyText] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [sendNotice, setSendNotice] = useState<string | null>(null);
+  const [confirmReplyOpen, setConfirmReplyOpen] = useState(false);
+  const [clientAttemptKey, setClientAttemptKey] = useState('');
   const { data: conversationRecords, source, error, reload } = useApiResource<ApiConversation, ReturnType<typeof mapConversation>>(
     '/v1/conversations?limit=100',
     [],
@@ -89,11 +108,15 @@ export default function AIReceptionist() {
   }, [conversationRecords]);
 
   const filtered = activeChannel === 'all' ? conversationRecords : conversationRecords.filter(item => item.channel === activeChannel);
+  const todayKey = new Date().toDateString();
   const callConversations = conversationRecords
     .filter(item => item.channel === 'call')
     .sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime());
-  const recovered = callConversations.filter(item => item.aiHandled || item.status === 'ai-recovered' || Boolean(item.lastAgentMessage)).length;
-  const unresolved = conversationRecords.filter(item => !['replied', 'ai-recovered'].includes(item.status)).length;
+  const callsToday = callConversations.filter(item => new Date(item.createdAt).toDateString() === todayKey);
+  // The legacy aiHandled flag has no actor/model provenance. Count only an
+  // actual stored outbound request and do not attribute it to AI.
+  const followUpEvidenceCount = callConversations.filter(item => Boolean(item.lastAgentMessage)).length;
+  const unresolved = conversationRecords.filter(item => item.status !== 'replied').length;
   const avgReplyMinutes = useMemo(() => {
     const replyDurations = conversationRecords
       .filter(item => item.lastAgentMessageAt)
@@ -111,15 +134,35 @@ export default function AIReceptionist() {
     if (!selectedConv) return;
     const message = replyText.trim() || replyPreview;
     if (!message.trim()) return;
+    if (status === 'replied' && !selectedConv.replyReadiness.ready) {
+      setSendError(`Submission is disabled: ${humanizeToken(selectedConv.replyReadiness.readinessReason).toLowerCase()}.`);
+      return;
+    }
+    if (status === 'replied' && !clientAttemptKey) {
+      setSendError('A durable submission attempt could not be initialized. Close and reopen the confirmation.');
+      return;
+    }
     setIsSending(true);
     setSendError(null);
+    setSendNotice(null);
     try {
-      await apiRequest(`/v1/conversations/${selectedConv.id}/reply`, {
+      const result = await apiRequest<ConversationReplyResult>(`/v1/conversations/${selectedConv.id}/reply`, {
         method: 'POST',
-        body: JSON.stringify({ message: message.trim(), status }),
+        body: JSON.stringify({ message: message.trim(), status, ...(status === 'replied' ? { clientAttemptKey } : {}) }),
       });
+      const deliveryStatus = result.deliveryStatus.toLowerCase();
+      setSendNotice(status === 'escalated'
+        ? 'Internal escalation recorded. No patient message was submitted.'
+        : deliveryStatus === 'submission_result_unknown'
+          ? 'Submission result unknown. Retry is blocked until provider evidence is reconciled.'
+        : deliveryStatus === 'delivered'
+          ? 'The provider reports the reply was delivered.'
+          : ['sent', 'accepted'].includes(deliveryStatus) || result.accepted
+            ? 'The provider accepted the reply request. Delivery is not confirmed.'
+            : result.message);
       await reload();
       setReplyText('');
+      if (deliveryStatus !== 'submission_result_unknown') setClientAttemptKey('');
     } catch (error) {
       setSendError(error instanceof Error ? error.message : 'Failed to send reply');
     } finally {
@@ -131,8 +174,8 @@ export default function AIReceptionist() {
     <div className="space-y-6 pb-8">
       <PageHeader
         title="AI Front Desk"
-        subtitle="Live conversation inbox, missed-call recovery, and AI reply automation."
-        badge={loadError ? 'Live Data Error' : `Unread: ${unresolved} · ${source === 'live' ? 'Live DB' : 'Loading'}`}
+        subtitle="Conversation records, missed-call follow-up, and staff-reviewed front-desk reply workflows."
+        badge={loadError ? 'Data unavailable' : `Unread: ${unresolved} · ${source === 'live' ? 'Stored clinic records' : 'Loading'}`}
         badgeColor={loadError ? 'red' : 'red'}
         actions={
           <button type="button" onClick={() => navigate('/settings')} className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 to-violet-600 px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
@@ -143,15 +186,15 @@ export default function AIReceptionist() {
 
       {loadError && (
         <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          Conversation data could not be loaded from the live API: {loadError}
+          Conversation records could not be loaded from the clinic API: {loadError}
         </div>
       )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Missed Calls Today" value={String(callConversations.length)} subtitle="Calls needing recovery" icon={<Phone className="w-4 h-4" />} accent="red" />
-        <StatCard title="AI Recovered" value={`${recovered}/${callConversations.length || 1}`} subtitle="Missed-call follow-up" trend={48} icon={<Bot className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Avg Response Time" value={`${avgReplyMinutes ? `${avgReplyMinutes} min` : 'n/a'}`} subtitle="Time to first AI reply" trend={-22} icon={<Clock className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Open Conversations" value={String(unresolved)} subtitle="Needs review or action" trend={31} icon={<Calendar className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Call records today" value={String(callsToday.length)} subtitle="All calls on the browser-local date" icon={<Phone className="w-4 h-4" />} accent="red" />
+        <StatCard title="Follow-up evidence" value={`${followUpEvidenceCount}/${callConversations.length}`} subtitle="Stored staff-submitted outbound request" icon={<Bot className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Avg recorded request lag" value={`${avgReplyMinutes ? `${avgReplyMinutes} min` : 'n/a'}`} subtitle="Conversation record to outbound request" icon={<Clock className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Open Conversations" value={String(unresolved)} subtitle="Needs review or action" icon={<Calendar className="w-4 h-4" />} accent="violet" />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_380px]">
@@ -164,14 +207,14 @@ export default function AIReceptionist() {
                   <h3 className="text-sm font-bold text-t1">All incoming enquiries</h3>
                 </div>
                 <span className="flex items-center gap-1.5 text-xs font-semibold text-emerald-v bg-[var(--emerald-soft)] px-2.5 py-1 rounded-full border border-[var(--b1)]">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" /> AI Active
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> {source === 'live' ? 'Stored inbox records' : 'Loading'}
                 </span>
               </div>
               <ModuleTabs tabs={channelTabs} activeTab={activeChannel} onChange={setActiveChannel} variant="pills" />
             </div>
             <div className="divide-y divide-[var(--b0)]">
               {filtered.length === 0 ? (
-                <p className="px-4 py-6 text-sm text-t3">No live conversations returned for this clinic.</p>
+                <p className="px-4 py-6 text-sm text-t3">No conversation records were returned for this clinic.</p>
               ) : filtered.map((conv) => {
                 const status = statusConfig[conv.status] ?? statusConfig.pending;
                 const isSelected = selectedConv?.id === conv.id;
@@ -182,6 +225,9 @@ export default function AIReceptionist() {
                     onClick={() => {
                       setSelectedId(conv.id);
                       setReplyText('');
+                      setSendNotice(null);
+                      setSendError(null);
+                      setClientAttemptKey('');
                     }}
                     className={`w-full flex items-start gap-3 px-4 py-3.5 text-left hover:bg-[var(--s3)] transition-colors ${isSelected ? 'bg-[var(--blue-soft)] border-l-2 border-l-indigo' : ''}`}
                   >
@@ -195,12 +241,13 @@ export default function AIReceptionist() {
                       </div>
                       <p className="text-xs text-t3 truncate mt-0.5">
                         {conv.message}
-                        {conv.lastAgentMessage ? ` · AI: ${conv.lastAgentMessage}` : ''}
+                        {conv.lastAgentMessage ? ` · Outbound request: ${conv.lastAgentMessage}` : ''}
                       </p>
                       <div className="flex items-center gap-2 mt-1">
                         <span className={status.badgeClass}>{status.label}</span>
-                        {conv.aiHandled && <span className="badge badge-violet">AI handled</span>}
-                        <span className="text-[10px] font-bold text-emerald-v ml-auto">{conv.value}</span>
+                        <span className="ml-auto text-right text-[10px] font-bold text-emerald-v">
+                          Recorded est. {conv.value}<span className="block font-medium text-t3">source not verified</span>
+                        </span>
                       </div>
                     </div>
                   </button>
@@ -211,7 +258,7 @@ export default function AIReceptionist() {
         </div>
 
         <div className="space-y-4">
-          <BentoCard title="AI Conversation Summary" subtitle="Smart context panel" headerRight={<Sparkles className="w-4 h-4 text-violet-v" />}>
+          <BentoCard title="Conversation Review" subtitle="Recorded context and server authorization evidence" headerRight={<Sparkles className="w-4 h-4 text-violet-v" />}>
             {selectedConv ? (
               <div className="space-y-3">
                 <div className="flex items-center gap-3 p-3 rounded-xl bg-[var(--s3)] border border-[var(--b1)]">
@@ -229,13 +276,59 @@ export default function AIReceptionist() {
                     <p className="text-xs font-semibold text-t1">{selectedConv.intent}</p>
                   </div>
                   <div className="p-2.5 rounded-xl bg-[var(--emerald-soft)] border border-[var(--b1)]">
-                    <p className="text-[10px] font-bold text-emerald-v uppercase tracking-wide mb-0.5">Est. Value</p>
+                    <p className="text-[10px] font-bold text-emerald-v uppercase tracking-wide mb-0.5">Recorded value</p>
                     <p className="text-xs font-bold text-emerald-v">{selectedConv.value}</p>
+                    <p className="text-[9px] text-t3">{selectedConv.valueEvidence}</p>
                   </div>
+                </div>
+                <div className="space-y-2 rounded-xl border border-[var(--b1)] bg-[var(--s3)] p-3" aria-label="Reply readiness evidence">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-[10px] font-bold uppercase tracking-widest text-t3">Reply authorization</p>
+                    <span className={`badge ${selectedConv.replyReadiness.ready ? 'badge-emerald' : 'badge-red'}`}>
+                      {selectedConv.replyReadiness.ready ? 'Ready for server recheck' : 'Not ready'}
+                    </span>
+                  </div>
+                  <dl className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.35fr)] gap-x-3 gap-y-1 text-[11px]">
+                    <dt className="text-t3">Channel + masked destination</dt>
+                    <dd className="text-right font-semibold text-t1">
+                      {selectedConv.replyReadiness.channel?.toUpperCase() ?? 'Unavailable'} · {selectedConv.replyReadiness.destinationMasked ?? 'No destination'}
+                    </dd>
+                    <dt className="text-t3">Patient-link identity</dt>
+                    <dd className="text-right font-semibold text-t1">{humanizeToken(selectedConv.replyReadiness.identityStatus)}</dd>
+                    <dt className="text-t3">Destination evidence</dt>
+                    <dd className="text-right font-semibold text-t1">
+                      {selectedConv.replyReadiness.destinationVerificationStatus === 'format_verified' ? 'Format verified' : 'Not verified'} · {humanizeToken(selectedConv.replyReadiness.destinationSource).toLowerCase()}
+                    </dd>
+                    <dt className="text-t3">Explicit consent</dt>
+                    <dd className="text-right font-semibold text-t1">
+                      {humanizeToken(selectedConv.replyReadiness.explicitConsentStatus)}
+                      <span className="block font-normal text-t3">Source: {selectedConv.replyReadiness.consentSource ?? 'not recorded'}</span>
+                    </dd>
+                    <dt className="text-t3">Operational basis</dt>
+                    <dd className="text-right font-semibold text-t1">{humanizeToken(selectedConv.replyReadiness.authorizationBasis)}</dd>
+                    <dt className="text-t3">Canonical sender</dt>
+                    <dd className="text-right font-semibold text-t1">{selectedConv.replyReadiness.senderIdentity}</dd>
+                    <dt className="text-t3">Channel terms</dt>
+                    <dd className="text-right font-semibold text-t1">
+                      Operational reply only
+                      <span className="block font-normal text-t3">{selectedConv.replyReadiness.channelTermsSource}</span>
+                    </dd>
+                    <dt className="text-t3">Current suppression state</dt>
+                    <dd className="text-right font-semibold text-t1">{humanizeToken(selectedConv.replyReadiness.suppressionStatus)}</dd>
+                    <dt className="text-t3">Submission state</dt>
+                    <dd className="text-right font-semibold text-t1">{humanizeToken(selectedConv.replyReadiness.submissionState)}</dd>
+                    <dt className="text-t3">Draft attribution</dt>
+                    <dd className="text-right font-semibold text-t1">Rule-based · requires staff review</dd>
+                  </dl>
+                  {!selectedConv.replyReadiness.ready && (
+                    <p className="rounded-lg bg-[var(--red-soft)] px-2 py-1.5 text-[10px] font-semibold text-red-v">
+                      Submission unavailable: {humanizeToken(selectedConv.replyReadiness.readinessReason).toLowerCase()}.
+                    </p>
+                  )}
                 </div>
                 {selectedConv.lastAgentMessage && (
                   <div className="p-3 rounded-xl bg-[var(--s3)] border border-[var(--b1)]">
-                    <p className="text-[10px] font-bold text-t3 uppercase tracking-widest mb-1">Last AI Reply</p>
+                    <p className="text-[10px] font-bold text-t3 uppercase tracking-widest mb-1">Last staff-submitted outbound message request</p>
                     <p className="text-sm text-t1 leading-relaxed">{selectedConv.lastAgentMessage}</p>
                     {selectedConv.lastAgentMessageAt && <p className="text-[10px] text-t3 mt-1">{new Date(selectedConv.lastAgentMessageAt).toLocaleString()}</p>}
                   </div>
@@ -244,33 +337,41 @@ export default function AIReceptionist() {
                   <div className="p-3 rounded-xl border border-[var(--b2)] bg-[var(--violet-soft)]">
                     <div className="flex items-center gap-2 mb-1">
                       <Calendar className="w-3.5 h-3.5 text-violet-v" />
-                      <p className="text-[10px] font-bold text-violet-v uppercase tracking-wide">AI Suggested Slot</p>
+                      <p className="text-[10px] font-bold text-violet-v uppercase tracking-wide">Suggested time — not booked</p>
                     </div>
                     <p className="text-sm font-bold text-t1">{selectedConv.suggestedSlot}</p>
                     <button type="button" onClick={() => navigate('/scheduling')} className="mt-2 w-full py-1.5 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition-colors">
-                      Confirm & Book
+                      Review in scheduling
                     </button>
                   </div>
                 )}
                 <div className="space-y-1.5">
-                  <p className="text-[10px] font-bold text-t3 uppercase tracking-widest">Draft Reply</p>
+                  <p className="text-[10px] font-bold text-t3 uppercase tracking-widest">Rule-based draft · staff review required</p>
                   <textarea
                     key={selectedConv?.id ?? 'none'}
                     defaultValue={replyPreview}
-                    onChange={event => setReplyText(event.target.value)}
+                    onChange={event => {
+                      setReplyText(event.target.value);
+                      setClientAttemptKey('');
+                    }}
                     rows={4}
                     className="w-full rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs text-t2 leading-relaxed outline-none focus:border-indigo"
-                    placeholder="Write the AI reply"
+                    aria-label="Reviewed reply text"
+                    placeholder="Review and edit the rule-based draft"
                   />
                   {sendError && <p className="text-[11px] font-semibold text-red-v">{sendError}</p>}
+                  {sendNotice && <p role="status" aria-live="polite" className="rounded-lg border border-[var(--b1)] bg-[var(--blue-soft)] px-2.5 py-2 text-[11px] font-semibold text-blue-v">{sendNotice}</p>}
                   <div className="grid grid-cols-2 gap-2">
                     <button
                       type="button"
-                      disabled={isSending}
-                      onClick={() => sendReply('replied')}
+                      disabled={isSending || !selectedConv.replyReadiness.ready}
+                      onClick={() => {
+                        setClientAttemptKey(crypto.randomUUID());
+                        setConfirmReplyOpen(true);
+                      }}
                       className="flex items-center justify-center gap-1.5 py-2 rounded-xl border border-dashed border-[var(--b2)] text-xs font-semibold text-indigo hover:bg-[var(--s3)] transition-colors disabled:opacity-60"
                     >
-                      <Zap className="w-3 h-3" /> {isSending ? 'Sending…' : 'Send AI Reply'}
+                      <Zap className="w-3 h-3" /> {isSending ? 'Submitting…' : 'Submit reviewed reply'}
                     </button>
                     <button
                       type="button"
@@ -288,19 +389,19 @@ export default function AIReceptionist() {
             )}
           </BentoCard>
 
-          <BentoCard title="Missed-Call Recovery" subtitle="Live call log" headerRight={
-            <span className="text-xs font-bold text-emerald-v bg-[var(--emerald-soft)] px-2 py-1 rounded-full border border-[var(--b1)]">{recovered}/{callConversations.length || 1} recovered</span>
+          <BentoCard title="Missed-Call Follow-up" subtitle="Stored call and reply records" headerRight={
+            <span className="text-xs font-bold text-emerald-v bg-[var(--emerald-soft)] px-2 py-1 rounded-full border border-[var(--b1)]">{followUpEvidenceCount}/{callConversations.length} with evidence</span>
           }>
             <div className="space-y-3">
               {(callConversations.length ? callConversations : conversationRecords.slice(0, 5)).length === 0 ? (
-                <p className="text-xs text-t3">No live call recovery entries are available yet.</p>
+                <p className="text-xs text-t3">No call follow-up records are available yet.</p>
               ) : (callConversations.length ? callConversations : conversationRecords.slice(0, 5)).map((call, index) => {
-                const recoveredCall = call.aiHandled || call.status === 'ai-recovered' || Boolean(call.lastAgentMessage);
+                const hasFollowUpEvidence = Boolean(call.lastAgentMessage);
                 return (
                   <div key={call.id} className="flex items-start gap-3">
                     <div className="flex flex-col items-center gap-1">
-                      <div className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 ${recoveredCall ? 'bg-[var(--emerald-soft)]' : 'bg-[var(--red-soft)]'}`}>
-                        {recoveredCall ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-v" /> : <AlertCircle className="w-3.5 h-3.5 text-red-v" />}
+                      <div className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 ${hasFollowUpEvidence ? 'bg-[var(--emerald-soft)]' : 'bg-[var(--red-soft)]'}`}>
+                        {hasFollowUpEvidence ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-v" /> : <AlertCircle className="w-3.5 h-3.5 text-red-v" />}
                       </div>
                       {index < (callConversations.length ? callConversations.length : conversationRecords.slice(0, 5).length) - 1 && <div className="w-px h-4 bg-[var(--b1)]" />}
                     </div>
@@ -314,7 +415,7 @@ export default function AIReceptionist() {
                         {call.value !== '—' && <span className="text-[10px] font-bold text-emerald-v">{call.value}</span>}
                       </div>
                       <div className="flex items-center gap-1.5 mt-0.5">
-                        <span className={`text-[10px] font-semibold ${recoveredCall ? 'text-emerald-v' : 'text-red-v'}`}>{recoveredCall ? 'Recovered by AI' : 'Needs review'}</span>
+                        <span className={`text-[10px] font-semibold ${hasFollowUpEvidence ? 'text-emerald-v' : 'text-red-v'}`}>{hasFollowUpEvidence ? 'Staff follow-up request recorded' : 'Needs review'}</span>
                         <span className="text-t3">·</span>
                         <span className="text-[10px] text-t3">{call.lastAgentMessage ?? call.message}</span>
                       </div>
@@ -328,26 +429,24 @@ export default function AIReceptionist() {
             </button>
           </BentoCard>
 
-          <BentoCard title="After-Hours Bookings" subtitle="AI automation — this week">
-            <div className="grid grid-cols-7 gap-1 mb-2 items-end">
-              {['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((day, index) => {
-                const heightClass = ['h-[60%]', 'h-[40%]', 'h-[75%]', 'h-[30%]', 'h-[90%]', 'h-[45%]', 'h-[20%]'][index];
-                const count = [3, 2, 4, 1, 5, 2, 1][index];
-                return (
-                  <div key={`${day}-${index}`} className="text-center">
-                    <p className="text-[9px] text-t3 mb-1">{day}</p>
-                    <div className="h-12 bg-[var(--s3)] rounded-md overflow-hidden flex items-end">
-                      <div className={`w-full bg-indigo rounded-sm ${heightClass}`} />
-                    </div>
-                    <p className="text-[9px] text-t2 mt-1">{count}</p>
-                  </div>
-                );
-              })}
+          <BentoCard title="After-Hours Activity" subtitle="Unavailable until clinic hours and timezone are configured">
+            <div className="rounded-xl border border-dashed border-[var(--b2)] bg-[var(--s3)] p-4 text-center">
+              <Clock className="mx-auto mb-2 h-5 w-5 text-t3" aria-hidden="true" />
+              <p className="text-xs font-semibold text-t2">No after-hours metric is calculated.</p>
+              <p className="mt-1 text-[11px] text-t3">Browser-local time is not used as a substitute for verified clinic hours and timezone.</p>
             </div>
-            <p className="text-xs text-t2 text-center">Live AI recovery stream · automatically updates from the DB</p>
           </BentoCard>
         </div>
       </div>
+      {confirmReplyOpen && selectedConv && (
+        <ConfirmationModal
+          title="Submit reviewed reply?"
+          message={`Submit as ${selectedConv.replyReadiness.senderIdentity} through ${selectedConv.replyReadiness.channel?.toUpperCase() ?? 'the configured channel'} to ${selectedConv.replyReadiness.destinationMasked ?? 'the recorded destination'} under the operational-reply-only channel terms? The server rechecks suppression at submission. A durable claim is recorded before provider contact; an uncertain result blocks retry. Provider acceptance does not confirm delivery; delivery evidence must arrive separately.`}
+          confirmLabel="Submit reply request"
+          onConfirm={async () => sendReply('replied')}
+          onClose={() => setConfirmReplyOpen(false)}
+        />
+      )}
     </div>
   );
 }

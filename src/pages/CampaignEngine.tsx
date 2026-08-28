@@ -1,13 +1,20 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Megaphone, Plus, Loader2, Users, ShieldAlert, Send, CheckCircle2, Pause, Sparkles, AlertCircle, Pencil, Trash2, Ban, X, Save } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
+import ConfirmationModal from '../components/workflow/ConfirmationModal';
 import {
   crmApi, AUDIENCE_TYPES, CAMPAIGN_TYPES, CAMPAIGN_STATUS_META, DELIVERY_STATUS_META,
   type Campaign, type AudiencePreview, type CampaignDraft, type LaunchResult, type CampaignDelivery,
-  type AudienceType, type CampaignType, type CommChannel,
+  type AudienceType, type CampaignType, type CommChannel, type CampaignLaunchPreview,
 } from '../lib/crm';
 
 const CHANNELS: CommChannel[] = ['sms', 'email', 'voice', 'whatsapp'];
+
+function displayLabel(value: string | null): string {
+  if (!value) return 'Not configured';
+  const words = value.replaceAll('_', ' ').toLowerCase();
+  return value.toLowerCase() === 'sms' ? 'SMS' : words[0].toUpperCase() + words.slice(1);
+}
 
 export default function CampaignEngine() {
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
@@ -49,10 +56,10 @@ export default function CampaignEngine() {
 
   return (
     <div className="space-y-6 pb-8">
-      <PageHeader title="Reactivation Engine" subtitle="Rule-based recall, recovery, and revenue-recovery campaigns — every send requires approval and respects consent." badge="New" badgeColor="violet" />
-      {error && <p className="text-sm text-red-v">{error}</p>}
+      <PageHeader title="Reactivation Engine" subtitle="Approved outreach workflow with recipient consent and suppression checks repeated at dispatch." />
+      {error && <div role="alert" className="flex items-center justify-between gap-3 rounded-xl border border-red-v/30 bg-[var(--red-soft)] p-3 text-sm text-red-v"><span>Campaign records are unavailable: {error}</span><button type="button" onClick={() => void reload()} className="rounded-lg border border-red-v/30 px-2.5 py-1 text-xs font-semibold">Try again</button></div>}
       {loading ? (
-        <div className="cc-card p-10 text-center text-sm text-t3"><Loader2 className="inline w-5 h-5 animate-spin" /></div>
+        <div role="status" aria-live="polite" aria-busy="true" className="cc-card p-10 text-center text-sm text-t3"><Loader2 className="inline w-5 h-5 animate-spin" /> Loading campaign records…</div>
       ) : (
         <div className="grid lg:grid-cols-[300px_1fr] gap-5">
           <div className="cc-card p-3 space-y-1.5 h-max">
@@ -69,7 +76,7 @@ export default function CampaignEngine() {
                     <span className="text-sm font-semibold truncate">{c.name}</span>
                     <span className={`badge ${meta.badge} shrink-0`}>{meta.label}</span>
                   </span>
-                  <span className="text-[10px] text-t3">{c.campaignType} · {c.channel ?? '—'}{c.requiresApprovalPending ? ' · approval needed' : ''}</span>
+                  <span className="text-[10px] text-t3">{displayLabel(c.campaignType)} · {displayLabel(c.channel)}{c.requiresApprovalPending ? ' · approval needed' : ''}</span>
                 </button>
               );
             })}
@@ -114,11 +121,11 @@ function CampaignCreator({ onCreated, onCancel }: { onCreated: (id: string) => v
         <input className={inputCls} value={name} onChange={e => setName(e.target.value)} placeholder="Q3 reactivation" /></label>
       <div className="grid grid-cols-3 gap-3">
         <label className="block space-y-1.5"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">Type</span>
-          <select aria-label="Campaign type" className={inputCls} value={campaignType} onChange={e => setType(e.target.value as CampaignType)}>{CAMPAIGN_TYPES.map(t => <option key={t} value={t}>{t}</option>)}</select></label>
+          <select aria-label="Campaign type" className={inputCls} value={campaignType} onChange={e => setType(e.target.value as CampaignType)}>{CAMPAIGN_TYPES.map(t => <option key={t} value={t}>{displayLabel(t)}</option>)}</select></label>
         <label className="block space-y-1.5"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">Audience</span>
-          <select aria-label="Audience type" className={inputCls} value={audienceType} onChange={e => setAudience(e.target.value as AudienceType)}>{AUDIENCE_TYPES.map(t => <option key={t} value={t}>{t}</option>)}</select></label>
+          <select aria-label="Audience type" className={inputCls} value={audienceType} onChange={e => setAudience(e.target.value as AudienceType)}>{AUDIENCE_TYPES.map(t => <option key={t} value={t}>{displayLabel(t)}</option>)}</select></label>
         <label className="block space-y-1.5"><span className="text-[11px] font-bold uppercase tracking-wide text-t3">Channel</span>
-          <select aria-label="Channel" className={inputCls} value={channel} onChange={e => setChannel(e.target.value as CommChannel)}>{CHANNELS.map(c => <option key={c} value={c}>{c}</option>)}</select></label>
+          <select aria-label="Channel" className={inputCls} value={channel} onChange={e => setChannel(e.target.value as CommChannel)}>{CHANNELS.map(c => <option key={c} value={c}>{displayLabel(c)}</option>)}</select></label>
       </div>
       {err && <p className="text-xs text-red-v">{err}</p>}
       <div className="flex gap-2">
@@ -139,30 +146,57 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [audienceError, setAudienceError] = useState<string | null>(null);
+  const [deliveryError, setDeliveryError] = useState<string | null>(null);
+  const [deliveryEvidenceLoaded, setDeliveryEvidenceLoaded] = useState(false);
+  const [confirmation, setConfirmation] = useState<{ kind: 'approve' | 'launch'; preview: CampaignLaunchPreview } | null>(null);
 
   const meta = CAMPAIGN_STATUS_META[campaign.status] ?? { label: campaign.status, badge: 'badge-blue' };
   const audienceType = (campaign.audienceType ?? 'inactive_patients') as AudienceType;
   const channel = (campaign.channel ?? 'sms') as CommChannel;
 
   const loadAux = useCallback(async () => {
-    try {
-      const [p, d] = await Promise.all([
-        crmApi.previewAudience(audienceType, channel).catch(() => null),
-        crmApi.listDeliveries(campaign.id).catch(() => [] as CampaignDelivery[]),
-      ]);
-      setPreview(p); setDeliveries(d);
-    } catch { /* ignore */ }
+    const [audienceResult, deliveryResult] = await Promise.allSettled([
+      crmApi.previewAudience(audienceType, channel),
+      crmApi.listDeliveries(campaign.id),
+    ]);
+    if (audienceResult.status === 'fulfilled') {
+      setPreview(audienceResult.value);
+      setAudienceError(null);
+    } else {
+      setPreview(null);
+      setAudienceError('Audience evidence is unavailable. Do not infer that no recipients are eligible or suppressed.');
+    }
+    if (deliveryResult.status === 'fulfilled') {
+      setDeliveries(deliveryResult.value);
+      setDeliveryError(null);
+      setDeliveryEvidenceLoaded(true);
+    } else {
+      setDeliveryError('Dispatch evidence is unavailable. Do not infer that no dispatch occurred; review provider records before retrying.');
+      setDeliveryEvidenceLoaded(false);
+    }
   }, [audienceType, channel, campaign.id]);
 
   useEffect(() => {
     let active = true;
     void (async () => {
-      const [p, d] = await Promise.all([
-        crmApi.previewAudience(audienceType, channel).catch(() => null),
-        crmApi.listDeliveries(campaign.id).catch(() => [] as CampaignDelivery[]),
+      const [audienceResult, deliveryResult] = await Promise.allSettled([
+        crmApi.previewAudience(audienceType, channel),
+        crmApi.listDeliveries(campaign.id),
       ]);
       if (!active) return;
-      setPreview(p); setDeliveries(d); setDraft(null); setLaunch(null); setNotice(null); setError(null);
+      if (audienceResult.status === 'fulfilled') {
+        setPreview(audienceResult.value); setAudienceError(null);
+      } else {
+        setPreview(null); setAudienceError('Audience evidence is unavailable. Do not infer that no recipients are eligible or suppressed.');
+      }
+      if (deliveryResult.status === 'fulfilled') {
+        setDeliveries(deliveryResult.value); setDeliveryError(null); setDeliveryEvidenceLoaded(true);
+      } else {
+        setDeliveryError('Dispatch evidence is unavailable. Do not infer that no dispatch occurred; review provider records before retrying.');
+        setDeliveryEvidenceLoaded(false);
+      }
+      setDraft(null); setLaunch(null); setNotice(null); setError(null);
     })();
     return () => { active = false; };
   }, [audienceType, channel, campaign.id]);
@@ -174,6 +208,37 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
 
   const actions = campaign.allowedActions;
 
+  async function prepareConfirmation(kind: 'approve' | 'launch') {
+    await run(async () => {
+      const exactPreview = await crmApi.launchPreview(campaign.id);
+      setConfirmation({ kind, preview: exactPreview });
+    });
+  }
+
+  async function confirmExactPreview() {
+    if (!confirmation) return;
+    const { kind, preview: exactPreview } = confirmation;
+    await run(async () => {
+      if (kind === 'approve') {
+        await crmApi.approve(campaign.id, exactPreview.fingerprint);
+        setNotice(campaign.scheduledAt ? 'Scheduled dispatch authorized for this exact preview.' : 'Approved. Dispatch remains operator-controlled.');
+        onChanged();
+        return;
+      }
+      const result = await crmApi.launch(campaign.id, exactPreview.fingerprint);
+      setLaunch(result);
+      if (result.summary.authorityBlocked > 0) {
+        setError(`${result.summary.authorityBlocked} recipient(s) lacked a current consent record tied to the approved notice version and this message purpose. Nothing was submitted for them.`);
+      } else if (result.summary.atomicBoundaryBlocked > 0) {
+        setError('Live campaign delivery is not activated. Nothing was submitted because the last-second consent and opt-out safety control has not been validated.');
+      } else {
+        setNotice(result.setupRequired ? 'Provider not configured — nothing submitted.' : `Dispatch complete: ${result.summary.accepted} provider-accepted, ${result.summary.deliveryUnknown} delivery-unknown, ${result.summary.queued} queued, ${result.summary.suppressed} suppressed. Delivery still requires provider receipts; unknown submissions require reconciliation, not automatic retry.`);
+      }
+      await loadAux();
+      onChanged();
+    });
+  }
+
   return (
     <div className="space-y-5">
       <div className="cc-card p-5 space-y-3">
@@ -182,9 +247,9 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
           <span className={`badge ${meta.badge}`}>{meta.label}</span>
         </div>
         <div className="flex flex-wrap gap-1.5 text-[11px]">
-          <span className="badge badge-blue">{campaign.campaignType}</span>
-          <span className="badge badge-violet">{campaign.audienceType}</span>
-          <span className="badge badge-blue">{campaign.channel}</span>
+          <span className="badge badge-blue">{displayLabel(campaign.campaignType)}</span>
+          <span className="badge badge-violet">{displayLabel(campaign.audienceType)}</span>
+          <span className="badge badge-blue">{displayLabel(campaign.channel)}</span>
           {campaign.requiresApprovalPending && <span className="badge badge-amber">Approval required</span>}
         </div>
         {campaign.messageTemplate && <p className="text-xs text-t3 whitespace-pre-wrap rounded-lg border border-[var(--b1)] p-2.5">{campaign.messageSubject ? `${campaign.messageSubject}\n` : ''}{campaign.messageTemplate}</p>}
@@ -195,10 +260,10 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
             <button type="button" disabled={busy} onClick={() => run(async () => { const d = await crmApi.generateDraft(campaign.id); setDraft(d); onChanged(); })} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50"><Sparkles className="w-3.5 h-3.5" /> Generate draft (rule-based)</button>
           )}
           {actions.includes('approve') && (
-            <button type="button" disabled={busy} onClick={() => run(async () => { await crmApi.approve(campaign.id); setNotice('Approved.'); onChanged(); })} className="inline-flex items-center gap-1.5 rounded-lg bg-indigo px-2.5 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 disabled:opacity-50"><CheckCircle2 className="w-3.5 h-3.5" /> Approve</button>
+            <button type="button" disabled={busy} onClick={() => void prepareConfirmation('approve')} className="inline-flex items-center gap-1.5 rounded-lg bg-indigo px-2.5 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 disabled:opacity-50"><CheckCircle2 className="w-3.5 h-3.5" /> Review and approve</button>
           )}
           {actions.includes('launch') && (
-            <button type="button" disabled={busy} onClick={() => run(async () => { const r = await crmApi.launch(campaign.id); setLaunch(r); setNotice(r.setupRequired ? 'Provider not configured — nothing sent.' : `Launched: ${r.summary.sent} sent, ${r.summary.suppressed} suppressed.`); await loadAux(); onChanged(); })} className="inline-flex items-center gap-1.5 rounded-lg bg-indigo px-2.5 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 disabled:opacity-50"><Send className="w-3.5 h-3.5" /> Launch</button>
+            <button type="button" disabled={busy} onClick={() => void prepareConfirmation('launch')} className="inline-flex items-center gap-1.5 rounded-lg bg-indigo px-2.5 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 disabled:opacity-50"><Send className="w-3.5 h-3.5" /> Review and launch</button>
           )}
           {actions.includes('pause') && (
             <button type="button" disabled={busy} onClick={() => run(async () => { await crmApi.pause(campaign.id); onChanged(); })} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50"><Pause className="w-3.5 h-3.5" /> Pause</button>
@@ -207,15 +272,15 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
             <button type="button" disabled={busy} onClick={() => { setEditing(v => !v); setError(null); setNotice(null); }} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50"><Pencil className="w-3.5 h-3.5" /> {editing ? 'Close editor' : 'Edit'}</button>
           )}
           {actions.includes('cancel') && (
-            <button type="button" disabled={busy} onClick={() => run(async () => { await crmApi.cancel(campaign.id); setNotice('Campaign cancelled.'); onChanged(); })} className="inline-flex items-center gap-1.5 rounded-lg border border-amber-v/30 text-amber-v px-2.5 py-1.5 text-[11px] font-semibold hover:bg-amber-v/5 disabled:opacity-50"><Ban className="w-3.5 h-3.5" /> Cancel campaign</button>
+            <button type="button" disabled={busy} onClick={() => run(async () => { await crmApi.cancel(campaign.id); setNotice('Campaign canceled.'); onChanged(); })} className="inline-flex items-center gap-1.5 rounded-lg border border-amber-v/30 text-amber-v px-2.5 py-1.5 text-[11px] font-semibold hover:bg-amber-v/5 disabled:opacity-50"><Ban className="w-3.5 h-3.5" /> Cancel campaign</button>
           )}
-          <button type="button" disabled={busy} onClick={() => setConfirmDelete(true)} className="inline-flex items-center gap-1.5 rounded-lg border border-red-v/30 text-red-v px-2.5 py-1.5 text-[11px] font-semibold hover:bg-red-v/5 disabled:opacity-50"><Trash2 className="w-3.5 h-3.5" /> Delete</button>
+          <button type="button" disabled={busy} onClick={() => setConfirmDelete(true)} className="inline-flex items-center gap-1.5 rounded-lg border border-red-v/30 text-red-v px-2.5 py-1.5 text-[11px] font-semibold hover:bg-red-v/5 disabled:opacity-50"><Trash2 className="w-3.5 h-3.5" /> Archive</button>
         </div>
         {confirmDelete && (
           <div className="flex items-center justify-between gap-3 rounded-lg border border-red-v/30 bg-red-v/5 px-3 py-2 text-[11px]">
-            <span className="text-red-v font-semibold">Delete “{campaign.name}” and its delivery log? This cannot be undone.</span>
+            <span className="text-red-v font-semibold">Archive “{campaign.name}”? Campaign and delivery evidence will be preserved and removed from the active list.</span>
             <span className="flex gap-1.5 shrink-0">
-              <button type="button" disabled={busy} onClick={() => run(async () => { await crmApi.deleteCampaign(campaign.id); onDeleted(); })} className="rounded-md bg-red-v px-2.5 py-1 font-semibold text-white hover:opacity-90 disabled:opacity-50">Delete</button>
+              <button type="button" disabled={busy} onClick={() => run(async () => { await crmApi.archiveCampaign(campaign.id); onDeleted(); })} className="rounded-md bg-red-v px-2.5 py-1 font-semibold text-white hover:opacity-90 disabled:opacity-50">Archive and preserve evidence</button>
               <button type="button" onClick={() => setConfirmDelete(false)} className="rounded-md border border-[var(--b1)] px-2.5 py-1 font-semibold text-t2 hover:bg-[var(--s2)]">Keep</button>
             </span>
           </div>
@@ -231,20 +296,33 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
         )}
         {launch?.setupRequired && (
           <div className="flex items-center gap-2 rounded-lg border border-red-v/40 bg-red-v/5 px-2.5 py-1.5 text-[11px] text-red-v">
-            <AlertCircle className="w-3.5 h-3.5" /> {launch.provider.channel} provider not configured ({launch.provider.missing.join(', ')}). No messages sent.
+            <AlertCircle className="w-3.5 h-3.5" /> {launch.provider.channel} provider not configured ({launch.provider.missing.join(', ')}). Nothing was submitted to a provider.
           </div>
         )}
+        {confirmation && (
+          <ConfirmationModal
+            title={confirmation.kind === 'approve' ? 'Authorize this exact campaign preview?' : 'Dispatch this exact campaign preview?'}
+            message={`${confirmation.preview.confirmationStatement} Eligible: ${confirmation.preview.audience.eligible}; consent record required: ${confirmation.preview.audience.authorityRequired}; live safety control pending: ${confirmation.preview.audience.atomicBoundaryBlocked}; suppressed: ${confirmation.preview.audience.suppressed}; missing contact: ${confirmation.preview.audience.missingContact}; channel: ${displayLabel(confirmation.preview.channel)}; provider: ${confirmation.preview.provider}; provider mode: ${displayLabel(confirmation.preview.providerMode)}${confirmation.preview.scheduledAt ? `; scheduled: ${new Date(confirmation.preview.scheduledAt).toLocaleString()}` : ''}.`}
+            confirmLabel={confirmation.kind === 'approve' ? 'Authorize exact preview' : 'Dispatch exact preview'}
+            tone="amber"
+            onConfirm={confirmExactPreview}
+            onClose={() => setConfirmation(null)}
+          />
+        )}
+        {confirmation?.preview.activationNotice && <p role="status" className="rounded-lg border border-amber-v/30 bg-amber-v/5 px-3 py-2 text-[11px] text-amber-v">{confirmation.preview.activationNotice}</p>}
       </div>
 
+      {audienceError && <div role="alert" className="rounded-xl border border-red-v/30 bg-[var(--red-soft)] p-3 text-xs text-red-v">{audienceError} <button type="button" onClick={() => void loadAux()} className="ml-2 font-semibold underline">Try again</button></div>}
       {preview && (
         <div className="cc-card p-5">
           <h4 className="text-sm font-bold text-t1 mb-3 flex items-center gap-2"><Users className="w-4 h-4 text-indigo" /> Audience preview</h4>
           <div className="grid grid-cols-4 gap-3 text-center">
             <Stat label="Total" value={preview.total} />
-            <Stat label="Eligible" value={preview.eligible} accent="emerald" />
+            <Stat label="Contactable*" value={preview.eligible} accent="emerald" />
             <Stat label="Suppressed" value={preview.suppressed} accent="violet" />
             <Stat label="No contact" value={preview.missingContact} accent="amber" />
           </div>
+          <p className="mt-2 text-[11px] text-t3">*Contact and suppression check only. This count is not live outreach authority; the exact purpose, versioned evidence, provider mode, and activation boundary are checked again before submission.</p>
           {preview.sample.length > 0 && (
             <div className="mt-3 space-y-1">
               {preview.sample.map((s, i) => <p key={i} className="text-[11px] text-t3">{s.name} · {s.reason} · {s.destinationMasked}</p>)}
@@ -254,8 +332,13 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
       )}
 
       <div className="cc-card p-5">
-        <h4 className="text-sm font-bold text-t1 mb-3 flex items-center gap-2"><ShieldAlert className="w-4 h-4 text-indigo" /> Delivery log ({deliveries.length})</h4>
-        {deliveries.length === 0 ? <p className="text-xs text-t3">No deliveries yet. Launch to generate truthful delivery rows.</p> : (
+        <h4 className="text-sm font-bold text-t1 mb-1 flex items-center gap-2"><ShieldAlert className="w-4 h-4 text-indigo" /> Dispatch evidence ({deliveries.length})</h4>
+        <p className="mb-3 text-[11px] text-t3">Provider acceptance is not confirmed delivery. Delivery receipts require separate provider evidence.</p>
+        {!deliveryEvidenceLoaded && !deliveryError ? (
+          <p role="status" aria-live="polite" className="text-xs text-t3">Loading dispatch evidence…</p>
+        ) : deliveryError ? (
+          <p role="alert" className="text-xs text-red-v">{deliveryError} <button type="button" onClick={() => void loadAux()} className="ml-2 font-semibold underline">Try again</button></p>
+        ) : deliveryEvidenceLoaded && deliveries.length === 0 ? <p className="text-xs text-t3">No dispatch records are stored for this campaign.</p> : (
           <div className="space-y-1.5">
             {deliveries.slice(0, 50).map(d => {
               const dm = DELIVERY_STATUS_META[d.status] ?? { label: d.status, badge: 'badge-blue' };
@@ -278,6 +361,11 @@ function CampaignEditForm({ campaign, onSaved, onError }: { campaign: Campaign; 
   const [subject, setSubject] = useState(campaign.messageSubject ?? '');
   const [template, setTemplate] = useState(campaign.messageTemplate ?? '');
   const [channel, setChannel] = useState<CommChannel>((campaign.channel ?? 'sms') as CommChannel);
+  const [scheduledAt, setScheduledAt] = useState(() => {
+    if (!campaign.scheduledAt) return '';
+    const date = new Date(campaign.scheduledAt);
+    return new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+  });
   const [saving, setSaving] = useState(false);
 
   async function save() {
@@ -288,6 +376,7 @@ function CampaignEditForm({ campaign, onSaved, onError }: { campaign: Campaign; 
         messageSubject: subject.trim() || undefined,
         messageTemplate: template.trim() || undefined,
         channel,
+        scheduledAt: scheduledAt ? new Date(scheduledAt).toISOString() : undefined,
       });
       onSaved();
     } catch (e) {
@@ -311,6 +400,10 @@ function CampaignEditForm({ campaign, onSaved, onError }: { campaign: Campaign; 
       </div>
       <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Message template</span>
         <textarea className={`${inputCls} min-h-[80px] resize-y`} value={template} onChange={e => setTemplate(e.target.value)} placeholder="Hi {{firstName}}, …" /></label>
+      <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Scheduled dispatch (optional)</span>
+        <input type="datetime-local" className={inputCls} value={scheduledAt} onChange={e => setScheduledAt(e.target.value)} />
+        <span className="block text-[10px] text-t3">The scheduler will run only after you review and authorize the exact server preview. Any eligibility, template, channel, or provider-mode change requires a new authorization.</span>
+      </label>
       <div className="flex gap-2">
         <button type="button" disabled={saving || name.trim().length < 2} onClick={save} className="inline-flex items-center gap-1.5 rounded-lg bg-indigo px-3 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 disabled:opacity-50">{saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />} Save changes</button>
         <button type="button" onClick={() => onSaved()} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)]"><X className="w-3.5 h-3.5" /> Close</button>

@@ -36,7 +36,12 @@ export interface PublicIntakeView {
   readinessScore: number;
   appointment: { service: string; startsAt: string } | null;
   objectStorageEnabled: boolean;
-  sections: Array<{ sectionType: string; status: string; prompt: string }>;
+  sections: Array<{
+    sectionType: string;
+    status: string;
+    prompt: string;
+    acknowledgement: { id: string; version: string; text: string } | null;
+  }>;
 }
 
 export const INTAKE_STATUS_META: Record<string, { label: string; badge: string }> = {
@@ -47,7 +52,7 @@ export const INTAKE_STATUS_META: Record<string, { label: string; badge: string }
   needs_review: { label: 'Needs review', badge: 'badge-amber' },
   approved: { label: 'Approved', badge: 'badge-emerald' },
   expired: { label: 'Expired', badge: 'badge-red' },
-  cancelled: { label: 'Cancelled', badge: 'badge-red' },
+  cancelled: { label: 'Canceled', badge: 'badge-red' },
 };
 
 export const SECTION_LABEL: Record<string, string> = {

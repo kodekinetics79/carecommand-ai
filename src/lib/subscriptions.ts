@@ -3,7 +3,7 @@ import { apiRequest } from './api';
 export type SubscriptionStatus = 'TRIAL' | 'ACTIVE' | 'PAST_DUE' | 'SUSPENDED' | 'CANCELLED' | 'none';
 
 export const STATUS_LABEL: Record<string, string> = {
-  TRIAL: 'Trial', ACTIVE: 'Active', PAST_DUE: 'Past due', SUSPENDED: 'Suspended', CANCELLED: 'Cancelled', none: 'No plan',
+  TRIAL: 'Trial', ACTIVE: 'Active', PAST_DUE: 'Past due', SUSPENDED: 'Suspended', CANCELLED: 'Canceled', none: 'No plan',
 };
 export const STATUS_BADGE: Record<string, string> = {
   TRIAL: 'badge badge-blue', ACTIVE: 'badge badge-emerald', PAST_DUE: 'badge badge-amber',

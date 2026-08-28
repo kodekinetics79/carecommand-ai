@@ -1,6 +1,5 @@
 import { Users, Megaphone, Radio } from 'lucide-react';
 import { formatCurrency } from '../../utils/formatters';
-import ConfidenceBadge from '../workflow/ConfidenceBadge';
 import type { SmartSegment } from '../../lib/crmService';
 
 export default function SmartSegmentCard({ segment, onCreateCampaign }: { segment: SmartSegment; onCreateCampaign: (s: SmartSegment) => void }) {
@@ -18,19 +17,20 @@ export default function SmartSegmentCard({ segment, onCreateCampaign }: { segmen
       </div>
 
       <div className="grid grid-cols-2 gap-2 mt-3">
-        <Stat label="Recoverable" value={formatCurrency(s.recoverableValue)} accent />
-        <Stat label="Expected bookings" value={`${s.expectedBookingRate}%`} />
-        <Stat label="Best channel" value={s.bestChannel} icon={<Radio className="w-3 h-3" />} />
-        <Stat label="Campaign cost" value={s.campaignCost === 0 ? 'Free' : formatCurrency(s.campaignCost)} />
+        <Stat label="Planning value (30%)" value={formatCurrency(s.recoverableValue)} accent />
+        <Stat label="Assumed booking rate" value={`${s.planningBookingRate}%`} />
+        <Stat label="Suggested channel" value={s.planningChannel} icon={<Radio className="w-3 h-3" />} />
+        <Stat label="Assumed cost" value={s.planningCost === 0 ? '$0 assumed' : formatCurrency(s.planningCost)} />
       </div>
 
       <div className="mt-3 rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2">
-        <p className="text-[10px] uppercase tracking-wide text-t3">Recommended offer</p>
-        <p className="text-[12px] font-semibold text-t1">{s.recommendedOffer}</p>
+        <p className="text-[10px] uppercase tracking-wide text-t3">Planning idea</p>
+        <p className="text-[12px] font-semibold text-t1">{s.planningOffer}</p>
+        <p className="text-[10px] text-amber-v mt-1">{s.assumptionNotice}</p>
       </div>
 
       <div className="flex items-center justify-between gap-2 mt-3">
-        <ConfidenceBadge value={s.confidence} size="xs" />
+        <span className="text-[10px] font-semibold text-amber-v">Contact, suppression, and purpose-specific authority are checked in the governed campaign workflow</span>
         <button type="button" onClick={() => onCreateCampaign(s)}
           className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 transition">
           <Megaphone className="w-3.5 h-3.5" aria-hidden="true" /> Create campaign

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { Star, CheckCircle2, AlertCircle, Sparkles, ArrowRight, TrendingUp, MessageSquare, ShieldCheck, BellRing } from 'lucide-react';
+import { useNavigate } from 'react-router';
+import { Star, CheckCircle2, Sparkles, ArrowRight, TrendingUp, MessageSquare, ShieldCheck, BellRing } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
@@ -8,7 +8,6 @@ import ProgressBar from '../components/ui/ProgressBar';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapProviderProfile, mapReview, type ApiProviderProfile, type ApiReview } from '../lib/apiAdapters';
 import { apiRequest } from '../lib/api';
-import { formatCurrency } from '../utils/formatters';
 
 interface ApiReputationCase {
   id: string;
@@ -58,15 +57,20 @@ export default function Reviews() {
   const { data: branchOptions, error: branchError } = useApiResource<{ id: string; name: string }, { id: string; name: string }>('/v1/branches?limit=100', [], row => row);
   const { data: providerRecords, error: providerError } = useApiResource<ApiProviderProfile, ReturnType<typeof mapProviderProfile>>('/v1/providers/overview?limit=100', [], mapProviderProfile);
   const [respondingId, setRespondingId] = useState<string | null>(null);
+  const [responseNotice, setResponseNotice] = useState<{ id: string; kind: 'ok' | 'error'; text: string } | null>(null);
 
   async function respondToReview(id: string, draft?: string) {
     setRespondingId(id);
+    setResponseNotice(null);
     try {
       await apiRequest(`/v1/reviews/${id}/respond`, {
         method: 'PATCH',
         body: JSON.stringify({ response: draft?.trim() || 'Thank you so much for taking the time to share your feedback — we truly appreciate it.' }),
       });
       reload();
+      setResponseNotice({ id, kind: 'ok', text: 'Response recorded in CareCommand. External delivery is not confirmed here.' });
+    } catch (error) {
+      setResponseNotice({ id, kind: 'error', text: error instanceof Error ? error.message : 'Unable to record response' });
     } finally {
       setRespondingId(null);
     }
@@ -76,12 +80,10 @@ export default function Reviews() {
     cases: [],
     reviewRequests: [],
   });
-  const [reputationSource, setReputationSource] = useState<'live' | 'loading'>('loading');
+  const [reputationSource, setReputationSource] = useState<'loaded' | 'loading'>('loading');
   const [reputationError, setReputationError] = useState<string | null>(null);
   const avgRating = reviewRecords.length > 0 ? (reviewRecords.reduce((sum, review) => sum + review.rating, 0) / reviewRecords.length).toFixed(1) : '0.0';
   const positiveCount = reviewRecords.filter(review => review.sentiment === 'positive').length;
-  const negativeCount = reviewRecords.filter(review => review.sentiment === 'negative').length;
-  const unrespondedNegative = reviewRecords.filter(review => review.sentiment === 'negative' && !review.responded);
   const sentimentPct = reviewRecords.length > 0 ? Math.round((positiveCount / reviewRecords.length) * 100) : 0;
   const ratingDist = [5, 4, 3, 2, 1].map(rating => ({ star: rating, count: reviewRecords.filter(review => review.rating === rating).length }));
 
@@ -90,12 +92,9 @@ export default function Reviews() {
     apiRequest<ReputationResponse>('/v1/reputation?limit=10')
       .then(row => {
         if (!active) return;
-        if (!row.cases.length && !row.reviewRequests.length) {
-          setReputationError('No live reputation cases returned.');
-          return;
-        }
         setReputation(row);
-        setReputationSource('live');
+        setReputationSource('loaded');
+        setReputationError(null);
       })
       .catch(error => {
         if (!active) return;
@@ -105,38 +104,40 @@ export default function Reviews() {
   }, []);
 
   const loadError = reviewError || branchError || providerError || reputationError;
+  const reviewMetricsReady = source === 'live' && !reviewError;
+  const reputationMetricsReady = reputationSource === 'loaded' && !reputationError;
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Reviews & Referrals"
-        subtitle="Reputation management, review automation, negative feedback recovery, and referral tracking."
-        badge={loadError ? 'Live Data Error' : `${reputation.summary.unresolvedCases || unrespondedNegative.length} Needs Response · ${source === 'live' || reputationSource === 'live' ? 'Live DB' : 'Loading'}`}
-        badgeColor="red"
+        subtitle="Review feedback, record responses, and open campaign setup for reputation and referral work."
+        badge={loadError ? 'Data unavailable' : source !== 'live' || reputationSource === 'loading' ? 'Loading reviews' : `${reputation.summary.unresolvedCases} need review`}
+        badgeColor={loadError ? 'red' : source !== 'live' || reputationSource === 'loading' ? 'blue' : reputation.summary.unresolvedCases > 0 ? 'amber' : 'emerald'}
         actions={
           <button type="button" onClick={() => navigate('/campaigner')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
-            <Sparkles className="w-4 h-4" /> Launch Review Campaign
+            <Sparkles className="w-4 h-4" /> Review campaign setup
           </button>
         }
       />
 
       {loadError && (
-        <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          Review data could not be loaded from the live API: {loadError}
+        <div role="alert" className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          Review data is unavailable. {loadError}
         </div>
       )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Avg Rating" value={avgRating} subtitle="All platforms" trend={4} icon={<Star className="w-4 h-4" />} accent="amber" />
-        <StatCard title="Total Reviews" value={reviewRecords.length} subtitle="This month" icon={<MessageSquare className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Positive Sentiment" value={`${sentimentPct}%`} subtitle="Of all reviews" trend={6} icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Bad Review Risk" value={`${reputation.summary.avgBadReviewRisk || negativeCount}%`} subtitle="Case average" trend={6} icon={<ShieldCheck className="w-4 h-4" />} accent="red" />
-        <StatCard title="Pending Requests" value={reputation.summary.pendingReviewRequests || unrespondedNegative.length} subtitle="Review automation" icon={<BellRing className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Average rating" value={reviewMetricsReady ? avgRating : '—'} subtitle={reviewMetricsReady ? 'Loaded reviews' : 'Unavailable'} icon={<Star className="w-4 h-4" />} accent="amber" />
+        <StatCard title="Reviews loaded" value={reviewMetricsReady ? reviewRecords.length : '—'} subtitle={reviewMetricsReady ? 'Current result set' : 'Unavailable'} icon={<MessageSquare className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Positive sentiment" value={reviewMetricsReady ? `${sentimentPct}%` : '—'} subtitle={reviewMetricsReady ? 'Loaded reviews' : 'Unavailable'} icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Review-risk score" value={reputationMetricsReady ? `${reputation.summary.avgBadReviewRisk}%` : '—'} subtitle={reputationMetricsReady ? 'Stored reputation cases · planning metric' : 'Unavailable'} icon={<ShieldCheck className="w-4 h-4" />} accent="red" />
+        <StatCard title="Pending requests" value={reputationMetricsReady ? reputation.summary.pendingReviewRequests : '—'} subtitle={reputationMetricsReady ? 'Recorded request status' : 'Unavailable'} icon={<BellRing className="w-4 h-4" />} accent="violet" />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
         <div className="space-y-4">
-          <BentoCard title="Review Feed" subtitle="Latest reviews · All platforms">
+          <BentoCard title="Review feed" subtitle="Latest loaded reviews across platforms">
             <div className="space-y-3">
               {reviewRecords.map((r) => (
                 <div key={r.id} className={`p-4 rounded-2xl border transition-all hover:bg-[var(--s3)] ${
@@ -145,8 +146,8 @@ export default function Reviews() {
                 }`}>
                   <div className="flex items-start justify-between gap-3 mb-2">
                     <div className="flex items-center gap-2">
-                      <div className="w-8 h-8 rounded-full bg-[var(--s3)] flex items-center justify-center text-t2 text-[10px] font-bold shrink-0">
-                        {r.patientName.split(' ').map(n => n[0]).join('')}
+                      <div className="w-8 h-8 rounded-full bg-[var(--s3)] flex items-center justify-center text-t2 text-[10px] font-bold shrink-0" aria-hidden="true">
+                        {r.patientName === 'Reviewer name unavailable' ? '—' : r.patientName.split(' ').map(n => n[0]).join('')}
                       </div>
                       <div>
                         <p className="text-sm font-bold text-t1">{r.patientName}</p>
@@ -166,19 +167,17 @@ export default function Reviews() {
                   <p className="text-xs text-t2 leading-relaxed mb-3">"{r.text}"</p>
                   {r.responded && r.aiDraftResponse && (
                     <div className="p-2.5 rounded-xl bg-[var(--s3)] border border-[var(--b1)] mb-2">
-                      <p className="text-[10px] font-bold text-t3 mb-1">Response sent</p>
+                      <p className="text-[10px] font-bold text-t3 mb-1">Response recorded</p>
                       <p className="text-xs text-t2">{r.aiDraftResponse}</p>
                     </div>
                   )}
                   <div className="flex items-center gap-2">
                     {r.responded
                       ? <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-v"><CheckCircle2 className="w-3 h-3" /> Responded</span>
-                      : <button type="button" disabled={respondingId === r.id} onClick={() => respondToReview(r.id, r.aiDraftResponse)} className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo bg-[var(--indigo-soft)] px-3 py-1.5 rounded-lg hover:opacity-80 transition-colors disabled:opacity-40"><Sparkles className="w-3 h-3" /> {respondingId === r.id ? 'Sending…' : r.aiDraftResponse ? 'Send AI Response' : 'Draft AI Response'}</button>
+                      : <button type="button" disabled={respondingId === r.id} onClick={() => void respondToReview(r.id, r.aiDraftResponse)} className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo bg-[var(--indigo-soft)] px-3 py-1.5 rounded-lg hover:opacity-80 transition-colors disabled:opacity-40"><Sparkles className="w-3 h-3" /> {respondingId === r.id ? 'Recording…' : r.aiDraftResponse ? 'Record drafted response' : 'Record standard response'}</button>
                     }
-                    {r.sentiment === 'negative' && !r.responded && (
-                      <button type="button" disabled={respondingId === r.id} onClick={() => respondToReview(r.id, r.aiDraftResponse)} className="inline-flex items-center gap-1 text-xs font-semibold text-red-v hover:opacity-80 disabled:opacity-40"><AlertCircle className="w-3 h-3" /> Resolve & respond</button>
-                    )}
                   </div>
+                  {responseNotice?.id === r.id && <p role={responseNotice.kind === 'error' ? 'alert' : 'status'} className={`mt-2 text-[11px] ${responseNotice.kind === 'error' ? 'text-red-v' : 'text-emerald-v'}`}>{responseNotice.text}</p>}
                 </div>
               ))}
             </div>
@@ -186,8 +185,8 @@ export default function Reviews() {
         </div>
 
         <div className="space-y-4">
-          <BentoCard title="Reputation Defense" subtitle="Unresolved cases and recovery workflow" headerRight={
-          <span className={`badge ${reputationSource === 'live' ? 'badge-emerald' : 'badge-blue'}`}>{reputationSource === 'live' ? 'Live DB' : 'Loading'}</span>
+          <BentoCard title="Reputation follow-up" subtitle="Unresolved cases and recorded recovery guidance" headerRight={
+          <span className={`badge ${reputationSource === 'loaded' ? 'badge-blue' : 'badge-blue'}`}>{reputationSource === 'loaded' ? 'Data loaded' : 'Loading'}</span>
           }>
             <div className="space-y-3">
               {reputation.cases.map((item) => (
@@ -203,18 +202,18 @@ export default function Reviews() {
                   <p className="text-[11px] text-t3 mt-2">Trend: {item.publicTrend} · NPS {item.npsScore}{item.staffComplaintDetected ? ' · staff issue detected' : ''}</p>
                   <p className="text-[11px] text-indigo mt-2 font-semibold">{item.recoveryWorkflow}</p>
                   <div className="mt-2 p-2.5 rounded-lg bg-[var(--s3)] border border-[var(--b1)]">
-                    <p className="text-[10px] font-bold text-t3 mb-1">AI suggested recovery message</p>
+                    <p className="text-[10px] font-bold text-t3 mb-1">Suggested message · review before use</p>
                     <p className="text-xs text-t2">{item.suggestedReply}</p>
                   </div>
                 </div>
               ))}
               {reputation.cases.length === 0 && (
-                <p className="text-xs text-t3">No live reputation cases returned for this clinic.</p>
+                <p className="text-xs text-t3">{reputationMetricsReady ? 'No reputation cases are recorded for this clinic.' : 'Reputation cases are unavailable.'}</p>
               )}
             </div>
           </BentoCard>
 
-          <BentoCard title="Review Request Automation" subtitle="Sent, delivered, and opened requests">
+          <BentoCard title="Review requests" subtitle="Recorded request and response status">
             <div className="space-y-2.5">
               {reputation.reviewRequests.map((request) => (
                 <div key={request.id} className="flex items-start justify-between gap-3 p-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)]">
@@ -230,7 +229,7 @@ export default function Reviews() {
                 </div>
               ))}
               {reputation.reviewRequests.length === 0 && (
-                <p className="text-xs text-t3">No live review requests yet.</p>
+                <p className="text-xs text-t3">No review requests are recorded yet.</p>
               )}
             </div>
           </BentoCard>
@@ -283,16 +282,16 @@ export default function Reviews() {
                   </div>
                 </div>
               ))}
-              {providerRecords.length === 0 && <p className="text-xs text-t3">No live provider ratings returned.</p>}
+              {providerRecords.length === 0 && <p className="text-xs text-t3">No provider ratings are available.</p>}
             </div>
           </BentoCard>
 
           <div className="rounded-2xl bg-[var(--s2)] border border-[var(--b1)] p-4">
-            <p className="text-[10px] font-bold uppercase tracking-widest text-violet-v mb-2">Referral Programme</p>
-            <p className="text-2xl font-bold text-t1 mb-1">18 referrals</p>
-            <p className="text-xs text-t2 mb-3">Generated this month · {formatCurrency(6400)} attributed revenue</p>
+            <p className="text-[10px] font-bold uppercase tracking-widest text-violet-v mb-2">Referral campaigns</p>
+            <p className="text-sm font-bold text-t1 mb-1">Set up a governed referral workflow</p>
+            <p className="text-xs text-t2 mb-3">Open campaign setup to review audience, consent, message, and approval requirements. No referral results are inferred on this page.</p>
             <button type="button" onClick={() => navigate('/campaigner')} className="w-full py-2 rounded-xl bg-[var(--s3)] hover:bg-[var(--b1)] text-t1 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
-              <ArrowRight className="w-3.5 h-3.5" /> Launch referral campaign
+              <ArrowRight className="w-3.5 h-3.5" /> Review campaign setup
             </button>
           </div>
         </div>

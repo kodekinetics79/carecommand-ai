@@ -1,23 +1,35 @@
 import type { FastifyInstance, FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
+import type { Prisma } from '../../generated/prisma/client';
 import { env } from '../../config/env';
 import { db } from '../../lib/db';
+import { enterTenantContext } from '../../lib/tenantContext';
+import {
+  resolveAuthLoginCandidates,
+  resolveIngressTenant,
+  resolvePasswordResetIngress,
+  revokeInactiveRefreshToken,
+  type AuthLoginCandidate,
+} from '../../lib/tenantIngressResolvers';
 import {
   createCsrfToken, createRefreshToken, hashRefreshToken, verifyPassword,
   validatePassword, createResetToken, hashResetToken, generatePasswordHash,
   encryptSecret, decryptSecret,
 } from '../../lib/security';
 import { generateTotpSecret, verifyTotp, totpAuthUri } from '../../lib/totp';
+import { getRequestPermissions } from '../../lib/permissions';
 
 const loginSchema = z.object({
   email: z.string().email().trim().toLowerCase(),
   password: z.string().min(1).max(200),
+  tenantSlug: z.string().trim().toLowerCase().min(2).max(80).optional(),
 });
 
 const refreshCookieName = 'cc_refresh';
 const csrfCookieName = 'cc_csrf';
 const refreshCookiePath = '/v1/auth';
+const csrfCookiePath = '/';
 const refreshTokenTtlSeconds = 60 * 60 * 24 * 30;
 const accessTokenTtl = '15m';
 const accessTokenTtlMinutes = 15;
@@ -26,6 +38,21 @@ const csrfErrorMessage = 'Invalid request token';
 // Identical generic response for invalid creds AND lockout, so probes cannot
 // tell whether an account exists or is locked.
 const genericAuthError = 'Invalid credentials or account temporarily unavailable.';
+
+// Valid fixed-cost scrypt material for identities with no stored password. The
+// plaintext used to create it is not an application credential. Authentication
+// still returns false for an absent user, but performs the same KDF work first.
+export const TENANT_LOGIN_DUMMY_HASH = 'scrypt$5f61b7e563732ec9e637bd7918a83f12$585ece13e6d3bcc495ea16877b3c11224a5ebc3d317f689578cd0c40279344a480e2ed0a03532b1182c6793e8f59d66917feaf24ba6d6ab13c8bcf413794e7a0';
+
+type PasswordVerifier = (password: string, storedHash?: string | null) => Promise<boolean>;
+
+export async function verifyTenantLoginPassword(
+  password: string,
+  storedHash: string | null | undefined,
+  verifier: PasswordVerifier = verifyPassword,
+): Promise<boolean> {
+  return verifier(password, storedHash ?? TENANT_LOGIN_DUMMY_HASH);
+}
 
 function isProduction() {
   return env.NODE_ENV === 'production';
@@ -36,12 +63,12 @@ function isProduction() {
 const sameSiteAttr = `SameSite=${env.COOKIE_SAMESITE.charAt(0).toUpperCase()}${env.COOKIE_SAMESITE.slice(1)}`;
 function cookieSecure() { return isProduction() || env.COOKIE_SAMESITE === 'none'; }
 
-function cookieFlags(httpOnly: boolean, maxAgeSeconds: number, value: string) {
+function cookieFlags(name: string, path: string, httpOnly: boolean, maxAgeSeconds: number, value: string) {
   const attributes = [
-    `${httpOnly ? refreshCookieName : csrfCookieName}=${encodeURIComponent(value)}`,
+    `${name}=${encodeURIComponent(value)}`,
     `Max-Age=${maxAgeSeconds}`,
     httpOnly ? 'HttpOnly' : undefined,
-    `Path=${refreshCookiePath}`,
+    `Path=${path}`,
     sameSiteAttr,
     cookieSecure() ? 'Secure' : undefined,
   ].filter(Boolean);
@@ -50,15 +77,20 @@ function cookieFlags(httpOnly: boolean, maxAgeSeconds: number, value: string) {
 
 function setAuthCookies(reply: FastifyReply, refreshToken: string, csrfToken: string) {
   reply.raw.setHeader('Set-Cookie', [
-    cookieFlags(true, refreshTokenTtlSeconds, refreshToken),
-    cookieFlags(false, refreshTokenTtlSeconds, csrfToken),
+    cookieFlags(refreshCookieName, refreshCookiePath, true, refreshTokenTtlSeconds, refreshToken),
+    cookieFlags(csrfCookieName, csrfCookiePath, false, refreshTokenTtlSeconds, csrfToken),
   ]);
+}
+
+function setCsrfCookie(reply: FastifyReply, csrfToken: string) {
+  reply.header('Cache-Control', 'no-store');
+  reply.raw.setHeader('Set-Cookie', cookieFlags(csrfCookieName, csrfCookiePath, false, refreshTokenTtlSeconds, csrfToken));
 }
 
 function clearAuthCookies(reply: FastifyReply) {
   reply.raw.setHeader('Set-Cookie', [
     `${refreshCookieName}=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Path=${refreshCookiePath}; ${sameSiteAttr}${cookieSecure() ? '; Secure' : ''}`,
-    `${csrfCookieName}=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=${refreshCookiePath}; ${sameSiteAttr}${cookieSecure() ? '; Secure' : ''}`,
+    `${csrfCookieName}=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=${csrfCookiePath}; ${sameSiteAttr}${cookieSecure() ? '; Secure' : ''}`,
   ]);
 }
 
@@ -86,9 +118,36 @@ function verifyCsrf(request: FastifyRequest) {
 }
 
 type SessionUserShape = { id: string; tenantId: string; role: string; branchId: string | null };
+type SessionResolvedUser = NonNullable<Awaited<ReturnType<typeof resolveSessionUser>>>;
+type LoginUser = AuthLoginCandidate;
+
+function tenantBlocksSessions(status: string) {
+  return status !== 'active';
+}
 
 async function tenantPolicy(tenantId: string) {
   return db.tenantSecurityPolicy.findUnique({ where: { tenantId } });
+}
+
+async function lockUserAuthState(client: Prisma.TransactionClient | typeof db, tenantId: string, userId: string) {
+  await client.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`tenant-auth:${tenantId}:${userId}`}::text, 0))::text AS locked`;
+}
+
+async function latestUserSessionRevocation(
+  client: Prisma.TransactionClient | typeof db,
+  tenantId: string,
+  userId: string,
+) {
+  return client.auditEvent.findFirst({
+    where: {
+      tenantId,
+      action: { in: ['controlPlane.session.revoked', 'auth.session.revoked'] },
+      resource: 'session',
+      resourceId: userId,
+    },
+    orderBy: { occurredAt: 'desc' },
+    select: { occurredAt: true },
+  });
 }
 
 // Access-token TTL honours the tenant's sessionTimeoutMinutes (clamped), while
@@ -98,44 +157,86 @@ function accessTtlSeconds(sessionTimeoutMinutes?: number | null) {
   return minutes * 60;
 }
 
-function buildSession(app: FastifyInstance, user: SessionUserShape, ttlSeconds: number) {
+function buildSession(app: FastifyInstance, user: SessionUserShape, ttlSeconds: number, revokedAt?: Date | null) {
+  const sessionIssuedAtMs = Math.max(Date.now(), (revokedAt?.getTime() ?? 0) + 1);
   return app.jwt.sign(
-    { userId: user.id, tenantId: user.tenantId, role: user.role, branchId: user.branchId ?? undefined, type: 'access' },
+    { userId: user.id, tenantId: user.tenantId, role: user.role, branchId: user.branchId ?? undefined, type: 'access', sessionIssuedAtMs },
     { expiresIn: ttlSeconds },
   );
 }
 
-async function issueSession(app: FastifyInstance, user: SessionUserShape, ttlSeconds: number) {
+async function issueSession(
+  app: FastifyInstance,
+  user: SessionUserShape,
+  ttlSeconds: number,
+  revokedAt?: Date | null,
+  client: Prisma.TransactionClient | typeof db = db,
+) {
+  await lockUserAuthState(client, user.tenantId, user.id);
+  const userRevocation = await latestUserSessionRevocation(client, user.tenantId, user.id);
+  const effectiveRevocation = userRevocation && (!revokedAt || userRevocation.occurredAt > revokedAt)
+    ? userRevocation.occurredAt
+    : revokedAt;
   const refreshToken = createRefreshToken();
   const csrfToken = createCsrfToken();
   const refreshTokenHash = hashRefreshToken(refreshToken);
   const refreshTokenExpiresAt = new Date(Date.now() + 1000 * refreshTokenTtlSeconds);
-  await db.user.update({
+  await client.user.update({
     where: { id: user.id },
     data: { refreshTokenHash, refreshTokenExpiresAt, lastLoginAt: new Date(), failedLoginCount: 0, lockedUntil: null },
   });
-  return { accessToken: buildSession(app, user, ttlSeconds), refreshToken, csrfToken };
+  return { accessToken: buildSession(app, user, ttlSeconds, effectiveRevocation), refreshToken, csrfToken };
+}
+
+async function issueMfaFlowToken(
+  app: FastifyInstance,
+  user: Pick<SessionUserShape, 'id' | 'tenantId'>,
+  type: 'mfa-setup' | 'mfa-challenge',
+  expiresIn: string,
+  tenantRevokedAt: Date | null | undefined,
+  client: Prisma.TransactionClient,
+) {
+  const userRevocation = await latestUserSessionRevocation(client, user.tenantId, user.id);
+  const effectiveRevocation = userRevocation && (!tenantRevokedAt || userRevocation.occurredAt > tenantRevokedAt)
+    ? userRevocation.occurredAt
+    : tenantRevokedAt;
+  const sessionIssuedAtMs = Math.max(Date.now(), (effectiveRevocation?.getTime() ?? 0) + 1);
+  return app.jwt.sign({ userId: user.id, tenantId: user.tenantId, type, sessionIssuedAtMs }, { expiresIn });
 }
 
 async function resolveSessionUser(userId: string) {
   return db.user.findFirst({
     where: { id: userId, active: true },
-    include: { tenant: { select: { id: true, name: true, slug: true } }, branch: { select: { id: true, name: true, location: true } } },
+    include: { tenant: { select: { id: true, name: true, slug: true, status: true } }, branch: { select: { id: true, name: true, location: true } } },
   });
 }
 
-function serializeUser(user: NonNullable<Awaited<ReturnType<typeof resolveSessionUser>>>) {
+function serializeUser(user: SessionResolvedUser | LoginUser) {
   return {
     id: user.id, email: user.email, displayName: user.displayName, role: user.role,
-    branchId: user.branchId, branch: user.branch, tenant: user.tenant, active: user.active,
+    branchId: user.branchId, branch: user.branch,
+    tenant: { id: user.tenant.id, name: user.tenant.name, slug: user.tenant.slug },
+    active: user.active,
     mfaEnabled: user.mfaEnabled,
   };
 }
 
-async function auditAuth(request: FastifyRequest, tenantId: string, userId: string | null, action: string, metadata?: Record<string, unknown>) {
-  await db.auditEvent.create({
+async function loginCandidates(email: string, tenantSlug?: string): Promise<LoginUser[]> {
+  return resolveAuthLoginCandidates(email, tenantSlug);
+}
+
+async function auditAuth(
+  request: FastifyRequest,
+  tenantId: string,
+  userId: string | null,
+  action: string,
+  metadata?: Record<string, unknown>,
+  client: Prisma.TransactionClient | typeof db = db,
+) {
+  await client.auditEvent.create({
     data: {
       tenantId, actorUserId: userId ?? undefined, action, resource: 'session',
+      resourceId: userId ?? undefined,
       requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
       metadata: metadata as never,
     },
@@ -143,24 +244,77 @@ async function auditAuth(request: FastifyRequest, tenantId: string, userId: stri
 }
 
 export const authRoutes: FastifyPluginAsync = async app => {
-  const rateLogin = { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } };
+  // The real-backend browser certification intentionally performs more than
+  // ten sequential synthetic role logins from one loopback IP. Production
+  // retains the strict limit; only the explicit E2E harness receives headroom.
+  const rateLogin = { config: { rateLimit: { max: env.E2E_TEST_MODE ? 100 : 10, timeWindow: '1 minute' } } };
   const rateSensitive = { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } };
 
   app.post('/dev-token', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } }, async (_request, reply) => {
-    if (env.NODE_ENV === 'production') return reply.code(404).send({ message: 'Not found' });
+    if (env.NODE_ENV === 'production' || !env.DEV_USER_ID || !env.DEV_TENANT_ID) {
+      return reply.code(404).send({ message: 'Not found' });
+    }
     return {
       token: app.jwt.sign({ userId: env.DEV_USER_ID, tenantId: env.DEV_TENANT_ID, role: 'OWNER', type: 'access' }, { expiresIn: accessTokenTtl }),
     };
+  });
+
+  // The SPA may be hosted on a different origin from the API. JavaScript on
+  // that origin cannot read an API-domain CSRF cookie, so expose the matching
+  // double-submit value through an allowlisted CORS response and keep it out of
+  // persistent browser storage. This endpoint never exposes session state.
+  app.get('/csrf', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async (_request, reply) => {
+    const csrfToken = createCsrfToken();
+    setCsrfCookie(reply, csrfToken);
+    return { csrfToken };
   });
 
   // ===== Login (lockout + expiry + MFA gating) =============================
   app.post('/login', rateLogin, async (request, reply) => {
     const input = loginSchema.parse(request.body);
     const now = new Date();
-    const user = await db.user.findFirst({
-      where: { email: input.email, active: true },
-      include: { tenant: { select: { id: true, name: true, slug: true } }, branch: { select: { id: true, name: true, location: true } } },
-    });
+    const candidates = await loginCandidates(input.email, input.tenantSlug);
+
+    // Do not reveal duplicate workspace membership to an unauthenticated email
+    // probe. Only a caller who has supplied a valid password for at least one of
+    // the duplicate accounts receives the neutral tenant-selector challenge;
+    // tenant names and slugs are never enumerated by this response.
+    if (!input.tenantSlug && candidates.length > 1) {
+      const passwordMatches = await Promise.all(candidates.map(candidate =>
+        verifyTenantLoginPassword(input.password, candidate.passwordHash),
+      ));
+      if (!passwordMatches.some((matches, index) => Boolean(candidates[index].passwordHash) && matches)) {
+        throw app.httpErrors.unauthorized(genericAuthError);
+      }
+      return reply.code(409).send({
+        status: 'tenant_required',
+        message: 'This email is linked to more than one workspace. Enter your clinic workspace identifier.',
+      });
+    }
+
+    const user = candidates[0] ?? null;
+    const passwordMatches = await verifyTenantLoginPassword(input.password, user?.passwordHash);
+    const passwordOk = Boolean(user?.passwordHash && passwordMatches);
+
+    // A tenant context can be activated only after the bounded credential
+    // resolver identifies a candidate. Inactive tenants fail before scoped DB
+    // work because the RLS context validator intentionally accepts only active
+    // tenants.
+    if (user && tenantBlocksSessions(user.tenant.status)) {
+      if (passwordOk) {
+        return reply.code(403).send({ status: 'suspended_tenant', message: 'This account is suspended. Please contact support.' });
+      }
+      throw app.httpErrors.unauthorized(genericAuthError);
+    }
+    if (user) {
+      enterTenantContext({
+        tenantId: user.tenantId,
+        actorId: user.id,
+        actorRole: user.role,
+        source: 'request',
+        requestId: request.id,
+      });
+    }
     const policy = user ? await tenantPolicy(user.tenantId) : null;
 
     // Locked account → generic error (no existence/lock leak), still audited.
@@ -169,60 +323,85 @@ export const authRoutes: FastifyPluginAsync = async app => {
       throw app.httpErrors.unauthorized(genericAuthError);
     }
 
-    const passwordOk = Boolean(user && user.passwordHash && await verifyPassword(input.password, user.passwordHash));
     if (!user || !passwordOk) {
       if (user) {
         const lockoutEnabled = policy?.failedLoginLockout ?? false;
-        const nextCount = user.failedLoginCount + 1;
-        const shouldLock = lockoutEnabled && nextCount >= env.AUTH_LOCKOUT_THRESHOLD;
-        await db.user.update({
-          where: { id: user.id },
-          data: shouldLock
-            ? { failedLoginCount: 0, lockedUntil: new Date(now.getTime() + env.AUTH_LOCKOUT_DURATION_MINUTES * 60000) }
-            : { failedLoginCount: nextCount },
+        // Commit the state and failure evidence before raising the HTTP error.
+        // Throwing inside this transaction would roll both back and erase the
+        // very audit trail/lockout state this rejected attempt must preserve.
+        await db.$transaction(async tx => {
+          await lockUserAuthState(tx, user.tenantId, user.id);
+          const current = await tx.user.findFirst({
+            where: { id: user.id, tenantId: user.tenantId, active: true },
+            select: { failedLoginCount: true, lockedUntil: true },
+          });
+          if (!current) return;
+          const transitionAt = new Date();
+          if (current.lockedUntil && current.lockedUntil > transitionAt) {
+            await auditAuth(request, user.tenantId, user.id, 'auth.login.failed', { reason: 'locked' }, tx);
+            return;
+          }
+          const nextCount = current.failedLoginCount + 1;
+          const shouldLock = lockoutEnabled && nextCount >= env.AUTH_LOCKOUT_THRESHOLD;
+          await tx.user.update({
+            where: { id: user.id },
+            data: shouldLock
+              ? { failedLoginCount: 0, lockedUntil: new Date(transitionAt.getTime() + env.AUTH_LOCKOUT_DURATION_MINUTES * 60000) }
+              : { failedLoginCount: nextCount },
+          });
+          await auditAuth(request, user.tenantId, user.id, 'auth.login.failed', { reason: 'invalid-credentials', attempt: nextCount }, tx);
+          if (shouldLock) {
+            await auditAuth(request, user.tenantId, user.id, 'auth.login.lockout', {
+              threshold: env.AUTH_LOCKOUT_THRESHOLD,
+              durationMinutes: env.AUTH_LOCKOUT_DURATION_MINUTES,
+            }, tx);
+          }
         });
-        await auditAuth(request, user.tenantId, user.id, 'auth.login.failed', { reason: 'invalid-credentials', attempt: nextCount });
-        if (shouldLock) await auditAuth(request, user.tenantId, user.id, 'auth.login.lockout', { threshold: env.AUTH_LOCKOUT_THRESHOLD, durationMinutes: env.AUTH_LOCKOUT_DURATION_MINUTES });
       }
       throw app.httpErrors.unauthorized(genericAuthError);
-    }
-
-    // Password verified — clear failed counters.
-    await db.user.update({ where: { id: user.id }, data: { failedLoginCount: 0, lockedUntil: null } });
-
-    // Platform-controlled suspension blocks tenant login (reactivate via Platform Admin).
-    const tenantStatus = await db.tenant.findUnique({ where: { id: user.tenantId }, select: { status: true } });
-    if (tenantStatus?.status === 'suspended') {
-      await auditAuth(request, user.tenantId, user.id, 'auth.login.failed', { reason: 'suspended_tenant' });
-      return reply.code(403).send({ status: 'suspended_tenant', message: 'This account is suspended. Please contact support.' });
     }
 
     // Password expiry → require reset (no session issued).
     if (policy?.passwordExpiryDays && policy.passwordExpiryDays > 0 && user.passwordChangedAt) {
       const expiresAt = new Date(user.passwordChangedAt.getTime() + policy.passwordExpiryDays * 86400000);
       if (expiresAt < now) {
-        await auditAuth(request, user.tenantId, user.id, 'auth.password.expired');
+        await db.$transaction(async tx => {
+          await lockUserAuthState(tx, user.tenantId, user.id);
+          await tx.user.update({ where: { id: user.id }, data: { failedLoginCount: 0, lockedUntil: null } });
+          await auditAuth(request, user.tenantId, user.id, 'auth.password.expired', undefined, tx);
+        });
         return reply.send({ status: 'password_expired', message: 'Your password has expired. Please reset it before signing in.' });
       }
     }
 
     // MFA challenge (user has verified MFA).
     if (user.mfaEnabled) {
-      const mfaToken = app.jwt.sign({ userId: user.id, tenantId: user.tenantId, type: 'mfa-challenge' }, { expiresIn: '5m' });
-      await auditAuth(request, user.tenantId, user.id, 'auth.login.mfaChallenge');
+      const mfaToken = await db.$transaction(async tx => {
+        await lockUserAuthState(tx, user.tenantId, user.id);
+        await tx.user.update({ where: { id: user.id }, data: { failedLoginCount: 0, lockedUntil: null } });
+        await auditAuth(request, user.tenantId, user.id, 'auth.login.mfaChallenge', undefined, tx);
+        return issueMfaFlowToken(app, user, 'mfa-challenge', '5m', policy?.sessionsRevokedAt, tx);
+      });
       return reply.send({ status: 'mfa_required', mfaToken });
     }
     // MFA required by policy but not yet set up.
     if (policy?.requireMfa && !user.mfaEnabled) {
-      const mfaToken = app.jwt.sign({ userId: user.id, tenantId: user.tenantId, type: 'mfa-setup' }, { expiresIn: '10m' });
-      await auditAuth(request, user.tenantId, user.id, 'auth.login.mfaSetupRequired');
+      const mfaToken = await db.$transaction(async tx => {
+        await lockUserAuthState(tx, user.tenantId, user.id);
+        await tx.user.update({ where: { id: user.id }, data: { failedLoginCount: 0, lockedUntil: null } });
+        await auditAuth(request, user.tenantId, user.id, 'auth.login.mfaSetupRequired', undefined, tx);
+        return issueMfaFlowToken(app, user, 'mfa-setup', '10m', policy.sessionsRevokedAt, tx);
+      });
       return reply.send({ status: 'mfa_setup_required', mfaToken });
     }
 
-    const session = await issueSession(app, user, accessTtlSeconds(policy?.sessionTimeoutMinutes));
+    const session = await db.$transaction(async tx => {
+      const issued = await issueSession(app, user, accessTtlSeconds(policy?.sessionTimeoutMinutes), policy?.sessionsRevokedAt, tx);
+      await auditAuth(request, user.tenantId, user.id, 'auth.login.success', { email: user.email }, tx);
+      return issued;
+    });
     setAuthCookies(reply, session.refreshToken, session.csrfToken);
-    await auditAuth(request, user.tenantId, user.id, 'auth.login.success', { email: user.email });
-    return { accessToken: session.accessToken, user: serializeUser(user) };
+    return { accessToken: session.accessToken, csrfToken: session.csrfToken, user: serializeUser(user) };
   });
 
   // ===== Refresh / logout / me / session-info =============================
@@ -231,25 +410,76 @@ export const authRoutes: FastifyPluginAsync = async app => {
     const refreshToken = readCookieValue(request, refreshCookieName);
     if (!refreshToken) throw app.httpErrors.unauthorized(authErrorMessage);
     const refreshTokenHash = hashRefreshToken(refreshToken);
+    const resolved = await resolveIngressTenant('refresh_token_hash', refreshTokenHash);
+    if (!resolved) {
+      const revoked = await revokeInactiveRefreshToken(refreshTokenHash);
+      clearAuthCookies(reply);
+      if (revoked) {
+        return reply.code(403).send({ status: 'suspended_tenant', message: 'This account is suspended. Please contact support.' });
+      }
+      return reply.code(401).send({ statusCode: 401, error: 'Unauthorized', message: authErrorMessage });
+    }
+    enterTenantContext({
+      tenantId: resolved.tenantId,
+      actorId: resolved.resourceId,
+      actorRole: 'SESSION_REFRESH',
+      source: 'request',
+      requestId: request.id,
+    });
     const user = await db.user.findFirst({
-      where: { refreshTokenHash, refreshTokenExpiresAt: { gt: new Date() }, active: true },
-      include: { tenant: { select: { id: true, name: true, slug: true } }, branch: { select: { id: true, name: true, location: true } } },
+      where: { id: resolved.resourceId, refreshTokenHash, refreshTokenExpiresAt: { gt: new Date() }, active: true },
+      include: { tenant: { select: { id: true, name: true, slug: true, status: true } }, branch: { select: { id: true, name: true, location: true } } },
     });
     if (!user) throw app.httpErrors.unauthorized(authErrorMessage);
+    if (tenantBlocksSessions(user.tenant.status)) {
+      await db.$transaction(async tx => {
+        await tx.user.update({ where: { id: user.id }, data: { refreshTokenHash: null, refreshTokenExpiresAt: null } });
+        await auditAuth(request, user.tenantId, user.id, 'auth.refresh.denied', { reason: `${user.tenant.status}_tenant` }, tx);
+      });
+      clearAuthCookies(reply);
+      return reply.code(403).send({ status: 'suspended_tenant', message: 'This account is suspended. Please contact support.' });
+    }
     const policy = await tenantPolicy(user.tenantId);
-    const session = await issueSession(app, user, accessTtlSeconds(policy?.sessionTimeoutMinutes));
+    if (policy?.requireMfa && !user.mfaEnabled) {
+      await db.$transaction(async tx => {
+        await tx.user.update({ where: { id: user.id }, data: { refreshTokenHash: null, refreshTokenExpiresAt: null } });
+        await auditAuth(request, user.tenantId, user.id, 'auth.refresh.denied', { reason: 'mfa_reauthentication_required' }, tx);
+      });
+      clearAuthCookies(reply);
+      return reply.code(403).send({
+        status: 'mfa_reauthentication_required',
+        message: 'MFA is required. Sign in with your password to complete setup or verification.',
+      });
+    }
+    const session = await db.$transaction(async tx => {
+      const issued = await issueSession(app, user, accessTtlSeconds(policy?.sessionTimeoutMinutes), policy?.sessionsRevokedAt, tx);
+      await auditAuth(request, user.tenantId, user.id, 'auth.refresh.success', undefined, tx);
+      return issued;
+    });
     setAuthCookies(reply, session.refreshToken, session.csrfToken);
-    return { accessToken: session.accessToken, user: serializeUser(user) };
+    return { accessToken: session.accessToken, csrfToken: session.csrfToken, user: serializeUser(user) };
   });
 
   app.post('/logout', { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async (request, reply) => {
     if (!verifyCsrf(request)) { clearAuthCookies(reply); return reply.code(204).send(); }
     const refreshToken = readCookieValue(request, refreshCookieName);
     if (refreshToken) {
-      await db.user.updateMany({ where: { refreshTokenHash: hashRefreshToken(refreshToken) }, data: { refreshTokenHash: null, refreshTokenExpiresAt: null } });
-    }
-    if (request.auth?.userId) {
-      await auditAuth(request, request.auth.tenantId, request.auth.userId, 'auth.logout', { reason: 'user-initiated' });
+      const refreshTokenHash = hashRefreshToken(refreshToken);
+      const resolved = await resolveIngressTenant('refresh_token_hash', refreshTokenHash);
+      if (resolved) {
+        enterTenantContext({
+          tenantId: resolved.tenantId,
+          actorId: resolved.resourceId,
+          actorRole: 'SESSION_LOGOUT',
+          source: 'request',
+          requestId: request.id,
+        });
+        await db.$transaction(async tx => {
+          const user = await tx.user.findFirst({ where: { id: resolved.resourceId, refreshTokenHash }, select: { id: true, tenantId: true } });
+          await tx.user.updateMany({ where: { id: resolved.resourceId, refreshTokenHash }, data: { refreshTokenHash: null, refreshTokenExpiresAt: null } });
+          if (user) await auditAuth(request, user.tenantId, user.id, 'auth.logout', { reason: 'user-initiated' }, tx);
+        });
+      }
     }
     clearAuthCookies(reply);
     return reply.code(204).send();
@@ -258,7 +488,11 @@ export const authRoutes: FastifyPluginAsync = async app => {
   app.get('/me', { preHandler: app.authenticate }, async request => {
     const user = await resolveSessionUser(request.auth.userId);
     if (!user) throw app.httpErrors.unauthorized(authErrorMessage);
-    return { user: serializeUser(user), access: { tenantId: user.tenantId, branchId: user.branchId, role: user.role } };
+    const permissions = [...await getRequestPermissions(request)].sort();
+    return {
+      user: serializeUser(user),
+      access: { tenantId: user.tenantId, branchId: user.branchId, role: user.role, permissions },
+    };
   });
 
   app.get('/session-info', { preHandler: app.authenticate }, async request => {
@@ -266,7 +500,7 @@ export const authRoutes: FastifyPluginAsync = async app => {
     return {
       accessTokenTtlMinutes: Math.round(accessTtlSeconds(policy?.sessionTimeoutMinutes) / 60),
       refreshTokenTtlDays: Math.round(refreshTokenTtlSeconds / 86400),
-      csrfEnabled: true, cookiePath: refreshCookiePath, sameSite: 'Lax', secure: isProduction(),
+      csrfEnabled: true, cookiePath: refreshCookiePath, csrfCookiePath, sameSite: env.COOKIE_SAMESITE, secure: cookieSecure(),
       httpOnlyRefreshCookie: true, devTokenEnabled: env.NODE_ENV !== 'production', productionHttpsRequired: isProduction(),
       rbacEnabled: true, auditLoggingEnabled: true,
       accountLockoutEnabled: policy?.failedLoginLockout ?? false,
@@ -277,26 +511,49 @@ export const authRoutes: FastifyPluginAsync = async app => {
   // ===== Password reset ===================================================
   app.post('/password-reset/request', rateSensitive, async request => {
     const { email } = z.object({ email: z.string().email().trim().toLowerCase() }).parse(request.body);
-    const user = await db.user.findFirst({ where: { email, active: true } });
     // Always return a generic response (no account-existence leak).
-    const generic = { status: 'ok', message: 'If an account exists for that email, a password reset has been initiated.' } as Record<string, unknown>;
+    const generic = { status: 'ok', message: 'If exactly one active account exists for that email, continue with the local reset token.' } as Record<string, unknown>;
+    // Production has no password-reset delivery adapter. Do not mint an
+    // unusable secret or imply that a reset message was sent.
+    if (isProduction()) return {
+      status: 'ok',
+      message: 'Self-service password reset is not configured. Contact your clinic administrator for account recovery.',
+      resetAvailable: false,
+      emailDelivered: false,
+    };
+    const candidates = await resolveAuthLoginCandidates(email);
+    // Password-reset URLs do not currently carry a workspace selector. Fail
+    // closed for an ambiguous multi-workspace email instead of resetting an
+    // arbitrary account.
+    if (candidates.length !== 1 || tenantBlocksSessions(candidates[0].tenant.status)) return generic;
+    const candidate = candidates[0];
+    enterTenantContext({
+      tenantId: candidate.tenantId,
+      actorId: candidate.id,
+      actorRole: 'PASSWORD_RESET',
+      source: 'request',
+      requestId: request.id,
+    });
+    const user = await db.user.findFirst({ where: { id: candidate.id, email, active: true } });
     if (!user) return generic;
 
     const rawToken = createResetToken();
     const tokenHash = hashResetToken(rawToken);
     const expiresAt = new Date(Date.now() + env.PASSWORD_RESET_TTL_MINUTES * 60000);
     // Invalidate any prior unused tokens for this user, then issue one.
-    await db.passwordResetToken.updateMany({ where: { userId: user.id, usedAt: null }, data: { usedAt: new Date() } });
-    await db.passwordResetToken.create({ data: { tenantId: user.tenantId, userId: user.id, tokenHash, expiresAt } });
-    await auditAuth(request, user.tenantId, user.id, 'auth.password.reset.requested', { ttlMinutes: env.PASSWORD_RESET_TTL_MINUTES });
+    await db.$transaction(async tx => {
+      await tx.passwordResetToken.updateMany({ where: { userId: user.id, usedAt: null }, data: { usedAt: new Date() } });
+      await tx.passwordResetToken.create({ data: { tenantId: user.tenantId, userId: user.id, tokenHash, expiresAt } });
+      await auditAuth(request, user.tenantId, user.id, 'auth.password.reset.requested', { ttlMinutes: env.PASSWORD_RESET_TTL_MINUTES }, tx);
+    });
 
     // No email provider is integrated. In non-production we return the token so
     // the flow is testable; in production the raw token is NEVER exposed.
     if (!isProduction()) {
       request.log.info({ userId: user.id }, 'password reset token issued (dev-only echo)');
-      return { ...generic, devToken: rawToken, emailDelivered: false, note: 'Dev mode: token returned for testing only. No email provider integrated.' };
+      return { ...generic, resetAvailable: true, devToken: rawToken, emailDelivered: false, note: 'Dev mode: token returned for testing only. No email provider integrated.' };
     }
-    return generic;
+    return { ...generic, resetAvailable: false, emailDelivered: false };
   });
 
   app.post('/password-reset/confirm', rateSensitive, async (request, reply) => {
@@ -304,28 +561,87 @@ export const authRoutes: FastifyPluginAsync = async app => {
     const policyCheck = validatePassword(newPassword);
     if (!policyCheck.ok) throw app.httpErrors.badRequest(policyCheck.message ?? 'Password does not meet policy.');
 
-    const record = await db.passwordResetToken.findFirst({ where: { tokenHash: hashResetToken(token), usedAt: null, expiresAt: { gt: new Date() } } });
-    if (!record) throw app.httpErrors.badRequest('This reset link is invalid or has expired.');
-
+    const tokenHash = hashResetToken(token);
+    const resolved = await resolvePasswordResetIngress(tokenHash);
+    if (!resolved) throw app.httpErrors.badRequest('This reset link is invalid or has expired.');
+    enterTenantContext({
+      tenantId: resolved.tenantId,
+      actorId: resolved.userId,
+      actorRole: 'PASSWORD_RESET',
+      source: 'request',
+      requestId: request.id,
+    });
     const passwordHash = await generatePasswordHash(newPassword);
-    await db.$transaction([
-      db.user.update({ where: { id: record.userId }, data: { passwordHash, passwordChangedAt: new Date(), failedLoginCount: 0, lockedUntil: null, refreshTokenHash: null, refreshTokenExpiresAt: null } }),
-      db.passwordResetToken.update({ where: { id: record.id }, data: { usedAt: new Date() } }),
-    ]);
-    await auditAuth(request, record.tenantId, record.userId, 'auth.password.reset.completed');
+    await db.$transaction(async tx => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`auth-password-reset:${resolved.tokenId}`}::text, 0))::text AS locked`;
+      const transitionAt = new Date();
+      const record = await tx.passwordResetToken.findFirst({
+        where: { id: resolved.tokenId, tenantId: resolved.tenantId, userId: resolved.userId, tokenHash, usedAt: null, expiresAt: { gt: transitionAt } },
+        select: { id: true, tenantId: true, userId: true },
+      });
+      if (!record) throw app.httpErrors.badRequest('This reset link is invalid or has expired.');
+      const consumed = await tx.passwordResetToken.updateMany({
+        where: { id: record.id, tokenHash, usedAt: null, expiresAt: { gt: transitionAt } },
+        data: { usedAt: transitionAt },
+      });
+      if (consumed.count !== 1) throw app.httpErrors.badRequest('This reset link is invalid or has expired.');
+      await lockUserAuthState(tx, record.tenantId, record.userId);
+      await tx.user.update({ where: { id: record.userId }, data: { passwordHash, passwordChangedAt: transitionAt, failedLoginCount: 0, lockedUntil: null, refreshTokenHash: null, refreshTokenExpiresAt: null } });
+      await auditAuth(request, record.tenantId, record.userId, 'auth.session.revoked', { reason: 'password_reset' }, tx);
+      await auditAuth(request, record.tenantId, record.userId, 'auth.password.reset.completed', undefined, tx);
+    });
     return reply.send({ status: 'ok', message: 'Your password has been reset. Please sign in.' });
   });
 
   // ===== MFA (TOTP) =======================================================
   // Manual token resolution so these endpoints accept a full session token OR a
   // short-lived login-flow mfa token (setup/challenge).
-  async function resolveMfaActor(request: FastifyRequest): Promise<{ userId: string; tenantId: string; type: string }> {
-    const payload = await request.jwtVerify<{ userId: string; tenantId: string; type?: string }>();
-    return { userId: payload.userId, tenantId: payload.tenantId, type: payload.type ?? 'access' };
+  async function resolveMfaActor(request: FastifyRequest, reply: FastifyReply): Promise<{ userId: string; tenantId: string; type: 'access' | 'mfa-setup' | 'mfa-challenge' }> {
+    const payload = await request.jwtVerify<{ userId: string; tenantId: string; type?: string; iat?: number; sessionIssuedAtMs?: number }>();
+    const type = payload.type ?? 'access';
+    if (!['access', 'mfa-setup', 'mfa-challenge'].includes(type)) throw app.httpErrors.unauthorized(authErrorMessage);
+    if (type === 'access') {
+      await app.authenticate(request, reply);
+      return { userId: request.auth.userId, tenantId: request.auth.tenantId, type: 'access' };
+    }
+    const actor = { userId: payload.userId, tenantId: payload.tenantId, type: type as 'mfa-setup' | 'mfa-challenge' };
+    enterTenantContext({
+      tenantId: actor.tenantId,
+      actorId: actor.userId,
+      actorRole: 'MFA_CHALLENGE',
+      source: 'request',
+      requestId: request.id,
+    });
+    const issuedAtMs = Number.isFinite(payload.sessionIssuedAtMs)
+      ? payload.sessionIssuedAtMs!
+      : Number.isFinite(payload.iat) ? payload.iat! * 1000 : 0;
+    if (!issuedAtMs) throw app.httpErrors.unauthorized(authErrorMessage);
+    const [user, policy, latestRevocation] = await Promise.all([
+      db.user.findFirst({
+        where: { id: actor.userId, tenantId: actor.tenantId, active: true },
+        select: { mfaEnabled: true, tenant: { select: { status: true } } },
+      }),
+      tenantPolicy(actor.tenantId),
+      latestUserSessionRevocation(db, actor.tenantId, actor.userId),
+    ]);
+    if (!user) throw app.httpErrors.unauthorized(authErrorMessage);
+    if (tenantBlocksSessions(user.tenant.status)) throw app.httpErrors.forbidden('suspended_tenant');
+    const tenantRevokedAt = policy?.sessionsRevokedAt;
+    if ((tenantRevokedAt && issuedAtMs <= tenantRevokedAt.getTime())
+      || (latestRevocation && latestRevocation.occurredAt.getTime() >= issuedAtMs)) {
+      throw app.httpErrors.unauthorized('Your session is no longer active. Please sign in again.');
+    }
+    if (actor.type === 'mfa-setup' && (!policy?.requireMfa || user.mfaEnabled)) {
+      throw app.httpErrors.unauthorized(authErrorMessage);
+    }
+    if (actor.type === 'mfa-challenge' && !user.mfaEnabled) {
+      throw app.httpErrors.unauthorized(authErrorMessage);
+    }
+    return actor;
   }
 
-  app.get('/mfa/status', async request => {
-    const actor = await resolveMfaActor(request);
+  app.get('/mfa/status', async (request, reply) => {
+    const actor = await resolveMfaActor(request, reply);
     const [user, policy] = await Promise.all([
       db.user.findFirst({ where: { id: actor.userId, active: true }, select: { mfaEnabled: true, mfaEnrolledAt: true } }),
       tenantPolicy(actor.tenantId),
@@ -334,50 +650,61 @@ export const authRoutes: FastifyPluginAsync = async app => {
     return { enabled: user.mfaEnabled, enrolledAt: user.mfaEnrolledAt?.toISOString() ?? null, requireMfa: policy?.requireMfa ?? false };
   });
 
-  app.post('/mfa/setup', rateSensitive, async request => {
-    const actor = await resolveMfaActor(request);
+  app.post('/mfa/setup', rateSensitive, async (request, reply) => {
+    const actor = await resolveMfaActor(request, reply);
     if (!['access', 'mfa-setup'].includes(actor.type)) throw app.httpErrors.unauthorized('A valid session is required to set up MFA.');
     const user = await db.user.findFirst({ where: { id: actor.userId, active: true }, select: { id: true, email: true, mfaEnabled: true } });
     if (!user) throw app.httpErrors.unauthorized(authErrorMessage);
     if (user.mfaEnabled) throw app.httpErrors.conflict('MFA is already enabled. Disable it first to re-enroll.');
 
     const secret = generateTotpSecret();
-    await db.user.update({ where: { id: user.id }, data: { mfaSecretEnc: encryptSecret(secret), mfaEnabled: false } });
-    await auditAuth(request, actor.tenantId, user.id, 'auth.mfa.setup');
+    await db.$transaction(async tx => {
+      await tx.user.update({ where: { id: user.id }, data: { mfaSecretEnc: encryptSecret(secret), mfaEnabled: false } });
+      await auditAuth(request, actor.tenantId, user.id, 'auth.mfa.setup', undefined, tx);
+    });
     // Secret + URI are shown once to the user for authenticator enrollment.
     return { secret, otpauthUri: totpAuthUri(secret, user.email), enabled: false };
   });
 
   app.post('/mfa/verify', rateSensitive, async (request, reply) => {
     const { code } = z.object({ code: z.string().min(6).max(10) }).parse(request.body);
-    const actor = await resolveMfaActor(request);
+    const actor = await resolveMfaActor(request, reply);
     const user = await db.user.findFirst({
       where: { id: actor.userId, active: true },
-      include: { tenant: { select: { id: true, name: true, slug: true } }, branch: { select: { id: true, name: true, location: true } } },
+      include: { tenant: { select: { id: true, name: true, slug: true, status: true } }, branch: { select: { id: true, name: true, location: true } } },
     });
     if (!user || !user.mfaSecretEnc) throw app.httpErrors.badRequest('MFA is not set up for this account.');
+    if (tenantBlocksSessions(user.tenant.status)) throw app.httpErrors.forbidden('suspended_tenant');
     const secret = decryptSecret(user.mfaSecretEnc);
     if (!secret || !verifyTotp(secret, code)) {
       await auditAuth(request, actor.tenantId, user.id, 'auth.mfa.verify.failed');
       throw app.httpErrors.unauthorized('Invalid verification code.');
     }
 
-    // First successful verify enables MFA.
+    // First successful verify enables MFA. Any session issuance and all
+    // mandatory success evidence commit with that enrollment state.
     const justEnabled = !user.mfaEnabled;
-    if (justEnabled) {
-      await db.user.update({ where: { id: user.id }, data: { mfaEnabled: true, mfaEnrolledAt: new Date() } });
-      await auditAuth(request, actor.tenantId, user.id, 'auth.mfa.enabled');
-    } else {
-      await auditAuth(request, actor.tenantId, user.id, 'auth.mfa.verify.success');
-    }
+    const completesLogin = actor.type === 'mfa-challenge' || actor.type === 'mfa-setup';
+    const enrolledAt = justEnabled ? new Date() : user.mfaEnrolledAt;
+    const session = await db.$transaction(async tx => {
+      if (justEnabled) {
+        await tx.user.update({ where: { id: user.id }, data: { mfaEnabled: true, mfaEnrolledAt: enrolledAt } });
+        await auditAuth(request, actor.tenantId, user.id, 'auth.mfa.enabled', undefined, tx);
+      } else {
+        await auditAuth(request, actor.tenantId, user.id, 'auth.mfa.verify.success', undefined, tx);
+      }
+      if (!completesLogin) return null;
+      const policy = await tx.tenantSecurityPolicy.findUnique({ where: { tenantId: user.tenantId } });
+      const issued = await issueSession(app, user, accessTtlSeconds(policy?.sessionTimeoutMinutes), policy?.sessionsRevokedAt, tx);
+      await auditAuth(request, user.tenantId, user.id, 'auth.login.success', { email: user.email, mfa: true }, tx);
+      return issued;
+    });
 
     // Login-flow tokens complete the sign-in by issuing a real session.
-    if (actor.type === 'mfa-challenge' || actor.type === 'mfa-setup') {
-      const policy = await tenantPolicy(user.tenantId);
-      const session = await issueSession(app, user, accessTtlSeconds(policy?.sessionTimeoutMinutes));
+    if (session) {
       setAuthCookies(reply, session.refreshToken, session.csrfToken);
-      await auditAuth(request, user.tenantId, user.id, 'auth.login.success', { email: user.email, mfa: true });
-      return { status: 'ok', accessToken: session.accessToken, user: serializeUser(user) };
+      const sessionUser = justEnabled ? { ...user, mfaEnabled: true, mfaEnrolledAt: enrolledAt } : user;
+      return { status: 'ok', accessToken: session.accessToken, csrfToken: session.csrfToken, user: serializeUser(sessionUser) };
     }
     return { status: 'ok', enabled: true };
   });
@@ -389,8 +716,10 @@ export const authRoutes: FastifyPluginAsync = async app => {
     if (!user.passwordHash || !(await verifyPassword(password, user.passwordHash))) {
       throw app.httpErrors.unauthorized('Password confirmation failed.');
     }
-    await db.user.update({ where: { id: user.id }, data: { mfaEnabled: false, mfaSecretEnc: null, mfaEnrolledAt: null } });
-    await auditAuth(request, request.auth.tenantId, user.id, 'auth.mfa.disabled');
+    await db.$transaction(async tx => {
+      await tx.user.update({ where: { id: user.id }, data: { mfaEnabled: false, mfaSecretEnc: null, mfaEnrolledAt: null } });
+      await auditAuth(request, request.auth.tenantId, user.id, 'auth.mfa.disabled', undefined, tx);
+    });
     return { status: 'ok', enabled: false };
   });
 };

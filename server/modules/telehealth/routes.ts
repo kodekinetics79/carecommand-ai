@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { db } from '../../lib/db';
+import { requirePermission } from '../../lib/permissions';
 import { branchScope } from '../../lib/scope';
 
 const sessionQuery = z.object({
@@ -10,7 +11,7 @@ const sessionQuery = z.object({
 
 export const telehealthRoutes: FastifyPluginAsync = async app => {
   // Virtual visits are appointments booked on the VIDEO channel.
-  app.get('/sessions', async request => {
+  app.get('/sessions', { preHandler: requirePermission('appointment:read') }, async request => {
     const query = sessionQuery.parse(request.query);
     const rows = await db.appointment.findMany({
       where: {

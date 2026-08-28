@@ -1,11 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { AlertCircle, BarChart3, Radar, ShieldCheck, Sparkles, TrendingUp, Zap, ArrowRight, Eye } from 'lucide-react';
+import { useNavigate } from 'react-router';
+import { AlertCircle, BarChart3, Radar, Sparkles, TrendingUp, Zap, ArrowRight } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import RiskBadge from '../components/ui/RiskBadge';
-import ProgressBar from '../components/ui/ProgressBar';
 import BentoCard from '../components/ui/BentoCard';
-import { formatCurrency } from '../utils/formatters';
 import type { AlertCategory, AlertSeverity } from '../types';
 import { apiRequest } from '../lib/api';
 import { useApiResource } from '../hooks/useApiResource';
@@ -24,6 +22,7 @@ interface ApiCompetitorRadar {
   weaknessSummary: string;
   opportunityAlert: string;
   marketOpeningRecommendation: string;
+  createdAt: string;
   branch: { name: string };
   insights: Array<{ theme: string; complaintCount: number; summary: string }>;
 }
@@ -63,7 +62,6 @@ type SignalRow = {
   title: string;
   description: string;
   action: string;
-  estimatedValue?: number;
   branchId?: string;
   branchName?: string;
   createdAt: string;
@@ -111,7 +109,7 @@ export default function ClinicRadar() {
   const [activeTab, setActiveTab] = useState<'opportunity' | 'risk'>('opportunity');
   const [selectedBranchId, setSelectedBranchId] = useState<'all' | string>('all');
   const [competitors, setCompetitors] = useState<ApiCompetitorRadar[]>([]);
-  const [competitorSource, setCompetitorSource] = useState<'live' | 'loading'>('loading');
+  const [competitorSource, setCompetitorSource] = useState<'loaded' | 'loading'>('loading');
   const [competitorError, setCompetitorError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -125,7 +123,7 @@ export default function ClinicRadar() {
         setReputation(reputationRows);
         setReputationError(null);
         setCompetitors(competitorRows);
-        setCompetitorSource('live');
+        setCompetitorSource('loaded');
         setCompetitorError(null);
       })
       .catch(error => {
@@ -147,7 +145,6 @@ export default function ClinicRadar() {
       title: `${caseRow.branch.name}: ${caseRow.workflowStatus}`,
       description: caseRow.unresolvedComplaint,
       action: caseRow.recoveryWorkflow,
-      estimatedValue: Math.round(caseRow.badReviewRisk * 45),
       branchId: caseRow.branchId,
       branchName: caseRow.branch.name,
       createdAt: caseRow.createdAt,
@@ -163,9 +160,8 @@ export default function ClinicRadar() {
         title: `${competitor.name} near ${competitor.branch.name}`,
         description: `${competitor.reviewVolume} reviews, ${competitor.googleRating} rating, and ${competitor.complaintThemes.join(' · ')} are creating a market opening.`,
         action: competitor.marketOpeningRecommendation,
-        estimatedValue: Math.round(competitor.reviewVolume * 18),
         branchName: competitor.branch.name,
-        createdAt: competitor.insights[0] ? new Date(`${competitor.insights[0].theme.length + 2024}-01-01`).toISOString() : new Date().toISOString(),
+        createdAt: competitor.createdAt,
       };
     });
 
@@ -186,7 +182,6 @@ export default function ClinicRadar() {
   const visibleCompetitors = selectedBranchId === 'all'
     ? competitors
     : competitors.filter(competitor => competitor.branch.name === selectedBranchName);
-  const totalOpportunity = signals.reduce((sum, signal) => sum + (signal.estimatedValue ?? 0), 0);
   const highCount = signals.filter(signal => signal.severity === 'high').length;
   const medCount = signals.filter(signal => signal.severity === 'medium').length;
   const loadError = reputationError || competitorError;
@@ -195,9 +190,9 @@ export default function ClinicRadar() {
     <div className="space-y-6 pb-8">
       <PageHeader
         title="ClinicRadar"
-        subtitle="Real-time intelligence board for revenue signals, retention risks, and branch health."
-        badge={loadError ? 'Live Data Error' : `${signals.length} Active Signals`}
-        badgeColor="red"
+        subtitle="Review stored reputation and competitor records as operational signals before deciding what to do next."
+        badge={loadError ? 'Data unavailable' : competitorSource === 'loading' ? 'Loading signals' : `${signals.length} signals loaded`}
+        badgeColor={loadError ? 'red' : highCount > 0 ? 'amber' : 'blue'}
         actions={
           <button
             type="button"
@@ -214,7 +209,7 @@ export default function ClinicRadar() {
                 .then(([reputationRows, competitorRows]) => {
                   setReputation(reputationRows);
                   setCompetitors(competitorRows);
-                  setCompetitorSource('live');
+                  setCompetitorSource('loaded');
                 })
                 .catch(error => {
                   const text = error instanceof Error ? error.message : 'Unable to load clinic radar';
@@ -224,23 +219,23 @@ export default function ClinicRadar() {
             }}
             className="inline-flex items-center gap-2 rounded-xl bg-[var(--s3)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] border border-[var(--b1)] transition"
           >
-            <Radar className="w-4 h-4" /> Refresh Insights
+            <Radar className="w-4 h-4" /> Refresh signals
           </button>
         }
       />
 
       {loadError && (
-        <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          Clinic radar could not load live data: {loadError}
+        <div role="alert" className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          ClinicRadar data is unavailable. {loadError}
         </div>
       )}
 
       {/* Summary KPI strip */}
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
         <div className="bg-[var(--s2)] rounded-2xl border border-[var(--b1)] p-4">
-          <p className="text-[10px] font-bold uppercase tracking-widest text-t3 mb-2">Total Opportunity</p>
-          <p className="text-2xl font-bold text-t1 tabular-nums">{formatCurrency(totalOpportunity)}</p>
-          <p className="text-xs text-t3 mt-0.5">Across all active signals</p>
+          <p className="text-[10px] font-bold uppercase tracking-widest text-t3 mb-2">Signals loaded</p>
+          <p className="text-2xl font-bold text-t1 tabular-nums">{signals.length}</p>
+          <p className="text-xs text-t3 mt-0.5">Current result set</p>
         </div>
         <div className="bg-[var(--red-soft)] rounded-2xl border border-[var(--b1)] p-4">
           <p className="text-[10px] font-bold uppercase tracking-widest text-red-v mb-2">High Priority</p>
@@ -253,15 +248,16 @@ export default function ClinicRadar() {
           <p className="text-xs text-amber-v/70 mt-0.5">Monitor and schedule</p>
         </div>
         <div className="bg-[var(--violet-soft)] rounded-2xl border border-[var(--b1)] p-4">
-              <p className="text-[10px] font-bold uppercase tracking-widest text-violet-v mb-2">Signal Confidence</p>
-              <p className="text-2xl font-bold text-violet-v tabular-nums">84%</p>
-              <p className="text-xs text-violet-v/70 mt-0.5">Average signal confidence</p>
+              <p className="text-[10px] font-bold uppercase tracking-widest text-violet-v mb-2">Open reputation cases</p>
+              <p className="text-2xl font-bold text-violet-v tabular-nums">{reputation?.summary.unresolvedCases ?? 0}</p>
+              <p className="text-xs text-violet-v/70 mt-0.5">Recorded as unresolved</p>
             </div>
           </div>
 
       <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-3">
         <p className="text-xs font-semibold text-t2">Clinic</p>
         <select
+          aria-label="Clinic"
           value={selectedBranchId}
           onChange={e => setSelectedBranchId(e.target.value)}
           className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs text-t1 outline-none"
@@ -314,10 +310,10 @@ export default function ClinicRadar() {
             </div>
 
             <div className="space-y-3">
+              {filtered.length === 0 && <p className="py-8 text-center text-sm text-t3">No signals match the selected clinic and filters.</p>}
               {filtered.map((alert) => {
                 const cat = categoryColor[alert.category];
                 const sev = severityConfig[alert.severity];
-                const confidence = alert.severity === 'high' ? 88 : alert.severity === 'medium' ? 72 : 55;
                 return (
                   <div key={alert.id} className={`rounded-2xl border border-[var(--b1)] border-l-2 p-4 hover:bg-[var(--s3)] transition-all ${sev.border} ${sev.glow}`}>
                     <div className="flex items-start gap-3">
@@ -327,14 +323,7 @@ export default function ClinicRadar() {
                       <div className="flex-1 min-w-0">
                         <div className="flex items-start justify-between gap-3 mb-1">
                           <p className="text-sm font-bold text-t1 leading-tight">{alert.title}</p>
-                          <div className="flex items-center gap-2 shrink-0">
-                            {alert.estimatedValue && (
-                              <span className="badge badge-emerald">
-                                {formatCurrency(alert.estimatedValue)}
-                              </span>
-                            )}
-                            <RiskBadge level={alert.severity} size="sm" />
-                          </div>
+                          <RiskBadge level={alert.severity} size="sm" />
                         </div>
 
                         <div className="flex items-center gap-2 mb-2">
@@ -348,20 +337,8 @@ export default function ClinicRadar() {
 
                         <p className="text-xs text-t3 leading-relaxed mb-3">{alert.description}</p>
 
-                        <div className="flex items-center justify-between gap-3">
-                          <div className="flex items-center gap-2 flex-1">
-                            <span className="text-[10px] font-medium text-t3 uppercase tracking-wide whitespace-nowrap">Confidence</span>
-                            <div className="flex gap-0.5 flex-1 max-w-[80px]">
-                              {[...Array(5)].map((_, i) => (
-                                <div key={i} className={`flex-1 h-1 rounded-full ${i < Math.round(confidence / 20) ? 'bg-blue-500' : 'bg-[var(--b2)]'}`} />
-                              ))}
-                            </div>
-                            <span className="text-[10px] font-semibold text-t3">{confidence}%</span>
-                          </div>
+                        <div className="flex items-center justify-end gap-3">
                           <div className="flex items-center gap-2">
-                            <button type="button" onClick={() => setActiveTab(alert.severity === 'high' ? 'risk' : 'opportunity')} className="inline-flex items-center gap-1.5 text-xs font-semibold text-t3 hover:text-t2 transition-colors">
-                              <Eye className="w-3 h-3" /> Details
-                            </button>
                           <button type="button" onClick={() => navigate(
                             alert.category === 'reputation' ? '/reviews' :
                             alert.category === 'staff' ? '/staff' :
@@ -371,7 +348,7 @@ export default function ClinicRadar() {
                               ? { state: { title: alert.title, branchName: alert.branchId ? branchOptions.find(branch => branch.id === alert.branchId)?.name : undefined, recommendedAction: alert.action } }
                               : undefined,
                           )} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition-colors">
-                              <Zap className="w-3 h-3" /> Run Action
+                              <Zap className="w-3 h-3" /> Review action
                             </button>
                           </div>
                         </div>
@@ -395,11 +372,11 @@ export default function ClinicRadar() {
         <div className="space-y-4">
           {/* Branch heatmap */}
           <BentoCard title="Nearby Competitors" subtitle="Local openings, ratings, and complaint themes" headerRight={
-            <span className={`badge ${competitorSource === 'live' ? 'badge-emerald' : 'badge-blue'}`}>{competitorSource === 'live' ? 'Live DB' : 'Loading'}</span>
+            <span className="badge badge-blue">{competitorSource === 'loaded' ? 'Data loaded' : 'Loading'}</span>
           }>
             <div className="space-y-3">
               {visibleCompetitors.length === 0 && (
-                <p className="text-xs text-t3">No live competitor rows returned for the selected clinic.</p>
+                <p className="text-xs text-t3">No competitor records are available for the selected clinic.</p>
               )}
               {visibleCompetitors.map((competitor) => (
                 <div key={competitor.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
@@ -427,27 +404,17 @@ export default function ClinicRadar() {
             </div>
           </BentoCard>
 
-          <BentoCard title="Branch Health Heatmap" subtitle="Comparative performance" headerRight={<BarChart3 className="w-4 h-4 text-t3" />}>
+          <BentoCard title="Signals by branch" subtitle="Count of loaded records that need review" headerRight={<BarChart3 className="w-4 h-4 text-t3" />}>
             <div className="space-y-3">
               {branchOptions.map((branch) => {
                 const signalCount = signals.filter(signal => signal.branchId === branch.id || signal.branchName === branch.name).length;
-                const score = Math.max(30, 100 - signalCount * 12);
                 return (
                 <div key={branch.id}>
                   <div className="flex items-center justify-between gap-2 mb-1.5">
                     <p className="text-xs font-semibold text-t2 truncate">{branch.name}</p>
-                    <span className={`badge ${
-                      score >= 75 ? 'badge-emerald' :
-                      score >= 55 ? 'badge-amber' :
-                      'badge-red'
-                    }`}>{score}/100</span>
+                    <span className={`badge ${signalCount > 0 ? 'badge-amber' : 'badge-blue'}`}>{signalCount} signal{signalCount === 1 ? '' : 's'}</span>
                   </div>
-                  <ProgressBar value={score} />
-                  <div className="flex items-center gap-3 mt-1.5 text-[11px] text-t3">
-                    <span>{signalCount} signals</span>
-                    <span>·</span>
-                    <span>Live competitor pressure</span>
-                  </div>
+                  <p className="text-[11px] text-t3">{signalCount > 0 ? 'Review source records before taking action.' : 'No current signals in this result set.'}</p>
                 </div>
               );})}
             </div>
@@ -477,26 +444,20 @@ export default function ClinicRadar() {
             </div>
           </BentoCard>
 
-          {/* Guardrails */}
-          <BentoCard title="Safe Operations" subtitle="Guardrails active">
+          {/* Decision checklist */}
+          <BentoCard title="Before you act" subtitle="Checks for staff reviewing a signal">
             <div className="space-y-2.5">
               {[
-                { text: 'No clinical diagnosis in outreach', ok: true },
-                { text: 'Consent verified before any marketing', ok: true },
-                { text: 'Audit trail for all sensitive access', ok: true },
-                { text: 'Opt-out compliance enforced', ok: true },
-              ].map((g, i) => (
+                'Open the source record and confirm it is current.',
+                'Confirm authority, consent, and suppression status in the destination workflow.',
+                'Treat estimated or suggested language as guidance, not a verified outcome.',
+                'Use the Control Plane to review available audit and integration evidence.',
+              ].map((text, i) => (
                 <div key={i} className="flex items-center gap-2.5">
-                  <ShieldCheck className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
-                  <p className="text-xs text-t2">{g.text}</p>
+                  <AlertCircle className="w-3.5 h-3.5 text-amber-v shrink-0" />
+                  <p className="text-xs text-t2">{text}</p>
                 </div>
               ))}
-            </div>
-            <div className="mt-3 p-3 rounded-xl bg-[var(--emerald-soft)] border border-[var(--b1)]">
-              <div className="flex items-center gap-2">
-                <TrendingUp className="w-3.5 h-3.5 text-emerald-v shrink-0" />
-                <p className="text-xs font-semibold text-emerald-v">All guardrails operational · No violations detected</p>
-              </div>
             </div>
           </BentoCard>
 
@@ -504,9 +465,9 @@ export default function ClinicRadar() {
           <BentoCard title="Quick Actions" subtitle="Common commands">
             <div className="space-y-2">
               {[
-                { label: 'Launch winback campaign', icon: <Sparkles className="w-3.5 h-3.5" />, action: () => navigate('/campaigner') },
-                { label: 'Fill empty Westside slots', icon: <AlertCircle className="w-3.5 h-3.5" />, action: () => navigate('/campaigner') },
-                { label: 'Assign missed-call queue', icon: <TrendingUp className="w-3.5 h-3.5" />, action: () => navigate('/ai-receptionist') },
+                { label: 'Review win-back campaign setup', icon: <Sparkles className="w-3.5 h-3.5" />, action: () => navigate('/campaigner') },
+                { label: 'Review scheduling gaps', icon: <AlertCircle className="w-3.5 h-3.5" />, action: () => navigate('/scheduling') },
+                { label: 'Review missed-call queue', icon: <TrendingUp className="w-3.5 h-3.5" />, action: () => navigate('/ai-receptionist') },
               ].map((a) => (
                 <button key={a.label} type="button" onClick={a.action} className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all text-left group">
                   <div className="text-t3 group-hover:text-indigo transition-colors">{a.icon}</div>

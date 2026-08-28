@@ -19,6 +19,25 @@ export const SECTION_TYPES = [
 ] as const;
 export type SectionType = typeof SECTION_TYPES[number];
 
+// Approved acknowledgement copy is server-owned and versioned. Clients submit
+// only the exact identifier returned in publicView; arbitrary text or a missing
+// checkbox can never be interpreted as acceptance.
+export const INTAKE_ACKNOWLEDGEMENTS = {
+  estimate_acknowledgement: {
+    id: 'estimate_acknowledgement:v1',
+    version: 'v1',
+    text: 'I understand the patient responsibility amount presented is an estimate, not a guarantee, and may change after insurer adjudication.',
+  },
+} as const;
+
+type AcknowledgementSection = keyof typeof INTAKE_ACKNOWLEDGEMENTS;
+
+function approvedAcknowledgement(sectionType: string) {
+  return sectionType in INTAKE_ACKNOWLEDGEMENTS
+    ? INTAKE_ACKNOWLEDGEMENTS[sectionType as AcknowledgementSection]
+    : null;
+}
+
 const REQUIRED_FOR_READINESS: SectionType[] = ['demographics', 'communication_consent', 'pre_visit_checklist'];
 const TOKEN_TTL_DAYS = 7;
 
@@ -38,8 +57,17 @@ export function hashValue(value: string | undefined | null): string | null {
   return createHash('sha256').update(value).digest('hex').slice(0, 32);
 }
 
-async function writeAudit(tenantId: string, actorUserId: string | null, action: string, resourceId: string, metadata: Prisma.InputJsonObject) {
-  await db.auditEvent.create({ data: { tenantId, actorUserId: actorUserId ?? undefined, action, resource: 'patientIntake', resourceId, userAgent: 'intake-engine', metadata } }).catch(() => {});
+async function writeAudit(
+  tenantId: string,
+  actorUserId: string | null,
+  action: string,
+  resourceId: string,
+  metadata: Prisma.InputJsonObject,
+  options: { tx?: Prisma.TransactionClient; critical?: boolean } = {},
+) {
+  const write = (options.tx ?? db).auditEvent.create({ data: { tenantId, actorUserId: actorUserId ?? undefined, action, resource: 'patientIntake', resourceId, userAgent: 'intake-engine', metadata } });
+  if (options.critical) await write;
+  else await write.catch(() => {});
 }
 
 // --- Context resolution + section planning ---------------------------------
@@ -160,17 +188,22 @@ export async function publicView(tenantId: string, packet: { id: string; status:
     readinessScore: packet.readinessScore,
     appointment: appointmentSummary,
     objectStorageEnabled: OBJECT_STORAGE_ENABLED,
-    sections: sections.map(s => ({ sectionType: s.sectionType, status: s.status, prompt: SECTION_PROMPT[s.sectionType] ?? 'Please complete this section.' })),
+    sections: sections.map(s => ({
+      sectionType: s.sectionType,
+      status: s.status,
+      prompt: SECTION_PROMPT[s.sectionType] ?? 'Please complete this section.',
+      acknowledgement: approvedAcknowledgement(s.sectionType),
+    })),
   };
 }
 
 const SECTION_PROMPT: Record<string, string> = {
   demographics: 'Confirm your contact details.',
-  communication_consent: 'Choose how we may contact you (SMS, email, voice). You can opt out anytime.',
+  communication_consent: 'Record any communication channels you do not want the clinic to use. This intake cannot grant outbound contact authority.',
   insurance: 'Add or update your insurance information.',
   insurance_card: 'Provide your insurance card details (metadata only — no image is stored).',
   photo_id: 'Provide your photo ID details (metadata only — no image is stored).',
-  payment_policy: 'Review and acknowledge the clinic payment policy.',
+  payment_policy: 'Payment-policy acknowledgment is unavailable until the clinic publishes exact versioned policy text.',
   estimate_acknowledgement: 'Review your estimated patient responsibility. This is an estimate, not a guarantee.',
   pre_visit_checklist: 'Confirm the pre-visit checklist.',
   consent_forms: 'Review and accept the consent forms.',
@@ -179,32 +212,81 @@ const SECTION_PROMPT: Record<string, string> = {
 
 // --- Section submission (idempotent per packet + sectionType) --------------
 export interface SectionSubmitContext { ipHash?: string | null; uaHash?: string | null; source?: string }
+export interface IntakeMutationOptions { tx?: Prisma.TransactionClient; deferNonCriticalEffects?: boolean }
+export interface SectionSubmissionOutcome {
+  sectionId: string;
+  tenantId: string;
+  packetId: string;
+  sectionType: string;
+  packetStarted: boolean;
+  insurancePatientId: string | null;
+  consentEvents: Array<{ eventType: 'intake.consent.accepted' | 'intake.consent.declined' | 'intake.estimate.acknowledged'; consentType: string; status: string }>;
+}
 
-export async function submitSection(tenantId: string, packetId: string, sectionType: string, data: Record<string, unknown>, ctx: SectionSubmitContext = {}, actorUserId?: string | null) {
-  const packet = await db.patientIntakePacket.findFirst({ where: { id: packetId, tenantId }, select: { id: true, patientId: true, leadId: true, status: true, startedAt: true } });
+/** Core intake mutation. The caller owns commit/rollback of `tx`. */
+export async function submitSectionMutation(
+  tx: Prisma.TransactionClient,
+  tenantId: string,
+  packetId: string,
+  sectionType: string,
+  data: Record<string, unknown>,
+  ctx: SectionSubmitContext = {},
+  actorUserId?: string | null,
+): Promise<SectionSubmissionOutcome> {
+  const packet = await tx.patientIntakePacket.findFirst({ where: { id: packetId, tenantId }, select: { id: true, patientId: true, leadId: true, status: true, startedAt: true } });
   if (!packet) throw new Error('packet_not_found');
-  const section = await db.patientIntakeSection.findFirst({ where: { packetId, sectionType } });
+  const section = await tx.patientIntakeSection.findFirst({ where: { packetId, sectionType } });
   if (!section) throw new Error('section_not_found');
+  if (sectionType === 'payment_policy') throw new Error('payment_policy_unavailable');
 
+  const acknowledgement = approvedAcknowledgement(sectionType);
+  if (acknowledgement) {
+    if (data.accepted !== true) throw new Error('explicit_acceptance_required');
+    if (data.acknowledgementId !== acknowledgement.id) throw new Error('acknowledgement_not_approved');
+  }
+
+  const packetStarted = packet.status === 'draft' || packet.status === 'sent';
   if (packet.status === 'draft' || packet.status === 'sent') {
-    await db.patientIntakePacket.update({ where: { id: packetId }, data: { status: 'in_progress', startedAt: packet.startedAt ?? new Date() } });
-    await emitBusinessEvent(tenantId, { eventType: 'intake.packet.started', entityType: 'intakePacket', entityId: packetId, sourceModule: 'intake', payload: {} }).catch(() => {});
+    await tx.patientIntakePacket.update({ where: { id: packetId }, data: { status: 'in_progress', startedAt: packet.startedAt ?? new Date() } });
   }
 
   // Sanitize stored section data — never store raw card/ID numbers or images.
   const safe = sanitizeSectionData(sectionType, data);
-  await db.patientIntakeSection.update({ where: { id: section.id }, data: { data: safe as Prisma.InputJsonValue, status: 'completed', completedAt: new Date() } });
-  await writeAudit(tenantId, actorUserId ?? null, 'intake.section.updated', section.id, { sectionType });
-  await emitBusinessEvent(tenantId, { eventType: 'intake.section.completed', entityType: 'intakeSection', entityId: section.id, sourceModule: 'intake', payload: { sectionType } }).catch(() => {});
+  await tx.patientIntakeSection.update({ where: { id: section.id }, data: { data: safe as Prisma.InputJsonValue, status: 'completed', completedAt: new Date() } });
+  await writeAudit(tenantId, actorUserId ?? null, 'intake.section.updated', section.id, { sectionType }, { tx, critical: true });
 
-  // Side effects per section type.
-  if (sectionType === 'communication_consent') await applyCommunicationConsent(tenantId, packet, data, ctx, actorUserId);
-  if (sectionType === 'insurance') await applyInsuranceUpdate(tenantId, packet, data, actorUserId);
-  if (sectionType === 'insurance_card' || sectionType === 'photo_id') await recordDocumentMetadata(tenantId, packetId, section.id, sectionType, data);
-  if (sectionType === 'estimate_acknowledgement') await recordConsent(tenantId, packet, 'estimate_acknowledgement', data, ctx, actorUserId, 'intake.estimate.acknowledged');
-  if (sectionType === 'payment_policy') await recordConsent(tenantId, packet, 'payment_policy', data, ctx, actorUserId);
+  // Related consent/insurance/document state is part of the same critical
+  // transaction. Only downstream workflow events are deferred until commit.
+  const consentEvents: SectionSubmissionOutcome['consentEvents'] = [];
+  if (sectionType === 'communication_consent') await applyCommunicationConsent(tx, tenantId, packet, data, ctx, actorUserId, consentEvents);
+  const insurancePatientId = sectionType === 'insurance' ? await applyInsuranceUpdate(tx, tenantId, packet, data, actorUserId) : null;
+  if (sectionType === 'insurance_card' || sectionType === 'photo_id') await recordDocumentMetadata(tx, tenantId, packetId, section.id, sectionType, data);
+  if (sectionType === 'estimate_acknowledgement') await recordConsent(tx, tenantId, packet, 'estimate_acknowledgement', data, ctx, actorUserId, consentEvents, 'intake.estimate.acknowledged');
+  if (sectionType === 'payment_policy') await recordConsent(tx, tenantId, packet, 'payment_policy', data, ctx, actorUserId, consentEvents);
 
-  return section.id;
+  return { sectionId: section.id, tenantId, packetId, sectionType, packetStarted, insurancePatientId, consentEvents };
+}
+
+export async function emitSectionSubmissionEffects(outcome: SectionSubmissionOutcome): Promise<void> {
+  if (outcome.packetStarted) {
+    await emitBusinessEvent(outcome.tenantId, { eventType: 'intake.packet.started', entityType: 'intakePacket', entityId: outcome.packetId, sourceModule: 'intake', payload: {} }).catch(() => {});
+  }
+  await emitBusinessEvent(outcome.tenantId, { eventType: 'intake.section.completed', entityType: 'intakeSection', entityId: outcome.sectionId, sourceModule: 'intake', payload: { sectionType: outcome.sectionType } }).catch(() => {});
+  for (const event of outcome.consentEvents) {
+    await emitBusinessEvent(outcome.tenantId, { eventType: event.eventType, entityType: 'intakePacket', entityId: outcome.packetId, sourceModule: 'intake', payload: { consentType: event.consentType, status: event.status } }).catch(() => {});
+  }
+  if (outcome.insurancePatientId) {
+    await emitBusinessEvent(outcome.tenantId, { eventType: 'intake.insurance.updated', entityType: 'patient', entityId: outcome.insurancePatientId, sourceModule: 'intake', payload: {} }).catch(() => {});
+  }
+}
+
+export async function submitSection(tenantId: string, packetId: string, sectionType: string, data: Record<string, unknown>, ctx: SectionSubmitContext = {}, actorUserId?: string | null, options: IntakeMutationOptions = {}) {
+  const outcome = options.tx
+    ? await submitSectionMutation(options.tx, tenantId, packetId, sectionType, data, ctx, actorUserId)
+    : await db.$transaction(tx => submitSectionMutation(tx, tenantId, packetId, sectionType, data, ctx, actorUserId));
+  // An outer-transaction caller must emit only after it has committed.
+  if (!options.deferNonCriticalEffects && !options.tx) await emitSectionSubmissionEffects(outcome);
+  return outcome.sectionId;
 }
 
 function sanitizeSectionData(sectionType: string, data: Record<string, unknown>): Record<string, unknown> {
@@ -218,6 +300,8 @@ function sanitizeSectionData(sectionType: string, data: Record<string, unknown>)
   if (sectionType === 'demographics') {
     return { firstName: str(data.firstName), lastName: str(data.lastName), email: str(data.email), phone: str(data.phone) };
   }
+  const acknowledgement = approvedAcknowledgement(sectionType);
+  if (acknowledgement) return { accepted: true, acknowledgementId: acknowledgement.id, version: acknowledgement.version };
   return data;
 }
 function str(v: unknown): string | null { return typeof v === 'string' && v.trim() ? v.trim().slice(0, 160) : null; }
@@ -225,69 +309,84 @@ function str(v: unknown): string | null { return typeof v === 'string' && v.trim
 // --- Consent reconciliation ------------------------------------------------
 const CHANNEL_CONSENT_TYPE: Record<string, string> = { sms: 'communication_sms', email: 'communication_email', voice: 'communication_voice' };
 
-async function applyCommunicationConsent(tenantId: string, packet: { id: string; patientId: string | null; leadId: string | null }, data: Record<string, unknown>, ctx: SectionSubmitContext, actorUserId?: string | null) {
+async function applyCommunicationConsent(tx: Prisma.TransactionClient, tenantId: string, packet: { id: string; patientId: string | null; leadId: string | null }, data: Record<string, unknown>, ctx: SectionSubmitContext, actorUserId: string | null | undefined, consentEvents: SectionSubmissionOutcome['consentEvents']) {
   for (const channel of ['sms', 'email', 'voice'] as const) {
-    if (!(channel in data)) continue; // only act on explicitly provided choices
-    const optedIn = data[channel] === true;
-    const status = optedIn ? 'opted_in' : 'opted_out';
-    // Update the campaign source of truth (idempotent on the unique key).
-    const existing = await db.communicationConsent.findFirst({ where: { tenantId, patientId: packet.patientId ?? null, leadId: packet.leadId ?? null, channel } });
-    if (existing) await db.communicationConsent.update({ where: { id: existing.id }, data: { status, source: 'intake', capturedAt: new Date(), revokedAt: optedIn ? null : new Date() } });
-    else await db.communicationConsent.create({ data: { tenantId, patientId: packet.patientId, leadId: packet.leadId, channel, status, source: 'intake', revokedAt: optedIn ? null : new Date() } });
-    await recordConsent(tenantId, packet, CHANNEL_CONSENT_TYPE[channel], { accepted: optedIn }, ctx, actorUserId, optedIn ? 'intake.consent.accepted' : 'intake.consent.declined');
+    // The generic intake disclosure is not a purpose/channel-specific grant.
+    // It can preserve a patient's restrictive choice, but never create or
+    // restore outbound authority from a checked box.
+    if (data[channel] !== false) continue;
+    const optedIn = false;
+    const status = 'opted_out';
+    const existing = await tx.communicationConsent.findFirst({ where: { tenantId, patientId: packet.patientId ?? null, leadId: packet.leadId ?? null, channel } });
+    if (existing) await tx.communicationConsent.update({ where: { id: existing.id }, data: { status, source: 'intake', capturedAt: new Date(), revokedAt: optedIn ? null : new Date() } });
+    else await tx.communicationConsent.create({ data: { tenantId, patientId: packet.patientId, leadId: packet.leadId, channel, status, source: 'intake', revokedAt: optedIn ? null : new Date() } });
+    await recordConsent(tx, tenantId, packet, CHANNEL_CONSENT_TYPE[channel], { accepted: optedIn }, ctx, actorUserId, consentEvents, 'intake.consent.declined');
   }
 }
 
 // Insert a versioned consent record (idempotent per packet + consentType +
 // status flip — never erases history; a new decision is a new accepted/revoked row).
-async function recordConsent(tenantId: string, packet: { id: string; patientId: string | null; leadId: string | null }, consentType: string, data: Record<string, unknown>, ctx: SectionSubmitContext, actorUserId?: string | null, eventType?: string) {
-  const accepted = data.accepted !== false; // estimate/payment acks default accepted
+async function recordConsent(tx: Prisma.TransactionClient, tenantId: string, packet: { id: string; patientId: string | null; leadId: string | null }, consentType: string, data: Record<string, unknown>, ctx: SectionSubmitContext, actorUserId: string | null | undefined, consentEvents: SectionSubmissionOutcome['consentEvents'], eventType?: 'intake.consent.accepted' | 'intake.consent.declined' | 'intake.estimate.acknowledged') {
+  const accepted = data.accepted === true;
   const status = accepted ? 'accepted' : 'declined';
-  const latest = await db.patientConsentRecord.findFirst({ where: { tenantId, packetId: packet.id, consentType }, orderBy: { createdAt: 'desc' } });
+  const acknowledgement = approvedAcknowledgement(consentType);
+  const latest = await tx.patientConsentRecord.findFirst({ where: { tenantId, packetId: packet.id, consentType }, orderBy: { createdAt: 'desc' } });
   if (latest && latest.status === status) return; // idempotent — same decision, no dup
-  await db.patientConsentRecord.create({
+  await tx.patientConsentRecord.create({
     data: {
       tenantId, packetId: packet.id, patientId: packet.patientId, leadId: packet.leadId, consentType, status,
-      source: ctx.source ?? 'intake', consentTextSnapshot: typeof data.consentText === 'string' ? data.consentText.slice(0, 500) : null,
+      version: acknowledgement?.version ?? 'v1',
+      source: ctx.source ?? 'intake', consentTextSnapshot: acknowledgement?.text ?? (typeof data.consentText === 'string' ? data.consentText.slice(0, 500) : null),
       acceptedAt: accepted ? new Date() : null, revokedAt: accepted ? null : new Date(), ipAddressHash: ctx.ipHash ?? null, userAgentHash: ctx.uaHash ?? null,
     },
   });
-  await writeAudit(tenantId, actorUserId ?? null, accepted ? 'intake.consent.accepted' : 'intake.consent.revoked', packet.id, { consentType, status });
-  if (eventType) await emitBusinessEvent(tenantId, { eventType: eventType as 'intake.consent.accepted', entityType: 'intakePacket', entityId: packet.id, sourceModule: 'intake', payload: { consentType, status } }).catch(() => {});
+  await writeAudit(tenantId, actorUserId ?? null, accepted ? 'intake.consent.accepted' : 'intake.consent.revoked', packet.id, {
+    consentType, status,
+    ...(acknowledgement ? { acknowledgementId: acknowledgement.id, version: acknowledgement.version } : {}),
+  }, { tx, critical: true });
+  if (eventType) consentEvents.push({ eventType, consentType, status });
 }
 
 // --- Insurance update (links to existing PatientInsurancePolicy) -----------
-async function applyInsuranceUpdate(tenantId: string, packet: { patientId: string | null }, data: Record<string, unknown>, actorUserId?: string | null) {
-  if (!packet.patientId) return;
+async function applyInsuranceUpdate(tx: Prisma.TransactionClient, tenantId: string, packet: { patientId: string | null }, data: Record<string, unknown>, actorUserId?: string | null): Promise<string | null> {
+  if (!packet.patientId) return null;
   const planName = str(data.planName); const memberId = str(data.memberId);
-  if (!planName || !memberId) return;
-  const patient = await db.patient.findFirst({ where: { id: packet.patientId, tenantId }, select: { branchId: true } });
-  if (!patient) return;
-  const active = await db.patientInsurancePolicy.findFirst({ where: { tenantId, patientId: packet.patientId, active: true } });
-  if (active && active.memberId === memberId) {
-    // Same policy → update details (idempotent, no duplicate policy).
-    await db.patientInsurancePolicy.update({ where: { id: active.id }, data: { planName, groupNumber: str(data.groupNumber) ?? active.groupNumber, verificationStatus: 'needs_review', verifiedAt: null } });
+  if (!planName || !memberId) return null;
+  const patient = await tx.patient.findFirst({ where: { id: packet.patientId, tenantId }, select: { branchId: true } });
+  if (!patient) return null;
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${tenantId}), hashtext(${packet.patientId!}))`;
+  const active = await tx.patientInsurancePolicy.findMany({
+    where: { tenantId, patientId: packet.patientId!, active: true },
+    orderBy: { coverageOrder: 'asc' },
+  });
+  const same = active.find(policy => policy.memberId === memberId);
+  if (same) {
+    await tx.patientInsurancePolicy.update({ where: { id: same.id }, data: { planName, groupNumber: str(data.groupNumber) ?? same.groupNumber, verificationStatus: 'needs_review', verifiedAt: null } });
   } else {
-    // New policy → supersede the old one.
-    if (active) await db.patientInsurancePolicy.updateMany({ where: { id: active.id }, data: { active: false } });
-    await db.patientInsurancePolicy.create({ data: { tenantId, branchId: patient.branchId, patientId: packet.patientId, planName, memberId, groupNumber: str(data.groupNumber), verificationStatus: 'needs_review' } });
+    // Intake must not silently replace primary coverage. A newly supplied card
+    // becomes the next coordination order and remains pending human review.
+    const nextOrder = Math.max(0, ...active.map(policy => policy.coverageOrder)) + 1;
+    await tx.patientInsurancePolicy.create({ data: { tenantId, branchId: patient.branchId, patientId: packet.patientId!, planName, memberId, groupNumber: str(data.groupNumber), coverageOrder: nextOrder, verificationStatus: 'needs_review' } });
   }
-  await writeAudit(tenantId, actorUserId ?? null, 'intake.insurance.updated', packet.patientId, { planName });
-  await emitBusinessEvent(tenantId, { eventType: 'intake.insurance.updated', entityType: 'patient', entityId: packet.patientId, sourceModule: 'intake', payload: {} }).catch(() => {});
+  await writeAudit(tenantId, actorUserId ?? null, 'intake.insurance.updated', packet.patientId, { source: 'patient_intake' }, { tx, critical: true });
+  return packet.patientId;
 }
 
 // --- Document metadata (metadata-only; never fakes binary upload) ----------
-async function recordDocumentMetadata(tenantId: string, packetId: string, sectionId: string, sectionType: string, data: Record<string, unknown>) {
+async function recordDocumentMetadata(tx: Prisma.TransactionClient, tenantId: string, packetId: string, sectionId: string, sectionType: string, data: Record<string, unknown>) {
   const docType = sectionType === 'photo_id' ? 'photo_id' : 'insurance_card_front';
-  const existing = await db.patientIntakeDocument.findFirst({ where: { tenantId, packetId, sectionId, documentType: docType } });
+  const existing = await tx.patientIntakeDocument.findFirst({ where: { tenantId, packetId, sectionId, documentType: docType } });
   const payload = { fileName: str(data.fileName), mimeType: str(data.mimeType), fileSize: typeof data.fileSize === 'number' ? data.fileSize : null, status: OBJECT_STORAGE_ENABLED ? 'uploaded' : 'metadata_only' as string };
-  if (existing) await db.patientIntakeDocument.update({ where: { id: existing.id }, data: payload });
-  else await db.patientIntakeDocument.create({ data: { tenantId, packetId, sectionId, documentType: docType, ...payload } });
+  if (existing) await tx.patientIntakeDocument.update({ where: { id: existing.id }, data: payload });
+  else await tx.patientIntakeDocument.create({ data: { tenantId, packetId, sectionId, documentType: docType, ...payload } });
 }
 
 // --- Submit (idempotent) ---------------------------------------------------
-export async function submitPacket(tenantId: string, packetId: string, actorUserId?: string | null) {
-  const packet = await db.patientIntakePacket.findFirst({ where: { id: packetId, tenantId }, include: { sections: true } });
+export type PacketSubmissionOutcome = Awaited<ReturnType<typeof submitPacketMutation>>;
+
+/** Core packet submission. The caller owns commit/rollback of `tx`. */
+export async function submitPacketMutation(tx: Prisma.TransactionClient, tenantId: string, packetId: string, actorUserId?: string | null) {
+  const packet = await tx.patientIntakePacket.findFirst({ where: { id: packetId, tenantId }, include: { sections: true } });
   if (!packet) throw new Error('packet_not_found');
   if (['submitted', 'needs_review', 'approved'].includes(packet.status)) {
     return { packet, alreadySubmitted: true }; // idempotent
@@ -296,11 +395,28 @@ export async function submitPacket(tenantId: string, packetId: string, actorUser
   const hasGaps = packet.sections.some(s => REQUIRED_FOR_READINESS.includes(s.sectionType as SectionType) && s.status !== 'completed')
     || packet.sections.some(s => s.status === 'needs_review');
   const status = hasGaps ? 'needs_review' : 'submitted';
-  const updated = await db.patientIntakePacket.update({ where: { id: packetId }, data: { status, submittedAt: new Date(), readinessScore: score }, include: { sections: true } });
-  await writeAudit(tenantId, actorUserId ?? null, 'intake.packet.submitted', packetId, { status, readinessScore: score });
-  await emitBusinessEvent(tenantId, { eventType: 'intake.packet.submitted', entityType: 'intakePacket', entityId: packetId, sourceModule: 'intake', payload: { status, readinessScore: score } }).catch(() => {});
-  await runIntakeIntelligence(tenantId, updated);
+  const changed = await tx.patientIntakePacket.updateMany({ where: { id: packetId, tenantId, status: packet.status }, data: { status, submittedAt: new Date(), readinessScore: score } });
+  if (changed.count !== 1) {
+    const current = await tx.patientIntakePacket.findFirstOrThrow({ where: { id: packetId, tenantId }, include: { sections: true } });
+    return { packet: current, alreadySubmitted: true };
+  }
+  const updated = await tx.patientIntakePacket.findFirstOrThrow({ where: { id: packetId, tenantId }, include: { sections: true } });
+  await writeAudit(tenantId, actorUserId ?? null, 'intake.packet.submitted', packetId, { status, readinessScore: score }, { tx, critical: true });
   return { packet: updated, alreadySubmitted: false };
+}
+
+export async function emitPacketSubmissionEffects(tenantId: string, outcome: PacketSubmissionOutcome): Promise<void> {
+  if (outcome.alreadySubmitted) return;
+  await emitBusinessEvent(tenantId, { eventType: 'intake.packet.submitted', entityType: 'intakePacket', entityId: outcome.packet.id, sourceModule: 'intake', payload: { status: outcome.packet.status, readinessScore: outcome.packet.readinessScore } }).catch(() => {});
+  await runIntakeIntelligence(tenantId, outcome.packet);
+}
+
+export async function submitPacket(tenantId: string, packetId: string, actorUserId?: string | null, options: IntakeMutationOptions = {}) {
+  const outcome = options.tx
+    ? await submitPacketMutation(options.tx, tenantId, packetId, actorUserId)
+    : await db.$transaction(tx => submitPacketMutation(tx, tenantId, packetId, actorUserId));
+  if (!options.deferNonCriticalEffects && !options.tx) await emitPacketSubmissionEffects(tenantId, outcome);
+  return outcome;
 }
 
 // --- Rule-based intelligence (gaps → signals/recs/tasks/alerts) ------------

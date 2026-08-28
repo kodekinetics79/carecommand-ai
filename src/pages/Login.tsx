@@ -1,6 +1,6 @@
 import { useState, type FormEvent, type ReactNode } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
-import { Lock, Mail, KeyRound, Smartphone, Eye, EyeOff, ShieldCheck, Users, Bot, TrendingUp, CalendarDays, BadgeCheck, CreditCard } from 'lucide-react';
+import { useLocation, useNavigate } from 'react-router';
+import { AlertCircle, ArrowLeft, Eye, EyeOff, Info, KeyRound, Lock, Mail, ShieldCheck, Smartphone, Users } from 'lucide-react';
 import { useSession } from '../hooks/useSession';
 import Logo from '../components/ui/Logo';
 import { mfaSetupWithToken, mfaVerifyWithToken, requestPasswordReset, confirmPasswordReset } from '../lib/session';
@@ -8,22 +8,33 @@ import { mfaSetupWithToken, mfaVerifyWithToken, requestPasswordReset, confirmPas
 type Mode = 'login' | 'mfa' | 'mfaSetup' | 'reset' | 'resetConfirm' | 'expired';
 const REMEMBER_KEY = 'cc_remember_email';
 
-const fieldWrap = 'flex items-center gap-2.5 rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3.5 py-2.5 focus-within:border-[var(--indigo)] focus-within:ring-2 focus-within:ring-[var(--indigo-soft)] transition';
-const fieldInput = 'w-full bg-transparent text-sm text-t1 outline-none placeholder:text-t3';
-const primaryBtn = 'w-full rounded-lg bg-[var(--indigo)] px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:opacity-90 active:scale-[0.99] transition disabled:opacity-50';
-// One repeating ECG/heart-monitor beat, 440 units wide, baseline y=40 (tiled + scrolled for a live trace).
-const ECG_PATH = 'M0 40 H70 l6 -3 l4 6 l6 -3 H150 l8 0 l4 -22 l6 40 l5 -18 H250 l6 0 l5 -4 l6 4 H440';
+// The <Logo> geometry, reused as the panel's only ornament — drafted as an
+// outline at ~25x scale and cropped by the corner.
+const BRAND_PULSE = 'M7 18 H11.2 L13 13.5 L16 21 L18.2 16.5 H21 L24 12.5';
+
+// Each mode announces where you are. Multi-step auth that silently swaps the
+// panel out from under the user is the main usability flaw of the old screen.
+const COPY: Record<Mode, { eyebrow: string; title: string; sub: string; step?: 1 | 2 }> = {
+  login:        { eyebrow: 'Secure sign-in',   title: 'Sign in to your workspace',   sub: 'Use the modules and locations assigned to your account.' },
+  mfa:          { eyebrow: 'Verification',     title: 'Confirm it’s you',            sub: 'Enter the 6-digit code from your authenticator app.', step: 2 },
+  mfaSetup:     { eyebrow: 'Set up MFA',       title: 'Add an authenticator',        sub: 'Your organization requires multi-factor authentication to continue.', step: 2 },
+  reset:        { eyebrow: 'Account recovery', title: 'Reset your password',         sub: 'We’ll generate a local development reset token for this email.' },
+  resetConfirm: { eyebrow: 'Account recovery', title: 'Choose a new password',       sub: 'Enter your reset token, then set a password that meets your policy.' },
+  expired:      { eyebrow: 'Account recovery', title: 'Your password has expired',   sub: 'It must be reset before you can sign in again.' },
+};
 
 export default function Login() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { signIn } = useSession();
+  const { signIn } = useSession({ hydrate: false });
 
-  // "Remember me" pre-fills the email on return (convenience only; no token change).
+  // Email-only convenience; authentication tokens and session duration are unchanged.
   const rememberedEmail = typeof localStorage !== 'undefined' ? localStorage.getItem(REMEMBER_KEY) : null;
   const [mode, setMode] = useState<Mode>('login');
   const [email, setEmail] = useState(rememberedEmail ?? '');
   const [password, setPassword] = useState('');
+  const [tenantSlug, setTenantSlug] = useState('');
+  const [tenantRequired, setTenantRequired] = useState(false);
   const [rememberMe, setRememberMe] = useState(rememberedEmail !== null);
   const [code, setCode] = useState('');
   const [resetToken, setResetToken] = useState('');
@@ -35,23 +46,33 @@ export default function Login() {
   const [info, setInfo] = useState<string | null>(null);
   const [showPw, setShowPw] = useState(false);
   const [showNewPw, setShowNewPw] = useState(false);
+  const resetUiAvailable = !import.meta.env.PROD;
 
   function goHome() {
     const destination = (location.state as { from?: string } | null)?.from ?? '/';
     navigate(destination, { replace: true });
   }
 
+  function backToLogin() {
+    setError(null); setInfo(null); setCode(''); setMode('login');
+  }
+
   async function run(fn: () => Promise<void>) {
     setLoading(true); setError(null);
-    try { await fn(); } catch (err) { setError(err instanceof Error ? err.message : 'Something went wrong'); }
+    try { await fn(); } catch (err) { setError(err instanceof Error ? err.message : 'We could not complete that request. Please try again.'); }
     finally { setLoading(false); }
   }
 
   const onLogin = (e: FormEvent) => { e.preventDefault(); void run(async () => {
     const cleanEmail = email.trim().toLowerCase();
     if (rememberMe) localStorage.setItem(REMEMBER_KEY, cleanEmail); else localStorage.removeItem(REMEMBER_KEY);
-    const result = await signIn(cleanEmail, password);
+    const result = await signIn(cleanEmail, password, tenantRequired ? tenantSlug.trim().toLowerCase() : undefined);
     if (result.kind === 'session') return goHome();
+    if (result.kind === 'tenant_required') {
+      setTenantRequired(true);
+      setInfo(result.message);
+      return;
+    }
     if (result.kind === 'mfa_required') { setMfaToken(result.mfaToken); setMode('mfa'); return; }
     if (result.kind === 'mfa_setup_required') {
       setMfaToken(result.mfaToken);
@@ -70,6 +91,11 @@ export default function Login() {
 
   const onResetRequest = (e: FormEvent) => { e.preventDefault(); void run(async () => {
     const res = await requestPasswordReset(email.trim().toLowerCase());
+    if (res.resetAvailable === false) {
+      setInfo('Self-service password reset is not configured. Contact your clinic administrator for account recovery.');
+      setMode('login');
+      return;
+    }
     setInfo(res.message);
     if (res.devToken) setResetToken(res.devToken); // dev-only convenience; absent in production
     setMode('resetConfirm');
@@ -81,209 +107,250 @@ export default function Login() {
     setNewPassword(''); setPassword(''); setMode('login');
   }); };
 
+  const copy = COPY[mode];
+
   return (
-    <div className="min-h-screen grid lg:grid-cols-[1.05fr_1fr] bg-[var(--bg)]">
-      {/* ── Brand panel — light, premium, on-theme ───────────── */}
-      <aside className="login-panel relative hidden lg:flex flex-col justify-center overflow-hidden px-14 py-12">
-        <div className="login-panel-accent pointer-events-none absolute inset-0" aria-hidden="true" />
-        <span className="login-orb login-orb-1" aria-hidden="true" />
-        <span className="login-orb login-orb-2" aria-hidden="true" />
-        <div className="login-grid" aria-hidden="true" />
-        {/* Live ECG / heart-monitor trace */}
-        <div className="login-ecg" aria-hidden="true">
-          <svg viewBox="0 0 1320 80" className="login-ecg-svg" preserveAspectRatio="none">
-            <g className="ecg-scroll">
-              <path d={ECG_PATH} />
-              <path d={ECG_PATH} transform="translate(440 0)" />
-              <path d={ECG_PATH} transform="translate(880 0)" />
-            </g>
-          </svg>
+    <div className="min-h-screen bg-[var(--paper)] lg:grid lg:grid-cols-[1.08fr_minmax(460px,0.92fr)]">
+
+      {/* ═══ Ink field — brand, cropped mark, module index ═══════════════ */}
+      <aside className="auth-ink relative hidden overflow-hidden lg:flex lg:flex-col lg:justify-between px-14 py-12 xl:px-16">
+        <svg className="auth-mark" viewBox="0 0 32 32" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+          <rect data-part="badge" x="2" y="2" width="28" height="28" rx="9" />
+          <rect data-part="badge" x="5.4" y="5.4" width="21.2" height="21.2" rx="6.4" />
+          <path data-part="pulse" d={BRAND_PULSE} />
+          <circle data-part="pulse" cx="24" cy="12.5" r="1.7" />
+        </svg>
+
+        <div className="auth-in relative flex items-center gap-3.5">
+          <Logo size={40} className="shrink-0" />
+          <div className="leading-none">
+            <p className="text-[17px] font-bold tracking-[-0.01em]">CareCommand <span style={{ color: 'var(--ink-accent)' }}>AI</span></p>
+            <p className="mt-2 text-[10px] font-semibold uppercase tracking-[0.2em]" style={{ color: 'var(--ink-t3)' }}>Clinic Operating System</p>
+          </div>
         </div>
 
-        {/* Prominent brand + tagline, centered, with product feature cards */}
-        <div className="relative w-full max-w-xl mx-auto lg:pl-6 xl:pl-12">
-          <div className="flex items-center gap-4 animate-fade-up">
-            <Logo size={56} glow className="shrink-0 logo-drop" />
-            <div>
-              <p className="text-[2.1rem] font-extrabold text-t1 leading-none tracking-tight">CareCommand <span className="text-indigo">AI</span></p>
-              <p className="text-[12px] font-bold text-indigo uppercase tracking-[0.22em] mt-2.5">Clinic Operating System</p>
-            </div>
-          </div>
-
-          <h1 className="text-[1.6rem] font-bold text-t1 leading-snug tracking-tight mt-8 animate-fade-up login-rise-1">
-            Run your entire clinic from <span className="text-indigo">one command center.</span>
+        <div className="relative max-w-[30rem] py-10">
+          <h1 className="auth-in auth-d1 text-[2.5rem] font-bold leading-[1.08] tracking-[-0.03em] xl:text-[2.85rem]">
+            Every clinic decision,
+            <br />
+            <span style={{ color: 'var(--ink-accent)' }}>one command center.</span>
           </h1>
-          <p className="text-[13.5px] text-t2 leading-relaxed mt-2.5 max-w-lg animate-fade-up login-rise-2">
-            Scheduling, revenue protection, patient growth, insurance, and an AI front desk — unified in one secure platform.
+          <p className="auth-in auth-d2 mt-5 max-w-[26rem] text-[14px] leading-relaxed" style={{ color: 'var(--ink-t2)' }}>
+            Scheduling, patient engagement, insurance and front-office work — held in a single
+            workspace instead of six browser tabs.
           </p>
 
-          <div className="grid grid-cols-2 gap-3 mt-7">
-            {FEATURES.map((f) => (
-              <div key={f.title}
-                className="feature-card group animate-fade-up rounded-xl border border-[var(--b1)] bg-gradient-to-b from-white/85 to-white/60 backdrop-blur px-4 py-3.5 shadow-sm">
-                <span className={`inline-flex w-9 h-9 rounded-lg items-center justify-center mb-2.5 transition-transform duration-200 group-hover:scale-110 group-hover:-rotate-3 ${f.chip}`}>
-                  <f.icon className="w-[18px] h-[18px]" aria-hidden="true" />
-                </span>
-                <p className="text-[13px] font-semibold text-t1 leading-tight">{f.title}</p>
-                <p className="text-[11.5px] text-t3 leading-snug mt-0.5">{f.sub}</p>
-              </div>
-            ))}
+          <div className="auth-in auth-d3 mt-11">
+            <p className="text-[10px] font-semibold uppercase tracking-[0.2em]" style={{ color: 'var(--ink-t3)' }}>In the workspace</p>
+            <ul className="mt-4 grid grid-cols-2 gap-x-10">
+              {MODULES.map(m => (
+                <li key={m.name} className="auth-module auth-rule py-3">
+                  <p className="auth-module-name text-[13.5px] font-semibold leading-tight" style={{ color: 'var(--ink-t1)' }}>{m.name}</p>
+                  <p className="mt-1 text-[11.5px] leading-snug" style={{ color: 'var(--ink-t3)' }}>{m.note}</p>
+                </li>
+              ))}
+            </ul>
+            <p className="mt-5 text-[11px]" style={{ color: 'var(--ink-t3)' }}>Modules appear once they are enabled for your clinic.</p>
           </div>
         </div>
 
-        <div className="absolute bottom-6 left-14 right-14 text-[11px] text-t3">
+        <p className="relative text-[11px]" style={{ color: 'var(--ink-t3)' }}>
           © {new Date().getFullYear()} CareCommand AI · Powered by{' '}
-          <a href="https://kodekinetics.com" target="_blank" rel="noopener noreferrer" className="text-t2 hover:text-indigo transition font-medium">Kode Kinetics</a>
-        </div>
+          <a href="https://kodekinetics.com" target="_blank" rel="noopener noreferrer" className="font-medium transition hover:text-white" style={{ color: 'var(--ink-t2)' }}>Kode Kinetics</a>
+        </p>
       </aside>
 
-      {/* ── Sign-in ──────────────────────────────────────────── */}
-      <main className="flex flex-col items-center justify-center px-6 py-10 sm:px-10">
-        <div className="w-full max-w-sm">
-          <div className="lg:hidden mb-8 flex items-center gap-3">
-            <Logo size={38} className="shrink-0" />
-            <div>
-              <p className="text-[15px] font-bold text-t1 tracking-tight">CareCommand AI</p>
-              <p className="text-[11px] text-t3">Clinic Operating System</p>
-            </div>
+      {/* ═══ Paper field — the form ══════════════════════════════════════ */}
+      <main className="auth-paper relative flex min-h-screen flex-col lg:min-h-0">
+        {/* Mobile keeps the brand band rather than dropping the identity entirely. */}
+        <div className="auth-band flex items-center gap-3 px-6 py-5 sm:px-10 lg:hidden">
+          <Logo size={32} className="shrink-0" />
+          <div className="leading-none">
+            <p className="text-[14px] font-bold tracking-[-0.01em]">CareCommand <span style={{ color: 'var(--ink-accent)' }}>AI</span></p>
+            <p className="mt-1.5 text-[9.5px] font-semibold uppercase tracking-[0.18em]" style={{ color: 'var(--ink-t3)' }}>Clinic Operating System</p>
           </div>
+        </div>
 
-          <div className="mb-6">
-            <h2 className="text-[1.35rem] font-bold text-t1 tracking-tight">Sign in to your clinic workspace</h2>
-            <p className="text-[13px] text-t3 mt-1.5 leading-relaxed">
-              Access scheduling, CRM, payments, revenue protection, and operational insights from one secure platform.
+        <div className="flex flex-1 items-center justify-center px-5 py-10 sm:px-10 sm:py-12">
+          <div className="auth-card auth-in w-full max-w-[456px] px-6 py-8 sm:px-9 sm:py-9">
+
+            <header className="mb-7">
+              <div className="flex items-center justify-between">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-indigo">{copy.eyebrow}</p>
+                {copy.step && (
+                  <div className="auth-rail flex gap-1.5" aria-hidden="true">
+                    <span className="on" /><span className={copy.step === 2 ? 'on' : ''} />
+                  </div>
+                )}
+              </div>
+              <h2 className="mt-3 text-[1.5rem] font-bold leading-tight tracking-[-0.02em] text-t1">{copy.title}</h2>
+              <p className="mt-2 text-[13px] leading-relaxed text-t2">{copy.sub}</p>
+            </header>
+
+            {error && <Banner tone="error">{error}</Banner>}
+            {info && !error && <Banner tone="info">{info}</Banner>}
+
+            {mode === 'login' && (
+              <form onSubmit={onLogin} className="space-y-4">
+                <Field label="Email" icon={<Mail className="h-4 w-4 shrink-0 text-t3" />}>
+                  <input type="email" value={email} onChange={e => { setEmail(e.target.value); setTenantRequired(false); setTenantSlug(''); }} className="auth-input" placeholder="you@clinic.com" autoComplete="email" required autoFocus />
+                </Field>
+                <Field label="Password" icon={<Lock className="h-4 w-4 shrink-0 text-t3" />}>
+                  <input type={showPw ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} className="auth-input" placeholder="••••••••" autoComplete="current-password" required />
+                  <PwReveal shown={showPw} onToggle={() => setShowPw(v => !v)} />
+                </Field>
+                {tenantRequired && (
+                  <Field label="Clinic workspace" icon={<Users className="h-4 w-4 shrink-0 text-t3" />}>
+                    <input value={tenantSlug} onChange={e => setTenantSlug(e.target.value)} className="auth-input" placeholder="your-clinic" autoComplete="organization" required autoFocus />
+                  </Field>
+                )}
+
+                <div className="flex items-center justify-between gap-3 pt-0.5">
+                  <label className="inline-flex cursor-pointer select-none items-center gap-2">
+                    <input type="checkbox" checked={rememberMe} onChange={e => setRememberMe(e.target.checked)}
+                      className="h-[15px] w-[15px] rounded border-[var(--b2)] accent-[var(--indigo)] focus-visible:outline-2 focus-visible:outline-[var(--indigo)]" />
+                    {/* Say exactly what is stored: the email only, never a session. */}
+                    <span className="text-[13px] text-t2">Remember email on this device</span>
+                  </label>
+                  {resetUiAvailable
+                    ? <button type="button" onClick={() => { setError(null); setInfo(null); setMode('reset'); }} className="rounded text-[13px] font-semibold text-indigo hover:underline">Forgot password?</button>
+                    : <span className="text-[11.5px] text-t3">Account recovery: contact your administrator</span>}
+                </div>
+
+                <Submit loading={loading} label="Sign in" busyLabel="Signing in…" />
+              </form>
+            )}
+
+            {(mode === 'mfa' || mode === 'mfaSetup') && (
+              <form onSubmit={onMfaVerify} className="space-y-4">
+                {mode === 'mfaSetup' && mfaSetupData && (
+                  <div className="rounded-xl border border-[var(--b1)] bg-white p-4">
+                    <p className="inline-flex items-center gap-2 text-[12px] font-semibold text-t1"><Smartphone className="h-3.5 w-3.5 text-indigo" aria-hidden="true" /> Add this key to your authenticator</p>
+                    <code aria-label="Authenticator setup key" className="mt-2.5 block break-all rounded-lg bg-[var(--s3)] px-2.5 py-2 font-mono text-[11.5px] text-t1">{mfaSetupData.secret}</code>
+                    <p id="mfa-setup-help" className="mt-2.5 text-[11.5px] leading-relaxed text-t3">Then enter the 6-digit code it generates. Keep the setup key private.</p>
+                  </div>
+                )}
+                <Field label="Verification code" icon={<KeyRound className="h-4 w-4 shrink-0 text-t3" />}>
+                  <input inputMode="numeric" value={code} onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))} className="auth-input font-mono tracking-[0.3em]" placeholder="123456" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} aria-describedby={mode === 'mfaSetup' ? 'mfa-setup-help' : undefined} required autoFocus />
+                </Field>
+                <Submit loading={loading} label="Verify & continue" busyLabel="Verifying…" />
+                <BackLink onClick={backToLogin} />
+              </form>
+            )}
+
+            {mode === 'reset' && (
+              <form onSubmit={onResetRequest} className="space-y-4">
+                <Field label="Email" icon={<Mail className="h-4 w-4 shrink-0 text-t3" />}>
+                  <input type="email" value={email} onChange={e => setEmail(e.target.value)} className="auth-input" placeholder="you@clinic.com" autoComplete="email" required autoFocus />
+                </Field>
+                <Submit loading={loading} label="Generate local reset token" busyLabel="Generating…" />
+                <BackLink onClick={backToLogin} />
+              </form>
+            )}
+
+            {mode === 'resetConfirm' && (
+              <form onSubmit={onResetConfirm} className="space-y-4">
+                <Field label="Reset token" icon={<KeyRound className="h-4 w-4 shrink-0 text-t3" />}>
+                  <input value={resetToken} onChange={e => setResetToken(e.target.value)} className="auth-input" placeholder="Paste the reset token" autoComplete="off" required autoFocus />
+                </Field>
+                <Field label="New password" icon={<Lock className="h-4 w-4 shrink-0 text-t3" />}>
+                  <input type={showNewPw ? 'text' : 'password'} value={newPassword} onChange={e => setNewPassword(e.target.value)} className="auth-input" placeholder="Follow your organization’s password policy" autoComplete="new-password" required />
+                  <PwReveal shown={showNewPw} onToggle={() => setShowNewPw(v => !v)} />
+                </Field>
+                <Submit loading={loading} label="Reset password" busyLabel="Updating…" />
+                <BackLink onClick={backToLogin} />
+              </form>
+            )}
+
+            {mode === 'expired' && (
+              <div className="space-y-4">
+                {resetUiAvailable
+                  ? <button type="button" onClick={() => { setError(null); setInfo(null); setMode('reset'); }} className="auth-submit">Reset password</button>
+                  : <p role="alert" className="rounded-xl border border-[var(--b1)] bg-[var(--amber-soft)] px-4 py-3 text-[13px] text-amber-v">Self-service password reset is unavailable. Contact your clinic administrator.</p>}
+                <BackLink onClick={backToLogin} />
+              </div>
+            )}
+
+            <p className="mt-6 flex items-center justify-center gap-1.5 text-[11.5px] text-t3">
+              <ShieldCheck className="h-3.5 w-3.5 text-emerald-v" aria-hidden="true" /> Role-based access · recorded account activity
             </p>
           </div>
-
-          {error && <Banner tone="red">{error}</Banner>}
-          {info && !error && <Banner tone="blue">{info}</Banner>}
-
-          {mode === 'login' && (
-            <form onSubmit={onLogin} className="space-y-4">
-              <Labeled label="Email" icon={<Mail className="w-4 h-4 text-t3 shrink-0" />}>
-                <input type="email" value={email} onChange={e => setEmail(e.target.value)} className={fieldInput} placeholder="you@clinic.com" autoComplete="email" autoFocus />
-              </Labeled>
-              <Labeled label="Password" icon={<Lock className="w-4 h-4 text-t3 shrink-0" />}>
-                <input type={showPw ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} className={fieldInput} placeholder="••••••••" autoComplete="current-password" />
-                <PwReveal shown={showPw} onToggle={() => setShowPw(v => !v)} />
-              </Labeled>
-
-              <div className="flex items-center justify-between">
-                <label className="inline-flex items-center gap-2 cursor-pointer select-none">
-                  <input type="checkbox" checked={rememberMe} onChange={e => setRememberMe(e.target.checked)}
-                    className="h-4 w-4 rounded border-[var(--b2)] text-[var(--indigo)] accent-[var(--indigo)] focus-visible:outline-2 focus-visible:outline-[var(--indigo)]" />
-                  <span className="text-[13px] text-t2">Remember me</span>
-                </label>
-                <button type="button" onClick={() => { setError(null); setInfo(null); setMode('reset'); }} className="text-[13px] font-semibold text-indigo hover:underline">Forgot password?</button>
-              </div>
-
-              <button type="submit" disabled={loading} className={primaryBtn}>{loading ? 'Signing in…' : 'Sign in'}</button>
-
-              <p className="flex items-center justify-center gap-1.5 text-[11px] text-t3">
-                <ShieldCheck className="w-3.5 h-3.5 text-emerald-v" aria-hidden="true" /> Protected workspace · Integration-ready · audit-ready
-              </p>
-            </form>
-          )}
-
-          {(mode === 'mfa' || mode === 'mfaSetup') && (
-            <form onSubmit={onMfaVerify} className="space-y-4">
-              {mode === 'mfaSetup' && mfaSetupData && (
-                <div className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3 space-y-2">
-                  <p className="text-xs font-semibold text-t2 inline-flex items-center gap-1.5"><Smartphone className="w-3.5 h-3.5" /> Set up your authenticator</p>
-                  <p className="text-[11px] text-t3">Your organization requires MFA. Add this secret to an authenticator app (Google Authenticator, 1Password, Authy), then enter the 6-digit code.</p>
-                  <code className="block break-all rounded-lg bg-[var(--s2)] px-2 py-1.5 text-[11px] font-mono text-t1">{mfaSetupData.secret}</code>
-                </div>
-              )}
-              {mode === 'mfa' && <p className="text-sm text-t2">Enter the 6-digit code from your authenticator app.</p>}
-              <Labeled label="Verification code" icon={<KeyRound className="w-4 h-4 text-t3 shrink-0" />}>
-                <input inputMode="numeric" value={code} onChange={e => setCode(e.target.value)} className={fieldInput} placeholder="123456" autoComplete="one-time-code" maxLength={6} autoFocus />
-              </Labeled>
-              <button type="submit" disabled={loading} className={primaryBtn}>{loading ? 'Verifying…' : 'Verify & continue'}</button>
-              <button type="button" onClick={() => { setMode('login'); setCode(''); }} className="w-full text-center text-[13px] font-semibold text-t3 hover:underline">Back to sign in</button>
-            </form>
-          )}
-
-          {mode === 'reset' && (
-            <form onSubmit={onResetRequest} className="space-y-4">
-              <p className="text-sm text-t2">Enter your email to start a password reset.</p>
-              <Labeled label="Email" icon={<Mail className="w-4 h-4 text-t3 shrink-0" />}>
-                <input type="email" value={email} onChange={e => setEmail(e.target.value)} className={fieldInput} placeholder="you@clinic.com" autoComplete="email" autoFocus />
-              </Labeled>
-              <button type="submit" disabled={loading} className={primaryBtn}>{loading ? 'Sending…' : 'Send reset link'}</button>
-              <button type="button" onClick={() => { setError(null); setInfo(null); setMode('login'); }} className="w-full text-center text-[13px] font-semibold text-t3 hover:underline">Back to sign in</button>
-            </form>
-          )}
-
-          {mode === 'resetConfirm' && (
-            <form onSubmit={onResetConfirm} className="space-y-4">
-              <p className="text-sm text-t2">Enter the reset token and choose a new password.</p>
-              <Labeled label="Reset token" icon={<KeyRound className="w-4 h-4 text-t3 shrink-0" />}>
-                <input value={resetToken} onChange={e => setResetToken(e.target.value)} className={fieldInput} placeholder="paste token" autoFocus />
-              </Labeled>
-              <Labeled label="New password" icon={<Lock className="w-4 h-4 text-t3 shrink-0" />}>
-                <input type={showNewPw ? 'text' : 'password'} value={newPassword} onChange={e => setNewPassword(e.target.value)} className={fieldInput} placeholder="At least 8 characters" autoComplete="new-password" />
-                <PwReveal shown={showNewPw} onToggle={() => setShowNewPw(v => !v)} />
-              </Labeled>
-              <button type="submit" disabled={loading} className={primaryBtn}>{loading ? 'Updating…' : 'Reset password'}</button>
-              <button type="button" onClick={() => { setError(null); setInfo(null); setMode('login'); }} className="w-full text-center text-[13px] font-semibold text-t3 hover:underline">Back to sign in</button>
-            </form>
-          )}
-
-          {mode === 'expired' && (
-            <div className="space-y-4">
-              <p className="text-sm text-t2">{info ?? 'Your password has expired and must be reset before signing in.'}</p>
-              <button type="button" onClick={() => { setError(null); setInfo(null); setMode('reset'); }} className={primaryBtn}>Reset password</button>
-            </div>
-          )}
-
-          {/* Footer */}
-          <div className="mt-9 pt-5 border-t border-[var(--b1)] flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5 text-[11px] text-t3">
-            <a href="#" className="hover:text-t1 transition">Privacy</a>
-            <span className="text-[var(--b2)]" aria-hidden="true">·</span>
-            <a href="#" className="hover:text-t1 transition">Terms</a>
-            <span className="text-[var(--b2)]" aria-hidden="true">·</span>
-            <a href="#" className="hover:text-t1 transition">Security</a>
-            <span className="text-[var(--b2)]" aria-hidden="true">·</span>
-            <a href="mailto:support@carecommand.ai" className="hover:text-t1 transition">Support</a>
-          </div>
-          <p className="mt-3 text-center text-[11px] text-t3">
-            Powered by{' '}
-            <a href="https://kodekinetics.com" target="_blank" rel="noopener noreferrer" className="font-medium text-t2 hover:text-t1 transition">Kode Kinetics</a>
-          </p>
         </div>
+
+        <footer className="px-6 pb-7 sm:px-10">
+          <div className="mx-auto flex w-full max-w-[456px] flex-wrap items-center justify-center gap-x-4 gap-y-1.5 text-[11.5px] text-t3">
+            <a href="mailto:support@carecommand.ai" className="transition hover:text-t1">Support</a>
+            <span className="text-[var(--b2)]" aria-hidden="true">·</span>
+            <a href="mailto:security@carecommand.ai?subject=CareCommand%20security%20report" className="transition hover:text-t1">Report a security issue</a>
+            <span className="text-[var(--b2)] lg:hidden" aria-hidden="true">·</span>
+            <a href="https://kodekinetics.com" target="_blank" rel="noopener noreferrer" className="transition hover:text-t1 lg:hidden">Kode Kinetics</a>
+          </div>
+        </footer>
       </main>
     </div>
   );
 }
 
-const FEATURES: Array<{ icon: typeof ShieldCheck; title: string; sub: string; chip: string }> = [
-  { icon: Bot, title: 'AI Receptionist', sub: 'Answers calls & books 24/7', chip: 'bg-[var(--indigo-soft)] text-indigo' },
-  { icon: TrendingUp, title: 'Revenue Leak Recovery', sub: 'Finds & recovers lost revenue', chip: 'bg-emerald-50 text-emerald-600' },
-  { icon: CalendarDays, title: 'Smart Scheduling', sub: 'Fills gaps, cuts no-shows', chip: 'bg-blue-50 text-blue-600' },
-  { icon: Users, title: 'Patient CRM & Reactivation', sub: 'Win-backs & retention', chip: 'bg-violet-50 text-violet-600' },
-  { icon: BadgeCheck, title: 'Insurance & Eligibility', sub: 'Prevent denials before they happen', chip: 'bg-cyan-50 text-cyan-600' },
-  { icon: CreditCard, title: 'Payments & Deposits', sub: 'Protect every booking', chip: 'bg-amber-50 text-amber-600' },
+// Monochrome and typographic — a contents list, not six pastel marketing cards.
+const MODULES: Array<{ name: string; note: string }> = [
+  { name: 'AI Receptionist', note: 'Calls, handoffs, booking' },
+  { name: 'Scheduling',      note: 'Slots and appointments' },
+  { name: 'Patient CRM',     note: 'Consent-aware outreach' },
+  { name: 'Insurance',       note: 'Eligibility and follow-up' },
+  { name: 'Revenue',         note: 'Risks and work queues' },
+  { name: 'Payments',        note: 'Requests and confirmations' },
 ];
 
-function PwReveal({ shown, onToggle }: { shown: boolean; onToggle: () => void }) {
+function Submit({ loading, label, busyLabel }: { loading: boolean; label: string; busyLabel: string }) {
   return (
-    <button type="button" onClick={onToggle} className="text-t3 hover:text-t1 transition shrink-0 focus-visible:outline-2 focus-visible:outline-[var(--indigo)] rounded"
-      aria-label={shown ? 'Hide password' : 'Show password'} title={shown ? 'Hide password' : 'Show password'}>
-      {shown ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+    <button type="submit" disabled={loading} className="auth-submit inline-flex items-center justify-center gap-2">
+      {loading && (
+        <svg className="auth-spin h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeOpacity="0.3" strokeWidth="2.5" />
+          <path d="M14.5 8A6.5 6.5 0 0 0 8 1.5" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
+        </svg>
+      )}
+      {loading ? busyLabel : label}
     </button>
   );
 }
 
-function Labeled({ label, icon, children }: { label: string; icon: ReactNode; children: ReactNode }) {
+function BackLink({ onClick }: { onClick: () => void }) {
+  return (
+    <button type="button" onClick={onClick} className="inline-flex w-full items-center justify-center gap-1.5 rounded py-1 text-[13px] font-semibold text-t3 transition hover:text-t1">
+      <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" /> Back to sign in
+    </button>
+  );
+}
+
+function PwReveal({ shown, onToggle }: { shown: boolean; onToggle: () => void }) {
+  return (
+    <button type="button" onClick={onToggle} className="shrink-0 rounded text-t3 transition hover:text-t1 focus-visible:outline-2 focus-visible:outline-[var(--indigo)]"
+      aria-label={shown ? 'Hide password' : 'Show password'} title={shown ? 'Hide password' : 'Show password'}>
+      {shown ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+    </button>
+  );
+}
+
+function Field({ label, icon, children }: { label: string; icon: ReactNode; children: ReactNode }) {
   return (
     <label className="block">
-      <span className="mb-1.5 block text-xs font-semibold text-t2">{label}</span>
-      <div className={fieldWrap}>{icon}{children}</div>
+      <span className="mb-1.5 block text-[12px] font-semibold text-t2">{label}</span>
+      <div className="auth-field">{icon}{children}</div>
     </label>
   );
 }
 
-function Banner({ tone, children }: { tone: 'red' | 'blue'; children: ReactNode }) {
-  const cls = tone === 'red' ? 'border-[var(--red-soft)] bg-[var(--red-soft)] text-red-v' : 'border-[var(--b1)] bg-[var(--blue-soft)] text-blue-v';
-  return <div className={`mb-4 rounded-xl border px-4 py-3 text-sm ${cls}`}>{children}</div>;
+function Banner({ tone, children }: { tone: 'error' | 'info'; children: ReactNode }) {
+  const isError = tone === 'error';
+  const Icon = isError ? AlertCircle : Info;
+  return (
+    <div role={isError ? 'alert' : 'status'} aria-live="polite"
+      className={`mb-5 flex items-start gap-2.5 rounded-xl border px-3.5 py-3 text-[13px] leading-relaxed ${
+        isError ? 'border-[rgba(220,38,38,0.22)] bg-[var(--red-soft)] text-red-v' : 'border-[rgba(37,99,235,0.20)] bg-[var(--blue-soft)] text-blue-v'
+      }`}>
+      <Icon className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+      <span>{children}</span>
+    </div>
+  );
 }

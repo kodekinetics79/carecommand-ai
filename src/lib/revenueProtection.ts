@@ -1,5 +1,6 @@
 import { apiRequest } from './api';
 import { formatCurrency } from '../utils/formatters';
+import { eligibilityRequestHeaders, runEligibilityAction } from './eligibilityIdempotency';
 
 export type RevenueProtectionMode = 'mock' | 'sandbox' | 'live';
 
@@ -279,11 +280,9 @@ export async function fetchRevenueProtectionIntegrationStatus() {
   return apiRequest<RevenueProtectionIntegrationStatus>('/v1/revenue-protection/integration-status');
 }
 
-export async function checkEligibility(input: { patientId?: string; appointmentId?: string; branchId?: string; payerId?: string; serviceType?: string }) {
-  return apiRequest<EligibilityVerification>('/v1/revenue-protection/eligibility/check', {
-    method: 'POST',
-    body: JSON.stringify(input),
-  });
+export async function checkEligibility(input: { patientId?: string; appointmentId?: string; branchId?: string; payerId?: string; serviceType?: string }, idempotencyKey?: string) {
+  const send = (key: string) => apiRequest<EligibilityVerification>('/v1/revenue-protection/eligibility/check', { method: 'POST', headers: eligibilityRequestHeaders(key), body: JSON.stringify(input) });
+  return idempotencyKey ? send(idempotencyKey) : runEligibilityAction('revenue_protection_v1', input, send);
 }
 
 export async function markEligibilityVerified(id: string) {

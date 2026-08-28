@@ -1,14 +1,16 @@
-import { db } from './db';
 import { env } from '../config/env';
 import { generatePasswordHash, validatePassword } from './security';
 import { recomputeEntitlements } from './entitlements';
 import { seedComplianceBaseline } from '../modules/compliance/baseline';
+import { validateIanaTimezone } from './scheduling';
+import { Prisma, type PrismaClient } from '../generated/prisma/client';
+import { lockTenantProvisioningIdentity } from './tenantProvisioningLocks';
 
 // ===========================================================================
-// Tenant provisioning — the full onboarding flow used by the operator-gated
-// onboarding endpoint. Creates a tenant, default branch, owner user, compliance
-// baseline (incl. default TenantSecurityPolicy), and a default TRIAL Starter
-// subscription, then recomputes entitlements. Audited. Never returns secrets.
+// Offline/test provisioning primitive. The legacy HTTP endpoint is retired and
+// runtime provisioning uses platformTenantProvisioning with the dedicated
+// least-privilege platform client. Requiring an explicit client prevents this
+// helper from silently falling back to the tenant-RLS runtime identity.
 // ===========================================================================
 
 export interface ProvisionInput {
@@ -31,54 +33,61 @@ export class ProvisionError extends Error {
   constructor(public code: string, message: string) { super(message); }
 }
 
-export async function provisionTenant(input: ProvisionInput) {
+export async function provisionTenant(input: ProvisionInput, client: PrismaClient) {
   const slug = input.clinicSlug.trim().toLowerCase();
   if (!/^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])$/.test(slug)) {
     throw new ProvisionError('invalid_slug', 'Slug must be 3-40 chars: lowercase letters, numbers, and hyphens.');
   }
   const email = input.ownerEmail.trim().toLowerCase();
+  const timezone = validateIanaTimezone(input.timezone ?? 'America/New_York');
   const pw = validatePassword(input.ownerPassword);
   if (!pw.ok) throw new ProvisionError('weak_password', pw.message ?? 'Password does not meet policy.');
 
-  if (await db.tenant.findUnique({ where: { slug } })) throw new ProvisionError('slug_taken', 'That clinic slug is already in use.');
-  // Login resolves users by email across tenants, so enforce global email uniqueness.
-  if (await db.user.findFirst({ where: { email } })) throw new ProvisionError('email_taken', 'That owner email is already in use.');
-
   const planKey = input.planKey ?? 'starter';
-  const plan = await db.subscriptionPlan.findUnique({ where: { key: planKey } });
-  if (!plan) throw new ProvisionError('plan_unavailable', 'Subscription catalog is not seeded.');
-
-  const tenant = await db.tenant.create({ data: { name: input.clinicName.trim(), slug } });
-  const branch = await db.branch.create({
-    data: { tenantId: tenant.id, name: input.defaultBranchName.trim(), location: (input.address ?? input.clinicName).trim(), ...(input.timezone ? { timezone: input.timezone } : {}) },
-  });
-  const owner = await db.user.create({
-    data: {
-      tenantId: tenant.id, branchId: branch.id, email, displayName: input.ownerName.trim(), role: 'OWNER',
-      passwordHash: await generatePasswordHash(input.ownerPassword), passwordChangedAt: new Date(), active: true,
-    },
-  });
-
-  // Compliance baseline (also creates the default TenantSecurityPolicy).
-  await seedComplianceBaseline(db, tenant.id);
-
-  const now = new Date();
+  const passwordHash = await generatePasswordHash(input.ownerPassword);
   const trialDays = input.trialDays ?? env.TRIAL_DAYS;
-  const trialEndsAt = new Date(now.getTime() + trialDays * 86400000);
   const status = input.status ?? 'TRIAL';
-  const subscription = await db.tenantSubscription.create({
-    data: { tenantId: tenant.id, planId: plan.id, status, startedAt: now, trialEndsAt: status === 'TRIAL' ? trialEndsAt : null, currentPeriodEnd: status === 'TRIAL' ? trialEndsAt : null },
-  });
-  await recomputeEntitlements(tenant.id);
-
   const actorLabel = input.actorLabel ?? 'platform-operator';
-  await db.auditEvent.create({ data: { tenantId: tenant.id, action: 'tenant.created', resource: 'tenant', resourceId: tenant.id, userAgent: actorLabel, metadata: { slug, plan: planKey, status } } });
-  await db.auditEvent.create({ data: { tenantId: tenant.id, action: 'tenant.owner.created', resource: 'user', resourceId: owner.id, userAgent: actorLabel, metadata: { email } } });
-
-  return {
-    tenant: { id: tenant.id, name: tenant.name, slug: tenant.slug },
-    owner: { id: owner.id, email: owner.email, displayName: owner.displayName, role: owner.role },
-    branch: { id: branch.id, name: branch.name },
-    subscription: { planKey, status, trialEndsAt: subscription.trialEndsAt?.toISOString() ?? null },
-  };
+  try {
+    return await client.$transaction(async tx => {
+      await lockTenantProvisioningIdentity(tx, slug, email);
+      // Every existence check is repeated inside the transaction. Unique
+      // constraints remain the final race guard and any later failure rolls the
+      // entire tenant graph back for a clean retry.
+      if (await tx.tenant.findUnique({ where: { slug } })) throw new ProvisionError('slug_taken', 'That clinic slug is already in use.');
+      if (await tx.user.findFirst({ where: { email: { equals: email, mode: 'insensitive' } } })) throw new ProvisionError('email_taken', 'That owner email is already in use.');
+      const plan = await tx.subscriptionPlan.findUnique({ where: { key: planKey } });
+      if (!plan) throw new ProvisionError('plan_unavailable', 'Subscription catalog is not seeded.');
+      const tenant = await tx.tenant.create({ data: { name: input.clinicName.trim(), slug } });
+      const branch = await tx.branch.create({ data: { tenantId: tenant.id, name: input.defaultBranchName.trim(), location: (input.address ?? input.clinicName).trim(), timezone } });
+      const owner = await tx.user.create({ data: {
+        tenantId: tenant.id, branchId: branch.id, email, displayName: input.ownerName.trim(), role: 'OWNER',
+        passwordHash, passwordChangedAt: new Date(), active: true,
+      } });
+      await seedComplianceBaseline(tx, tenant.id);
+      const now = new Date();
+      const trialEndsAt = new Date(now.getTime() + trialDays * 86400000);
+      const subscription = await tx.tenantSubscription.create({ data: {
+        tenantId: tenant.id, planId: plan.id, status, startedAt: now,
+        trialEndsAt: status === 'TRIAL' ? trialEndsAt : null,
+        currentPeriodEnd: status === 'TRIAL' ? trialEndsAt : null,
+      } });
+      await recomputeEntitlements(tenant.id, tx);
+      await tx.auditEvent.create({ data: { tenantId: tenant.id, action: 'tenant.created', resource: 'tenant', resourceId: tenant.id, userAgent: actorLabel, metadata: { slug, plan: planKey, status } } });
+      await tx.auditEvent.create({ data: { tenantId: tenant.id, action: 'tenant.owner.created', resource: 'user', resourceId: owner.id, userAgent: actorLabel, metadata: { email } } });
+      return {
+        tenant: { id: tenant.id, name: tenant.name, slug: tenant.slug },
+        owner: { id: owner.id, email: owner.email, displayName: owner.displayName, role: owner.role },
+        branch: { id: branch.id, name: branch.name },
+        subscription: { planKey, status, trialEndsAt: subscription.trialEndsAt?.toISOString() ?? null },
+      };
+    });
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+      const target = Array.isArray(error.meta?.target) ? error.meta.target.map(String) : [];
+      if (target.includes('slug')) throw new ProvisionError('slug_taken', 'That clinic slug is already in use.');
+      if (target.includes('email')) throw new ProvisionError('email_taken', 'That owner email is already in use.');
+    }
+    throw error;
+  }
 }

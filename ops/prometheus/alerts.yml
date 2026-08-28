@@ -1,0 +1,118 @@
+# ===========================================================================
+# CareCommand alert rules — the "know before the customer does" layer.
+#
+# Load into Prometheus (rule_files) or Grafana Alerting / Grafana Cloud. These
+# fire against the metrics exposed at /metrics (see server/lib/metrics.ts) and
+# are derived from the SLOs in server/lib/slo.ts — keep the two in sync.
+#
+# Scrape config (Prometheus side): TWO targets, both bearer-token in production.
+# The API serves request/dependency/queue metrics at /metrics; the WORKER serves
+# job metrics (jobs_total, job_duration_seconds) on its own listener — they are
+# separate processes with separate registries, so scraping only the API would
+# leave the job SLO/alerts blind.
+#   scrape_configs:
+#     - job_name: carecommand-api
+#       metrics_path: /metrics
+#       authorization: { credentials: "<METRICS_TOKEN>" }
+#       static_configs: [{ targets: ["carecommand-ai.onrender.com"] }]
+#     - job_name: carecommand-worker
+#       metrics_path: /metrics
+#       authorization: { credentials: "<METRICS_TOKEN>" }
+#       static_configs: [{ targets: ["<worker-host>:9464"] }]   # WORKER_METRICS_PORT
+# NOTE: Render `type: worker` services accept no inbound traffic — see
+# docs/OBSERVABILITY.md#worker-metrics for scraping options per platform.
+# ===========================================================================
+groups:
+  - name: carecommand-availability
+    rules:
+      # Hard down: the API stopped being scraped at all. This is the primary
+      # "app is down" page — it fires when the process is gone or unreachable.
+      # (Also point an external uptime monitor at /health/ready; see runbook.)
+      - alert: ApiTargetDown
+        expr: up{job="carecommand-api"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "API target is down (no successful scrape for 2m)"
+          runbook: "docs/OBSERVABILITY.md#api-down"
+
+      # The worker stopped being scraped — jobs are not draining and the job
+      # metrics have gone dark. QueueBacklogGrowing (via the API's queue_depth)
+      # is the backstop if the worker scrape isn't wired on this platform.
+      - alert: WorkerTargetDown
+        expr: up{job="carecommand-worker"} == 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "Worker target is down (no successful scrape for 5m) — queues are not draining"
+          runbook: "docs/OBSERVABILITY.md#queue-backlog"
+
+      # A critical dependency (Postgres/Redis) is failing the probe. The gauge
+      # is refreshed by BOTH /health/ready and every /metrics scrape, so it
+      # stays live even without an external uptime monitor.
+      - alert: DependencyDown
+        expr: dependency_up == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Dependency {{ $labels.dependency }} is DOWN (readiness failing)"
+          runbook: "docs/OBSERVABILITY.md#dependency-down"
+
+  - name: carecommand-slo-burn
+    rules:
+      # SLO: availability 99.5%. Fast-burn: >5% error rate over 5m and 1h both.
+      # (Multi-window burn-rate avoids paging on a single spike while still
+      # catching a real outage within minutes.)
+      - alert: AvailabilitySLOFastBurn
+        expr: |
+          (sum(rate(http_request_errors_total[5m])) / sum(rate(http_requests_total[5m]))) > 0.05
+          and
+          (sum(rate(http_request_errors_total[1h])) / sum(rate(http_requests_total[1h]))) > 0.05
+        for: 5m
+        labels: { severity: critical, slo: availability }
+        annotations:
+          summary: "5xx error rate >5% — burning the availability error budget fast"
+          runbook: "docs/OBSERVABILITY.md#availability-slo"
+
+      # SLO: p95 latency < 500ms. Sustained breach.
+      - alert: LatencySLOBreach
+        expr: |
+          histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) > 0.5
+        for: 10m
+        labels: { severity: warning, slo: latency }
+        annotations:
+          summary: "p95 request latency > 500ms for 10m"
+          runbook: "docs/OBSERVABILITY.md#latency-slo"
+
+  - name: carecommand-jobs
+    rules:
+      # SLO: job success 99%. Alert when the failed fraction climbs.
+      - alert: JobFailureRateHigh
+        expr: |
+          (sum(rate(jobs_total{outcome="failed"}[30m])) / sum(rate(jobs_total[30m]))) > 0.01
+        for: 15m
+        labels: { severity: warning, slo: job_success }
+        annotations:
+          summary: "Background job failure rate > 1% over 30m"
+          runbook: "docs/OBSERVABILITY.md#job-failures"
+
+      # Queue backlog piling up = worker down or wedged. A spun-down free-plan
+      # worker is the classic cause (see runbook).
+      # `max by (queue)` (not bare max): keeps the queue label so the summary
+      # below can name the culprit and one wedged queue can't hide behind another.
+      - alert: QueueBacklogGrowing
+        expr: max by (queue) (queue_depth{state="waiting"}) > 100
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Queue {{ $labels.queue }} backlog > 100 waiting for 10m — is the worker draining?"
+          runbook: "docs/OBSERVABILITY.md#queue-backlog"
+
+      # Event-loop saturation — the early-warning signal before latency spikes.
+      - alert: EventLoopLagHigh
+        expr: nodejs_eventloop_lag_p99_seconds > 0.2
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Event-loop p99 lag > 200ms for 10m — instance is CPU-saturated"
+          runbook: "docs/OBSERVABILITY.md#event-loop-lag"

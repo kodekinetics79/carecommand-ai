@@ -4,6 +4,7 @@ import {
   paymentsApi, PAYMENT_STATUS_META,
   type AppointmentPaymentView, type GenerateLinkResult,
 } from '../../lib/payments';
+import ConfirmationModal from '../workflow/ConfirmationModal';
 
 // Truthful appointment deposit/checkout card. Never shows a fake "paid" state;
 // surfaces setup_required when the payment provider isn't configured.
@@ -14,6 +15,7 @@ export default function AppointmentPaymentCard({ appointmentId, currency = 'USD'
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [showWaiver, setShowWaiver] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -73,10 +75,8 @@ export default function AppointmentPaymentCard({ appointmentId, currency = 'USD'
     }
   }
 
-  async function waive() {
+  async function waive(reason: string) {
     if (!view?.depositRequirementId) return;
-    const reason = window.prompt('Reason for waiving this deposit?');
-    if (!reason) return;
     setBusy(true); setError(null); setNotice(null);
     try {
       await paymentsApi.waiveDeposit(view.depositRequirementId, reason);
@@ -146,11 +146,23 @@ export default function AppointmentPaymentCard({ appointmentId, currency = 'USD'
           </button>
         )}
         {actions.includes('waive') && (
-          <button type="button" disabled={busy} onClick={waive} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t3 hover:bg-[var(--s3)] disabled:opacity-50">
+          <button type="button" disabled={busy} onClick={() => setShowWaiver(true)} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t3 hover:bg-[var(--s3)] disabled:opacity-50">
             <Ban className="w-3.5 h-3.5" /> Waive
           </button>
         )}
       </div>
+      {showWaiver && (
+        <ConfirmationModal
+          title="Waive this appointment deposit?"
+          message="This changes the deposit requirement to waived. Enter the staff-approved reason that should be retained with the record."
+          confirmLabel="Waive deposit"
+          tone="amber"
+          requireReason
+          reasonLabel="Waiver reason"
+          onClose={() => setShowWaiver(false)}
+          onConfirm={waive}
+        />
+      )}
     </div>
   );
 }

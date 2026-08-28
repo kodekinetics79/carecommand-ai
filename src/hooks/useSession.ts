@@ -2,14 +2,15 @@ import { useCallback, useEffect, useState } from 'react';
 import { apiRequest } from '../lib/api';
 import { authEventName, clearSession, login, logout, type AuthMeResponse, type SessionUser } from '../lib/session';
 
-export function useSession() {
+export function useSession(options: { hydrate?: boolean } = {}) {
+  const shouldHydrate = options.hydrate ?? true;
   const [user, setUser] = useState<SessionUser | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(shouldHydrate);
 
   const hydrate = useCallback(async () => {
     try {
       const response = await apiRequest<AuthMeResponse>('/v1/auth/me');
-      setUser(response.user);
+      setUser({ ...response.user, effectivePermissions: response.access.permissions });
     } catch {
       setUser(null);
     } finally {
@@ -18,6 +19,9 @@ export function useSession() {
   }, []);
 
   useEffect(() => {
+    if (!shouldHydrate) {
+      return;
+    }
     let active = true;
     void (async () => {
       if (!active) return;
@@ -33,10 +37,10 @@ export function useSession() {
       active = false;
       window.removeEventListener(authEventName, handleAuthChange);
     };
-  }, [hydrate]);
+  }, [hydrate, shouldHydrate]);
 
-  const signIn = async (email: string, password: string) => {
-    const result = await login(email, password);
+  const signIn = async (email: string, password: string, tenantSlug?: string) => {
+    const result = await login(email, password, tenantSlug);
     if (result.kind === 'session') {
       setUser(result.user);
       setLoading(false);

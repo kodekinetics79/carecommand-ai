@@ -17,7 +17,7 @@ export default function OpportunityDetailPanel({ opportunity }: { opportunity: O
       <div className="grid grid-cols-2 gap-2.5">
         <Field label="Expected revenue" value={formatCurrency(o.expectedRevenue)} strong />
         <Field label="ROI" value={`${o.roi}×`} />
-        <FieldNode label="Confidence"><ConfidenceBadge value={o.confidence} size="xs" /></FieldNode>
+        <FieldNode label="Recorded confidence"><ConfidenceBadge value={o.confidence} size="xs" /></FieldNode>
         <FieldNode label="Approval"><ApprovalStatusBadge state={o.approval} /></FieldNode>
         <Field label="Owner" value={o.owner} />
         <Field label="Department" value={o.department} />

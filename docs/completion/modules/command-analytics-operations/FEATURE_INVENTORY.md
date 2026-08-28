@@ -1,0 +1,15 @@
+# M16 Command Center, Operations, Opportunities and Analytics — Feature Inventory
+
+Pod: Command Analytics Pod. Embedded consultant: medical-practice COO/analytics consultant. Independent reviewer: analytics-truthfulness consultant. Data: INTERNAL/PHI-M aggregates. Dependencies: M01-M15, M19-M23.
+
+| ID | Feature/value | Roles/journeys | UI/API trace | Data/jobs/integrations | Controls/audit/isolation/flags/demo | Evidence/missing/acceptance | Status |
+|---|---|---|---|---|---|---|---|
+| M16-F01 | Dashboard summary | Staff; live/empty/partial dependency failure | `/`; `/dashboard/summary` | aggregates | tenant scope, no static metrics, truthful zero/error | Browser crawl/pilot benchmark pass; metric formula contract tests incomplete | IN DISCOVERY |
+| M16-F02 | Command deck/priority rail | Operational staff; view/rank/open route | dashboard components | opportunities/tasks/alerts | evidence-based ordering, no dead controls/PHI leak | Dead actions removed/crawl passes; ranking correctness incomplete | IN DISCOVERY |
+| M16-F03 | Clinic radar/benchmarking | Owner/manager/analyst; compare branches, insufficient data | `/clinic-radar`, `/benchmarking` | branch/revenue/provider aggregates | minimum sample/truthful unavailable, tenant-only benchmark unless deidentified | Crawl only plus local aggregates; statistical/privacy acceptance missing | IN DISCOVERY |
+| M16-F04 | Opportunity center | Managers; list/detail/status, foreign/stale | `/opportunities`; opportunity APIs | `Opportunity` | tenant scope, evidence refs, audit, no fake launch | Dead campaign/audit CTAs fixed; workflow/browser tests incomplete | IN DISCOVERY |
+| M16-F05 | Operational signals | Managers/AI; list/update, stale/foreign | signals APIs | `OperationalSignal` | source/provenance/time, tenant scope, audit | Revenue signal tests selected; complete lifecycle incomplete | IN DISCOVERY |
+| M16-F06 | AI recommendations consumer workflow | Managers; review/accept/dismiss/expired | recommendation APIs/UI consumers | M15 `AIRecommendation` | human review, allowed action type, evidence, audit | Selected tests; end-to-end browser/worker handoff incomplete | IN DISCOVERY |
+| M16-F07 | Business event intelligence | System/analyst; emit/replay/aggregate | domain event writers/intelligence service | `BusinessEvent` | tenant/event/entity scope, idempotency, no PHI payload by default | Multiple domain tests assert events; catalog-wide schema/consumer contracts incomplete | IN DISCOVERY |
+| M16-F08 | Revenue snapshots/trends | Owner/billing/analyst; list/trend/empty | revenue snapshots API/charts | `RevenueSnapshot` | tenant/branch scope, source period/currency, no static figures | Revenue signal/pilot benchmark selected; formula/currency/browser evidence incomplete | IN DISCOVERY |
+| M16-F09 | Morning/operations briefing | Staff; load/partial/error | `/briefing` | task/revenue/opportunity/appointment aggregates | tenant scope, truthful partial state, no clinical advice | Morning briefing tests exist; browser and performance/role matrix incomplete | IN DISCOVERY |

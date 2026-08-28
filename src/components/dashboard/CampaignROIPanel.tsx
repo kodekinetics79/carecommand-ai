@@ -14,15 +14,15 @@ export default function CampaignROIPanel({ campaigns, onViewAll, onCreate }: { c
       <EmptyStatePremium
         icon={<Megaphone className="w-5 h-5" />}
         title="No campaigns yet"
-        description="Launch a reactivation or recall campaign to start recovering revenue from inactive patients."
-        cta={{ label: 'Create your first campaign', onClick: onCreate }}
+        description="Create an approved reactivation or recall campaign to begin recording audience, booking, and attributed-value evidence."
+        cta={{ label: 'Create campaign draft', onClick: onCreate }}
       />
     );
   }
   return (
     <div className="space-y-2.5">
       {campaigns.map(c => {
-        const launched = c.audienceSize > 0 || c.revenue > 0;
+        const hasRecordedResults = c.audienceSize > 0 || c.revenue > 0;
         return (
           <div key={c.id} className="hover-lift rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3.5">
             <div className="flex items-center justify-between gap-2">
@@ -30,23 +30,23 @@ export default function CampaignROIPanel({ campaigns, onViewAll, onCreate }: { c
                 <p className="text-[13px] font-semibold text-t1 truncate">{c.name}</p>
                 <span className={`badge ${STATUS_BADGE[c.status] ?? 'badge-blue'} shrink-0`}>{c.status.replace(/_/g, ' ')}</span>
               </div>
-              {launched
-                ? <p className="text-sm font-bold text-t1 shrink-0 tabular-nums">{formatCurrency(c.revenue)}</p>
+              {hasRecordedResults
+                ? <div className="shrink-0 text-right"><p className="text-[9px] uppercase tracking-wide text-t3">Recorded associated value</p><p className="text-sm font-bold text-t1 tabular-nums">{formatCurrency(c.revenue)}</p></div>
                 : <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-v shrink-0"><Sparkles className="w-3 h-3" /> {c.nextAction}</span>}
             </div>
 
-            {launched ? (
+            {hasRecordedResults ? (
               <div className="flex items-center gap-3 text-[11px] text-t3 mt-1.5">
-                <span>{c.audienceSize} patients</span>
+                <span>Recorded audience {c.audienceSize}</span>
                 <span>·</span>
-                <span className="text-emerald-v font-semibold">{c.conversionRate}% booked</span>
+                <span className="font-semibold text-t2">Stored booking rate {c.conversionRate}%</span>
                 <span>·</span>
-                <span>{c.booked} appointments</span>
+                <span>{c.booked} recorded appointments</span>
               </div>
             ) : (
               <div className="flex items-center gap-4 text-[11px] mt-2">
                 <Stat label="Est. audience" value={c.estimatedAudience != null ? `${c.estimatedAudience} patients` : '—'} />
-                <Stat label="Est. recoverable" value={c.estimatedRecoverable != null ? formatCurrency(c.estimatedRecoverable) : '—'} accent />
+                <Stat label="Stored planning estimate" value={c.estimatedRecoverable != null ? formatCurrency(c.estimatedRecoverable) : '—'} accent />
               </div>
             )}
           </div>
