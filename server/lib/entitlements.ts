@@ -1,6 +1,7 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { db } from './db';
 import { FEATURE_KEYS, ENTITLED_STATUSES } from '../modules/subscriptions/catalog';
+import type { Prisma, PrismaClient } from '../generated/prisma/client';
 
 // ===========================================================================
 // Tenant feature entitlements. Resolves a tenant's plan + active add-ons into
@@ -12,8 +13,11 @@ import { FEATURE_KEYS, ENTITLED_STATUSES } from '../modules/subscriptions/catalo
 export interface ResolvedEntitlement { featureKey: string; enabled: boolean; source: string; limitValue: number | null }
 
 /** Recompute and persist a tenant's entitlements from its subscription + add-ons. */
-export async function recomputeEntitlements(tenantId: string): Promise<ResolvedEntitlement[]> {
-  const subscription = await db.tenantSubscription.findUnique({
+export async function recomputeEntitlements(
+  tenantId: string,
+  client: PrismaClient | Prisma.TransactionClient = db,
+): Promise<ResolvedEntitlement[]> {
+  const subscription = await client.tenantSubscription.findUnique({
     where: { tenantId },
     include: { plan: { include: { features: true } }, addons: { where: { active: true }, include: { addon: true } } },
   });
@@ -41,7 +45,7 @@ export async function recomputeEntitlements(tenantId: string): Promise<ResolvedE
   const rows: ResolvedEntitlement[] = [];
   for (const key of FEATURE_KEYS) {
     const ent = resolved.get(key) ?? { featureKey: key, enabled: false, source: 'plan', limitValue: null };
-    await db.tenantFeatureEntitlement.upsert({
+    await client.tenantFeatureEntitlement.upsert({
       where: { tenantId_featureKey: { tenantId, featureKey: key } },
       update: { enabled: ent.enabled, source: ent.source, limitValue: ent.limitValue },
       create: { tenantId, featureKey: key, enabled: ent.enabled, source: ent.source, limitValue: ent.limitValue },
@@ -52,8 +56,12 @@ export async function recomputeEntitlements(tenantId: string): Promise<ResolvedE
 }
 
 /** Fast entitlement check for a single feature. */
-export async function isFeatureEnabled(tenantId: string, featureKey: string): Promise<boolean> {
-  const ent = await db.tenantFeatureEntitlement.findUnique({ where: { tenantId_featureKey: { tenantId, featureKey } } });
+export async function isFeatureEnabled(
+  tenantId: string,
+  featureKey: string,
+  client: PrismaClient | Prisma.TransactionClient = db,
+): Promise<boolean> {
+  const ent = await client.tenantFeatureEntitlement.findUnique({ where: { tenantId_featureKey: { tenantId, featureKey } } });
   return Boolean(ent?.enabled);
 }
 

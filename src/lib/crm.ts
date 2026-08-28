@@ -27,6 +27,7 @@ export interface Campaign {
   requiresApproval: boolean;
   approvedByUserId: string | null;
   approvedAt: string | null;
+  scheduledAt: string | null;
   messageSubject: string | null;
   messageTemplate: string | null;
   draftSource: string | null;
@@ -34,6 +35,10 @@ export interface Campaign {
   allowedActions: string[];
   deepLinkTarget: string;
   requiresApprovalPending: boolean;
+  archivedAt: string | null;
+  dispatchAuthorizedAt: string | null;
+  dispatchAuthorizedByUserId: string | null;
+  dispatchAuthorizationRecorded: boolean;
   deliveryCounts?: Record<string, number>;
 }
 
@@ -61,8 +66,24 @@ export interface LaunchResult {
   campaignId: string;
   status: string;
   setupRequired: boolean;
-  summary: { total: number; sent: number; suppressed: number; skipped: number; setupRequired: number; pending: number };
-  provider: { channel: string; configured: boolean; setupRequired: boolean; missing: string[] };
+  summary: { total: number; accepted: number; deliveryUnknown: number; suppressed: number; skipped: number; setupRequired: number; queued: number; failed: number; authorityBlocked: number; atomicBoundaryBlocked: number };
+  provider: { channel: string; configured: boolean; setupRequired: boolean; missing: string[]; mode: string; liveDispatchActivated: boolean };
+  launchFingerprint: string;
+}
+
+export interface CampaignLaunchPreview {
+  campaignId: string;
+  fingerprint: string;
+  templateRevision: string;
+  providerMode: string;
+  provider: string;
+  channel: CommChannel;
+  scheduledAt: string | null;
+  audience: { total: number; eligible: number; suppressed: number; missingContact: number; authorityRequired: number; atomicBoundaryBlocked: number };
+  liveDispatchActivated: boolean;
+  activationNotice: string | null;
+  finalConfirmationRequired: true;
+  confirmationStatement: string;
 }
 
 export interface CampaignDelivery {
@@ -75,6 +96,9 @@ export interface CampaignDelivery {
   provider: string | null;
   failureReason: string | null;
   sentAt: string | null;
+  providerAcceptedAt?: string | null;
+  deliveredAt?: string | null;
+  statusUpdatedAt?: string;
 }
 
 export const CAMPAIGN_STATUS_META: Record<string, { label: string; badge: string }> = {
@@ -84,13 +108,17 @@ export const CAMPAIGN_STATUS_META: Record<string, { label: string; badge: string
   ACTIVE: { label: 'Running', badge: 'badge-emerald' },
   PAUSED: { label: 'Paused', badge: 'badge-amber' },
   COMPLETED: { label: 'Completed', badge: 'badge-emerald' },
-  CANCELLED: { label: 'Cancelled', badge: 'badge-red' },
+  CANCELLED: { label: 'Canceled', badge: 'badge-red' },
   FAILED: { label: 'Failed', badge: 'badge-red' },
 };
 
 export const DELIVERY_STATUS_META: Record<string, { label: string; badge: string }> = {
-  sent: { label: 'Sent', badge: 'badge-emerald' },
-  pending: { label: 'Queued', badge: 'badge-amber' },
+  sent: { label: 'Provider accepted (legacy)', badge: 'badge-emerald' },
+  pending: { label: 'Queued (legacy)', badge: 'badge-amber' },
+  accepted: { label: 'Provider accepted', badge: 'badge-emerald' },
+  queued: { label: 'Queued', badge: 'badge-amber' },
+  delivered: { label: 'Delivered', badge: 'badge-emerald' },
+  delivery_unknown: { label: 'Delivery unknown', badge: 'badge-amber' },
   suppressed: { label: 'Suppressed', badge: 'badge-violet' },
   skipped: { label: 'Skipped', badge: 'badge-blue' },
   setup_required: { label: 'Setup required', badge: 'badge-red' },
@@ -107,6 +135,8 @@ export interface ProviderReadiness {
   unsupportedChannels: string[];
   schedulerEnforced: boolean;
   liveSendingSupported: boolean;
+  liveCampaignDispatchActivated: boolean;
+  activationNotice: string;
 }
 
 const base = '/v1/crm';
@@ -119,13 +149,17 @@ export const crmApi = {
     apiRequest<Campaign>(`${base}/campaigns`, { method: 'POST', body: JSON.stringify(body) }),
   generateDraft: (id: string) => apiRequest<CampaignDraft & { campaignId: string }>(`${base}/campaigns/${id}/draft`, { method: 'POST' }),
   previewAudience: (type: AudienceType, channel: CommChannel) => apiRequest<AudiencePreview>(`${base}/audiences/${type}/preview?channel=${channel}`),
-  approve: (id: string) => apiRequest<Campaign>(`${base}/campaigns/${id}/approve`, { method: 'POST' }),
-  launch: (id: string, force = false) => apiRequest<LaunchResult>(`${base}/campaigns/${id}/launch`, { method: 'POST', body: JSON.stringify({ force }) }),
+  approve: (id: string, previewFingerprint: string) => apiRequest<Campaign>(`${base}/campaigns/${id}/approve`, {
+    method: 'POST',
+    body: JSON.stringify({ previewFingerprint, confirmExactAudienceTemplateProvider: true }),
+  }),
+  launchPreview: (id: string) => apiRequest<CampaignLaunchPreview>(`${base}/campaigns/${id}/launch-preview`),
+  launch: (id: string, previewFingerprint: string, force = false) => apiRequest<LaunchResult>(`${base}/campaigns/${id}/launch`, { method: 'POST', body: JSON.stringify({ force, previewFingerprint, confirmExactAudienceTemplateProvider: true }) }),
   pause: (id: string) => apiRequest<Campaign>(`${base}/campaigns/${id}/pause`, { method: 'POST' }),
   cancel: (id: string) => apiRequest<Campaign>(`${base}/campaigns/${id}/cancel`, { method: 'POST' }),
   updateCampaign: (id: string, body: { name?: string; messageSubject?: string; messageTemplate?: string; channel?: CommChannel; scheduledAt?: string }) =>
     apiRequest<Campaign>(`${base}/campaigns/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
-  deleteCampaign: (id: string) => apiRequest<void>(`${base}/campaigns/${id}`, { method: 'DELETE' }),
+  archiveCampaign: (id: string) => apiRequest<Campaign>(`${base}/campaigns/${id}`, { method: 'DELETE' }),
   listDeliveries: (id: string) => apiRequest<CampaignDelivery[]>(`${base}/campaigns/${id}/deliveries`),
   listSuppressions: () => apiRequest<Array<{ id: string; channel: string; reason: string; patientId: string | null }>>(`${base}/suppressions`),
 };

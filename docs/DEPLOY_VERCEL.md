@@ -1,61 +1,27 @@
-# Deploy — All on Vercel (SPA + Fastify Function) + Neon
+# Vercel Deployment Profile
 
-The whole app runs on **one Vercel project**: the Vite SPA as static files, and the
-Fastify backend as a **Serverless Function** (`api/index.ts`). Same origin → **no
-CORS**. Database is **Neon** (already migrated + seeded). Redis is optional.
+`vercel.json` packages the SPA and request-driven Fastify handler. It does not
+host the always-on worker and therefore is **not**, by itself, a complete pilot
+or unattended-autonomy topology.
 
-```
-Browser ─► Vercel
-            ├─ /v1/*, /health/*  ─► api/index.ts (Fastify)  ─► Neon Postgres
-            └─ everything else   ─► SPA (dist/)
-```
+Vercel can remain the frontend tier when it is connected to a separately
+operated API/worker stack. Required browser settings are:
 
-## How routing works (`vercel.json`)
-- `/v1/*` and `/health/*` → the Fastify function.
-- everything else → the SPA.
-- Build runs `prisma generate && npm run build`.
-- The frontend defaults to **same-origin** in production (`import.meta.env.PROD`),
-  so you do **not** need to set `VITE_API_URL`.
+- `VITE_AUTH_MODE=login-required`
+- `VITE_DEMO_FALLBACK=false`
+- no unapproved default clinic slug
+- an HTTPS API URL, or a deliberately configured same-origin API
 
-## 1. Set Environment Variables (Vercel → Project → Settings → Environment Variables, **Production**)
+Never place secrets in `VITE_*` variables because Vite embeds them in browser
+assets. The backend environment must separately satisfy the pilot-profile
+validation, restricted database roles, queue/worker, webhook, metrics, backup,
+and alerting requirements in `docs/production/DEPLOYMENT_AND_ROLLBACK.md`.
 
-| Variable | Value |
-|---|---|
-| `NODE_ENV` | `production` |
-| `DATABASE_URL` | Neon **pooled** URL (`...-pooler...?sslmode=require`) |
-| `DATABASE_MIGRATION_URL` | Neon **direct** URL (no `-pooler`, `?sslmode=require`) |
-| `QUEUES_ENABLED` | `false`  *(no Redis → background jobs are skipped; all request routes still work)* |
-| `JWT_SECRET` | 32+ random chars |
-| `JWT_REFRESH_SECRET` | 32+ random chars (different) |
-| `AUTH_ENCRYPTION_KEY` | 32 bytes (`openssl rand -base64 32`) |
-| `AI_PROVIDER` | `mock` |
-| `VITE_AUTH_MODE` | `login-required` |
+The Vercel serverless handler is appropriate for a bounded demonstration only
+when queues are explicitly unavailable and the UI truthfully labels affected
+workflows. It must not be represented as proof that scheduled campaigns,
+background compliance, RPM safety processing, retries, or unattended outbound
+work are operational.
 
-> Leave provider keys (Stripe/Twilio/Stedi/Retell…) empty — those modules report
-> `setup_required`; the Stedi sandbox + connected-care sandbox still work.
-> `VITE_*` are build-time, so **redeploy** after changing them. Never put secrets in `VITE_*`.
-
-### Optional: enable Redis (background jobs)
-Add a serverless Redis (Upstash), set `REDIS_URL=...` and `QUEUES_ENABLED=true`.
-Even then, queued jobs only *process* if a worker runs — not available on
-serverless. Fine to leave `QUEUES_ENABLED=false` for a demo.
-
-## 2. Deploy
-Push to the connected branch (Vercel auto-builds) **or** `vercel --prod`.
-
-## 3. Smoke test
-```
-APP=https://<your-app>.vercel.app
-curl -s $APP/health/live                                   # {"status":"ok"}
-curl -s -o /dev/null -w '%{http_code}\n' $APP/v1/auth/me   # 401 (route live)
-```
-Then in the browser: staff login, and the patient portal at `/client/login`
-(clinic `harley-street-medical`, email `charlotte.whitmore@carecommand.local`).
-
-## Notes / limits (it's a demo/test env)
-- **No background workers** on serverless — autopilot execution + scheduled
-  campaigns won't *process*. Everything request-driven (Connected Care, AI,
-  eligibility, monitoring, portal) works.
-- First request after idle has a **cold start** (the API registers many routes).
-- Migrations already applied to Neon; the function does **not** run migrations.
-  Re-run them locally if the schema changes: `DATABASE_MIGRATION_URL=<neon direct> npm run db:deploy`.
+No Vercel deployment or environment mutation is performed without explicit
+authorization.

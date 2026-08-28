@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { randomUUID } from 'node:crypto';
-import { db } from '../lib/db';
+import { fixtureDb as db } from './helpers/fixtureDb';
 import type { Prisma } from '../generated/prisma/client';
 
 // Proves DB-level tenant isolation (Row-Level Security) on an enrolled table,
@@ -19,16 +19,32 @@ const RLS_TABLE = 'AiGuardrail';
 async function asRls<T>(tenantId: string | null, fn: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
   return db.$transaction(async (tx) => {
     await tx.$executeRawUnsafe('SET LOCAL ROLE app_rls');
-    if (tenantId) await tx.$executeRaw`SELECT set_config('app.current_tenant_id', ${tenantId}, true)`;
+    if (tenantId) {
+      const actorId = tenantActors.get(tenantId);
+      if (!actorId) throw new Error('Missing persisted fixture actor');
+      await tx.$executeRaw`
+        SELECT
+          set_config('app.current_tenant_id', ${tenantId}, true),
+          set_config('app.current_actor_id', ${actorId}, true),
+          set_config('app.current_actor_role', 'OWNER', true),
+          set_config('app.current_context_source', 'request', true)
+      `;
+    }
     return fn(tx);
   });
 }
 
 const tenants: string[] = [];
+const tenantActors = new Map<string, string>();
 async function makeTenant(): Promise<string> {
   const id = randomUUID();
   await db.tenant.create({ data: { id, name: `rls-${id.slice(0, 6)}`, slug: `rls-${id.slice(0, 8)}` } });
+  const actor = await db.user.create({
+    data: { tenantId: id, email: `owner-${id.slice(0, 8)}@rls.test`, displayName: 'RLS Owner', role: 'OWNER', active: true },
+    select: { id: true },
+  });
   tenants.push(id);
+  tenantActors.set(id, actor.id);
   return id;
 }
 

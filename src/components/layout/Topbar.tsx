@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { useLocation, useNavigate, Link } from 'react-router-dom';
-import { Search, Command, ChevronDown, ChevronRight, LogOut, Settings as SettingsIcon, Globe } from 'lucide-react';
+import { useLocation, useNavigate, Link } from 'react-router';
+import { Search, Command, ChevronDown, ChevronRight, LogOut, Settings as SettingsIcon, Globe, Menu } from 'lucide-react';
 import CommandPalette from '../ui/CommandPalette';
 import BackButton from './BackButton';
 import { useSession } from '../../hooks/useSession';
@@ -8,13 +8,14 @@ import { usePreferences, LANGUAGES } from '../../lib/preferences';
 
 const routeLabels: Record<string, string> = {
   '/':                 'Command Center',
-  '/advisory':         'AI Briefing',
+  '/advisory':         'Advisory Room',
   '/opportunities':    'Opportunity Center',
-  '/clinic-radar':     'Clinic Radar',
+  '/clinic-radar':     'ClinicRadar',
   '/benchmarking':     'Multi-Clinic Benchmarking',
   '/autopilot':        'Autopilot',
   '/crm':              'CRM',
   '/receptionist-studio': 'Receptionist Studio',
+  '/ai-receptionist':  'AI Receptionist',
   '/campaigner':       'Campaigner',
   '/reactivation':     'Reactivation',
   '/reviews':          'Reviews',
@@ -29,7 +30,7 @@ const routeLabels: Record<string, string> = {
   '/doctor-workspace': 'Provider Performance',
   '/patients':         'Patients',
   '/patient-intake':   'Patient Intake',
-  '/scheduling':       'Appointments',
+  '/scheduling':       'Scheduling',
   '/staff':            'Staff Tasks',
   '/compliance':       'Compliance Readiness',
   '/control-plane':    'Control Plane',
@@ -63,7 +64,7 @@ function prettySegment(seg: string): string {
   return seg.replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
-export default function Topbar() {
+export default function Topbar({ mobileNavOpen = false, onOpenNavigation }: { mobileNavOpen?: boolean; onOpenNavigation?: () => void }) {
   const { pathname } = useLocation();
   const navigate = useNavigate();
   const [cmdOpen, setCmdOpen] = useState(false);
@@ -81,6 +82,9 @@ export default function Topbar() {
   return (
     <>
       <header className="topbar">
+        <button type="button" className="mobile-nav-trigger topbar-icon-btn" aria-label="Open navigation" aria-controls="staff-navigation" aria-expanded={mobileNavOpen} onClick={onOpenNavigation}>
+          <Menu className="w-4 h-4" />
+        </button>
         {/* Smart back control — true previous screen, parent fallback on deep link */}
         <BackButton className="mr-1" />
         {/* Breadcrumb: workspace › section, with location context chip */}
@@ -124,7 +128,7 @@ export default function Topbar() {
         {/* User menu */}
         {user && (
           <div className="relative shrink-0">
-            <button type="button" onClick={() => setMenuOpen(v => !v)} aria-haspopup="menu" aria-expanded={menuOpen ? 'true' : 'false'}
+            <button type="button" onClick={() => setMenuOpen(v => !v)} aria-label={`Account menu for ${user.displayName}`} aria-haspopup="menu" aria-expanded={menuOpen ? 'true' : 'false'}
               className="flex items-center gap-2.5 rounded-lg border border-[var(--b1)] bg-white px-2 py-1.5 hover:bg-[var(--s2)] transition">
               <span className="logo-user w-7 h-7 rounded-full grid place-items-center text-[10px] font-bold text-white shrink-0">{initials(user.displayName)}</span>
               <span className="hidden md:flex flex-col items-start min-w-0">

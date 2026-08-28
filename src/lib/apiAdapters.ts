@@ -7,6 +7,7 @@ export interface ApiPatient {
   lastName: string;
   email?: string | null;
   phone?: string | null;
+  dateOfBirth?: string | null;
   lifecycleStage: 'NEW' | 'ACTIVE' | 'AT_RISK' | 'INACTIVE' | 'LOST' | 'RETAINED';
   churnRisk: number;
   lifetimeValue: string;
@@ -16,6 +17,7 @@ export interface ApiPatient {
   nextVisitAt?: string | null;
   appointments?: ApiAppointment[];
   consentEvents?: Array<{ purpose: 'SMS' | 'WHATSAPP' | 'EMAIL' | 'MARKETING'; granted: boolean }>;
+  _count?: { appointments?: number };
   patientInsurancePolicies?: Array<{
     id: string;
     payerId?: string | null;
@@ -111,6 +113,7 @@ export interface ApiAppointment {
   id: string;
   branchId: string;
   patientId: string;
+  patientName?: string | null;
   providerRef?: string | null;
   service: string;
   startsAt: string;
@@ -251,6 +254,25 @@ export interface ApiConversation {
   updatedAt: string;
   patient?: { firstName: string; lastName: string } | null;
   branch?: { name: string } | null;
+  replyReadiness: {
+    channel: 'sms' | 'email' | 'whatsapp' | null;
+    destinationMasked: string | null;
+    identityStatus: 'patient_linked' | 'not_linked';
+    destinationSource: 'linked_patient_record' | 'unavailable';
+    destinationVerificationStatus: 'format_verified' | 'not_verified';
+    authorizationBasis: 'recorded_inbound_conversation_reply' | 'none';
+    explicitConsentStatus: string;
+    consentSource: string | null;
+    consentCapturedAt: string | null;
+    suppressionStatus: 'suppressed' | 'not_suppressed' | 'not_checked_no_destination';
+    submissionState: 'clear' | 'submission_result_unknown' | 'provider_evidence_pending';
+    ready: boolean;
+    readinessReason: 'patient_identity_not_linked' | 'destination_not_available' | 'destination_format_invalid' | 'recipient_suppressed' | 'submission_result_unknown' | 'provider_evidence_pending' | 'ready_for_server_recheck';
+    draftSource: 'rule_based_staff_review_draft';
+    senderIdentity: string;
+    channelTerms: 'operational_reply_to_recorded_inbound_conversation';
+    channelTermsSource: 'carecommand_operational_reply_policy_v1';
+  };
 }
 
 const lifecycleMap = {
@@ -270,26 +292,26 @@ export function mapPatient(row: ApiPatient): Patient {
   return {
     id: row.id,
     name: `${row.firstName} ${row.lastName}`,
-    age: 0,
-    gender: 'female',
+    age: row.dateOfBirth ? Math.max(0, Math.floor((Date.now() - new Date(row.dateOfBirth).getTime()) / 31_556_952_000)) : null,
+    gender: null,
     branchId: row.branchId,
-    assignedDoctorId: '',
-    lastVisit: row.lastVisitAt ?? new Date().toISOString(),
+    assignedDoctorId: null,
+    lastVisit: row.lastVisitAt ?? null,
     nextVisit: row.nextVisitAt ?? undefined,
     lifecycleStage: lifecycleMap[row.lifecycleStage],
     churnRisk: row.churnRisk,
     lifetimeValue: Number(row.lifetimeValue),
-    preferredChannel: latestConsent.get('WHATSAPP') ? 'whatsapp' : latestConsent.get('SMS') ? 'sms' : 'email',
+    preferredChannel: latestConsent.get('WHATSAPP') ? 'whatsapp' : latestConsent.get('SMS') ? 'sms' : latestConsent.get('EMAIL') ? 'email' : null,
     consentStatus: {
       sms: latestConsent.get('SMS') ?? false,
       whatsapp: latestConsent.get('WHATSAPP') ?? false,
-      email: latestConsent.get('EMAIL') ?? Boolean(row.email),
+      email: latestConsent.get('EMAIL') ?? false,
       marketing: latestConsent.get('MARKETING') ?? false,
     },
     tags: row.tags,
     phone: row.phone ?? '',
     email: row.email ?? '',
-    visitCount: row.appointments?.length ?? 0,
+    visitCount: row._count?.appointments ?? row.appointments?.length ?? 0,
     outstandingBalance: Number(row.outstandingBalance),
   };
 }
@@ -323,7 +345,7 @@ export function mapIntegration(row: ApiIntegration): Integration {
     category: row.category,
     status: row.status.toLowerCase().replace('_', '-') as Integration['status'],
     icon: row.config?.icon ?? 'Cloud',
-    description: row.config?.description ?? `${row.name} operational integration.`,
+    description: row.config?.description ?? 'No integration description provided.',
     lastSync: row.lastSyncAt ? new Date(row.lastSyncAt).toLocaleString() : undefined,
   };
 }
@@ -350,9 +372,11 @@ export function mapAppointment(row: ApiAppointment): Appointment {
   return {
     id: row.id,
     patientId: row.patientId,
-    patientName: 'Live DB Customer',
+    // Real patient name from the API (list/detail now include it); fall back only
+    // when a row genuinely lacks a linked patient name.
+    patientName: row.patientName?.trim() || 'Unknown patient',
     doctorId: row.providerRef ?? '',
-    doctorName: row.providerRef ?? 'Assigned provider',
+    doctorName: row.providerRef ?? 'Provider not linked',
     branchId: row.branchId,
     service: row.service,
     date: startsAt.toISOString().slice(0, 10),
@@ -383,7 +407,7 @@ export function mapLead(row: ApiLead): Lead {
 export function mapReview(row: ApiReview): Review {
   return {
     id: row.id,
-    patientName: 'Live DB Customer',
+    patientName: 'Reviewer name unavailable',
     branchId: row.branchId ?? '',
     rating: row.rating,
     text: row.text,
@@ -399,9 +423,9 @@ export function mapPartnerReport(row: ApiPartnerReport): LabOrder {
   return {
     id: row.id,
     patientId: row.patientId ?? '',
-    patientName: row.patient ? `${row.patient.firstName} ${row.patient.lastName}` : 'Live DB Customer',
+    patientName: row.patient ? `${row.patient.firstName} ${row.patient.lastName}` : 'Patient not linked',
     doctorId: row.providerRef ?? '',
-    doctorName: row.providerRef ?? 'Assigned provider',
+    doctorName: row.providerRef ?? 'Provider not linked',
     branchId: row.branchId,
     testName: row.reportType,
     orderedAt: row.orderedAt,
@@ -448,6 +472,7 @@ export function mapRevenueSnapshot(row: ApiRevenueSnapshot): RevenueData & { id:
   return {
     id: row.id,
     month: new Date(row.period).toLocaleDateString('en-GB', { month: 'short', year: '2-digit' }),
+    periodTs: new Date(row.period).getTime(),
     revenue: Number(row.revenue),
     recovered: Number(row.recovered),
     lost: Number(row.lost),
@@ -609,5 +634,7 @@ export function mapConversation(row: ApiConversation) {
     lastAgentMessageAt: row.lastAgentMessageAt ?? undefined,
     suggestedSlot: null,
     value: `$${Number(row.estimatedValue).toLocaleString()}`,
+    valueEvidence: 'Recorded estimate · source not verified',
+    replyReadiness: row.replyReadiness,
   };
 }

@@ -1,0 +1,172 @@
+# Pilot-ready Render Blueprint. It is intentionally not the default render.yaml:
+# selecting this file is an explicit environment activation decision. Blueprint
+# creation prompts for every sync:false value; existing services require those
+# values to be set manually before a sync.
+services:
+  - type: keyvalue
+    name: carecommand-pilot-redis
+    region: oregon
+    plan: starter
+    ipAllowList: []
+    maxmemoryPolicy: noeviction
+
+  - type: web
+    name: carecommand-pilot-api
+    runtime: node
+    region: oregon
+    plan: starter
+    buildCommand: npm ci && npm run db:generate
+    startCommand: npm run api:start
+    healthCheckPath: /health/ready
+    autoDeploy: false
+    envVars:
+      - fromGroup: carecommand-pilot-shared
+      - key: OTEL_SERVICE_NAME
+        value: carecommand-api
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: carecommand-pilot-redis
+          property: connectionString
+      - key: DATABASE_URL
+        sync: false
+      - key: PLATFORM_DATABASE_URL
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: PUBLIC_API_URL
+        sync: false
+      - key: TRUSTED_PROXY_CIDRS
+        sync: false
+      - key: PAYMENT_PROVIDER
+        sync: false
+      - key: INSURANCE_PROVIDER
+        sync: false
+      - key: AI_PROVIDER
+        sync: false
+      - key: ALLOWED_MOCK_INTEGRATIONS
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_SUCCESS_URL
+        sync: false
+      - key: STRIPE_CANCEL_URL
+        sync: false
+      - key: STEDI_API_KEY
+        sync: false
+      - key: RETELL_API_KEY
+        sync: false
+      - key: RETELL_FROM_NUMBER
+        sync: false
+      - key: CAMPAIGN_WEBHOOK_SECRET
+        sync: false
+      - key: EMAIL_HTTP_API_URL
+        sync: false
+      - key: EMAIL_HTTP_API_KEY
+        sync: false
+      - key: EMAIL_FROM_ADDRESS
+        sync: false
+      - key: OTEL_ENABLED
+        sync: false
+      - key: OTEL_EXPORTER_OTLP_ENDPOINT
+        sync: false
+      - key: OTEL_EXPORTER_OTLP_HEADERS
+        sync: false
+
+  - type: worker
+    name: carecommand-pilot-worker
+    runtime: node
+    region: oregon
+    plan: starter
+    buildCommand: npm ci && npm run db:generate
+    startCommand: npm run worker:start
+    autoDeploy: false
+    envVars:
+      - fromGroup: carecommand-pilot-shared
+      - key: OTEL_SERVICE_NAME
+        value: carecommand-worker
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: carecommand-pilot-redis
+          property: connectionString
+      - key: DATABASE_URL
+        sync: false
+      - key: PLATFORM_DATABASE_URL
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: PUBLIC_API_URL
+        sync: false
+      - key: PAYMENT_PROVIDER
+        sync: false
+      - key: INSURANCE_PROVIDER
+        sync: false
+      - key: AI_PROVIDER
+        sync: false
+      - key: ALLOWED_MOCK_INTEGRATIONS
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_SUCCESS_URL
+        sync: false
+      - key: STRIPE_CANCEL_URL
+        sync: false
+      - key: STEDI_API_KEY
+        sync: false
+      - key: RETELL_API_KEY
+        sync: false
+      - key: RETELL_FROM_NUMBER
+        sync: false
+      - key: CAMPAIGN_WEBHOOK_SECRET
+        sync: false
+      - key: EMAIL_HTTP_API_URL
+        sync: false
+      - key: EMAIL_HTTP_API_KEY
+        sync: false
+      - key: EMAIL_FROM_ADDRESS
+        sync: false
+      - key: OTEL_ENABLED
+        sync: false
+      - key: OTEL_EXPORTER_OTLP_ENDPOINT
+        sync: false
+      - key: OTEL_EXPORTER_OTLP_HEADERS
+        sync: false
+
+envVarGroups:
+  - name: carecommand-pilot-shared
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DEPLOYMENT_PROFILE
+        value: pilot
+      - key: INGRESS_MODE
+        value: trusted_proxy
+      - key: QUEUES_ENABLED
+        value: "true"
+      - key: RLS_ENFORCE_RUNTIME_ROLE
+        value: "true"
+      - key: PLATFORM_LEGACY_TOKEN_ENABLED
+        value: "false"
+      - key: COOKIE_SAMESITE
+        value: none
+      - key: VITE_AUTH_MODE
+        value: login-required
+      - key: VITE_DEMO_FALLBACK
+        value: "false"
+      - key: METRICS_ENABLED
+        value: "true"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: AUTH_ENCRYPTION_KEY
+        generateValue: true
+      - key: JOB_ENVELOPE_SECRET
+        generateValue: true
+      - key: METRICS_TOKEN
+        generateValue: true

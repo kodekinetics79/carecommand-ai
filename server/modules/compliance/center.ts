@@ -2,11 +2,13 @@ import type { FastifyInstance, FastifyPluginAsync, FastifyRequest } from 'fastif
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { db } from '../../lib/db';
+import { booleanString } from '../../lib/booleanString';
 import { audit } from '../../lib/audit';
 import { env } from '../../config/env';
 import { requireRoles } from '../../plugins/roles';
 import { requireFeature } from '../../lib/entitlements';
 import type { Prisma } from '../../generated/prisma/client';
+import { runWithTenantContext } from '../../lib/tenantContext';
 
 const PASSWORD_MIN_LENGTH = env.PASSWORD_MIN_LENGTH;
 const LOCKOUT_THRESHOLD = env.AUTH_LOCKOUT_THRESHOLD;
@@ -180,7 +182,8 @@ export const complianceCenterRoutes: FastifyPluginAsync = async app => {
 
   // ===== Evidence (metadata/link/hash only; soft delete; version chain) ====
   app.get('/evidence', { preHandler: complianceRead }, async request => {
-    const query = z.object({ includeDeleted: z.coerce.boolean().default(false), reviewStatus: z.enum(REVIEW_STATUSES).optional() }).parse(request.query);
+    // booleanString, not z.coerce.boolean(): the latter coerces "false" → true.
+    const query = z.object({ includeDeleted: booleanString(false), reviewStatus: z.enum(REVIEW_STATUSES).optional() }).parse(request.query);
     return db.complianceEvidence.findMany({
       where: {
         tenantId: tenant(request),
@@ -497,8 +500,36 @@ export const complianceCenterRoutes: FastifyPluginAsync = async app => {
       evidenceReviewFrequency: z.string().trim().max(40).optional(),
     }).parse(request.body);
     const tenantId = tenant(request);
-    const row = await db.tenantSecurityPolicy.upsert({ where: { tenantId }, update: input, create: { tenantId, ...input } });
-    await audit(request, { action: 'compliance.securityPolicy.updated', resource: 'tenantSecurityPolicy', resourceId: row.id, metadata: input as Prisma.InputJsonObject });
+    const row = await runWithTenantContext(tenantId, async tx => {
+      const existing = await tx.tenantSecurityPolicy.findUnique({ where: { tenantId } });
+      const enablingMfa = input.requireMfa === true && !existing?.requireMfa;
+      const revokedAt = enablingMfa ? new Date() : undefined;
+      if (enablingMfa) {
+        await tx.user.updateMany({
+          where: { tenantId },
+          data: { refreshTokenHash: null, refreshTokenExpiresAt: null },
+        });
+      }
+      const updated = await tx.tenantSecurityPolicy.upsert({
+        where: { tenantId },
+        update: { ...input, sessionsRevokedAt: revokedAt },
+        create: { tenantId, ...input, sessionsRevokedAt: revokedAt },
+      });
+      await tx.auditEvent.create({
+        data: {
+          tenantId,
+          actorUserId: request.auth.userId,
+          action: 'compliance.securityPolicy.updated',
+          resource: 'tenantSecurityPolicy',
+          resourceId: updated.id,
+          requestId: request.id,
+          ipAddress: request.ip,
+          userAgent: request.headers['user-agent'],
+          metadata: input as Prisma.InputJsonObject,
+        },
+      });
+      return updated;
+    });
     return row;
   });
 

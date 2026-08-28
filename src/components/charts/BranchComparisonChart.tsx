@@ -16,7 +16,7 @@ export default function BranchComparisonChart({ data }: BranchComparisonChartPro
   if (data.length === 0) {
     return (
       <div className="flex h-[200px] items-center justify-center rounded-xl border border-dashed border-[var(--b1)] text-xs text-t3">
-        No live branch revenue data available.
+        No recorded branch revenue data is available.
       </div>
     );
   }

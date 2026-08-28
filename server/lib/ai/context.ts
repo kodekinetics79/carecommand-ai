@@ -1,5 +1,6 @@
 import { db } from '../db';
 import { env } from '../../config/env';
+import { countCurrentReadyRpmPatients } from '../connectedCare/rpmReadinessService';
 
 // A single evidence reference grounding an AI output in real backend data.
 export interface EvidenceRef { source: string; metric: string; value: number; label: string }
@@ -26,7 +27,7 @@ export const aiContextBuilder = {
       db.readingAlert.count({ where: { tenantId, alertType: 'missed_reading', status: { in: OPEN } } }),
       db.device.count({ where: { tenantId, active: true, status: { in: ['offline', 'error'] } } }),
       db.eligibilityVerification.count({ where: { tenantId, checkedAt: { gte: dayStart }, coverageStatus: { in: ['INACTIVE', 'ERROR'] } } }),
-      db.rPMBillingReadiness.count({ where: { tenantId, status: 'READY' } }),
+      countCurrentReadyRpmPatients(tenantId),
       db.readingAlert.count({ where: { tenantId, status: { in: OPEN } } }),
     ]);
     const metrics: EvidenceRef[] = [

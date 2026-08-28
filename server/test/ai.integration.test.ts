@@ -14,10 +14,11 @@ vi.mock('../workers/queues', () => ({
 }));
 
 const { buildApp } = await import('../app');
-const { db } = await import('../lib/db');
+const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { recomputeEntitlements } = await import('../lib/entitlements');
 const { aiGateway, AiGatewayBlockedError } = await import('../lib/ai/gateway');
 const { aiContextBuilder } = await import('../lib/ai/context');
+const { runInTenantContext } = await import('../lib/tenantContext');
 
 let app: FastifyInstance;
 const tenants: string[] = [];
@@ -28,7 +29,7 @@ async function makeTenant() {
   tenants.push(id);
   const plan = await db.subscriptionPlan.findUnique({ where: { key: 'enterprise' } });
   await db.tenantSubscription.create({ data: { tenantId: id, planId: plan!.id, status: 'ACTIVE', startedAt: new Date() } });
-  await recomputeEntitlements(id);
+  await recomputeEntitlements(id, db);
   const branch = await db.branch.create({ data: { tenantId: id, name: 'b', location: 'x' } });
   const patient = await db.patient.create({ data: { tenantId: id, branchId: branch.id, firstName: 'AI', lastName: 'Patient', lifecycleStage: 'NEW' } });
   const admin = await db.user.create({ data: { tenantId: id, role: 'ADMIN', active: true, email: `a-${id.slice(0, 8)}@ai.test`, displayName: 'Admin' } });
@@ -36,7 +37,7 @@ async function makeTenant() {
   await db.readingAlert.create({ data: { tenantId: id, patientId: patient.id, branchId: branch.id, severity: 'critical', alertType: 'abnormal_reading', status: 'open', generatedReason: 'seeded for test' } });
   return { id, adminId: admin.id };
 }
-const tok = (tenantId: string, userId: string) => app.jwt.sign({ userId, tenantId, type: 'access' });
+const tok = (tenantId: string, userId: string) => app.jwt.sign({ userId, tenantId, role: 'OWNER', type: 'access' });
 const auth = (t: string) => ({ authorization: `Bearer ${t}`, 'x-forwarded-for': '203.0.113.9' });
 
 beforeAll(async () => { app = await buildApp(); }, 60_000);
@@ -88,7 +89,10 @@ describe('AI model gateway (integration, mock provider)', () => {
   it('blocks PHI when AI_ENABLE_PHI=false and logs the block', async () => {
     const t = await makeTenant();
     await expect(
-      aiGateway.generate({ tenantId: t.id, operation: 'recommendation', containsPhi: true, messages: [{ role: 'user', content: 'x' }] }),
+      runInTenantContext(
+        { tenantId: t.id, actorId: t.adminId, actorRole: 'ADMIN', source: 'request' },
+        () => aiGateway.generate({ tenantId: t.id, operation: 'recommendation', containsPhi: true, messages: [{ role: 'user', content: 'x' }] }),
+      ),
     ).rejects.toBeInstanceOf(AiGatewayBlockedError);
     const blocked = await db.aIUsageLog.findFirst({ where: { tenantId: t.id, status: 'blocked' } });
     expect(blocked?.error).toMatch(/PHI/);
@@ -96,7 +100,10 @@ describe('AI model gateway (integration, mock provider)', () => {
 
   it('context builder produces a de-identified snapshot (counts only, no PHI)', async () => {
     const t = await makeTenant();
-    const snap = await aiContextBuilder.buildOperationalSnapshot(t.id);
+    const snap = await runInTenantContext(
+      { tenantId: t.id, actorId: t.adminId, actorRole: 'ADMIN', source: 'request' },
+      () => aiContextBuilder.buildOperationalSnapshot(t.id),
+    );
     expect(snap.phiEnabled).toBe(false);
     expect(snap.metrics.every(m => typeof m.value === 'number')).toBe(true);
     // No patient identifiers anywhere in the snapshot payload.

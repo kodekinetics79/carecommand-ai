@@ -17,8 +17,9 @@ vi.mock('../workers/queues', () => ({
 }));
 
 const { buildApp } = await import('../app');
-const { db } = await import('../lib/db');
+const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { recomputeEntitlements } = await import('../lib/entitlements');
+const { issuePortalSession } = await import('../lib/portalAuth');
 
 let app: FastifyInstance;
 const createdTenantIds: string[] = [];
@@ -39,7 +40,7 @@ async function makeTenant() {
   createdTenantIds.push(id);
   const plan = await db.subscriptionPlan.findUnique({ where: { key: 'enterprise' } });
   await db.tenantSubscription.create({ data: { tenantId: id, planId: plan!.id, status: 'ACTIVE', startedAt: new Date() } });
-  await recomputeEntitlements(id); // enables patient_crm (portal feature gate)
+  await recomputeEntitlements(id, db); // enables patient_crm (portal feature gate)
   const branch = await db.branch.create({ data: { tenantId: id, name: 'b', location: 'x' } });
   const provUser = await db.user.create({ data: { tenantId: id, role: 'PROVIDER', active: true, email: `pv-${id.slice(0, 8)}@pb.test`, displayName: 'Dr Who' } });
   const provider = await db.providerProfile.create({ data: { tenantId: id, branchId: branch.id, userId: provUser.id, specialty: 'Primary Care', rating: 4.8, reviewCount: 12 } });
@@ -47,12 +48,13 @@ async function makeTenant() {
   await db.providerAvailability.create({ data: { tenantId: id, branchId: branch.id, providerProfileId: provider.id, dayOfWeek: 1, startMinute: 540, endMinute: 720, slotMinutes: 30 } });
   const patient = await db.patient.create({ data: { tenantId: id, branchId: branch.id, firstName: 'Pat', lastName: 'Roe', lifecycleStage: 'ACTIVE' } });
   const account = await db.patientPortalAccount.create({ data: { tenantId: id, patientId: patient.id, status: 'active', email: `pat-${id.slice(0, 8)}@pb.test` } });
-  return { id, branchId: branch.id, providerId: provider.id, patientId: patient.id, accountId: account.id };
+  const portalToken = await issuePortalSession(app, account, db);
+  return { id, branchId: branch.id, providerId: provider.id, patientId: patient.id, accountId: account.id, portalToken };
 }
 
 const portalTok = (t: { id: string; patientId: string; accountId: string }) =>
-  app.jwt.sign({ portalAccountId: t.accountId, patientId: t.patientId, tenantId: t.id, type: 'portal' });
-const phdr = (t: { id: string; patientId: string; accountId: string }) => ({ authorization: `Bearer ${portalTok(t)}` });
+  'portalToken' in t ? String(t.portalToken) : '';
+const phdr = (t: { id: string; patientId: string; accountId: string; portalToken: string }) => ({ authorization: `Bearer ${portalTok(t)}` });
 
 beforeAll(async () => { app = await buildApp(); }, 60_000);
 afterAll(async () => {
@@ -107,7 +109,7 @@ describe('portal self-scheduling — patient books real availability for themsel
     const t = await makeTenant();
     expect((await app.inject({ method: 'GET', url: '/v1/portal/booking/providers' })).statusCode).toBe(401);
     // a staff-style access token must not work on the portal plane
-    const staff = app.jwt.sign({ userId: randomUUID(), tenantId: t.id, type: 'access' });
+    const staff = app.jwt.sign({ userId: randomUUID(), tenantId: t.id, role: 'OWNER', type: 'access' });
     const res = await app.inject({ method: 'GET', url: '/v1/portal/booking/providers', headers: { authorization: `Bearer ${staff}` } });
     expect(res.statusCode).toBe(401);
   });

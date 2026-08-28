@@ -1,5 +1,5 @@
-import { useNavigate } from 'react-router-dom';
-import { Star, TrendingUp, Users, CalendarDays, ArrowRight, Sparkles, Award, Clock } from 'lucide-react';
+import { useNavigate } from 'react-router';
+import { Star, Users, CalendarDays, ArrowRight, Sparkles, Award, Clock } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
@@ -18,13 +18,14 @@ export default function DoctorWorkspace() {
   const totalRevenue = providerRecords.reduce((s, d) => s + d.revenueThisMonth, 0);
   const avgUtilization = providerRecords.length > 0 ? Math.round(providerRecords.reduce((s, d) => s + d.utilization, 0) / providerRecords.length) : 0;
   const avgRating = providerRecords.length > 0 ? (providerRecords.reduce((s, d) => s + d.rating, 0) / providerRecords.length).toFixed(1) : '0.0';
+  const metricsReady = source === 'live' && !loadError;
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Provider Productivity"
-        subtitle="Utilisation, appointment volume, repeat customer rates, and review performance across all providers."
-        badge={loadError ? 'Live Data Error' : `${source === 'live' ? 'Live DB' : 'Loading'} · ${providerRecords.length} providers`}
+        subtitle="Utilisation, appointment volume, repeat patient rates, and review performance across all providers."
+        badge={loadError ? 'Data unavailable' : `${source === 'live' ? 'Stored provider records' : 'Loading'} · ${providerRecords.length} providers`}
         badgeColor={loadError ? 'red' : 'emerald'}
         actions={
           <button type="button" onClick={() => window.print()} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
@@ -35,15 +36,15 @@ export default function DoctorWorkspace() {
 
       {loadError && (
         <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          Provider data could not be loaded from the live API: {loadError}
+          Provider data could not be loaded: {loadError}
         </div>
       )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Total Providers" value={providerRecords.length} subtitle="Across all branches" icon={<Users className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Avg Utilisation" value={`${avgUtilization}%`} subtitle="Network capacity" trend={4} icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Network Revenue" value={formatCurrency(totalRevenue)} subtitle="This month" trend={8} icon={<CalendarDays className="w-4 h-4" />} accent="violet" />
-        <StatCard title="Avg Rating" value={avgRating} subtitle="Customer satisfaction" trend={2} icon={<Star className="w-4 h-4" />} accent="amber" />
+        <StatCard title="Total Providers" value={metricsReady ? providerRecords.length : '—'} subtitle={metricsReady ? 'Across all branches' : 'Unavailable'} icon={<Users className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Avg Utilisation" value={metricsReady ? `${avgUtilization}%` : '—'} subtitle={metricsReady ? 'Network capacity' : 'Unavailable'} icon={<CalendarDays className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Network Revenue" value={metricsReady ? formatCurrency(totalRevenue) : '—'} subtitle={metricsReady ? 'This month' : 'Unavailable'} icon={<CalendarDays className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Avg Rating" value={metricsReady ? avgRating : '—'} subtitle={metricsReady ? 'Patient reviews' : 'Unavailable'} icon={<Star className="w-4 h-4" />} accent="amber" />
       </div>
 
       {/* Provider table */}
@@ -111,7 +112,7 @@ export default function DoctorWorkspace() {
               })}
               {providerRecords.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="py-6 px-3 text-center text-xs text-t3">No live provider profiles returned.</td>
+                  <td colSpan={8} className="py-6 px-3 text-center text-xs text-t3">No provider profiles were returned.</td>
                 </tr>
               )}
             </tbody>
@@ -138,7 +139,7 @@ export default function DoctorWorkspace() {
                 </div>
               </div>
             ))}
-            {providerRecords.length === 0 && <p className="text-sm text-t3 text-center py-4">No live provider rankings available.</p>}
+            {providerRecords.length === 0 && <p className="text-sm text-t3 text-center py-4">No provider ranking records are available.</p>}
           </div>
         </BentoCard>
 
@@ -159,7 +160,7 @@ export default function DoctorWorkspace() {
               </div>
             ))}
             {providerRecords.filter(d => d.followUpRate < 80).length === 0 && (
-              <p className="text-sm text-t3 text-center py-4">All providers meeting follow-up targets.</p>
+              <p className="text-sm text-t3 text-center py-4">{metricsReady ? 'No providers in the loaded result set are below the follow-up threshold.' : 'Follow-up metrics are unavailable.'}</p>
             )}
           </div>
           <button type="button" onClick={() => navigate('/campaigner')} className="mt-3 w-full flex items-center justify-center gap-1 text-xs font-semibold text-indigo py-2 border border-dashed border-[var(--b2)] rounded-xl hover:bg-[var(--s3)] transition-colors">

@@ -1,5 +1,6 @@
 import { db } from '../../lib/db';
 import type { Prisma } from '../../generated/prisma/client';
+import { forEachActiveJobTenant } from '../../lib/jobTenantResolver';
 
 // ===========================================================================
 // Compliance Readiness Center — background job logic (Phase C-1D).
@@ -19,11 +20,6 @@ async function auditJob(tenantId: string, action: string, resource: string, reso
   await db.auditEvent.create({
     data: { tenantId, actorUserId: null, action, resource, resourceId: resourceId ?? undefined, userAgent: 'compliance-job', metadata },
   });
-}
-
-async function tenantIds(only?: string): Promise<string[]> {
-  if (only) return [only];
-  return (await db.tenant.findMany({ select: { id: true } })).map(t => t.id);
 }
 
 // Prefer an active COMPLIANCE_OFFICER, then ADMIN, then OWNER. Inactive users
@@ -67,7 +63,7 @@ function isoWeek(date = new Date()): string {
 // recompute and AUDIT the result rather than inventing a table. Truthful only.
 export async function runReadinessRecalc(only?: string) {
   const results: Array<{ tenantId: string; overall: number }> = [];
-  for (const tenantId of await tenantIds(only)) {
+  await forEachActiveJobTenant(only, 'worker:compliance:readiness', async tenantId => {
     const [frameworks, controls] = await Promise.all([
       db.complianceFramework.findMany({ where: { tenantId }, select: { id: true, key: true, weight: true } }),
       db.complianceControl.findMany({ where: { tenantId }, select: { frameworkId: true, status: true } }),
@@ -83,14 +79,14 @@ export async function runReadinessRecalc(only?: string) {
     const overall = Math.round(frameworks.reduce((s, f) => s + scoreFor(f.id) * f.weight, 0) / weightTotal);
     await auditJob(tenantId, 'compliance.readiness.recalculated', 'complianceReadiness', null, { overall, perFramework });
     results.push({ tenantId, overall });
-  }
+  });
   return results;
 }
 
 // --- 2) Daily evidence expiry check ----------------------------------------
 export async function runEvidenceExpiry(only?: string) {
   let created = 0;
-  for (const tenantId of await tenantIds(only)) {
+  await forEachActiveJobTenant(only, 'worker:compliance:evidence-expiry', async tenantId => {
     const policy = await db.tenantSecurityPolicy.findUnique({ where: { tenantId }, select: { evidenceReviewFrequency: true } });
     const window = new Date();
     window.setDate(window.getDate() + reviewWindowDays(policy?.evidenceReviewFrequency));
@@ -114,11 +110,11 @@ export async function runEvidenceExpiry(only?: string) {
           status: 'OPEN',
         },
       });
-      if (!assigneeUserId) console.warn(`[compliance-job] evidence-expiry: tenant ${tenantId} has no eligible assignee; created unassigned task ${task.id}`);
+      if (!assigneeUserId) console.warn('[compliance-job] evidence-expiry: no eligible assignee; created an unassigned task');
       await auditJob(tenantId, 'compliance.task.created', 'complianceTask', task.id, { source: 'evidence-expiry', evidenceId: ev.id, assigned: Boolean(assigneeUserId) });
       created += 1;
     }
-  }
+  });
   return { created };
 }
 
@@ -127,15 +123,15 @@ export async function runEvidenceExpiry(only?: string) {
 // claims a successful/verified backup. One record per tenant per day.
 export async function runBackupPlaceholder(only?: string) {
   let created = 0;
-  for (const tenantId of await tenantIds(only)) {
+  await forEachActiveJobTenant(only, 'worker:compliance:backup', async tenantId => {
     const existing = await db.backupVerification.findFirst({ where: { tenantId, runAt: { gte: startOfToday() } } });
-    if (existing) continue;
+    if (existing) return;
     const row = await db.backupVerification.create({
       data: { tenantId, type: 'database', status: 'unverified', details: { integrated: false, reason: 'Backup provider not integrated' } },
     });
     await auditJob(tenantId, 'compliance.backup.recorded', 'backupVerification', row.id, { status: 'unverified', integrated: false });
     created += 1;
-  }
+  });
   return { created };
 }
 
@@ -143,17 +139,17 @@ export async function runBackupPlaceholder(only?: string) {
 export async function runAccessReviewReminder(only?: string) {
   let created = 0;
   const period = isoWeek();
-  for (const tenantId of await tenantIds(only)) {
+  await forEachActiveJobTenant(only, 'worker:compliance:access-review', async tenantId => {
     const existing = await db.accessReview.findFirst({ where: { tenantId, period } });
-    if (existing) continue;
+    if (existing) return;
     const reviewerUserId = await pickAssignee(tenantId);
     const row = await db.accessReview.create({
       data: { tenantId, period, reviewerUserId: reviewerUserId ?? undefined, status: 'pending', startedAt: new Date() },
     });
-    if (!reviewerUserId) console.warn(`[compliance-job] access-review: tenant ${tenantId} has no eligible reviewer; created unassigned review ${row.id}`);
+    if (!reviewerUserId) console.warn('[compliance-job] access-review: no eligible reviewer; created an unassigned review');
     await auditJob(tenantId, 'compliance.accessReview.created', 'accessReview', row.id, { period, assigned: Boolean(reviewerUserId) });
     created += 1;
-  }
+  });
   return { created, period };
 }
 
@@ -161,7 +157,7 @@ export async function runAccessReviewReminder(only?: string) {
 export async function runVendorReviewReminder(only?: string) {
   let created = 0;
   const now = new Date();
-  for (const tenantId of await tenantIds(only)) {
+  await forEachActiveJobTenant(only, 'worker:compliance:vendor-review', async tenantId => {
     const due = await db.vendorRisk.findMany({ where: { tenantId, status: 'active', nextReviewAt: { not: null, lte: now } } });
     for (const vendor of due) {
       const marker = `[vendor:${vendor.id}]`;
@@ -181,7 +177,7 @@ export async function runVendorReviewReminder(only?: string) {
       await auditJob(tenantId, 'compliance.task.created', 'complianceTask', task.id, { source: 'vendor-review', vendorId: vendor.id, assigned: Boolean(assigneeUserId) });
       created += 1;
     }
-  }
+  });
   return { created };
 }
 

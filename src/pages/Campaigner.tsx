@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
-import { Sparkles, Zap, ArrowRight, Target, Users, TrendingUp, CheckCircle2, Play, PauseCircle } from 'lucide-react';
+import { useLocation, useNavigate } from 'react-router';
+import { Sparkles, Zap, ArrowRight, Target, Users, TrendingUp, CheckCircle2, Play, PauseCircle, AlertTriangle } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
@@ -20,17 +20,17 @@ const statusConfig: Record<string, { label: string; color: string; bg: string }>
 };
 
 const goalCards = [
-  { id: 'winback', icon: <Users className="w-5 h-5" />, title: 'Reactivate Inactive Customers', desc: 'Target 30–180 day inactive segment', est: formatCurrency(18700), color: 'border-[var(--b2)] bg-[var(--blue-soft)]', iconBg: 'bg-[var(--blue-soft)] text-blue-v' },
-  { id: 'slots', icon: <Target className="w-5 h-5" />, title: 'Fill Empty Appointment Slots', desc: 'Boost branch utilisation with targeted offers', est: formatCurrency(6200), color: 'border-[var(--b2)] bg-[var(--violet-soft)]', iconBg: 'bg-[var(--violet-soft)] text-violet-v' },
-  { id: 'reviews', icon: <CheckCircle2 className="w-5 h-5" />, title: 'Grow Reputation & Reviews', desc: 'Post-visit review request automation', est: '28 reviews', color: 'border-[var(--b2)] bg-[var(--amber-soft)]', iconBg: 'bg-[var(--amber-soft)] text-amber-v' },
-  { id: 'referrals', icon: <TrendingUp className="w-5 h-5" />, title: 'Drive Referral Revenue', desc: 'Loyalty and referral reward program', est: formatCurrency(4500), color: 'border-[var(--b2)] bg-[var(--emerald-soft)]', iconBg: 'bg-[var(--emerald-soft)] text-emerald-v' },
+  { id: 'winback', icon: <Users className="w-5 h-5" />, title: 'Reconnect with inactive patients', desc: 'Build a draft for an approved, consented segment', est: 'Requires audience review', color: 'border-[var(--b2)] bg-[var(--blue-soft)]', iconBg: 'bg-[var(--blue-soft)] text-blue-v' },
+  { id: 'slots', icon: <Target className="w-5 h-5" />, title: 'Share appointment availability', desc: 'Offer current openings without implying a hold', est: 'Requires slot validation', color: 'border-[var(--b2)] bg-[var(--violet-soft)]', iconBg: 'bg-[var(--violet-soft)] text-violet-v' },
+  { id: 'reviews', icon: <CheckCircle2 className="w-5 h-5" />, title: 'Request patient feedback', desc: 'Prepare an approved post-visit request', est: 'Requires eligibility review', color: 'border-[var(--b2)] bg-[var(--amber-soft)]', iconBg: 'bg-[var(--amber-soft)] text-amber-v' },
+  { id: 'referrals', icon: <TrendingUp className="w-5 h-5" />, title: 'Prepare a referral campaign', desc: 'Create a draft under clinic and jurisdiction rules', est: 'Requires policy approval', color: 'border-[var(--b2)] bg-[var(--emerald-soft)]', iconBg: 'bg-[var(--emerald-soft)] text-emerald-v' },
 ];
 
 const messagePreviews: Record<string, string> = {
-  whatsapp: "👋 Hi {Name}, it's been a while! We miss you at CareCommand Clinics.\n\nWe've saved a slot just for you this week: *Wednesday 28 May at 10:30am*.\n\nReply YES to confirm or tap to rebook: 🔗 [Book Now]\n\n_Reply STOP to opt out._",
-  sms: "Hi {Name}, you have a special slot waiting at CareCommand Clinics. Book your appointment: bit.ly/carecommand-book. Reply STOP to opt out.",
-  email: "Subject: We've saved a slot for you, {Name}!\n\nHi {Name},\n\nIt's been a while since your last visit, and we'd love to welcome you back.\n\nOur team at [Branch Name] has availability this week, and we've put together a special offer just for returning customers.\n\n[Book Your Appointment →]\n\nWarm regards,\nThe CareCommand Team",
-  push: "📅 Your slot is waiting! Tap to book your appointment this week at CareCommand Clinics.",
+  whatsapp: "Hi {Name}, this is [Clinic Name]. If you would like to schedule a visit, you can review current appointment options here: [Scheduling Link]. No appointment is held until booking is confirmed. Reply STOP to opt out.",
+  sms: "[Clinic Name]: Review current appointment options at [Scheduling Link]. No appointment is held until confirmed. Reply STOP to opt out.",
+  email: "Subject: Appointment options from [Clinic Name]\n\nHi {Name},\n\nIf you would like to schedule a visit, you can review current options at [Scheduling Link]. Availability can change, and no appointment is held until booking is confirmed.\n\nManage communication preferences: [Preferences Link]\n\n[Clinic Name]",
+  push: "[Clinic Name] has appointment options available. Open scheduling to review; no appointment is held until confirmed.",
 };
 
 const channelTabs = [
@@ -39,13 +39,6 @@ const channelTabs = [
   { id: 'email', label: 'Email' },
   { id: 'push', label: 'Push' },
 ];
-
-const launchPlans: Record<string, { name: string; goal: string; channels: string[] }> = {
-  winback: { name: 'Winback Campaign', goal: 'Reactivation for inactive customers', channels: ['WHATSAPP', 'EMAIL', 'SMS'] },
-  slots: { name: 'Slot Fill Campaign', goal: 'Boost branch utilisation with targeted offers', channels: ['WHATSAPP', 'SMS'] },
-  reviews: { name: 'Review Growth Campaign', goal: 'Post-visit review request automation', channels: ['WHATSAPP', 'SMS', 'EMAIL'] },
-  referrals: { name: 'Referral Growth Campaign', goal: 'Loyalty and referral reward program', channels: ['EMAIL', 'WHATSAPP'] },
-};
 
 export default function Campaigner() {
   const navigate = useNavigate();
@@ -56,36 +49,20 @@ export default function Campaigner() {
   const [campaignFilter, setCampaignFilter] = useState('all');
   const { data: campaignRecords, source, error, reload } = useApiResource<ApiCampaign, ReturnType<typeof mapCampaign>>('/v1/campaigns?limit=100', [], mapCampaign);
   const [pendingId, setPendingId] = useState<string | null>(null);
-  const [creatingCampaign, setCreatingCampaign] = useState(false);
   const loadError = error;
 
-  async function setCampaignStatus(id: string, status: 'ACTIVE' | 'PAUSED') {
+  async function pauseCampaign(id: string) {
     setPendingId(id);
     try {
-      await apiRequest(`/v1/campaigns/${id}`, { method: 'PATCH', body: JSON.stringify({ status }) });
+      await apiRequest(`/v1/campaigns/${id}`, { method: 'PATCH', body: JSON.stringify({ status: 'PAUSED' }) });
       reload();
     } finally {
       setPendingId(null);
     }
   }
 
-  async function createCampaign(name: string, goal: string, channels: string[] = ['WHATSAPP', 'EMAIL']) {
-    setCreatingCampaign(true);
-    try {
-      await apiRequest('/v1/campaigns', {
-        method: 'POST',
-        body: JSON.stringify({ name, goal, status: 'DRAFT', channels, aiGenerated: true }),
-      });
-      reload();
-    } finally {
-      setCreatingCampaign(false);
-    }
-  }
-
-  async function launchSelectedGoal() {
-    const goalId = selectedGoal && launchPlans[selectedGoal] ? selectedGoal : 'winback';
-    const plan = launchPlans[goalId];
-    await createCampaign(plan.name, plan.goal, plan.channels);
+  function openApprovedCampaignWorkflow() {
+    navigate('/reactivation', { state: selectedGoal ? { goal: selectedGoal } : undefined });
   }
   const campaignFilterTabs = [
     { id: 'all', label: 'All', count: campaignRecords.length },
@@ -95,6 +72,8 @@ export default function Campaigner() {
   ];
   const totalRevenue = campaignRecords.reduce((sum, campaign) => sum + campaign.revenue, 0);
   const totalBooked = campaignRecords.reduce((sum, campaign) => sum + campaign.booked, 0);
+  const totalSent = campaignRecords.reduce((sum, campaign) => sum + campaign.sent, 0);
+  const recordedConversionRate = totalSent > 0 ? Math.round((totalBooked / totalSent) * 1000) / 10 : null;
   const activeCount = campaignRecords.filter(campaign => campaign.status === 'active').length;
 
   const filteredCampaigns = campaignFilter === 'all' ? campaignRecords : campaignRecords.filter(c => c.status === campaignFilter);
@@ -102,9 +81,9 @@ export default function Campaigner() {
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
-        title="Campaigner"
-        subtitle="Campaign studio — build, launch, and measure multi-channel growth campaigns."
-        badge={loadError ? 'Live Data Error' : `${activeCount} Active · ${source === 'live' ? 'Live DB' : 'Loading'}`}
+        title="Campaign Planner & Portfolio"
+        subtitle="Review stored campaign metrics and prepare content; approved audience and dispatch actions live in the Reactivation Engine."
+        badge={loadError ? 'Data unavailable' : `${activeCount} Active · ${source === 'live' ? 'Stored campaign records' : 'Loading'}`}
         badgeColor={loadError ? 'red' : 'emerald'}
         actions={
           <div className="flex gap-2">
@@ -117,16 +96,16 @@ export default function Campaigner() {
 
       {loadError && (
         <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          Campaign data could not be loaded from the live API: {loadError}
+          Campaign records could not be loaded from the clinic service: {loadError}
         </div>
       )}
 
       {/* KPIs */}
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Total Campaign Revenue" value={formatCurrency(totalRevenue)} subtitle="All campaigns" trend={18} icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Total Bookings" value={totalBooked} subtitle="From campaigns" trend={12} icon={<CheckCircle2 className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Active Campaigns" value={activeCount} subtitle="Currently running" icon={<Play className="w-4 h-4" />} accent="violet" />
-        <StatCard title="Avg Conversion Rate" value="19.4%" subtitle="Across all campaigns" trend={3} icon={<Target className="w-4 h-4" />} accent="cyan" />
+        <StatCard title="Attributed Revenue" value={loadError ? 'Unavailable' : formatCurrency(totalRevenue)} subtitle={loadError ? 'Campaign records did not load' : 'Stored campaign attribution'} icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Recorded Bookings" value={loadError ? 'Unavailable' : totalBooked} subtitle={loadError ? 'Campaign records did not load' : 'Stored campaign outcomes'} icon={<CheckCircle2 className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Active Campaigns" value={loadError ? 'Unavailable' : activeCount} subtitle={loadError ? 'Campaign records did not load' : 'Currently running'} icon={<Play className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Booking / Accepted" value={loadError ? 'Unavailable' : recordedConversionRate === null ? '—' : `${recordedConversionRate}%`} subtitle={loadError ? 'Campaign records did not load' : 'Bookings per provider-accepted request'} icon={<Target className="w-4 h-4" />} accent="cyan" />
       </div>
 
       {/* Goal Selector */}
@@ -155,7 +134,7 @@ export default function Campaigner() {
               <div className={`w-9 h-9 rounded-xl flex items-center justify-center mb-3 ${goal.iconBg}`}>{goal.icon}</div>
               <p className="text-sm font-bold text-t1 leading-tight mb-1">{goal.title}</p>
               <p className="text-[11px] text-t3 mb-2">{goal.desc}</p>
-              <p className="text-sm font-bold text-emerald-v">Est. {goal.est}</p>
+              <p className="text-[11px] font-semibold text-amber-v">{goal.est}</p>
             </button>
           ))}
         </div>
@@ -163,11 +142,11 @@ export default function Campaigner() {
           <div className="mt-4 p-4 rounded-2xl bg-[var(--indigo-soft)] border border-[var(--b2)]">
             <div className="flex items-center justify-between gap-3">
               <div>
-                <p className="text-sm font-bold text-t1">Campaign segments are ready</p>
-                <p className="text-xs text-t3 mt-0.5">Audience identified · Message prepared · Best send time set</p>
+                <p className="text-sm font-bold text-t1">Draft objective selected</p>
+                <p className="text-xs text-t3 mt-0.5">Creating a draft does not authorize an audience, schedule delivery, or contact anyone.</p>
               </div>
-              <button type="button" disabled={!selectedGoal || creatingCampaign} onClick={() => void launchSelectedGoal()} className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition-colors shrink-0 disabled:opacity-40">
-                <Zap className="w-3.5 h-3.5" /> Continue to Launch
+              <button type="button" disabled={!selectedGoal} onClick={openApprovedCampaignWorkflow} className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition-colors shrink-0 disabled:opacity-40">
+                <Zap className="w-3.5 h-3.5" /> Open approved campaign workflow
               </button>
             </div>
           </div>
@@ -185,7 +164,7 @@ export default function Campaigner() {
             <div className="space-y-3">
               {filteredCampaigns.map((c) => {
                 const sc = statusConfig[c.status] ?? statusConfig['draft'];
-                const convRate = c.audienceSize > 0 ? Math.round((c.booked / c.audienceSize) * 100) : 0;
+                const convRate = c.sent > 0 ? Math.round((c.booked / c.sent) * 100) : 0;
                 const openRate = c.sent > 0 ? Math.round((c.opened / c.sent) * 100) : 0;
                 return (
                   <div key={c.id} className="p-4 rounded-2xl border border-[var(--b1)] hover:border-[var(--b2)] hover:bg-[var(--s3)] transition-all">
@@ -223,7 +202,7 @@ export default function Campaigner() {
                       </div>
                       <div className="text-center p-2 rounded-lg bg-[var(--s3)]">
                         <p className="text-sm font-bold text-emerald-v">{c.sent > 0 ? `${convRate}%` : '—'}</p>
-                        <p className="text-[10px] text-t3">Conversion</p>
+                        <p className="text-[10px] text-t3">Booking / accepted</p>
                       </div>
                       <div className="text-center p-2 rounded-lg bg-[var(--s3)]">
                         <p className="text-sm font-bold text-t1">{c.booked}</p>
@@ -241,13 +220,13 @@ export default function Campaigner() {
 
                     <div className="flex items-center gap-2 mt-3">
                       {c.status === 'active' && (
-                        <button type="button" disabled={pendingId === c.id} onClick={() => setCampaignStatus(c.id, 'PAUSED')} className="inline-flex items-center gap-1 text-xs font-semibold text-amber-v hover:text-amber-v/80 disabled:opacity-40">
+                        <button type="button" disabled={pendingId === c.id} onClick={() => pauseCampaign(c.id)} className="inline-flex items-center gap-1 text-xs font-semibold text-amber-v hover:text-amber-v/80 disabled:opacity-40">
                           <PauseCircle className="w-3.5 h-3.5" /> {pendingId === c.id ? 'Pausing…' : 'Pause'}
                         </button>
                       )}
                       {(c.status === 'draft' || c.status === 'scheduled' || c.status === 'paused') && (
-                        <button type="button" disabled={pendingId === c.id} onClick={() => setCampaignStatus(c.id, 'ACTIVE')} className="inline-flex items-center gap-1 text-xs font-semibold text-indigo hover:text-indigo/80 disabled:opacity-40">
-                          <Play className="w-3.5 h-3.5" /> {pendingId === c.id ? 'Launching…' : c.status === 'paused' ? 'Resume' : 'Launch'}
+                        <button type="button" onClick={openApprovedCampaignWorkflow} className="inline-flex items-center gap-1 text-xs font-semibold text-indigo hover:text-indigo/80">
+                          <Play className="w-3.5 h-3.5" /> Open activation workflow
                         </button>
                       )}
                       <button type="button" onClick={() => navigate('/revenue')} className="ml-auto inline-flex items-center gap-1 text-xs font-semibold text-t3 hover:text-t2">
@@ -263,7 +242,7 @@ export default function Campaigner() {
 
         {/* Right: Message preview + consent */}
         <div className="space-y-4">
-          <BentoCard title="Message Preview" subtitle="Multi-channel preview">
+          <BentoCard title="Message Template Preview" subtitle="Draft examples only · clinic and counsel approval required">
             <div className="mb-4">
               <ModuleTabs tabs={channelTabs} activeTab={previewChannel} onChange={setPreviewChannel} />
             </div>
@@ -277,74 +256,41 @@ export default function Campaigner() {
             </div>
             <div className="flex items-center gap-2 mt-3">
               <div className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-              <p className="text-[11px] text-t3">Consent check: <span className="font-semibold text-emerald-v">Active · opt-out link included</span></p>
+              <p className="text-[11px] text-t3">Template includes an opt-out instruction where shown. Recipient consent, suppression, channel eligibility, and jurisdiction rules are checked separately at activation and dispatch.</p>
             </div>
           </BentoCard>
 
           {/* Audience preview */}
-          <BentoCard title="Audience Builder" subtitle="Segmented audience">
-            <div className="space-y-2.5">
-              {[
-                { label: 'Inactive 60–90 days', count: 87, pct: 47, color: 'bg-blue-500' },
-                { label: 'At-risk lifecycle stage', count: 54, pct: 29, color: 'bg-amber-500' },
-                { label: 'High LTV, low engagement', count: 31, pct: 17, color: 'bg-violet-500' },
-                { label: 'Excluded: no consent', count: 15, pct: 8, color: 'bg-[var(--b2)]' },
-              ].map((seg) => (
-                <div key={seg.label}>
-                  <div className="flex items-center justify-between gap-2 mb-1">
-                    <div className="flex items-center gap-2">
-                      <div className={`w-2 h-2 rounded-full ${seg.color}`} />
-                      <p className="text-xs font-medium text-t2">{seg.label}</p>
-                    </div>
-                    <span className="text-xs font-bold text-t1">{seg.count}</span>
-                  </div>
-                  <ProgressBar value={seg.pct} color={seg.color === 'bg-blue-500' ? 'blue' : seg.color === 'bg-amber-500' ? 'amber' : seg.color === 'bg-violet-500' ? 'violet' : 'blue'} />
-                </div>
-              ))}
-            </div>
-            <div className="mt-3 p-3 rounded-xl bg-[var(--s3)] border border-[var(--b1)]">
-              <p className="text-xs font-bold text-t1">187 customers in final audience</p>
-              <p className="text-[11px] text-t3 mt-0.5">15 excluded for no consent · WhatsApp preferred: 124</p>
+          <BentoCard title="Audience Authorization" subtitle="No audience is inferred on this page">
+            <div className="rounded-xl border border-[var(--b1)] bg-[var(--amber-soft)] p-3">
+              <p className="text-xs font-bold text-amber-v">Audience evidence required</p>
+              <p className="mt-1 text-[11px] text-t3">Before activation, review purpose-specific consent, do-not-contact and suppression records, channel eligibility, jurisdiction, clinic policy, and the final recipient count. A CRM segment alone is not outreach authority.</p>
             </div>
           </BentoCard>
 
-          {/* ROI estimate */}
+          {/* Planning state */}
           <div className="rounded-2xl bg-[var(--emerald-soft)] border border-[var(--b2)] p-4">
-            <p className="text-[10px] font-bold uppercase tracking-widest text-emerald-v mb-2">Estimated Campaign ROI</p>
-            <p className="text-3xl font-bold text-t1 mb-0.5">{formatCurrency(18700)}</p>
-            <p className="text-xs text-t3 mb-3">Based on 18% historical conversion · 187 audience</p>
-            <div className="grid grid-cols-3 gap-2 text-center">
-              <div className="bg-[var(--s2)] border border-[var(--b1)] rounded-xl p-2">
-                <p className="text-sm font-bold text-t1">34</p>
-                <p className="text-[10px] text-t3">Est. bookings</p>
-              </div>
-              <div className="bg-[var(--s2)] border border-[var(--b1)] rounded-xl p-2">
-                <p className="text-sm font-bold text-t1">{formatCurrency(550)}</p>
-                <p className="text-[10px] text-t3">Avg value</p>
-              </div>
-              <div className="bg-[var(--s2)] border border-[var(--b1)] rounded-xl p-2">
-                <p className="text-sm font-bold text-t1">6.2×</p>
-                <p className="text-[10px] text-t3">Est. ROI</p>
-              </div>
-            </div>
-            <button type="button" onClick={() => void launchSelectedGoal()} className="mt-3 w-full py-2 rounded-xl bg-[var(--s2)] border border-[var(--b1)] hover:bg-[var(--s3)] text-t1 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
-              <Zap className="w-3.5 h-3.5" /> Launch Campaign Now
+            <p className="text-[10px] font-bold uppercase tracking-widest text-emerald-v mb-2">Planning inputs required</p>
+            <p className="text-sm font-bold text-t1 mb-1">No ROI forecast is available</p>
+            <p className="text-xs text-t3">Add approved audience, cost, attribution-window, expected-value, and historical conversion inputs before presenting a forecast. A forecast is not guaranteed revenue.</p>
+            <button type="button" onClick={openApprovedCampaignWorkflow} className="mt-3 w-full py-2 rounded-xl bg-[var(--s2)] border border-[var(--b1)] hover:bg-[var(--s3)] text-t1 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
+              <Zap className="w-3.5 h-3.5" /> Open approved campaign workflow
             </button>
           </div>
 
           {/* Safety panel */}
-          <BentoCard title="Consent & Safety" subtitle="Compliance guardrails">
+          <BentoCard title="Consent & Safety" subtitle="Activation requirements · not verified on this page">
             <div className="space-y-2">
               {[
-                { label: 'SMS consent verified', ok: true },
-                { label: 'WhatsApp opt-in confirmed', ok: true },
-                { label: 'Marketing consent active', ok: true },
-                { label: 'Opt-out link in all messages', ok: true },
-                { label: 'No clinical claims in content', ok: true },
+                'Purpose-specific consent is current and source-attributed',
+                'DNC, revocation, and suppression checks pass at dispatch',
+                'Channel and jurisdiction requirements are approved',
+                'Opt-out instructions and handling are tested',
+                'Clinic reviewer approved the exact final content',
               ].map((g, i) => (
                 <div key={i} className="flex items-center gap-2.5">
-                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
-                  <p className="text-xs text-t2">{g.label}</p>
+                  <AlertTriangle className="w-3.5 h-3.5 text-amber-v shrink-0" />
+                  <p className="text-xs text-t2">{g}</p>
                 </div>
               ))}
             </div>

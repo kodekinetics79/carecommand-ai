@@ -22,7 +22,7 @@ export type WorkflowEventType =
   | 'insurance.intake.gap_detected' | 'insurance.patient_responsibility.estimated' | 'insurance.denialRisk.created'
   // CRM campaign / reactivation events.
   | 'campaign.created' | 'campaign.approved' | 'campaign.scheduled' | 'campaign.launched'
-  | 'campaign.delivery.sent' | 'campaign.delivery.failed' | 'campaign.delivery.suppressed' | 'campaign.completed'
+  | 'campaign.delivery.accepted' | 'campaign.delivery.failed' | 'campaign.delivery.suppressed' | 'campaign.completed'
   | 'patient.reactivation.recommended' | 'no_show.recovery.recommended' | 'unpaid_deposit.followup.recommended'
   | 'failed_payment.followup.recommended' | 'insurance_update.followup.recommended' | 'review_request.recommended' | 'empty_slot.fill.recommended'
   // Patient Intake + Consent engine events.

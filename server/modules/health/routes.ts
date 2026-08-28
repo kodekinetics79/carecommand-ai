@@ -1,50 +1,79 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { db } from '../../lib/db';
-import { env } from '../../config/env';
-import { autopilotQueue } from '../../workers/queues';
+import { env, isIngressProxyConfigurationReady, parseAllowedMockIntegrations } from '../../config/env';
+import { metricsAccess } from '../../lib/metrics';
+import { SLOS, errorBudgetMinutes } from '../../lib/slo';
+import { refreshDependencyGauges } from './checks';
 
-async function withTimeout<T>(operation: Promise<T>, ms: number): Promise<T> {
-  return Promise.race([
-    operation,
-    new Promise<T>((_resolve, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
-  ]);
-}
-
-async function checkDatabase(): Promise<boolean> {
-  try {
-    await withTimeout(db.$queryRaw`SELECT 1`, 2000);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function checkRedis(): Promise<boolean> {
-  try {
-    const client = (await withTimeout(Promise.resolve(autopilotQueue.client), 1000)) as unknown as { ping(): Promise<string> };
-    const pong = await withTimeout(client.ping(), 1000);
-    return pong === 'PONG';
-  } catch {
-    return false;
-  }
-}
+const BOOTED_AT = Date.now();
 
 export const healthRoutes: FastifyPluginAsync = async app => {
   app.get('/health/live', async () => ({ status: 'ok' }));
 
   app.get('/health/ready', async (_request, reply) => {
-    const [databaseOk, redisOk] = await Promise.all([checkDatabase(), checkRedis()]);
+    // The probe result also feeds the dependency_up gauge so an alert can fire
+    // on a dependency outage even between external probes (the /metrics scrape
+    // refreshes the same gauge — see plugins/metrics.ts).
+    const { databaseOk, redisOk } = await refreshDependencyGauges();
     // Redis backs rate limiting and the job queue, so it is required in
     // production. In other environments we report its state without failing.
     const redisRequired = env.NODE_ENV === 'production';
-    const ready = databaseOk && (!redisRequired || redisOk);
+    const proxyTrustOk = isIngressProxyConfigurationReady(env);
+    const ready = databaseOk && (!redisRequired || redisOk) && proxyTrustOk;
     const body = {
       status: ready ? 'ready' : 'not-ready',
       checks: {
         database: databaseOk ? 'ok' : 'down',
         redis: redisOk ? 'ok' : redisRequired ? 'down' : 'degraded',
+        ingressProxy: proxyTrustOk ? 'ok' : 'trusted_proxy_cidrs_required',
       },
     };
     return ready ? body : reply.code(503).send(body);
   });
+
+  // Human/uptime-monitor summary: one call that reports liveness, release, and
+  // uptime. Point an external uptime monitor at /health/ready (which 503s on a
+  // dependency outage); use this for at-a-glance status and version confirmation.
+  app.get('/health', async () => ({
+    status: 'ok',
+    service: env.OTEL_SERVICE_NAME,
+    environment: env.SERVICE_ENV ?? env.NODE_ENV,
+    release: env.RELEASE ?? 'unknown',
+    uptimeSeconds: Math.floor((Date.now() - BOOTED_AT) / 1000),
+    time: new Date().toISOString(),
+  }));
+
+  // Operational integration inventory. In production it shares the protected
+  // monitoring-token boundary with /metrics so public probes cannot fingerprint
+  // configured providers or deployment profile. It never returns credentials.
+  app.get('/health/integrations', async (request, reply) => {
+    const access = metricsAccess(request.headers.authorization);
+    if (access === 'not_found') return reply.code(404).send();
+    if (access === 'unauthorized') return reply.code(401).send();
+    return {
+    profile: env.DEPLOYMENT_PROFILE,
+    integrations: {
+      // Provider-mode integrations report their effective provider id.
+      payments: env.PAYMENT_PROVIDER,
+      insurance: env.INSURANCE_PROVIDER,
+      ai: env.AI_PROVIDER,
+      // Channel integrations are presence-derived: 'configured' only means the
+      // relevant env credentials are set, not that delivery has been proven.
+      email: env.EMAIL_HTTP_API_URL || env.SMTP_HOST ? 'configured' : 'not_configured',
+      sms: env.TWILIO_ACCOUNT_SID ? 'configured' : 'not_configured',
+      voice: env.RETELL_API_KEY ? 'configured' : 'not_configured',
+    },
+    // Mocks this profile has explicitly acknowledged (empty under 'demo' by
+    // convention — the gate ignores it there but boot validates the tokens).
+    acknowledgedMockIntegrations: parseAllowedMockIntegrations(env.ALLOWED_MOCK_INTEGRATIONS),
+    };
+  });
+
+  // Published SLO targets — the measurable commitments the alerts fire against.
+  app.get('/health/slo', async () => ({
+    window: '30d',
+    objectives: SLOS.map(slo => ({
+      ...slo,
+      ...(slo.unit === 'ratio' ? { errorBudgetMinutes: errorBudgetMinutes(slo.target) } : {}),
+    })),
+  }));
 };

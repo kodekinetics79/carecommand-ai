@@ -51,6 +51,15 @@ function TrendIcon({ trend }: { trend: string }) {
   return <Minus className="w-3.5 h-3.5 text-t3" aria-label="Flat" />;
 }
 
+function notificationStatusLabel(status: string): string {
+  if (status === 'sent') return 'provider accepted';
+  if (status === 'delivered') return 'delivered';
+  if (status === 'queued') return 'queued';
+  if (status === 'retrying') return 'retrying';
+  if (status === 'failed') return 'failed';
+  return status.replace(/_/g, ' ');
+}
+
 export default function RemoteMonitoring() {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [alerts, setAlerts] = useState<Alert[]>([]);
@@ -110,20 +119,24 @@ export default function RemoteMonitoring() {
     <div className="space-y-4 pb-6">
       {/* Toolbar */}
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="badge badge-red inline-flex items-center gap-1"><AlertOctagon className="w-3 h-3" />{s?.criticalAlerts ?? 0} critical open</span>
+        <span className="badge badge-red inline-flex items-center gap-1"><AlertOctagon className="w-3 h-3" />{s?.criticalAlerts ?? 0} critical-priority open</span>
         <button type="button" onClick={() => void load()} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-[13px] font-semibold text-t1 hover:bg-[var(--s2)] transition">
           <RefreshCw className="w-3.5 h-3.5 text-t3" /> Refresh
         </button>
+      </div>
+
+      <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-[11px] font-medium text-red-700">
+        Not an emergency-monitoring service. Do not rely on CareCommand as the only way to detect or respond to a clinical change. Follow the clinic's approved escalation plan; for an emergency in the United States, call 911.
       </div>
 
       {/* 1 · KPI cards */}
       <div className="grid gap-2.5 grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
         <StatCard title="Readings Today" value={s?.readingsToday ?? 0} subtitle="Captured" icon={<Activity className="w-4 h-4" />} accent="blue" />
         <StatCard title="Open Alerts" value={s?.openAlerts ?? 0} subtitle="Need action" icon={<Bell className="w-4 h-4" />} accent="amber" />
-        <StatCard title="Critical Alerts" value={s?.criticalAlerts ?? 0} subtitle="Doctor review" icon={<AlertOctagon className="w-4 h-4" />} accent="red" />
-        <StatCard title="Missed Readings" value={s?.missedReadings ?? 0} subtitle="High-risk gaps" icon={<CalendarX className="w-4 h-4" />} accent="violet" />
+        <StatCard title="Critical-Priority Alerts" value={s?.criticalAlerts ?? 0} subtitle="Needs clinician review" icon={<AlertOctagon className="w-4 h-4" />} accent="red" />
+        <StatCard title="Missed Readings" value={s?.missedReadings ?? 0} subtitle="Operational data gaps" icon={<CalendarX className="w-4 h-4" />} accent="violet" />
         <StatCard title="Offline Devices" value={s?.offlineDevices ?? 0} subtitle="Impacting monitoring" icon={<WifiOff className="w-4 h-4" />} accent="cyan" />
-        <StatCard title="Patients at Risk" value={s?.patientsAtRisk ?? 0} subtitle="Open high/critical" icon={<HeartPulse className="w-4 h-4" />} accent="red" />
+        <StatCard title="Patients Flagged" value={s?.patientsAtRisk ?? 0} subtitle="Operational review queue" icon={<HeartPulse className="w-4 h-4" />} accent="red" />
       </div>
 
       {/* 7 · Morning briefing */}
@@ -158,13 +171,13 @@ export default function RemoteMonitoring() {
         {/* Left column */}
         <div className="space-y-3 min-w-0">
           {/* 2 · Alert queue */}
-          <BentoCard title="Alert Queue" subtitle="Backend-generated — acknowledge, assign, or resolve">
+          <BentoCard title="Alert Queue" subtitle="Threshold and workflow alerts · not diagnosis or emergency dispatch">
             {loading ? <div className="space-y-2">{Array.from({ length: 4 }).map((_, i) => <div key={i} className="skeleton-line h-14 rounded-lg" />)}</div>
-              : alerts.length === 0 ? <EmptyStatePremium icon={<CheckCircle2 className="w-5 h-5" />} title="No active alerts" description="Abnormal readings, missed readings, and device issues will surface here." />
+              : alerts.length === 0 ? <EmptyStatePremium icon={<CheckCircle2 className="w-5 h-5" />} title="No open workflow alerts" description="No threshold, missed-reading, or device alerts were returned in the current response." />
               : (
                 <div className="space-y-2">
                   {alerts.filter(a => a.status !== 'resolved').map(a => (
-                    <div key={a.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3">
+                    <div key={a.id} data-alert-id={a.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3">
                       <div className="flex items-start justify-between gap-3">
                         <div className="min-w-0">
                           <div className="flex items-center gap-2 flex-wrap">
@@ -179,7 +192,7 @@ export default function RemoteMonitoring() {
                       </div>
                       <div className="flex items-center gap-1.5 mt-2.5 flex-wrap">
                         {a.status === 'open' && (
-                          <button type="button" disabled={busy === a.id} onClick={() => act(a.id, 'acknowledge')} className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-t2 hover:bg-[var(--s3)] disabled:opacity-50"><Check className="w-3 h-3" /> Acknowledge</button>
+                          <button type="button" disabled={busy === a.id} onClick={() => act(a.id, 'acknowledge')} className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-t2 hover:bg-[var(--s3)] disabled:opacity-50"><Check className="w-3 h-3" /> Record acknowledged</button>
                         )}
                         <div className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] pl-1.5 pr-1 py-0.5">
                           <UserPlus className="w-3 h-3 text-t3" />
@@ -188,7 +201,7 @@ export default function RemoteMonitoring() {
                             {users.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
                           </select>
                         </div>
-                        <button type="button" disabled={busy === a.id} onClick={() => act(a.id, 'resolve')} className="inline-flex items-center gap-1 rounded-lg bg-[var(--indigo)] px-2.5 py-1 text-[11px] font-semibold text-white hover:opacity-90 disabled:opacity-50"><CheckCircle2 className="w-3 h-3" /> Resolve</button>
+                        <button type="button" disabled={busy === a.id} onClick={() => act(a.id, 'resolve')} className="inline-flex items-center gap-1 rounded-lg bg-[var(--indigo)] px-2.5 py-1 text-[11px] font-semibold text-white hover:opacity-90 disabled:opacity-50"><CheckCircle2 className="w-3 h-3" /> Close workflow alert</button>
                       </div>
                     </div>
                   ))}
@@ -197,7 +210,7 @@ export default function RemoteMonitoring() {
           </BentoCard>
 
           {/* 3 · Live / recent readings */}
-          <BentoCard title="Live & Recent Readings" subtitle="Latest device captures across monitored patients">
+          <BentoCard title="Latest Recorded Readings" subtitle="Most recent stored device captures across monitored patients">
             {loading ? <div className="skeleton-line h-40 rounded-lg" />
               : !overview || overview.recentReadings.length === 0 ? <p className="text-xs text-t3 py-4 text-center">No readings captured yet.</p>
               : (
@@ -223,9 +236,9 @@ export default function RemoteMonitoring() {
           </BentoCard>
 
           {/* 4 · Patients at risk */}
-          <BentoCard title="Patients at Risk" subtitle="Operational urgency summary — not a clinical diagnosis">
+          <BentoCard title="Patients Flagged for Review" subtitle="Operational priority score — not a diagnosis or clinical risk determination">
             {loading ? <div className="skeleton-line h-32 rounded-lg" />
-              : risk.length === 0 ? <EmptyStatePremium icon={<HeartPulse className="w-5 h-5" />} title="No patients flagged" description="Patients with open high/critical alerts or missed readings will appear here." />
+              : risk.length === 0 ? <EmptyStatePremium icon={<HeartPulse className="w-5 h-5" />} title="No patients flagged" description="No patients with qualifying open alerts or missed-reading rules were returned." />
               : (
                 <div className="space-y-2">
                   {risk.map(r => (
@@ -249,7 +262,7 @@ export default function RemoteMonitoring() {
           {/* 5 · Device health visibility */}
           <BentoCard title="Device Health" subtitle="Offline / error devices affecting monitoring" headerRight={<WifiOff className="w-4 h-4 text-t3" />}>
             {loading ? <div className="skeleton-line h-24 rounded-lg" />
-              : !overview || overview.deviceHealth.length === 0 ? <p className="text-xs text-t3 py-4 text-center inline-flex items-center gap-1.5 w-full justify-center"><CheckCircle2 className="w-4 h-4 text-emerald-v" /> All devices reporting normally.</p>
+              : !overview || overview.deviceHealth.length === 0 ? <p className="text-xs text-t3 py-4 text-center inline-flex items-center gap-1.5 w-full justify-center"><CheckCircle2 className="w-4 h-4 text-emerald-v" /> No offline or error devices were returned.</p>
               : (
                 <div className="space-y-2">
                   {overview.deviceHealth.map(d => (
@@ -267,21 +280,21 @@ export default function RemoteMonitoring() {
           </BentoCard>
 
           {/* 6 · Notification timeline */}
-          <BentoCard title="Notification Timeline" subtitle="Who was notified · channel · delivery · consent" headerRight={<Bell className="w-4 h-4 text-t3" />}>
+          <BentoCard title="Notification Timeline" subtitle="Queued, provider-accepted, delivered, and failed are distinct states" headerRight={<Bell className="w-4 h-4 text-t3" />}>
             {loading ? <div className="skeleton-line h-32 rounded-lg" />
-              : !overview || overview.notifications.length === 0 ? <p className="text-xs text-t3 py-4 text-center">No notifications sent yet.</p>
+              : !overview || overview.notifications.length === 0 ? <p className="text-xs text-t3 py-4 text-center">No notification records are available yet.</p>
               : (
                 <ol className="space-y-2.5">
                   {overview.notifications.map(n => (
                     <li key={n.id} className="flex items-start gap-2.5">
-                      <span className={`mt-1 w-1.5 h-1.5 rounded-full shrink-0 ${n.status === 'failed' ? 'bg-red-500' : n.status === 'queued' ? 'bg-slate-300' : 'bg-emerald-500'}`} />
+                      <span className={`mt-1 w-1.5 h-1.5 rounded-full shrink-0 ${n.status === 'failed' ? 'bg-red-500' : n.status === 'queued' ? 'bg-slate-300' : n.status === 'delivered' ? 'bg-emerald-500' : 'bg-blue-500'}`} />
                       <div className="min-w-0 flex-1">
                         <p className="text-[12px] text-t1">
                           <span className="font-semibold capitalize">{n.recipientType}</span>{n.recipientName ? ` · ${n.recipientName}` : ''}
                           <span className="text-t3"> · {n.channel.replace('_', '-')}</span>
                         </p>
                         <p className="text-[10.5px] mt-0.5">
-                          <span className={`font-semibold capitalize ${NOTIF_STATUS[n.status] ?? 'text-t3'}`}>{n.status}</span>
+                          <span className={`font-semibold ${NOTIF_STATUS[n.status] ?? 'text-t3'}`}>{notificationStatusLabel(n.status)}</span>
                           {n.attempts > 1 ? <span className="text-t3"> · {n.attempts} attempts</span> : ''}
                           <span className="text-t3"> · {relTime(n.createdAt)}</span>
                           {n.consentChecked && <span className="text-t3"> · consent {n.consentResult?.replace('_', ' ')}</span>}
