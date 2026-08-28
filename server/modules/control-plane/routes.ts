@@ -5,7 +5,7 @@ import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { generatePasswordHash, validatePassword } from '../../lib/security';
 import { requireRoles } from '../../plugins/roles';
-import { setUserActiveSafely, setUserRoleSafely } from '../../lib/adminSafety';
+import { setUserActiveSafely, setUserPasswordSafely, setUserRoleSafely } from '../../lib/adminSafety';
 import { autopilotQueue } from '../../workers/queues';
 import { createPaymentProvider, createInsuranceProvider, type PaymentRequestContext } from '../revenue-protection';
 import { paymentProviderStatus } from '../../lib/deposits';
@@ -592,6 +592,7 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     branchIds: z.array(uuid).default([]),
     primaryBranchId: uuid.optional(),
   });
+  const userPasswordResetBody = z.object({ password: z.string().min(8).max(200) });
   const clinicStatusBody = z.object({ active: z.boolean() });
 
   app.get('/overview', { preHandler: ownerAdminRoles }, async request => {
@@ -771,6 +772,24 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     const { role } = userRoleBody.parse(request.body);
     const updated = await setUserRoleSafely(request, id, role, 'controlPlane.user.roleChanged');
     return { id: updated.id, role: updated.role };
+  });
+
+  // ADMIN-INITIATED RECOVERY. A password is otherwise only ever set at user
+  // creation, so a clinic user who forgets theirs has no way back in: no email
+  // delivery adapter is integrated, and inventing one would be a control that
+  // claims to have sent something it never sent. Recovery is therefore an
+  // administrator setting a temporary password and handing it over directly,
+  // exactly as at creation. The value is never echoed by this route and never
+  // appears in GET /users — the administrator typed it, and returning it would
+  // put a live credential in response bodies and logs.
+  app.post('/users/:id/password-reset', { preHandler: ownerAdminRoles }, async (request, reply) => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const { password } = userPasswordResetBody.parse(request.body);
+    const policy = validatePassword(password);
+    if (!policy.ok) throw app.httpErrors.badRequest(policy.message ?? 'Weak password');
+    const passwordHash = await generatePasswordHash(password);
+    const updated = await setUserPasswordSafely(request, id, passwordHash, 'controlPlane.user.passwordReset');
+    return reply.send({ id: updated.id, passwordChangedAt: updated.passwordChangedAt.toISOString(), sessionsRevoked: true });
   });
 
   app.patch('/users/:id/clinic-access', { preHandler: ownerAdminRoles }, async request => {

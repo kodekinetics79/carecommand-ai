@@ -593,6 +593,48 @@ export const authRoutes: FastifyPluginAsync = async app => {
     return reply.send({ status: 'ok', message: 'Your password has been reset. Please sign in.' });
   });
 
+  // Self-service change for a signed-in user. There is no delivery adapter to
+  // mail a reset token, so possession of the current password is the proof, and
+  // it is verified before anything is written.
+  app.post('/password-change', { preHandler: app.authenticate, ...rateSensitive }, async (request, reply) => {
+    const { currentPassword, newPassword } = z.object({
+      currentPassword: z.string().min(1).max(200),
+      newPassword: z.string().min(1).max(200),
+    }).parse(request.body);
+    const policyCheck = validatePassword(newPassword);
+    if (!policyCheck.ok) throw app.httpErrors.badRequest(policyCheck.message ?? 'Password does not meet policy.');
+
+    const user = await db.user.findFirst({
+      where: { id: request.auth.userId, tenantId: request.auth.tenantId, active: true },
+      select: { id: true, tenantId: true, passwordHash: true },
+    });
+    if (!user) throw app.httpErrors.unauthorized(authErrorMessage);
+    // A failed confirmation is a bad request, not a 401: the caller's session is
+    // valid, and the shared API client answers 401 by refreshing and replaying
+    // the request, which would record every attempt twice.
+    if (!user.passwordHash || !(await verifyPassword(currentPassword, user.passwordHash))) {
+      await auditAuth(request, user.tenantId, user.id, 'auth.password.change.failed', { reason: 'invalid_current_password' });
+      throw app.httpErrors.badRequest('Password confirmation failed.');
+    }
+    if (await verifyPassword(newPassword, user.passwordHash)) {
+      throw app.httpErrors.badRequest('Choose a new password that is different from your current one.');
+    }
+
+    const passwordHash = await generatePasswordHash(newPassword);
+    await db.$transaction(async tx => {
+      await lockUserAuthState(tx, user.tenantId, user.id);
+      const transitionAt = new Date();
+      // Outstanding reset tokens are older recovery material for this same
+      // account and must not survive the password they were issued against.
+      await tx.passwordResetToken.updateMany({ where: { userId: user.id, usedAt: null }, data: { usedAt: transitionAt } });
+      await tx.user.update({ where: { id: user.id }, data: { passwordHash, passwordChangedAt: transitionAt, failedLoginCount: 0, lockedUntil: null, refreshTokenHash: null, refreshTokenExpiresAt: null } });
+      await auditAuth(request, user.tenantId, user.id, 'auth.session.revoked', { reason: 'password_changed' }, tx);
+      await auditAuth(request, user.tenantId, user.id, 'auth.password.changed', undefined, tx);
+    });
+    clearAuthCookies(reply);
+    return reply.send({ status: 'ok', message: 'Your password has been updated. Please sign in again.' });
+  });
+
   // ===== MFA (TOTP) =======================================================
   // Manual token resolution so these endpoints accept a full session token OR a
   // short-lived login-flow mfa token (setup/challenge).

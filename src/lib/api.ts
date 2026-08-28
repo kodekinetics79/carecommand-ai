@@ -70,12 +70,28 @@ async function rawApiRequest<T>(path: string, init?: RequestInit, retryOnRefresh
   if (!response.ok) {
     // Keep the hardened ApiError (status/code/details let callers branch on a
     // 409) but default the user-visible text to plain language instead of a
-    // raw HTTP code. A server-supplied `message` still wins.
+    // raw HTTP code. A server-supplied `message` still wins, except on the
+    // access denials handled below.
     let message = humanApiMessage(response.status);
     let code: string | undefined;
     const body = await response.json().catch(() => null) as Record<string, unknown> | null;
-    if (typeof body?.message === 'string') message = body.message;
     if (typeof body?.error === 'string') code = body.error;
+    // An access denial is a fact about this account, not a fault to report. The
+    // API answers with the permission key it enforced ("…required permission
+    // (billing:read)…") or Fastify's bare "Forbidden"; neither is language for a
+    // clinic user. Keep the plain line and let callers branch on `code` /
+    // `details`, which are untouched — as is the server check itself.
+    // Entitlement denials (`feature_locked`) keep their own message: that one
+    // names a real upgrade the tenant can actually buy.
+    // Narrow deliberately. errors.ts sends `handledError.code ?? 'INTERNAL_SERVER_ERROR'`,
+    // so only an RBAC denial carries 'insufficient_permission' (permissions.ts:216)
+    // and only an entitlement denial carries 'feature_locked'. Every OTHER 403 —
+    // a suspended workspace, a branch-scope refusal, a consent review — arrives
+    // with a real explanation and code INTERNAL_SERVER_ERROR. Suppressing those
+    // told staff to "ask a clinic owner or administrator" about a suspension no
+    // one in the workspace can reverse. Only the true RBAC case is replaced.
+    const accessDenied = response.status === 403 && code === 'insufficient_permission';
+    if (!accessDenied && typeof body?.message === 'string') message = body.message;
     throw new ApiError(response.status, message, code, body ?? undefined);
   }
   if (response.status === 204 || response.headers.get('content-length') === '0') {
@@ -86,9 +102,11 @@ async function rawApiRequest<T>(path: string, init?: RequestInit, retryOnRefresh
 
 // Plain-language fallbacks so a failed request never renders as
 // "API request failed: 500" in the product. A server-supplied message wins.
-function humanApiMessage(status: number): string {
+// Exported so the shared screen-state contract (lib/resourceState.ts) can put
+// the same sentences on a panel that failed to load.
+export function humanApiMessage(status: number): string {
   if (status === 400) return 'That request could not be processed. Please check the details and try again.';
-  if (status === 403) return 'You do not have permission to do that.';
+  if (status === 403) return 'You do not have access to this. Ask a clinic owner or administrator if you need it.';
   if (status === 404) return 'That item could not be found. It may have been moved or deleted.';
   if (status === 409) return 'Someone else changed this while you were working. Refresh and try again.';
   if (status === 429) return 'Too many requests. Please wait a moment and try again.';

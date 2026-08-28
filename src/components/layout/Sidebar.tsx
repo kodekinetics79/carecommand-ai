@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import { useSession } from '../../hooks/useSession';
 import { useEntitlements } from '../../hooks/useEntitlements';
+import { canOpenPath, type RoutePath } from '../../lib/access';
 import { useUiPrefs } from '../../lib/uiPrefs';
 import Logo from '../ui/Logo';
 
@@ -33,7 +34,10 @@ const NAV_FEATURE: Record<string, string> = {
 
 interface NavItem {
   label: string;
-  path: string;
+  // Only declared destinations are navigable: every path here must exist in the
+  // route access registry (src/lib/access.ts), so an entry can never ship
+  // without stating what its destination requires.
+  path: RoutePath;
   icon: React.ElementType;
   badge?: string | number;
   badgeColor?: 'red' | 'amber' | 'indigo';
@@ -133,23 +137,24 @@ function isPathActive(pathname: string, path: string): boolean {
 export default function Sidebar({ mobileOpen = false, onNavigate }: { mobileOpen?: boolean; onNavigate?: () => void }) {
   const { pathname } = useLocation();
   const navigate = useNavigate();
-  const { user } = useSession();
+  const { user, loading } = useSession();
   const entitlements = useEntitlements();
   const { collapsed, collapsedSections, setCollapsed, toggleSection } = useUiPrefs();
   const [filter, setFilter] = useState('');
 
-  const permissions = new Set(user?.effectivePermissions ?? []);
   const q = filter.trim().toLowerCase();
   const collapsedSet = new Set(collapsedSections);
 
-  const visibleNav = nav
+  // Permission-aware navigation. An entry whose destination the user's grants do
+  // not cover is HIDDEN — never padlocked, because a padlock promises an upgrade
+  // path and no plan change can grant a permission. The lock below stays for
+  // subscription entitlements only. Until /v1/auth/me resolves the grant set we
+  // know nothing, so nothing is offered.
+  const visibleNav = loading ? [] : nav
     .map(section => ({
       ...section,
       items: section.items.filter(item =>
-        (item.path !== '/control-plane' || permissions.has('admin:manage')) &&
-        (item.path !== '/compliance' || permissions.has('compliance:read')) &&
-        (item.path !== '/receptionist-studio' || permissions.has('receptionist:manage')) &&
-        (item.path !== '/ai-receptionist' || permissions.has('receptionist:call-artifacts:read')) &&
+        canOpenPath(user, item.path) &&
         (!q || item.label.toLowerCase().includes(q))),
     }))
     .filter(section => section.items.length > 0);
@@ -195,8 +200,15 @@ export default function Sidebar({ mobileOpen = false, onNavigate }: { mobileOpen
       <nav className="flex-1 overflow-y-auto px-3 py-2" onClick={event => {
         if ((event.target as Element).closest('a')) onNavigate?.();
       }}>
-        {visibleNav.length === 0 && (
-          <p className="px-2 py-6 text-center text-[12px] text-t3">No modules match “{filter}”.</p>
+        {loading && (
+          <div className="px-2 py-2 space-y-2" aria-hidden="true">
+            {Array.from({ length: 8 }, (_, index) => <div key={index} className="skeleton h-7 rounded-lg" />)}
+          </div>
+        )}
+        {!loading && visibleNav.length === 0 && (
+          <p className="px-2 py-6 text-center text-[12px] text-t3">
+            {q ? <>No modules match “{filter}”.</> : 'No modules are available for your role yet. Ask an owner or administrator to update your access.'}
+          </p>
         )}
         {visibleNav.map((section) => {
           // Sections collapse only in the expanded sidebar and when not filtering.

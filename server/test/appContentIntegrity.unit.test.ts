@@ -141,7 +141,10 @@ describe('general app content integrity', () => {
 
     expect(page).toContain('Role-based access · recorded account activity');
     expect(page).toContain('Remember email on this device');
-    expect(page).toContain('Account recovery: contact your administrator');
+    // Production mints no reset token and sends no mail, so the screen states
+    // the recovery that actually exists instead of a self-service promise.
+    expect(page).toContain('Ask a clinic administrator to set a new password for you from Control Plane → Users.');
+    expect(page).not.toContain('We’ve sent you a reset link');
     expect(page).toContain('Generate local reset token');
     expect(page).not.toContain('audit-ready');
     expect(page).not.toContain('Answers calls & books 24/7');

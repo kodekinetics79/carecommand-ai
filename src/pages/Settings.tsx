@@ -1,4 +1,6 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, type ReactNode, useEffect, useRef, type FormEvent } from 'react';
+import { useNavigate } from 'react-router';
+import { useSession } from '../hooks/useSession';
 import {
   Building2, Users, Lock, Bell, Cable, ShieldCheck, CheckCircle2, Circle, RefreshCw,
   Trash2, Plus, MapPin, Activity, AlertTriangle, KeyRound, Clock, Coins, Globe, Check,
@@ -6,8 +8,11 @@ import {
 import PageHeader from '../components/ui/PageHeader';
 import BentoCard from '../components/ui/BentoCard';
 import StatCard from '../components/ui/StatCard';
+import EmptyStatePremium from '../components/ui/EmptyStatePremium';
+import ResourceSection, { ResourceErrorNotice, ResourceSkeleton } from '../components/ui/ResourceSection';
 import { apiRequest } from '../lib/api';
-import { useApiData } from '../hooks/useApiData';
+import { describeFailure, hasResponse, type ResourceFailure } from '../lib/resourceState';
+import { useResource } from '../hooks/useResource';
 import { useCrudResource } from '../hooks/useCrudResource';
 import { usePreferences, CURRENCIES, LANGUAGES } from '../lib/preferences';
 import { formatCurrency } from '../utils/formatters';
@@ -73,6 +78,19 @@ type SectionId = typeof NAV[number]['id'];
 
 const inputClass = 'w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]';
 
+// The recorded checks the summary tile counts. Kept next to the posture type so
+// the tile can never report a score for a posture that was not received.
+function postureChecks(posture: SecurityPosture): boolean[] {
+  return [
+    posture.rbacEnabled,
+    posture.auditLoggingEnabled,
+    posture.rateLimitingEnabled,
+    posture.csrf.enabled,
+    posture.secrets.jwtSecretConfigured,
+    posture.secrets.jwtRefreshSecretConfigured,
+  ];
+}
+
 export default function Settings() {
   const [section, setSection] = useState<SectionId>('overview');
 
@@ -126,49 +144,79 @@ export default function Settings() {
 }
 
 function SettingsSummary() {
-  const { data: overview } = useApiData<AdminOverview | null>('/v1/admin/overview', null);
-  const { data: integrations } = useApiData<IntegrationStatus[]>('/v1/integrations/status', []);
-  const { data: posture } = useApiData<SecurityPosture | null>('/v1/security/posture', null);
-
-  const connected = integrations.filter(item => item.configured).length;
-  const risky = integrations.filter(item => item.health !== 'healthy').length;
-  const activeBranches = overview?.summary.activeBranches ?? 0;
-  const securityChecks = posture
-    ? [posture.rbacEnabled, posture.auditLoggingEnabled, posture.rateLimitingEnabled, posture.csrf.enabled, posture.secrets.jwtSecretConfigured, posture.secrets.jwtRefreshSecretConfigured]
-    : [];
-  const passingSecurityChecks = securityChecks.filter(Boolean).length;
+  const overview = useResource<AdminOverview>('/v1/admin/overview');
+  const integrations = useResource<IntegrationStatus[]>('/v1/integrations/status');
+  const posture = useResource<SecurityPosture>('/v1/security/posture');
 
   return (
     <BentoCard title="Workspace summary" subtitle="Current configuration and the latest recorded control status">
       <div className="grid gap-3 xl:grid-cols-[1.3fr_0.9fr]">
         <div className="grid gap-3 grid-cols-2 xl:grid-cols-4">
-          <StatCard title="Team Members" value={overview?.summary.totalUsers ?? '—'} subtitle={`${overview?.summary.activeUsers ?? 0} active`} icon={<Users className="w-4 h-4" />} accent="blue" />
-          <StatCard title="Configured" value={connected} subtitle={`${integrations.length} integrations`} icon={<Cable className="w-4 h-4" />} accent="emerald" />
-          <StatCard title="Security check results" value={posture ? `${passingSecurityChecks}/${securityChecks.length}` : '—'} subtitle="Latest recorded checks" icon={<ShieldCheck className="w-4 h-4" />} accent="violet" />
-          <StatCard title="Active Branches" value={activeBranches} subtitle={`${risky} integrations need attention`} icon={<Building2 className="w-4 h-4" />} accent="amber" />
+          <ResourceSection label="Team members" state={overview.state} onRetry={overview.reload} compact loading={<TileSkeleton label="team members" />}>
+            {data => <StatCard title="Team Members" value={data.summary.totalUsers} subtitle={`${data.summary.activeUsers} active`} icon={<Users className="w-4 h-4" />} accent="blue" />}
+          </ResourceSection>
+
+          {/* A response listing zero integrations is a real answer, so these
+              tiles show the received 0 rather than the empty-state card. */}
+          <ResourceSection label="Integration status" state={integrations.state} onRetry={integrations.reload} compact isEmpty={() => false} loading={<TileSkeleton label="integration status" />}>
+            {rows => <StatCard title="Configured" value={rows.filter(item => item.configured).length} subtitle={`${rows.length} integrations`} icon={<Cable className="w-4 h-4" />} accent="emerald" />}
+          </ResourceSection>
+
+          <ResourceSection label="Security checks" state={posture.state} onRetry={posture.reload} compact loading={<TileSkeleton label="security checks" />}>
+            {data => (
+              <StatCard
+                title="Security check results"
+                value={`${postureChecks(data).filter(Boolean).length}/${postureChecks(data).length}`}
+                subtitle="Latest recorded checks"
+                icon={<ShieldCheck className="w-4 h-4" />}
+                accent="violet"
+              />
+            )}
+          </ResourceSection>
+
+          <ResourceSection label="Active branches" state={overview.state} onRetry={overview.reload} compact loading={<TileSkeleton label="active branches" />}>
+            {data => <StatCard title="Active Branches" value={data.summary.activeBranches} subtitle="Active locations" icon={<Building2 className="w-4 h-4" />} accent="amber" />}
+          </ResourceSection>
         </div>
 
         <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
-          <div className="flex items-center justify-between gap-2 mb-3">
-            <div>
-              <p className="text-xs font-bold uppercase tracking-widest text-t3">Operational status</p>
-              <p className="text-sm font-semibold text-t1 mt-1">{overview?.tenant.name ?? 'Workspace'} · {overview?.tenant.slug ?? '—'}</p>
-            </div>
-            <span className="badge badge-blue">{connected}/{integrations.length} configured</span>
+          <div className="mb-3">
+            <p className="text-xs font-bold uppercase tracking-widest text-t3">Operational status</p>
+            <ResourceSection label="Workspace identity" state={overview.state} onRetry={overview.reload} compact
+              loading={<ResourceSkeleton label="workspace identity" lines={1} rowClassName="h-4 w-44 rounded mt-1" />}>
+              {data => <p className="text-sm font-semibold text-t1 mt-1">{data.tenant.name} · {data.tenant.slug}</p>}
+            </ResourceSection>
           </div>
           <div className="space-y-2.5">
-            <div className="flex items-center justify-between gap-3 text-xs">
-              <span className="text-t3">Recorded integration health</span>
-              <span className="font-semibold text-t1">{integrations.length === 0 ? 'No integrations loaded' : risky === 0 ? 'No issues reported' : `${risky} need attention`}</span>
-            </div>
-            <div className="flex items-center justify-between gap-3 text-xs">
-              <span className="text-t3">Security posture</span>
-              <span className="font-semibold text-t1">{posture?.authMode ?? 'Loading…'}</span>
-            </div>
-            <div className="flex items-center justify-between gap-3 text-xs">
-              <span className="text-t3">Tenant created</span>
-              <span className="font-semibold text-t1">{overview?.tenant.createdAt ? new Date(overview.tenant.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '—'}</span>
-            </div>
+            <StatusRow label="Recorded integration health">
+              <ResourceSection label="Integration status" state={integrations.state} onRetry={integrations.reload} compact isEmpty={() => false}
+                loading={<ResourceSkeleton label="integration status" lines={1} rowClassName="h-3.5 w-32 rounded" />}>
+                {rows => {
+                  const risky = rows.filter(item => item.health !== 'healthy').length;
+                  return (
+                    <span className="font-semibold text-t1">
+                      {rows.length === 0 ? 'No integrations returned' : risky === 0 ? 'No issues reported' : `${risky} need attention`}
+                    </span>
+                  );
+                }}
+              </ResourceSection>
+            </StatusRow>
+            <StatusRow label="Security posture">
+              <ResourceSection label="Security posture" state={posture.state} onRetry={posture.reload} compact
+                loading={<ResourceSkeleton label="security posture" lines={1} rowClassName="h-3.5 w-24 rounded" />}>
+                {data => <span className="font-semibold text-t1">{data.authMode}</span>}
+              </ResourceSection>
+            </StatusRow>
+            <StatusRow label="Tenant created">
+              <ResourceSection label="Workspace identity" state={overview.state} onRetry={overview.reload} compact
+                loading={<ResourceSkeleton label="tenant creation date" lines={1} rowClassName="h-3.5 w-24 rounded" />}>
+                {data => (
+                  <span className="font-semibold text-t1">
+                    {new Date(data.tenant.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}
+                  </span>
+                )}
+              </ResourceSection>
+            </StatusRow>
           </div>
         </div>
       </div>
@@ -222,112 +270,167 @@ function PreferencesSection() {
 
 /* ------------------------------------------------------------------ Overview */
 function OverviewSection() {
-  const { data, loading } = useApiData<AdminOverview | null>('/v1/admin/overview', null);
-  if (loading && !data) return <Skeleton />;
-  const s = data?.summary;
+  const overview = useResource<AdminOverview>('/v1/admin/overview');
   return (
-    <>
-      <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Team Members" value={s?.totalUsers ?? '—'} subtitle={`${s?.activeUsers ?? 0} active`} icon={<Users className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Roles" value={s?.totalRoles ?? '—'} subtitle="Defined" icon={<Lock className="w-4 h-4" />} accent="violet" />
-        <StatCard title="Branches" value={s?.activeBranches ?? '—'} subtitle="Active locations" icon={<MapPin className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Audit Events" value={s?.recentAuditEvents ?? '—'} subtitle="Recent activity" icon={<Activity className="w-4 h-4" />} accent="amber" />
-      </div>
+    <ResourceSection
+      label="Workspace overview"
+      state={overview.state}
+      onRetry={overview.reload}
+      loading={<ResourceSkeleton label="workspace overview" lines={4} rowClassName="h-16 rounded-xl" />}
+    >
+      {data => (
+        <div className="space-y-4">
+          <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
+            <StatCard title="Team Members" value={data.summary.totalUsers} subtitle={`${data.summary.activeUsers} active`} icon={<Users className="w-4 h-4" />} accent="blue" />
+            <StatCard title="Roles" value={data.summary.totalRoles} subtitle="Defined" icon={<Lock className="w-4 h-4" />} accent="violet" />
+            <StatCard title="Branches" value={data.summary.activeBranches} subtitle="Active locations" icon={<MapPin className="w-4 h-4" />} accent="emerald" />
+            <StatCard title="Audit Events" value={data.summary.recentAuditEvents} subtitle="Recent activity" icon={<Activity className="w-4 h-4" />} accent="amber" />
+          </div>
 
-      <BentoCard title="Practice Profile" subtitle="Organization details" headerRight={<Building2 className="w-4 h-4 text-t3" />}>
-        <div className="grid sm:grid-cols-2 gap-3">
-          <Field label="Practice name" value={data?.tenant.name ?? '—'} />
-          <Field label="Workspace slug" value={data?.tenant.slug ?? '—'} />
-          <Field label="Created" value={data?.tenant.createdAt ? new Date(data.tenant.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }) : '—'} />
-          <Field label="Active branches" value={String(data?.branches.filter(b => b.active).length ?? 0)} />
-        </div>
-      </BentoCard>
-
-      <BentoCard title="Practice Locations" subtitle="Branch configuration" headerRight={<MapPin className="w-4 h-4 text-t3" />}>
-        <div className="space-y-2.5">
-          {(data?.branches ?? []).map(branch => (
-            <div key={branch.id} className="flex items-center justify-between gap-3 p-3.5 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-all">
-              <div className="flex items-center gap-3">
-                <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-blue-500 to-violet-500 flex items-center justify-center text-white text-[10px] font-bold shrink-0">{branch.name.charAt(0)}</div>
-                <div>
-                  <p className="text-xs font-bold text-t1">{branch.name}</p>
-                  <p className="text-[11px] text-t3">{branch.location}</p>
-                </div>
-              </div>
-              <span className={branch.active ? 'badge badge-emerald' : 'badge badge-red'}>{branch.active ? 'Active' : 'Inactive'}</span>
+          <BentoCard title="Practice Profile" subtitle="Organization details" headerRight={<Building2 className="w-4 h-4 text-t3" />}>
+            <div className="grid sm:grid-cols-2 gap-3">
+              <Field label="Practice name" value={data.tenant.name} />
+              <Field label="Workspace slug" value={data.tenant.slug} />
+              <Field label="Created" value={new Date(data.tenant.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })} />
+              <Field label="Active branches" value={String(data.branches.filter(b => b.active).length)} />
             </div>
-          ))}
+          </BentoCard>
+
+          <BentoCard title="Practice Locations" subtitle="Branch configuration" headerRight={<MapPin className="w-4 h-4 text-t3" />}>
+            {data.branches.length === 0 ? (
+              <EmptyStatePremium
+                icon={<MapPin className="w-5 h-5" />}
+                title="No branches configured"
+                description="The workspace overview loaded successfully and this workspace has no branch records."
+              />
+            ) : (
+              <div className="space-y-2.5">
+                {data.branches.map(branch => (
+                  <div key={branch.id} className="flex items-center justify-between gap-3 p-3.5 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-all">
+                    <div className="flex items-center gap-3">
+                      <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-blue-500 to-violet-500 flex items-center justify-center text-white text-[10px] font-bold shrink-0">{branch.name.charAt(0)}</div>
+                      <div>
+                        <p className="text-xs font-bold text-t1">{branch.name}</p>
+                        <p className="text-[11px] text-t3">{branch.location}</p>
+                      </div>
+                    </div>
+                    <span className={branch.active ? 'badge badge-emerald' : 'badge badge-red'}>{branch.active ? 'Active' : 'Inactive'}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </BentoCard>
         </div>
-      </BentoCard>
-    </>
+      )}
+    </ResourceSection>
   );
 }
 
 /* ------------------------------------------------------------------ Team */
 function TeamSection() {
-  const { data, loading, reload } = useApiData<AdminUsersResponse | null>('/v1/admin/users', null);
+  const team = useResource<AdminUsersResponse>('/v1/admin/users');
   const [pendingId, setPendingId] = useState<string | null>(null);
+  const [actionFailure, setActionFailure] = useState<ResourceFailure | null>(null);
   const [search, setSearch] = useState('');
 
   async function changeRole(id: string, role: string) {
     setPendingId(id);
-    try { await apiRequest(`/v1/admin/users/${id}/role`, { method: 'PATCH', body: JSON.stringify({ role }) }); await reload(); }
-    finally { setPendingId(null); }
+    setActionFailure(null);
+    try {
+      await apiRequest(`/v1/admin/users/${id}/role`, { method: 'PATCH', body: JSON.stringify({ role }) });
+      team.reload();
+    } catch (err) {
+      setActionFailure(describeFailure(err));
+    } finally {
+      setPendingId(null);
+    }
   }
   async function toggleActive(id: string, active: boolean) {
     setPendingId(id);
-    try { await apiRequest(`/v1/admin/users/${id}/status`, { method: 'PATCH', body: JSON.stringify({ active }) }); await reload(); }
-    finally { setPendingId(null); }
+    setActionFailure(null);
+    try {
+      await apiRequest(`/v1/admin/users/${id}/status`, { method: 'PATCH', body: JSON.stringify({ active }) });
+      team.reload();
+    } catch (err) {
+      setActionFailure(describeFailure(err));
+    } finally {
+      setPendingId(null);
+    }
   }
 
-  if (loading && !data) return <Skeleton />;
-  const users = (data?.users ?? []).filter(u => !search || u.displayName.toLowerCase().includes(search.toLowerCase()) || u.email.toLowerCase().includes(search.toLowerCase()));
-
   return (
-    <BentoCard title="Team & users" subtitle={`${data?.users.length ?? 0} member records`} headerRight={
-      <input value={search} onChange={e => setSearch(e.target.value)} aria-label="Search team members" placeholder="Search team…" className="text-xs px-3 py-1.5 border border-[var(--b1)] rounded-xl bg-[var(--s3)] text-t1 placeholder:text-t3 outline-none w-40" />
-    }>
-      <div className="space-y-2">
-        {users.map(user => (
-          <div key={user.id} className="flex flex-wrap items-center gap-3 p-3 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-all">
-            <div className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-400 to-violet-500 flex items-center justify-center text-white text-[11px] font-bold shrink-0">
-              {user.displayName.split(' ').map(n => n[0]).join('').slice(0, 2)}
-            </div>
-            <div className="flex-1 min-w-[140px]">
-              <p className="text-sm font-semibold text-t1">{user.displayName}</p>
-              <p className="text-[11px] text-t3">{user.email}{user.branch ? ` · ${user.branch.name.split(' ')[0]}` : ''}</p>
-            </div>
-            <select
-              aria-label={`Role for ${user.displayName}`}
-              value={user.role}
-              disabled={pendingId === user.id}
-              onChange={e => changeRole(user.id, e.target.value)}
-              className="px-2.5 py-1.5 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-[11px] font-semibold text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-40"
-            >
-              {ROLE_OPTIONS.map(r => <option key={r} value={r}>{r.replace('_', ' ')}</option>)}
-              {COMPLIANCE_ROLE_OPTIONS.map(r => <option key={r} value={r}>{COMPLIANCE_ROLE_LABEL[r]}</option>)}
-            </select>
-            <button
-              type="button"
-              disabled={pendingId === user.id}
-              onClick={() => toggleActive(user.id, !user.active)}
-              aria-label={`${user.active ? 'Disable' : 'Activate'} ${user.displayName}`}
-              title={`${user.active ? 'Disable' : 'Activate'} ${user.displayName}`}
-              className={`text-[10px] font-bold px-2.5 py-1 rounded-full transition disabled:opacity-40 ${user.active ? 'badge badge-emerald' : 'badge badge-red'}`}
-            >
-              {user.active ? 'Active' : 'Disabled'}
-            </button>
-          </div>
-        ))}
-        {users.length === 0 && <p className="text-xs text-t3 py-6 text-center">No users match your search.</p>}
-      </div>
-    </BentoCard>
+    <div className="space-y-3">
+      {actionFailure && <ResourceErrorNotice title="That change was not saved" failure={actionFailure} />}
+
+      <BentoCard
+        title="Team & users"
+        subtitle="Roles, activation state, and recorded branch access"
+        headerRight={hasResponse(team.state)
+          ? <input value={search} onChange={e => setSearch(e.target.value)} aria-label="Search team members" placeholder="Search team…" className="text-xs px-3 py-1.5 border border-[var(--b1)] rounded-xl bg-[var(--s3)] text-t1 placeholder:text-t3 outline-none w-40" />
+          : undefined}
+      >
+        <ResourceSection
+          label="Team members"
+          state={team.state}
+          onRetry={team.reload}
+          isEmpty={data => data.users.length === 0}
+          empty={{
+            icon: <Users className="w-5 h-5" />,
+            title: 'No team members recorded',
+            description: 'The team list loaded successfully and this workspace has no user records.',
+          }}
+        >
+          {data => {
+            const users = data.users.filter(u => !search || u.displayName.toLowerCase().includes(search.toLowerCase()) || u.email.toLowerCase().includes(search.toLowerCase()));
+            return (
+              <>
+                <p className="text-[11px] text-t3 mb-2">{data.users.length} member records</p>
+                <div className="space-y-2">
+                  {users.map(user => (
+                    <div key={user.id} className="flex flex-wrap items-center gap-3 p-3 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-all">
+                      <div className="w-9 h-9 rounded-full bg-gradient-to-br from-blue-400 to-violet-500 flex items-center justify-center text-white text-[11px] font-bold shrink-0">
+                        {user.displayName.split(' ').map(n => n[0]).join('').slice(0, 2)}
+                      </div>
+                      <div className="flex-1 min-w-[140px]">
+                        <p className="text-sm font-semibold text-t1">{user.displayName}</p>
+                        <p className="text-[11px] text-t3">{user.email}{user.branch ? ` · ${user.branch.name.split(' ')[0]}` : ''}</p>
+                      </div>
+                      <select
+                        aria-label={`Role for ${user.displayName}`}
+                        value={user.role}
+                        disabled={pendingId === user.id}
+                        onChange={e => changeRole(user.id, e.target.value)}
+                        className="px-2.5 py-1.5 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-[11px] font-semibold text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-40"
+                      >
+                        {ROLE_OPTIONS.map(r => <option key={r} value={r}>{r.replace('_', ' ')}</option>)}
+                        {COMPLIANCE_ROLE_OPTIONS.map(r => <option key={r} value={r}>{COMPLIANCE_ROLE_LABEL[r]}</option>)}
+                      </select>
+                      <button
+                        type="button"
+                        disabled={pendingId === user.id}
+                        onClick={() => toggleActive(user.id, !user.active)}
+                        aria-label={`${user.active ? 'Disable' : 'Activate'} ${user.displayName}`}
+                        title={`${user.active ? 'Disable' : 'Activate'} ${user.displayName}`}
+                        className={`text-[10px] font-bold px-2.5 py-1 rounded-full transition disabled:opacity-40 ${user.active ? 'badge badge-emerald' : 'badge badge-red'}`}
+                      >
+                        {user.active ? 'Active' : 'Disabled'}
+                      </button>
+                    </div>
+                  ))}
+                  {users.length === 0 && <p className="text-xs text-t3 py-6 text-center">No users match your search.</p>}
+                </div>
+              </>
+            );
+          }}
+        </ResourceSection>
+      </BentoCard>
+    </div>
   );
 }
 
 /* ------------------------------------------------------------------ Roles */
 function RolesSection() {
-  const roles = useCrudResource<RoleDef>('/v1/settings/roles', []);
+  const roles = useCrudResource<RoleDef>('/v1/settings/roles');
   const [show, setShow] = useState(false);
   const [form, setForm] = useState({ name: '', description: '' });
 
@@ -340,18 +443,34 @@ function RolesSection() {
 
   return (
     <BentoCard title="Roles & access" subtitle="Configured permission groups" headerRight={<Lock className="w-4 h-4 text-t3" />}>
-      {roles.error && <p className="text-[11px] text-red-v mb-2">{roles.error}</p>}
-      <div className="space-y-2.5">
-        {roles.data.map(r => (
-          <div key={r.id} className="flex items-start gap-3 p-3 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors group">
-            <span className={`text-[10px] font-bold px-2 py-1 rounded-lg shrink-0 ${accentBadge[r.accent] ?? 'badge badge-blue'}`}>{r.name}</span>
-            <p className="flex-1 min-w-0 text-[11px] text-t2">{r.description}</p>
-            <span className="text-[10px] text-t3 shrink-0">{r.userCount} users</span>
-            <button type="button" disabled={roles.busy} onClick={() => roles.remove(r.id)} className="text-t3 hover:text-red-v opacity-0 group-hover:opacity-100 disabled:opacity-40 shrink-0" aria-label="Delete role"><Trash2 className="w-3.5 h-3.5" /></button>
+      {roles.actionFailure && <ResourceErrorNotice title="That role change was not saved" failure={roles.actionFailure} className="mb-3" />}
+      <ResourceSection
+        label="Roles"
+        state={roles.state}
+        onRetry={roles.reload}
+        empty={{
+          icon: <Lock className="w-5 h-5" />,
+          title: 'No roles configured',
+          description: 'The role list loaded successfully and this workspace has no role definitions.',
+        }}
+      >
+        {rows => (
+          <div className="space-y-2.5">
+            {rows.map(r => (
+              <div key={r.id} className="flex items-start gap-3 p-3 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors group">
+                <span className={`text-[10px] font-bold px-2 py-1 rounded-lg shrink-0 ${accentBadge[r.accent] ?? 'badge badge-blue'}`}>{r.name}</span>
+                <p className="flex-1 min-w-0 text-[11px] text-t2">{r.description}</p>
+                <span className="text-[10px] text-t3 shrink-0">{r.userCount} users</span>
+                <button type="button" disabled={roles.busy} onClick={() => roles.remove(r.id)} className="text-t3 hover:text-red-v opacity-0 group-hover:opacity-100 disabled:opacity-40 shrink-0" aria-label="Delete role"><Trash2 className="w-3.5 h-3.5" /></button>
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
-      {show ? (
+        )}
+      </ResourceSection>
+
+      {/* Adding is only offered once the list itself loaded: a role cannot be
+          added to a list the workspace would not return. */}
+      {hasResponse(roles.state) && (show ? (
         <div className="mt-3 p-3 rounded-xl border border-[var(--b2)] bg-[var(--s2)] space-y-2">
           <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} aria-label="Role name" placeholder="Role name" className={inputClass} />
           <input value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} aria-label="Role description" placeholder="Role description" className={inputClass} />
@@ -362,14 +481,14 @@ function RolesSection() {
         </div>
       ) : (
         <button type="button" onClick={() => setShow(true)} className="mt-3 w-full py-2 border border-dashed border-[var(--b2)] rounded-xl text-xs font-semibold text-t3 hover:text-indigo hover:bg-[var(--s3)] inline-flex items-center justify-center gap-1"><Plus className="w-3.5 h-3.5" /> Add role</button>
-      )}
+      ))}
     </BentoCard>
   );
 }
 
 /* ------------------------------------------------------------------ Notifications */
 function NotificationsSection() {
-  const templates = useCrudResource<Template>('/v1/settings/notification-templates', []);
+  const templates = useCrudResource<Template>('/v1/settings/notification-templates');
   const [show, setShow] = useState(false);
   const [form, setForm] = useState({ name: '', channel: '' });
 
@@ -382,23 +501,37 @@ function NotificationsSection() {
 
   return (
     <BentoCard title="Notification templates" subtitle="Configured patient-message templates; delivery depends on provider setup and consent checks" headerRight={<Bell className="w-4 h-4 text-t3" />}>
-      {templates.error && <p className="text-[11px] text-red-v mb-2">{templates.error}</p>}
-      <div className="space-y-2.5">
-        {templates.data.map(t => (
-          <div key={t.id} className={`flex items-center justify-between gap-3 p-3.5 rounded-xl border transition-all ${t.status === 'PAUSED' ? 'border-[var(--b1)] bg-[var(--s2)]' : 'border-[var(--b1)] hover:border-[var(--b2)]'}`}>
-            <div className="min-w-0">
-              <p className="text-xs font-bold text-t1">{t.name}</p>
-              <p className="text-[10px] text-t3 mt-0.5">Channel: {t.channel}</p>
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              <span className={t.status === 'ACTIVE' ? 'badge badge-emerald' : 'badge badge-blue'}>{t.status.toLowerCase()}</span>
-              <button type="button" disabled={templates.busy} onClick={() => templates.update(t.id, { status: t.status === 'ACTIVE' ? 'PAUSED' : 'ACTIVE' })} className="text-[10px] font-semibold text-indigo hover:text-blue-v disabled:opacity-40">{t.status === 'ACTIVE' ? 'Pause' : 'Activate'}</button>
-              <button type="button" disabled={templates.busy} onClick={() => templates.remove(t.id)} className="text-t3 hover:text-red-v disabled:opacity-40" aria-label="Delete template"><Trash2 className="w-3.5 h-3.5" /></button>
-            </div>
+      {templates.actionFailure && <ResourceErrorNotice title="That template change was not saved" failure={templates.actionFailure} className="mb-3" />}
+      <ResourceSection
+        label="Notification templates"
+        state={templates.state}
+        onRetry={templates.reload}
+        empty={{
+          icon: <Bell className="w-5 h-5" />,
+          title: 'No templates configured',
+          description: 'The template list loaded successfully and this workspace has no message templates.',
+        }}
+      >
+        {rows => (
+          <div className="space-y-2.5">
+            {rows.map(t => (
+              <div key={t.id} className={`flex items-center justify-between gap-3 p-3.5 rounded-xl border transition-all ${t.status === 'PAUSED' ? 'border-[var(--b1)] bg-[var(--s2)]' : 'border-[var(--b1)] hover:border-[var(--b2)]'}`}>
+                <div className="min-w-0">
+                  <p className="text-xs font-bold text-t1">{t.name}</p>
+                  <p className="text-[10px] text-t3 mt-0.5">Channel: {t.channel}</p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className={t.status === 'ACTIVE' ? 'badge badge-emerald' : 'badge badge-blue'}>{t.status.toLowerCase()}</span>
+                  <button type="button" disabled={templates.busy} onClick={() => templates.update(t.id, { status: t.status === 'ACTIVE' ? 'PAUSED' : 'ACTIVE' })} className="text-[10px] font-semibold text-indigo hover:text-blue-v disabled:opacity-40">{t.status === 'ACTIVE' ? 'Pause' : 'Activate'}</button>
+                  <button type="button" disabled={templates.busy} onClick={() => templates.remove(t.id)} className="text-t3 hover:text-red-v disabled:opacity-40" aria-label="Delete template"><Trash2 className="w-3.5 h-3.5" /></button>
+                </div>
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
-      {show ? (
+        )}
+      </ResourceSection>
+
+      {hasResponse(templates.state) && (show ? (
         <div className="mt-3 p-3 rounded-xl border border-[var(--b2)] bg-[var(--s2)] space-y-2">
           <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} aria-label="Template name" placeholder="Template name" className={inputClass} />
           <input value={form.channel} onChange={e => setForm(f => ({ ...f, channel: e.target.value }))} aria-label="Message channel" placeholder="Channel (for example, SMS)" className={inputClass} />
@@ -409,54 +542,74 @@ function NotificationsSection() {
         </div>
       ) : (
         <button type="button" onClick={() => setShow(true)} className="mt-3 w-full py-2 border border-dashed border-[var(--b2)] rounded-xl text-xs font-semibold text-t3 hover:text-indigo hover:bg-[var(--s3)] inline-flex items-center justify-center gap-1"><Plus className="w-3.5 h-3.5" /> Add template</button>
-      )}
+      ))}
     </BentoCard>
   );
 }
 
 /* ------------------------------------------------------------------ Integrations */
 function IntegrationsSection() {
-  const { data, loading, reload } = useApiData<IntegrationStatus[]>('/v1/integrations/status', []);
+  const integrations = useResource<IntegrationStatus[]>('/v1/integrations/status');
   const [testingKey, setTestingKey] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
+  // Held here rather than in the rendered list so a reload cannot discard the
+  // result of a connection test the user just ran.
   async function test(key: string) {
     setTestingKey(key);
     setToast(null);
     try {
       const res = await apiRequest<{ message?: string; modeLabel?: string }>(`/v1/integrations/${key}/test`, { method: 'POST' });
       setToast(`${key}: ${res.modeLabel ?? 'tested'} — ${res.message ?? 'ok'}`);
-      await reload();
+      integrations.reload();
     } catch (err) {
-      setToast(`${key}: ${err instanceof Error ? err.message : 'test failed'}`);
+      setToast(`${key}: ${describeFailure(err).message}`);
     } finally {
       setTestingKey(null);
     }
   }
 
+  return (
+    <div className="space-y-4">
+      {toast && <div role="status" aria-live="polite" className="rounded-xl border border-[var(--b2)] bg-[var(--blue-soft)] px-3 py-2 text-[11px] font-semibold text-blue-v">{toast}</div>}
+
+      <ResourceSection
+        label="Integrations"
+        state={integrations.state}
+        onRetry={integrations.reload}
+        loading={<ResourceSkeleton label="integrations" lines={4} rowClassName="h-16 rounded-xl" />}
+        empty={{
+          icon: <Cable className="w-5 h-5" />,
+          title: 'No integrations available',
+          description: 'The integration catalogue loaded successfully and returned no providers.',
+        }}
+      >
+        {rows => <IntegrationsView rows={rows} testingKey={testingKey} onTest={test} />}
+      </ResourceSection>
+    </div>
+  );
+}
+
+function IntegrationsView({ rows, testingKey, onTest }: { rows: IntegrationStatus[]; testingKey: string | null; onTest: (key: string) => void }) {
   const grouped = useMemo(() => {
     const map = new Map<string, IntegrationStatus[]>();
-    for (const item of data) {
+    for (const item of rows) {
       if (!map.has(item.category)) map.set(item.category, []);
       map.get(item.category)!.push(item);
     }
     return [...map.entries()];
-  }, [data]);
+  }, [rows]);
 
-  const connected = data.filter(d => d.configured).length;
-
-  if (loading && data.length === 0) return <Skeleton />;
+  const connected = rows.filter(d => d.configured).length;
 
   return (
-    <>
+    <div className="space-y-4">
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Integrations" value={data.length} subtitle="Available providers" icon={<Cable className="w-4 h-4" />} accent="blue" />
+        <StatCard title="Integrations" value={rows.length} subtitle="Available providers" icon={<Cable className="w-4 h-4" />} accent="blue" />
         <StatCard title="Configured" value={connected} subtitle="Configuration detected" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Needs Setup" value={data.length - connected} subtitle="Awaiting credentials" icon={<AlertTriangle className="w-4 h-4" />} accent="amber" />
+        <StatCard title="Needs Setup" value={rows.length - connected} subtitle="Awaiting credentials" icon={<AlertTriangle className="w-4 h-4" />} accent="amber" />
         <StatCard title="Categories" value={grouped.length} subtitle="Provider types" icon={<Activity className="w-4 h-4" />} accent="violet" />
       </div>
-
-      {toast && <div role="status" aria-live="polite" className="rounded-xl border border-[var(--b2)] bg-[var(--blue-soft)] px-3 py-2 text-[11px] font-semibold text-blue-v">{toast}</div>}
 
       {grouped.map(([category, items]) => (
         <BentoCard key={category} title={category} subtitle={`${items.filter(i => i.configured).length}/${items.length} connected`}>
@@ -486,7 +639,7 @@ function IntegrationsSection() {
 
                 <div className="mt-auto flex items-center justify-between gap-2 pt-1">
                   <span className="text-[10px] text-t3">{item.lastSyncAt ? `Synced ${new Date(item.lastSyncAt).toLocaleDateString('en-GB')}` : 'Never synced'}</span>
-                  <button type="button" disabled={testingKey === item.key} onClick={() => test(item.key)} className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1 rounded-lg hover:opacity-80 disabled:opacity-40">
+                  <button type="button" disabled={testingKey === item.key} onClick={() => onTest(item.key)} className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1 rounded-lg hover:opacity-80 disabled:opacity-40">
                     <RefreshCw className={`w-3 h-3 ${testingKey === item.key ? 'animate-spin' : ''}`} /> {testingKey === item.key ? 'Testing…' : 'Test connection'}
                   </button>
                 </div>
@@ -495,76 +648,185 @@ function IntegrationsSection() {
           </div>
         </BentoCard>
       ))}
-    </>
+    </div>
   );
 }
 
 /* ------------------------------------------------------------------ Security */
+function ChangePasswordCard() {
+  const navigate = useNavigate();
+  const { signOut } = useSession();
+  const [form, setForm] = useState({ currentPassword: '', newPassword: '', confirmPassword: '' });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [changed, setChanged] = useState(false);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setError(null);
+    if (form.newPassword !== form.confirmPassword) {
+      setError('The new password and its confirmation do not match.');
+      return;
+    }
+    setBusy(true);
+    try {
+      await apiRequest('/v1/auth/password-change', {
+        method: 'POST',
+        body: JSON.stringify({ currentPassword: form.currentPassword, newPassword: form.newPassword }),
+      });
+      setForm({ currentPassword: '', newPassword: '', confirmPassword: '' });
+      setChanged(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Password change failed.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // The change revoked this session server-side. Clicking "sign in again" is
+  // not enough: switching Settings tabs unmounts this card and leaves a
+  // signed-in-looking shell whose every request now 401s. Guarantee the local
+  // session ends however the user leaves, while still showing the confirmation.
+  const changedRef = useRef(false);
+  useEffect(() => { changedRef.current = changed; }, [changed]);
+  useEffect(() => () => { if (changedRef.current) void signOut(); }, [signOut]);
+
+  // Explicit path for the user who clicks the button.
+  async function signInAgain() {
+    await signOut();
+    navigate('/login', { replace: true });
+  }
+
+  return (
+    <BentoCard title="Your password" subtitle="Change the password for your own account. No reset email is sent — your current password is the confirmation." headerRight={<KeyRound className="w-4 h-4 text-t3" />}>
+      {changed ? (
+        <div className="space-y-3 max-w-sm">
+          <p role="status" className="rounded-xl border border-[var(--b1)] bg-[var(--emerald-soft)] px-3 py-2.5 text-[11px] font-semibold text-emerald-v">
+            Password updated. Every session for your account was ended, so sign in again with the new password.
+          </p>
+          <button type="button" onClick={() => void signInAgain()} className="w-full py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90">Sign in again</button>
+        </div>
+      ) : (
+        <form onSubmit={submit} className="space-y-2 max-w-sm">
+          {error && <p role="alert" className="text-[11px] text-red-v">{error}</p>}
+          <input type="password" value={form.currentPassword} onChange={e => setForm(f => ({ ...f, currentPassword: e.target.value }))} aria-label="Current password" placeholder="Current password" autoComplete="current-password" className={inputClass} required />
+          <input type="password" value={form.newPassword} onChange={e => setForm(f => ({ ...f, newPassword: e.target.value }))} aria-label="New password" placeholder="New password" autoComplete="new-password" minLength={8} className={inputClass} required />
+          <input type="password" value={form.confirmPassword} onChange={e => setForm(f => ({ ...f, confirmPassword: e.target.value }))} aria-label="Confirm new password" placeholder="Confirm new password" autoComplete="new-password" minLength={8} className={inputClass} required />
+          <button type="submit" disabled={busy} className="w-full py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 disabled:opacity-40">{busy ? 'Updating…' : 'Update password'}</button>
+          <p className="text-[10px] text-t3">Changing your password ends every signed-in session for your account, including this one.</p>
+        </form>
+      )}
+    </BentoCard>
+  );
+}
+
+/* ------------------------------------------------------------------ Security */
+
 function SecuritySection() {
-  const posture = useApiData<SecurityPosture | null>('/v1/security/posture', null);
-  const sessions = useApiData<SessionRow[]>('/v1/security/sessions', []);
+  const posture = useResource<SecurityPosture>('/v1/security/posture');
+  const sessions = useResource<SessionRow[]>('/v1/security/sessions');
   const [pendingId, setPendingId] = useState<string | null>(null);
+  const [actionFailure, setActionFailure] = useState<ResourceFailure | null>(null);
 
   async function revoke(userId: string) {
     setPendingId(userId);
-    try { await apiRequest(`/v1/security/sessions/${userId}/revoke`, { method: 'POST' }); await sessions.reload(); }
-    finally { setPendingId(null); }
+    setActionFailure(null);
+    try {
+      await apiRequest(`/v1/security/sessions/${userId}/revoke`, { method: 'POST' });
+      sessions.reload();
+    } catch (err) {
+      setActionFailure(describeFailure(err));
+    } finally {
+      setPendingId(null);
+    }
   }
 
-  const p = posture.data;
-  const checks = p ? [
-    { label: 'Role-based access control', ok: p.rbacEnabled },
-    { label: 'Audit logging', ok: p.auditLoggingEnabled },
-    { label: 'Rate limiting', ok: p.rateLimitingEnabled },
-    { label: 'CSRF protection', ok: p.csrf.enabled },
-    { label: 'JWT secret configured', ok: p.secrets.jwtSecretConfigured },
-    { label: 'Refresh secret configured', ok: p.secrets.jwtRefreshSecretConfigured },
-    { label: 'Dev-token disabled in production', ok: p.devTokenDisabledInProduction },
-    { label: 'HTTPS required', ok: p.httpsRequired },
-  ] : [];
-
   return (
-    <>
-      {p && (
-        <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-          <StatCard title="Access Token TTL" value={`${p.accessTokenTtlMinutes}m`} subtitle="Session lifetime" icon={<Clock className="w-4 h-4" />} accent="blue" />
-          <StatCard title="Audit Events" value={p.auditEventCount} subtitle="Total logged" icon={<Activity className="w-4 h-4" />} accent="violet" />
-          <StatCard title="Login Events" value={p.loginEventCount} subtitle="Recorded" icon={<KeyRound className="w-4 h-4" />} accent="emerald" />
-          <StatCard title="Unrevoked Sessions" value={sessions.data.filter(s => !s.revoked).length} subtitle="Session records" icon={<Users className="w-4 h-4" />} accent="amber" />
-        </div>
-      )}
+    <div className="space-y-4">
+      {/* Self-service password change: available to EVERY authenticated user.
+          This is the only self-service password path in the product, so it must
+          not sit behind an admin-only gate. */}
+      <ChangePasswordCard />
+      {actionFailure && <ResourceErrorNotice title="Those sessions were not revoked" failure={actionFailure} />}
 
-      <BentoCard title="Security Posture" subtitle={p?.authMode ?? 'Authentication & controls'} headerRight={<ShieldCheck className="w-4 h-4 text-t3" />}>
-        {posture.loading && !p ? <Skeleton /> : (
-          <div className="grid sm:grid-cols-2 gap-2">
-            {checks.map(c => (
-              <div key={c.label} className={`flex items-center gap-2.5 p-2.5 rounded-xl border border-[var(--b1)] ${c.ok ? 'bg-[var(--emerald-soft)]' : 'bg-[var(--amber-soft)]'}`}>
-                {c.ok ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-v shrink-0" /> : <Circle className="w-3.5 h-3.5 text-amber-v shrink-0" />}
-                <p className="text-[11px] font-medium text-t2">{c.label}</p>
+      <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
+        <ResourceSection label="Access token lifetime" state={posture.state} onRetry={posture.reload} compact loading={<TileSkeleton label="access token lifetime" />}>
+          {p => <StatCard title="Access Token TTL" value={`${p.accessTokenTtlMinutes}m`} subtitle="Session lifetime" icon={<Clock className="w-4 h-4" />} accent="blue" />}
+        </ResourceSection>
+        <ResourceSection label="Audit event count" state={posture.state} onRetry={posture.reload} compact loading={<TileSkeleton label="audit event count" />}>
+          {p => <StatCard title="Audit Events" value={p.auditEventCount} subtitle="Total logged" icon={<Activity className="w-4 h-4" />} accent="violet" />}
+        </ResourceSection>
+        <ResourceSection label="Login event count" state={posture.state} onRetry={posture.reload} compact loading={<TileSkeleton label="login event count" />}>
+          {p => <StatCard title="Login Events" value={p.loginEventCount} subtitle="Recorded" icon={<KeyRound className="w-4 h-4" />} accent="emerald" />}
+        </ResourceSection>
+        <ResourceSection label="Session records" state={sessions.state} onRetry={sessions.reload} compact isEmpty={() => false} loading={<TileSkeleton label="session records" />}>
+          {rows => <StatCard title="Unrevoked Sessions" value={rows.filter(s => !s.revoked).length} subtitle="Session records" icon={<Users className="w-4 h-4" />} accent="amber" />}
+        </ResourceSection>
+      </div>
+
+      <BentoCard title="Security Posture" subtitle="Authentication & controls" headerRight={<ShieldCheck className="w-4 h-4 text-t3" />}>
+        <ResourceSection label="Security posture" state={posture.state} onRetry={posture.reload} lines={4} rowClassName="h-11 rounded-xl">
+          {p => (
+            <>
+              <p className="text-[11px] text-t3 mb-2">Auth mode: {p.authMode}</p>
+              <div className="grid sm:grid-cols-2 gap-2">
+                {[
+                  { label: 'Role-based access control', ok: p.rbacEnabled },
+                  { label: 'Audit logging', ok: p.auditLoggingEnabled },
+                  { label: 'Rate limiting', ok: p.rateLimitingEnabled },
+                  { label: 'CSRF protection', ok: p.csrf.enabled },
+                  { label: 'JWT secret configured', ok: p.secrets.jwtSecretConfigured },
+                  { label: 'Refresh secret configured', ok: p.secrets.jwtRefreshSecretConfigured },
+                  { label: 'Dev-token disabled in production', ok: p.devTokenDisabledInProduction },
+                  { label: 'HTTPS required', ok: p.httpsRequired },
+                ].map(c => (
+                  <div key={c.label} className={`flex items-center gap-2.5 p-2.5 rounded-xl border border-[var(--b1)] ${c.ok ? 'bg-[var(--emerald-soft)]' : 'bg-[var(--amber-soft)]'}`}>
+                    {c.ok ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-v shrink-0" /> : <Circle className="w-3.5 h-3.5 text-amber-v shrink-0" />}
+                    <p className="text-[11px] font-medium text-t2">{c.label}</p>
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
-        )}
+            </>
+          )}
+        </ResourceSection>
       </BentoCard>
 
-      <BentoCard title="Session records" subtitle={`${sessions.data.filter(s => !s.revoked).length} unrevoked · revoke to require sign-in again`}>
-        <div className="space-y-2">
-          {sessions.data.map(s => (
-            <div key={s.id} className="flex flex-wrap items-center gap-3 p-3 rounded-xl border border-[var(--b1)]">
-              <div className="flex-1 min-w-[160px]">
-                <p className="text-xs font-bold text-t1">{s.user.displayName} <span className="text-[10px] font-normal text-t3">· {s.user.role.replace('_', ' ')}</span></p>
-                <p className="text-[10px] text-t3 mt-0.5">{s.lastLoginAudit?.ipAddress ?? '—'} · last active {new Date(s.lastActivityAt).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}</p>
+      <BentoCard title="Session records" subtitle="Revoke a user's sessions to require sign-in again">
+        <ResourceSection
+          label="Session records"
+          state={sessions.state}
+          onRetry={sessions.reload}
+          empty={{
+            icon: <Users className="w-5 h-5" />,
+            title: 'No session records',
+            description: 'The session list loaded successfully and this workspace has no recorded sessions.',
+          }}
+        >
+          {rows => (
+            <>
+              <p className="text-[11px] text-t3 mb-2">{rows.filter(s => !s.revoked).length} unrevoked</p>
+              <div className="space-y-2">
+                {rows.map(s => (
+                  <div key={s.id} className="flex flex-wrap items-center gap-3 p-3 rounded-xl border border-[var(--b1)]">
+                    <div className="flex-1 min-w-[160px]">
+                      <p className="text-xs font-bold text-t1">{s.user.displayName} <span className="text-[10px] font-normal text-t3">· {s.user.role.replace('_', ' ')}</span></p>
+                      <p className="text-[10px] text-t3 mt-0.5">
+                        {s.lastLoginAudit ? `${s.lastLoginAudit.ipAddress} · ` : ''}
+                        last active {new Date(s.lastActivityAt).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}
+                      </p>
+                    </div>
+                    {s.revoked
+                      ? <span className="badge badge-red shrink-0">Revoked</span>
+                      : <button type="button" disabled={pendingId === s.user.id} onClick={() => revoke(s.user.id)} aria-label={`Revoke sessions for ${s.user.displayName}`} className="text-[10px] font-semibold text-red-v hover:opacity-80 border border-[var(--b1)] px-2.5 py-1 rounded-lg disabled:opacity-40 shrink-0">{pendingId === s.user.id ? 'Revoking…' : 'Revoke sessions'}</button>
+                    }
+                  </div>
+                ))}
               </div>
-              {s.revoked
-                ? <span className="badge badge-red shrink-0">Revoked</span>
-                : <button type="button" disabled={pendingId === s.user.id} onClick={() => revoke(s.user.id)} aria-label={`Revoke sessions for ${s.user.displayName}`} className="text-[10px] font-semibold text-red-v hover:opacity-80 border border-[var(--b1)] px-2.5 py-1 rounded-lg disabled:opacity-40 shrink-0">{pendingId === s.user.id ? 'Revoking…' : 'Revoke sessions'}</button>
-              }
-            </div>
-          ))}
-          {sessions.data.length === 0 && <p className="text-xs text-t3 py-4 text-center">No active sessions.</p>}
-        </div>
+            </>
+          )}
+        </ResourceSection>
       </BentoCard>
-    </>
+    </div>
   );
 }
 
@@ -578,12 +840,16 @@ function Field({ label, value }: { label: string; value: string }) {
   );
 }
 
-function Skeleton() {
+/** KPI-tile shaped loading placeholder, announced like every other one. */
+function TileSkeleton({ label }: { label: string }) {
+  return <ResourceSkeleton label={label} lines={1} rowClassName="h-[92px] rounded-xl" />;
+}
+
+function StatusRow({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <div className="space-y-2">
-      <div className="skeleton h-16 rounded-xl" />
-      <div className="skeleton h-16 rounded-xl" />
-      <div className="skeleton h-16 rounded-xl" />
+    <div className="flex items-center justify-between gap-3 text-xs">
+      <span className="text-t3 shrink-0">{label}</span>
+      <div className="min-w-0 text-right">{children}</div>
     </div>
   );
 }

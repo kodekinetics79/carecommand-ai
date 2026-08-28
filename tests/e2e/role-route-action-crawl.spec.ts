@@ -70,9 +70,32 @@ test.describe('role-aware real-backend route and action crawl', () => {
       await expect(nav.locator(`a[href="${hydratedLink}"]`)).toHaveCount(1);
 
       const hrefs = await nav.locator('a').evaluateAll(anchors => [...new Set(anchors.map(anchor => anchor.getAttribute('href')).filter((href): href is string => Boolean(href)))]);
-      expect(hrefs.length).toBeGreaterThan(20);
-      expect(hrefs.includes('/control-plane')).toBe(role === 'OWNER');
-      expect(hrefs.includes('/compliance')).toBe(role === 'OWNER' || role === 'AUDITOR');
+
+      // Navigation offers only destinations this role's grants can open. Each
+      // probe is a section whose endpoints enforce a permission or a role list,
+      // checked against the default matrix in server/lib/permissions.ts:
+      // FRONT_DESK has patient/billing/staff reads but no integrations:read;
+      // AUDITOR has compliance and audit reads and nothing operational.
+      const offered: Record<Role, Record<string, boolean>> = {
+        OWNER: {
+          '/patients': true, '/scheduling': true, '/insurance': true, '/staff': true,
+          '/integrations': true, '/monitoring': true, '/compliance': true, '/control-plane': true,
+        },
+        FRONT_DESK: {
+          '/patients': true, '/scheduling': true, '/insurance': true, '/staff': true,
+          '/integrations': false, '/monitoring': false, '/compliance': false, '/control-plane': false,
+        },
+        AUDITOR: {
+          '/patients': false, '/scheduling': false, '/insurance': false, '/staff': false,
+          '/integrations': false, '/monitoring': false, '/compliance': true, '/control-plane': false,
+        },
+      };
+      for (const [href, expected] of Object.entries(offered[role])) {
+        expect(hrefs.includes(href), `${role} navigation offers ${href}`).toBe(expected);
+      }
+      // Everyone keeps a landing page and their own account settings.
+      expect(hrefs).toContain('/');
+      expect(hrefs).toContain('/settings');
 
       for (const href of hrefs) {
         // Use the product's client-side navigation so this exercises the same
@@ -86,6 +109,22 @@ test.describe('role-aware real-backend route and action crawl', () => {
         await expect(page.locator('a[href="#"]')).toHaveCount(0);
         await expect(page.locator('button a, a button')).toHaveCount(0);
         await assertAccessibilityContract(page, `${role}:${href}`);
+      }
+
+      // Arriving at a section this role cannot use — the bookmark/deep-link case
+      // navigation no longer produces — is one honest state, never a status
+      // code, the word "forbidden", or a raw permission key.
+      const outOfScope: Record<Role, string | null> = { OWNER: null, FRONT_DESK: '/control-plane', AUDITOR: '/patients' };
+      const blocked = outOfScope[role];
+      if (blocked) {
+        await page.goto(blocked);
+        const main = page.getByRole('main', { name: 'Clinic workspace' });
+        await expect(main.getByText('is not part of your access')).toBeVisible();
+        const shown = (await main.innerText()).toLowerCase();
+        expect(shown).not.toContain('forbidden');
+        expect(shown).not.toContain('403');
+        expect(shown).not.toContain('permission (');
+        await assertAccessibilityContract(page, `${role}:${blocked} (no access)`);
       }
 
       expect(pageErrors, `uncaught browser errors for ${role}`).toEqual([]);

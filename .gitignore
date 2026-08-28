@@ -39,3 +39,6 @@ api/_bundle.mjs
 
 # Playwright run artifacts — these captured portal tokens and tripped the secret scan.
 .playwright/
+
+# Agent worktrees and local agent state — never commit a second copy of the repo.
+.claude/

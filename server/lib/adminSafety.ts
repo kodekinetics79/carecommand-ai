@@ -70,12 +70,12 @@ export async function assertDeactivateSafe(request: FastifyRequest, target: { id
   }
 }
 
-function auditData(request: FastifyRequest, action: string, targetId: string, metadata: Record<string, unknown>) {
+function auditData(request: FastifyRequest, action: string, targetId: string, metadata: Record<string, unknown>, resource = 'user') {
   return {
     tenantId: request.auth.tenantId,
     actorUserId: request.auth.userId,
     action,
-    resource: 'user',
+    resource,
     resourceId: targetId,
     requestId: request.id,
     ipAddress: request.ip,
@@ -147,4 +147,44 @@ export async function setUserRoleSafely(request: FastifyRequest, targetId: strin
   if (result.kind === 'not_found') throw request.server.httpErrors.notFound('User not found');
   if (result.kind === 'blocked') throw request.server.httpErrors.conflict(result.message);
   return result.updated;
+}
+
+/**
+ * Serialize an administrator-set password with the revocations it must carry.
+ *
+ * No password-reset delivery adapter is integrated, so recovery for a
+ * locked-out user is an OWNER/ADMIN setting a temporary password and handing it
+ * over directly — the same way a password is set at user creation. The reset is
+ * only honest if the old credential material stops working with it, so the
+ * outstanding reset tokens, the refresh token, and (via the
+ * `controlPlane.session.revoked` receipt the auth plugin reads as the
+ * revocation epoch) already-issued access tokens are all invalidated in the
+ * same transaction as the password write. The plaintext is hashed by the caller
+ * before this transaction opens and never reaches an audit record.
+ *
+ * The caller's own account is refused: this path verifies no current password,
+ * and a signed-in user changes their own via POST /v1/auth/password-change.
+ */
+export async function setUserPasswordSafely(request: FastifyRequest, targetId: string, passwordHash: string, action: string) {
+  const result = await runWithTenantContext(request.auth.tenantId, async tx => {
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`tenant-auth:${request.auth.tenantId}:${targetId}`}::text, 0))::text AS locked`;
+    const target = await tx.user.findFirst({ where: { id: targetId, tenantId: request.auth.tenantId } });
+    if (!target) return { kind: 'not_found' as const };
+    if (target.id === request.auth.userId) {
+      await tx.auditEvent.create({ data: auditData(request, 'admin.user.passwordResetBlocked', target.id, { operation: 'passwordReset', reason: 'self_target' }) });
+      return { kind: 'blocked' as const, message: 'Change your own password in Settings → Security, where your current password is required.' };
+    }
+    const changedAt = new Date();
+    await tx.passwordResetToken.updateMany({ where: { tenantId: request.auth.tenantId, userId: target.id, usedAt: null }, data: { usedAt: changedAt } });
+    const updated = await tx.user.update({
+      where: { id: target.id },
+      data: { passwordHash, passwordChangedAt: changedAt, failedLoginCount: 0, lockedUntil: null, refreshTokenHash: null, refreshTokenExpiresAt: null },
+    });
+    await tx.auditEvent.create({ data: auditData(request, 'controlPlane.session.revoked', target.id, { reason: 'password_reset' }, 'session') });
+    await tx.auditEvent.create({ data: auditData(request, action, target.id, { role: target.role, sessionsRevoked: true }) });
+    return { kind: 'updated' as const, updated, changedAt };
+  });
+  if (result.kind === 'not_found') throw request.server.httpErrors.notFound('User not found');
+  if (result.kind === 'blocked') throw request.server.httpErrors.conflict(result.message);
+  return { id: result.updated.id, passwordChangedAt: result.changedAt };
 }
