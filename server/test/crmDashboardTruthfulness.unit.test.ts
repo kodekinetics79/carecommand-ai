@@ -52,10 +52,22 @@ describe('CRM and dashboard truthfulness contracts', () => {
 
     expect(crm).toContain('CRM data unavailable');
     expect(opportunities).toContain('Zero leaks or revenue cannot be inferred');
-    expect(dashboard).toContain('No zero or healthy-state conclusions should be drawn');
+
+    // The dashboard's "don't read this as zero" caution used to be one sentence
+    // hardcoded on one panel. It now lives in the shared failure state, which
+    // carries it for every panel in the app — including the compact variant the
+    // KPI-sized slots use, where a blank is likeliest to be taken for a real
+    // zero. Assert it there, in both lengths, so neither can be dropped.
+    const resourceSection = source('src/components/ui/ResourceSection.tsx');
+    expect(resourceSection).toContain('should be read as zero, empty or healthy');
+    expect(resourceSection).toContain('do not read as zero');
+
     expect(crm).not.toContain('getLeads().catch(() => [])');
     expect(opportunities).not.toContain('listLeaks().catch(() => [])');
     expect(dashboard).not.toContain('getSummary().catch(() => null)');
+    // A failed feed must never be laundered into an empty list or a null
+    // anywhere on the page — that is what turns an outage into a false zero.
+    expect(dashboard).not.toMatch(/catch\(\(\)\s*=>\s*(\[\]|null)\)/);
   });
 
   it('labels fixed heuristics as planning assumptions and never presents them as AI scoring', () => {

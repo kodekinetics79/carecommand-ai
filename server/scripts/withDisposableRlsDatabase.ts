@@ -116,6 +116,15 @@ export async function withDisposableRlsDatabase(command: string, args: string[])
     await run(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['prisma', 'migrate', 'deploy'], ownerEnv);
     await run(command, args, {
       ...process.env,
+      // This script loads .env at import (line 1), which carries
+      // NODE_ENV=development, and the child inherits it. Vitest only defaults
+      // NODE_ENV to "test" when nothing has set it, so every suite launched
+      // through here ran believing it was a development process — and the
+      // codebase's test-only guards are written to refuse in that case
+      // (`autopilot execution test hook is test-only`). The disposable database
+      // lifecycle is a test lifecycle by construction; say so explicitly, while
+      // still letting a caller who set NODE_ENV on purpose keep their value.
+      NODE_ENV: process.env.NODE_ENV === 'development' ? 'test' : (process.env.NODE_ENV ?? 'test'),
       DATABASE_URL: plan.runtimeUrl,
       DATABASE_MIGRATION_URL: plan.ownerUrl,
       SYNTHETIC_DATABASE_URL: plan.ownerUrl,

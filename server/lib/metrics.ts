@@ -120,11 +120,40 @@ export function metricsAccess(authorizationHeader: string | undefined): MetricsA
 // Accept any BullMQ Queue regardless of its job/name generics.
 type AnyQueue = Pick<Queue<unknown, unknown, string>, 'name' | 'getJobCounts'>;
 
+// A Redis outage must never stall a scrape. The BullMQ clients are built with
+// `maxRetriesPerRequest: null` (workers/queues.ts), which tells ioredis to
+// buffer commands indefinitely rather than fail them — so getJobCounts() does
+// not reject when Redis is unreachable, it simply never settles. A try/catch
+// cannot catch a hang, so the guard has to be a timeout.
+//
+// Without it, `/metrics` never reaches registry.metrics() during a Redis
+// incident: the scrape hangs, and dependency_up{dependency="redis"}=0 is never
+// published — silencing the DependencyDown alert at exactly the moment it
+// exists to fire. Same 1s bound modules/health/checks.ts puts on its Redis ping.
+const QUEUE_SAMPLE_TIMEOUT_MS = 1000;
+
+async function withTimeout<T>(operation: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('timeout')), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export async function sampleQueueDepths(queues: AnyQueue[]): Promise<void> {
   await Promise.all(
     queues.map(async q => {
       try {
-        const counts = await q.getJobCounts('waiting', 'active', 'delayed', 'failed');
+        const counts = await withTimeout(
+          q.getJobCounts('waiting', 'active', 'delayed', 'failed'),
+          QUEUE_SAMPLE_TIMEOUT_MS,
+        );
         for (const state of ['waiting', 'active', 'delayed', 'failed'] as const) {
           queueDepth.set({ queue: q.name, state }, counts[state] ?? 0);
         }

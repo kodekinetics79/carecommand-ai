@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { describe, it, expect } from 'vitest';
 import Fastify from 'fastify';
 import { metricsPlugin } from '../plugins/metrics';
-import { monitoringAccessForEnvironment, registry } from '../lib/metrics';
+import { monitoringAccessForEnvironment, registry, sampleQueueDepths, queueDepth } from '../lib/metrics';
 import { SLOS, errorBudgetMinutes } from '../lib/slo';
 import { currentTraceCarrier, runInJobContext, getTraceIds } from '../lib/traceContext';
 import { healthRoutes } from '../modules/health/routes';
@@ -40,6 +40,45 @@ describe('metrics — /metrics exposition', () => {
     // Guard against a regression that would explode label cardinality / leak ids.
     const metric = registry.getSingleMetric('http_requests_total');
     expect(metric).toBeDefined();
+  });
+});
+
+describe('metrics — a Redis outage must not stall the scrape', () => {
+  // The BullMQ clients are constructed with `maxRetriesPerRequest: null`
+  // (workers/queues.ts), which tells ioredis to buffer commands indefinitely
+  // rather than fail them. So when Redis is unreachable getJobCounts() does not
+  // reject — it never settles, and the try/catch around it can never run. The
+  // scrape then never reaches registry.metrics(), so dependency_up{redis}=0 is
+  // never published and DependencyDown stays silent through the whole incident.
+  // A hung dependency is modelled here exactly: a promise that never settles.
+  const hungQueue = {
+    name: 'test-hung-queue',
+    getJobCounts: () => new Promise<never>(() => { /* buffered forever, like ioredis offline */ }),
+  } as unknown as Parameters<typeof sampleQueueDepths>[0][number];
+
+  it('gives up on a queue whose client never answers, instead of waiting forever', async () => {
+    const startedAt = process.hrtime.bigint();
+    await sampleQueueDepths([hungQueue]);
+    const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    // Bounded by the 1s guard. Without it this call never returns and the test
+    // fails on timeout rather than on this assertion.
+    expect(elapsedMs).toBeLessThan(3000);
+  });
+
+  it('still publishes the rest of the scrape when one queue is unreachable', async () => {
+    const healthyQueue = {
+      name: 'test-healthy-queue',
+      getJobCounts: async () => ({ waiting: 4, active: 1, delayed: 0, failed: 2 }),
+    } as unknown as Parameters<typeof sampleQueueDepths>[0][number];
+
+    await sampleQueueDepths([hungQueue, healthyQueue]);
+
+    // The reachable queue's backlog is recorded even though its neighbour hung —
+    // one dead dependency must not blank the whole exposition.
+    expect(await queueDepth.get().then(g => g.values.find(v =>
+      v.labels.queue === 'test-healthy-queue' && v.labels.state === 'waiting')?.value)).toBe(4);
+    // And the scrape body itself renders, which is the property the alert needs.
+    expect(await registry.metrics()).toContain('test-healthy-queue');
   });
 });
 
