@@ -9,7 +9,10 @@ export function useApiResource<TApi, TView extends { id: string }>(
   mapRow: (row: TApi) => TView,
 ) {
   const fallbackRef = useRef(fallback);
-  const [data, setData] = useState<TView[]>(fallbackRef.current ?? EMPTY_ROWS);
+  // Seed from the prop, not from fallbackRef.current: reading a ref during
+  // render is unsafe under concurrent rendering. The ref still carries the
+  // fallback into the effect, where reading it is correct.
+  const [data, setData] = useState<TView[]>(fallback ?? EMPTY_ROWS);
   const [source, setSource] = useState<'live' | 'offline'>('offline');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);

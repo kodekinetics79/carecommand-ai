@@ -47,6 +47,11 @@ jobs:
       - run: npm ci
       - run: npm run db:generate
       - run: npm run db:deploy
+      # The suite needs reference data that no migration inserts — subscription
+      # plans exist only in prisma/seed.ts. Without this, 36 of 111 tests fail
+      # on `subscriptionPlan.findUnique(...) === null`, which is why `npm test`
+      # has never passed in this job.
+      - run: npm run db:seed
       - run: npm run api:typecheck
       - run: npm run lint
       - run: npm test
@@ -61,6 +66,9 @@ jobs:
       - name: Secret scan (gitleaks)
         uses: gitleaks/gitleaks-action@v2
         env:
+          # gitleaks-action@v2 exits immediately without a token. Its absence is
+          # why the security job failed in ~6s on every PR into main.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
       - uses: actions/setup-node@v4
         with:
