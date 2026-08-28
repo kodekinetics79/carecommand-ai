@@ -80,7 +80,14 @@ function ProtectedLayout() {
         <Topbar mobileNavOpen={mobileNavOpen} onOpenNavigation={() => setMobileNavOpen(true)} />
         <main className="app-scroll" aria-label="Clinic workspace">
           <div className="app-inner">
-            <Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}>
+            {/* Keyed by pathname so each route mounts its own Suspense boundary.
+                Every page is React.lazy and react-router dispatches navigation
+                inside startTransition, so a single already-mounted boundary keeps
+                the PREVIOUS route rendered while the next chunk loads — the URL
+                advances but breadcrumb, sidebar highlight and body all lag one
+                navigation behind, with no loading feedback. Keying forces the
+                fallback to show and the shell to track the current route. */}
+            <Suspense key={location.pathname} fallback={<div className="skeleton h-48 rounded-2xl" />}>
               <div key={`${currency}-${language}`}><Outlet /></div>
             </Suspense>
           </div>
