@@ -207,7 +207,8 @@ async function buildIntegrationRows(tenantId: string) {
     const integrationRow = integrationRows.find(row => row.key === definition.key);
     const paymentRow = paymentConnections.find(row => row.providerKey === definition.key);
     const latestLog = logs.find(log => log.provider === definition.key || log.provider === definition.name.toLowerCase());
-    const missingEnvVars = definition.envVars.filter(name => !process.env[name]);
+    // Operator-only detail. Tenants receive a count, never the variable names.
+    const missingConfigCount = definition.envVars.filter(name => !process.env[name]).length;
 
     let mode: 'mock' | 'sandbox' | 'live';
     let configured: boolean;
@@ -265,7 +266,7 @@ async function buildIntegrationRows(tenantId: string) {
       configured,
       health,
       lastSyncAt,
-      missingEnvVars,
+      missingConfigCount,
       riskLevel: !configured ? 'high' : health === 'degraded' ? 'medium' : 'low',
       action: 'Test connection',
       integrationId: integrationRow?.id ?? null,
@@ -1116,12 +1117,12 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     const commonFields = {
       providerKey: provider, providerName: selected.name, modeLabel: selected.modeLabel,
       health: selected.health, supportedWorkflows: selected.supportedWorkflows,
-      missingEnvVars: selected.missingEnvVars, riskLevel: selected.riskLevel,
+      missingConfigCount: selected.missingConfigCount, riskLevel: selected.riskLevel,
     };
 
     // Not configured → honest not_configured; never claim a successful test.
     if (!selected.configured) {
-      const note = `${selected.name} is not configured; no live connection test was performed.${selected.missingEnvVars?.length ? ` Missing: ${selected.missingEnvVars.join(', ')}.` : ''}`;
+      const note = `${selected.name} is not configured; no live connection test was performed.${selected.missingConfigCount ? ' Setup must be completed by your administrator.' : ''}`;
       await db.integrationRunLog.create({
         data: {
           tenantId: request.auth.tenantId, branchId, provider, providerMode: selected.mode,

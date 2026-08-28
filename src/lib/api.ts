@@ -68,7 +68,9 @@ async function rawApiRequest<T>(path: string, init?: RequestInit, retryOnRefresh
   }
 
   if (!response.ok) {
-    let message = `API request failed: ${response.status}`;
+    // User-facing default. The raw status stays on ApiError.status for
+    // diagnostics; never render a bare HTTP code as page copy.
+    let message = humanApiMessage(response.status);
     let code: string | undefined;
     const body = await response.json().catch(() => null) as Record<string, unknown> | null;
     if (typeof body?.message === 'string') message = body.message;
@@ -79,6 +81,18 @@ async function rawApiRequest<T>(path: string, init?: RequestInit, retryOnRefresh
     return undefined as T;
   }
   return response.json() as Promise<T>;
+}
+
+// Plain-language fallbacks so a failed request never renders as "API request
+// failed: 500" in the product. A server-supplied `message` still wins.
+function humanApiMessage(status: number): string {
+  if (status === 400) return 'That request could not be processed. Please check the details and try again.';
+  if (status === 403) return 'You do not have permission to do that.';
+  if (status === 404) return 'That item could not be found. It may have been moved or deleted.';
+  if (status === 409) return 'Someone else changed this while you were working. Refresh and try again.';
+  if (status === 429) return 'Too many requests. Please wait a moment and try again.';
+  if (status >= 500) return 'Something went wrong on our side. Please try again in a moment.';
+  return 'That request could not be completed. Please try again.';
 }
 
 export async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {

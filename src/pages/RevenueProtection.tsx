@@ -255,8 +255,15 @@ export default function RevenueProtection() {
     }));
   };
 
-  const handleMarkPaymentCollected = async (row: PaymentActionRow) => {
+  // `source` is explicit because the two call sites pass different id types:
+  // the payment queue's row.id IS a PaymentRequest id, while the deposit queue's
+  // row.id is a DepositRequirement id. Inferring this from the optional
+  // paymentRequestId silently routed payment rows into the deposit table.
+  const handleMarkPaymentCollected = async (row: PaymentActionRow, source: 'payment' | 'deposit') => {
     await withRefresh(`collected-${row.id}`, () => {
+      if (source === 'payment') {
+        return updatePaymentStatus(row.id, 'collected', row.providerReference ?? undefined);
+      }
       if (row.paymentRequestId) {
         return updatePaymentStatus(row.paymentRequestId, 'collected', row.providerReference ?? undefined);
       }
@@ -719,7 +726,7 @@ export default function RevenueProtection() {
                     <button
                       type="button"
                       disabled={actionBusy === `collected-${row.id}`}
-                      onClick={() => void handleMarkPaymentCollected(row)}
+                      onClick={() => void handleMarkPaymentCollected(row, 'payment')}
                       className="rounded-xl bg-[var(--emerald)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-50"
                     >
                       {actionBusy === `collected-${row.id}` ? 'Saving…' : 'Record Staff-Confirmed Collection'}
@@ -866,7 +873,7 @@ export default function RevenueProtection() {
                         paymentUrl: null,
                         providerReference: null,
                         dueAt: row.dueAt,
-                      })}
+                      }, 'deposit')}
                       className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition"
                     >
                       Record Staff-Confirmed Collection

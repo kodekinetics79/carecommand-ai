@@ -88,7 +88,7 @@ export default function Integrations() {
         configured: boolean;
         message: string;
         supportedWorkflows: string[];
-        missingEnvVars: string[];
+        missingConfigCount: number;
         riskLevel: string;
       }>(`/v1/integrations/${providerKey}/test`, { method: 'POST' });
       setTestResults(current => ({
@@ -225,9 +225,9 @@ export default function Integrations() {
                     </div>
                   </div>
 
-                  {row.missingEnvVars.length > 0 && (
+                  {row.missingConfigCount > 0 && (
                     <p className="mt-3 text-[11px] text-t3">
-                      Server configuration needed: {row.missingEnvVars.join(', ')}
+                      Setup required — your administrator must finish connecting this provider.
                     </p>
                   )}
 
