@@ -102,5 +102,8 @@
     "vite": "^8.0.12",
     "vitest": "^4.1.10",
     "yaml": "^2.9.0"
+  },
+  "overrides": {
+    "deepmerge-ts": "^8.0.0"
   }
 }
