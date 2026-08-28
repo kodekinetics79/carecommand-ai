@@ -203,7 +203,7 @@ const SECTION_PROMPT: Record<string, string> = {
   insurance: 'Add or update your insurance information.',
   insurance_card: 'Provide your insurance card details (metadata only — no image is stored).',
   photo_id: 'Provide your photo ID details (metadata only — no image is stored).',
-  payment_policy: 'Payment-policy acknowledgment is unavailable until the clinic publishes exact versioned policy text.',
+  payment_policy: 'No action needed here — your clinic will go over their payment policy with you directly.',
   estimate_acknowledgement: 'Review your estimated patient responsibility. This is an estimate, not a guarantee.',
   pre_visit_checklist: 'Confirm the pre-visit checklist.',
   consent_forms: 'Review and accept the consent forms.',

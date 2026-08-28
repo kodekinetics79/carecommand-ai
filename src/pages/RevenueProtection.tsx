@@ -192,12 +192,37 @@ export default function RevenueProtection() {
     };
   }, [selectedClinicId, reload]);
 
+  // Several endpoints refuse work truthfully with HTTP 200 and a status envelope
+  // (e.g. {status:'setup_required'}). apiRequest only throws on !response.ok, so
+  // those refusals used to be reported to the user as "Updated successfully"
+  // while nothing happened. Treat them as failures, not successes.
+  function serverRefusal(result: unknown): string | null {
+    if (!result || typeof result !== 'object') return null;
+    const envelope = result as { status?: unknown; message?: unknown };
+    if (typeof envelope.status !== 'string') return null;
+    if (envelope.status === 'setup_required') {
+      return 'This provider is not connected yet, so nothing was changed. Your administrator needs to finish setting it up.';
+    }
+    if (envelope.status === 'not_configured' || envelope.status === 'failed') {
+      return typeof envelope.message === 'string' && envelope.message
+        ? envelope.message
+        : 'The provider could not complete this request, so nothing was changed.';
+    }
+    return null;
+  }
+
   async function withRefresh<T>(key: string, action: () => Promise<T>) {
     setActionBusy(key);
     setMessage(null);
     setActionError(null);
     try {
       const result = await action();
+      const refusal = serverRefusal(result);
+      if (refusal) {
+        setActionError(refusal);
+        await reload();
+        return result;
+      }
       setMessage('Updated successfully');
       await reload();
       return result;
@@ -255,8 +280,15 @@ export default function RevenueProtection() {
     }));
   };
 
-  const handleMarkPaymentCollected = async (row: PaymentActionRow) => {
+  // `source` is explicit because the two call sites pass different id types:
+  // the payment queue's row.id IS a PaymentRequest id, while the deposit queue's
+  // row.id is a DepositRequirement id. Inferring this from the optional
+  // paymentRequestId silently routed payment rows into the deposit table.
+  const handleMarkPaymentCollected = async (row: PaymentActionRow, source: 'payment' | 'deposit') => {
     await withRefresh(`collected-${row.id}`, () => {
+      if (source === 'payment') {
+        return updatePaymentStatus(row.id, 'collected', row.providerReference ?? undefined);
+      }
       if (row.paymentRequestId) {
         return updatePaymentStatus(row.paymentRequestId, 'collected', row.providerReference ?? undefined);
       }
@@ -719,7 +751,7 @@ export default function RevenueProtection() {
                     <button
                       type="button"
                       disabled={actionBusy === `collected-${row.id}`}
-                      onClick={() => void handleMarkPaymentCollected(row)}
+                      onClick={() => void handleMarkPaymentCollected(row, 'payment')}
                       className="rounded-xl bg-[var(--emerald)] px-3 py-2 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-50"
                     >
                       {actionBusy === `collected-${row.id}` ? 'Saving…' : 'Record Staff-Confirmed Collection'}
@@ -866,7 +898,7 @@ export default function RevenueProtection() {
                         paymentUrl: null,
                         providerReference: null,
                         dueAt: row.dueAt,
-                      })}
+                      }, 'deposit')}
                       className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1 hover:bg-[var(--s2)] transition"
                     >
                       Record Staff-Confirmed Collection

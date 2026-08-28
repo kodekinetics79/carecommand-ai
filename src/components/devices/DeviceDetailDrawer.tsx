@@ -196,7 +196,7 @@ export default function DeviceDetailDrawer({ deviceId, onClose, onChanged }: { d
             <div className="flex items-center gap-2">
               <button type="button" disabled={busy === 'test'} onClick={testConnection}
                 className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-white px-3 py-2 text-[13px] font-semibold text-t1 hover:bg-[var(--s2)] disabled:opacity-50">
-                {busy === 'test' ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4 text-emerald-v" />} Test connection
+                {busy === 'test' ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4 text-emerald-v" />} Run readiness check
               </button>
               <button type="button" disabled={busy === 'delete'} onClick={deactivate}
                 className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-3 py-2 text-[13px] font-semibold text-t2 hover:text-red-v hover:border-red-v/30 disabled:opacity-50">

@@ -430,7 +430,7 @@ export interface IntegrationStatus {
   configured: boolean;
   health: 'healthy' | 'degraded' | 'disconnected' | 'not_configured';
   lastSyncAt: string | null;
-  missingEnvVars: string[];
+  missingConfigCount: number;
   riskLevel: 'low' | 'medium' | 'high' | string;
   action: string;
   integrationId: string | null;

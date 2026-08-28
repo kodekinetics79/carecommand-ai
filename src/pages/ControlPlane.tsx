@@ -1068,7 +1068,7 @@ export default function ControlPlane() {
                   </div>
                   <p className="mt-2 text-[11px] text-t3">{row.description}</p>
                   <div className="mt-2 flex flex-wrap gap-1.5">{row.supportedWorkflows.map(workflow => <span key={workflow} className="badge badge-indigo">{workflow}</span>)}</div>
-                  {row.missingEnvVars.length > 0 && <p className="mt-2 text-[11px] text-t3">Missing env: {row.missingEnvVars.join(', ')}</p>}
+                  {row.missingConfigCount > 0 && <p className="mt-2 text-[11px] text-t3">Setup incomplete — your administrator must finish connecting this provider.</p>}
                   <button type="button" onClick={() => void testIntegration(row.key)} disabled={!canManage} className="mt-3 inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition disabled:opacity-40">Test connection</button>
                 </div>
               ))}

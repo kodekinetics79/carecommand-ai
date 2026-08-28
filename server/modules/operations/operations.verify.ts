@@ -114,8 +114,8 @@ async function main() {
   // --- Integration Hub: truthful Retell status (Part 5) ------------------
   const integ = JSON.parse((await call('GET', '/v1/integrations/status', aTok)).body);
   const retell = integ.find((i: any) => i.key === 'retell');
-  check('Integration hub: Retell entry with truthful configured + missingEnvVars (no secret values)',
-    !!retell && typeof retell.configured === 'boolean' && Array.isArray(retell.missingEnvVars) && retell.missingEnvVars.every((v: string) => v === v.toUpperCase()));
+  check('Integration hub: Retell entry with truthful configured + missingConfigCount (no names, no secrets)',
+    !!retell && typeof retell.configured === 'boolean' && typeof retell.missingConfigCount === 'number' && retell.missingConfigCount >= 0);
 
   // --- Tenant isolation (Part 7 #13) -------------------------------------
   const bRecs = JSON.parse((await call('GET', '/v1/recommendations', bTok)).body);

@@ -361,7 +361,8 @@ async function buildIntegrationStatuses(tenantId: string) {
     const paymentRow = paymentConnections.find(row => row.providerKey === entry.key);
     const latestLog = logs.find((log: IntegrationLogRow) => log.provider === entry.key || log.provider === entry.name.toLowerCase());
 
-    const missingEnvVars = entry.envVars.filter((name: string) => !isEnvSet(name));
+    // Operator-only detail. Tenants receive a count, never the variable names.
+    const missingConfigCount = entry.envVars.filter((name: string) => !isEnvSet(name)).length;
 
     let mode: 'mock' | 'sandbox' | 'live' = 'mock';
     let configured = false;
@@ -437,7 +438,7 @@ async function buildIntegrationStatuses(tenantId: string) {
       configured,
       health,
       lastSyncAt,
-      missingEnvVars,
+      missingConfigCount,
       riskLevel: !configured ? 'high' : health === 'degraded' ? 'medium' : 'low',
       action: 'Test connection',
       integrationId: integrationRow?.id ?? null,
@@ -808,7 +809,7 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
       message: selected.configured ? 'Connection test recorded.' : 'Provider is not configured yet.',
       lastCheckedAt: new Date().toISOString(),
       supportedWorkflows: selected.supportedWorkflows,
-      missingEnvVars: selected.missingEnvVars,
+      missingConfigCount: selected.missingConfigCount,
       riskLevel: selected.riskLevel,
     });
   });

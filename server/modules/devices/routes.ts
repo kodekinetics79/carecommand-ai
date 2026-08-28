@@ -164,7 +164,12 @@ export const deviceRoutes: FastifyPluginAsync = async app => {
     return updated;
   });
 
-  // Local readiness test (no external telemetry). Flips to online, records result.
+  // Local readiness test (no external telemetry). Evaluates whether the device
+  // RECORD is complete enough to receive data. It must never claim the device is
+  // reachable: `status` reflects real telemetry (lastSeenAt) and is not mutated
+  // here. Previously this unconditionally wrote status='online' and
+  // lastTestStatus='passed' without performing any check, which reported
+  // unreachable devices as Online and inflated the RPM device-readiness count.
   app.post('/:id/test', { preHandler: adminRoles }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const tenantId = request.auth.tenantId;
@@ -173,13 +178,21 @@ export const deviceRoutes: FastifyPluginAsync = async app => {
     if (existing.branchId) await assertBranchAccess(request, existing.branchId);
     const now = new Date();
     const period = rpmPeriodBounds(now);
+    const readinessFailures: string[] = [];
+    if (!existing.active) readinessFailures.push('device_inactive');
+    if (!existing.branchId) readinessFailures.push('no_location_assigned');
+    if (!existing.serialNumber) readinessFailures.push('no_serial_number');
+    const passed = readinessFailures.length === 0;
+    const message = passed
+      ? 'Local readiness check passed. Device record is complete; reachability is not verified by this check.'
+      : `Local readiness check failed: ${readinessFailures.join(', ')}.`;
     const updated = await db.$transaction(async tx => {
       const row = await tx.device.update({
         where: { id: existing.id },
-        data: { status: 'online', lastSeenAt: now, lastTestStatus: 'passed', lastTestedAt: now },
+        data: { lastTestStatus: passed ? 'passed' : 'failed', lastTestedAt: now },
         select: { id: true, status: true, lastSeenAt: true, lastTestStatus: true, lastTestedAt: true },
       });
-      await tx.deviceEvent.create({ data: { tenantId, deviceId: id, actorUserId: request.auth.userId, type: 'connection_test', fromStatus: existing.status, toStatus: 'online', message: 'Local readiness check passed' } });
+      await tx.deviceEvent.create({ data: { tenantId, deviceId: id, actorUserId: request.auth.userId, type: 'connection_test', fromStatus: existing.status, toStatus: existing.status, message } });
       await invalidateRpmSignoffsForDevice(tx, {
         tenantId, deviceId: id, periodStart: period.start,
         reason: 'enrolled_device_mutated', actorUserId: request.auth.userId,
@@ -188,7 +201,7 @@ export const deviceRoutes: FastifyPluginAsync = async app => {
       await tx.auditEvent.create({ data: { tenantId, actorUserId: request.auth.userId, action: 'device.connection_tested', resource: 'device', resourceId: id, requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'] } });
       return row;
     });
-    return updated;
+    return { ...updated, readiness: { passed, failures: readinessFailures, reachabilityVerified: false } };
   });
 
   // Deactivate (soft remove). Admin roles only; audited + event.

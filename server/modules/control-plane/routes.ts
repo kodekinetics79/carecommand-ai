@@ -207,7 +207,8 @@ async function buildIntegrationRows(tenantId: string) {
     const integrationRow = integrationRows.find(row => row.key === definition.key);
     const paymentRow = paymentConnections.find(row => row.providerKey === definition.key);
     const latestLog = logs.find(log => log.provider === definition.key || log.provider === definition.name.toLowerCase());
-    const missingEnvVars = definition.envVars.filter(name => !process.env[name]);
+    // Operator-only detail. Tenants receive a count, never the variable names.
+    const missingConfigCount = definition.envVars.filter(name => !process.env[name]).length;
 
     let mode: 'mock' | 'sandbox' | 'live';
     let configured: boolean;
@@ -265,7 +266,7 @@ async function buildIntegrationRows(tenantId: string) {
       configured,
       health,
       lastSyncAt,
-      missingEnvVars,
+      missingConfigCount,
       riskLevel: !configured ? 'high' : health === 'degraded' ? 'medium' : 'low',
       action: 'Test connection',
       integrationId: integrationRow?.id ?? null,
@@ -684,6 +685,17 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     if (!policy.ok) throw app.httpErrors.badRequest(policy.message ?? 'Weak password');
 
     const requestedBranchIds = [...new Set(body.branchIds)];
+    // PRIVILEGE ESCALATION GUARD. replaceClinicAccess writes
+    // `branchId: orderedBranchIds[0] ?? null`, and a null branchId is how this
+    // codebase represents "not restricted to a branch": branchScope() returns
+    // {} (no filter, every branch) and assertBranchAccess() permits any branch.
+    // So clearing every clinic for a departing user silently granted them
+    // tenant-wide access to all branches while the console displayed
+    // "No access configured". Removing all access is a deactivation, not a
+    // grant, so refuse it here and make the admin say what they mean.
+    if (requestedBranchIds.length === 0) {
+      throw app.httpErrors.badRequest('Select at least one clinic. To remove this user\u2019s access entirely, deactivate the account instead.');
+    }
     if (body.primaryBranchId && !requestedBranchIds.includes(body.primaryBranchId)) {
       throw app.httpErrors.badRequest('Primary branch must be included in selected branch access');
     }
@@ -1116,12 +1128,12 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     const commonFields = {
       providerKey: provider, providerName: selected.name, modeLabel: selected.modeLabel,
       health: selected.health, supportedWorkflows: selected.supportedWorkflows,
-      missingEnvVars: selected.missingEnvVars, riskLevel: selected.riskLevel,
+      missingConfigCount: selected.missingConfigCount, riskLevel: selected.riskLevel,
     };
 
     // Not configured → honest not_configured; never claim a successful test.
     if (!selected.configured) {
-      const note = `${selected.name} is not configured; no live connection test was performed.${selected.missingEnvVars?.length ? ` Missing: ${selected.missingEnvVars.join(', ')}.` : ''}`;
+      const note = `${selected.name} is not configured; no live connection test was performed.${selected.missingConfigCount ? ' Setup must be completed by your administrator.' : ''}`;
       await db.integrationRunLog.create({
         data: {
           tenantId: request.auth.tenantId, branchId, provider, providerMode: selected.mode,

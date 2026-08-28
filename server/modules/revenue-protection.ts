@@ -1898,7 +1898,10 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
             eligibilityVerifications: {
               where: { tenantId: request.auth.tenantId },
               orderBy: { checkedAt: 'desc' },
-              take: 1,
+              // Widened from 1 so the appointment-scoping below can still find a
+              // check that belongs to THIS appointment when the patient's most
+              // recent check belongs to a different one.
+              take: 10,
               include: { payer: { select: { name: true } }, policy: { select: { memberId: true, groupNumber: true } } },
             },
             priorAuthorizations: {
@@ -1910,6 +1913,16 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
         },
       },
     });
+
+    // An eligibility check performed for a DIFFERENT appointment must never be
+    // presented as this appointment's coverage. The nested include cannot
+    // reference the outer row, so scope it here: keep checks tied to this
+    // appointment, plus patient-level checks that name no appointment at all.
+    for (const row of rows) {
+      row.patient.eligibilityVerifications = row.patient.eligibilityVerifications
+        .filter(verification => verification.appointmentId === null || verification.appointmentId === row.id)
+        .slice(0, 1);
+    }
 
     await audit(request, { action: 'eligibility.appointmentQueue.list', resource: 'appointment', metadata: { count: rows.length, branchId: request.auth.branchId ?? query.branchId ?? null } });
     return { appointments: rows.map(mapAppointmentQueueRow) };

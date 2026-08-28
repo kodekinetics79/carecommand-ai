@@ -29,7 +29,7 @@ interface Template { id: string; name: string; channel: string; status: 'ACTIVE'
 interface IntegrationStatus {
   key: string; name: string; category: string; description: string; supportedWorkflows: string[];
   mode: string; modeLabel: string; configured: boolean; health: string; lastSyncAt: string | null;
-  missingEnvVars: string[]; riskLevel: string;
+  missingConfigCount: number; riskLevel: string;
 }
 interface SecurityPosture {
   authMode: string; rbacEnabled: boolean; auditLoggingEnabled: boolean; rateLimitingEnabled: boolean;
@@ -480,8 +480,8 @@ function IntegrationsSection() {
                   ))}
                 </div>
 
-                {item.missingEnvVars.length > 0 && (
-                  <p className="text-[10px] text-amber-v mb-2 flex items-center gap-1"><KeyRound className="w-3 h-3 shrink-0" /> Needs: {item.missingEnvVars.join(', ')}</p>
+                {item.missingConfigCount > 0 && (
+                  <p className="text-[10px] text-amber-v mb-2 flex items-center gap-1"><KeyRound className="w-3 h-3 shrink-0" /> Setup required — your administrator must finish connecting this provider.</p>
                 )}
 
                 <div className="mt-auto flex items-center justify-between gap-2 pt-1">
