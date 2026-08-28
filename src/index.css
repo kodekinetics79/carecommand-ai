@@ -435,6 +435,20 @@ button, a, [role="button"] {
 .bg-b0 { background: var(--b0); }
 .bg-b1 { background: var(--b1); }
 
+/* Semantic accent backgrounds. The TEXT utilities above define every accent but
+   the background block defined only surfaces, so `bg-indigo`, `bg-red-v`,
+   `bg-amber-v` and `bg-emerald-v` generated no CSS at all while shipping on 56
+   controls. Paired with `text-white` that rendered the primary action as white
+   text on a transparent ground — invisible — including the patient intake
+   submit button and every destructive confirm. Verified against the built
+   bundle: `.bg-indigo{` appeared 0 times in dist CSS, 17 times in dist JS. */
+.bg-indigo    { background: var(--indigo); }
+.bg-emerald-v { background: var(--emerald); }
+.bg-amber-v   { background: var(--amber); }
+.bg-red-v     { background: var(--red); }
+.hover\:bg-amber-v:hover { background: var(--amber); }
+.hover\:bg-red-v:hover   { background: var(--red); }
+
 /* ═══════════════════════════════════════════════════════
    BORDER UTILITIES
    ═══════════════════════════════════════════════════════ */
