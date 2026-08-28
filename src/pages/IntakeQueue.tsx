@@ -17,6 +17,7 @@ export default function IntakeQueue() {
   const [tab, setTab] = useState<'queue' | 'all'>('queue');
   // Originate a new intake for a patient (createPacket) directly from the queue.
   const [patients, setPatients] = useState<ReturnType<typeof mapPatient>[]>([]);
+  const [patientLoadError, setPatientLoadError] = useState<string | null>(null);
   const [originatePatientId, setOriginatePatientId] = useState('');
   const [originating, setOriginating] = useState(false);
   const [originateNotice, setOriginateNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
@@ -55,10 +56,19 @@ export default function IntakeQueue() {
     let active = true;
     void (async () => {
       try {
-        const res = await apiRequest<{ data: ApiPatient[] } | ApiPatient[]>('/v1/patients?limit=200');
+        // limit=200 exceeded the server's cap of 100, so this always returned
+        // 400 VALIDATION_ERROR. The empty catch then swallowed it, leaving the
+        // patient picker permanently empty and "Send intake" unusable with no
+        // sign anything was wrong.
+        const res = await apiRequest<{ data: ApiPatient[] } | ApiPatient[]>('/v1/patients?limit=100');
         const rows = Array.isArray(res) ? res : res.data;
         if (active) setPatients(rows.map(mapPatient));
-      } catch { /* patient list is optional for the queue */ }
+      } catch (error) {
+        // Still non-fatal for the queue itself, but never silent: without a
+        // patient list the originate control cannot work, and the user needs
+        // to know that rather than face a picker that is simply empty.
+        if (active) setPatientLoadError(error instanceof Error ? error.message : 'Could not load the patient list.');
+      }
     })();
     return () => { active = false; };
   }, []);
@@ -103,6 +113,7 @@ export default function IntakeQueue() {
           </button>
         </div>
       </div>
+      {patientLoadError && <p role="alert" className="text-xs font-semibold text-red-v">Patient list unavailable, so a new intake cannot be started right now. {patientLoadError}</p>}
       {originateNotice && <p role={originateNotice.kind === 'error' ? 'alert' : 'status'} className={`text-xs font-semibold ${originateNotice.kind === 'ok' ? 'text-emerald-v' : 'text-red-v'}`}>{originateNotice.text}</p>}
       {error && <p role="alert" className="text-sm text-red-v">{error}</p>}
       {loading ? (
