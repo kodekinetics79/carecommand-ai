@@ -1,9 +1,10 @@
 import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Queue } from 'bullmq';
 import Redis from 'ioredis';
 import { fixtureDb } from './helpers/fixtureDb';
+import { requireQueueRedis } from './helpers/requireQueueRedis';
 import { createEligibilityReconciliationWorker } from '../workers/eligibilityReconciliation.worker';
 import {
   autopilotQueue,
@@ -60,6 +61,8 @@ async function cleanup() {
     autopilotQueue.close(), campaignQueue.close(), complianceQueue.close(), monitoringQueue.close(), eligibilityReconciliationQueue.close(),
   ]);
 }
+
+beforeAll(requireQueueRedis);
 
 afterAll(async () => {
   await cleanup();

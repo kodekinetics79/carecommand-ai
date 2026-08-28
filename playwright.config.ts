@@ -3,6 +3,13 @@ import { defineConfig, devices } from '@playwright/test';
 const useInstalledChrome = process.env.E2E_USE_INSTALLED_CHROME === 'true';
 const headedInstalledChrome = process.env.E2E_HEADLESS !== 'true';
 
+// Where the suite runs. Unset, Playwright builds and serves this checkout, and
+// specs provision their own data. Set, the run is pointed at an already-running
+// environment — the local pilot, staging, production — and starts nothing, so
+// the same specs gate a build and a deployment without a URL in either.
+const externalBaseUrl = process.env.E2E_BASE_URL?.trim();
+const localBaseUrl = 'http://127.0.0.1:44173';
+
 const projects = useInstalledChrome
   ? [
       {
@@ -36,15 +43,15 @@ export default defineConfig({
   workers: 1,
   reporter: [['list'], ['html', { outputFolder: '.playwright/report', open: 'never' }]],
   use: {
-    baseURL: 'http://127.0.0.1:44173',
+    baseURL: externalBaseUrl ?? localBaseUrl,
     trace: 'on',
     screenshot: 'on',
     video: 'on',
   },
   projects,
-  webServer: {
+  webServer: externalBaseUrl ? undefined : {
     command: 'npm run e2e:serve',
-    url: 'http://127.0.0.1:44173/client/login',
+    url: `${localBaseUrl}/client/login`,
     timeout: 120_000,
     reuseExistingServer: false,
   },
