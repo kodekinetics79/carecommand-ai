@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { apiRequest } from '../lib/api';
+import { ApiError, apiRequest } from '../lib/api';
 import { authEventName, clearSession, login, logout, type AuthMeResponse, type SessionUser } from '../lib/session';
 
 export function useSession(options: { hydrate?: boolean } = {}) {
@@ -11,8 +11,14 @@ export function useSession(options: { hydrate?: boolean } = {}) {
     try {
       const response = await apiRequest<AuthMeResponse>('/v1/auth/me');
       setUser({ ...response.user, effectivePermissions: response.access.permissions });
-    } catch {
-      setUser(null);
+    } catch (error) {
+      // Only a real authentication failure means "signed out". Treating every
+      // failure as unauthenticated meant a transient 5xx or a dropped
+      // connection cleared the session and bounced staff to /login in the
+      // middle of a task. On a non-auth error keep whatever session we already
+      // have; the request layer already handles 401 refresh and cleanup.
+      const status = error instanceof ApiError ? error.status : 0;
+      if (status === 401 || status === 403) setUser(null);
     } finally {
       setLoading(false);
     }
