@@ -52,7 +52,15 @@ export default function PublicIntake() {
   if (error || !view) return <CenterCard><div role="alert" className="text-center"><AlertCircle className="w-8 h-8 text-red-v mx-auto mb-2" /><p className="text-sm text-t2">{error}</p></div></CenterCard>;
   if (submitted) return <CenterCard><div role="status" aria-live="polite" className="text-center"><CheckCircle2 className="w-10 h-10 text-emerald-v mx-auto mb-3" /><p className="text-base font-semibold text-t1 mb-1">Intake submitted for review</p><p className="text-sm text-t3 max-w-sm">{submitted}</p><p className="mt-2 text-xs text-t3">Submission does not confirm clinical review, insurance coverage, or payment.</p></div></CenterCard>;
 
-  const allDone = view.sections.every(s => s.status === 'completed');
+  // Sections the server categorically refuses to accept can never reach
+  // 'completed', so they must not gate submission. payment_policy is issued
+  // whenever a deposit is owed but submitSection always throws
+  // payment_policy_unavailable, which previously left every patient who owed
+  // money permanently unable to submit. The server's own gate only requires
+  // REQUIRED_FOR_READINESS and marks the rest needs_review, so submitting here
+  // is correct and loses nothing.
+  const NEVER_COMPLETABLE = new Set(['payment_policy']);
+  const allDone = view.sections.every(s => NEVER_COMPLETABLE.has(s.sectionType) || s.status === 'completed');
 
   return (
     <div className="min-h-screen bg-[var(--s1)] py-10 px-4">
@@ -151,7 +159,7 @@ function SectionCard({ section, clinicName, onSave }: { section: PublicIntakeVie
             <label className="flex items-start gap-2 text-sm text-t2"><input type="checkbox" className="mt-1" onChange={e => set('accepted', e.target.checked)} /> I understand the amount shown is an <strong>estimate</strong> of my responsibility, not a guarantee, and may change based on my insurance.</label>
           )}
           {section.sectionType === 'payment_policy' && (
-            <p role="status" className="rounded-lg border border-[var(--b1)] bg-[var(--amber-soft)] p-3 text-sm text-amber-v">No versioned clinic payment policy is available in this packet, so this section cannot record an acknowledgment.</p>
+            <p role="status" className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] p-3 text-sm text-t2">No action needed here. Your clinic will go over their payment policy with you directly, so there is nothing to acknowledge online. You can continue with the rest of your forms.</p>
           )}
           {(section.sectionType === 'pre_visit_checklist' || section.sectionType === 'consent_forms' || section.sectionType === 'custom') && (
             <label className="flex items-start gap-2 text-sm text-t2"><input type="checkbox" className="mt-1" onChange={e => set('accepted', e.target.checked)} /> I confirm this section.</label>

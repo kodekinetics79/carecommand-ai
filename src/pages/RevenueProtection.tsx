@@ -192,12 +192,37 @@ export default function RevenueProtection() {
     };
   }, [selectedClinicId, reload]);
 
+  // Several endpoints refuse work truthfully with HTTP 200 and a status envelope
+  // (e.g. {status:'setup_required'}). apiRequest only throws on !response.ok, so
+  // those refusals used to be reported to the user as "Updated successfully"
+  // while nothing happened. Treat them as failures, not successes.
+  function serverRefusal(result: unknown): string | null {
+    if (!result || typeof result !== 'object') return null;
+    const envelope = result as { status?: unknown; message?: unknown };
+    if (typeof envelope.status !== 'string') return null;
+    if (envelope.status === 'setup_required') {
+      return 'This provider is not connected yet, so nothing was changed. Your administrator needs to finish setting it up.';
+    }
+    if (envelope.status === 'not_configured' || envelope.status === 'failed') {
+      return typeof envelope.message === 'string' && envelope.message
+        ? envelope.message
+        : 'The provider could not complete this request, so nothing was changed.';
+    }
+    return null;
+  }
+
   async function withRefresh<T>(key: string, action: () => Promise<T>) {
     setActionBusy(key);
     setMessage(null);
     setActionError(null);
     try {
       const result = await action();
+      const refusal = serverRefusal(result);
+      if (refusal) {
+        setActionError(refusal);
+        await reload();
+        return result;
+      }
       setMessage('Updated successfully');
       await reload();
       return result;
