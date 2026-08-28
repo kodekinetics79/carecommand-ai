@@ -1,60 +1,35 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { apiRequest } from '../lib/api';
+import { describeFailure, type ResourceFailure } from '../lib/resourceState';
+import { useResource } from './useResource';
 
 /**
- * Live, editable list resource. Unlike useApiResource (read-only with offline
- * fallback), this hook owns create/update/delete and refreshes from the API
- * after each mutation. Falls back to the provided seed list only until the
- * first successful load, so the UI is never empty while offline.
+ * Live, editable list resource. It owns create/update/delete and reloads from
+ * the API after each mutation.
+ *
+ * Reads run through the shared screen-state contract (useResource), so a list
+ * that failed to load reports `error` instead of rendering as an empty list —
+ * the previous seed-list fallback made "offline" and "you have none" look the
+ * same. A mutation that fails reports its own failure rather than silently
+ * leaving the old rows on screen.
  */
-export function useCrudResource<T extends { id: string }>(path: string, fallback: T[]) {
-  const [data, setData] = useState<T[]>(fallback);
-  const [source, setSource] = useState<'live' | 'offline'>('offline');
+export function useCrudResource<T extends { id: string }>(path: string) {
+  const { state, reload } = useResource<T[]>(path);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [actionFailure, setActionFailure] = useState<ResourceFailure | null>(null);
 
-  const refresh = useCallback(async () => {
-    try {
-      const rows = await apiRequest<T[]>(path);
-      setData(rows);
-      setSource('live');
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load');
-    }
-  }, [path]);
-
-  useEffect(() => {
-    let active = true;
-    void (async () => {
-      try {
-        const rows = await apiRequest<T[]>(path);
-        if (!active) return;
-        setData(rows);
-        setSource('live');
-        setError(null);
-      } catch (err) {
-        if (!active) return;
-        setError(err instanceof Error ? err.message : 'Failed to load');
-      }
-    })();
-    return () => {
-      active = false;
-    };
-  }, [path]);
-
-  async function mutate(run: () => Promise<unknown>) {
+  const mutate = useCallback(async (run: () => Promise<unknown>) => {
     setBusy(true);
-    setError(null);
+    setActionFailure(null);
     try {
       await run();
-      await refresh();
+      reload();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Action failed');
+      setActionFailure(describeFailure(err));
     } finally {
       setBusy(false);
     }
-  }
+  }, [reload]);
 
   const create = (body: Record<string, unknown>) =>
     mutate(() => apiRequest(path, { method: 'POST', body: JSON.stringify(body) }));
@@ -65,5 +40,5 @@ export function useCrudResource<T extends { id: string }>(path: string, fallback
   const remove = (id: string) =>
     mutate(() => apiRequest(`${path}/${id}`, { method: 'DELETE' }));
 
-  return { data, source, busy, error, create, update, remove, refresh };
+  return { state, reload, busy, actionFailure, create, update, remove };
 }

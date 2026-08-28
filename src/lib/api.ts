@@ -102,7 +102,9 @@ async function rawApiRequest<T>(path: string, init?: RequestInit, retryOnRefresh
 
 // Plain-language fallbacks so a failed request never renders as
 // "API request failed: 500" in the product. A server-supplied message wins.
-function humanApiMessage(status: number): string {
+// Exported so the shared screen-state contract (lib/resourceState.ts) can put
+// the same sentences on a panel that failed to load.
+export function humanApiMessage(status: number): string {
   if (status === 400) return 'That request could not be processed. Please check the details and try again.';
   if (status === 403) return 'You do not have access to this. Ask a clinic owner or administrator if you need it.';
   if (status === 404) return 'That item could not be found. It may have been moved or deleted.';
