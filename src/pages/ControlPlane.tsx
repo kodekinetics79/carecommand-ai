@@ -213,6 +213,10 @@ export default function ControlPlane() {
   const [inviteOpen, setInviteOpen] = useState(false);
   const [inviteBusy, setInviteBusy] = useState(false);
   const [inviteError, setInviteError] = useState<string | null>(null);
+  const [passwordResetUserId, setPasswordResetUserId] = useState<string | null>(null);
+  const [passwordResetValue, setPasswordResetValue] = useState('');
+  const [passwordResetError, setPasswordResetError] = useState<string | null>(null);
+  const [passwordResetNotice, setPasswordResetNotice] = useState<string | null>(null);
   const [inviteForm, setInviteForm] = useState({
     name: '',
     email: '',
@@ -308,6 +312,27 @@ export default function ControlPlane() {
       await apiRequest(`/v1/control-plane/users/${userId}/clinic-access`, { method: 'PATCH', body: JSON.stringify(accessDraft) });
       setEditingAccessUserId(null);
       await loadData();
+    } finally {
+      setSavingAction(null);
+    }
+  }
+
+  // ADMIN-INITIATED RECOVERY. Nothing is emailed, so the administrator sets the
+  // temporary password and passes it on themselves. It is never returned by the
+  // API, so it is shown here only while it is being typed.
+  async function resetUserPassword(userId: string) {
+    if (!canManage) return;
+    setSavingAction(`password:${userId}`);
+    setPasswordResetError(null);
+    try {
+      const target = usersPayload?.users.find(userRecord => userRecord.id === userId);
+      await apiRequest(`/v1/control-plane/users/${userId}/password-reset`, { method: 'POST', body: JSON.stringify({ password: passwordResetValue }) });
+      setPasswordResetUserId(null);
+      setPasswordResetValue('');
+      setPasswordResetNotice(`Temporary password set for ${target?.email ?? 'the selected user'}. Give it to them directly — it is not emailed, and it cannot be shown again. Their existing sessions were signed out.`);
+      await loadData();
+    } catch (err) {
+      setPasswordResetError(err instanceof Error ? err.message : 'Password reset failed');
     } finally {
       setSavingAction(null);
     }
@@ -535,7 +560,7 @@ export default function ControlPlane() {
       )}
 
       {activeTab === 'users' && (
-        <BentoCard title="Users & Access" subtitle="Activate users, change roles, update clinic access, revoke sessions, and review audit trails." headerRight={<Users2 className="w-4 h-4 text-t3" />}>
+        <BentoCard title="Users & Access" subtitle="Activate users, change roles, update clinic access, reset a locked-out user's password, revoke sessions, and review audit trails." headerRight={<Users2 className="w-4 h-4 text-t3" />}>
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
             <div className="relative flex-1">
               <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-t3" />
@@ -646,6 +671,12 @@ export default function ControlPlane() {
             </div>
           )}
 
+          {passwordResetNotice && (
+            <div role="status" className="mt-4 rounded-2xl border border-[var(--amber-soft)] bg-[var(--amber-soft)] px-4 py-3 text-xs leading-relaxed text-amber-v">
+              {passwordResetNotice}
+            </div>
+          )}
+
           <div className="mt-4 overflow-hidden rounded-2xl border border-[var(--b1)]">
             <table className="min-w-full text-sm">
               <thead className="bg-[var(--s2)] text-left text-xs text-t3">
@@ -712,6 +743,15 @@ export default function ControlPlane() {
                         <button type="button" onClick={() => void revokeSession(userRecord.id)} disabled={!canManage || !userRecord.sessionActive || savingAction === `session:${userRecord.id}`} className="rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition disabled:opacity-40" title={!userRecord.sessionActive ? 'No active session to revoke' : ''}>
                           Revoke session
                         </button>
+                        <button
+                          type="button"
+                          onClick={() => { setPasswordResetUserId(userRecord.id); setPasswordResetValue(''); setPasswordResetError(null); setPasswordResetNotice(null); }}
+                          disabled={!canManage || userRecord.id === user?.id || savingAction === `password:${userRecord.id}`}
+                          title={userRecord.id === user?.id ? 'Change your own password in Settings → Security' : 'Set a temporary password and sign this user out'}
+                          className="rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition disabled:opacity-40"
+                        >
+                          Reset password
+                        </button>
                         <button type="button" onClick={() => void openAuditTrail(userRecord.id)} className="rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition">
                           View audit trail
                         </button>
@@ -722,6 +762,46 @@ export default function ControlPlane() {
               </tbody>
             </table>
           </div>
+
+          {passwordResetUserId && canManage && (
+            <div className="mt-4 rounded-2xl border border-[var(--b1)] p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-t1">Set a temporary password</p>
+                  <p className="text-xs text-t3">
+                    For {usersPayload?.users.find(userRecord => userRecord.id === passwordResetUserId)?.email ?? 'this user'}. Nothing is emailed — read the password to them or hand it over in person, then have them change it in Settings → Security.
+                  </p>
+                </div>
+                <button type="button" onClick={() => { setPasswordResetUserId(null); setPasswordResetValue(''); setPasswordResetError(null); }} className="text-xs font-semibold text-t3 hover:text-t1">Close</button>
+              </div>
+              {passwordResetError && <div role="alert" className="mt-3 rounded-xl border border-[rgba(220,38,38,0.18)] bg-red-soft px-3 py-2 text-xs text-red-v">{passwordResetError}</div>}
+              <div className="mt-3 max-w-sm">
+                <label htmlFor="control-plane-temp-password" className="text-xs font-semibold text-t2">Temporary password</label>
+                <input
+                  id="control-plane-temp-password"
+                  value={passwordResetValue}
+                  onChange={event => setPasswordResetValue(event.target.value)}
+                  type="text"
+                  autoComplete="off"
+                  placeholder="At least 8 characters"
+                  className="mt-1 w-full rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--b3)]"
+                />
+              </div>
+              <div className="mt-4 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  disabled={passwordResetValue.length < 8 || savingAction === `password:${passwordResetUserId}`}
+                  onClick={() => void resetUserPassword(passwordResetUserId)}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--indigo-mid)] transition disabled:opacity-50"
+                >
+                  {savingAction === `password:${passwordResetUserId}` ? <Loader2 className="w-4 h-4 animate-spin" /> : <KeyRound className="w-4 h-4" />}
+                  Set temporary password
+                </button>
+                <button type="button" onClick={() => { setPasswordResetUserId(null); setPasswordResetValue(''); setPasswordResetError(null); }} className="rounded-xl border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s3)] transition">Cancel</button>
+              </div>
+              <p className="mt-3 text-[11px] text-t3">This ends every session for that user and cancels any outstanding reset token. The password is not stored in readable form or shown again.</p>
+            </div>
+          )}
 
           {editingAccessUserId && (
             <div className="mt-4 rounded-2xl border border-[var(--b1)] p-4">

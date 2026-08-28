@@ -1,4 +1,5 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, type FormEvent, useEffect, useRef } from 'react';
+import { useNavigate } from 'react-router';
 import {
   Building2, Users, Lock, Bell, Cable, ShieldCheck, CheckCircle2, Circle, RefreshCw,
   Trash2, Plus, MapPin, Activity, AlertTriangle, KeyRound, Clock, Coins, Globe, Check,
@@ -9,6 +10,7 @@ import StatCard from '../components/ui/StatCard';
 import { apiRequest } from '../lib/api';
 import { useApiData } from '../hooks/useApiData';
 import { useCrudResource } from '../hooks/useCrudResource';
+import { useSession } from '../hooks/useSession';
 import { usePreferences, CURRENCIES, LANGUAGES } from '../lib/preferences';
 import { formatCurrency } from '../utils/formatters';
 
@@ -499,6 +501,78 @@ function IntegrationsSection() {
   );
 }
 
+/* ------------------------------------------------------- Your password */
+// Self-service recovery for a signed-in user. No reset email exists to send, so
+// the current password is the confirmation and the copy says so. A user who is
+// already locked out cannot reach this card — that path is an administrator
+// setting a temporary password from Control Plane → Users.
+function ChangePasswordCard() {
+  const navigate = useNavigate();
+  const { signOut } = useSession();
+  const [form, setForm] = useState({ currentPassword: '', newPassword: '', confirmPassword: '' });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [changed, setChanged] = useState(false);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setError(null);
+    if (form.newPassword !== form.confirmPassword) {
+      setError('The new password and its confirmation do not match.');
+      return;
+    }
+    setBusy(true);
+    try {
+      await apiRequest('/v1/auth/password-change', {
+        method: 'POST',
+        body: JSON.stringify({ currentPassword: form.currentPassword, newPassword: form.newPassword }),
+      });
+      setForm({ currentPassword: '', newPassword: '', confirmPassword: '' });
+      setChanged(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Password change failed.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // The change revoked this session server-side. Clicking "sign in again" is
+  // not enough: switching Settings tabs unmounts this card and leaves a
+  // signed-in-looking shell whose every request now 401s. Guarantee the local
+  // session ends however the user leaves, while still showing the confirmation.
+  const changedRef = useRef(false);
+  useEffect(() => { changedRef.current = changed; }, [changed]);
+  useEffect(() => () => { if (changedRef.current) void signOut(); }, [signOut]);
+
+  // Explicit path for the user who clicks the button.
+  async function signInAgain() {
+    await signOut();
+    navigate('/login', { replace: true });
+  }
+
+  return (
+    <BentoCard title="Your password" subtitle="Change the password for your own account. No reset email is sent — your current password is the confirmation." headerRight={<KeyRound className="w-4 h-4 text-t3" />}>
+      {changed ? (
+        <div className="space-y-3 max-w-sm">
+          <p role="status" className="rounded-xl border border-[var(--b1)] bg-[var(--emerald-soft)] px-3 py-2.5 text-[11px] font-semibold text-emerald-v">
+            Password updated. Every session for your account was ended, so sign in again with the new password.
+          </p>
+          <button type="button" onClick={() => void signInAgain()} className="w-full py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90">Sign in again</button>
+        </div>
+      ) : (
+        <form onSubmit={submit} className="space-y-2 max-w-sm">
+          {error && <p role="alert" className="text-[11px] text-red-v">{error}</p>}
+          <input type="password" value={form.currentPassword} onChange={e => setForm(f => ({ ...f, currentPassword: e.target.value }))} aria-label="Current password" placeholder="Current password" autoComplete="current-password" className={inputClass} required />
+          <input type="password" value={form.newPassword} onChange={e => setForm(f => ({ ...f, newPassword: e.target.value }))} aria-label="New password" placeholder="New password" autoComplete="new-password" minLength={8} className={inputClass} required />
+          <input type="password" value={form.confirmPassword} onChange={e => setForm(f => ({ ...f, confirmPassword: e.target.value }))} aria-label="Confirm new password" placeholder="Confirm new password" autoComplete="new-password" minLength={8} className={inputClass} required />
+          <button type="submit" disabled={busy} className="w-full py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 disabled:opacity-40">{busy ? 'Updating…' : 'Update password'}</button>
+          <p className="text-[10px] text-t3">Changing your password ends every signed-in session for your account, including this one.</p>
+        </form>
+      )}
+    </BentoCard>
+  );
+}
+
 /* ------------------------------------------------------------------ Security */
 function SecuritySection() {
   const posture = useApiData<SecurityPosture | null>('/v1/security/posture', null);
@@ -525,6 +599,8 @@ function SecuritySection() {
 
   return (
     <>
+      <ChangePasswordCard />
+
       {p && (
         <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
           <StatCard title="Access Token TTL" value={`${p.accessTokenTtlMinutes}m`} subtitle="Session lifetime" icon={<Clock className="w-4 h-4" />} accent="blue" />

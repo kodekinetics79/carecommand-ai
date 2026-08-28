@@ -1085,7 +1085,13 @@ export const securityRoutes: FastifyPluginAsync = async app => {
     const logs = await db.auditEvent.findMany({
       where: {
         tenantId: request.auth.tenantId,
-        action: { in: ['auth.login.success', 'auth.login.failed', 'auth.logout', 'auth.session.revoked'] },
+        action: { in: ['auth.login.success', 'auth.login.failed', 'auth.logout', 'auth.session.revoked',
+          // Credential changes are security activity. Without these a password
+          // change or an admin-initiated reset is audited but invisible in the
+          // very report an auditor opens to review account activity.
+          'auth.password.changed', 'auth.password.change.failed',
+          'auth.password.reset.requested', 'controlPlane.user.passwordReset',
+          'controlPlane.session.revoked'] },
         ...(query.userId ? { actorUserId: query.userId } : {}),
       },
       orderBy: { occurredAt: 'desc' },

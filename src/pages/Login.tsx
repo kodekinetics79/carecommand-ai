@@ -12,6 +12,12 @@ const REMEMBER_KEY = 'cc_remember_email';
 // outline at ~25x scale and cropped by the corner.
 const BRAND_PULSE = 'M7 18 H11.2 L13 13.5 L16 21 L18.2 16.5 H21 L24 12.5';
 
+// Production has no password-reset delivery adapter, so there is no link to
+// send and no message to wait for. Recovery is an administrator setting a new
+// password, and the screen says exactly that rather than advertising a
+// self-service flow that cannot complete.
+const ADMIN_RECOVERY_COPY = 'Ask a clinic administrator to set a new password for you from Control Plane → Users. Once you are signed in you can change it yourself in Settings → Security.';
+
 // Each mode announces where you are. Multi-step auth that silently swaps the
 // panel out from under the user is the main usability flaw of the old screen.
 const COPY: Record<Mode, { eyebrow: string; title: string; sub: string; step?: 1 | 2 }> = {
@@ -92,7 +98,7 @@ export default function Login() {
   const onResetRequest = (e: FormEvent) => { e.preventDefault(); void run(async () => {
     const res = await requestPasswordReset(email.trim().toLowerCase());
     if (res.resetAvailable === false) {
-      setInfo('Self-service password reset is not configured. Contact your clinic administrator for account recovery.');
+      setInfo(`Self-service password reset is not configured. ${ADMIN_RECOVERY_COPY}`);
       setMode('login');
       return;
     }
@@ -212,10 +218,15 @@ export default function Login() {
                     {/* Say exactly what is stored: the email only, never a session. */}
                     <span className="text-[13px] text-t2">Remember email on this device</span>
                   </label>
-                  {resetUiAvailable
-                    ? <button type="button" onClick={() => { setError(null); setInfo(null); setMode('reset'); }} className="rounded text-[13px] font-semibold text-indigo hover:underline">Forgot password?</button>
-                    : <span className="text-[11.5px] text-t3">Account recovery: contact your administrator</span>}
+                  {resetUiAvailable && (
+                    <button type="button" onClick={() => { setError(null); setInfo(null); setMode('reset'); }} className="rounded text-[13px] font-semibold text-indigo hover:underline">Forgot password?</button>
+                  )}
                 </div>
+                {!resetUiAvailable && (
+                  <p className="text-[11.5px] leading-relaxed text-t3">
+                    <span className="font-semibold text-t2">Forgot your password?</span> {ADMIN_RECOVERY_COPY}
+                  </p>
+                )}
 
                 <Submit loading={loading} label="Sign in" busyLabel="Signing in…" />
               </form>
@@ -266,7 +277,7 @@ export default function Login() {
               <div className="space-y-4">
                 {resetUiAvailable
                   ? <button type="button" onClick={() => { setError(null); setInfo(null); setMode('reset'); }} className="auth-submit">Reset password</button>
-                  : <p role="alert" className="rounded-xl border border-[var(--b1)] bg-[var(--amber-soft)] px-4 py-3 text-[13px] text-amber-v">Self-service password reset is unavailable. Contact your clinic administrator.</p>}
+                  : <p role="alert" className="rounded-xl border border-[var(--b1)] bg-[var(--amber-soft)] px-4 py-3 text-[13px] leading-relaxed text-amber-v">Self-service password reset is not configured. {ADMIN_RECOVERY_COPY}</p>}
                 <BackLink onClick={backToLogin} />
               </div>
             )}
