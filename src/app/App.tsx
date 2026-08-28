@@ -2,7 +2,9 @@ import { lazy, Suspense, useState, type ReactNode } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, Outlet, useLocation } from 'react-router';
 import Sidebar from '../components/layout/Sidebar';
 import Topbar from '../components/layout/Topbar';
+import AccessRestricted from '../components/ui/AccessRestricted';
 import { useSession } from '../hooks/useSession';
+import { matchRoute, hasRouteAccess } from '../lib/access';
 import { usePreferences } from '../lib/preferences';
 import AutoTranslate from '../components/AutoTranslate';
 import {
@@ -55,7 +57,7 @@ const Settings = lazy(() => import('../pages/Settings'));
 const ControlPlane = lazy(() => import('../pages/ControlPlane'));
 
 function ProtectedLayout() {
-  const { loading, isAuthenticated } = useSession();
+  const { loading, isAuthenticated, user } = useSession();
   const location = useLocation();
   // Remount page content when currency/language changes so all formatted
   // figures (formatCurrency) re-render with the new preference immediately.
@@ -69,6 +71,13 @@ function ProtectedLayout() {
   if (!isAuthenticated) {
     return <Navigate to="/login" replace state={{ from: location.pathname }} />;
   }
+
+  // Arrival at a section this account's role does not cover — a bookmark, a
+  // shared link, a tab left open across a role change. One honest state instead
+  // of a page that loads and then fills with the API's permission text. The
+  // server check is untouched; this only stops the page from being drawn.
+  const destination = matchRoute(location.pathname);
+  const permitted = hasRouteAccess(user, destination.route);
 
   return (
     <div className="app-shell">
@@ -88,7 +97,11 @@ function ProtectedLayout() {
                 navigation behind, with no loading feedback. Keying forces the
                 fallback to show and the shell to track the current route. */}
             <Suspense key={location.pathname} fallback={<div className="skeleton h-48 rounded-2xl" />}>
-              <div key={`${currency}-${language}`}><Outlet /></div>
+              <div key={`${currency}-${language}`}>
+                {permitted
+                  ? <Outlet />
+                  : <AccessRestricted section={destination.route.label} role={user?.role} workspace={user?.tenant?.name} />}
+              </div>
             </Suspense>
           </div>
         </main>
@@ -111,48 +124,6 @@ function PublicRoute({ children }: { children: ReactNode }) {
   }
 
   return <>{children}</>;
-}
-
-function AdminRoute() {
-  const { loading, isAuthenticated, user } = useSession();
-
-  if (loading) {
-    return <div className="min-h-screen flex items-center justify-center text-sm text-t3">Loading session…</div>;
-  }
-
-  if (!isAuthenticated) {
-    return <Navigate to="/login" replace />;
-  }
-
-  if (!user || !['OWNER', 'ADMIN'].includes(user.role)) {
-    return <Navigate to="/" replace />;
-  }
-
-  return (
-    <Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}>
-      <ControlPlane />
-    </Suspense>
-  );
-}
-
-function ComplianceRoute() {
-  const { loading, isAuthenticated, user } = useSession();
-
-  if (loading) {
-    return <div className="min-h-screen flex items-center justify-center text-sm text-t3">Loading session…</div>;
-  }
-  if (!isAuthenticated) {
-    return <Navigate to="/login" replace />;
-  }
-  if (!user || !['OWNER', 'ADMIN', 'COMPLIANCE_OFFICER', 'AUDITOR'].includes(user.role)) {
-    return <Navigate to="/" replace />;
-  }
-
-  return (
-    <Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}>
-      <ComplianceCenter />
-    </Suspense>
-  );
 }
 
 export default function App() {
@@ -215,8 +186,8 @@ export default function App() {
           <Route path="/inventory" element={<Inventory />} />
           <Route path="/labs" element={<Labs />} />
           <Route path="/telehealth" element={<Telehealth />} />
-          <Route path="/compliance" element={<ComplianceRoute />} />
-          <Route path="/compliance/:section" element={<ComplianceRoute />} />
+          <Route path="/compliance" element={<ComplianceCenter />} />
+          <Route path="/compliance/:section" element={<ComplianceCenter />} />
           <Route path="/integrations" element={<Integrations />} />
           <Route path="/devices" element={<DeviceIntegration />} />
           <Route path="/monitoring" element={<RemoteMonitoring />} />
@@ -229,8 +200,11 @@ export default function App() {
           {/* Operator-only console — gated by a platform token, not a tenant role; not in the sidebar. */}
           <Route path="/platform-legacy" element={<Platform />} />
           <Route path="/settings" element={<Settings />} />
-          <Route path="/control-plane" element={<AdminRoute />} />
-          <Route path="/admin" element={<AdminRoute />} />
+          {/* Owner/admin console. ProtectedLayout's access gate holds the role
+              requirement, mirroring requireRoles('OWNER','ADMIN') on
+              /v1/control-plane; the API stays the enforcement point. */}
+          <Route path="/control-plane" element={<ControlPlane />} />
+          <Route path="/admin" element={<ControlPlane />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

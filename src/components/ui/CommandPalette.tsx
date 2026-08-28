@@ -1,13 +1,17 @@
 import { useState, useEffect, useRef } from 'react';
 import { Search, Megaphone, Users, Phone, TrendingUp, Star, BarChart2, UserPlus, Zap, X, ArrowRight, Orbit } from 'lucide-react';
 import { useNavigate } from 'react-router';
+import { canOpenPath, type RoutePath } from '../../lib/access';
+import type { SessionUser } from '../../lib/session';
 
 interface Command {
   id: string;
   label: string;
   description: string;
   icon: React.ReactNode;
-  path?: string;
+  // Declared destinations only — the same registry the sidebar gates on, so a
+  // command can never offer a page the user's role does not cover.
+  path?: RoutePath;
   action?: string;
   category: string;
 }
@@ -29,9 +33,11 @@ const commands: Command[] = [
 interface CommandPaletteProps {
   isOpen: boolean;
   onClose: () => void;
+  /** Signed-in user, so commands are filtered to destinations they can open. */
+  user?: SessionUser | null;
 }
 
-export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps) {
+export default function CommandPalette({ isOpen, onClose, user }: CommandPaletteProps) {
   const [query, setQuery] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
   const navigate = useNavigate();
@@ -59,9 +65,12 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
 
   if (!isOpen) return null;
 
+  // Same rule as the sidebar: a destination the user's grants do not cover is
+  // not offered here either.
+  const available = commands.filter(c => !c.path || canOpenPath(user, c.path));
   const filtered = query
-    ? commands.filter(c => c.label.toLowerCase().includes(query.toLowerCase()) || c.description.toLowerCase().includes(query.toLowerCase()))
-    : commands;
+    ? available.filter(c => c.label.toLowerCase().includes(query.toLowerCase()) || c.description.toLowerCase().includes(query.toLowerCase()))
+    : available;
 
   const grouped = filtered.reduce<Record<string, Command[]>>((acc, cmd) => {
     if (!acc[cmd.category]) acc[cmd.category] = [];

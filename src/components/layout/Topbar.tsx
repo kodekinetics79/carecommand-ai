@@ -4,60 +4,14 @@ import { Search, Command, ChevronDown, ChevronRight, LogOut, Settings as Setting
 import CommandPalette from '../ui/CommandPalette';
 import BackButton from './BackButton';
 import { useSession } from '../../hooks/useSession';
+import { matchRoute } from '../../lib/access';
 import { usePreferences, LANGUAGES } from '../../lib/preferences';
-
-const routeLabels: Record<string, string> = {
-  '/':                 'Command Center',
-  '/advisory':         'Advisory Room',
-  '/opportunities':    'Opportunity Center',
-  '/clinic-radar':     'ClinicRadar',
-  '/benchmarking':     'Multi-Clinic Benchmarking',
-  '/autopilot':        'Autopilot',
-  '/crm':              'CRM',
-  '/receptionist-studio': 'Receptionist Studio',
-  '/ai-receptionist':  'AI Receptionist',
-  '/campaigner':       'Campaigner',
-  '/reactivation':     'Reactivation',
-  '/reviews':          'Reviews',
-  '/revenue':          'Revenue Leaks',
-  '/revenue-protection': 'Revenue Protection',
-  '/insurance':        'Insurance',
-  '/insurance-eligibility': 'Insurance Eligibility',
-  '/integration-setup': 'Integration Setup',
-  '/enrollments':      'Device Enrollments',
-  '/sync-logs':        'Provider Sync Logs',
-  '/rpm-readiness':    'RPM Billing Readiness',
-  '/doctor-workspace': 'Provider Performance',
-  '/patients':         'Patients',
-  '/patient-intake':   'Patient Intake',
-  '/scheduling':       'Scheduling',
-  '/staff':            'Staff Tasks',
-  '/compliance':       'Compliance Readiness',
-  '/control-plane':    'Control Plane',
-  '/admin':            'Control Plane',
-  '/subscription':     'Subscription',
-  '/integrations':     'Integrations',
-  '/devices':          'Device Integration',
-  '/monitoring':       'Remote Monitoring',
-  '/settings':         'Settings',
-};
 
 function initials(name: string): string {
   return name.trim().split(/\s+/).slice(0, 2).map(p => p[0]?.toUpperCase() ?? '').join('') || '·';
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-// Longest matching top-level route (segment-aware, so /revenue does not shadow
-// /revenue-protection).
-function matchRoute(pathname: string): { key: string; label: string } {
-  let best = '';
-  for (const k of Object.keys(routeLabels)) {
-    if (k === '/') continue;
-    if ((pathname === k || pathname.startsWith(k + '/')) && k.length > best.length) best = k;
-  }
-  return best ? { key: best, label: routeLabels[best] } : { key: '/', label: routeLabels['/'] };
-}
 
 function prettySegment(seg: string): string {
   if (UUID_RE.test(seg) || /^\d+$/.test(seg)) return 'Details';
@@ -72,8 +26,10 @@ export default function Topbar({ mobileNavOpen = false, onOpenNavigation }: { mo
   const { user, signOut } = useSession();
   const { language, setLanguage } = usePreferences();
 
-  const matched = pathname === '/' ? { key: '/', label: routeLabels['/'] } : matchRoute(pathname);
-  const isDetail = pathname !== matched.key && matched.key !== '/';
+  // Destination names come from the shared route registry, so the breadcrumb
+  // and the no-access notice always call a section the same thing.
+  const matched = matchRoute(pathname);
+  const isDetail = pathname !== matched.path && matched.path !== '/';
   const detailLabel = isDetail ? prettySegment(pathname.split('/').filter(Boolean).pop() ?? '') : null;
 
   const workspace = user?.tenant?.name;
@@ -97,12 +53,12 @@ export default function Topbar({ mobileNavOpen = false, onOpenNavigation }: { mo
           )}
           {isDetail ? (
             <>
-              <Link to={matched.key} className="text-t2 hover:text-t1 hover:underline truncate transition-colors">{matched.label}</Link>
+              <Link to={matched.path} className="text-t2 hover:text-t1 hover:underline truncate transition-colors">{matched.route.label}</Link>
               <ChevronRight className="w-3.5 h-3.5 text-t3 shrink-0 opacity-60" aria-hidden="true" />
               <span className="font-semibold text-t1 truncate">{detailLabel}</span>
             </>
           ) : (
-            <span className="font-semibold text-t1 truncate">{matched.label}</span>
+            <span className="font-semibold text-t1 truncate">{matched.route.label}</span>
           )}
           {locationLabel && (
             <span className="ml-1.5 hidden md:inline-flex items-center rounded-md border border-[var(--b1)] bg-[var(--s2)] px-2 py-0.5 text-[11px] font-medium text-t2 shrink-0">{locationLabel}</span>
@@ -164,7 +120,7 @@ export default function Topbar({ mobileNavOpen = false, onOpenNavigation }: { mo
         )}
       </header>
 
-      <CommandPalette isOpen={cmdOpen} onClose={() => setCmdOpen(false)} />
+      <CommandPalette isOpen={cmdOpen} onClose={() => setCmdOpen(false)} user={user} />
     </>
   );
 }
