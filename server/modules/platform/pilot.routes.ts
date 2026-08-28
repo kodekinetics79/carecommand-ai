@@ -209,7 +209,7 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
     });
   });
 
-  app.post('/tenants/:tenantId/pilot-import/:entityType/preview', async (request, reply) => {
+  app.post('/tenants/:tenantId/pilot-import/:entityType/preview', async request => {
     const { tenantId, entityType } = z.object({ tenantId: uuid, entityType: entityTypeSchema }).parse(request.params);
     const body = importBodySchema.parse(request.body);
     const preset = await loadPresetMapping(tenantId, entityType);

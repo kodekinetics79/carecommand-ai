@@ -33,3 +33,6 @@ server/generated
 .env.*
 !.env.example
 api/_bundle.mjs
+
+# Playwright run artifacts — these captured portal tokens and tripped the secret scan.
+.playwright/

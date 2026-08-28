@@ -49,10 +49,16 @@ function RevenueChartView({ data, emptyMessage }: { data: RevenueChartRow[]; emp
 }
 
 export default function RevenueChart({ data }: RevenueChartProps) {
+  // The live branch owns its own component so useApiResource is never called
+  // after an early return. A conditionally-called hook changes hook order
+  // between renders, which React treats as undefined behaviour.
   if (data) {
     return <RevenueChartView data={data} emptyMessage="No revenue data available." />;
   }
+  return <RevenueChartLive />;
+}
 
+function RevenueChartLive() {
   const { data: liveData, source, loading, error } = useApiResource<ApiRevenueSnapshot, RevenueChartRow>(
     '/v1/revenue-snapshots?limit=100',
     [],

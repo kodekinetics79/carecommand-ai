@@ -36,7 +36,11 @@ export default function PatientProfile() {
   const { id } = useParams();
   const navigate = useNavigate();
   const [patient, setPatient] = useState<ReturnType<typeof mapPatient> | null>(null);
-  const [loading, setLoading] = useState(true);
+  // Derived, not stored: `loading` is simply "the patient we have is not the
+  // patient the URL asks for". Storing it forced a synchronous setState at the
+  // top of the fetch effect, which triggers a cascading re-render.
+  const [loadedId, setLoadedId] = useState<string | null>(null);
+  const loading = loadedId !== (id ?? null);
   const [liveVisitHistory, setLiveVisitHistory] = useState<ReturnType<typeof mapAppointment>[]>([]);
   const [eligibilityHistory, setEligibilityHistory] = useState<EligibilityVerification[]>([]);
   const [policyRow, setPolicyRow] = useState<{
@@ -61,7 +65,6 @@ export default function PatientProfile() {
   useEffect(() => {
     if (!id) return;
     let active = true;
-    setLoading(true);
     apiRequest<ApiPatient>(`/v1/patients/${id}`)
       .then(row => {
         if (!active) return;
@@ -103,7 +106,7 @@ export default function PatientProfile() {
       })
       .catch(() => undefined)
       .finally(() => {
-        if (active) setLoading(false);
+        if (active) setLoadedId(id ?? null);
       });
     return () => { active = false; };
   }, [id]);
