@@ -1,5 +1,4 @@
 import { apiRequest } from './api';
-import { eligibilityRequestHeaders, runEligibilityAction } from './eligibilityIdempotency';
 
 // --- Types -----------------------------------------------------------------
 
@@ -66,10 +65,6 @@ export const insuranceApi = {
   getIntake: (appointmentId: string) => apiRequest<DenialRiskAssessment>(`${base}/intake/${appointmentId}`),
   runDenialPrevention: (appointmentId: string) =>
     apiRequest<DenialRiskAssessment & { requiresHumanReview: boolean }>(`${base}/denial-prevention/${appointmentId}`, { method: 'POST' }),
-  runEligibilityCheck: (body: { appointmentId?: string; patientId?: string; branchId?: string; payerId?: string; serviceType?: string }, idempotencyKey?: string) => {
-    const send = (key: string) => apiRequest<{ status?: string; setupRequired?: boolean; provider?: string; coverageStatus?: string; verificationId?: string }>(`/v1/revenue-protection/eligibility/check`, {
-      method: 'POST', headers: eligibilityRequestHeaders(key), body: JSON.stringify(body),
-    });
-    return idempotencyKey ? send(idempotencyKey) : runEligibilityAction('revenue_protection_v1', body, send);
-  },
+  runEligibilityCheck: (body: { appointmentId?: string; patientId?: string; branchId?: string; payerId?: string; serviceType?: string }) =>
+    apiRequest<{ status?: string; setupRequired?: boolean; provider?: string; coverageStatus?: string; verificationId?: string }>(`/v1/revenue-protection/eligibility/check`, { method: 'POST', body: JSON.stringify(body) }),
 };

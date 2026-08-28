@@ -17,10 +17,6 @@ const SEV: Record<Severity, { ring: string; dot: string; label: string; icon: ty
   low: { ring: 'sev-low', dot: 'text-emerald-v', label: 'Low', icon: CircleDot },
 };
 
-/**
- * Priority queue — the cockpit's right rail. Fixed header (revenue at stake)
- * and filters; the queue itself scrolls internally so the page never does.
- */
 export default function PriorityActionRail({
   actions, loading, onOpen, onCta, onCreateCampaign,
 }: {
@@ -33,40 +29,34 @@ export default function PriorityActionRail({
     for (const a of actions) c[a.category] = (c[a.category] ?? 0) + 1;
     return c;
   }, [actions]);
-  const atStake = useMemo(() => actions.reduce((s, a) => s + (a.revenueImpact ?? 0), 0), [actions]);
   const rows = filter === 'all' ? actions : actions.filter(a => a.category === filter);
 
   return (
-    <div className="cc-card h-full flex flex-col overflow-hidden">
-      <div className="bento-header shrink-0">
+    <div className="cc-card overflow-hidden">
+      <div className="bento-header">
         <div>
-          <p className="bento-title">Priority Queue</p>
-          <p className="text-[11px] text-t3 mt-0.5">Ordered by recorded potential value</p>
+          <p className="bento-title">Priority Actions</p>
+          <p className="text-[11px] text-t3 mt-0.5">AI-ranked by revenue impact</p>
         </div>
-        {atStake > 0 && (
-          <div className="text-right shrink-0">
-            <p className="text-[15px] font-bold text-t1 leading-none">{formatCurrency(atStake)}</p>
-            <p className="text-[10px] font-semibold uppercase tracking-wide text-t3 mt-0.5">at stake</p>
-          </div>
-        )}
+        <span className="badge badge-violet">{actions.length} open</span>
       </div>
 
-      {/* Filters — fixed above the scrolling queue */}
-      <div className="px-3.5 pt-2.5 pb-1 flex flex-wrap gap-1.5 shrink-0" role="group" aria-label="Filter priority actions">
+      {/* Filters */}
+      <div className="px-4 pt-3 flex flex-wrap gap-1.5" role="tablist" aria-label="Filter priority actions">
         {FILTERS.map(f => {
           const n = counts[f.id] ?? 0;
           const on = filter === f.id;
           if (f.id !== 'all' && n === 0) return null;
           return (
-            <button key={f.id} type="button" aria-pressed={on} onClick={() => setFilter(f.id)}
+            <button key={f.id} type="button" role="tab" aria-selected={on ? 'true' : 'false'} onClick={() => setFilter(f.id)}
               className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-semibold transition-colors ${on ? 'bg-[var(--indigo)] text-white' : 'bg-[var(--s3)] text-t2 hover:bg-[var(--s4)]'}`}>
-              {f.label}{f.id === 'all' ? ` ${counts.all}` : ` ${n}`}
+              {f.label}{f.id === 'all' ? '' : ` ${n}`}
             </button>
           );
         })}
       </div>
 
-      <div className="flex-auto min-h-0 overflow-y-auto px-3.5 py-2.5 space-y-2.5">
+      <div className="bento-body space-y-2.5">
         {loading ? (
           <div className="space-y-2">{Array.from({ length: 4 }).map((_, i) => <div key={i} className="skeleton-line h-20 rounded-xl" />)}</div>
         ) : rows.length === 0 ? (
@@ -83,7 +73,7 @@ export function PriorityActionCard({ action, onOpen, onCta }: { action: Priority
   const sev = SEV[action.severity];
   const SevIcon = sev.icon;
   return (
-    <div className={`rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3 transition-shadow hover:shadow-[0_4px_12px_rgba(15,23,42,0.07)] ${sev.ring}`}>
+    <div className={`hover-lift rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3 ${sev.ring}`}>
       <div className="flex items-start justify-between gap-2">
         <button type="button" onClick={() => onOpen(action)} className="text-left min-w-0 flex-1">
           <div className="flex items-center gap-1.5">
@@ -92,29 +82,23 @@ export function PriorityActionCard({ action, onOpen, onCta }: { action: Priority
           </div>
           <p className="text-[13px] font-bold text-t1 leading-tight mt-1">{action.title}</p>
         </button>
-        {action.revenueImpact != null && (
-          <div className="text-right shrink-0">
-            <p className="text-[13px] font-bold text-t1 leading-none">{formatCurrency(action.revenueImpact)}</p>
-            <p className="text-[9.5px] font-semibold uppercase tracking-wide text-t3 mt-0.5">impact</p>
-          </div>
-        )}
+        {action.revenueImpact != null && <span className="badge badge-emerald shrink-0">{formatCurrency(action.revenueImpact)}</span>}
       </div>
       {action.description && <p className="text-[11px] text-t3 mt-1 leading-relaxed line-clamp-2">{action.description}</p>}
-      <div className="flex items-center justify-between gap-2 mt-2">
-        <span className="text-[10px] text-t3 inline-flex items-center gap-1 min-w-0">
-          <CircleDot className="w-3 h-3 text-violet-v shrink-0" aria-hidden="true" />
-          <span className="truncate">Owner: {action.owner}</span>
-        </span>
-        <span className="flex items-center gap-1.5 shrink-0">
-          <button type="button" onClick={() => onCta(action)}
-            className="inline-flex items-center gap-1 rounded-lg bg-[var(--indigo)] px-2.5 py-1 text-[11px] font-semibold text-white hover:opacity-90 transition">
-            {action.cta.label}
-          </button>
-          <button type="button" onClick={() => onOpen(action)} aria-label="View details"
-            className="inline-flex items-center justify-center w-6 h-6 rounded-lg border border-[var(--b1)] text-t2 hover:text-t1 hover:bg-[var(--s2)] transition">
-            <ChevronRight className="w-3.5 h-3.5" aria-hidden="true" />
-          </button>
-        </span>
+      <div className="flex items-center gap-x-3 gap-y-1 flex-wrap mt-2 text-[10px] text-t3">
+        <span className="inline-flex items-center gap-1"><Zap className="w-3 h-3 text-violet-v" aria-hidden="true" /> {action.aiConfidence}% confidence</span>
+        <span>· {action.owner}</span>
+        {action.dueDate && <span>· due {new Date(action.dueDate).toLocaleDateString()}</span>}
+      </div>
+      <div className="flex items-center gap-2 mt-2.5">
+        <button type="button" onClick={() => onCta(action)}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-2.5 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 transition">
+          <Zap className="w-3 h-3" /> {action.cta.label}
+        </button>
+        <button type="button" onClick={() => onOpen(action)}
+          className="inline-flex items-center gap-1 text-[11px] font-semibold text-t2 hover:text-t1 transition">
+          View details <ChevronRight className="w-3 h-3" />
+        </button>
       </div>
     </div>
   );

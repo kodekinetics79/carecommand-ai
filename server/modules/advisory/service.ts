@@ -1,10 +1,8 @@
 import type { FastifyRequest } from 'fastify';
 import { db } from '../../lib/db';
-import { env } from '../../config/env';
 import { branchScope, assertBranchAccess } from '../../lib/scope';
 import { runWithTenantContext } from '../../lib/tenantContext';
-import { aiGateway } from '../../lib/ai/gateway';
-import { MockAdvisorProvider } from './providers';
+import { createAIProvider } from './providers';
 import type {
   AdvisorAnalysis,
   AdvisorPromptInput,
@@ -16,17 +14,7 @@ import type {
   AdvisoryAction,
 } from './types';
 
-// Deterministic, network-free formatter. Used verbatim as the honest fallback
-// whenever the governed gateway is unavailable (mock provider, PHI-blocked,
-// budget-capped, or provider error) so an advisory answer is never fabricated.
-const advisoryFallback = new MockAdvisorProvider();
-
-const ADVISORY_SYSTEM_PROMPT =
-  'You are a clinic operations advisor. Business operations only. No medical advice, no diagnosis, no treatment. Write a concise owner-facing advisory response.';
-
-// Honest provenance for the templated numbers surfaced on every advisor.
-const RULE_BASED_METHODOLOGY =
-  'Rule-based heuristic estimate: expected-impact ($) and confidence (%) are templated arithmetic over real backend counts, not AI-model reasoning.';
+const aiProvider = createAIProvider();
 
 function formatCurrency(value: number) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(value);
@@ -418,52 +406,7 @@ function buildAdvisorAnalysis(advisorType: AdvisorType, context: Awaited<ReturnT
   }
 }
 
-interface Actor { tenantId: string; userId?: string | null }
-
-// Generate the free-text advisory `answer`. This is the SINGLE outbound AI seam
-// for advisory and now runs through the governed gateway (PHI guard, daily
-// budget cap, and AIUsageLog). It never bypasses the gateway to a raw provider.
-//
-// PHI posture: the structured evidence prompt carries no patient identifiers
-// (branch/staff/campaign names + counts only), so the auto-brief is non-PHI. A
-// user-supplied free-text `question` is unbounded and treated as possibly-PHI —
-// the gateway then blocks it unless AI_ENABLE_PHI=true, and we degrade to the
-// deterministic fallback rather than sending it ungoverned.
-async function generateAnswer(
-  actor: Actor,
-  promptInput: AdvisorPromptInput,
-  question?: string,
-): Promise<{ answer: string; answerSource: 'model' | 'rule-based' }> {
-  const deterministic = await advisoryFallback.generateAnswer(promptInput);
-
-  // Clinical guardrail or the default mock provider → deterministic only, no
-  // network call (identical to prior behaviour, minus the ungoverned bypass).
-  if (clinicGuardrail(question) || env.AI_PROVIDER === 'mock') {
-    return { answer: deterministic, answerSource: 'rule-based' };
-  }
-
-  try {
-    const { result } = await aiGateway.generate({
-      tenantId: actor.tenantId,
-      actorUserId: actor.userId ?? null,
-      operation: 'advisory',
-      containsPhi: Boolean(question),
-      // `deterministic` already embeds the question line (if any) + evidence.
-      messages: [
-        { role: 'system', content: ADVISORY_SYSTEM_PROMPT },
-        { role: 'user', content: deterministic },
-      ],
-    });
-    const text = result.text?.trim();
-    return text ? { answer: text, answerSource: 'model' } : { answer: deterministic, answerSource: 'rule-based' };
-  } catch {
-    // Blocked (PHI/budget) or provider error → honest deterministic fallback.
-    return { answer: deterministic, answerSource: 'rule-based' };
-  }
-}
-
 async function materializeResponse(
-  actor: Actor,
   advisorType: AdvisorType,
   context: Awaited<ReturnType<typeof loadContext>>,
   question?: string,
@@ -475,13 +418,13 @@ async function materializeResponse(
     analysis,
     clinicName: context.branches.length === 1 ? context.branches[0]?.name ?? null : null,
   };
-  const { answer, answerSource } = await generateAnswer(actor, promptInput, question);
+  const answer = clinicGuardrail(question)
+    ? `${analysis.summary} ${analysis.diagnosis} ${analysis.recommendedAction}`
+    : await aiProvider.generateAnswer(promptInput);
 
   return {
     ...analysis,
     answer,
-    answerSource,
-    methodology: RULE_BASED_METHODOLOGY,
     question,
     clinicId: context.branchId ?? null,
     generatedAt: new Date().toISOString(),
@@ -490,13 +433,12 @@ async function materializeResponse(
 
 export async function getAdvisoryBrief(request: FastifyRequest, clinicId?: string, range?: AdvisoryDateRange): Promise<AdvisoryBriefResponse> {
   const context = await loadContext(request, clinicId, range);
-  const actor: Actor = { tenantId: request.auth.tenantId, userId: request.auth.userId };
   const advisors = await Promise.all([
-    materializeResponse(actor, 'revenue', context),
-    materializeResponse(actor, 'growth', context),
-    materializeResponse(actor, 'front-desk', context),
-    materializeResponse(actor, 'competitor', context),
-    materializeResponse(actor, 'operations', context),
+    materializeResponse('revenue', context),
+    materializeResponse('growth', context),
+    materializeResponse('front-desk', context),
+    materializeResponse('competitor', context),
+    materializeResponse('operations', context),
   ]);
   return {
     generatedAt: new Date().toISOString(),
@@ -508,6 +450,5 @@ export async function getAdvisoryBrief(request: FastifyRequest, clinicId?: strin
 
 export async function askAdvisor(request: FastifyRequest, input: AdvisoryRequestInput): Promise<AdvisorResponse> {
   const context = await loadContext(request, input.clinicId, input.dateRange);
-  const actor: Actor = { tenantId: request.auth.tenantId, userId: request.auth.userId };
-  return materializeResponse(actor, input.advisorType, context, input.question);
+  return materializeResponse(input.advisorType, context, input.question);
 }

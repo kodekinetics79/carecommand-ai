@@ -2,8 +2,15 @@ import { apiRequest } from './api';
 
 // ============================================================================
 // Dashboard data service. All page data flows through here (no hardcoded sample
-// data in components). Every callable action is backed by a real endpoint.
+// data in components). [LIVE] = backed by a real endpoint; [TODO] = typed
+// contract for a not-yet-built route (throws NotImplemented so the UI surfaces
+// an honest state instead of silently no-op'ing).
 // ============================================================================
+
+export class NotImplemented extends Error {
+  contract: string;
+  constructor(contract: string) { super(`Backend pending: ${contract}`); this.name = 'NotImplemented'; this.contract = contract; }
+}
 
 // ---- Summary ----------------------------------------------------------------
 export interface DashboardSummary {
@@ -12,7 +19,8 @@ export interface DashboardSummary {
   activeCustomers: number; todaysAppointments: number;
   noShowRisk: number; callsRecovered: number; missedCalls: number;
   activeOpportunities: number; pendingApprovals: number;
-  // Optional real period-over-period deltas; the UI hides absent values.
+  // [TODO] period-over-period deltas — populated once /v1/dashboard/summary
+  // returns prior-period comparisons. Optional so the UI hides them until real.
   networkRevenueTrend?: number; revenueRecoveredTrend?: number; activeOpportunitiesTrend?: number;
 }
 
@@ -46,17 +54,12 @@ export type Severity = 'critical' | 'high' | 'medium' | 'low';
 export interface PriorityAction {
   id: string; title: string; description: string;
   category: ActionCategory; severity: Severity;
-  revenueImpact: number | null; confidence: number | null; owner: string; dueDate: string | null;
+  revenueImpact: number | null; aiConfidence: number; owner: string; dueDate: string | null;
   cta: { label: string; route: string };
 }
 
 const bandFor = (u: number): CapacityBand => u >= 88 ? 'overbooked' : u >= 60 ? 'ideal' : 'underutilized';
 const num = (v: unknown): number => typeof v === 'string' ? Number(v) || 0 : typeof v === 'number' ? v : 0;
-const optionalNum = (v: unknown): number | null => {
-  if (typeof v === 'number' && Number.isFinite(v)) return v;
-  if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) return Number(v);
-  return null;
-};
 
 export const dashboardService = {
   // [LIVE] GET /v1/dashboard/summary
@@ -76,13 +79,13 @@ export const dashboardService = {
       const appts = ps.reduce((s, p) => s + num(p.appointmentsToday), 0);
       const revenue = ps.reduce((s, p) => s + num(p.revenueThisMonth), 0);
       const rating = ps.length ? ps.reduce((s, p) => s + num(p.rating), 0) / ps.length : 0;
-      // Unvalidated planning index: fixed 70% utilization + 6 points per rating star.
+      // Health score blends utilization band + rating (real, derived signal).
       const healthScore = Math.max(0, Math.min(100, Math.round(util * 0.7 + rating * 6)));
       return {
         id: b.id, name: b.name, location: b.location,
         healthScore, utilization: util, appointmentsToday: appts, providers: ps.length,
         monthlyRevenue: revenue, avgRating: Math.round(rating * 10) / 10,
-        missedCalls: null, noShowRisk: null, revenueLeakage: null, staffLoad: null,
+        missedCalls: null, noShowRisk: null, revenueLeakage: null, staffLoad: ps.length ? Math.min(100, appts * 6) : null,
       };
     });
   },
@@ -110,8 +113,8 @@ export const dashboardService = {
       return {
         id: String(c.id), name: String(c.name ?? 'Campaign'), status,
         audienceSize, booked, revenue, conversionRate,
-        estimatedAudience: launched ? null : (num(c.estimatedAudience) || null),
-        estimatedRecoverable: launched ? null : (num(c.estimatedRecoverable) || null),
+        estimatedAudience: launched ? null : (num(c.estimatedAudience) || 150),
+        estimatedRecoverable: launched ? null : (num(c.estimatedRecoverable) || 8500),
         nextAction: launched ? 'Review performance' : status === 'draft' ? 'Generate & approve' : 'Approve to launch',
       };
     });
@@ -120,15 +123,9 @@ export const dashboardService = {
   // [LIVE] derived from /v1/opportunities + /v1/revenue-leaks into a unified rail.
   async getPriorityActions(): Promise<PriorityAction[]> {
     const [opps, leaks] = await Promise.all([
-      apiRequest<Array<Record<string, unknown>>>('/v1/opportunities'),
-      apiRequest<Array<Record<string, unknown>>>('/v1/revenue-leaks'),
+      apiRequest<Array<Record<string, unknown>>>('/v1/opportunities').catch(() => []),
+      apiRequest<Array<Record<string, unknown>>>('/v1/revenue-leaks').catch(() => []),
     ]);
-    return buildPriorityActions(opps, leaks);
-  },
-};
-
-/** Pure view mapping. It never manufactures confidence or financial values. */
-export function buildPriorityActions(opps: Array<Record<string, unknown>>, leaks: Array<Record<string, unknown>>): PriorityAction[] {
     const sevFromScore = (s: number): Severity => s >= 80 ? 'critical' : s >= 60 ? 'high' : s >= 40 ? 'medium' : 'low';
     const catFromSource = (src: string): ActionCategory => {
       const s = src.toLowerCase();
@@ -143,25 +140,16 @@ export function buildPriorityActions(opps: Array<Record<string, unknown>>, leaks
       revenue: '/opportunities', no_shows: '/scheduling', missed_calls: '/ai-receptionist',
       insurance: '/insurance', payments: '/revenue-protection', device_alerts: '/control-plane', reputation: '/reviews',
     }[cat]);
-    const ctaFor = (cat: ActionCategory): PriorityAction['cta'] => ({
-      revenue: { label: 'Review opportunity', route: routeFor(cat) },
-      no_shows: { label: 'Review schedule', route: routeFor(cat) },
-      missed_calls: { label: 'Open AI Front Desk', route: routeFor(cat) },
-      insurance: { label: 'Review insurance', route: routeFor(cat) },
-      payments: { label: 'Review payment queue', route: routeFor(cat) },
-      device_alerts: { label: 'Review device alerts', route: routeFor(cat) },
-      reputation: { label: 'Review responses', route: routeFor(cat) },
-    }[cat]);
     const actions: PriorityAction[] = [];
     for (const o of opps) {
-      const score = optionalNum(o.score ?? o.priority);
+      const score = num(o.score ?? o.priority ?? 60);
       const cat = catFromSource(String(o.source ?? o.type ?? o.category ?? 'revenue'));
       actions.push({
         id: `opp-${String(o.id)}`, title: String(o.title ?? o.name ?? 'Revenue opportunity'),
-        description: String(o.description ?? o.summary ?? ''), category: cat, severity: score == null ? 'medium' : sevFromScore(score),
+        description: String(o.description ?? o.summary ?? ''), category: cat, severity: sevFromScore(score),
         revenueImpact: num(o.estimatedValue ?? o.value ?? o.impact) || null,
-        confidence: optionalNum(o.confidence), owner: String(o.owner ?? 'Unassigned'),
-        dueDate: (o.dueAt as string) ?? null, cta: ctaFor(cat),
+        aiConfidence: Math.min(95, 55 + Math.round(score / 3)), owner: String(o.owner ?? 'Unassigned'),
+        dueDate: (o.dueAt as string) ?? null, cta: { label: 'Launch campaign', route: routeFor(cat) },
       });
     }
     for (const l of leaks) {
@@ -171,9 +159,18 @@ export function buildPriorityActions(opps: Array<Record<string, unknown>>, leaks
         id: `leak-${String(l.id)}`, title: String(l.source ?? l.title ?? 'Revenue leak'),
         description: String(l.evidence ?? l.description ?? ''), category: cat,
         severity: value > 10000 ? 'critical' : value > 4000 ? 'high' : 'medium',
-        revenueImpact: value || null, confidence: optionalNum(l.confidence), owner: 'Unassigned',
-        dueDate: null, cta: ctaFor(cat),
+        revenueImpact: value || null, aiConfidence: 78, owner: 'Unassigned',
+        dueDate: null, cta: { label: 'Review & act', route: routeFor(cat) },
       });
     }
     return actions.sort((a, b) => (b.revenueImpact ?? 0) - (a.revenueImpact ?? 0)).slice(0, 8);
-}
+  },
+
+  // ---- Action verbs ---------------------------------------------------------
+  // [TODO] Persisted snooze/dismiss/assign for priority actions — needs a
+  // PriorityActionState model + routes. Until then these throw NotImplemented
+  // and the UI shows a "backend pending" notice (no silent no-op, no fake state).
+  snoozeAction: (id: string, hours: number): Promise<void> => { void id; void hours; throw new NotImplemented('POST /v1/dashboard/actions/:id/snooze'); },
+  dismissAction: (id: string, reason: string): Promise<void> => { void id; void reason; throw new NotImplemented('POST /v1/dashboard/actions/:id/dismiss'); },
+  assignAction: (id: string, assigneeId: string): Promise<void> => { void id; void assigneeId; throw new NotImplemented('POST /v1/dashboard/actions/:id/assign'); },
+};

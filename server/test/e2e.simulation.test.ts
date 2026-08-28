@@ -25,10 +25,8 @@ vi.mock('../workers/queues', () => ({
 }));
 
 const { buildApp } = await import('../app');
-const { fixtureDb: db } = await import('./helpers/fixtureDb');
+const { db } = await import('../lib/db');
 const { recomputeEntitlements } = await import('../lib/entitlements');
-const { encryptSecret } = await import('../lib/security');
-const { issuePortalSession } = await import('../lib/portalAuth');
 
 let app: FastifyInstance;
 const createdTenantIds: string[] = [];
@@ -45,7 +43,8 @@ function nextMondayISO(): string {
 const MONDAY = nextMondayISO();
 const at = (hhmm: string) => `${MONDAY}T${hhmm}:00.000Z`;
 
-const staffTok = (tenantId: string, userId: string) => app.jwt.sign({ userId, tenantId, role: 'OWNER', type: 'access' });
+const staffTok = (tenantId: string, userId: string) => app.jwt.sign({ userId, tenantId, type: 'access' });
+const portalTok = (a: { tenantId: string; patientId: string; accountId: string }) => app.jwt.sign({ portalAccountId: a.accountId, patientId: a.patientId, tenantId: a.tenantId, type: 'portal' });
 const bearer = (t: string, ip: string) => ({ authorization: `Bearer ${t}`, 'x-forwarded-for': ip });
 function stripeSig(body: string) {
   const ts = Math.floor(Date.now() / 1000);
@@ -54,7 +53,7 @@ function stripeSig(body: string) {
 
 interface Clinic {
   id: string; branchId: string; providerId: string; patientId: string; accountId: string;
-  adminId: string; payerId: string; policyId: string; externalRef: string; ip: string; portalToken: string;
+  adminId: string; externalRef: string; ip: string;
 }
 
 async function provisionClinic(seq: number): Promise<Clinic> {
@@ -63,17 +62,14 @@ async function provisionClinic(seq: number): Promise<Clinic> {
   createdTenantIds.push(id);
   const plan = await db.subscriptionPlan.findUnique({ where: { key: 'enterprise' } });
   await db.tenantSubscription.create({ data: { tenantId: id, planId: plan!.id, status: 'ACTIVE', startedAt: new Date() } });
-  await recomputeEntitlements(id, db);
-  const branch = await db.branch.create({ data: { tenantId: id, name: 'Main', location: 'City', timezone: 'UTC' } });
+  await recomputeEntitlements(id);
+  const branch = await db.branch.create({ data: { tenantId: id, name: 'Main', location: 'City' } });
   const provUser = await db.user.create({ data: { tenantId: id, role: 'PROVIDER', active: true, email: `pv-${id.slice(0, 8)}@sim.test`, displayName: 'Dr Sim' } });
   const provider = await db.providerProfile.create({ data: { tenantId: id, branchId: branch.id, userId: provUser.id, specialty: 'Primary Care', rating: 4.7, reviewCount: 9 } });
   const patient = await db.patient.create({ data: { tenantId: id, branchId: branch.id, firstName: 'Sim', lastName: `Patient${seq}`, lifecycleStage: 'NEW' } });
-  const payer = await db.insurancePayer.create({ data: { tenantId: id, name: 'Aetna', sourceProvider: 'stedi', active: true } });
-  const policy = await db.patientInsurancePolicy.create({ data: { tenantId: id, branchId: branch.id, patientId: patient.id, payerId: payer.id, planName: 'Aetna PPO', memberId: 'AET-110293', coverageOrder: 1, active: true } });
   const account = await db.patientPortalAccount.create({ data: { tenantId: id, patientId: patient.id, status: 'active', email: `sp-${id.slice(0, 8)}@sim.test` } });
   const admin = await db.user.create({ data: { tenantId: id, role: 'ADMIN', active: true, email: `ad-${id.slice(0, 8)}@sim.test`, displayName: 'Admin' } });
-  const portalToken = await issuePortalSession(app, account, db);
-  return { id, branchId: branch.id, providerId: provider.id, patientId: patient.id, accountId: account.id, adminId: admin.id, payerId: payer.id, policyId: policy.id, externalRef: `EXT-${id.slice(0, 8)}`, ip: `203.0.113.${(seq % 240) + 10}`, portalToken };
+  return { id, branchId: branch.id, providerId: provider.id, patientId: patient.id, accountId: account.id, adminId: admin.id, externalRef: `EXT-${id.slice(0, 8)}`, ip: `203.0.113.${(seq % 240) + 10}` };
 }
 
 type StepResult = { ok: boolean; detail: string };
@@ -81,12 +77,12 @@ type StepResult = { ok: boolean; detail: string };
 async function runJourney(c: Clinic): Promise<Record<string, StepResult>> {
   const steps: Record<string, StepResult> = {};
   const admin = bearer(staffTok(c.id, c.adminId), c.ip);
-  const portal = bearer(c.portalToken, c.ip);
+  const portal = bearer(portalTok({ tenantId: c.id, patientId: c.patientId, accountId: c.accountId }), c.ip);
   const ok = (cond: boolean, detail: string): StepResult => ({ ok: cond, detail });
 
   // 1) Insurance: configure Stedi sandbox + run an eligibility check.
   await app.inject({ method: 'POST', url: '/v1/insurance/providers/stedi/configure', headers: admin, payload: { mode: 'sandbox', config: {} } });
-  const elig = await app.inject({ method: 'POST', url: '/v1/insurance/eligibility/check', headers: { ...admin, 'idempotency-key': 'e2e-simulation-eligibility' }, payload: { patientId: c.patientId, policyId: c.policyId, payerName: 'Aetna', memberId: 'AET-110293' } });
+  const elig = await app.inject({ method: 'POST', url: '/v1/insurance/eligibility/check', headers: admin, payload: { patientId: c.patientId, payerName: 'Aetna', memberId: 'AET-110293' } });
   steps.eligibility = ok(elig.statusCode === 201 && elig.json().status === 'ACTIVE', `status=${elig.statusCode}`);
 
   // 2) Revenue policy: a new-patient deposit rule (so a deposit applies below).
@@ -129,19 +125,9 @@ async function runJourney(c: Clinic): Promise<Record<string, StepResult>> {
   }
   steps.paymentCollected = ok(paymentsOk, payDetail);
 
-  // 7) Connected care / RPM: enroll + ingest a critical reading via a SIGNED webhook.
-  // The device webhook fails closed — it ingests only when the per-provider secret
-  // verifies the request, so configure that secret, enroll, and sign the payload.
-  const deviceSecret = `whsec-dev-${c.id}`;
-  await db.deviceProvider.upsert({
-    where: { tenantId_providerKey: { tenantId: c.id, providerKey: 'withings' } },
-    create: { tenantId: c.id, providerKey: 'withings', displayName: 'Withings', category: 'DIRECT_API', mode: 'sandbox', status: 'SANDBOX', encryptedConfig: encryptSecret(JSON.stringify({ webhookSecret: deviceSecret })), webhookConfigured: true },
-    update: { encryptedConfig: encryptSecret(JSON.stringify({ webhookSecret: deviceSecret })), webhookConfigured: true },
-  });
-  await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: admin, payload: { patientId: c.patientId, providerKey: 'withings', externalRef: c.externalRef } });
-  const deviceRaw = JSON.stringify({ readings: [{ patientExternalRef: c.externalRef, readingType: 'glucose', value: '330', numericValue: 330, unit: 'mg/dL' }] });
-  const deviceSig = createHmac('sha256', deviceSecret).update(deviceRaw).digest('hex');
-  const hook = await app.inject({ method: 'POST', url: `/v1/connected-care/${c.id}/providers/withings/webhook`, headers: { 'content-type': 'application/json', 'x-cc-signature': deviceSig }, payload: deviceRaw });
+  // 7) Connected care / RPM: enroll + ingest a critical reading via webhook.
+  await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: admin, payload: { patientId: c.patientId, providerKey: 'manual', externalRef: c.externalRef } });
+  const hook = await app.inject({ method: 'POST', url: `/v1/connected-care/${c.id}/providers/manual/webhook`, payload: { readings: [{ patientExternalRef: c.externalRef, readingType: 'glucose', value: '330', numericValue: 330, unit: 'mg/dL' }] } });
   steps.deviceAlert = ok(hook.statusCode === 200 && hook.json().alertsCreated === 1, `ingested=${hook.json().ingested} alerts=${hook.json().alertsCreated}`);
 
   // 8) Compliance: HIPAA data-access export compiles the cross-module record.

@@ -29,10 +29,7 @@ server/generated
 .projects/vault
 .projects/state.test.json
 .projects/state.local.test.json
-.playwright
 .env
 .env.*
 !.env.example
-# NOTE: .env.production is intentionally NOT un-ignored — it must never be committed.
-# Production secrets live only in the platform's encrypted env store (Vercel/Render).
 api/_bundle.mjs

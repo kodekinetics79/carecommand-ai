@@ -40,16 +40,16 @@ export interface Doctor {
 export interface Patient {
   id: string;
   name: string;
-  age: number | null;
-  gender: 'male' | 'female' | null;
+  age: number;
+  gender: 'male' | 'female';
   branchId: string;
-  assignedDoctorId: string | null;
-  lastVisit: string | null; // ISO date when known
+  assignedDoctorId: string;
+  lastVisit: string; // ISO date
   nextVisit?: string;
   lifecycleStage: LifecycleStage;
   churnRisk: number; // 0-100
   lifetimeValue: number;
-  preferredChannel: Channel | null;
+  preferredChannel: Channel;
   consentStatus: {
     sms: boolean;
     whatsapp: boolean;
@@ -197,8 +197,6 @@ export interface Integration {
 
 export interface RevenueData {
   month: string;
-  /** Sortable timestamp of the period start — charts sort ascending on this. */
-  periodTs?: number;
   revenue: number;
   recovered: number;
   lost: number;
@@ -258,8 +256,6 @@ export interface AdvisoryAction {
 export interface AdvisorResponse {
   advisorType: AdvisorType;
   answer: string;
-  answerSource: 'model' | 'rule-based';
-  methodology: string;
   summary: string;
   diagnosis: string;
   recommendedAction: string;

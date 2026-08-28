@@ -1,0 +1,16 @@
+import type { Campaign } from '../types';
+
+export const campaigns: Campaign[] = [
+  { id: 'c1', name: '90-Day Winback', goal: 'Reactivate inactive customers', status: 'active', channels: ['whatsapp', 'sms', 'email'], audienceSize: 187, sent: 187, opened: 142, responded: 67, booked: 38, revenue: 7600, startDate: '2025-05-01', aiGenerated: true },
+  { id: 'c2', name: 'Dental Cleaning Recall', goal: 'Fill empty dental slots', status: 'active', channels: ['whatsapp', 'email'], audienceSize: 210, sent: 210, opened: 178, responded: 89, booked: 52, revenue: 11440, startDate: '2025-04-15', aiGenerated: true },
+  { id: 'c3', name: 'Skin Treatment Lead Nurture', goal: 'Convert skin service inquiries', status: 'active', channels: ['whatsapp'], audienceSize: 34, sent: 34, opened: 29, responded: 18, booked: 11, revenue: 5280, startDate: '2025-05-10', aiGenerated: false },
+  { id: 'c4', name: 'Pediatric Back-to-School Checkup', goal: 'Promote preventive care', status: 'scheduled', channels: ['whatsapp', 'sms', 'email'], audienceSize: 156, sent: 0, opened: 0, responded: 0, booked: 0, revenue: 0, startDate: '2025-07-15', aiGenerated: true },
+  { id: 'c5', name: 'Care Follow-Up Reminder', goal: 'Care follow-up reminder', status: 'completed', channels: ['sms', 'email'], audienceSize: 44, sent: 44, opened: 38, responded: 22, booked: 18, revenue: 3960, startDate: '2025-03-01', endDate: '2025-04-01', aiGenerated: false },
+  { id: 'c6', name: 'No-Show Recovery', goal: 'Recover no-show appointments', status: 'active', channels: ['whatsapp', 'sms'], audienceSize: 31, sent: 31, opened: 28, responded: 14, booked: 9, revenue: 1620, startDate: '2025-05-15', aiGenerated: true },
+  { id: 'c7', name: 'Google Review Boost', goal: 'Improve online reputation', status: 'active', channels: ['whatsapp', 'sms'], audienceSize: 280, sent: 280, opened: 241, responded: 112, booked: 0, revenue: 0, startDate: '2025-05-01', aiGenerated: true },
+  { id: 'c8', name: 'Family Wellness Package', goal: 'Upsell family memberships', status: 'draft', channels: ['whatsapp', 'email'], audienceSize: 88, sent: 0, opened: 0, responded: 0, booked: 0, revenue: 0, startDate: '2025-06-01', aiGenerated: false },
+  { id: 'c9', name: 'New Branch Launch — Southbank', goal: 'Drive awareness for new branch', status: 'completed', channels: ['whatsapp', 'sms', 'email', 'push'], audienceSize: 500, sent: 500, opened: 421, responded: 189, booked: 74, revenue: 14800, startDate: '2025-02-01', endDate: '2025-03-01', aiGenerated: true },
+  { id: 'c10', name: 'New Provider Promotion — Dr. Nwosu', goal: 'Build customer list for new provider', status: 'completed', channels: ['whatsapp', 'email'], audienceSize: 140, sent: 140, opened: 118, responded: 56, booked: 31, revenue: 9920, startDate: '2025-01-15', endDate: '2025-02-15', aiGenerated: false },
+  { id: 'c11', name: 'Physiotherapy Referral Drive', goal: 'Physician referral conversion', status: 'paused', channels: ['email'], audienceSize: 22, sent: 15, opened: 12, responded: 4, booked: 2, revenue: 560, startDate: '2025-04-20', aiGenerated: false },
+  { id: 'c12', name: 'Skin Rejuvenation Summer Promo', goal: 'Promote seasonal treatment', status: 'draft', channels: ['whatsapp', 'email', 'push'], audienceSize: 95, sent: 0, opened: 0, responded: 0, booked: 0, revenue: 0, startDate: '2025-06-15', aiGenerated: true },
+];

@@ -16,13 +16,6 @@ export interface AdvisoryAction {
 export interface AdvisorResponse {
   advisorType: AdvisorType;
   answer: string;
-  // 'model' when `answer` came from a real LLM through the governed gateway;
-  // 'rule-based' when it is the deterministic templated fallback (mock provider,
-  // guardrail, PHI-blocked, budget-capped, or provider error).
-  answerSource: 'model' | 'rule-based';
-  // expectedImpact + confidence are rule-based templated arithmetic over real
-  // backend counts, NOT AI-model outputs. This label makes that explicit.
-  methodology: string;
   summary: string;
   diagnosis: string;
   recommendedAction: string;

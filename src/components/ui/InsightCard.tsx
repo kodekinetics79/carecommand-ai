@@ -5,6 +5,7 @@ interface InsightCardProps {
   title: string;
   description: string;
   impact?: string;
+  confidence?: number;
   action?: string;
   onAction?: () => void;
   icon?: ReactNode;
@@ -20,7 +21,7 @@ const variants = {
 };
 
 export default function InsightCard({
-  title, description, impact, action, onAction, icon,
+  title, description, impact, confidence, action, onAction, icon,
   variant = 'default', className = '',
 }: InsightCardProps) {
   const v = variants[variant];
@@ -40,6 +41,17 @@ export default function InsightCard({
           </div>
           <p className="text-xs text-t3 leading-relaxed mb-3">{description}</p>
           <div className="flex items-center justify-between gap-3">
+            {confidence !== undefined && (
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-medium text-t3 uppercase tracking-wide">AI confidence</span>
+                <div className="flex gap-0.5">
+                  {[...Array(5)].map((_, i) => (
+                    <div key={i} className={`w-5 h-1.5 rounded-full ${i < Math.round(confidence / 20) ? 'bg-[var(--indigo)]' : 'bg-[var(--b1)]'}`} />
+                  ))}
+                </div>
+                <span className="text-[10px] font-semibold text-t3">{confidence}%</span>
+              </div>
+            )}
             {action && (
               <button
                 onClick={onAction}

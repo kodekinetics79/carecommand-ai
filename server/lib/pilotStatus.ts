@@ -1,6 +1,5 @@
 import { createHmac, randomBytes } from 'node:crypto';
 import { db } from './db';
-import { platformDb } from './platformDb';
 import { env } from '../config/env';
 
 export type PilotChecklistItem = {
@@ -24,8 +23,8 @@ export async function buildPilotChecklist(tenantId: string) {
     db.appointment.count({ where: { tenantId, deletedAt: null } }),
     db.patientInsurancePolicy.count({ where: { tenantId, active: true } }),
     db.auditEvent.count({ where: { tenantId } }),
-    platformDb.platformAuditEvent.count({ where: { tenantId, action: { startsWith: 'pilot.import.' } } }),
-    platformDb.platformAuditEvent.findFirst({ where: { tenantId, action: { startsWith: 'pilot.import.' } }, orderBy: { createdAt: 'desc' } }),
+    db.platformAuditEvent.count({ where: { tenantId, action: { startsWith: 'pilot.import.' } } }),
+    db.platformAuditEvent.findFirst({ where: { tenantId, action: { startsWith: 'pilot.import.' } }, orderBy: { createdAt: 'desc' } }),
   ]);
 
   if (!tenant) return null;

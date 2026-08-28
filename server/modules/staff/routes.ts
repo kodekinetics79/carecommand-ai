@@ -3,8 +3,8 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { cursorPage, paginationSchema } from '../../lib/pagination';
 import { branchScope, assertBranchAccess } from '../../lib/scope';
-import { requirePermission } from '../../lib/permissions';
-import { runWithTenantContext } from '../../lib/tenantContext';
+import { requireRoles } from '../../plugins/roles';
+import { audit } from '../../lib/audit';
 
 const staffQuery = paginationSchema.extend({
   branchId: z.string().uuid().optional(),
@@ -15,7 +15,7 @@ const taskStatusInput = z.object({
 });
 
 export const staffRoutes: FastifyPluginAsync = async app => {
-  app.get('/overview', { preHandler: requirePermission('staff:read') }, async request => {
+  app.get('/overview', async request => {
     const query = staffQuery.parse(request.query);
     const rows = await db.staffProfile.findMany({
       where: {
@@ -36,29 +36,20 @@ export const staffRoutes: FastifyPluginAsync = async app => {
     return cursorPage(rows, query.limit);
   });
 
-  app.patch('/tasks/:id/status', { preHandler: requirePermission('staff:task-status') }, async (request, reply) => {
+  app.patch('/tasks/:id/status', { preHandler: requireRoles('OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK') }, async (request, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = taskStatusInput.parse(request.body);
-    const result = await runWithTenantContext(request.auth.tenantId, async tx => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`staff-task:${request.auth.tenantId}:${params.id}`}::text, 0))::text AS locked`;
-      const existing = await tx.staffTask.findFirst({ where: { id: params.id, tenantId: request.auth.tenantId } });
-      if (!existing) return { kind: 'not_found' as const };
-      if (existing.branchId) assertBranchAccess(request, existing.branchId);
-      if ((existing.status === 'COMPLETED' || existing.status === 'CANCELED') && existing.status !== input.status) {
-        return { kind: 'terminal' as const };
-      }
-      if (existing.status === input.status) return { kind: 'updated' as const, task: existing };
-      const task = await tx.staffTask.update({ where: { id: existing.id }, data: { status: input.status } });
-      await tx.auditEvent.create({ data: {
-        tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
-        action: 'task.status.updated', resource: 'staffTask', resourceId: task.id,
-        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
-        metadata: { fromStatus: existing.status, toStatus: input.status },
-      } });
-      return { kind: 'updated' as const, task };
+    const existing = await db.staffTask.findFirst({
+      where: { id: params.id, tenantId: request.auth.tenantId },
     });
-    if (result.kind === 'not_found') throw app.httpErrors.notFound('Task not found');
-    if (result.kind === 'terminal') throw app.httpErrors.conflict('Completed or canceled tasks are final and cannot be reopened');
-    return reply.send(result.task);
+    if (!existing) throw app.httpErrors.notFound('Task not found');
+    if (existing.branchId) assertBranchAccess(request, existing.branchId);
+
+    const task = await db.staffTask.update({
+      where: { id: params.id },
+      data: { status: input.status },
+    });
+    await audit(request, { action: 'task.status.updated', resource: 'staffTask', resourceId: task.id, metadata: { status: input.status } });
+    return reply.send(task);
   });
 };

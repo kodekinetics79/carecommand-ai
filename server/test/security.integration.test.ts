@@ -18,7 +18,7 @@ vi.mock('../workers/queues', () => ({
 }));
 
 const { buildApp } = await import('../app');
-const { fixtureDb: db } = await import('./helpers/fixtureDb');
+const { db } = await import('../lib/db');
 const { recomputeEntitlements } = await import('../lib/entitlements');
 
 let app: FastifyInstance;
@@ -30,7 +30,7 @@ async function makeTenant() {
   createdTenantIds.push(id);
   const plan = await db.subscriptionPlan.findUnique({ where: { key: 'enterprise' } });
   await db.tenantSubscription.create({ data: { tenantId: id, planId: plan!.id, status: 'ACTIVE', startedAt: new Date() } });
-  await recomputeEntitlements(id, db);
+  await recomputeEntitlements(id);
   const branch = await db.branch.create({ data: { tenantId: id, name: 'b', location: 'x' } });
   const patient = await db.patient.create({ data: { tenantId: id, branchId: branch.id, firstName: 'Seed', lastName: 'Patient', lifecycleStage: 'NEW' } });
   const admin = await db.user.create({ data: { tenantId: id, role: 'ADMIN', active: true, email: `ad-${id.slice(0, 8)}@sec.test`, displayName: 'Admin' } });
@@ -38,7 +38,7 @@ async function makeTenant() {
   return { id, branchId: branch.id, patientId: patient.id, adminUserId: admin.id, providerUserId: provider.id };
 }
 
-const tok = (tenantId: string, userId: string) => app.jwt.sign({ userId, tenantId, role: 'OWNER', type: 'access' });
+const tok = (tenantId: string, userId: string) => app.jwt.sign({ userId, tenantId, type: 'access' });
 const auth = (t: string, ip = '203.0.113.7') => ({ authorization: `Bearer ${t}`, 'x-forwarded-for': ip });
 
 beforeAll(async () => {

@@ -1,6 +1,6 @@
 import { db } from '../db';
 import { env } from '../../config/env';
-import { OllamaProviderClient, OpenAIProviderClient, ClaudeProviderClient, MockProviderClient, type AiProviderClient, type AiMessage, type AiGenerateResult } from './providers';
+import { OllamaProviderClient, MockProviderClient, type AiProviderClient, type AiMessage, type AiGenerateResult } from './providers';
 
 export class AiGatewayBlockedError extends Error {
   constructor(public readonly reason: 'phi_disabled' | 'budget_exceeded' | 'provider_not_configured', message: string) {
@@ -21,7 +21,7 @@ function estimateCostUsd(provider: string, mode: string | undefined, totalTokens
 export interface GatewayGenerateOptions {
   tenantId: string;
   actorUserId?: string | null;
-  operation: 'recommendation' | 'morning_briefing' | 'evaluation' | 'advisory';
+  operation: 'recommendation' | 'morning_briefing' | 'evaluation';
   messages: AiMessage[];
   jsonMode?: boolean;
   containsPhi?: boolean;
@@ -42,15 +42,6 @@ export const aiGateway = {
   resolveProvider(): AiProviderClient {
     switch (env.AI_PROVIDER) {
       case 'ollama': return new OllamaProviderClient();
-      case 'openai':
-        // Wired, but fail with a clear, actionable, TYPED error (not a raw throw)
-        // when the required key is absent — callers catch AiGatewayBlockedError
-        // and degrade gracefully; health-check surfaces the same message.
-        if (!env.OPENAI_API_KEY) throw new AiGatewayBlockedError('provider_not_configured', 'AI_PROVIDER=openai but OPENAI_API_KEY is not set');
-        return new OpenAIProviderClient();
-      case 'claude':
-        if (!env.CLAUDE_API_KEY) throw new AiGatewayBlockedError('provider_not_configured', 'AI_PROVIDER=claude but CLAUDE_API_KEY is not set');
-        return new ClaudeProviderClient();
       case 'mock': return new MockProviderClient();
       default:
         throw new AiGatewayBlockedError('provider_not_configured', `AI provider "${env.AI_PROVIDER}" is not configured in this build`);

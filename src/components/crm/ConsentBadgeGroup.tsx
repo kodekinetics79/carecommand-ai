@@ -1,29 +1,28 @@
-import { Mail, MessageSquare, Phone, ShieldAlert, ShieldX } from 'lucide-react';
-import type { ConsentEvidenceStatus, ConsentFlags } from '../../lib/crmService';
+import { Mail, MessageSquare, Phone, Megaphone, Ban, ShieldCheck } from 'lucide-react';
+import type { ConsentFlags } from '../../lib/crmService';
 
-// Evidence badges show only canonical persisted state. They do not imply that a
-// record is campaign-ready; dispatch re-checks consent and suppression.
+// Consent-aware badges. Do-not-contact takes precedence and is shown in red.
+// "Campaign-ready" (green) means marketing consent is present.
 export default function ConsentBadgeGroup({ consent, compact = false }: { consent: ConsentFlags; compact?: boolean }) {
-  const channels: Array<{ status: ConsentEvidenceStatus; icon: typeof Mail; label: string }> = [
-    { status: consent.email, icon: Mail, label: 'Email' },
-    { status: consent.sms, icon: MessageSquare, label: 'SMS' },
-    { status: consent.whatsapp, icon: MessageSquare, label: 'WhatsApp' },
-    { status: consent.voice, icon: Phone, label: 'Voice' },
-  ];
-  if (!consent.evidenceAvailable) {
-    return <span className="badge badge-amber" title="No canonical channel consent is available in this view"><ShieldAlert className="w-3 h-3" aria-hidden="true" /> Consent evidence unavailable</span>;
+  if (consent.doNotContact) {
+    return <span className="badge badge-red"><Ban className="w-3 h-3" aria-hidden="true" /> Do not contact</span>;
   }
+  const channels: Array<{ on: boolean; icon: typeof Mail; label: string }> = [
+    { on: consent.email, icon: Mail, label: 'Email' },
+    { on: consent.sms, icon: MessageSquare, label: 'SMS' },
+    { on: consent.whatsapp, icon: MessageSquare, label: 'WhatsApp' },
+    { on: consent.voice, icon: Phone, label: 'Voice' },
+  ];
   return (
-    <div className="flex flex-wrap items-center gap-1" role="group" aria-label="Stored communication-consent evidence">
-      {channels.filter(c => c.status !== 'unknown').map(c => (
-        <span key={c.label} className={`inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[9px] font-semibold ${c.status === 'opted_in' ? 'bg-[var(--blue-soft)] text-blue-v' : 'bg-red-soft text-red-v'}`} title={c.status === 'opted_in' ? `${c.label}: a prior affirmative preference is stored; this is not purpose-specific live outreach authority` : `${c.label}: stored opt-out evidence`}>
+    <div className="flex flex-wrap items-center gap-1" role="group" aria-label="Communication consent">
+      {channels.filter(c => c.on).map(c => (
+        <span key={c.label} className="inline-flex items-center gap-0.5 rounded-full bg-[var(--s3)] text-t2 px-1.5 py-0.5 text-[9px] font-semibold" title={`${c.label} allowed`}>
           <c.icon className="w-2.5 h-2.5" aria-hidden="true" />{!compact && c.label}
-          {c.status === 'opted_in' ? <ShieldAlert className="w-2.5 h-2.5" aria-hidden="true" /> : <ShieldX className="w-2.5 h-2.5" aria-hidden="true" />}
         </span>
       ))}
-      <span className="inline-flex items-center gap-0.5 rounded-full bg-[var(--s3)] text-t3 px-1.5 py-0.5 text-[9px] font-semibold" title="Consent and suppression are verified again when dispatch is requested">
-        <ShieldAlert className="w-2.5 h-2.5" aria-hidden="true" /> {compact ? 'Re-check at dispatch' : 'Dispatch verification required'}
-      </span>
+      {consent.campaignReady
+        ? <span className="badge badge-emerald"><ShieldCheck className="w-3 h-3" aria-hidden="true" /> Campaign-ready</span>
+        : <span className="inline-flex items-center gap-0.5 rounded-full bg-amber-soft text-amber-v px-1.5 py-0.5 text-[9px] font-semibold" title="No marketing consent"><Megaphone className="w-2.5 h-2.5" aria-hidden="true" /> Transactional only</span>}
     </div>
   );
 }

@@ -9,9 +9,7 @@ export function useApiResource<TApi, TView extends { id: string }>(
   mapRow: (row: TApi) => TView,
 ) {
   const fallbackRef = useRef(fallback);
-  // Lazy initializer: reads the prop once on mount (refs must not be read
-  // during render; the ref is only for the async catch below).
-  const [data, setData] = useState<TView[]>(() => fallback ?? EMPTY_ROWS);
+  const [data, setData] = useState<TView[]>(fallbackRef.current ?? EMPTY_ROWS);
   const [source, setSource] = useState<'live' | 'offline'>('offline');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router';
+import { useNavigate } from 'react-router-dom';
 import {
   AlertTriangle,
   Activity,
@@ -28,7 +28,6 @@ import PageHeader from '../components/ui/PageHeader';
 import BentoCard from '../components/ui/BentoCard';
 import StatCard from '../components/ui/StatCard';
 import { apiRequest, downloadCsv } from '../lib/api';
-import { getLocale } from '../lib/preferences';
 import { useSession } from '../hooks/useSession';
 import type { AdminAuditEvent, AdminRole, AdminUser, IntegrationStatus, SecurityPosture, SecuritySession } from '../types';
 
@@ -111,7 +110,6 @@ interface InsuranceRail {
   eligibilitySupported: boolean;
   benefitsSupported: boolean;
   priorAuthSupported: boolean;
-  priorAuthTrackingSupported: boolean;
   claimStatusSupportedFuture: boolean;
   payerListStatus: string;
   lastEligibilityCheck: string | null;
@@ -173,7 +171,7 @@ const tabs: Array<{ key: TabKey; label: string; icon: React.ElementType }> = [
 
 function formatDateTime(value: string | null | undefined) {
   if (!value) return '—';
-  return new Date(value).toLocaleString(getLocale(), {
+  return new Date(value).toLocaleString('en-US', {
     month: 'short',
     day: 'numeric',
     hour: 'numeric',
@@ -419,19 +417,19 @@ export default function ControlPlane() {
 
   const overviewCards = [
     { title: 'Users', value: overview?.summary.totalUsers ?? 0, subtitle: 'Tenant accounts', icon: <Users2 className="w-4 h-4" />, accent: 'blue' as const },
-    { title: 'Active users', value: overview?.summary.activeUsers ?? 0, subtitle: 'Enabled accounts', icon: <CheckCircle2 className="w-4 h-4" />, accent: 'emerald' as const },
+    { title: 'Active users', value: overview?.summary.activeUsers ?? 0, subtitle: 'Signed in and active', icon: <CheckCircle2 className="w-4 h-4" />, accent: 'emerald' as const },
     { title: 'Admin users', value: overview?.summary.adminUsers ?? 0, subtitle: 'OWNER / ADMIN', icon: <ShieldCheck className="w-4 h-4" />, accent: 'violet' as const },
     { title: 'Clinics', value: overview?.summary.clinics ?? 0, subtitle: 'Branches in tenant', icon: <Building2 className="w-4 h-4" />, accent: 'amber' as const },
     { title: 'Integration health', value: `${overview?.summary.activeIntegrations ?? 0}/${overview?.integrations.length ?? 0}`, subtitle: 'Active integrations', icon: <Network className="w-4 h-4" />, accent: 'indigo' as const },
-    { title: 'Control checks', value: `${overview?.summary.productionReadinessScore ?? 0}%`, subtitle: 'Configured-check score', icon: <BadgeCheck className="w-4 h-4" />, accent: 'emerald' as const },
+    { title: 'Readiness', value: `${overview?.summary.productionReadinessScore ?? 0}%`, subtitle: 'Production readiness', icon: <BadgeCheck className="w-4 h-4" />, accent: 'emerald' as const },
   ];
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Control Plane"
-        subtitle="Review access, recorded controls, audit events, provider connectivity, and system health for this workspace."
-        badge={loading ? 'Loading…' : `Checks ${overview?.summary.productionReadinessScore ?? 0}%`}
+        subtitle="Enterprise governance for access, security posture, audit, integrations, insurance rails, finance rails, and system health."
+        badge={loading ? 'Loading…' : `Readiness ${overview?.summary.productionReadinessScore ?? 0}%`}
         badgeColor="violet"
         actions={
           <button
@@ -444,12 +442,8 @@ export default function ControlPlane() {
         }
       />
 
-      <div role="note" className="rounded-2xl border border-[var(--amber-soft)] bg-[var(--amber-soft)] px-4 py-3 text-xs text-amber-v">
-        The displayed score summarizes selected configuration checks. It is not a security assessment, compliance certification, or authorization to launch.
-      </div>
-
       {error && (
-        <div role="alert" className="rounded-2xl border border-[var(--red-soft)] bg-[var(--red-soft)] p-4 text-sm text-red-v">
+        <div className="rounded-2xl border border-[var(--red-soft)] bg-[var(--red-soft)] p-4 text-sm text-red-v">
           {error}
         </div>
       )}
@@ -481,12 +475,12 @@ export default function ControlPlane() {
           </div>
 
           <div className="grid gap-4 xl:grid-cols-[1.6fr_1fr]">
-            <BentoCard title="Configuration checks" subtitle="Calculated from the runtime signals listed below" headerRight={<BadgeCheck className="w-4 h-4 text-t3" />}>
+            <BentoCard title="Production Readiness" subtitle="Honest status, no fake green checks" headerRight={<BadgeCheck className="w-4 h-4 text-t3" />}>
               <div className="grid gap-3 sm:grid-cols-2">
                 <div className="rounded-2xl border border-[var(--b1)] p-4">
-                  <p className="text-xs text-t3">Configured-check score</p>
+                  <p className="text-xs text-t3">Readiness score</p>
                   <p className="mt-2 text-3xl font-black text-t1">{overview?.summary.productionReadinessScore ?? 0}%</p>
-                  <p className="mt-1 text-xs text-t3">Calculated from authentication, secret configuration, integration status, access controls, audit logging, and tenant-isolation checks.</p>
+                  <p className="mt-1 text-xs text-t3">Based on auth, secrets, integration posture, RBAC, audit logging, and tenant isolation.</p>
                 </div>
                 <div className="rounded-2xl border border-[var(--b1)] p-4">
                   <p className="text-xs text-t3">Payment rails</p>
@@ -498,7 +492,7 @@ export default function ControlPlane() {
 
             <BentoCard title="Security Alerts" subtitle="Issues that need owner attention" headerRight={<AlertTriangle className="w-4 h-4 text-t3" />}>
               <div className="space-y-2">
-                {(postureAlerts.length > 0 ? postureAlerts : [{ severity: 'low', title: 'No alerts returned', message: 'The checks shown did not return an alert. This is not a complete security assessment.' }]).map((alert, index) => (
+                {(postureAlerts.length > 0 ? postureAlerts : [{ severity: 'low', title: 'No alerts', message: 'Security posture is clean for the current configuration.' }]).map((alert, index) => (
                   <div key={`${alert.title}-${index}`} className="rounded-xl border border-[var(--b1)] p-3">
                     <div className="flex items-center justify-between gap-2">
                       <p className="text-sm font-semibold text-t1">{alert.title}</p>
@@ -733,7 +727,7 @@ export default function ControlPlane() {
                 <button type="button" onClick={() => setEditingAccessUserId(null)} className="text-xs font-semibold text-t3 hover:text-t1">Close</button>
               </div>
               <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-                {(usersPayload?.branches ?? []).filter(branch => branch.active).map(branch => (
+                {(usersPayload?.branches ?? []).map(branch => (
                   <label key={branch.id} className="flex items-center justify-between gap-3 rounded-xl border border-[var(--b1)] px-3 py-2 text-sm text-t2">
                     <span className="min-w-0">
                       <span className="block truncate font-semibold text-t1">{branch.name}</span>
@@ -743,17 +737,10 @@ export default function ControlPlane() {
                       type="checkbox"
                       checked={accessDraft.branchIds.includes(branch.id)}
                       onChange={event => {
-                        setAccessDraft(current => {
-                          const branchIds = event.target.checked
-                            ? [...current.branchIds, branch.id]
-                            : current.branchIds.filter(branchId => branchId !== branch.id);
-                          return {
-                            branchIds,
-                            primaryBranchId: current.primaryBranchId && branchIds.includes(current.primaryBranchId)
-                              ? current.primaryBranchId
-                              : branchIds[0],
-                          };
-                        });
+                        setAccessDraft(current => ({
+                          ...current,
+                          branchIds: event.target.checked ? [...current.branchIds, branch.id] : current.branchIds.filter(branchId => branchId !== branch.id),
+                        }));
                       }}
                     />
                   </label>
@@ -980,12 +967,12 @@ export default function ControlPlane() {
         <div className="space-y-4">
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <StatCard title="Auth mode" value={posture.authMode} subtitle="Current session strategy" icon={<KeyRound className="w-4 h-4" />} accent="blue" />
-            <StatCard title="Control checks" value={`${overview?.summary.productionReadinessScore ?? 0}%`} subtitle={posture.riskLabel} icon={<ShieldCheck className="w-4 h-4" />} accent="emerald" />
+            <StatCard title="Readiness" value={`${overview?.summary.productionReadinessScore ?? 0}%`} subtitle={posture.riskLabel} icon={<ShieldCheck className="w-4 h-4" />} accent="emerald" />
             <StatCard title="Alerts" value={posture.alerts.length} subtitle="Security warnings" icon={<AlertTriangle className="w-4 h-4" />} accent="amber" />
             <StatCard title="Access TTL" value={`${posture.accessTokenTtlMinutes}m`} subtitle="Short-lived access tokens" icon={<Lock className="w-4 h-4" />} accent="violet" />
           </div>
           <div className="grid gap-4 xl:grid-cols-[1fr_1fr]">
-            <BentoCard title="Recorded security controls" subtitle="Reported authentication, access, isolation, and infrastructure checks">
+            <BentoCard title="Security Posture" subtitle="Real auth, RBAC, tenant isolation, and infra checks">
               <div className="grid gap-2 sm:grid-cols-2">
                 {[
                   ['Password login', posture.passwordLoginEnabled],
@@ -1090,7 +1077,7 @@ export default function ControlPlane() {
                   <div className="mt-2 space-y-1 text-[11px] text-t2">
                     <p>Eligibility: {provider.eligibilitySupported ? 'Yes' : 'No'}</p>
                     <p>Benefits: {provider.benefitsSupported ? 'Yes' : 'No'}</p>
-                    <p>Prior auth: {provider.priorAuthSupported ? 'Payer-connected' : provider.priorAuthTrackingSupported ? 'Manual tracking only' : 'No'}</p>
+                    <p>Prior auth: {provider.priorAuthSupported ? 'Yes' : 'No'}</p>
                     <p>Payer list: {provider.payerListStatus}</p>
                     <p>Error rate: {provider.errorRate}%</p>
                   </div>

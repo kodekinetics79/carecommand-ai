@@ -3,23 +3,6 @@
 # API web service, the always-on background worker (drains the BullMQ queues),
 # and a managed Key Value (Redis) instance. Secrets are set in the dashboard.
 #
-# ══════════════════════════════════════════════════════════════════════════
-# DEPLOYMENT POSTURE: DEMO-GRADE AS WRITTEN — NOT FIT FOR ENTERPRISE VALIDATION
-#
-# This blueprint ships DEPLOYMENT_PROFILE=demo with mock payments/insurance/AI
-# and FREE plans. Free-plan services spin down after ~15 min idle (cold starts,
-# dropped webhooks, no HA) and free Key Value is non-persistent — that alone
-# disqualifies this file, unmodified, for any enterprise validation cycle.
-# Before pointing a pilot or enterprise validation at this blueprint:
-#   1. Upgrade every `plan: free` to an always-on paid plan.
-#   2. Set DEPLOYMENT_PROFILE=pilot|enterprise. The app then REFUSES TO BOOT
-#      while any integration is still mock unless explicitly acknowledged via
-#      ALLOWED_MOCK_INTEGRATIONS (enterprise never allows mock payments).
-#   3. Record every integration's mode (live/sandbox/mock/not-configured) per
-#      docs/INTEGRATION_MODE_REGISTER.md — buyer-facing claims must not mix
-#      modes. Verify the live posture at GET /health/integrations.
-# ══════════════════════════════════════════════════════════════════════════
-#
 # NOTE: this lives on the feature branch — merge to `main` (or connect the
 # Blueprint to this branch) before deploying.
 
@@ -28,7 +11,7 @@ services:
   - type: keyvalue
     name: carecommand-redis
     region: oregon
-    plan: free            # demo only; upgrade for enterprise validation/persistence/HA
+    plan: free            # upgrade for persistence/HA
     ipAllowList: []       # internal-only (reachable by the services below)
     maxmemoryPolicy: noeviction   # required by BullMQ
 
@@ -37,7 +20,7 @@ services:
     name: carecommand-ai
     runtime: node
     region: oregon
-    plan: free            # demo only; upgrade for enterprise validation (no spindown)
+    plan: free            # fine for testing; spins down when idle
     # prisma CLI is a prod dependency, so `npm ci` (which omits devDeps under
     # NODE_ENV=production) still installs it. db:deploy runs migrations here
     # because preDeployCommand is a paid-plan-only feature (skipped on free).
@@ -66,14 +49,8 @@ services:
     buildCommand: npm ci && npm run db:generate
     startCommand: npm run worker:start
     autoDeploy: true
-    # NOTE: Render workers accept no inbound traffic, so the worker's /metrics
-    # listener (WORKER_METRICS_PORT) is not scrapable here. Job metrics need a
-    # private service + in-network Prometheus/agent, or another host. See
-    # docs/OBSERVABILITY.md#worker-metrics.
     envVars:
       - fromGroup: carecommand-shared
-      - key: OTEL_SERVICE_NAME
-        value: carecommand-worker
       - key: REDIS_URL
         fromService:
           type: keyvalue
@@ -86,20 +63,10 @@ envVarGroups:
     envVars:
       - key: NODE_ENV
         value: production
-      # Deployment posture gate (see header block). 'demo' is truthful for this
-      # blueprint as written. Flip to 'pilot'/'enterprise' ONLY after replacing
-      # the mock providers below (or acknowledging them via
-      # ALLOWED_MOCK_INTEGRATIONS) — otherwise the app fails boot by design.
-      - key: DEPLOYMENT_PROFILE
-        value: demo
       - key: QUEUES_ENABLED
         value: "true"
-      - key: QUEUE_NAMESPACE
-        value: carecommand-render
       - key: RLS_ENFORCE_RUNTIME_ROLE
-        value: "false"     # enterprise validation/prod: set true after DATABASE_URL uses app_rls
-      - key: PLATFORM_LEGACY_TOKEN_ENABLED
-        value: "false"
+        value: "false"     # keep false until DATABASE_URL is the restricted app_rls role
       - key: LOG_LEVEL
         value: info
       - key: AI_PROVIDER

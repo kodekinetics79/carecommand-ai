@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { X, User, Mail, Phone, CalendarDays, ShieldCheck, CreditCard, Sparkles, Tag } from 'lucide-react';
+import { X, User, Mail, Phone, CalendarDays, ShieldCheck, CreditCard, Cpu, Sparkles, Tag } from 'lucide-react';
 import { formatCurrency } from '../../utils/formatters';
 import ConsentBadgeGroup from './ConsentBadgeGroup';
 import { apiRequest } from '../../lib/api';
@@ -31,7 +31,7 @@ export default function PatientGrowthDrawer({ lead, patient, onClose, onNavigate
     return () => { a = false; };
   }, [patient]);
 
-  const consent = patient?.consent ?? lead?.consent ?? { email: 'unknown', sms: 'unknown', whatsapp: 'unknown', voice: 'unknown', evidenceAvailable: false };
+  const consent = patient?.consent ?? lead?.consent ?? { email: true, sms: true, whatsapp: false, voice: true, marketing: false, doNotContact: false, campaignReady: false };
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end" role="dialog" aria-modal="true" aria-label={`${subjectName} growth profile`}>
@@ -60,7 +60,7 @@ export default function PatientGrowthDrawer({ lead, patient, onClose, onNavigate
           {/* Consent */}
           <Block icon={<ShieldCheck className="w-3.5 h-3.5" />} title="Consent & communication">
             <ConsentBadgeGroup consent={consent} />
-            <p className="text-[11px] text-t3 mt-2">Recorded lead channel: <span className="font-semibold text-t2">{lead?.bestChannel ?? 'Not available'}</span>. Consent and suppression are checked at dispatch.</p>
+            <p className="text-[11px] text-t3 mt-2">Preferred channel: <span className="font-semibold text-t2">{lead?.bestChannel ?? (consent.whatsapp ? 'WhatsApp' : consent.sms ? 'SMS' : 'Email')}</span></p>
           </Block>
 
           {/* Value + risk */}
@@ -71,7 +71,7 @@ export default function PatientGrowthDrawer({ lead, patient, onClose, onNavigate
               <Metric label="Last visit" value={patient!.lastVisit ? new Date(patient!.lastVisit).toLocaleDateString() : '—'} />
               <Metric label="Next visit" value={patient!.nextVisit ? new Date(patient!.nextVisit).toLocaleDateString() : 'Not booked'} />
             </> : <>
-              <Metric label="Planning priority" value={String(lead!.score)} accent={lead!.score >= 70} />
+              <Metric label="AI score" value={String(lead!.score)} accent={lead!.score >= 70} />
               <Metric label="Estimated value" value={formatCurrency(lead!.estimatedValue)} />
               <Metric label="Stage" value={lead!.stage.replace('-', ' ')} />
               <Metric label="Age" value={`${lead!.ageDays}d`} />
@@ -100,6 +100,10 @@ export default function PatientGrowthDrawer({ lead, patient, onClose, onNavigate
             </Block>
           )}
 
+          {/* Honest placeholders for sections without a backend feed */}
+          <Block icon={<Cpu className="w-3.5 h-3.5" />} title="Device / RPM signals & timeline">
+            <p className="text-[11px] text-t3">Device readings, full communication timeline, notes, and per-record audit trail are pending backend feeds (RPM model + comms log + <code className="font-mono">GET /v1/patients/:id/audit</code>).</p>
+          </Block>
         </div>
 
         <footer className="p-5 border-t border-[var(--b1)] bg-[var(--s1)] grid grid-cols-2 gap-2">

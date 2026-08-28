@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- dev verification script */
 /**
- * Canonical PlatformUser Tenant Provisioning + Control Plane verification.
+ * Tenant Onboarding + Platform Control Plane verification.
  *   npx tsx server/modules/platform/platform.verify.ts
  */
 import 'dotenv/config';
@@ -8,12 +8,9 @@ import { randomUUID } from 'node:crypto';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '../../generated/prisma/client';
 import { buildApp } from '../../app';
-import { decryptSecret } from '../../lib/security';
-import { generateTotp } from '../../lib/totp';
 
 const ownerDb = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_MIGRATION_URL ?? process.env.DATABASE_URL }) });
-const PLATFORM_OWNER_EMAIL = process.env.PLATFORM_OWNER_EMAIL;
-const PLATFORM_OWNER_PASSWORD = process.env.PLATFORM_OWNER_PASSWORD;
+const PLATFORM_TOKEN = process.env.PLATFORM_API_TOKEN ?? 'dev-platform-operator-token';
 const DEV_TENANT = process.env.DEV_TENANT_ID!;
 let fail = 0;
 const check = (l: string, ok: boolean) => { console.log(`${ok ? '✓' : '✗'} ${l}`); if (!ok) fail++; };
@@ -22,40 +19,8 @@ async function main() {
   const app = await buildApp();
   let ipN = 0;
   const ip = () => `10.7.${(++ipN >> 8) & 255}.${ipN & 255}`;
-  if (!PLATFORM_OWNER_EMAIL || !PLATFORM_OWNER_PASSWORD) throw new Error('Set PLATFORM_OWNER_EMAIL and PLATFORM_OWNER_PASSWORD to run this verifier.');
-  const platformLogin = await app.inject({
-    method: 'POST', url: '/v1/platform/auth/login', headers: { 'x-forwarded-for': ip() },
-    payload: { email: PLATFORM_OWNER_EMAIL, password: PLATFORM_OWNER_PASSWORD },
-  });
-  const platformLoginBody = JSON.parse(platformLogin.body);
-  if (platformLogin.statusCode !== 200 || !platformLoginBody.mfaToken) {
-    throw new Error('PlatformUser password verification failed.');
-  }
-  let verificationCode: string;
-  if (platformLoginBody.mfaSetupRequired) {
-    const setup = await app.inject({
-      method: 'POST', url: '/v1/platform/auth/mfa/setup',
-      headers: { authorization: `Bearer ${platformLoginBody.mfaToken}`, 'x-forwarded-for': ip() },
-    });
-    const setupBody = JSON.parse(setup.body);
-    if (setup.statusCode !== 200 || !setupBody.secret) throw new Error('Platform MFA enrollment setup failed.');
-    verificationCode = generateTotp(setupBody.secret);
-  } else {
-    const operator = await ownerDb.platformUser.findUnique({ where: { email: PLATFORM_OWNER_EMAIL } });
-    const secret = operator?.mfaSecretEnc ? decryptSecret(operator.mfaSecretEnc) : null;
-    if (!secret) throw new Error('Platform MFA challenge secret is unavailable to the verifier.');
-    verificationCode = generateTotp(secret);
-  }
-  const verified = await app.inject({
-    method: 'POST', url: '/v1/platform/auth/mfa/verify',
-    headers: { authorization: `Bearer ${platformLoginBody.mfaToken}`, 'x-forwarded-for': ip() },
-    payload: { code: verificationCode },
-  });
-  const verifiedBody = JSON.parse(verified.body);
-  if (verified.statusCode !== 200 || !verifiedBody.token) throw new Error('Platform MFA verification failed.');
-  const platformToken = verifiedBody.token as string;
   const plat = (m: 'GET' | 'PATCH' | 'POST', url: string, payload?: unknown) =>
-    app.inject({ method: m, url, headers: { authorization: `Bearer ${platformToken}`, 'x-forwarded-for': ip() }, payload: payload as object });
+    app.inject({ method: m, url, headers: { 'x-platform-token': PLATFORM_TOKEN, 'x-forwarded-for': ip() }, payload: payload as object });
   const tenantTok = (userId: string, tenantId: string) => app.jwt.sign({ userId, tenantId, role: 'OWNER', type: 'access' });
   const tcall = (m: 'GET' | 'PATCH' | 'POST', url: string, t: string, payload?: unknown) =>
     app.inject({ method: m, url, headers: { authorization: `Bearer ${t}`, 'x-forwarded-for': ip() }, payload: payload as object });
@@ -64,16 +29,15 @@ async function main() {
   const ownerEmail = `owner-${randomUUID().slice(0, 8)}@onb.test`;
   const ownerPassword = 'Owner-Pass-9';
 
-  // 1) Canonical PlatformUser workflow creates tenant, owner, branch, trial subscription, entitlements
-  const onb = await plat('POST', '/v1/platform/tenants', {
-    name: 'Onboard Clinic', slug, ownerName: 'Olivia Owner', ownerEmail, ownerPassword,
+  // 1) Onboarding creates tenant, owner, branch, trial subscription, entitlements
+  const onb = await plat('POST', '/v1/onboarding/tenant', {
+    clinicName: 'Onboard Clinic', clinicSlug: slug, ownerName: 'Olivia Owner', ownerEmail, ownerPassword,
     defaultBranchName: 'Main Branch', timezone: 'America/New_York',
   });
   const onbBody = JSON.parse(onb.body);
-  check('platform provisioning → 201 with tenant + trial subscription', onb.statusCode === 201 && onbBody.subscription.status === 'TRIAL' && onbBody.subscription.planKey === 'starter');
-  check('platform provisioning does not expose password hash', !JSON.stringify(onbBody).toLowerCase().includes('passwordhash') && !JSON.stringify(onbBody).includes('scrypt$'));
-  const tenantA = onbBody.tenant.id;
-  const ownerA = (await ownerDb.user.findFirstOrThrow({ where: { tenantId: tenantA, email: ownerEmail }, select: { id: true } })).id;
+  check('onboarding → 201 with tenant + owner + trial subscription', onb.statusCode === 201 && onbBody.subscription.status === 'TRIAL' && onbBody.subscription.planKey === 'starter');
+  check('onboarding does not expose password hash', !JSON.stringify(onbBody).toLowerCase().includes('passwordhash') && !JSON.stringify(onbBody).includes('scrypt$'));
+  const tenantA = onbBody.tenant.id; const ownerA = onbBody.owner.id;
   const dbBranch = await ownerDb.branch.count({ where: { tenantId: tenantA } });
   const dbEnt = await ownerDb.tenantFeatureEntitlement.count({ where: { tenantId: tenantA } });
   check('default branch + 15 entitlements created', dbBranch === 1 && dbEnt === 15);
@@ -123,12 +87,10 @@ async function main() {
   const subAfterReject = await ownerDb.tenantSubscription.findUnique({ where: { tenantId: tenantA }, include: { plan: true } });
   check('subscription unchanged after rejection (still enterprise)', subAfterReject?.plan.key === 'enterprise');
 
-  // 8) Tenant isolation — provision tenant B; A cannot see B's data
+  // 8) Tenant isolation — onboard tenant B; A cannot see B's data
   const slugB = `clinic-${randomUUID().slice(0, 8)}`;
-  const ownerEmailB = `b-${randomUUID().slice(0, 8)}@onb.test`;
-  const onbB = JSON.parse((await plat('POST', '/v1/platform/tenants', { name: 'Clinic B', slug: slugB, ownerName: 'Bob B', ownerEmail: ownerEmailB, ownerPassword, defaultBranchName: 'B Branch' })).body);
-  const ownerB = await ownerDb.user.findFirstOrThrow({ where: { tenantId: onbB.tenant.id, email: ownerEmailB }, select: { id: true } });
-  const bTok = tenantTok(ownerB.id, onbB.tenant.id);
+  const onbB = JSON.parse((await plat('POST', '/v1/onboarding/tenant', { clinicName: 'Clinic B', clinicSlug: slugB, ownerName: 'Bob B', ownerEmail: `b-${randomUUID().slice(0, 8)}@onb.test`, ownerPassword, defaultBranchName: 'B Branch' })).body);
+  const bTok = tenantTok(onbB.owner.id, onbB.tenant.id);
   const aReqList = JSON.parse((await tcall('GET', '/v1/subscriptions/requests', aTok)).body);
   const bReqList = JSON.parse((await tcall('GET', '/v1/subscriptions/requests', bTok)).body);
   check('request lists isolated (A has its own, B has none)', aReqList.length >= 1 && bReqList.length === 0);

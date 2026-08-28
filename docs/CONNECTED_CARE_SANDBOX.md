@@ -13,7 +13,7 @@ encrypted in the DB** (configured at **Integration Setup → `/integration-setup
 ## TL;DR — make it test-ready in 2 commands
 
 ```bash
-npm run db:seed        # guarded synthetic data; requires the documented test-only confirmation variables
+npm run db:seed        # base data (patients, devices, providers, monitoring)
 npm run demo:sandbox   # flip every provider to Sandbox + stream live readings
 ```
 

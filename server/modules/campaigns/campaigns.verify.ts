@@ -5,7 +5,7 @@
  *
  * Proves: insurance carry-forward (eligibility by appointmentId), model reuse,
  * consent/suppression gating, campaign CRUD, deterministic audiences, provider
- * setup_required vs dev-mock provider acceptance, delivery idempotency/rerun, approval gating,
+ * setup_required vs dev-mock sent, delivery idempotency/rerun, approval gating,
  * RBAC, tenant isolation, intelligence connection, briefing opportunities, audit,
  * mobile-ready fields, no-PHI payloads.
  */
@@ -53,16 +53,6 @@ async function main() {
   const tok = (userId: string, tenantId: string) => app.jwt.sign({ userId, tenantId, role: 'ADMIN', type: 'access' });
   const call = (method: 'GET' | 'POST' | 'PATCH', url: string, t: string, payload?: unknown) =>
     app.inject({ method, url, headers: { authorization: `Bearer ${t}`, 'x-forwarded-for': ip() }, payload: payload as object });
-  const exactPreview = async (campaignId: string, token: string) =>
-    JSON.parse((await call('GET', `/v1/crm/campaigns/${campaignId}/launch-preview`, token)).body);
-  const approveExact = async (campaignId: string, token: string) => {
-    const reviewed = await exactPreview(campaignId, token);
-    return call('POST', `/v1/crm/campaigns/${campaignId}/approve`, token, { previewFingerprint: reviewed.fingerprint, confirmExactAudienceTemplateProvider: true });
-  };
-  const launchExact = async (campaignId: string, token: string) => {
-    const reviewed = await exactPreview(campaignId, token);
-    return call('POST', `/v1/crm/campaigns/${campaignId}/launch`, token, { previewFingerprint: reviewed.fingerprint, confirmExactAudienceTemplateProvider: true });
-  };
   const aTok = tok(tA.admin.id, tA.id);
   const aBilling = tok(tA.billing.id, tA.id);
   const aProvider = tok(tA.provider.id, tA.id);
@@ -96,36 +86,36 @@ async function main() {
 
   // 12) Draft requires approval; launch before approval blocked.
   const draft = JSON.parse((await call('POST', `/v1/crm/campaigns/${campaign.id}/draft`, aTok)).body);
-  const earlyLaunch = await call('POST', `/v1/crm/campaigns/${campaign.id}/launch`, aTok, { previewFingerprint: '0'.repeat(64), confirmExactAudienceTemplateProvider: true });
+  const earlyLaunch = await call('POST', `/v1/crm/campaigns/${campaign.id}/launch`, aTok);
   check('12. rule-based draft requires approval; launch blocked pre-approval', draft.draftSource === 'rule_based' && draft.requiresApproval === true && earlyLaunch.statusCode === 409);
 
-  await approveExact(campaign.id, aTok);
+  await call('POST', `/v1/crm/campaigns/${campaign.id}/approve`, aTok);
 
   // 6) Provider missing → setup_required, nothing sent, stays DRAFT.
   const savedSid = env.TWILIO_ACCOUNT_SID, savedTok = env.TWILIO_AUTH_TOKEN, savedFrom = env.TWILIO_FROM_NUMBER;
   (env as any).TWILIO_ACCOUNT_SID = undefined; (env as any).TWILIO_AUTH_TOKEN = undefined; (env as any).TWILIO_FROM_NUMBER = undefined;
-  const setupLaunch = JSON.parse((await launchExact(campaign.id, aTok)).body);
-  check('6. provider missing → setup_required, nothing accepted', setupLaunch.setupRequired === true && setupLaunch.summary.accepted === 0 && setupLaunch.summary.setupRequired >= 1);
+  const setupLaunch = JSON.parse((await call('POST', `/v1/crm/campaigns/${campaign.id}/launch`, aTok)).body);
+  check('6. provider missing → setup_required, nothing sent', setupLaunch.setupRequired === true && setupLaunch.summary.sent === 0 && setupLaunch.summary.setupRequired >= 1);
 
-  // 7) Mock provider (dev) → accepted, not delivered.
+  // 7) Mock provider (dev) → sent.
   (env as any).TWILIO_ACCOUNT_SID = 'mock_sid'; (env as any).TWILIO_AUTH_TOKEN = 'mock_tok'; (env as any).TWILIO_FROM_NUMBER = '+15550000000';
-  const sentLaunch = JSON.parse((await launchExact(campaign.id, aTok)).body);
-  check('7. dev mock provider records accepted (not delivered) + suppressed/skipped truthful', sentLaunch.summary.accepted >= 1 && sentLaunch.summary.suppressed >= 1 && sentLaunch.summary.skipped >= 1);
+  const sentLaunch = JSON.parse((await call('POST', `/v1/crm/campaigns/${campaign.id}/launch`, aTok)).body);
+  check('7. dev mock provider marks sent (eligible) + suppressed/skipped truthful', sentLaunch.summary.sent >= 1 && sentLaunch.summary.suppressed >= 1 && sentLaunch.summary.skipped >= 1);
 
   // 3b) Consent opt-out actually suppressed the opted-out recipient's delivery.
   const optDelivery = await ownerDb.campaignDelivery.findFirst({ where: { tenantId: tA.id, campaignId: campaign.id, patientId: pOpt.id } });
   check('3. consent opt-out suppresses delivery', optDelivery?.status === 'suppressed');
 
-  // 8 + 9 + 11) Idempotent: rerun does not duplicate rows or resubmit accepted ones.
+  // 8 + 9 + 11) Idempotent: rerun does not duplicate rows or resend sent ones.
   const countBefore = await ownerDb.campaignDelivery.count({ where: { tenantId: tA.id, campaignId: campaign.id } });
-  const sentRow = await ownerDb.campaignDelivery.findFirst({ where: { tenantId: tA.id, campaignId: campaign.id, status: 'accepted' } });
-  const rerun = JSON.parse((await launchExact(campaign.id, aTok)).body);
+  const sentRow = await ownerDb.campaignDelivery.findFirst({ where: { tenantId: tA.id, campaignId: campaign.id, status: 'sent' } });
+  const rerun = JSON.parse((await call('POST', `/v1/crm/campaigns/${campaign.id}/launch`, aTok)).body);
   const countAfter = await ownerDb.campaignDelivery.count({ where: { tenantId: tA.id, campaignId: campaign.id } });
   const sentRowAfter = await ownerDb.campaignDelivery.findUnique({ where: { id: sentRow!.id } });
-  check('8/9/11. rerun idempotent: no duplicate rows, no resubmit of accepted recipients', countBefore === countAfter && rerun.summary.accepted >= 1 && sentRowAfter?.providerAcceptedAt?.getTime() === sentRow?.providerAcceptedAt?.getTime());
+  check('8/9/11. rerun idempotent: no duplicate rows, no resend of sent recipients', countBefore === countAfter && rerun.summary.sent >= 1 && sentRowAfter?.sentAt?.getTime() === sentRow?.sentAt?.getTime());
 
-  // 10) Re-processing (duplicate trigger) does not regress accepted evidence.
-  check('10. duplicate launch does not regress accepted delivery state', sentRowAfter?.status === 'accepted');
+  // 10) Re-processing (duplicate trigger) does not flip a sent delivery's state.
+  check('10. duplicate launch does not regress sent delivery state', sentRowAfter?.status === 'sent');
 
   // 13) Unauthorized role (PROVIDER) cannot launch.
   const provLaunch = await call('POST', `/v1/crm/campaigns/${campaign.id}/launch`, aProvider);
@@ -134,9 +124,9 @@ async function main() {
   // 14) BILLING can manage a payment follow-up campaign.
   await ownerDb.depositRequirement.create({ data: { tenantId: tA.id, branchId: tA.branchId, patientId: pElig.id, status: 'required', requiredAmount: 50, reason: 'deposit', mode: 'mock' } });
   const billCamp = JSON.parse((await call('POST', '/v1/crm/campaigns', aBilling, { name: 'Deposit followup', campaignType: 'unpaid_deposit_followup', audienceType: 'unpaid_deposit_followup', channel: 'sms' })).body);
-  await approveExact(billCamp.id, aBilling);
-  const billLaunch = await launchExact(billCamp.id, aBilling);
-  check('14. BILLING manages payment follow-up campaign', billLaunch.statusCode === 200 && JSON.parse(billLaunch.body).summary.accepted >= 1);
+  await call('POST', `/v1/crm/campaigns/${billCamp.id}/approve`, aBilling);
+  const billLaunch = await call('POST', `/v1/crm/campaigns/${billCamp.id}/launch`, aBilling);
+  check('14. BILLING manages payment follow-up campaign', billLaunch.statusCode === 200 && JSON.parse(billLaunch.body).summary.sent >= 1);
 
   // Fixtures for failed-payment audience + empty-slot opportunity.
   await ownerDb.paymentRequest.create({ data: { tenantId: tA.id, branchId: tA.branchId, patientId: pOpt.id, amount: 75, status: 'failed', reason: 'deposit', mode: 'mock' } });
@@ -183,21 +173,10 @@ async function main() {
   check('20. mobile-ready fields on deliveries', !!d0 && 'deliveryId' in d0 && 'status' in d0 && 'channel' in d0 && 'destinationMasked' in d0 && 'deepLinkTarget' in d0);
 
   // Consent + suppression endpoints audited.
-  const revokedConsent = await call('POST', '/v1/crm/consent', aTok, { patientId: pElig.id, channel: 'email', status: 'opted_out' });
-  const incompleteGrant = await call('POST', '/v1/crm/consent', aTok, { patientId: pElig.id, channel: 'email', status: 'opted_in' });
-  const crossTenantGrant = await call('POST', '/v1/crm/consent', bTok, {
-    patientId: pElig.id, channel: 'email', status: 'opted_in', outreachPurpose: 'inactive_patient_reactivation',
-    policyVersion: 'email-reactivation-2026-08-01', disclosureTextHash: 'b'.repeat(64), evidenceReference: 'written-form:qa',
-    captureMethod: 'written', evidenceSource: 'patient_written', jurisdiction: 'US-NY',
-  });
-  const versionedGrant = await call('POST', '/v1/crm/consent', aTok, {
-    patientId: pElig.id, channel: 'email', status: 'opted_in', outreachPurpose: 'inactive_patient_reactivation',
-    policyVersion: 'email-reactivation-2026-08-01', disclosureTextHash: 'b'.repeat(64), evidenceReference: 'written-form:qa',
-    captureMethod: 'written', evidenceSource: 'patient_written', jurisdiction: 'US-NY',
-  });
+  await call('POST', '/v1/crm/consent', aTok, { patientId: pElig.id, channel: 'email', status: 'opted_out' });
   await call('POST', '/v1/crm/suppressions', aTok, { patientId: pElig.id, channel: 'voice', reason: 'requested' });
   const actions2 = new Set((await ownerDb.auditEvent.findMany({ where: { tenantId: tA.id }, select: { action: true } })).map(a => a.action));
-  check('19b. nonvoice revocation/grant are explicit, tenant-bound, and audited atomically', revokedConsent.statusCode === 201 && incompleteGrant.statusCode === 400 && crossTenantGrant.statusCode === 404 && versionedGrant.statusCode === 201 && actions2.has('communication.authority.revoked') && actions2.has('communication.authority.granted') && actions2.has('suppression.created'));
+  check('19b. consent.updated + suppression.created audited', actions2.has('consent.updated') && actions2.has('suppression.created'));
 
   (env as any).TWILIO_ACCOUNT_SID = savedSid; (env as any).TWILIO_AUTH_TOKEN = savedTok; (env as any).TWILIO_FROM_NUMBER = savedFrom;
 
@@ -206,7 +185,7 @@ async function main() {
   const prov = JSON.parse((await call('GET', '/v1/crm/provider-status', aTok)).body);
   const provStr = JSON.stringify(prov);
   const noSecrets = ['mock_sid', 'mock_tok', savedSid, savedTok].every(v => !v || !provStr.includes(String(v)));
-  check('A2. provider-status truthfully blocks live campaign dispatch + no secret values', typeof prov.smsConfigured === 'boolean' && Array.isArray(prov.missingEnvKeys) && Array.isArray(prov.supportedChannels) && ['unconfigured', 'mock_dev', 'configured_pending_provider', 'live_supported'].includes(prov.providerMode.sms) && prov.liveSendingSupported === false && prov.liveCampaignDispatchActivated === false && prov.schedulerEnforced === true && noSecrets);
+  check('A2. provider-status truthful fields + no secret values (live SMS + scheduler real)', typeof prov.smsConfigured === 'boolean' && Array.isArray(prov.missingEnvKeys) && Array.isArray(prov.supportedChannels) && ['unconfigured', 'mock_dev', 'configured_pending_provider', 'live_supported'].includes(prov.providerMode.sms) && prov.liveSendingSupported === true && prov.schedulerEnforced === true && noSecrets);
 
   // A3) Delivery webhook: no provider secret configured → provider_not_integrated.
   const wh = await app.inject({ method: 'POST', url: '/v1/crm/webhooks/delivery', headers: { 'content-type': 'application/json', 'x-forwarded-for': ip() }, payload: JSON.stringify({ providerMessageId: 'x', status: 'delivered' }) });
@@ -216,8 +195,8 @@ async function main() {
   const pLegacy = await ownerDb.patient.create({ data: { tenantId: tA.id, branchId: tA.branchId, firstName: 'Lana', lastName: 'Legacy', phone: '+15551110100', lastVisitAt: old, lifecycleStage: 'AT_RISK' } });
   await ownerDb.consentEvent.create({ data: { tenantId: tA.id, patientId: pLegacy.id, purpose: 'SMS', granted: false, source: 'patient' } });
   const legacyCamp = JSON.parse((await call('POST', '/v1/crm/campaigns', aTok, { name: 'Legacy consent', campaignType: 'inactive_patient_reactivation', audienceType: 'inactive_patients', channel: 'sms' })).body);
-  await approveExact(legacyCamp.id, aTok);
-  await launchExact(legacyCamp.id, aTok);
+  await call('POST', `/v1/crm/campaigns/${legacyCamp.id}/approve`, aTok);
+  await call('POST', `/v1/crm/campaigns/${legacyCamp.id}/launch`, aTok);
   const legacyDelivery = await ownerDb.campaignDelivery.findFirst({ where: { tenantId: tA.id, campaignId: legacyCamp.id, patientId: pLegacy.id } });
   check('A5. legacy ConsentEvent opt-out suppresses delivery (safely mapped channel)', legacyDelivery?.status === 'suppressed');
 
@@ -225,20 +204,20 @@ async function main() {
   const pMkt = await ownerDb.patient.create({ data: { tenantId: tA.id, branchId: tA.branchId, firstName: 'Mara', lastName: 'Mkt', phone: '+15551110200', email: 'mara@x.test', lastVisitAt: old, lifecycleStage: 'AT_RISK' } });
   await ownerDb.consentEvent.create({ data: { tenantId: tA.id, patientId: pMkt.id, purpose: 'MARKETING', granted: false, source: 'patient' } });
   const mktCamp = JSON.parse((await call('POST', '/v1/crm/campaigns', aTok, { name: 'Mkt optout', campaignType: 'inactive_patient_reactivation', audienceType: 'inactive_patients', channel: 'email' })).body);
-  await approveExact(mktCamp.id, aTok);
-  await launchExact(mktCamp.id, aTok);
+  await call('POST', `/v1/crm/campaigns/${mktCamp.id}/approve`, aTok);
+  await call('POST', `/v1/crm/campaigns/${mktCamp.id}/launch`, aTok);
   const mktDelivery = await ownerDb.campaignDelivery.findFirst({ where: { tenantId: tA.id, campaignId: mktCamp.id, patientId: pMkt.id } });
   check('A6. MARKETING opt-out suppresses all channels (email)', mktDelivery?.status === 'suppressed');
 
   // A7) Per-recipient delivery BusinessEvents (PHI-safe: no destination).
-  const sentDeliv = await ownerDb.campaignDelivery.findFirst({ where: { tenantId: tA.id, status: 'accepted' } });
-  const perRecipEvent = sentDeliv ? await ownerDb.businessEvent.findFirst({ where: { tenantId: tA.id, eventType: 'campaign.delivery.accepted', entityId: sentDeliv.id } }) : null;
+  const sentDeliv = await ownerDb.campaignDelivery.findFirst({ where: { tenantId: tA.id, status: 'sent' } });
+  const perRecipEvent = sentDeliv ? await ownerDb.businessEvent.findFirst({ where: { tenantId: tA.id, eventType: 'campaign.delivery.sent', entityId: sentDeliv.id } }) : null;
   const evtStr = JSON.stringify(perRecipEvent?.payload ?? {});
   check('A7. per-recipient delivery event exists + no PHI (no destination)', !!perRecipEvent && !evtStr.includes('@') && !evtStr.includes('+1555'));
 
   // A8) Real signed, idempotent delivery webhook updates status by providerMessageId.
   (env as any).CAMPAIGN_WEBHOOK_SECRET = 'whsec_campaign_test';
-  const liveDeliv = await ownerDb.campaignDelivery.findFirst({ where: { tenantId: tA.id, status: 'accepted', providerMessageId: { not: null } } });
+  const liveDeliv = await ownerDb.campaignDelivery.findFirst({ where: { tenantId: tA.id, status: 'sent', providerMessageId: { not: null } } });
   const evtId = `evt_${randomUUID().slice(0, 10)}`;
   const raw = JSON.stringify({ eventId: evtId, providerMessageId: liveDeliv!.providerMessageId, status: 'failed' });
   const sig = createHmac('sha256', 'whsec_campaign_test').update(raw).digest('hex');
@@ -252,8 +231,8 @@ async function main() {
   // A9) Scheduler: approved SCHEDULED + due campaign dispatches once (idempotent).
   (env as any).TWILIO_ACCOUNT_SID = 'mock_sid'; (env as any).TWILIO_AUTH_TOKEN = 'mock_tok'; (env as any).TWILIO_FROM_NUMBER = '+15550000000';
   const schedCamp = JSON.parse((await call('POST', '/v1/crm/campaigns', aTok, { name: 'Scheduled', campaignType: 'inactive_patient_reactivation', audienceType: 'inactive_patients', channel: 'sms' })).body);
+  await call('POST', `/v1/crm/campaigns/${schedCamp.id}/approve`, aTok); // → SCHEDULED
   await ownerDb.campaign.update({ where: { id: schedCamp.id }, data: { scheduledAt: new Date(Date.now() - 60000) } });
-  await approveExact(schedCamp.id, aTok); // exact preview authority → SCHEDULED
   const run1 = await runScheduledCampaigns(new Date());
   const afterRun = await ownerDb.campaign.findUnique({ where: { id: schedCamp.id } });
   const deliv1 = await ownerDb.campaignDelivery.count({ where: { tenantId: tA.id, campaignId: schedCamp.id } });

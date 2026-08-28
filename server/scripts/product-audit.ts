@@ -1,4 +1,4 @@
- 
+/* eslint-disable no-console -- reporting script */
 /**
  * Code-backed Product Completion Audit. Static repo inspection (no DB) that
  * classifies each roadmap feature BUILT / PARTIAL / MISSING / NOT_STARTED from

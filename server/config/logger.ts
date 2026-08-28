@@ -1,5 +1,4 @@
 import { env } from './env';
-import { getTraceIds } from '../lib/traceContext';
 
 // Shared Fastify/pino logger options. Centralised so the redaction policy is
 // applied identically by the HTTP app and any other logger we construct, and so
@@ -28,13 +27,4 @@ export const REDACT_PATHS = [
 export const loggerOptions = {
   level: env.LOG_LEVEL,
   redact: { paths: REDACT_PATHS, censor: REDACTED },
-  // Correlate the three pillars: stamp the active trace/span id onto every log
-  // line so a log entry links straight to its distributed trace (and vice
-  // versa). No-op when tracing is disabled — getTraceIds() returns nulls, which
-  // pino omits. Named `trace_id`/`span_id` to match OTel log-correlation
-  // conventions most backends key on.
-  mixin() {
-    const { traceId, spanId } = getTraceIds();
-    return traceId ? { trace_id: traceId, span_id: spanId } : {};
-  },
 };

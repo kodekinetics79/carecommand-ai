@@ -13,6 +13,7 @@ import { randomUUID, createHmac } from 'node:crypto';
 // Configure a MOCK Retell so launches succeed without network/real creds, while
 // never faking success for real config. Must be set before env.ts parses.
 process.env.RETELL_API_KEY = (process.env.RETELL_API_KEY ?? '').startsWith('mock') ? process.env.RETELL_API_KEY! : 'mock_verify_secret';
+process.env.RETELL_AGENT_ID ||= 'agent_verify';
 process.env.RETELL_FROM_NUMBER ||= '+15550100000';
 
 const { PrismaPg } = await import('@prisma/adapter-pg');
@@ -63,7 +64,6 @@ async function main() {
   });
   check('2. entitled tenant creates campaign (201)', reqCampaignRes.statusCode === 201);
   const reqCampaign = JSON.parse(reqCampaignRes.body);
-  await call('PATCH', `/v1/receptionist/outbound-campaigns/${reqCampaign.id}`, entTok, { status: 'RUNNING' });
 
   // 3) setup_required is honest: with Retell unconfigured, no fake success.
   const savedKey = env.RETELL_API_KEY;

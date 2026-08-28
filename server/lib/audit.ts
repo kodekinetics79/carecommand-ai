@@ -1,6 +1,6 @@
 import type { FastifyRequest } from 'fastify';
+import { db } from './db';
 import type { Prisma } from '../generated/prisma/client';
-import { runWithTenantContext } from './tenantContext';
 
 interface AuditInput {
   action: string;
@@ -10,7 +10,7 @@ interface AuditInput {
 }
 
 export async function audit(request: FastifyRequest, input: AuditInput) {
-  await runWithTenantContext(request.auth.tenantId, tx => tx.auditEvent.create({
+  await db.auditEvent.create({
     data: {
       tenantId: request.auth.tenantId,
       actorUserId: request.auth.userId,
@@ -22,5 +22,5 @@ export async function audit(request: FastifyRequest, input: AuditInput) {
       userAgent: request.headers['user-agent'],
       metadata: input.metadata,
     },
-  }));
+  });
 }

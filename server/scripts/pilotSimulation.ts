@@ -8,18 +8,9 @@ import { generatePasswordHash } from '../lib/security';
 import { buildPilotSimulationCases, type PilotSimulationCase } from './pilotSimulationFixtures';
 
 type JsonResponse = { [key: string]: unknown };
-type OpContext = { caseName: string; tenantId: string };
 
-function jsonHeaders(token: string, idempotencyKey?: string) {
-  return {
-    authorization: `Bearer ${token}`,
-    'content-type': 'application/json',
-    ...(idempotencyKey ? { 'idempotency-key': idempotencyKey } : {}),
-  };
-}
-
-function operationHeaders(token: string, context: OpContext, operation: string) {
-  return jsonHeaders(token, `${context.caseName}:${context.tenantId}:${operation}:${randomUUID()}`);
+function jsonHeaders(token: string) {
+  return { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
 }
 
 function assertOk(condition: boolean, message: string): void {
@@ -69,17 +60,12 @@ async function createTenant(caseData: PilotSimulationCase) {
   };
 }
 
-async function runImport(
-  app: FastifyInstance,
-  token: string,
-  context: OpContext,
-  entityType: 'patients' | 'appointments' | 'insurance',
-  csvText: string,
-) {
+async function runImport(app: FastifyInstance, token: string, tenantId: string, entityType: 'patients' | 'appointments' | 'insurance', csvText: string) {
+  const headers = jsonHeaders(token);
   const previewRes = await app.inject({
     method: 'POST',
-    url: `/v1/platform/tenants/${context.tenantId}/pilot-import/${entityType}/preview`,
-    headers: jsonHeaders(token),
+    url: `/v1/platform/tenants/${tenantId}/pilot-import/${entityType}/preview`,
+    headers,
     payload: JSON.stringify({ csvText, mapping: {} }),
   });
   assertOk(previewRes.statusCode === 200, statusMessage(`${entityType} preview`, previewRes.statusCode, previewRes.body));
@@ -87,8 +73,8 @@ async function runImport(
 
   const commitRes = await app.inject({
     method: 'POST',
-    url: `/v1/platform/tenants/${context.tenantId}/pilot-import/${entityType}/commit`,
-    headers: operationHeaders(token, context, `${entityType}-commit`),
+    url: `/v1/platform/tenants/${tenantId}/pilot-import/${entityType}/commit`,
+    headers,
     payload: JSON.stringify({ csvText, mapping: {} }),
   });
   assertOk(commitRes.statusCode === 200, statusMessage(`${entityType} commit`, commitRes.statusCode, commitRes.body));
@@ -99,12 +85,12 @@ async function runImport(
 
 async function runClinicSimulation(app: FastifyInstance, token: string, caseData: PilotSimulationCase) {
   const { tenantId, cleanup } = await createTenant(caseData);
-  const opContext: OpContext = { caseName: caseData.clinicName, tenantId };
+  const headers = jsonHeaders(token);
 
   try {
-    const patient = await runImport(app, token, opContext, 'patients', caseData.patientCsv);
-    const appointment = await runImport(app, token, opContext, 'appointments', caseData.appointmentCsv);
-    const insurance = await runImport(app, token, opContext, 'insurance', caseData.insuranceCsv);
+    const patient = await runImport(app, token, tenantId, 'patients', caseData.patientCsv);
+    const appointment = await runImport(app, token, tenantId, 'appointments', caseData.appointmentCsv);
+    const insurance = await runImport(app, token, tenantId, 'insurance', caseData.insuranceCsv);
 
     const patientPreview = patient.preview as { summary: { invalid: number; warnings: number }; canCommit: boolean };
     const patientCommit = patient.commit as { summary: { created: number; warnings: number; skipped: number; invalidRows: number; validRows: number; updated: number } };
@@ -138,7 +124,7 @@ async function runClinicSimulation(app: FastifyInstance, token: string, caseData
     const savePresetRes = await app.inject({
       method: 'POST',
       url: `/v1/platform/tenants/${tenantId}/pilot-import/presets`,
-      headers: operationHeaders(token, opContext, 'preset-save'),
+      headers,
       payload: JSON.stringify({
         entityType: 'patients',
         name: presetName,
@@ -160,7 +146,7 @@ async function runClinicSimulation(app: FastifyInstance, token: string, caseData
     const presetPreviewRes = await app.inject({
       method: 'POST',
       url: `/v1/platform/tenants/${tenantId}/pilot-import/patients/preview`,
-      headers: jsonHeaders(token),
+      headers,
       payload: JSON.stringify({ csvText: caseData.patientCsv, mapping: {} }),
     });
     assertOk(presetPreviewRes.statusCode === 200, statusMessage('preset preview', presetPreviewRes.statusCode, presetPreviewRes.body));
@@ -171,7 +157,7 @@ async function runClinicSimulation(app: FastifyInstance, token: string, caseData
     const templateRes = await app.inject({
       method: 'GET',
       url: `/v1/platform/tenants/${tenantId}/pilot-import/patients/template.csv`,
-      headers: jsonHeaders(token),
+      headers,
     });
     assertOk(templateRes.statusCode === 200, statusMessage('template', templateRes.statusCode, templateRes.body));
     assertOk(Boolean(templateRes.headers['content-type']?.includes('text/csv')), `${caseData.clinicName} template content-type missing`);
@@ -179,7 +165,7 @@ async function runClinicSimulation(app: FastifyInstance, token: string, caseData
     const checklistRes = await app.inject({
       method: 'GET',
       url: `/v1/platform/tenants/${tenantId}/pilot-checklist`,
-      headers: jsonHeaders(token),
+      headers,
     });
     assertOk(checklistRes.statusCode === 200, statusMessage('checklist', checklistRes.statusCode, checklistRes.body));
     const checklist = checklistRes.json() as { readinessScore: number; counts: { branches: number; users: number; patients: number; appointments: number; policies: number; imports: number } };
@@ -193,7 +179,7 @@ async function runClinicSimulation(app: FastifyInstance, token: string, caseData
     const shareRes = await app.inject({
       method: 'POST',
       url: `/v1/platform/tenants/${tenantId}/pilot-status-links`,
-      headers: operationHeaders(token, opContext, 'share-create'),
+      headers,
       payload: JSON.stringify({ label: `${caseData.clinicName} pilot share`, expiresInDays: 14 }),
     });
     assertOk(shareRes.statusCode === 201, statusMessage('share create', shareRes.statusCode, shareRes.body));

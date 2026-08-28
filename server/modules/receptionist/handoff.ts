@@ -100,11 +100,7 @@ export async function runBookingHandoff(retellCallId: string, custom: Record<str
   const validDateTime = requestedDateTime && !Number.isNaN(requestedDateTime.getTime()) ? requestedDateTime : null;
   const branchId = campaign.defaultBranchId ?? patient?.branchId ?? null;
 
-  const requestedLegacyDirect = campaign.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE';
-  // This legacy analysis handoff has no signed/version-attested inbound booking
-  // campaign. It is therefore request-only even for pre-existing rows that
-  // still carry the retired direct-booking enum value.
-  const wantsDirect = false;
+  const wantsDirect = campaign.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE';
 
   // Decide whether a safe direct booking is possible. No service/availability
   // model exists, so we validate: branch exists, a parseable time, an existing
@@ -138,9 +134,7 @@ export async function runBookingHandoff(retellCallId: string, custom: Record<str
   }
 
   // Fallback: pending review (request-only mode, or direct booking not safely possible).
-  const reason = requestedLegacyDirect
-    ? 'Unattested direct booking mode was downgraded to staff review.'
-    : 'Appointment request only — routed to staff review.';
+  const reason = wantsDirect ? 'Direct booking not safely possible; routed to staff review.' : 'Appointment request only — routed to staff review.';
   // Create a lead for tracking if no patient matched.
   let leadId: string | null = null;
   if (!patient?.id && collected.phone) {

@@ -1,4 +1,4 @@
-import type { Prisma, PrismaClient } from '../../generated/prisma/client';
+import type { PrismaClient } from '../../generated/prisma/client';
 
 // ===========================================================================
 // Compliance Readiness Center baseline seeding — reusable by the seed script
@@ -41,11 +41,9 @@ const COMPLIANCE_RETENTION = [
   { dataClass: 'audit', retentionDays: 2555, legalBasis: 'Audit-trail retention for accountability.' },
   { dataClass: 'evidence', retentionDays: 3650, legalBasis: 'Compliance evidence retention.' },
   { dataClass: 'security', retentionDays: 1095, legalBasis: 'Security telemetry retention.' },
-  { dataClass: 'receptionist_recording', retentionDays: 30, legalBasis: 'Configurable call-recording schedule; legal/privacy approval required.' },
-  { dataClass: 'receptionist_transcript', retentionDays: 90, legalBasis: 'Configurable call-transcript schedule; legal/privacy approval required.' },
 ] as const;
 
-export async function seedComplianceBaseline(db: PrismaClient | Prisma.TransactionClient, tenantId: string) {
+export async function seedComplianceBaseline(db: PrismaClient, tenantId: string) {
   for (const framework of COMPLIANCE_FRAMEWORKS) {
     const fw = await db.complianceFramework.upsert({
       where: { tenantId_key: { tenantId, key: framework.key } },

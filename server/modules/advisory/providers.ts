@@ -6,15 +6,6 @@ export interface AIProvider {
   generateAnswer(input: AdvisorPromptInput): Promise<string>;
 }
 
-// Every outbound provider call is bounded by an AbortController timeout, matching
-// the rest of the repo's outbound wrappers (commsProvider/retell ~8s). Without it
-// a hung model server would stall an advisory request indefinitely.
-async function fetchWithTimeout(url: string | URL, init: RequestInit, timeoutMs = 8000): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try { return await fetch(url, { ...init, signal: controller.signal }); } finally { clearTimeout(timer); }
-}
-
 function toSentenceCase(value: string) {
   return value.replace(/-/g, ' ').replace(/\b\w/g, character => character.toUpperCase());
 }
@@ -26,12 +17,8 @@ function formatEvidence(input: AdvisorPromptInput) {
     `Summary: ${input.analysis.summary}`,
     `Diagnosis: ${input.analysis.diagnosis}`,
     `Recommended action: ${input.analysis.recommendedAction}`,
-    // HONEST framing: these two numbers are templated rule-based arithmetic over
-    // real backend counts — NOT AI-model confidence or a model-predicted dollar
-    // figure. Labelled as such so the model (and any downstream reader) never
-    // presents them as model reasoning.
-    `Rule-based expected-impact estimate: $${Math.round(input.analysis.expectedImpact).toLocaleString('en-US')}`,
-    `Heuristic confidence (rule-based, not model-derived): ${input.analysis.confidence}%`,
+    `Expected impact: $${Math.round(input.analysis.expectedImpact).toLocaleString('en-US')}`,
+    `Confidence: ${input.analysis.confidence}%`,
     'Evidence:',
     lines,
     'Actions:',
@@ -55,7 +42,7 @@ class OllamaProvider implements AIProvider {
 
   async generateAnswer(input: AdvisorPromptInput) {
     try {
-      const response = await fetchWithTimeout(new URL('/api/chat', env.OLLAMA_BASE_URL), {
+      const response = await fetch(new URL('/api/chat', env.OLLAMA_BASE_URL), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -91,7 +78,7 @@ class OpenAIProvider implements AIProvider {
   async generateAnswer(input: AdvisorPromptInput) {
     if (!env.OPENAI_API_KEY) return this.fallback.generateAnswer(input);
     try {
-      const response = await fetchWithTimeout(new URL('/v1/chat/completions', env.OPENAI_BASE_URL), {
+      const response = await fetch(new URL('/v1/chat/completions', env.OPENAI_BASE_URL), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -130,7 +117,7 @@ class ClaudeProvider implements AIProvider {
   async generateAnswer(input: AdvisorPromptInput) {
     if (!env.CLAUDE_API_KEY) return this.fallback.generateAnswer(input);
     try {
-      const response = await fetchWithTimeout(new URL('/v1/messages', env.CLAUDE_BASE_URL), {
+      const response = await fetch(new URL('/v1/messages', env.CLAUDE_BASE_URL), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

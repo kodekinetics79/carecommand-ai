@@ -43,7 +43,7 @@ The backend is an operational platform boundary, not an EHR. It stores clinic op
 - Autopilot executes higher-impact actions only after an atomic pending-to-approved transition.
 - Production must keep short-lived access tokens, HttpOnly cookie-backed refresh rotation, and a real identity provider or SSO gateway.
 - Passwords must be stored only as salted hashes. The seeded local admin account is for development only.
-- Refresh and logout require a double-submit CSRF header/cookie match. Login/refresh rotate and return the CSRF value for module-memory use; `/v1/auth/csrf` bootstraps a separate-origin SPA after reload without putting credentials in local storage.
+- Refresh and logout require a lightweight double-submit CSRF header check (`X-CSRF-Token` plus `cc_csrf` cookie) to keep the cookie-backed session safer without adding a heavy framework.
 - The advisory room must stay business-only: revenue, growth, front desk, operations, reputation, and competitor guidance only. Clinical advice stays out of scope even when using LLM providers.
 - Revenue Protection is operational, not clinical: it handles insurance readiness, copay/deposit capture, prior auth tracking, and payment follow-up. Provider credentials are server-side only; mock fallback is used when live sandbox credentials are absent or invalid.
 - Integration readiness is configuration-aware: mock and placeholder providers never claim live status, and connection tests only record safe metadata rather than PHI or card data.
@@ -52,7 +52,7 @@ The backend is an operational platform boundary, not an EHR. It stores clinic op
 
 - Apply migrations with `npm run db:deploy`.
 - Generate the Prisma client with `npm run db:generate`.
-- Seed only an explicitly confirmed disposable test database with `npm run db:seed`; see `docs/testing/SYNTHETIC_DATA_CATALOG.md`.
+- Seed local demo records with `npm run db:seed`.
 - Use encrypted managed PostgreSQL backups with point-in-time recovery in production.
 - Run Redis as a managed durable service with alerting and dead-letter monitoring.
 - Treat provider productivity as snapshot data sourced from the operational database, not a clinical source of truth.
@@ -70,4 +70,4 @@ The backend is an operational platform boundary, not an EHR. It stores clinic op
 9. Treat front-desk replies as operational writes: persist the outbound text, timestamp, and escalation state in PostgreSQL and audit every change.
 10. Replace the seeded admin credential with SSO/OIDC in production.
 11. Serve the application over HTTPS in production so the refresh cookie can remain `Secure`.
-12. For separate frontend/API origins, configure exact HTTPS CORS origins and `COOKIE_SAMESITE=none`, and verify the response/bootstrap CSRF lifecycle.
+12. If the API becomes cross-site, add a CSRF token strategy before allowing cookie-authenticated writes.

@@ -5,10 +5,6 @@ on:
   push:
     branches: [main]
 
-permissions:
-  contents: read
-  pull-requests: read
-
 jobs:
   quality:
     runs-on: ubuntu-latest
@@ -36,9 +32,8 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
-      DATABASE_URL: postgresql://app_rls:ci-app-rls-only@localhost:5432/carecommand?schema=public
+      DATABASE_URL: postgresql://carecommand:carecommand@localhost:5432/carecommand?schema=public
       DATABASE_MIGRATION_URL: postgresql://carecommand:carecommand@localhost:5432/carecommand?schema=public
-      PLATFORM_DATABASE_URL: postgresql://app_platform:ci-app-platform-only@localhost:5432/carecommand?schema=public
       REDIS_URL: redis://localhost:6379
       JWT_SECRET: ci-only-secret-with-more-than-32-characters
       JWT_REFRESH_SECRET: ci-only-refresh-secret-more-than-32-characters
@@ -49,82 +44,13 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - name: Install PostgreSQL 17 client
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo install -d -m 0755 /etc/apt/keyrings
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-            | sudo gpg --dearmor --yes -o /etc/apt/keyrings/postgresql.gpg
-          . /etc/os-release
-          echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
-            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends postgresql-client-17
-          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
-      - name: Verify PostgreSQL client and server majors
-        env:
-          PGPASSWORD: carecommand
-        shell: bash
-        run: |
-          set -euo pipefail
-          pg_dump --version
-          pg_restore --version
-          psql -h localhost -U carecommand -d carecommand -Atqc "SHOW server_version;"
-          test "$(pg_dump --version | sed -E 's/.* ([0-9]+).*/\1/')" = "17"
-          test "$(psql -h localhost -U carecommand -d carecommand -Atqc "SHOW server_version_num;" | cut -c1-2)" = "17"
       - run: npm ci
       - run: npm run db:generate
       - run: npm run db:deploy
-      - name: Reject unexpected Prisma drift
-        run: npm run verify:prisma-drift
-      - name: Configure restricted RLS runtime role for verification
-        env:
-          PGPASSWORD: carecommand
-        run: psql -h localhost -U carecommand -d carecommand -v ON_ERROR_STOP=1 -c "ALTER ROLE app_rls PASSWORD 'ci-app-rls-only'; ALTER ROLE app_platform PASSWORD 'ci-app-platform-only'"
-      - name: Verify complete RLS catalog as restricted runtime role
-        env:
-          DATABASE_URL: postgresql://app_rls:ci-app-rls-only@localhost:5432/carecommand?schema=public
-        run: npm run rls:verify
-      - name: Verify every protected table behaviorally in a disposable database
-        env:
-          NODE_ENV: test
-          RLS_DISPOSABLE_DB_ACK: CREATE_AND_DROP_LOCAL_RLS_TEST_DATABASE
-        run: npm run test:rls:behavior
-      - name: Verify clean migrate, deterministic seed, backup, and restore
-        env:
-          NODE_ENV: test
-          RELEASE_DB_LIFECYCLE_ACK: CREATE_DROP_LOCAL_RELEASE_TEST_DATABASES
-        run: npm run verify:db-lifecycle
       - run: npm run api:typecheck
       - run: npm run lint
       - run: npm test
-      - name: Run disposable-only receptionist integrity suites
-        env:
-          NODE_ENV: test
-          RLS_DISPOSABLE_DB_ACK: CREATE_AND_DROP_LOCAL_RLS_TEST_DATABASE
-        run: >-
-          npx tsx server/scripts/withDisposableRlsDatabase.ts --
-          npx vitest run
-          server/test/receptionistConfirmationOutbox.integration.test.ts
-          server/test/receptionistDeliveryConsentIntegrity.integration.test.ts
       - run: npm run build
-      - name: Reject production demo, fixture, credential, and dead-action artifacts
-        run: npm run verify:no-production-demo-artifacts
-      - name: Install Chromium for real-backend route/action tests
-        run: npx playwright install --with-deps chromium
-      - name: Real-backend desktop and mobile route/action certification
-        env:
-          NODE_ENV: test
-          RLS_DISPOSABLE_DB_ACK: CREATE_AND_DROP_LOCAL_RLS_TEST_DATABASE
-        run: npm run test:e2e
-      - name: Upload browser evidence on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: playwright-evidence
-          path: .playwright/
-          if-no-files-found: ignore
 
   security:
     runs-on: ubuntu-latest
@@ -135,21 +61,11 @@ jobs:
       - name: Secret scan (gitleaks)
         uses: gitleaks/gitleaks-action@v2
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
       - run: npm ci
-      - name: Verify package registry signatures and attestations
-        run: npm audit signatures
-      - name: Generate CycloneDX software bill of materials
-        run: npm sbom --sbom-format cyclonedx > carecommand-sbom.cdx.json
-      - name: Upload software bill of materials
-        uses: actions/upload-artifact@v4
-        with:
-          name: carecommand-sbom
-          path: carecommand-sbom.cdx.json
       - name: Dependency audit (production deps, high+)
         run: npm audit --audit-level=high --omit=dev

@@ -1,4 +1,4 @@
-import { getCurrency, getCurrencyLocale, getLocale } from '../lib/preferences';
+import { getCurrency, getCurrencyLocale } from '../lib/preferences';
 
 export const formatCurrency = (value: number): string => {
   return new Intl.NumberFormat(getCurrencyLocale(), {
@@ -9,29 +9,16 @@ export const formatCurrency = (value: number): string => {
   }).format(value);
 };
 
-// Compact form ($12K / $1.2M) for axis ticks and dense chart chrome.
-export const formatCurrencyCompact = (value: number): string => {
-  return new Intl.NumberFormat(getCurrencyLocale(), {
-    style: 'currency',
-    currency: getCurrency(),
-    notation: 'compact',
-    maximumFractionDigits: 1,
-  }).format(value);
-};
-
 export const formatNumber = (value: number): string => {
-  return new Intl.NumberFormat(getLocale()).format(value);
+  return new Intl.NumberFormat('en-US').format(value);
 };
 
 export const formatPercent = (value: number, decimals = 1): string => {
-  return `${new Intl.NumberFormat(getLocale(), {
-    minimumFractionDigits: decimals,
-    maximumFractionDigits: decimals,
-  }).format(value)}%`;
+  return `${value.toFixed(decimals)}%`;
 };
 
 export const formatDate = (isoDate: string): string => {
-  return new Date(isoDate).toLocaleDateString(getLocale(), {
+  return new Date(isoDate).toLocaleDateString('en-US', {
     month: 'short',
     day: 'numeric',
     year: 'numeric',

@@ -35,9 +35,9 @@ export default function InsuranceIntakeCard({ appointmentId }: { appointmentId: 
     try {
       const res = await insuranceApi.runEligibilityCheck({ appointmentId });
       if (res.status === 'setup_required' || res.setupRequired) {
-        setNotice(`Eligibility provider not configured (${res.provider ?? 'provider'}). Configure it before requesting a payer response.`);
+        setNotice(`Eligibility provider not configured (${res.provider ?? 'provider'}). Set it up to run real checks.`);
       } else {
-        setNotice('Eligibility response recorded. Review the response; coverage and payment are not guaranteed.');
+        setNotice('Eligibility check completed.');
         setData(await insuranceApi.getIntake(appointmentId));
       }
     } catch (e) {
@@ -60,8 +60,8 @@ export default function InsuranceIntakeCard({ appointmentId }: { appointmentId: 
     }
   }
 
-  if (loading) return <div role="status" aria-live="polite" aria-busy="true" className="rounded-xl border border-[var(--b1)] p-3 text-xs text-t3"><Loader2 className="inline w-4 h-4 animate-spin" /> Loading insurance status…</div>;
-  if (error && !data) return <div role="alert" className="rounded-xl border border-[var(--b1)] p-3 text-xs text-red-v">Insurance status is unavailable. Refresh the appointment before taking action. {error}</div>;
+  if (loading) return <div className="rounded-xl border border-[var(--b1)] p-3 text-xs text-t3"><Loader2 className="inline w-4 h-4 animate-spin" /> Loading insurance status…</div>;
+  if (error && !data) return <div className="rounded-xl border border-[var(--b1)] p-3 text-xs text-red-v">{error}</div>;
   if (!data) return null;
 
   const risk = RISK_META[data.denialRiskLevel];
@@ -72,7 +72,7 @@ export default function InsuranceIntakeCard({ appointmentId }: { appointmentId: 
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <ShieldCheck className="w-4 h-4 text-indigo" />
-          <span className="text-xs font-bold text-t1">Insurance and billing review</span>
+          <span className="text-xs font-bold text-t1">Insurance &amp; Denial Risk</span>
         </div>
         <span className={`badge ${risk.badge}`}>{risk.label}{data.denialRiskLevel !== 'NONE' ? ` · ${data.denialRiskScore}` : ''}</span>
       </div>
@@ -86,7 +86,7 @@ export default function InsuranceIntakeCard({ appointmentId }: { appointmentId: 
 
       {data.setupRequired && (
         <div className="flex items-center gap-2 rounded-lg border border-amber-v/40 bg-amber-v/5 px-2.5 py-1.5 text-[11px] text-amber-v">
-          <AlertCircle className="w-3.5 h-3.5" /> Eligibility provider not configured. No payer response is available.
+          <AlertCircle className="w-3.5 h-3.5" /> Eligibility provider not configured — checks return setup-required, never a fake eligible result.
         </div>
       )}
       {data.reasons.length > 0 && (
@@ -94,9 +94,8 @@ export default function InsuranceIntakeCard({ appointmentId }: { appointmentId: 
           {data.reasons.map(r => <li key={r} className="text-[11px] text-t3">• {REASON_LABEL[r] ?? r}</li>)}
         </ul>
       )}
-      <p className="text-[11px] text-t3">The risk score supports staff review; it is not a payer decision or a coverage guarantee.</p>
-      {notice && <p role="status" aria-live="polite" className="text-[11px] text-t2">{notice}</p>}
-      {error && <p role="alert" className="text-[11px] text-red-v">{error}</p>}
+      {notice && <p className="text-[11px] text-t2">{notice}</p>}
+      {error && <p className="text-[11px] text-red-v">{error}</p>}
 
       <div className="flex flex-wrap items-center gap-2">
         {data.allowedActions.includes('run_eligibility_check') && (

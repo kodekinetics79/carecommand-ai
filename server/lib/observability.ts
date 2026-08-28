@@ -80,53 +80,6 @@ export function captureException(error: Error, context: ErrorContext = {}, logge
   // DSN configured but nothing wired it up — surface the misconfiguration once.
   if (env.SENTRY_DSN && !warnedMissingReporter) {
     warnedMissingReporter = true;
-    log.warn({ event: 'observability.reporter_missing' }, 'SENTRY_DSN is set but no error reporter is registered (call registerSentry at boot)');
-  }
-}
-
-/**
- * Activate the durable error reporter at boot. No-op unless SENTRY_DSN is set.
- *
- * @sentry/node is loaded via dynamic import so it is NOT a hard dependency: a
- * deploy without the package (or without a DSN) still boots and keeps emitting
- * structured `event: 'exception'` logs — this only *adds* durable capture when
- * both are present. Call once from server/index.ts and server/workers/index.ts.
- *
- * Returns true if Sentry was activated. Never throws — telemetry setup must not
- * block startup.
- */
-export async function registerSentry(logger?: MinimalLogger): Promise<boolean> {
-  const log = logger ?? console;
-  if (!env.SENTRY_DSN) return false;
-
-  try {
-    // Optional dependency: `npm i @sentry/node` to enable. Kept as a dynamic,
-    // string-built specifier so bundlers/type-checkers don't require it present.
-    const moduleName = '@sentry/node';
-    const Sentry = (await import(/* @vite-ignore */ moduleName)) as {
-      init: (opts: Record<string, unknown>) => void;
-      captureException: (err: unknown, hint?: { extra?: Record<string, unknown> }) => void;
-    };
-
-    Sentry.init({
-      dsn: env.SENTRY_DSN,
-      environment: env.SERVICE_ENV ?? env.NODE_ENV,
-      release: env.RELEASE,
-      tracesSampleRate: env.SENTRY_TRACES_SAMPLE_RATE,
-    });
-
-    setErrorReporter((error, context) => {
-      Sentry.captureException(error, { extra: { ...context } });
-    });
-
-    log.warn({ event: 'observability.sentry_active', serviceEnv: env.SERVICE_ENV ?? env.NODE_ENV }, 'Sentry error reporter active');
-    return true;
-  } catch (error) {
-    // Package missing or init failed — degrade to structured logs, don't crash.
-    log.warn(
-      { event: 'observability.sentry_unavailable', err: (error as Error).message },
-      'SENTRY_DSN is set but @sentry/node could not be loaded; run `npm i @sentry/node`. Falling back to structured error logs.',
-    );
-    return false;
+    log.warn({ event: 'observability.reporter_missing' }, 'SENTRY_DSN is set but no error reporter is registered (call setErrorReporter at boot)');
   }
 }

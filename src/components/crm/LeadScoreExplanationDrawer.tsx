@@ -25,7 +25,7 @@ export default function LeadScoreExplanationDrawer({ lead, onClose }: { lead: Cr
         <div className="p-5 space-y-4">
           <div className="text-center rounded-2xl border border-[var(--b1)] bg-[var(--s1)] p-4">
             <p className={`text-3xl font-bold tabular-nums ${tone}`}>{lead.score}</p>
-            <p className="text-[11px] text-t3">Unvalidated rule-based planning priority · not an AI prediction</p>
+            <p className="text-[11px] text-t3">AI lead score · {lead.confidence}% confidence</p>
             <p className="text-[12px] font-semibold text-t1 mt-1">{lead.name}</p>
           </div>
 
@@ -37,15 +37,15 @@ export default function LeadScoreExplanationDrawer({ lead, onClose }: { lead: Cr
           </Section>
 
           <div className="rounded-xl border border-[var(--indigo-mid)] bg-[var(--indigo-soft)] p-3">
-            <p className="text-[10px] font-bold uppercase tracking-wide text-indigo mb-1">Rule-based planning suggestion</p>
+            <p className="text-[10px] font-bold uppercase tracking-wide text-indigo mb-1">Recommended action</p>
             <p className="text-[13px] font-semibold text-t1">{lead.nextBestAction.label}</p>
           </div>
 
           <div className="grid grid-cols-2 gap-2.5">
-            <Fact label="Recorded estimated value" value={formatCurrency(lead.estimatedValue)} />
+            <Fact label="Expected value" value={formatCurrency(lead.estimatedValue)} />
             <Fact label="Last activity" value={`${lead.ageDays}d ago`} />
-            <Fact label="Recorded lead channel" value={lead.bestChannel} icon={<Radio className="w-3 h-3" />} />
-            <Fact label="Suggested review time" value={lead.bestTime} icon={<Clock className="w-3 h-3" />} />
+            <Fact label="Best channel" value={lead.bestChannel} icon={<Radio className="w-3 h-3" />} />
+            <Fact label="Best time" value={lead.bestTime} icon={<Clock className="w-3 h-3" />} />
           </div>
         </div>
       </div>

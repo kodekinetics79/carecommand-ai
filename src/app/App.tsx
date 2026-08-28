@@ -1,5 +1,5 @@
-import { lazy, Suspense, useState, type ReactNode } from 'react';
-import { BrowserRouter, Routes, Route, Navigate, Outlet, useLocation } from 'react-router';
+import { lazy, Suspense, type ReactNode } from 'react';
+import { BrowserRouter, Routes, Route, Navigate, Outlet, useLocation } from 'react-router-dom';
 import Sidebar from '../components/layout/Sidebar';
 import Topbar from '../components/layout/Topbar';
 import { useSession } from '../hooks/useSession';
@@ -60,7 +60,6 @@ function ProtectedLayout() {
   // Remount page content when currency/language changes so all formatted
   // figures (formatCurrency) re-render with the new preference immediately.
   const { currency, language } = usePreferences();
-  const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
   if (loading) {
     return <div className="min-h-screen flex items-center justify-center text-sm text-t3">Loading session…</div>;
@@ -72,26 +71,23 @@ function ProtectedLayout() {
 
   return (
     <div className="app-shell">
-      <Sidebar mobileOpen={mobileNavOpen} onNavigate={() => setMobileNavOpen(false)} />
-      {mobileNavOpen && (
-        <button type="button" className="mobile-nav-backdrop" aria-label="Close navigation" onClick={() => setMobileNavOpen(false)} />
-      )}
+      <Sidebar />
       <div className="app-main">
-        <Topbar mobileNavOpen={mobileNavOpen} onOpenNavigation={() => setMobileNavOpen(true)} />
-        <main className="app-scroll" aria-label="Clinic workspace">
+        <Topbar />
+        <div className="app-scroll">
           <div className="app-inner">
             <Suspense fallback={<div className="skeleton h-48 rounded-2xl" />}>
               <div key={`${currency}-${language}`}><Outlet /></div>
             </Suspense>
           </div>
-        </main>
+        </div>
       </div>
     </div>
   );
 }
 
 function PublicRoute({ children }: { children: ReactNode }) {
-  const { loading, isAuthenticated } = useSession({ hydrate: false });
+  const { loading, isAuthenticated } = useSession();
   const location = useLocation();
 
   if (loading) {

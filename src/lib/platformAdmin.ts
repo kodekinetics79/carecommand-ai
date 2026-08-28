@@ -1,12 +1,10 @@
 // Platform Admin Console client. Uses a PlatformUser JWT (NOT a tenant session,
-// NOT the legacy static token). The privileged token is memory-only: reload or
-// tab close requires re-authentication and no bearer credential is persisted in
-// browser storage.
+// NOT the legacy static token). Token is held in localStorage and sent as Bearer.
 const API = (import.meta.env.VITE_API_URL as string | undefined) ?? (import.meta.env.PROD ? '' : 'http://localhost:3001');
-let platformToken: string | null = null;
+const TOKEN_KEY = 'cc_platform_token';
 
-export function getPlatformToken(): string | null { return platformToken; }
-export function setPlatformToken(token: string | null) { platformToken = token; }
+export function getPlatformToken(): string | null { return localStorage.getItem(TOKEN_KEY); }
+export function setPlatformToken(t: string | null) { if (t) localStorage.setItem(TOKEN_KEY, t); else localStorage.removeItem(TOKEN_KEY); }
 
 async function pf<T>(path: string, init?: RequestInit & { auth?: boolean }): Promise<T> {
   const token = getPlatformToken();
@@ -54,8 +52,7 @@ export interface PilotStatusShare {
   createdAt: string;
   updatedAt: string;
   active: boolean;
-  publicUrlAvailable: false;
-  url: null;
+  url: string;
 }
 
 export interface PilotStatusShareCreated {
@@ -144,8 +141,7 @@ export const TENANT_STATUS_BADGE: Record<string, string> = { active: 'badge-emer
 export const SUB_STATUS_BADGE: Record<string, string> = { ACTIVE: 'badge-emerald', TRIAL: 'badge-violet', PAST_DUE: 'badge-amber', SUSPENDED: 'badge-red', CANCELLED: 'badge-red' };
 
 export const platformAdmin = {
-  login: (email: string, password: string) => pf<{ token?: string; mfaRequired?: boolean; mfaSetupRequired?: boolean; mfaToken?: string; user?: PlatformMe }>(`/v1/platform/auth/login`, { method: 'POST', auth: false, body: JSON.stringify({ email, password }) }),
-  mfaSetup: (mfaToken: string) => pf<{ secret: string; otpauthUri: string; enabled: false }>(`/v1/platform/auth/mfa/setup`, { method: 'POST', auth: false, headers: { Authorization: `Bearer ${mfaToken}` }, body: '{}' }),
+  login: (email: string, password: string) => pf<{ token?: string; mfaRequired?: boolean; mfaToken?: string; user?: PlatformMe }>(`/v1/platform/auth/login`, { method: 'POST', auth: false, body: JSON.stringify({ email, password }) }),
   mfaVerify: (code: string, mfaToken: string) => pf<{ token: string; user: PlatformMe }>(`/v1/platform/auth/mfa/verify`, { method: 'POST', auth: false, headers: { Authorization: `Bearer ${mfaToken}` }, body: JSON.stringify({ code }) }),
   me: () => pf<PlatformMe>(`/v1/platform/auth/me`),
   logout: () => pf<{ loggedOut: boolean }>(`/v1/platform/auth/logout`, { method: 'POST' }),
@@ -154,7 +150,7 @@ export const platformAdmin = {
   health: () => pf<SystemHealth>(`/v1/platform/health`),
   tenants: () => pf<TenantSummary[]>(`/v1/platform/tenants`),
   tenant: (id: string) => pf<TenantSummary>(`/v1/platform/tenants/${id}`),
-  createTenant: (body: { name: string; slug: string; planKey?: string; ownerName: string; ownerEmail: string; ownerPassword: string; defaultBranchName?: string; timezone?: string }) =>
+  createTenant: (body: { name: string; slug: string; planKey?: string; ownerName: string; ownerEmail: string; ownerPassword: string; defaultBranchName?: string }) =>
     pf<TenantSummary>(`/v1/platform/tenants`, { method: 'POST', body: JSON.stringify(body) }),
   suspend: (id: string) => pf<{ status: string }>(`/v1/platform/tenants/${id}/suspend`, { method: 'POST' }),
   reactivate: (id: string) => pf<{ status: string }>(`/v1/platform/tenants/${id}/reactivate`, { method: 'POST' }),
@@ -209,10 +205,10 @@ export const platformAdmin = {
   getPilotChecklist: (tenantId: string) => pf<PilotChecklistView>(`/v1/platform/tenants/${tenantId}/pilot-checklist`),
   getPilotImportPresets: (tenantId: string, entityType?: PilotEntityType) =>
     pf<PilotImportPreset[]>(`/v1/platform/tenants/${tenantId}/pilot-import/presets${entityType ? `?entityType=${encodeURIComponent(entityType)}` : ''}`),
-  savePilotImportPreset: (tenantId: string, body: { entityType: PilotEntityType; name: string; mapping: Record<string, string>; isDefault?: boolean }, operationKey = crypto.randomUUID()) =>
-    pf<PilotImportPreset>(`/v1/platform/tenants/${tenantId}/pilot-import/presets`, { method: 'POST', headers: { 'Idempotency-Key': operationKey }, body: JSON.stringify(body) }),
-  deletePilotImportPreset: (tenantId: string, presetId: string, operationKey = crypto.randomUUID()) =>
-    pf<void>(`/v1/platform/tenants/${tenantId}/pilot-import/presets/${presetId}`, { method: 'DELETE', headers: { 'Idempotency-Key': operationKey } }),
+  savePilotImportPreset: (tenantId: string, body: { entityType: PilotEntityType; name: string; mapping: Record<string, string>; isDefault?: boolean }) =>
+    pf<PilotImportPreset>(`/v1/platform/tenants/${tenantId}/pilot-import/presets`, { method: 'POST', body: JSON.stringify(body) }),
+  deletePilotImportPreset: (tenantId: string, presetId: string) =>
+    pf<void>(`/v1/platform/tenants/${tenantId}/pilot-import/presets/${presetId}`, { method: 'DELETE' }),
   downloadPilotTemplate: async (tenantId: string, entityType: PilotEntityType) => {
     const token = getPlatformToken();
     const res = await fetch(`${API}/v1/platform/tenants/${tenantId}/pilot-import/${entityType}/template.csv`, {
@@ -229,11 +225,11 @@ export const platformAdmin = {
   },
   previewPilotImport: (tenantId: string, entityType: PilotEntityType, body: { csvText: string; mapping: Record<string, string> }) =>
     pf<PilotImportPreview>(`/v1/platform/tenants/${tenantId}/pilot-import/${entityType}/preview`, { method: 'POST', body: JSON.stringify(body) }),
-  commitPilotImport: (tenantId: string, entityType: PilotEntityType, body: { csvText: string; mapping: Record<string, string> }, operationKey = crypto.randomUUID()) =>
-    pf<PilotImportCommit>(`/v1/platform/tenants/${tenantId}/pilot-import/${entityType}/commit`, { method: 'POST', headers: { 'Idempotency-Key': operationKey }, body: JSON.stringify(body) }),
+  commitPilotImport: (tenantId: string, entityType: PilotEntityType, body: { csvText: string; mapping: Record<string, string> }) =>
+    pf<PilotImportCommit>(`/v1/platform/tenants/${tenantId}/pilot-import/${entityType}/commit`, { method: 'POST', body: JSON.stringify(body) }),
   getPilotStatusShare: (token: string) => pf<{ link: { label: string | null; expiresAt: string; active: boolean }; clinic: { id: string; name: string; slug: string }; checklist: PilotChecklistView }>(`/v1/pilot/share/${token}`, { auth: false }),
-  createPilotStatusShare: (tenantId: string, body: { label?: string; expiresInDays?: number }, operationKey = crypto.randomUUID()) =>
-    pf<PilotStatusShareCreated>(`/v1/platform/tenants/${tenantId}/pilot-status-links`, { method: 'POST', headers: { 'Idempotency-Key': operationKey }, body: JSON.stringify(body) }),
+  createPilotStatusShare: (tenantId: string, body: { label?: string; expiresInDays?: number }) =>
+    pf<PilotStatusShareCreated>(`/v1/platform/tenants/${tenantId}/pilot-status-links`, { method: 'POST', body: JSON.stringify(body) }),
   listPilotStatusShares: (tenantId: string) => pf<PilotStatusShare[]>(`/v1/platform/tenants/${tenantId}/pilot-status-links`),
 
   integrations: () => pf<IntegrationView[]>(`/v1/platform/integrations`),

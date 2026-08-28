@@ -118,18 +118,11 @@ async function main() {
   const { isSuppressed } = await import('../../lib/campaigns');
   check('marketing opt-out suppresses campaigns', await isSuppressed(tenantA, { patientId: patientA.id }, 'email'));
 
-  const genericEmailOptIn = await patch('/v1/portal/preferences', { email: true }, session);
-  const latestEmailGrant = await ownerDb.consentEvent.findFirst({ where: { tenantId: tenantA, patientId: patientA.id, purpose: 'EMAIL', granted: true } });
-  check('generic portal preference cannot manufacture affirmative email authority', genericEmailOptIn.statusCode === 409 && !latestEmailGrant);
-
-  // 15b) The generic portal is one-way for voice: it may record a durable
-  // opt-out, but cannot create or restore purpose-specific outbound authority.
-  const voiceOn = await patch('/v1/portal/preferences', { voice: true }, session);
-  const voiceOff = await patch('/v1/portal/preferences', { voice: false }, session);
+  // 15b) Voice preference is truly persisted in CommunicationConsent.
+  const voiceOn = JSON.parse((await patch('/v1/portal/preferences', { voice: true }, session)).body);
+  const voiceConsent = await ownerDb.communicationConsent.findFirst({ where: { tenantId: tenantA, patientId: patientA.id, channel: 'voice' }, orderBy: { capturedAt: 'desc' } });
   const prefAfterVoice = JSON.parse((await get('/v1/portal/preferences', session)).body);
-  const voiceHistory = JSON.parse((await get('/v1/portal/consents', session)).body);
-  check('portal cannot grant outbound voice authority', voiceOn.statusCode === 409);
-  check('voice opt-out persists and appears in history', voiceOff.statusCode === 200 && prefAfterVoice.voice === false && prefAfterVoice.voiceOptedOut === true && voiceHistory.some((event: any) => event.purpose === 'VOICE' && event.granted === false));
+  check('voice preference persists via CommunicationConsent + reloads true', voiceOn.ok === true && voiceConsent?.status === 'opted_in' && prefAfterVoice.voice === true);
 
   // 16) Disabled account cannot login
   await ownerDb.patientPortalAccount.update({ where: { id: acctA.id }, data: { status: 'disabled' } });

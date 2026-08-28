@@ -7,7 +7,6 @@ import { requireFeature } from '../../lib/entitlements';
 import { assertBranchAccess } from '../../lib/scope';
 import { encryptSecret } from '../../lib/security';
 import { DEVICE_PROVIDERS } from '../../lib/connectedCare/catalog';
-import { invalidateRpmSignoffsForDevice, rpmPeriodBounds } from '../../lib/connectedCare/rpmEvidence';
 
 function devStatus(category: string, mode: string, hasRequired: boolean): string {
   if (category === 'MANUAL') return 'ACTIVE';
@@ -131,36 +130,21 @@ export const deviceRoutes: FastifyPluginAsync = async app => {
     if (existing.branchId) await assertBranchAccess(request, existing.branchId);
     if (input.branchId) await assertBranchAccess(request, input.branchId);
 
-    const statusChanged = input.status && input.status !== existing.status;
-    const configKeys = Object.keys(input).filter(k => k !== 'status' && k !== 'active');
-    const period = rpmPeriodBounds();
-    const updated = await db.$transaction(async tx => {
-      const row = await tx.device.update({
-        where: { id: existing.id },
-        data: { ...input, lastSeenAt: input.status === 'online' ? new Date() : existing.lastSeenAt },
-        select: { id: true, name: true, status: true, active: true },
-      });
-      if (statusChanged) {
-        await tx.deviceEvent.create({ data: { tenantId, deviceId: id, actorUserId: request.auth.userId, type: 'status_changed', fromStatus: existing.status, toStatus: input.status, message: `Status set to ${input.status}` } });
-      }
-      if (configKeys.length > 0) {
-        await tx.deviceEvent.create({ data: { tenantId, deviceId: id, actorUserId: request.auth.userId, type: 'config_updated', message: `Updated ${configKeys.join(', ')}` } });
-      }
-      await invalidateRpmSignoffsForDevice(tx, {
-        tenantId, deviceId: id, periodStart: period.start,
-        reason: 'enrolled_device_mutated', actorUserId: request.auth.userId,
-        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
-      });
-      await tx.auditEvent.create({
-        data: {
-          tenantId, actorUserId: request.auth.userId, action: 'device.updated',
-          resource: 'device', resourceId: id, requestId: request.id,
-          ipAddress: request.ip, userAgent: request.headers['user-agent'],
-          metadata: { status: row.status, active: row.active, fields: configKeys },
-        },
-      });
-      return row;
+    const updated = await db.device.update({
+      where: { id: existing.id },
+      data: { ...input, lastSeenAt: input.status === 'online' ? new Date() : existing.lastSeenAt },
+      select: { id: true, name: true, status: true, active: true },
     });
+
+    const statusChanged = input.status && input.status !== existing.status;
+    if (statusChanged) {
+      await recordEvent(tenantId, id, request.auth.userId, { type: 'status_changed', fromStatus: existing.status, toStatus: input.status, message: `Status set to ${input.status}` });
+    }
+    const configKeys = Object.keys(input).filter(k => k !== 'status' && k !== 'active');
+    if (configKeys.length > 0) {
+      await recordEvent(tenantId, id, request.auth.userId, { type: 'config_updated', message: `Updated ${configKeys.join(', ')}` });
+    }
+    await audit(request, { action: 'device.updated', resource: 'device', resourceId: id, metadata: { status: updated.status, active: updated.active, fields: configKeys } });
     return updated;
   });
 
@@ -172,22 +156,13 @@ export const deviceRoutes: FastifyPluginAsync = async app => {
     if (!existing) throw app.httpErrors.notFound('Device not found');
     if (existing.branchId) await assertBranchAccess(request, existing.branchId);
     const now = new Date();
-    const period = rpmPeriodBounds(now);
-    const updated = await db.$transaction(async tx => {
-      const row = await tx.device.update({
-        where: { id: existing.id },
-        data: { status: 'online', lastSeenAt: now, lastTestStatus: 'passed', lastTestedAt: now },
-        select: { id: true, status: true, lastSeenAt: true, lastTestStatus: true, lastTestedAt: true },
-      });
-      await tx.deviceEvent.create({ data: { tenantId, deviceId: id, actorUserId: request.auth.userId, type: 'connection_test', fromStatus: existing.status, toStatus: 'online', message: 'Local readiness check passed' } });
-      await invalidateRpmSignoffsForDevice(tx, {
-        tenantId, deviceId: id, periodStart: period.start,
-        reason: 'enrolled_device_mutated', actorUserId: request.auth.userId,
-        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
-      });
-      await tx.auditEvent.create({ data: { tenantId, actorUserId: request.auth.userId, action: 'device.connection_tested', resource: 'device', resourceId: id, requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'] } });
-      return row;
+    const updated = await db.device.update({
+      where: { id: existing.id },
+      data: { status: 'online', lastSeenAt: now, lastTestStatus: 'passed', lastTestedAt: now },
+      select: { id: true, status: true, lastSeenAt: true, lastTestStatus: true, lastTestedAt: true },
     });
+    await recordEvent(tenantId, id, request.auth.userId, { type: 'connection_test', fromStatus: existing.status, toStatus: 'online', message: 'Local readiness check passed' });
+    await audit(request, { action: 'device.connection_tested', resource: 'device', resourceId: id });
     return updated;
   });
 
@@ -198,17 +173,9 @@ export const deviceRoutes: FastifyPluginAsync = async app => {
     const existing = await db.device.findFirst({ where: { id, tenantId } });
     if (!existing) throw app.httpErrors.notFound('Device not found');
     if (existing.branchId) await assertBranchAccess(request, existing.branchId);
-    const period = rpmPeriodBounds();
-    await db.$transaction(async tx => {
-      await tx.device.update({ where: { id: existing.id }, data: { active: false, status: 'offline' } });
-      await tx.deviceEvent.create({ data: { tenantId, deviceId: id, actorUserId: request.auth.userId, type: 'deactivated', fromStatus: existing.status, toStatus: 'offline', message: 'Device deactivated' } });
-      await invalidateRpmSignoffsForDevice(tx, {
-        tenantId, deviceId: id, periodStart: period.start,
-        reason: 'enrolled_device_mutated', actorUserId: request.auth.userId,
-        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
-      });
-      await tx.auditEvent.create({ data: { tenantId, actorUserId: request.auth.userId, action: 'device.deactivated', resource: 'device', resourceId: id, requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'], metadata: { name: existing.name } } });
-    });
+    await db.device.update({ where: { id: existing.id }, data: { active: false, status: 'offline' } });
+    await recordEvent(tenantId, id, request.auth.userId, { type: 'deactivated', fromStatus: existing.status, toStatus: 'offline', message: 'Device deactivated' });
+    await audit(request, { action: 'device.deactivated', resource: 'device', resourceId: id, metadata: { name: existing.name } });
     return reply.code(204).send();
   });
 

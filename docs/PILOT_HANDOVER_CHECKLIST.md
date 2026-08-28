@@ -4,9 +4,6 @@ Use this for a real prospect or customer that gets credentials and runs their ow
 
 For the execution order and role-by-role run steps, use [`docs/PILOT_RUNBOOK.md`](/Users/zackkhan/carecommand-ai/docs/PILOT_RUNBOOK.md).
 For a printable check-off sheet, use [`docs/PILOT_WORKSHEET.md`](/Users/zackkhan/carecommand-ai/docs/PILOT_WORKSHEET.md).
-For full enterprise client validation with real data, real workflows, evidence
-capture, and formal go/no-go gates, use
-[`docs/ENTERPRISE_CLIENT_VALIDATION_RUNBOOK.md`](/Users/zackkhan/carecommand-ai/docs/ENTERPRISE_CLIENT_VALIDATION_RUNBOOK.md).
 
 Customer handoff flow:
 

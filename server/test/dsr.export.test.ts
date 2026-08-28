@@ -17,7 +17,7 @@ vi.mock('../workers/queues', () => ({
 }));
 
 const { buildApp } = await import('../app');
-const { fixtureDb: db } = await import('./helpers/fixtureDb');
+const { db } = await import('../lib/db');
 
 let app: FastifyInstance;
 const createdTenantIds: string[] = [];
@@ -39,7 +39,7 @@ async function makeTenant() {
   return { id, branchId: branch.id, patientId: patient.id, users };
 }
 
-const tok = (tenantId: string, userId: string) => app.jwt.sign({ userId, tenantId, role: 'OWNER', type: 'access' });
+const tok = (tenantId: string, userId: string) => app.jwt.sign({ userId, tenantId, type: 'access' });
 const auth = (t: string) => ({ authorization: `Bearer ${t}` });
 const exportUrl = (patientId: string) => `/v1/patients/${patientId}/data-export`;
 

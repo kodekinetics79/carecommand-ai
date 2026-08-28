@@ -36,7 +36,6 @@ services:
     environment:
       DATABASE_URL: postgresql://carecommand:carecommand@postgres:5432/carecommand?schema=public
       REDIS_URL: redis://redis:6379
-      QUEUE_NAMESPACE: carecommand-compose
     ports:
       - "3001:3001"
     depends_on:
@@ -54,7 +53,6 @@ services:
     environment:
       DATABASE_URL: postgresql://carecommand:carecommand@postgres:5432/carecommand?schema=public
       REDIS_URL: redis://redis:6379
-      QUEUE_NAMESPACE: carecommand-compose
     depends_on:
       postgres:
         condition: service_healthy

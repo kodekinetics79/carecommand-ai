@@ -1,42 +1,18 @@
 import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
-import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { env } from '../../config/env';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { assertBranchAccess, branchScope } from '../../lib/scope';
+import { requireRoles } from '../../plugins/roles';
 import { runWithTenantContext } from '../../lib/tenantContext';
 import { requireFeature } from '../../lib/entitlements';
-import { sendMessage, type SendResult } from '../../lib/commsProvider';
-import { isSuppressed, isValidE164, isValidEmail, maskDestination, toE164, type CommChannel } from '../../lib/campaigns';
-import { getRequestPermissions, requirePermission } from '../../lib/permissions';
 
 const channel = z.enum(['WHATSAPP', 'SMS', 'EMAIL', 'PUSH', 'CALL', 'VIDEO']);
 const uuid = z.string().uuid();
 const listLimit = z.object({ limit: z.coerce.number().int().min(1).max(100).default(50) });
-const OPERATIONAL_REPLY_TERMS = 'operational_reply_to_recorded_inbound_conversation' as const;
-const OPERATIONAL_REPLY_TERMS_SOURCE = 'carecommand_operational_reply_policy_v1' as const;
-// Route guards are classified by data class + action. Avoid a shared "staff"
-// role list: it previously made unrelated PHI, revenue, integration, and
-// clinical-review surfaces available to every authenticated tenant role.
-const operationsRead = requirePermission('operations:read');
-const operationsWrite = requirePermission('operations:write');
-const crmRead = requirePermission('crm:read');
-const crmWrite = requirePermission('crm:write');
-const campaignRead = requirePermission('campaign:read');
-const campaignManage = requirePermission('campaign:manage');
-const revenueRead = requirePermission('revenue:read');
-const revenueWrite = requirePermission('revenue:write');
-const inventoryRead = requirePermission('inventory:read');
-const inventoryWrite = requirePermission('inventory:write');
-const inventoryManage = requirePermission('inventory:manage');
-const integrationsRead = requirePermission('integrations:read');
-const integrationsManage = requirePermission('integrations:manage');
-const partnerReportRead = requirePermission('partner-report:read');
-const partnerReportWrite = requirePermission('partner-report:write');
-const partnerReportReview = requirePermission('partner-report:review');
-const staffTaskRead = requirePermission('staff:read');
-const staffTaskWrite = requirePermission('staff:write');
+const writeRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK');
+const adminRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
 
 type IntegrationCatalogEntry = {
   key: string;
@@ -217,116 +193,13 @@ const integrationCatalog: IntegrationCatalogEntry[] = [
     category: 'AI Voice',
     description: 'Outbound AI receptionist voice calls and webhook handoff.',
     supportedWorkflows: ['Outbound calling', 'Appointment request capture', 'Call webhook handoff'],
-    envVars: ['RETELL_API_KEY', 'RETELL_FROM_NUMBER'],
+    envVars: ['RETELL_API_KEY', 'RETELL_AGENT_ID', 'RETELL_FROM_NUMBER'],
     providerType: 'integration',
   },
 ] as const;
 
 function scopedBranch(request: FastifyRequest, branchId?: string) {
   return request.auth.branchId ?? branchId;
-}
-
-async function requireTenantBranch(request: FastifyRequest, branchId: string) {
-  assertBranchAccess(request, branchId);
-  const branch = await db.branch.findFirst({
-    where: { id: branchId, tenantId: request.auth.tenantId },
-    select: { id: true },
-  });
-  if (!branch) throw request.server.httpErrors.badRequest('Branch must belong to the authenticated tenant');
-}
-
-async function requireTenantPatient(request: FastifyRequest, patientId: string, branchId?: string) {
-  const patient = await db.patient.findFirst({
-    where: { id: patientId, tenantId: request.auth.tenantId, deletedAt: null, ...branchScope(request) },
-    select: { id: true, branchId: true },
-  });
-  if (!patient || (branchId && patient.branchId !== branchId)) {
-    throw request.server.httpErrors.badRequest('Patient must belong to the authenticated tenant and branch');
-  }
-}
-
-async function requireTenantAssignee(request: FastifyRequest, assignedToId: string) {
-  const user = await db.user.findFirst({
-    where: { id: assignedToId, tenantId: request.auth.tenantId, active: true },
-    select: { id: true },
-  });
-  if (!user) throw request.server.httpErrors.badRequest('Assignee must be an active user in the authenticated tenant');
-}
-
-// Map a conversation channel + patient contact to a real outbound send target.
-// Returns null when no concrete sender/destination exists (PUSH/VIDEO, or a
-// missing phone/email) — the caller then records the reply truthfully as
-// undelivered instead of claiming an AI recovery.
-function resolveReplyTarget(
-  channel: string,
-  patient: { phone: string | null; email: string | null } | null,
-): { channel: CommChannel; destination: string } | null {
-  const phone = patient?.phone?.trim() || '';
-  const email = patient?.email?.trim() || '';
-  switch (channel) {
-    case 'SMS':
-    case 'CALL': // missed-call recovery is delivered as an SMS follow-up
-      return phone ? { channel: 'sms', destination: phone } : null;
-    case 'WHATSAPP':
-      return phone ? { channel: 'whatsapp', destination: phone } : null;
-    case 'EMAIL':
-      return email ? { channel: 'email', destination: email } : null;
-    default: // PUSH / VIDEO — no concrete outbound sender wired
-      return null;
-  }
-}
-
-function isReplyDestinationFormatValid(target: { channel: CommChannel; destination: string } | null): boolean {
-  if (!target) return false;
-  if (target.channel === 'email') return isValidEmail(target.destination);
-  return isValidE164(toE164(target.destination));
-}
-
-function evidenceHash(value: string): string {
-  return createHash('sha256').update(value, 'utf8').digest('hex');
-}
-
-function durableReplyPayload(result: {
-  status: string;
-  providerMode: string | null;
-  providerMessageId: string | null;
-}) {
-  const accepted = result.status === 'provider_accepted';
-  const deliveryStatus = result.status === 'submission_result_unknown'
-    ? 'submission_result_unknown'
-    : result.status === 'provider_pending'
-      ? 'pending'
-      : result.status === 'provider_rejected'
-        ? 'failed'
-        : result.status === 'suppressed'
-          ? 'suppressed'
-          : accepted ? 'accepted' : 'failed';
-  return {
-    accepted,
-    delivered: false,
-    deliveryStatus,
-    providerMode: result.providerMode,
-    providerMessageId: result.providerMessageId,
-    message: deliveryStatus === 'submission_result_unknown'
-      ? 'Submission result unknown. Retrying is blocked until provider evidence is reconciled.'
-      : deliveryMessage(accepted, deliveryStatus, result.providerMode as SendResult['mode'] | null),
-  };
-}
-
-function deliveryMessage(accepted: boolean, deliveryStatus: string, providerMode?: SendResult['mode'] | null): string {
-  if (accepted && providerMode === 'mock_dev') {
-    return 'Test provider accepted the simulated request. No patient delivery occurred.';
-  }
-  if (accepted) {
-    return 'Provider accepted the message request, but delivery is not confirmed. Review provider evidence before resending.';
-  }
-  switch (deliveryStatus) {
-    case 'suppressed': return 'Not sent: recipient has opted out / is suppressed. Nothing was delivered.';
-    case 'setup_required': return 'Not sent: this channel has no messaging provider configured yet.';
-    case 'no_contact': return 'Not sent: no reachable phone/email on file for this channel.';
-    case 'pending': return 'Pending: provider submission and delivery are not confirmed.';
-    default: return 'Not sent: delivery failed. Nothing was delivered to the patient.';
-  }
 }
 
 function isEnvSet(name: string) {
@@ -401,7 +274,7 @@ async function buildIntegrationStatuses(tenantId: string) {
       health = configured ? 'healthy' : 'not_configured';
       lastSyncAt = latestLog?.createdAt.toISOString() ?? null;
     } else if (entry.key === 'retell') {
-      configured = Boolean(env.RETELL_API_KEY && env.RETELL_FROM_NUMBER);
+      configured = Boolean(env.RETELL_API_KEY && env.RETELL_AGENT_ID && env.RETELL_FROM_NUMBER);
       mode = !configured ? 'mock' : env.RETELL_API_KEY!.startsWith('mock') ? 'sandbox' : 'live';
       health = configured ? 'healthy' : 'not_configured';
       lastSyncAt = latestLog?.createdAt.toISOString() ?? null;
@@ -448,7 +321,7 @@ async function buildIntegrationStatuses(tenantId: string) {
 }
 
 export const operationsRoutes: FastifyPluginAsync = async app => {
-  app.get('/competitors/radar', { preHandler: operationsRead }, async request => {
+  app.get('/competitors/radar', async request => {
     const query = listLimit.extend({ branchId: uuid.optional() }).parse(request.query);
     return db.competitor.findMany({
       where: { tenantId: request.auth.tenantId, branchId: scopedBranch(request, query.branchId) },
@@ -458,7 +331,7 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     });
   });
 
-  app.get('/reputation', { preHandler: crmRead }, async request => {
+  app.get('/reputation', async request => {
     const query = listLimit.extend({ branchId: uuid.optional() }).parse(request.query);
     const branchId = scopedBranch(request, query.branchId);
     const [cases, reviewRequests, unresolvedCount, averageRisk] = await Promise.all([
@@ -494,7 +367,7 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
   });
 
   // RLS (B-3): RevenueLeak is tenant-isolated — reads/writes run under context.
-  app.get('/revenue-leaks', { preHandler: revenueRead }, async request => {
+  app.get('/revenue-leaks', async request => {
     const query = listLimit.extend({ branchId: uuid.optional() }).parse(request.query);
     return runWithTenantContext(request.auth.tenantId, tx => tx.revenueLeak.findMany({
       where: { tenantId: request.auth.tenantId, branchId: scopedBranch(request, query.branchId) },
@@ -504,7 +377,7 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     }));
   });
 
-  app.patch('/revenue-leaks/:id', { preHandler: revenueWrite }, async request => {
+  app.patch('/revenue-leaks/:id', { preHandler: writeRoles }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const input = z.object({
       status: z.string().min(2).max(40).optional(),
@@ -520,7 +393,7 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     return row;
   });
 
-  app.get('/opportunities', { preHandler: revenueRead }, async request => {
+  app.get('/opportunities', async request => {
     const query = listLimit.extend({ branchId: uuid.optional() }).parse(request.query);
     return db.opportunity.findMany({
       where: { tenantId: request.auth.tenantId, branchId: scopedBranch(request, query.branchId) },
@@ -529,7 +402,7 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
       include: { branch: { select: { name: true } }, ownerUser: { select: { displayName: true } }, patient: { select: { firstName: true, lastName: true } } },
     });
   });
-  app.patch('/opportunities/:id', { preHandler: revenueWrite }, async request => {
+  app.patch('/opportunities/:id', { preHandler: writeRoles }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const input = z.object({
       status: z.string().min(2).max(40).optional(),
@@ -544,22 +417,21 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     return row;
   });
 
-  app.get('/leads', { preHandler: crmRead }, async request => {
+  app.get('/leads', async request => {
     const { limit } = listLimit.parse(request.query);
     return db.lead.findMany({ where: { tenantId: request.auth.tenantId }, take: limit, orderBy: { createdAt: 'desc' } });
   });
-  app.post('/leads', { preHandler: crmWrite }, async (request, reply) => {
+  app.post('/leads', { preHandler: writeRoles }, async (request, reply) => {
     const input = z.object({
       patientId: uuid.optional(), name: z.string().min(2).max(160), phone: z.string().max(40).optional(),
       email: z.string().email().optional(), channel, service: z.string().min(2).max(160),
       stage: z.string().min(2).max(40), source: z.string().min(2).max(120), estimatedValue: z.coerce.number().min(0).default(0),
     }).parse(request.body);
-    if (input.patientId) await requireTenantPatient(request, input.patientId);
     const row = await db.lead.create({ data: { tenantId: request.auth.tenantId, ...input } });
     await audit(request, { action: 'lead.created', resource: 'lead', resourceId: row.id });
     return reply.code(201).send(row);
   });
-  app.patch('/leads/:id', { preHandler: crmWrite }, async request => {
+  app.patch('/leads/:id', { preHandler: writeRoles }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const input = z.object({
       stage: z.string().min(2).max(40).optional(),
@@ -574,14 +446,11 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
 
   // Campaign automation is feature-gated (campaign_automation entitlement).
   const campaignFeature = requireFeature('campaign_automation');
-  // Before → after: legacy campaign reads were authenticated-only and mutations
-  // were OWNER/ADMIN/MANAGER. Dedicated grants now close reads without expanding
-  // mutation authority to FRONT_DESK through crm:write.
-  app.get('/campaigns', { preHandler: [campaignRead, campaignFeature] }, async request => {
+  app.get('/campaigns', { preHandler: campaignFeature }, async request => {
     const { limit } = listLimit.parse(request.query);
     return db.campaign.findMany({ where: { tenantId: request.auth.tenantId }, take: limit, orderBy: { createdAt: 'desc' } });
   });
-  app.post('/campaigns', { preHandler: [campaignManage, campaignFeature] }, async (request, reply) => {
+  app.post('/campaigns', { preHandler: [adminRoles, campaignFeature] }, async (request, reply) => {
     const input = z.object({
       name: z.string().min(2).max(160), goal: z.string().min(2).max(300),
       status: z.enum(['DRAFT', 'ACTIVE', 'PAUSED', 'COMPLETED', 'SCHEDULED']).default('DRAFT'),
@@ -592,7 +461,7 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     await audit(request, { action: 'campaign.created', resource: 'campaign', resourceId: row.id });
     return reply.code(201).send(row);
   });
-  app.patch('/campaigns/:id', { preHandler: [campaignManage, campaignFeature] }, async request => {
+  app.patch('/campaigns/:id', { preHandler: [adminRoles, campaignFeature] }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const input = z.object({
       status: z.enum(['DRAFT', 'ACTIVE', 'PAUSED', 'COMPLETED', 'SCHEDULED']).optional(),
@@ -606,22 +475,21 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     return row;
   });
 
-  app.get('/reviews', { preHandler: crmRead }, async request => {
+  app.get('/reviews', async request => {
     const query = listLimit.extend({ branchId: uuid.optional() }).parse(request.query);
     return db.review.findMany({ where: { tenantId: request.auth.tenantId, branchId: scopedBranch(request, query.branchId) }, take: query.limit, orderBy: { createdAt: 'desc' } });
   });
-  app.post('/reviews', { preHandler: crmWrite }, async (request, reply) => {
+  app.post('/reviews', { preHandler: writeRoles }, async (request, reply) => {
     const input = z.object({
       patientId: uuid.optional(), branchId: uuid.optional(), rating: z.coerce.number().int().min(1).max(5),
       text: z.string().min(1).max(4000), platform: z.string().min(2).max(80), sentiment: z.string().min(2).max(40),
     }).parse(request.body);
-    if (input.branchId) await requireTenantBranch(request, input.branchId);
-    if (input.patientId) await requireTenantPatient(request, input.patientId, input.branchId);
+    if (input.branchId) assertBranchAccess(request, input.branchId);
     const row = await db.review.create({ data: { tenantId: request.auth.tenantId, ...input } });
     await audit(request, { action: 'review.created', resource: 'review', resourceId: row.id });
     return reply.code(201).send(row);
   });
-  app.patch('/reviews/:id/respond', { preHandler: crmWrite }, async request => {
+  app.patch('/reviews/:id/respond', { preHandler: writeRoles }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const input = z.object({ response: z.string().min(1).max(4000) }).parse(request.body);
     const existing = await db.review.findFirst({ where: { id, tenantId: request.auth.tenantId } });
@@ -635,24 +503,22 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     return row;
   });
 
-  app.get('/inventory', { preHandler: inventoryRead }, async request => {
+  app.get('/inventory', async request => {
     const query = listLimit.extend({ branchId: uuid.optional() }).parse(request.query);
     return db.inventoryItem.findMany({ where: { tenantId: request.auth.tenantId, branchId: scopedBranch(request, query.branchId) }, take: query.limit, orderBy: { name: 'asc' } });
   });
-  // Inventory creation preserves the former OWNER/ADMIN/MANAGER gate; stock
-  // updates preserve the former FRONT_DESK operational membership separately.
-  app.post('/inventory', { preHandler: inventoryManage }, async (request, reply) => {
+  app.post('/inventory', { preHandler: adminRoles }, async (request, reply) => {
     const input = z.object({
       branchId: uuid, name: z.string().min(2).max(160), category: z.string().min(2).max(100),
       currentStock: z.coerce.number().int().min(0), unit: z.string().min(1).max(40), reorderLevel: z.coerce.number().int().min(0),
       expiryDate: z.coerce.date().optional(), unitCost: z.coerce.number().min(0), usagePerWeek: z.coerce.number().int().min(0), supplier: z.string().min(2).max(160),
     }).parse(request.body);
-    await requireTenantBranch(request, input.branchId);
+    assertBranchAccess(request, input.branchId);
     const row = await db.inventoryItem.create({ data: { tenantId: request.auth.tenantId, ...input } });
     await audit(request, { action: 'inventory.created', resource: 'inventoryItem', resourceId: row.id });
     return reply.code(201).send(row);
   });
-  app.patch('/inventory/:id', { preHandler: inventoryWrite }, async request => {
+  app.patch('/inventory/:id', { preHandler: writeRoles }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     // Either set an absolute stock level or add a restock amount.
     const input = z.object({
@@ -672,10 +538,7 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     return row;
   });
 
-  // Partner-report policy: read OWNER/ADMIN/MANAGER/PROVIDER; create preserves
-  // OWNER/ADMIN/MANAGER/FRONT_DESK; clinical review is OWNER/ADMIN/PROVIDER only.
-  // operations:write does not satisfy any of these clinical guards.
-  app.get('/partner-reports', { preHandler: partnerReportRead }, async request => {
+  app.get('/partner-reports', async request => {
     const query = listLimit.extend({ branchId: uuid.optional() }).parse(request.query);
     return db.partnerReport.findMany({
       where: { tenantId: request.auth.tenantId, branchId: scopedBranch(request, query.branchId) },
@@ -688,20 +551,19 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
       },
     });
   });
-  app.post('/partner-reports', { preHandler: partnerReportWrite }, async (request, reply) => {
+  app.post('/partner-reports', { preHandler: writeRoles }, async (request, reply) => {
     const input = z.object({
       branchId: uuid, patientId: uuid.optional(), providerRef: z.string().max(120).optional(),
       reportType: z.string().min(2).max(160), partner: z.string().min(2).max(160),
       urgency: z.string().min(2).max(40), status: z.string().min(2).max(60), summary: z.string().max(4000).optional(),
     }).parse(request.body);
-    await requireTenantBranch(request, input.branchId);
-    if (input.patientId) await requireTenantPatient(request, input.patientId, input.branchId);
+    assertBranchAccess(request, input.branchId);
     const row = await db.partnerReport.create({ data: { tenantId: request.auth.tenantId, ...input } });
     await audit(request, { action: 'partnerReport.created', resource: 'partnerReport', resourceId: row.id });
     return reply.code(201).send(row);
   });
 
-  app.patch('/partner-reports/:id/review', { preHandler: partnerReportReview }, async request => {
+  app.patch('/partner-reports/:id/review', { preHandler: writeRoles }, async request => {
     const params = z.object({ id: uuid }).parse(request.params);
     const body = z.object({
       status: z.enum(['ordered', 'sample-collected', 'pending-result', 'result-received', 'doctor-reviewed']).default('doctor-reviewed'),
@@ -728,10 +590,10 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     return updated;
   });
 
-  app.get('/integrations', { preHandler: integrationsRead }, async request => {
+  app.get('/integrations', async request => {
     return db.integration.findMany({ where: { tenantId: request.auth.tenantId }, orderBy: { name: 'asc' } });
   });
-  app.patch('/integrations/:id', { preHandler: integrationsManage }, async request => {
+  app.patch('/integrations/:id', { preHandler: adminRoles }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const input = z.object({
       status: z.enum(['CONNECTED', 'DISCONNECTED', 'ERROR', 'COMING_SOON']),
@@ -746,11 +608,11 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     return row;
   });
 
-  app.get('/integrations/status', { preHandler: integrationsRead }, async request => {
+  app.get('/integrations/status', async request => {
     return buildIntegrationStatuses(request.auth.tenantId);
   });
 
-  app.post('/integrations/:provider/test', { preHandler: integrationsManage }, async (request, reply) => {
+  app.post('/integrations/:provider/test', { preHandler: adminRoles }, async (request, reply) => {
     const { provider } = z.object({ provider: z.string().trim().min(1).max(80) }).parse(request.params);
     const statuses = await buildIntegrationStatuses(request.auth.tenantId);
     const selected = statuses.find(entry => entry.key === provider);
@@ -813,10 +675,10 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     });
   });
 
-  app.get('/tasks', { preHandler: staffTaskRead }, async request => {
+  app.get('/tasks', async request => {
     const query = listLimit.extend({ branchId: uuid.optional() }).parse(request.query);
     const branchId = scopedBranch(request, query.branchId);
-    const rows = await db.staffTask.findMany({
+    return db.staffTask.findMany({
       where: { tenantId: request.auth.tenantId, branchId },
       take: query.limit,
       orderBy: { createdAt: 'desc' },
@@ -825,348 +687,67 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
         assignedTo: { select: { displayName: true } },
       },
     });
-    const permissions = await getRequestPermissions(request);
-    const canReadReceptionistArtifacts = permissions.has('receptionist:call-artifacts:read');
-    await audit(request, { action: 'task.list', resource: 'staffTask', metadata: { count: rows.length, branchScoped: Boolean(branchId) } });
-    return rows.map(row => {
-      const metadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
-        ? row.metadata as Record<string, unknown>
-        : null;
-      if (canReadReceptionistArtifacts || metadata?.workflow !== 'receptionist_safety') return row;
-      return {
-        ...row,
-        metadata: {
-          workflow: 'receptionist_safety',
-          kind: metadata.kind ?? 'restricted',
-          requiresAcknowledgement: metadata.requiresAcknowledgement === true,
-          restricted: true,
-        },
-      };
-    });
   });
-  app.post('/tasks', { preHandler: staffTaskWrite }, async (request, reply) => {
+  app.post('/tasks', { preHandler: adminRoles }, async (request, reply) => {
     const input = z.object({
       branchId: uuid.optional(), assignedToId: uuid.optional(), title: z.string().min(2).max(240),
       priority: z.string().min(2).max(40), dueAt: z.coerce.date().optional(),
     }).parse(request.body);
-    if (input.branchId) await requireTenantBranch(request, input.branchId);
-    if (input.assignedToId) await requireTenantAssignee(request, input.assignedToId);
+    if (input.branchId) assertBranchAccess(request, input.branchId);
     const row = await db.staffTask.create({ data: { tenantId: request.auth.tenantId, ...input } });
     await audit(request, { action: 'task.created', resource: 'staffTask', resourceId: row.id });
     return reply.code(201).send(row);
   });
 
-  app.get('/revenue-snapshots', { preHandler: revenueRead }, async request => {
+  app.get('/revenue-snapshots', async request => {
     const query = listLimit.extend({ branchId: uuid.optional() }).parse(request.query);
     return db.revenueSnapshot.findMany({ where: { tenantId: request.auth.tenantId, branchId: scopedBranch(request, query.branchId) }, take: query.limit, orderBy: { period: 'desc' } });
   });
 
-  app.get('/conversations', { preHandler: crmRead }, async request => {
+  app.get('/conversations', async request => {
     const query = listLimit.extend({ branchId: uuid.optional() }).parse(request.query);
-    const rows = await db.conversation.findMany({
+    return db.conversation.findMany({
       where: { tenantId: request.auth.tenantId, ...branchScope(request), branchId: scopedBranch(request, query.branchId) },
       take: query.limit,
       orderBy: { updatedAt: 'desc' },
       include: {
-        tenant: { select: { name: true } },
         branch: { select: { name: true } },
-        patient: { select: { firstName: true, lastName: true, phone: true, email: true } },
+        patient: { select: { firstName: true, lastName: true } },
       },
     });
-    return Promise.all(rows.map(async row => {
-      const target = resolveReplyTarget(row.channel, row.patient);
-      const destinationFormatValid = isReplyDestinationFormatValid(target);
-      const [consent, suppressed, replyAttempts] = await Promise.all([
-        target && row.patientId
-          ? db.communicationConsent.findFirst({
-              where: { tenantId: request.auth.tenantId, patientId: row.patientId, leadId: null, channel: target.channel },
-              select: { status: true, source: true, capturedAt: true },
-            })
-          : null,
-        target
-          ? isSuppressed(request.auth.tenantId, { patientId: row.patientId, destination: target.destination }, target.channel)
-          : true,
-        db.conversationReplyAttempt.findMany({
-          where: { tenantId: request.auth.tenantId, conversationId: row.id },
-          select: { clientAttemptKey: true, phase: true, status: true },
-          orderBy: { createdAt: 'desc' },
-          take: 30,
-        }),
-      ]);
-      const resultKeys = new Set(replyAttempts.filter(attempt => attempt.phase === 'RESULT').map(attempt => attempt.clientAttemptKey));
-      const hasUnresolvedClaim = replyAttempts.some(attempt => attempt.phase === 'SUBMISSION_CLAIM' && !resultKeys.has(attempt.clientAttemptKey));
-      const hasUnknownResult = replyAttempts.some(attempt => attempt.phase === 'RESULT' && attempt.status === 'submission_result_unknown');
-      const hasProviderEvidencePending = replyAttempts.some(attempt => attempt.phase === 'RESULT' && ['provider_accepted', 'provider_pending'].includes(attempt.status));
-      const submissionState = hasUnresolvedClaim || hasUnknownResult
-        ? 'submission_result_unknown'
-        : hasProviderEvidencePending
-          ? 'provider_evidence_pending'
-          : 'clear';
-      const ready = Boolean(row.patientId && target && destinationFormatValid && !suppressed && submissionState === 'clear');
-      const readinessReason = !row.patientId
-        ? 'patient_identity_not_linked'
-        : !target
-          ? 'destination_not_available'
-          : !destinationFormatValid
-            ? 'destination_format_invalid'
-            : suppressed
-              ? 'recipient_suppressed'
-              : submissionState === 'submission_result_unknown'
-                ? 'submission_result_unknown'
-                : submissionState === 'provider_evidence_pending'
-                  ? 'provider_evidence_pending'
-                  : 'ready_for_server_recheck';
-      const senderIdentity = row.branch?.name ?? row.tenant.name;
-      const publicRow = { ...row, tenant: undefined };
-      return {
-        ...publicRow,
-        patient: row.patient ? { firstName: row.patient.firstName, lastName: row.patient.lastName } : null,
-        replyReadiness: {
-          channel: target?.channel ?? null,
-          destinationMasked: target ? maskDestination(target.destination) : null,
-          identityStatus: row.patientId ? 'patient_linked' : 'not_linked',
-          destinationSource: target ? 'linked_patient_record' : 'unavailable',
-          destinationVerificationStatus: destinationFormatValid ? 'format_verified' : 'not_verified',
-          authorizationBasis: row.patientId && target ? 'recorded_inbound_conversation_reply' : 'none',
-          explicitConsentStatus: consent?.status ?? 'not_recorded',
-          consentSource: consent?.source ?? null,
-          consentCapturedAt: consent?.capturedAt.toISOString() ?? null,
-          suppressionStatus: !target ? 'not_checked_no_destination' : suppressed ? 'suppressed' : 'not_suppressed',
-          submissionState,
-          ready,
-          readinessReason,
-          draftSource: 'rule_based_staff_review_draft',
-          senderIdentity,
-          channelTerms: OPERATIONAL_REPLY_TERMS,
-          channelTermsSource: OPERATIONAL_REPLY_TERMS_SOURCE,
-        },
-      };
-    }));
   });
 
-  // HONEST outbound reply. Previously this fabricated an "AI recovery": it wrote
-  // lastAgentMessage + aiHandled:true and set status 'ai-recovered' while sending
-  // NOTHING to the patient. Now the reply is actually delivered through the
-  // governed comms provider (consent/suppression gate + E.164/email validation).
-  // Provider API acceptance is not delivery: until a receipt is ingested, the
-  // conversation remains pending and must never inflate recovery metrics.
-  const replyResponseInclude = {
-    branch: { select: { name: true } },
-    patient: { select: { firstName: true, lastName: true } },
-  } as const;
-
-  app.post('/conversations/:id/reply', { preHandler: crmWrite }, async (request, reply) => {
+  app.post('/conversations/:id/reply', { preHandler: writeRoles }, async (request, reply) => {
     const params = z.object({ id: uuid }).parse(request.params);
     const body = z.object({
-      message: z.string().trim().min(1).max(2000),
-      status: z.enum(['replied', 'escalated']).default('replied'),
-      clientAttemptKey: uuid.optional(),
+      message: z.string().min(1).max(2000),
+      status: z.enum(['replied', 'ai-recovered', 'escalated', 'pending']).default('replied'),
     }).parse(request.body);
-    const row = await db.conversation.findFirst({
-      where: { id: params.id, tenantId: request.auth.tenantId },
-      include: {
-        tenant: { select: { name: true } },
-        branch: { select: { name: true } },
-        patient: { select: { id: true, phone: true, email: true } },
-      },
-    });
+    const row = await db.conversation.findFirst({ where: { id: params.id, tenantId: request.auth.tenantId } });
     if (!row) throw request.server.httpErrors.notFound('Conversation not found');
     if (row.branchId) assertBranchAccess(request, row.branchId);
-
-    // Escalation is an internal hand-off to a human — never an outbound patient
-    // message, so it must not send and must not inflate AI-recovery metrics.
-    if (body.status === 'escalated') {
-      const escalated = await db.conversation.update({
-        where: { id: row.id },
-        data: { status: 'escalated' },
-        include: replyResponseInclude,
-      });
-      await audit(request, { action: 'conversation.escalated', resource: 'conversation', resourceId: row.id });
-      return reply.send({ conversation: escalated, delivered: false, deliveryStatus: 'escalated', providerMode: null, message: 'Escalated to a human. No patient message was sent.' });
-    }
-
-    if (!body.clientAttemptKey) {
-      throw request.server.httpErrors.badRequest('A durable clientAttemptKey is required for an outbound reply');
-    }
-    const target = resolveReplyTarget(row.channel, row.patient);
-    if (!row.patientId || !target) {
-      return reply.code(409).send({
-        accepted: false, delivered: false, deliveryStatus: 'no_contact', providerMode: null,
-        message: 'Submission blocked: no linked patient destination is available.',
-      });
-    }
-    if (!isReplyDestinationFormatValid(target)) {
-      return reply.code(409).send({
-        accepted: false, delivered: false, deliveryStatus: 'invalid_destination', providerMode: null,
-        message: 'Submission blocked: the linked patient destination is not valid for this channel.',
-      });
-    }
-
-    // Sender identity and subject are derived only from canonical tenant data;
-    // reviewed drafts cannot invent an organization identity or channel terms.
-    const senderIdentity = row.branch?.name ?? row.tenant.name;
-    const subject = `Message from ${senderIdentity}`;
-    const evidence = {
-      tenantId: request.auth.tenantId,
-      conversationId: row.id,
-      actorUserId: request.auth.userId,
-      clientAttemptKey: body.clientAttemptKey,
-      channel: target.channel,
-      destinationMasked: maskDestination(target.destination) ?? '****',
-      messageHash: evidenceHash(body.message),
-      subjectHash: evidenceHash(subject),
-      senderIdentityHash: evidenceHash(senderIdentity),
-    };
-
-    const claim = await runWithTenantContext(request.auth.tenantId, async tx => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`conversation-reply:${request.auth.tenantId}:${row.id}`})::bigint)`;
-      const attempts = await tx.conversationReplyAttempt.findMany({
-        where: { tenantId: request.auth.tenantId, conversationId: row.id },
-        orderBy: { createdAt: 'asc' },
-      });
-      const sameAttempt = attempts.filter(attempt => attempt.clientAttemptKey === body.clientAttemptKey);
-      const sameResult = sameAttempt.find(attempt => attempt.phase === 'RESULT');
-      const matchesEvidence = sameAttempt.every(attempt =>
-        attempt.channel === evidence.channel
-        && attempt.destinationMasked === evidence.destinationMasked
-        && attempt.messageHash === evidence.messageHash
-        && attempt.subjectHash === evidence.subjectHash
-        && attempt.senderIdentityHash === evidence.senderIdentityHash,
-      );
-      if (sameAttempt.length > 0 && !matchesEvidence) return { kind: 'conflict' as const };
-      if (sameResult) return { kind: 'replay' as const, result: sameResult };
-
-      const resultKeys = new Set(attempts.filter(attempt => attempt.phase === 'RESULT').map(attempt => attempt.clientAttemptKey));
-      const hasDanglingClaim = attempts.some(attempt => attempt.phase === 'SUBMISSION_CLAIM' && !resultKeys.has(attempt.clientAttemptKey));
-      const hasUnknownResult = attempts.some(attempt => attempt.phase === 'RESULT' && attempt.status === 'submission_result_unknown');
-      if (hasDanglingClaim || hasUnknownResult || sameAttempt.length > 0) return { kind: 'unknown' as const };
-      const hasProviderEvidencePending = attempts.some(attempt =>
-        attempt.phase === 'RESULT' && ['provider_accepted', 'provider_pending'].includes(attempt.status),
-      );
-      if (hasProviderEvidencePending) return { kind: 'provider_pending' as const };
-
-      const completedAt = new Date();
-      await tx.conversationReplyAttempt.create({ data: {
-        ...evidence, phase: 'INTENT', status: 'authorized', completedAt,
-      } });
-      await tx.conversationReplyAttempt.create({ data: {
-        ...evidence, phase: 'SUBMISSION_CLAIM', status: 'submission_claimed', completedAt,
-      } });
-      return { kind: 'claimed' as const };
+    const updated = await db.conversation.update({
+      where: { id: row.id },
+      data: {
+        latestMessage: row.latestMessage,
+        lastAgentMessage: body.message,
+        lastAgentMessageAt: new Date(),
+        status: body.status,
+        aiHandled: true,
+      },
+      include: {
+        branch: { select: { name: true } },
+        patient: { select: { firstName: true, lastName: true } },
+      },
     });
-
-    if (claim.kind === 'conflict') {
-      return reply.code(409).send({
-        accepted: false, delivered: false, deliveryStatus: 'attempt_conflict', providerMode: null,
-        message: 'This attempt key is already bound to different reviewed content. Nothing was submitted.',
-      });
-    }
-    if (claim.kind === 'unknown') {
-      return reply.code(409).send({
-        accepted: false, delivered: false, deliveryStatus: 'submission_result_unknown', providerMode: null,
-        message: 'Submission result unknown. Retrying is blocked until provider evidence is reconciled.',
-      });
-    }
-    if (claim.kind === 'provider_pending') {
-      return reply.code(409).send({
-        accepted: false, delivered: false, deliveryStatus: 'provider_evidence_pending', providerMode: null,
-        message: 'A prior submission is awaiting provider or delivery evidence. A duplicate request is blocked.',
-      });
-    }
-    if (claim.kind === 'replay') {
-      const conversation = await db.conversation.findFirst({ where: { id: row.id, tenantId: request.auth.tenantId }, include: replyResponseInclude });
-      return reply.send({ conversation, ...durableReplyPayload(claim.result), replayed: true });
-    }
-
-    let send: SendResult;
-    try {
-      const suppressed = await isSuppressed(
-        request.auth.tenantId,
-        { patientId: row.patientId, destination: target.destination },
-        target.channel,
-      );
-      send = suppressed
-        ? { ok: false, status: 'suppressed', mode: 'suppressed', failureReason: 'suppressed_or_opted_out' }
-        : await sendMessage(
-            target.channel,
-            target.destination,
-            subject,
-            body.message,
-            `conv-reply-${request.auth.tenantId}-${row.id}-${body.clientAttemptKey}`,
-            { tenantId: request.auth.tenantId, patientId: row.patientId },
-          );
-    } catch {
-      send = { ok: false, status: 'failed', mode: 'configured_pending_provider', failureReason: 'submission_result_unknown' };
-    }
-
-    const resultStatus = send.failureReason === 'submission_result_unknown' || send.failureReason?.startsWith('transport_ambiguous:')
-      ? 'submission_result_unknown'
-      : send.ok && send.status === 'sent'
-        ? 'provider_accepted'
-        : send.status === 'pending'
-          ? 'provider_pending'
-          : send.status === 'suppressed'
-            ? 'suppressed'
-            : 'provider_rejected';
-    const failureCode = resultStatus === 'submission_result_unknown'
-      ? 'provider_submission_ambiguous'
-      : resultStatus === 'provider_rejected'
-        ? send.status === 'setup_required' ? 'provider_setup_required' : 'provider_rejected'
-        : resultStatus === 'suppressed' ? 'recipient_suppressed' : null;
-
-    try {
-      const persisted = await runWithTenantContext(request.auth.tenantId, async tx => {
-        const result = await tx.conversationReplyAttempt.create({ data: {
-          ...evidence,
-          phase: 'RESULT',
-          status: resultStatus,
-          providerMode: send.mode,
-          providerMessageId: send.providerMessageId ?? null,
-          failureCode,
-          completedAt: new Date(),
-        } });
-        const conversation = resultStatus === 'provider_accepted'
-          ? await tx.conversation.update({
-              where: { id: row.id },
-              data: { lastAgentMessage: body.message, lastAgentMessageAt: new Date(), status: 'pending', aiHandled: false },
-              include: replyResponseInclude,
-            })
-          : await tx.conversation.findFirst({ where: { id: row.id, tenantId: request.auth.tenantId }, include: replyResponseInclude });
-        await tx.auditEvent.create({ data: {
-          tenantId: request.auth.tenantId,
-          actorUserId: request.auth.userId,
-          action: resultStatus === 'provider_accepted' ? 'conversation.replyProviderAccepted' : 'conversation.replySubmissionResult',
-          resource: 'conversation',
-          resourceId: row.id,
-          requestId: request.id,
-          ipAddress: request.ip,
-          userAgent: request.headers['user-agent'],
-          metadata: {
-            accepted: resultStatus === 'provider_accepted', delivered: false, resultStatus,
-            channel: target.channel, providerMode: send.mode, providerMessageId: send.providerMessageId ?? null,
-            attemptId: result.id, channelTerms: OPERATIONAL_REPLY_TERMS, channelTermsSource: OPERATIONAL_REPLY_TERMS_SOURCE,
-          },
-        } });
-        return { conversation, result };
-      });
-      return reply.send({ conversation: persisted.conversation, ...durableReplyPayload(persisted.result) });
-    } catch {
-      // The immutable claim was committed before provider I/O. If result
-      // persistence is uncertain, never retry or degrade this to normal failure.
-      return reply.code(409).send({
-        accepted: false, delivered: false, deliveryStatus: 'submission_result_unknown', providerMode: send.mode,
-        message: 'Submission result unknown. Retrying is blocked until provider evidence is reconciled.',
-      });
-    }
+    await audit(request, { action: 'conversation.replied', resource: 'conversation', resourceId: row.id });
+    return reply.send(updated);
   });
 
   // ===== AI-ready operational briefing (RULE-BASED — no LLM) ===============
   // Real data only: pending requests, unpaid deposits, failed/expired payments,
   // receptionist handoffs, revenue alerts/tasks, and top rule-based recs.
-  // Aggregate-sensitive grant: this response intentionally combines counts from
-  // appointments, payments, receptionist, insurance, CRM, and intake. It is not
-  // available merely because a caller has one narrower read permission.
-  app.get('/briefing', { preHandler: operationsRead }, async request => {
+  app.get('/briefing', async request => {
     const tenantId = request.auth.tenantId;
     const [
       appointmentRequestsPending, receptionistHandoffPending, unpaidDeposits,
@@ -1263,17 +844,17 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
   });
 
   // ===== Operational signals + AI recommendations (read + triage) =========
-  app.get('/signals', { preHandler: operationsRead }, async request => {
+  app.get('/signals', async request => {
     const query = z.object({ status: z.string().optional(), limit: z.coerce.number().int().min(1).max(200).default(100) }).parse(request.query);
     return db.operationalSignal.findMany({ where: { tenantId: request.auth.tenantId, ...(query.status ? { status: query.status } : {}) }, orderBy: [{ severity: 'desc' }, { createdAt: 'desc' }], take: query.limit });
   });
 
-  app.get('/recommendations', { preHandler: operationsRead }, async request => {
+  app.get('/recommendations', async request => {
     const query = z.object({ status: z.string().optional(), limit: z.coerce.number().int().min(1).max(200).default(100) }).parse(request.query);
     return db.aIRecommendation.findMany({ where: { tenantId: request.auth.tenantId, ...(query.status ? { status: query.status } : {}) }, orderBy: [{ confidence: 'desc' }, { createdAt: 'desc' }], take: query.limit });
   });
 
-  app.patch('/recommendations/:id', { preHandler: operationsWrite }, async request => {
+  app.patch('/recommendations/:id', { preHandler: writeRoles }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const input = z.object({ status: z.enum(['pending', 'accepted', 'rejected', 'executed', 'dismissed']) }).parse(request.body);
     const existing = await db.aIRecommendation.findFirst({ where: { id, tenantId: request.auth.tenantId } });
@@ -1283,7 +864,7 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     return row;
   });
 
-  app.patch('/signals/:id', { preHandler: operationsWrite }, async request => {
+  app.patch('/signals/:id', { preHandler: writeRoles }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const input = z.object({ status: z.enum(['open', 'acknowledged', 'resolved', 'dismissed']) }).parse(request.body);
     const existing = await db.operationalSignal.findFirst({ where: { id, tenantId: request.auth.tenantId } });
