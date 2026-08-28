@@ -61,6 +61,9 @@ jobs:
       - name: Secret scan (gitleaks)
         uses: gitleaks/gitleaks-action@v2
         env:
+          # gitleaks-action@v2 exits immediately without a token. Its absence is
+          # why the security job failed in ~6s on every PR into main.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
       - uses: actions/setup-node@v4
         with:

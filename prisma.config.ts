@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { defineConfig, env } from 'prisma/config';
+import { defineConfig } from 'prisma/config';
 
 export default defineConfig({
   schema: 'prisma/schema.prisma',
@@ -7,9 +7,12 @@ export default defineConfig({
     path: 'prisma/migrations',
   },
   datasource: {
-    // Migrations/CLI run as the owner role when DATABASE_MIGRATION_URL is set;
-    // otherwise fall back to the runtime DATABASE_URL (single-role setups).
-    url: process.env.DATABASE_MIGRATION_URL ?? env('DATABASE_URL'),
+    // Prisma loads this config for EVERY CLI command. `prisma generate` does
+    // not connect to the database, so preview/build environments may omit the
+    // runtime URL — and env() THROWS on a missing variable, which failed every
+    // preview build with PrismaConfigEnvError. Commands that genuinely need a
+    // database still fail at execution time when neither URL is configured.
+    url: process.env.DATABASE_MIGRATION_URL ?? process.env.DATABASE_URL ?? '',
     ...(process.env.SHADOW_DATABASE_URL ? { shadowDatabaseUrl: process.env.SHADOW_DATABASE_URL } : {}),
   },
 });
