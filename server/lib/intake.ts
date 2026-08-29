@@ -127,7 +127,7 @@ async function planSections(tenantId: string, ctx: { patientId: string | null; a
 }
 
 // --- Packet generation (idempotent per appointment / request) --------------
-const ACTIVE_STATUSES = ['draft', 'sent', 'in_progress', 'submitted', 'needs_review'];
+const ACTIVE_STATUSES = ['draft', 'link_issued', 'in_progress', 'submitted', 'needs_review'];
 
 export async function generateIntakePacket(tenantId: string, target: PacketTarget, opts: { source?: string; actorUserId?: string | null; force?: boolean } = {}) {
   const ctx = await resolveContext(tenantId, target);
@@ -159,9 +159,16 @@ export async function generateIntakePacket(tenantId: string, target: PacketTarge
 export async function issueIntakeToken(tenantId: string, packetId: string, actorUserId?: string | null): Promise<string> {
   const { token, hash } = newIntakeToken();
   const expires = new Date(Date.now() + TOKEN_TTL_DAYS * 86400000);
-  await db.patientIntakePacket.update({ where: { id: packetId }, data: { publicTokenHash: hash, tokenExpiresAt: expires, status: 'sent' } });
+  // 'link_issued', NOT 'sent'. This function mints a token and returns it; there
+  // is no email, SMS or dispatch anywhere in this module. Recording 'sent' told
+  // the clinic a patient had been contacted when nothing left the building —
+  // an audit sent a packet to a patient whose phone was null and got "sent"
+  // back — and left staff waiting on a response that could never arrive. The
+  // status now says exactly what happened: a link exists and somebody has to
+  // deliver it. Reserve 'sent' for when real delivery lands.
+  await db.patientIntakePacket.update({ where: { id: packetId }, data: { publicTokenHash: hash, tokenExpiresAt: expires, status: 'link_issued' } });
   await writeAudit(tenantId, actorUserId ?? null, 'intake.public_token.generated', packetId, { expiresAt: expires.toISOString() });
-  await emitBusinessEvent(tenantId, { eventType: 'intake.packet.sent', entityType: 'intakePacket', entityId: packetId, sourceModule: 'intake', payload: {} }).catch(() => {});
+  await emitBusinessEvent(tenantId, { eventType: 'intake.packet.link_issued', entityType: 'intakePacket', entityId: packetId, sourceModule: 'intake', payload: {} }).catch(() => {});
   return token;
 }
 
@@ -245,8 +252,8 @@ export async function submitSectionMutation(
     if (data.acknowledgementId !== acknowledgement.id) throw new Error('acknowledgement_not_approved');
   }
 
-  const packetStarted = packet.status === 'draft' || packet.status === 'sent';
-  if (packet.status === 'draft' || packet.status === 'sent') {
+  const packetStarted = packet.status === 'draft' || packet.status === 'link_issued';
+  if (packet.status === 'draft' || packet.status === 'link_issued') {
     await tx.patientIntakePacket.update({ where: { id: packetId }, data: { status: 'in_progress', startedAt: packet.startedAt ?? new Date() } });
   }
 
@@ -471,7 +478,7 @@ export async function reviewPacket(tenantId: string, packetId: string, action: '
 export function packetView(packet: { id: string; status: string; source: string; appointmentId: string | null; appointmentRequestId: string | null; patientId: string | null; leadId: string | null; readinessScore: number; submittedAt: Date | null; reviewedAt: Date | null; tokenExpiresAt: Date | null; createdAt: Date; sections?: Array<{ sectionType: string; status: string }> }) {
   const allowed: string[] = [];
   if (['submitted', 'needs_review'].includes(packet.status)) allowed.push('approve', 'mark_needs_review');
-  if (['draft', 'sent', 'in_progress', 'needs_review'].includes(packet.status)) allowed.push('resend');
+  if (['draft', 'link_issued', 'in_progress', 'needs_review'].includes(packet.status)) allowed.push('resend');
   return {
     intakePacketId: packet.id,
     appointmentId: packet.appointmentId,

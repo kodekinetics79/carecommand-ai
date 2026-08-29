@@ -15,7 +15,7 @@ import { useApiResource } from '../hooks/useApiResource';
 import { mapAppointment, mapProviderProfile, mapPatient, type ApiAppointment, type ApiProviderProfile, type ApiPatient } from '../lib/apiAdapters';
 import { ApiError } from '../lib/api';
 import { appointmentsApi, schedulingApi, type LifecycleStatus, type ProviderSlot } from '../lib/appointments';
-import { intakeApi } from '../lib/intake';
+import { intakeApi, intakeLink } from '../lib/intake';
 import { useSession } from '../hooks/useSession';
 import { checkEligibility, fetchAppointmentVerificationQueue, type AppointmentVerificationQueueRow } from '../lib/revenueProtection';
 
@@ -250,7 +250,7 @@ export default function Scheduling() {
     setRowNotice(null);
     try {
       const packet = await intakeApi.createPacket({ appointmentId: appt.id, source: 'staff' });
-      const link = packet.publicUrl || (packet.publicToken ? `/intake/${packet.publicToken}` : null);
+      const link = intakeLink(packet.publicUrl, packet.publicToken);
       if (link) await navigator.clipboard.writeText(link).catch(() => undefined);
       setRowNotice({ id: appt.id, kind: 'ok', text: link ? 'Intake link created and copied to clipboard.' : 'Intake packet created.' });
     } catch (err) {

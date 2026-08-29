@@ -44,8 +44,26 @@ export interface PublicIntakeView {
   }>;
 }
 
+/**
+ * The link a receptionist actually hands to a patient.
+ *
+ * The server can only build an absolute URL when PUBLIC_APP_URL names the
+ * deployment, and it answers null otherwise rather than inventing one. The
+ * browser has no such gap: the intake page is served by this same app, so its
+ * own origin is always the right host. Callers used to fall back to the bare
+ * path `/intake/<token>`, which copies out as a string no patient can open.
+ */
+export function intakeLink(publicUrl: string | null | undefined, publicToken: string | null | undefined): string | null {
+  if (publicUrl) return publicUrl;
+  if (!publicToken) return null;
+  return new URL(`/intake/${publicToken}`, window.location.origin).toString();
+}
+
 export const INTAKE_STATUS_META: Record<string, { label: string; badge: string }> = {
   draft: { label: 'Draft', badge: 'badge-blue' },
+  // The module has no delivery mechanism, so a packet is never 'Sent'. The
+  // label states what is true and what the desk still has to do.
+  link_issued: { label: 'Link ready to share', badge: 'badge-violet' },
   sent: { label: 'Sent', badge: 'badge-violet' },
   in_progress: { label: 'In progress', badge: 'badge-amber' },
   submitted: { label: 'Submitted', badge: 'badge-blue' },

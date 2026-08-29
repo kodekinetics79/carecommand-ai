@@ -26,7 +26,7 @@ export type WorkflowEventType =
   | 'patient.reactivation.recommended' | 'no_show.recovery.recommended' | 'unpaid_deposit.followup.recommended'
   | 'failed_payment.followup.recommended' | 'insurance_update.followup.recommended' | 'review_request.recommended' | 'empty_slot.fill.recommended'
   // Patient Intake + Consent engine events.
-  | 'intake.packet.created' | 'intake.packet.sent' | 'intake.packet.started' | 'intake.section.completed'
+  | 'intake.packet.created' | 'intake.packet.link_issued' | 'intake.packet.started' | 'intake.section.completed'
   | 'intake.packet.submitted' | 'intake.packet.reviewed' | 'intake.consent.accepted' | 'intake.consent.declined'
   | 'intake.insurance.updated' | 'intake.estimate.acknowledged' | 'intake.gap_detected';
 

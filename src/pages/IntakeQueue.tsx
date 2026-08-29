@@ -5,7 +5,7 @@ import ModuleTabs from '../components/ui/ModuleTabs';
 import { apiRequest } from '../lib/api';
 import { mapPatient, type ApiPatient } from '../lib/apiAdapters';
 import {
-  intakeApi, INTAKE_STATUS_META, SECTION_LABEL,
+  intakeApi, intakeLink, INTAKE_STATUS_META, SECTION_LABEL,
   type IntakePacket, type IntakePacketDetail,
 } from '../lib/intake';
 
@@ -79,7 +79,7 @@ export default function IntakeQueue() {
     setOriginateNotice(null);
     try {
       const packet = await intakeApi.createPacket({ patientId: originatePatientId, source: 'staff' });
-      const link = packet.publicUrl || (packet.publicToken ? `/intake/${packet.publicToken}` : null);
+      const link = intakeLink(packet.publicUrl, packet.publicToken);
       if (link) await navigator.clipboard.writeText(link).catch(() => undefined);
       setOriginateNotice({ kind: 'ok', text: link ? 'Intake link created and copied to clipboard.' : 'Intake packet created.' });
       setOriginatePatientId('');
@@ -182,7 +182,7 @@ function PacketDetail({ id, onChanged }: { id: string; onChanged: () => void }) 
             <button type="button" disabled={busy} onClick={() => run(async () => { await intakeApi.review(id, 'needs_review'); setNotice('Marked needs review.'); await load(); onChanged(); })} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50"><AlertCircle className="w-3.5 h-3.5" /> Needs review</button>
           )}
           {packet.allowedActions.includes('resend') && (
-            <button type="button" disabled={busy} onClick={() => run(async () => { const r = await intakeApi.resend(id); setLink(r.publicUrl || `/intake/${r.publicToken}`); setNotice('New intake link generated.'); })} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50"><RefreshCw className="w-3.5 h-3.5" /> Resend link</button>
+            <button type="button" disabled={busy} onClick={() => run(async () => { const r = await intakeApi.resend(id); setLink(intakeLink(r.publicUrl, r.publicToken)); setNotice('New intake link generated. Share it with the patient — the clinic does not send it for you.'); })} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50"><RefreshCw className="w-3.5 h-3.5" /> Resend link</button>
           )}
           {link && (
             <button type="button" onClick={async () => { await navigator.clipboard.writeText(link); setCopied(true); setTimeout(() => setCopied(false), 1500); }} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)]">{copied ? <Check className="w-3.5 h-3.5 text-emerald-v" /> : <Copy className="w-3.5 h-3.5" />} {copied ? 'Copied' : 'Copy patient link'}</button>

@@ -1,0 +1,12 @@
+-- Intake packets were never actually sent.
+--
+-- issueIntakeToken() mints a public token and returns it. There is no email, no
+-- SMS and no dispatch anywhere in the intake module, yet the packet was recorded
+-- as status 'sent'. Staff read that as "the patient has been contacted" and
+-- waited for a response that could not arrive; an audit sent a packet to a
+-- patient whose phone number was null and got "sent" back.
+--
+-- Every existing 'sent' row is in the same position: a link was issued and
+-- nobody was contacted. Relabel them to say so. 'sent' stays a valid value in
+-- the vocabulary, reserved for when real delivery is implemented.
+UPDATE "PatientIntakePacket" SET "status" = 'link_issued' WHERE "status" = 'sent';
