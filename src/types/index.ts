@@ -26,6 +26,10 @@ export interface Doctor {
   name: string;
   specialty: string;
   branchId: string;
+  /** On the booking schedule. A deactivated provider is never bookable. */
+  active: boolean;
+  /** Recurring weekly windows configured; null when the source did not say. */
+  availabilityWindows: number | null;
   avatar?: string;
   utilization: number;
   appointmentsToday: number;

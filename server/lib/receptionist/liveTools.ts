@@ -117,7 +117,7 @@ async function resolveBranch(tenantId: string): Promise<{ id: string; timezone: 
 // Live booking requires an unambiguous provider. Ambiguity is routed to staff;
 // provider-null appointments would bypass the canonical capacity guard.
 async function resolveSoleProvider(tenantId: string, branchId: string): Promise<string | null> {
-  const providers = await db.providerProfile.findMany({ where: { tenantId, branchId }, select: { id: true }, take: 2 });
+  const providers = await db.providerProfile.findMany({ where: { tenantId, branchId, active: true }, select: { id: true }, take: 2 });
   return providers.length === 1 ? providers[0].id : null;
 }
 
@@ -983,7 +983,7 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
       return review('Canonical self-booking policy does not permit the requested time', ['schedulingPolicy'], 'A team member needs to review this appointment request.');
     }
     const providers = await tx.providerProfile.findMany({
-      where: { tenantId: ctx.tenantId, branchId: trusted.branchId!, user: { active: true } },
+      where: { tenantId: ctx.tenantId, branchId: trusted.branchId!, active: true, user: { active: true } },
       select: {
         id: true,
         user: { select: { displayName: true } },

@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router';
 import { CalendarDays, Zap, AlertCircle, CheckCircle2, Clock, Users, DollarSign, RefreshCw, CreditCard, LogIn, UserX, CheckCheck, XCircle, CalendarClock } from 'lucide-react';
 import AppointmentPaymentCard from '../components/payments/AppointmentPaymentCard';
 import PaymentRequestsPanel from '../components/payments/PaymentRequestsPanel';
+import ProviderSetupPanel from '../components/scheduling/ProviderSetupPanel';
 import InsuranceIntakeCard from '../components/insurance/InsuranceIntakeCard';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
@@ -74,7 +75,7 @@ export default function Scheduling() {
     return `/v1/appointments?limit=100&from=${from}&to=${to}${branchParam}`;
   }, [selectedDate, selectedBranch]);
   const { data: appointmentRecords, source, error: appointmentError, reload } = useApiResource<ApiAppointment, ReturnType<typeof mapAppointment>>(appointmentsPath, [], mapAppointment);
-  const { data: providerRecords, error: providerError } = useApiResource<ApiProviderProfile, ReturnType<typeof mapProviderProfile>>('/v1/providers/overview?limit=100', [], mapProviderProfile);
+  const { data: providerRecords, error: providerError, loading: providersLoading, reload: reloadProviders } = useApiResource<ApiProviderProfile, ReturnType<typeof mapProviderProfile>>('/v1/providers/overview?limit=100', [], mapProviderProfile);
   const { data: patientRecords, error: patientError } = useApiResource<ApiPatient, ReturnType<typeof mapPatient>>('/v1/patients?limit=100', [], mapPatient);
   const { data: branchRecords, error: branchError } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
 
@@ -97,10 +98,20 @@ export default function Scheduling() {
   // Providers bookable for the chosen patient (same branch — the book route
   // requires the patient to belong to the provider's clinic).
   const bookingPatient = patientRecords.find(p => p.id === booking.patientId);
-  const bookableProviders = useMemo(
+  const clinicProviders = useMemo(
     () => (bookingPatient ? providerRecords.filter(p => p.branchId === bookingPatient.branchId) : []),
     [providerRecords, bookingPatient],
   );
+  // Only offer a provider the booking route can actually accept: on the schedule,
+  // and with working hours behind them. A provider with no hours has no open slot
+  // on any day, so offering them would be one more control that cannot do what it
+  // offers. `availabilityWindows === null` means the list did not carry the count,
+  // and an unknown is not a reason to hide someone.
+  const bookableProviders = useMemo(
+    () => clinicProviders.filter(p => p.active && p.availabilityWindows !== 0),
+    [clinicProviders],
+  );
+  const unbookableInClinic = clinicProviders.length - bookableProviders.length;
 
   // Load real open slots whenever a provider + date are chosen.
   useEffect(() => {
@@ -115,7 +126,7 @@ export default function Scheduling() {
         const res = await schedulingApi.slots(booking.providerId, booking.date);
         if (!active) return;
         setSlots(res.slots);
-        if (res.slots.length === 0) setSlotsError('No open slots for this provider on this day. Set availability, pick another day, or use manual time entry below.');
+        if (res.slots.length === 0) setSlotsError('No open slots for this provider on this day. Pick another day, or change their working hours in Providers & availability.');
       } catch (err) {
         if (!active) return;
         setSlots([]);
@@ -181,7 +192,13 @@ export default function Scheduling() {
       setSelectedDate(bookedDate);
       reload();
     } catch (err) {
-      if (err instanceof ApiError && err.status === 409) {
+      // Two different 409s arrive here. Only one of them is a taken slot; saying
+      // "that slot was just taken" about a provider who was deactivated mid-flight
+      // would send the receptionist hunting for another time that does not exist.
+      if (err instanceof ApiError && err.status === 409 && err.code === 'provider_inactive') {
+        setBookingError(err.message);
+        setSlots([]);
+      } else if (err instanceof ApiError && err.status === 409) {
         setBookingError('That slot was just taken. Pick another open slot.');
         // Refresh slots so the taken one drops off.
         if (booking.providerId) {
@@ -306,7 +323,7 @@ export default function Scheduling() {
                 <option value="">Select patient…</option>
                 {patientRecords.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
               </select>
-              <input value={booking.service} onChange={e => setBooking(b => ({ ...b, service: e.target.value }))} placeholder="Service (e.g. Dermatology Review)" className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+              <input aria-label="Service" value={booking.service} onChange={e => setBooking(b => ({ ...b, service: e.target.value }))} placeholder="Service (e.g. Dermatology Review)" className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
               <div className="grid grid-cols-2 gap-2.5">
                 <select aria-label="Provider" title="Provider" disabled={!booking.patientId} value={booking.providerId} onChange={e => setBooking(b => ({ ...b, providerId: e.target.value, slotStart: '', slotEnd: '' }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-40">
                   <option value="">{booking.patientId ? 'Select provider…' : 'Pick patient first'}</option>
@@ -341,7 +358,16 @@ export default function Scheduling() {
               )}
 
               {booking.patientId && bookableProviders.length === 0 && (
-                <p role="alert" className="text-[11px] text-amber-v">No provider is configured for this patient's clinic. Configure a provider and availability before booking.</p>
+                <p role="alert" className="text-[11px] text-amber-v">
+                  {clinicProviders.length === 0
+                    ? "No provider is set up in this patient's clinic yet. Add one in Providers & availability, then set their working hours."
+                    : `Every provider in this patient's clinic is deactivated or has no working hours, so no appointment can be booked here yet. Set that up in Providers & availability.`}
+                </p>
+              )}
+              {booking.patientId && bookableProviders.length > 0 && unbookableInClinic > 0 && (
+                <p className="text-[11px] text-t3">
+                  {unbookableInClinic} other {unbookableInClinic === 1 ? 'provider' : 'providers'} in this clinic {unbookableInClinic === 1 ? 'is' : 'are'} not on the schedule (deactivated, or no working hours set).
+                </p>
               )}
             </div>
             <div className="flex gap-2 mt-4">
@@ -554,6 +580,16 @@ export default function Scheduling() {
 
         {/* Right sidebar */}
         <div className="space-y-4">
+          {/* Provider records + working hours — what every booking resolves against */}
+          <ProviderSetupPanel
+            user={user}
+            providers={providerRecords}
+            loading={providersLoading}
+            error={providerError}
+            branches={branchRecords}
+            onProvidersChanged={reloadProviders}
+          />
+
           {/* Deposit payment requests queue */}
           <PaymentRequestsPanel />
 
@@ -568,6 +604,7 @@ export default function Scheduling() {
                         {doc.name.split(' ').slice(-1)[0][0]}
                       </div>
                       <p className="text-xs font-semibold text-t1 truncate max-w-[120px]">{doc.name}</p>
+                      {!doc.active && <span className="badge badge-red shrink-0">Off schedule</span>}
                     </div>
                     <div className="flex items-center gap-1.5">
                       <Clock className="w-3 h-3 text-t3" />

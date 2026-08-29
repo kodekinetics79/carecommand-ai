@@ -33,12 +33,22 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
   async function loadProvider(request: FastifyRequest, providerId: string) {
     const provider = await db.providerProfile.findFirst({
       where: { id: providerId, tenantId: request.auth.tenantId },
-      select: { id: true, branchId: true, userId: true },
+      select: { id: true, branchId: true, userId: true, active: true },
     });
     if (!provider) throw app.httpErrors.notFound('Provider not found');
     assertBranchAccess(request, provider.branchId);
     return provider;
   }
+
+  // A deactivated provider is off the schedule: no slots are advertised and no
+  // booking is accepted. Said explicitly rather than answered with an empty slot
+  // list, which reads as "fully booked today" and is a different fact. Editing
+  // their hours and time off stays open so a clinic can prepare a provider
+  // before putting them back on the schedule.
+  const PROVIDER_INACTIVE = {
+    error: 'provider_inactive',
+    message: 'This provider is deactivated and is not on the booking schedule. Reactivate the provider to book them.',
+  } as const;
 
   // ----- Self-scheduling policy (per tenant) --------------------------------
   app.get('/policy', async request => getSchedulingPolicy(request.auth.tenantId));
@@ -65,6 +75,20 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
     const { providerId } = providerParam.parse(request.params);
     const { windows } = z.object({ windows: z.array(windowSchema).max(50) }).parse(request.body);
     const provider = await loadProvider(request, providerId);
+    // Two windows that overlap on the same weekday would advertise the same
+    // minute twice, and two windows with the same start minute collide on the
+    // (provider, day, startMinute) key — which createMany's skipDuplicates would
+    // drop in silence, saving less than the caller asked for and reporting
+    // success. Refuse the ambiguous set instead of half-saving it.
+    const byDay = new Map<number, Array<{ startMinute: number; endMinute: number }>>();
+    for (const window of windows) {
+      const day = byDay.get(window.dayOfWeek) ?? [];
+      if (day.some(other => window.startMinute < other.endMinute && other.startMinute < window.endMinute)) {
+        throw app.httpErrors.badRequest('Working hours overlap on the same weekday. Merge the overlapping windows and save again.');
+      }
+      day.push(window);
+      byDay.set(window.dayOfWeek, day);
+    }
 
     await db.$transaction(async tx => {
       await tx.providerAvailability.deleteMany({ where: { tenantId: request.auth.tenantId, providerProfileId: providerId } });
@@ -97,11 +121,35 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
     return reply.code(201).send(row);
   });
 
+  app.get('/providers/:providerId/time-off', async request => {
+    const { providerId } = providerParam.parse(request.params);
+    const query = z.object({ from: z.coerce.date().optional() }).parse(request.query);
+    await loadProvider(request, providerId);
+    // Time off that has not finished yet — what still affects bookability. A
+    // caller that wants the history passes `from`.
+    const from = query.from ?? new Date();
+    const timeOff = await db.providerTimeOff.findMany({
+      where: { tenantId: request.auth.tenantId, providerProfileId: providerId, endsAt: { gte: from } },
+      orderBy: { startsAt: 'asc' }, take: 100,
+    });
+    return { providerId, from: from.toISOString(), timeOff };
+  });
+
+  app.delete('/providers/:providerId/time-off/:timeOffId', { preHandler: canManageSchedule }, async (request, reply) => {
+    const { providerId, timeOffId } = z.object({ providerId: uuid, timeOffId: uuid }).parse(request.params);
+    await loadProvider(request, providerId);
+    const removed = await db.providerTimeOff.deleteMany({ where: { id: timeOffId, tenantId: request.auth.tenantId, providerProfileId: providerId } });
+    if (removed.count === 0) throw app.httpErrors.notFound('Time off not found');
+    await audit(request, { action: 'schedule.time_off.removed', resource: 'providerProfile', resourceId: providerId, metadata: { timeOffId } });
+    return reply.code(204).send();
+  });
+
   // ----- Open slots (read) --------------------------------------------------
-  app.get('/providers/:providerId/slots', async request => {
+  app.get('/providers/:providerId/slots', async (request, reply) => {
     const { providerId } = providerParam.parse(request.params);
     const query = z.object({ date: dateISO, serviceCatalogItemId: uuid.optional(), service: z.string().trim().min(1).max(160).optional(), durationMin: z.coerce.number().int().min(5).max(240).optional() }).parse(request.query);
-    await loadProvider(request, providerId);
+    const provider = await loadProvider(request, providerId);
+    if (!provider.active) return reply.code(409).send(PROVIDER_INACTIVE);
     const service = await resolveSchedulingService({ tenantId: request.auth.tenantId, serviceCatalogItemId: query.serviceCatalogItemId, service: query.service, fallbackDurationMin: query.durationMin });
     if (!service) throw app.httpErrors.badRequest('Select an active service before checking availability');
     const slots = await computeProviderSlots({ tenantId: request.auth.tenantId, providerProfileId: providerId, dateISO: query.date, durationMin: service.durationMin });
@@ -120,6 +168,7 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
       channel: z.enum(['WHATSAPP', 'SMS', 'EMAIL', 'PUSH', 'CALL', 'VIDEO']).default('EMAIL'),
     }).parse(request.body);
     const provider = await loadProvider(request, providerId);
+    if (!provider.active) return reply.code(409).send(PROVIDER_INACTIVE);
     const service = await resolveSchedulingService({ tenantId: request.auth.tenantId, serviceCatalogItemId: body.serviceCatalogItemId, service: body.service, fallbackDurationMin: body.durationMin });
     if (!service) throw app.httpErrors.badRequest('Select an active service before booking');
 

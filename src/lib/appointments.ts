@@ -20,6 +20,32 @@ export interface ProviderSlotsResponse {
   slots: ProviderSlot[];
 }
 
+/** One recurring weekly window, in clinic-local minutes from midnight. */
+export interface AvailabilityWindow {
+  dayOfWeek: number;
+  startMinute: number;
+  endMinute: number;
+  slotMinutes: number;
+}
+
+export interface AvailabilityResponse {
+  providerId: string;
+  windows: Array<AvailabilityWindow & { id: string; active: boolean }>;
+}
+
+export interface TimeOffEntry {
+  id: string;
+  startsAt: string;
+  endsAt: string;
+  reason: string | null;
+}
+
+export interface TimeOffResponse {
+  providerId: string;
+  from: string;
+  timeOff: TimeOffEntry[];
+}
+
 const base = '/v1/appointments';
 const schedulingBase = '/v1/scheduling';
 
@@ -58,4 +84,30 @@ export const schedulingApi = {
       method: 'POST',
       body: JSON.stringify(body),
     }),
+
+  // ----- What produces slots in the first place ----------------------------
+  // Recurring working hours and time off. Both routes are backend-owned and
+  // guarded by `schedule:manage`; without them a provider exists but has no
+  // open slot, so the booking modal above can never be completed.
+  availability: (providerId: string) =>
+    apiRequest<AvailabilityResponse>(`${schedulingBase}/providers/${providerId}/availability`),
+
+  /** Replace-all: the posted set becomes the provider's entire week. */
+  saveAvailability: (providerId: string, windows: AvailabilityWindow[]) =>
+    apiRequest<AvailabilityResponse>(`${schedulingBase}/providers/${providerId}/availability`, {
+      method: 'PUT',
+      body: JSON.stringify({ windows }),
+    }),
+
+  timeOff: (providerId: string) =>
+    apiRequest<TimeOffResponse>(`${schedulingBase}/providers/${providerId}/time-off`),
+
+  addTimeOff: (providerId: string, body: { startsAt: string; endsAt: string; reason?: string }) =>
+    apiRequest<TimeOffEntry>(`${schedulingBase}/providers/${providerId}/time-off`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  removeTimeOff: (providerId: string, timeOffId: string) =>
+    apiRequest<void>(`${schedulingBase}/providers/${providerId}/time-off/${timeOffId}`, { method: 'DELETE' }),
 };

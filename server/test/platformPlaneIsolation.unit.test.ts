@@ -39,7 +39,7 @@ async function importPlatformDbWithoutTheVariable() {
       `catch (e) { console.log('USE=' + e.message); }`,
     ].join('\n'));
 
-    const env = { ...process.env, DOTENV_CONFIG_PATH: envFile };
+    const env: NodeJS.ProcessEnv = { ...process.env, DOTENV_CONFIG_PATH: envFile };
     delete env.PLATFORM_DATABASE_URL;
     const { stdout } = await run('npx', ['tsx', probe], { cwd: repoRoot, env, timeout: 120_000 });
     return stdout;

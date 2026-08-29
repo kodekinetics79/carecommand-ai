@@ -672,6 +672,12 @@ model ProviderProfile {
   revenueThisMonth      Decimal                @default(0) @db.Decimal(14, 2)
   repeatVisitRate       Int                    @default(0)
   followUpRate          Int                    @default(0)
+  // Whether this clinician is on the booking schedule. Deactivation is how a
+  // clinic retires a provider without deleting the identity their existing
+  // appointments, reviews and revenue rows point at: every booking path
+  // (front desk, patient portal, AI receptionist) resolves through
+  // resolveProviderSchedulingContext, which refuses an inactive profile.
+  active                Boolean                @default(true)
   createdAt             DateTime               @default(now())
   updatedAt             DateTime               @updatedAt
   tenant                Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)

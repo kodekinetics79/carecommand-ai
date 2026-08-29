@@ -97,6 +97,8 @@ export interface ApiProviderProfile {
   id: string;
   branchId: string;
   specialty: string;
+  /** Whether the clinician is on the booking schedule (ProviderProfile.active). */
+  active: boolean;
   utilization: number;
   appointmentsToday: number;
   appointmentsThisMonth: number;
@@ -107,6 +109,8 @@ export interface ApiProviderProfile {
   followUpRate: number;
   branch: { name: string };
   user: { displayName: string };
+  /** Active recurring windows, from GET /v1/providers/overview. */
+  _count?: { availability: number };
 }
 
 export interface ApiAppointment {
@@ -356,6 +360,10 @@ export function mapProviderProfile(row: ApiProviderProfile): Doctor {
     name: row.user.displayName,
     specialty: row.specialty,
     branchId: row.branchId,
+    active: row.active,
+    // null means the response did not carry the count — never rendered as
+    // "no working hours", which is a different claim from "not known".
+    availabilityWindows: row._count?.availability ?? null,
     utilization: row.utilization,
     appointmentsToday: row.appointmentsToday,
     appointmentsThisMonth: row.appointmentsThisMonth,
