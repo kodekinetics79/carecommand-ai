@@ -16,15 +16,24 @@ interface Device {
   serialNumber: string | null; connectionType: string; status: string; location: string | null;
   firmwareVersion: string | null; notes: string | null; lastSeenAt: string | null;
   lastTestStatus: string | null; lastTestedAt: string | null; branchId: string | null; branchName: string | null;
+  /**
+   * OBSERVED reachability, derived server-side on every read from the newest
+   * activity. Distinct from `status`, which is a human-settable record field.
+   * Rendering `status` as connectivity is what let a device last seen 71 days
+   * ago sit under a green "Online" badge next to its own contradicting
+   * timestamp — a clinician reading that believes a patient is being watched.
+   */
+  connectivity: Connectivity; lastActivityAt: string | null; offlineAfterHours: number;
 }
+type Connectivity = 'reporting' | 'stale' | 'never_reported' | 'error' | 'retired';
 interface Branch { id: string; name: string }
 interface DeviceOverview {
-  summary: { total: number; online: number; offline: number; error: number; pending: number };
+  summary: { total: number; reporting: number; stale: number; neverReported: number; error: number };
   devices: Device[];
   branches: Branch[];
 }
 
-const fallback: DeviceOverview = { summary: { total: 0, online: 0, offline: 0, error: 0, pending: 0 }, devices: [], branches: [] };
+const fallback: DeviceOverview = { summary: { total: 0, reporting: 0, stale: 0, neverReported: 0, error: 0 }, devices: [], branches: [] };
 
 const TYPE_META: Record<string, { label: string; icon: ElementType }> = {
   vitals_monitor: { label: 'Vitals monitor', icon: Activity },
@@ -37,11 +46,15 @@ const TYPE_META: Record<string, { label: string; icon: ElementType }> = {
 const TYPES = Object.keys(TYPE_META);
 const CONNECTIONS = ['network', 'usb', 'bluetooth', 'cloud_api'];
 const CONNECTION_LABEL: Record<string, string> = { network: 'Network', usb: 'USB', bluetooth: 'Bluetooth', cloud_api: 'Cloud API' };
-const STATUS_META: Record<string, { label: string; cls: string; icon: ElementType }> = {
-  online: { label: 'Online', cls: 'badge-emerald', icon: Wifi },
-  offline: { label: 'Offline', cls: 'badge', icon: WifiOff },
+// Every label here is a statement about what was OBSERVED, never a claim about
+// a live connection. "Reporting" says data arrived recently and can be shown
+// with its timestamp; "Not reporting" says it did not.
+const STATUS_META: Record<Connectivity, { label: string; cls: string; icon: ElementType }> = {
+  reporting: { label: 'Reporting', cls: 'badge-emerald', icon: Wifi },
+  stale: { label: 'Not reporting', cls: 'badge-amber', icon: WifiOff },
+  never_reported: { label: 'Never reported', cls: 'badge', icon: Clock },
   error: { label: 'Error', cls: 'badge-red', icon: AlertTriangle },
-  pending: { label: 'Pending', cls: 'badge-amber', icon: Clock },
+  retired: { label: 'Retired', cls: 'badge', icon: WifiOff },
 };
 
 function relTime(iso: string | null): string {
@@ -72,7 +85,7 @@ export default function DeviceIntegration() {
   const vendors = useMemo(() => [...new Set(data.devices.map(d => d.vendor).filter((v): v is string => !!v))].sort(), [data.devices]);
   const filtered = useMemo(() => data.devices.filter(d =>
     (fBranch === 'all' || d.branchId === fBranch) &&
-    (fStatus === 'all' || d.status === fStatus) &&
+    (fStatus === 'all' || d.connectivity === fStatus) &&
     (fType === 'all' || d.deviceType === fType) &&
     (fVendor === 'all' || d.vendor === fVendor)
   ), [data.devices, fBranch, fStatus, fType, fVendor]);
@@ -104,7 +117,7 @@ export default function DeviceIntegration() {
     <div className="space-y-4 pb-6">
       {/* Slim toolbar — the topbar breadcrumb carries the page title. */}
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="badge badge-emerald">{s.online} of {s.total} online</span>
+        <span className={`badge ${s.reporting > 0 ? 'badge-emerald' : ''}`}>{s.reporting} of {s.total} reporting</span>
         <div className="flex items-center gap-2">
           <button type="button" onClick={() => void reload()} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-[13px] font-semibold text-t1 hover:bg-[var(--s2)] transition">
             <RefreshCw className="w-3.5 h-3.5 text-t3" /> Refresh
@@ -118,10 +131,12 @@ export default function DeviceIntegration() {
       {/* KPI summary */}
       <div className="grid gap-2.5 grid-cols-2 lg:grid-cols-5">
         <StatCard title="Total Devices" value={s.total} subtitle="Registered" icon={<Cpu className="w-4 h-4" />} accent="indigo" />
-        <StatCard title="Online" value={s.online} subtitle="Connected now" icon={<Wifi className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Offline" value={s.offline} subtitle="Not reachable" icon={<WifiOff className="w-4 h-4" />} accent="blue" />
+        {/* Subtitles say what was measured. "Connected now" asserted a live
+            link the product never tested; these describe observed activity. */}
+        <StatCard title="Reporting" value={s.reporting} subtitle="Sent data recently" icon={<Wifi className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Not reporting" value={s.stale} subtitle="Silent past the threshold" icon={<WifiOff className="w-4 h-4" />} accent="blue" />
         <StatCard title="Errors" value={s.error} subtitle="Need attention" icon={<AlertTriangle className="w-4 h-4" />} accent="red" />
-        <StatCard title="Pending" value={s.pending} subtitle="Awaiting setup" icon={<Clock className="w-4 h-4" />} accent="amber" />
+        <StatCard title="Never reported" value={s.neverReported} subtitle="No data yet" icon={<Clock className="w-4 h-4" />} accent="amber" />
       </div>
 
       {error && (
@@ -176,7 +191,7 @@ export default function DeviceIntegration() {
           <div className="flex flex-wrap items-center gap-2 mb-3">
             <Filter className="w-3.5 h-3.5 text-t3" aria-hidden="true" />
             <FilterSelect label="Branch" value={fBranch} onChange={setFBranch} options={[['all', 'All branches'], ...data.branches.map(b => [b.id, b.name] as [string, string])]} />
-            <FilterSelect label="Status" value={fStatus} onChange={setFStatus} options={[['all', 'All statuses'], ...Object.keys(STATUS_META).map(s2 => [s2, STATUS_META[s2].label] as [string, string])]} />
+            <FilterSelect label="Status" value={fStatus} onChange={setFStatus} options={[['all', 'All statuses'], ...(Object.keys(STATUS_META) as Connectivity[]).map(s2 => [s2, STATUS_META[s2].label] as [string, string])]} />
             <FilterSelect label="Type" value={fType} onChange={setFType} options={[['all', 'All types'], ...TYPES.map(t => [t, TYPE_META[t].label] as [string, string])]} />
             <FilterSelect label="Vendor" value={fVendor} onChange={setFVendor} options={[['all', 'All vendors'], ...vendors.map(v => [v, v] as [string, string])]} />
             {filtersActive && (
@@ -208,7 +223,7 @@ export default function DeviceIntegration() {
               <tbody className="divide-y divide-[var(--b1)]">
                 {filtered.map(d => {
                   const tm = TYPE_META[d.deviceType] ?? { label: d.deviceType, icon: Cpu };
-                  const sm = STATUS_META[d.status] ?? STATUS_META.pending;
+                  const sm = STATUS_META[d.connectivity] ?? STATUS_META.never_reported;
                   const TIcon = tm.icon;
                   const SIcon = sm.icon;
                   return (

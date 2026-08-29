@@ -117,15 +117,19 @@ test.describe('Connected Care — the clinic journey', () => {
       await page.getByLabel('Device provider').selectOption('withings');
       await page.getByLabel('Device', { exact: true }).selectOption(data.deviceId);
       await page.getByRole('button', { name: /^Enrol$/ }).click();
-      await expect(page.getByRole('cell', { name: data.patientName })).toBeVisible();
+      // exact: the actions cell also carries the name via its aria-labels.
+      await expect(page.getByRole('cell', { name: data.patientName, exact: true })).toBeVisible();
 
       // ── Consent shows its current state before offering an action, and the
       // disclosure the patient must hear — including cost sharing.
       await page.getByRole('button', { name: /Consent/i }).first().click();
-      await expect(page.getByText(/No consent on record/i)).toBeVisible();
-      await expect(page.getByText(/may owe a copay/i)).toBeVisible();
-      await page.getByRole('checkbox').check();
-      await page.getByRole('button', { name: /Record consent/i }).click();
+      const consent = page.getByRole('dialog');
+      await expect(consent.getByText(/No consent on record/i)).toBeVisible();
+      // The phrase appears twice by design: once in the script read to the
+      // patient, once in what the staff member attests to having said.
+      await expect(page.getByText(/may owe a copay/i)).toHaveCount(2);
+      await consent.getByRole('checkbox').check();
+      await consent.getByRole('button', { name: /Record consent/i }).click();
       await expect(page.getByRole('dialog')).toBeHidden();
 
       // ── Readings arrive through the signed provider webhook, dated across
@@ -154,12 +158,15 @@ test.describe('Connected Care — the clinic journey', () => {
       // behind the server's clock, inside the allowed skew.
       await page.clock.install({ time: new Date(Date.now() - 5 * 60_000) });
       await page.getByRole('button', { name: /Log review session/i }).first().click();
-      await page.getByRole('button', { name: /Start review/i }).click();
-      await page.getByRole('textbox').fill('Reviewed four days of BP readings, confirmed evening dosing by phone.');
-      await page.getByRole('combobox').selectOption('live_phone');
+      // Scope to the dialog: "Start review" is also the remedy link on the
+      // unmet review-minutes requirement behind it.
+      const session = page.getByRole('dialog');
+      await session.getByRole('button', { name: /Start review/i }).click();
+      await session.getByRole('textbox').fill('Reviewed four days of BP readings, confirmed evening dosing by phone.');
+      await session.getByRole('combobox').selectOption('live_phone');
       await page.clock.fastForward(150_000);
-      await page.getByRole('button', { name: /Stop and log/i }).click();
-      await page.getByRole('button', { name: /Record session/i }).click();
+      await session.getByRole('button', { name: /Stop and log/i }).click();
+      await session.getByRole('button', { name: /Record session/i }).click();
       await expect(page.getByRole('dialog')).toBeHidden();
 
       // ── The page now reports which codes the evidence supports. Four
@@ -167,7 +174,10 @@ test.describe('Connected Care — the clinic journey', () => {
       // gate that read as nothing billable at all. It is a supportable
       // short-duration supply month.
       await expect(page.getByText('99445')).toBeVisible();
-      await expect(page.getByText(/review min/)).toBeVisible();
+      // The session was measured, not asserted: 150s of driven clock floors to
+      // 2 recorded minutes, and the live phone call is reflected back.
+      await expect(page.getByText(/2 review min/).first()).toBeVisible();
+      await expect(page.getByText(/live contact recorded/).first()).toBeVisible();
     } finally {
       await db.tenant.delete({ where: { id: data.tenantId } }).catch(() => {});
     }
