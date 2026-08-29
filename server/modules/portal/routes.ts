@@ -146,7 +146,8 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     const patient = await db.patient.findUnique({ where: { id: patientId }, select: { branchId: true } });
     if (!patient) return [];
     const providers = await db.providerProfile.findMany({
-      where: { tenantId, branchId: patient.branchId },
+      // Deactivated clinicians are off the schedule; never offer one to a patient.
+      where: { tenantId, branchId: patient.branchId, active: true },
       select: { id: true, specialty: true, rating: true, reviewCount: true, user: { select: { displayName: true } } },
       orderBy: { rating: 'desc' },
     });
@@ -157,7 +158,7 @@ export const portalRoutes: FastifyPluginAsync = async app => {
   async function loadBookableProvider(tenantId: string, patientId: string, providerId: string) {
     const patient = await db.patient.findUnique({ where: { id: patientId }, select: { branchId: true } });
     if (!patient) return null;
-    return db.providerProfile.findFirst({ where: { id: providerId, tenantId, branchId: patient.branchId }, select: { id: true, branchId: true } });
+    return db.providerProfile.findFirst({ where: { id: providerId, tenantId, branchId: patient.branchId, active: true }, select: { id: true, branchId: true } });
   }
 
   app.get('/booking/providers/:providerId/slots', async (request, reply) => {

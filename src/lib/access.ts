@@ -23,8 +23,10 @@ import type { SessionUser } from './session';
 // ===========================================================================
 
 /**
- * The subset of the server permission vocabulary that navigation gates on.
- * Source of truth: PERMISSIONS in server/lib/permissions.ts.
+ * The subset of the server permission vocabulary that navigation and in-page
+ * controls gate on. Source of truth: PERMISSIONS in server/lib/permissions.ts.
+ * Gating here only hides a control the caller cannot use; the server re-checks
+ * every one of these on the route itself.
  */
 export type Permission =
   | 'admin:manage'
@@ -40,7 +42,9 @@ export type Permission =
   | 'patient:read'
   | 'receptionist:manage'
   | 'revenue:read'
-  | 'staff:read';
+  | 'staff:read'
+  | 'staff:task-status'
+  | 'staff:write';
 
 export interface RouteDefinition {
   /** Human name of the destination — breadcrumb, and the access notice. */

@@ -256,6 +256,30 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
         data: { status },
       });
       if (changed.count !== 1) throw app.httpErrors.conflict('Appointment changed concurrently; refresh and retry');
+
+      // Completing a visit is the only moment the product learns a patient was
+      // actually seen, and nothing wrote it down. Patient.lastVisitAt stayed NULL
+      // for everyone while three separate audiences read it to decide who has
+      // lapsed — reactivation campaigns (lib/campaigns.ts), automation rules, and
+      // the lapsed-patient count on operations. With it always NULL those fall
+      // through to `createdAt < cutoff`, so a patient seen yesterday looks
+      // identical to one never seen at all, and a pilot's first reactivation
+      // campaign phones people who were just in the chair.
+      //
+      // Stamped with the appointment's own start, not "now": completing
+      // yesterday's list this morning records yesterday, which is what happened.
+      // Only ever moved forward, so back-filling an old visit cannot erase a more
+      // recent one. Same transaction as the status change, so the visit record
+      // and the fact it is derived from can never disagree.
+      if (status === 'COMPLETED') await tx.patient.updateMany({
+        where: {
+          id: appointment.patientId,
+          tenantId: request.auth.tenantId,
+          OR: [{ lastVisitAt: null }, { lastVisitAt: { lt: appointment.startsAt } }],
+        },
+        data: { lastVisitAt: appointment.startsAt },
+      });
+
       return tx.appointment.findUniqueOrThrow({ where: { id } });
     });
     await audit(request, { action: 'appointment.status_changed', resource: 'appointment', resourceId: id, metadata: { from: appointment.status, to: status } });

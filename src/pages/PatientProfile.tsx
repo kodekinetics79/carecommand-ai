@@ -7,7 +7,7 @@ import FormDialog from '../components/workflow/FormDialog';
 import { formatCurrency, formatDate } from '../utils/formatters';
 import { apiRequest } from '../lib/api';
 import { mapAppointment, mapPatient, mapProviderProfile, type ApiPatient, type ApiProviderProfile } from '../lib/apiAdapters';
-import { intakeApi } from '../lib/intake';
+import { intakeApi, intakeLink } from '../lib/intake';
 import { checkEligibility, type EligibilityVerification } from '../lib/revenueProtection';
 import { useApiResource } from '../hooks/useApiResource';
 
@@ -218,7 +218,7 @@ export default function PatientProfile() {
     setIntakeNotice(null);
     try {
       const packet = await intakeApi.createPacket({ patientId: patient.id, source: 'staff' });
-      const link = packet.publicUrl || (packet.publicToken ? `/intake/${packet.publicToken}` : null);
+      const link = intakeLink(packet.publicUrl, packet.publicToken);
       let copied = false;
       if (link) {
         try {

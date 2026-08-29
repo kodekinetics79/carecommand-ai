@@ -80,6 +80,16 @@ async function filterPacketsForBranch<T extends IntakeTarget>(request: FastifyRe
   });
 }
 
+// A shareable link only exists if PUBLIC_APP_URL names the deployment. Returning
+// `${'' }/intake/<token>` produced a bare path — a string no patient can open, and
+// the only honest sharing route the module has. Answer null instead, so the
+// client can build the link from its own origin rather than pasting a dead one.
+function publicIntakeUrl(token: string | null | undefined): string | null {
+  const base = process.env.PUBLIC_APP_URL?.trim();
+  if (!token || !base) return null;
+  return `${base.replace(/\/+$/, '')}/intake/${token}`;
+}
+
 export const intakeRoutes: FastifyPluginAsync = async app => {
   app.addHook('preHandler', requireFeature('patient_crm'));
 
@@ -113,7 +123,7 @@ export const intakeRoutes: FastifyPluginAsync = async app => {
     let token: string | null = null;
     if (created && body.issueToken) token = await issueIntakeToken(request.auth.tenantId, packet.id, request.auth.userId);
     const full = await db.patientIntakePacket.findUniqueOrThrow({ where: { id: packet.id }, include: { sections: true } });
-    return reply.code(created ? 201 : 200).send({ ...packetView(full), created, publicToken: token, publicUrl: token ? `${process.env.PUBLIC_APP_URL ?? ''}/intake/${token}` : null });
+    return reply.code(created ? 201 : 200).send({ ...packetView(full), created, publicToken: token, publicUrl: publicIntakeUrl(token) });
   });
 
   // ----- List / queue -----------------------------------------------------
@@ -185,8 +195,9 @@ export const intakeRoutes: FastifyPluginAsync = async app => {
     await assertPacketAccess(request, existing);
     if (['approved', 'cancelled', 'expired'].includes(existing.status)) throw app.httpErrors.conflict('Packet is not resendable');
     const token = await issueIntakeToken(request.auth.tenantId, id, request.auth.userId);
-    await audit(request, { action: 'intake.packet.sent', resource: 'patientIntake', resourceId: id, metadata: {} });
-    return reply.send({ resent: true, publicToken: token, publicUrl: `${process.env.PUBLIC_APP_URL ?? ''}/intake/${token}` });
+    // The module sends nothing; it mints a link. Record that.
+    await audit(request, { action: 'intake.packet.link_issued', resource: 'patientIntake', resourceId: id, metadata: {} });
+    return reply.send({ resent: true, publicToken: token, publicUrl: publicIntakeUrl(token) });
   });
 };
 

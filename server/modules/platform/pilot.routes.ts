@@ -85,6 +85,34 @@ async function loadPresetMapping(tenantId: string, entityType: PilotEntityType) 
   return preset ? { preset, mapping: (preset.mapping ?? {}) as Record<string, string> } : { preset: null, mapping: {} as Record<string, string> };
 }
 
+// Resolve a CSV provider reference to the canonical ProviderProfile link.
+//
+// Appointment.providerProfileId is what the double-booking exclusion constraint
+// binds on, and what every conflict, availability and past-date guard checks
+// before it does anything. An appointment carrying only the legacy free-text
+// providerRef is invisible to all of it: the audit booked the same patient into
+// the same slot twice and rescheduled a confirmed appointment into 2019, purely
+// because every imported row had a NULL provider. A practice migrating off
+// Dentrix or Open Dental would land its entire history in that state.
+//
+// Matched on the clinic's own vocabulary: the profile id, the clinician's login
+// email, or their display name. Anything unmatched is REPORTED rather than
+// quietly dropped — silently importing an appointment outside the scheduling
+// guards is how the current data got this way.
+async function providerLookup(tx: TenantTxClient, tenantId: string) {
+  const profiles = await tx.providerProfile.findMany({
+    where: { tenantId },
+    select: { id: true, user: { select: { displayName: true, email: true } } },
+  });
+  const byKey = new Map<string, string>();
+  for (const profile of profiles) {
+    byKey.set(profile.id.toLowerCase(), profile.id);
+    if (profile.user?.email) byKey.set(profile.user.email.trim().toLowerCase(), profile.id);
+    if (profile.user?.displayName) byKey.set(profile.user.displayName.trim().toLowerCase(), profile.id);
+  }
+  return (ref: string | null): string | null => (ref ? byKey.get(ref.trim().toLowerCase()) ?? null : null);
+}
+
 export const pilotRoutes: FastifyPluginAsync = async app => {
   app.addHook('preHandler', pilotAdmin);
 
@@ -324,7 +352,9 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
     // rolled back — or describe rows that never landed. Both go in together or
     // neither does. Generous timeout: the CSV ceiling is 2MB of rows.
     const results = await db.$transaction(async tx => {
-      const tally = { created: 0, updated: 0, skipped: 0, warnings: analysis.summary.warnings };
+      const tally = { created: 0, updated: 0, skipped: 0, warnings: analysis.summary.warnings, providersUnmatched: 0 };
+      const unmatchedProviderRefs = new Set<string>();
+      const resolveProvider = entityType === 'appointments' ? await providerLookup(tx, tenantId) : null;
 
       for (const row of validRows) {
         if (entityType === 'patients') {
@@ -364,17 +394,24 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
           const channel = safeEnumValue(row.values.channel, appointmentChannels, 'EMAIL') as never;
           const value = safeNumberValue(row.values.value, 0);
           const providerRef = row.values.providerRef?.trim() || null;
+          // Keep providerRef as the clinic wrote it; add the canonical link so
+          // the row is actually covered by the scheduling guards.
+          const providerProfileId = resolveProvider?.(providerRef) ?? null;
+          if (providerRef && !providerProfileId) {
+            unmatchedProviderRefs.add(providerRef);
+            tally.providersUnmatched++;
+          }
           const notes = row.values.notes?.trim() || null;
           const existing = await tx.appointment.findFirst({ where: { tenantId, patientId: patient.id, startsAt, service } });
           if (existing) {
             await tx.appointment.update({
               where: { id: existing.id },
-              data: { branchId: branch.id, endsAt, status, channel, value, ...(providerRef ? { providerRef } : { providerRef: null }), ...(notes ? { notes } : { notes: null }) },
+              data: { branchId: branch.id, endsAt, status, channel, value, providerProfileId, ...(providerRef ? { providerRef } : { providerRef: null }), ...(notes ? { notes } : { notes: null }) },
             });
             tally.updated++;
           } else {
             await tx.appointment.create({
-              data: { tenantId, branchId: branch.id, patientId: patient.id, service, startsAt, endsAt, status, channel, value, ...(providerRef ? { providerRef } : {}), ...(notes ? { notes } : {}) },
+              data: { tenantId, branchId: branch.id, patientId: patient.id, service, startsAt, endsAt, status, channel, value, ...(providerProfileId ? { providerProfileId } : {}), ...(providerRef ? { providerRef } : {}), ...(notes ? { notes } : {}) },
             });
             tally.created++;
           }
@@ -438,13 +475,18 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
         },
       });
 
-      return tally;
+      return { ...tally, unmatchedProviderRefs: [...unmatchedProviderRefs].slice(0, 50) };
     }, { timeout: 120_000, maxWait: 15_000 });
 
+    const { unmatchedProviderRefs, ...counts } = results;
     return {
       entityType,
       preset: preset.preset ? { id: preset.preset.id, name: preset.preset.name, isDefault: preset.preset.isDefault } : null,
-      summary: { ...results, total: analysis.summary.total, validRows: validRows.length, invalidRows: analysis.summary.invalid },
+      summary: { ...counts, total: analysis.summary.total, validRows: validRows.length, invalidRows: analysis.summary.invalid },
+      // Named so the clinic can map them and re-import, instead of discovering
+      // months later that those visits were never covered by the double-booking
+      // guard.
+      unmatchedProviderRefs,
       preview: analysis.rows.slice(0, 10).map(row => ({ index: row.index, status: row.status, issues: row.issues, sample: buildPreviewSample(row) })),
     };
   });

@@ -2,8 +2,19 @@ import { useEffect, useState } from 'react';
 import { ShieldCheck, AlertCircle, Loader2, RefreshCw, FileWarning } from 'lucide-react';
 import {
   insuranceApi, RISK_META, ELIGIBILITY_STATUS_META, REASON_LABEL,
-  type DenialRiskAssessment,
+  type DenialPreventionReview, type DenialRiskAssessment,
 } from '../../lib/insurance';
+
+// One line per real outcome of a denial-prevention run. No branch of this map
+// claims a task that was not written.
+const REVIEW_NOTICE: Record<DenialPreventionReview['reason'], string> = {
+  task_created: 'Flagged for billing review — a task was created in Staff Tasks and a revenue alert was opened.',
+  task_already_open: 'Already flagged — the open Staff Tasks review for this appointment was reused, not duplicated.',
+  task_write_failed: 'The risk was assessed but the review task could not be written. Re-run the flag or raise it in Staff Tasks manually.',
+  review_not_required: 'Risk recorded. It does not meet this clinic’s staff-review threshold, so no task was created.',
+  no_risk_detected: 'No denial risk was detected for this appointment. Nothing was flagged and no task was created.',
+  no_branch_on_appointment: 'The risk was recorded but this appointment has no branch, so no branch queue could receive a task.',
+};
 
 // Pre-visit insurance / denial-risk card for an appointment. Truthful states
 // only: setup_required, not_checked, eligible, ineligible, needs_review, prior-
@@ -50,8 +61,11 @@ export default function InsuranceIntakeCard({ appointmentId }: { appointmentId: 
   async function flagForReview() {
     setBusy(true); setError(null); setNotice(null);
     try {
-      await insuranceApi.runDenialPrevention(appointmentId);
-      setNotice('Flagged for billing review — task and alert created.');
+      // Report what the run actually wrote. A NONE-risk appointment creates
+      // nothing, and a re-run reuses the open task — claiming "task and alert
+      // created" either way was the control asserting work it had not done.
+      const result = await insuranceApi.runDenialPrevention(appointmentId);
+      setNotice(REVIEW_NOTICE[result.review?.reason ?? 'review_not_required']);
       setData(await insuranceApi.getIntake(appointmentId));
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to flag for review');

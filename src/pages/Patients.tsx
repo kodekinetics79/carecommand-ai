@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react';
+import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { Search, Users, AlertCircle, TrendingUp, Heart, Sparkles, ArrowRight, ShieldCheck, UserPlus, Filter } from 'lucide-react';
 import { useNavigate } from 'react-router';
 import PageHeader from '../components/ui/PageHeader';
@@ -40,7 +41,18 @@ export default function Patients() {
   const navigate = useNavigate();
   const [query, setQuery] = useState('');
   const [activeLifecycle, setActiveLifecycle] = useState<string>('all');
-  const { data: patientRecords, error, reload } = useApiResource<ApiPatient, ReturnType<typeof mapPatient>>('/v1/patients?limit=100', [], mapPatient);
+  // Search runs on the SERVER. It used to be a useMemo over the first 100 rows,
+  // which arrive ordered by UUID — so past ~100 patients a receptionist typing a
+  // surname got an empty list for a patient who plainly exists. The API already
+  // searches name, email, phone (including a 10-digit local number against
+  // stored E.164) and externalRef; the client simply never asked it to.
+  const debouncedQuery = useDebouncedValue(query);
+  const patientsPath = useMemo(() => {
+    const params = new URLSearchParams({ limit: '100' });
+    if (debouncedQuery.trim()) params.set('search', debouncedQuery.trim());
+    return `/v1/patients?${params.toString()}`;
+  }, [debouncedQuery]);
+  const { data: patientRecords, error, reload } = useApiResource<ApiPatient, ReturnType<typeof mapPatient>>(patientsPath, [], mapPatient);
   const { data: summary, error: summaryError, reload: reloadSummary } = useApiData<PatientSummary | null>('/v1/patients/summary', null);
   const { data: branchOptions } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], b => b);
   const [showAddForm, setShowAddForm] = useState(false);
@@ -94,16 +106,13 @@ export default function Patients() {
     { label: 'Marketing consented', count: summary?.activeConsentCounts.MARKETING ?? null, color: 'blue' as const },
   ];
 
-  const filtered = useMemo(() => {
-    let list = patientRecords;
-    if (activeLifecycle !== 'all') list = list.filter(p => p.lifecycleStage === activeLifecycle);
-    if (query) list = list.filter(p =>
-      p.name.toLowerCase().includes(query.toLowerCase()) ||
-      p.phone.includes(query) ||
-      p.email.toLowerCase().includes(query.toLowerCase())
-    );
-    return list;
-  }, [query, activeLifecycle, patientRecords]);
+  // patientRecords is already the search result; only the lifecycle chip is
+  // applied locally, over that result rather than over an arbitrary first page.
+  const filtered = useMemo(() => (
+    activeLifecycle === 'all'
+      ? patientRecords
+      : patientRecords.filter(p => p.lifecycleStage === activeLifecycle)
+  ), [activeLifecycle, patientRecords]);
 
   return (
     <div className="space-y-6 pb-8">

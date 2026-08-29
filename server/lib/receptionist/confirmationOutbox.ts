@@ -338,6 +338,63 @@ async function dispatchEvent(tenantId: string, eventId: string): Promise<Confirm
   return finalizeClaim(claim, result);
 }
 
+/**
+ * Queue confirmations for an appointment a HUMAN booked.
+ *
+ * The outbox itself already had everything that makes sending safe — the shared
+ * suppression fence, quiet hours, the DNC check, and delivery reporting that
+ * never claims a send it did not make. What it did not have was anyone putting
+ * work into it except the AI voice path, where the channels are gated by the
+ * calling campaign. A staff-booked appointment has no campaign, so a clinic that
+ * books at the front desk got no confirmation at all, and no lever on no-shows.
+ *
+ * This only ENQUEUES. Every consent and suppression decision still happens at
+ * dispatch, on the same boundary the voice path crosses, so nothing here can
+ * widen who may be contacted. `skipDuplicates` plus the appointment-scoped
+ * idempotency key means re-booking or a retried request cannot double-send.
+ *
+ * Returns the channels queued, so the caller can report what will be attempted
+ * rather than announcing a message it has not actually arranged.
+ */
+export async function queueAppointmentConfirmations(
+  tx: Prisma.TransactionClient,
+  input: {
+    tenantId: string;
+    appointmentId: string;
+    patientId: string;
+    smsEnabled: boolean;
+    emailEnabled: boolean;
+    phone: string | null;
+    email: string | null;
+  },
+): Promise<ConfirmationChannel[]> {
+  const channels: ConfirmationChannel[] = [
+    input.smsEnabled && input.phone ? 'sms' : null,
+    input.emailEnabled && input.email ? 'email' : null,
+  ].filter((channel): channel is ConfirmationChannel => channel !== null);
+  if (channels.length === 0) return [];
+
+  await tx.notificationEvent.createMany({
+    data: channels.map(channel => ({
+      tenantId: input.tenantId,
+      appointmentId: input.appointmentId,
+      patientId: input.patientId,
+      recipientType: 'patient',
+      channel,
+      status: 'queued',
+      attempts: 0,
+      // Consent is decided at the delivery boundary, not here. Recording it as
+      // checked at enqueue time would assert an authority nobody has evaluated.
+      consentChecked: false,
+      consentResult: 'not_recorded_transactional',
+      source: CONFIRMATION_OUTBOX_SOURCE,
+      idempotencyKey: `${input.appointmentId}:${channel}`,
+    })),
+    skipDuplicates: true,
+  });
+  return channels;
+}
+
 export async function processAppointmentConfirmations(
   input: { tenantId: string; appointmentId: string; messagingConsent: boolean | null; smsEnabled: boolean; emailEnabled: boolean; phone: string | null; email: string | null },
 ): Promise<Record<ConfirmationChannel, ConfirmationDispatch>> {

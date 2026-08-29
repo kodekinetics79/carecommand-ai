@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { afterAll, describe, expect, it } from 'vitest';
 import { Queue } from 'bullmq';
 import { bullMqPrefix, redisConnection } from '../workers/queues';
+import { requireQueueRedis } from './helpers/requireQueueRedis';
 
 const queues: Queue[] = [];
 
@@ -19,6 +20,7 @@ describe('BullMQ deployment namespace', () => {
   });
 
   it('isolates identical logical queue and job IDs across test namespaces', async () => {
+    await requireQueueRedis();
     const suffix = randomUUID();
     const first = new Queue('namespace-isolation', { connection: redisConnection, prefix: `carecommand:test-a:${suffix}` });
     const second = new Queue('namespace-isolation', { connection: redisConnection, prefix: `carecommand:test-b:${suffix}` });

@@ -97,6 +97,8 @@ export interface ApiProviderProfile {
   id: string;
   branchId: string;
   specialty: string;
+  /** Whether the clinician is on the booking schedule (ProviderProfile.active). */
+  active: boolean;
   utilization: number;
   appointmentsToday: number;
   appointmentsThisMonth: number;
@@ -107,6 +109,8 @@ export interface ApiProviderProfile {
   followUpRate: number;
   branch: { name: string };
   user: { displayName: string };
+  /** Active recurring windows, from GET /v1/providers/overview. */
+  _count?: { availability: number };
 }
 
 export interface ApiAppointment {
@@ -169,12 +173,24 @@ export interface ApiStaffTask {
   id: string;
   title: string;
   branchId?: string | null;
+  assignedToId?: string | null;
   priority: string;
   dueAt?: string | null;
   status: 'OPEN' | 'IN_PROGRESS' | 'COMPLETED' | 'CANCELED';
   branch?: { name: string } | null;
   assignedTo?: { displayName: string } | null;
+  metadata?: Record<string, unknown> | null;
 }
+
+/** Human label for the control that filed a hand-off task, or null for a task typed by hand. */
+const HANDOFF_ORIGIN_LABEL: Record<string, string> = {
+  opportunity_handoff: 'Opportunity Center',
+  conversation_escalation: 'AI Receptionist escalation',
+  insurance_denial_prevention: 'Insurance denial review',
+  receptionist_safety: 'AI receptionist safety',
+  receptionist_provider_intent_recovery: 'Receptionist call recovery',
+  receptionist_outbound_stop_reconciliation: 'Receptionist outbound stop',
+};
 
 export interface ApiStaffProfile {
   id: string;
@@ -356,6 +372,10 @@ export function mapProviderProfile(row: ApiProviderProfile): Doctor {
     name: row.user.displayName,
     specialty: row.specialty,
     branchId: row.branchId,
+    active: row.active,
+    // null means the response did not carry the count — never rendered as
+    // "no working hours", which is a different claim from "not known".
+    availabilityWindows: row._count?.availability ?? null,
     utilization: row.utilization,
     appointmentsToday: row.appointmentsToday,
     appointmentsThisMonth: row.appointmentsThisMonth,
@@ -440,14 +460,24 @@ export function mapPartnerReport(row: ApiPartnerReport): LabOrder {
 
 export function mapStaffTask(row: ApiStaffTask) {
   const dueAt = row.dueAt ? new Date(row.dueAt) : undefined;
+  const status = row.status.toLowerCase().replace('_', '-') as 'open' | 'in-progress' | 'completed' | 'canceled';
+  const workflow = typeof row.metadata?.workflow === 'string' ? row.metadata.workflow : null;
   return {
     id: row.id,
     title: row.title,
     branch: row.branch?.name ?? (row.branchId ? 'Live branch' : 'All'),
-    priority: row.priority,
-    due: dueAt && dueAt < new Date() ? 'Overdue' : dueAt ? dueAt.toLocaleString() : 'Unscheduled',
-    assignee: row.assignedTo?.displayName ?? 'Unassigned',
-    status: row.status.toLowerCase() as 'open' | 'in-progress' | 'completed' | 'canceled',
+    // Priority strings are written by several modules in mixed case ('high',
+    // 'HIGH', 'CRITICAL'). Normalise for display and styling; the stored value
+    // is untouched.
+    priority: row.priority.toLowerCase(),
+    dueAt: dueAt ?? null,
+    // Only a live task can be overdue — a finished one is not work in arrears.
+    overdue: Boolean(dueAt && dueAt < new Date() && (status === 'open' || status === 'in-progress')),
+    due: dueAt ? dueAt.toLocaleString() : 'No due date',
+    assignedToId: row.assignedToId ?? null,
+    assignee: row.assignedTo?.displayName ?? null,
+    origin: workflow ? HANDOFF_ORIGIN_LABEL[workflow] ?? workflow.replace(/_/g, ' ') : null,
+    status,
   };
 }
 

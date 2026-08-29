@@ -5,6 +5,7 @@ import type { Worker } from 'bullmq';
 import { fixtureDb as db } from './helpers/fixtureDb';
 import { createAutopilotWorker, executeAutopilotApprovedAction, isFinalAutopilotAttempt, setAutopilotExecutionTestHook } from '../workers/autopilot.worker';
 import { autopilotQueue, enqueueAutopilotExecution } from '../workers/queues';
+import { requireQueueRedis } from './helpers/requireQueueRedis';
 
 // Proves the background worker actually CONSUMES an enqueued job end-to-end
 // (real Redis + Postgres, no queue mock): an exactly fenced APPROVED action
@@ -68,6 +69,7 @@ describe('worker runtime — queues are actually drained', () => {
   let approvalSequence = 0;
 
   it('executes the allowlisted domain action and stores its receipt atomically', async () => {
+    await requireQueueRedis();
     const t = await fixture();
 
     await enqueueAutopilotExecution({ approvalId: t.approval.id, tenantId: t.tenantId, dispatchAttemptId: t.dispatchAttemptId });
@@ -96,6 +98,7 @@ describe('worker runtime — queues are actually drained', () => {
   }, 40_000);
 
   it('keeps the durable dispatch queued through BullMQ retries and terminalizes exactly once at attempt five', async () => {
+    await requireQueueRedis();
     const t = await fixture();
     const observedStates: string[] = [];
     setAutopilotExecutionTestHook(async () => {

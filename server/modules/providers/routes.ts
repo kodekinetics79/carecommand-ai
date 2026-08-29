@@ -27,8 +27,12 @@ const providerCreateInput = z.object({
 const providerUpdateInput = z.object({
   branchId: z.string().uuid().optional(),
   specialty: z.string().trim().min(1).max(160).optional(),
-}).refine(input => input.branchId !== undefined || input.specialty !== undefined, {
-  message: 'At least one field (branchId, specialty) must be provided',
+  // Deactivation retires a clinician from the booking schedule without deleting
+  // the identity their existing appointments point at. Enforced in the slot
+  // engine (resolveProviderSchedulingContext), not only in the UI.
+  active: z.boolean().optional(),
+}).refine(input => input.branchId !== undefined || input.specialty !== undefined || input.active !== undefined, {
+  message: 'At least one field (branchId, specialty, active) must be provided',
 });
 
 export const providerRoutes: FastifyPluginAsync = async app => {
@@ -47,10 +51,51 @@ export const providerRoutes: FastifyPluginAsync = async app => {
       include: {
         branch: { select: { name: true } },
         user: { select: { displayName: true } },
+        // A provider with no working hours has no open slots, so every booking
+        // surface needs to tell "not on the schedule yet" apart from "fully
+        // booked today". Counting the recurring windows here is what lets the
+        // front desk see that difference without a second request per provider.
+        _count: { select: { availability: { where: { active: true } } } },
       },
     });
 
     return cursorPage(rows, query.limit);
+  });
+
+  // ----- Users who may be given a provider identity ---------------------------
+  // The create route below requires a clinician-capable, branch-entitled user.
+  // Without this, a console could only offer a free-text user id and would fail
+  // at submit; with it the picker offers exactly the users POST / will accept.
+  app.get('/candidates', { preHandler: canManageProviders }, async request => {
+    const query = z.object({ branchId: z.string().uuid().optional() }).parse(request.query);
+    if (query.branchId) assertBranchAccess(request, query.branchId);
+    const branchId = request.auth.branchId ?? query.branchId;
+    const users = await db.user.findMany({
+      where: {
+        tenantId: request.auth.tenantId,
+        active: true,
+        role: { in: [...CLINICIAN_CAPABLE_ROLES] },
+        ...(branchId ? { OR: [{ branchId }, { clinicAccesses: { some: { branchId } } }] } : {}),
+      },
+      select: {
+        id: true, displayName: true, email: true, role: true, branchId: true,
+        providerProfile: { select: { id: true, active: true } },
+        clinicAccesses: { select: { branchId: true } },
+      },
+      orderBy: [{ displayName: 'asc' }],
+      take: 100,
+    });
+    return users.map(user => ({
+      userId: user.id,
+      displayName: user.displayName,
+      email: user.email,
+      role: user.role,
+      // Every branch this user may be given a provider identity in, so the
+      // console cannot offer a branch the create route would reject.
+      branchIds: [...new Set([user.branchId, ...user.clinicAccesses.map(access => access.branchId)].filter((id): id is string => Boolean(id)))],
+      providerProfileId: user.providerProfile?.id ?? null,
+      providerActive: user.providerProfile?.active ?? null,
+    }));
   });
 
   // ----- Onboard a clinician (create a ProviderProfile for a tenant user) -----
@@ -115,16 +160,24 @@ export const providerRoutes: FastifyPluginAsync = async app => {
       }
     }
 
+    // Taking a provider off (or back on) the schedule is a distinct operational
+    // event from editing their specialty, and is recorded as one — the same way
+    // admin.user.activated / admin.user.deactivated are recorded for accounts.
+    const activationChanged = input.active !== undefined && input.active !== provider.active;
+    const action = activationChanged
+      ? (input.active ? 'provider.activated' : 'provider.deactivated')
+      : 'provider.updated';
+
     const updated = await runWithTenantContext(request.auth.tenantId, async tx => {
       const row = await tx.providerProfile.update({
         where: { id: provider.id },
-        data: { branchId: input.branchId ?? undefined, specialty: input.specialty ?? undefined },
+        data: { branchId: input.branchId ?? undefined, specialty: input.specialty ?? undefined, active: input.active ?? undefined },
       });
       await tx.auditEvent.create({ data: {
         tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
-        action: 'provider.updated', resource: 'providerProfile', resourceId: provider.id,
+        action, resource: 'providerProfile', resourceId: provider.id,
         requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
-        metadata: { fromBranchId: provider.branchId, toBranchId: row.branchId, specialtyChanged: input.specialty !== undefined },
+        metadata: { fromBranchId: provider.branchId, toBranchId: row.branchId, specialtyChanged: input.specialty !== undefined, active: row.active },
       } });
       return row;
     });

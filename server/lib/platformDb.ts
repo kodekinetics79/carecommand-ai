@@ -4,13 +4,34 @@ import type { Prisma } from '../generated/prisma/client';
 import { env } from '../config/env';
 import { getPlatformDatabaseContext } from './platformContextStore';
 
-function connectionString(): string {
-  if (env.PLATFORM_DATABASE_URL) return env.PLATFORM_DATABASE_URL;
-  throw new Error('PlatformDatabase: PLATFORM_DATABASE_URL is required; the platform plane must never fall back to the tenant runtime role');
+// Resolved on FIRST USE, not at import.
+//
+// This module used to build its client at module scope, so an unset
+// PLATFORM_DATABASE_URL threw while the module was still being imported. app.ts
+// registers the platform and pilot routes on every boot, so that one missing
+// variable took down the ENTIRE API: a clinic could not look up a patient,
+// answer a call or check anyone in, because a console only the vendor uses was
+// misconfigured. Blast radius should match the thing that is broken.
+//
+// The refusal itself is unchanged and just as absolute. The platform plane still
+// never falls back to the tenant runtime role; it now refuses when something
+// actually tries to USE it, which turns a total outage into a failing
+// platform-admin request and leaves the clinic-facing product serving.
+let cachedClient: PrismaClient | undefined;
+
+function basePlatformClient(): PrismaClient {
+  if (cachedClient) return cachedClient;
+  if (!env.PLATFORM_DATABASE_URL) {
+    throw new Error('PlatformDatabase: PLATFORM_DATABASE_URL is required; the platform plane must never fall back to the tenant runtime role');
+  }
+  cachedClient = new PrismaClient({ adapter: new PrismaPg({ connectionString: env.PLATFORM_DATABASE_URL }) });
+  return cachedClient;
 }
 
-const adapter = new PrismaPg({ connectionString: connectionString() });
-const basePlatformDb = new PrismaClient({ adapter });
+/** True when the platform plane is configured. Lets callers answer honestly. */
+export function platformDatabaseConfigured(): boolean {
+  return Boolean(env.PLATFORM_DATABASE_URL);
+}
 
 type DynamicRecord = Record<PropertyKey, unknown>;
 type DynamicMethod = (...args: unknown[]) => unknown;
@@ -48,9 +69,10 @@ function scopedDelegate(target: PrismaClient, delegateName: string, delegate: ob
 }
 
 const delegateCache = new Map<string, object>();
-const platformDbProxy = new Proxy(basePlatformDb, {
-  get(target, property, receiver) {
-    const value = Reflect.get(target, property, receiver);
+const platformDbProxy = new Proxy({} as PrismaClient, {
+  get(_placeholder, property) {
+    const target = basePlatformClient();
+    const value = Reflect.get(target, property);
     const context = getPlatformDatabaseContext();
     if (property === '$transaction' && context) {
       return (callback: (tx: Prisma.TransactionClient) => Promise<unknown>, options?: Parameters<PrismaClient['$transaction']>[1]) =>
@@ -91,7 +113,7 @@ export interface PlatformRolePosture {
 
 /** Fail closed before serving the platform plane with an over-privileged role. */
 export async function assertPlatformDatabaseRole(): Promise<PlatformRolePosture> {
-  const rows = await basePlatformDb.$queryRaw<PlatformRolePosture[]>`
+  const rows = await basePlatformClient().$queryRaw<PlatformRolePosture[]>`
     SELECT r.rolname AS current_user,
            r.rolsuper,
            r.rolbypassrls,

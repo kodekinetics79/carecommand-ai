@@ -1,8 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { CalendarDays, Zap, AlertCircle, CheckCircle2, Clock, Users, DollarSign, RefreshCw, CreditCard, LogIn, UserX, CheckCheck, XCircle, CalendarClock } from 'lucide-react';
 import AppointmentPaymentCard from '../components/payments/AppointmentPaymentCard';
 import PaymentRequestsPanel from '../components/payments/PaymentRequestsPanel';
+import ProviderSetupPanel from '../components/scheduling/ProviderSetupPanel';
+import ServiceCatalogPanel from '../components/scheduling/ServiceCatalogPanel';
+import { activeServices, durationLabel, servicesApi, type ServiceCatalogItem } from '../lib/services';
 import InsuranceIntakeCard from '../components/insurance/InsuranceIntakeCard';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
@@ -14,21 +17,16 @@ import { useApiResource } from '../hooks/useApiResource';
 import { mapAppointment, mapProviderProfile, mapPatient, type ApiAppointment, type ApiProviderProfile, type ApiPatient } from '../lib/apiAdapters';
 import { ApiError } from '../lib/api';
 import { appointmentsApi, schedulingApi, type LifecycleStatus, type ProviderSlot } from '../lib/appointments';
-import { intakeApi } from '../lib/intake';
+import { intakeApi, intakeLink } from '../lib/intake';
+import { useDebouncedValue } from '../hooks/useDebouncedValue';
+import { clinicDateLabel, clinicDayRangeUtc, clinicTimeToUtc, resolveTimezone, shiftClinicDate, todayInZone } from '../lib/clinicTime';
 import { useSession } from '../hooks/useSession';
 import { checkEligibility, fetchAppointmentVerificationQueue, type AppointmentVerificationQueueRow } from '../lib/revenueProtection';
 
-const isoDate = (offsetDays: number) => {
-  const d = new Date();
-  d.setDate(d.getDate() + offsetDays);
-  return d.toISOString().slice(0, 10);
-};
-const dateOptions = [0, 1, 2].map(offset => ({
-  value: isoDate(offset),
-  label: offset === 0 ? 'Today' : offset === 1 ? 'Tomorrow' : new Date(isoDate(offset)).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric' }),
-}));
-const todayDate = dateOptions[0].value;
-const emptyBooking = { patientId: '', providerId: '', service: '', date: todayDate, channel: 'EMAIL', slotStart: '', slotEnd: '' };
+// Dates are clinic-local and therefore cannot be module constants: the zone is
+// not known until the branches load. Computing them here with toISOString()
+// meant the board opened on tomorrow every evening for any clinic west of UTC.
+const emptyBooking = (today: string) => ({ patientId: '', providerId: '', service: '', date: today, channel: 'EMAIL', slotStart: '', slotEnd: '' });
 
 // Client mirror of the backend lifecycle transition rules (appointments/routes.ts)
 // so we only offer actions the server will accept; a race still surfaces as a 409.
@@ -52,35 +50,83 @@ const statusConfig: Record<string, { label: string; dot: string; bg: string; tex
   waitlist:   { label: 'Waitlist',  dot: 'bg-amber-500',   bg: 'bg-[var(--amber-soft)]',    text: 'text-amber-v' },
 };
 
-interface ApiBranchOption { id: string; name: string }
+interface ApiBranchOption { id: string; name: string; timezone?: string | null }
 
 export default function Scheduling() {
   const navigate = useNavigate();
   const { user } = useSession();
   const isFrontDesk = user?.role === 'FRONT_DESK';
   const [selectedBranch, setSelectedBranch] = useState('all');
-  const [selectedDate, setSelectedDate] = useState(todayDate);
+  const [selectedDate, setSelectedDate] = useState<string | null>(null);
   const [insuranceQueue, setInsuranceQueue] = useState<AppointmentVerificationQueueRow[]>([]);
   const [queueLoading, setQueueLoading] = useState(true);
   const [queueError, setQueueError] = useState<string | null>(null);
   const [queueBusy, setQueueBusy] = useState<string | null>(null);
-  // Server-side day/branch filtering: fetch only the selected UTC day (and branch)
-  // instead of the first 100 rows ordered by id — so a busy day past the first 100
-  // rows is no longer silently dropped. UTC bounds match mapAppointment's date.
-  const appointmentsPath = useMemo(() => {
-    const from = `${selectedDate}T00:00:00.000Z`;
-    const to = `${selectedDate}T23:59:59.999Z`;
-    const branchParam = selectedBranch === 'all' ? '' : `&branchId=${selectedBranch}`;
-    return `/v1/appointments?limit=100&from=${from}&to=${to}${branchParam}`;
-  }, [selectedDate, selectedBranch]);
-  const { data: appointmentRecords, source, error: appointmentError, reload } = useApiResource<ApiAppointment, ReturnType<typeof mapAppointment>>(appointmentsPath, [], mapAppointment);
-  const { data: providerRecords, error: providerError } = useApiResource<ApiProviderProfile, ReturnType<typeof mapProviderProfile>>('/v1/providers/overview?limit=100', [], mapProviderProfile);
-  const { data: patientRecords, error: patientError } = useApiResource<ApiPatient, ReturnType<typeof mapPatient>>('/v1/patients?limit=100', [], mapPatient);
   const { data: branchRecords, error: branchError } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
 
+  // The schedule belongs to the clinic, so every date on this screen is read in
+  // the clinic's zone. With one branch chosen that is its zone; across all
+  // branches the first is the practice's own, and the viewer's zone is the last
+  // resort. Before this the board used the browser: "today" came from
+  // toISOString(), which is UTC, so a Chicago clinic opened on tomorrow every
+  // evening and its post-19:00 appointments fell outside the day it fetched.
+  const clinicTimezone = useMemo(() => {
+    const chosen = selectedBranch === 'all' ? branchRecords[0] : branchRecords.find(b => b.id === selectedBranch);
+    return resolveTimezone(chosen?.timezone ?? branchRecords[0]?.timezone);
+  }, [branchRecords, selectedBranch]);
+
+  const todayDate = useMemo(() => todayInZone(clinicTimezone), [clinicTimezone]);
+  const activeDate = selectedDate ?? todayDate;
+  const dateOptions = useMemo(() => [0, 1, 2].map(offset => {
+    const value = shiftClinicDate(todayDate, offset, clinicTimezone);
+    return {
+      value,
+      label: offset === 0 ? 'Today'
+        : offset === 1 ? 'Tomorrow'
+        : clinicDateLabel(value, clinicTimezone, { weekday: 'short', day: 'numeric' }),
+    };
+  }), [todayDate, clinicTimezone]);
+
+  // Server-side day/branch filtering: fetch only the selected CLINIC day (and
+  // branch) instead of the first 100 rows ordered by id. The window is the
+  // clinic's midnight-to-midnight expressed as UTC instants, which is 23 or 25
+  // hours long on a DST changeover — a fixed 24h span drops or duplicates an hour.
+  const appointmentsPath = useMemo(() => {
+    const { from, to } = clinicDayRangeUtc(activeDate, clinicTimezone);
+    const branchParam = selectedBranch === 'all' ? '' : `&branchId=${selectedBranch}`;
+    return `/v1/appointments?limit=100&from=${from.toISOString()}&to=${to.toISOString()}${branchParam}`;
+  }, [activeDate, clinicTimezone, selectedBranch]);
+  const { data: appointmentRecords, source, error: appointmentError, reload } = useApiResource<ApiAppointment, ReturnType<typeof mapAppointment>>(appointmentsPath, [], mapAppointment);
+  const { data: providerRecords, error: providerError, loading: providersLoading, reload: reloadProviders } = useApiResource<ApiProviderProfile, ReturnType<typeof mapProviderProfile>>('/v1/providers/overview?limit=100', [], mapProviderProfile);
+  // The booking picker searches on the SERVER. It used to list the first 100
+  // patients ordered by UUID, so in a clinic with more than that the caller on
+  // the phone simply was not in the dropdown and could not be booked at all.
+  const [patientQuery, setPatientQuery] = useState('');
+  const debouncedPatientQuery = useDebouncedValue(patientQuery);
+  const patientsPath = useMemo(() => {
+    const params = new URLSearchParams({ limit: '100' });
+    if (debouncedPatientQuery.trim()) params.set('search', debouncedPatientQuery.trim());
+    return `/v1/patients?${params.toString()}`;
+  }, [debouncedPatientQuery]);
+  const { data: patientRecords, error: patientError } = useApiResource<ApiPatient, ReturnType<typeof mapPatient>>(patientsPath, [], mapPatient);
+  // The service catalog governs booking as soon as it holds one active entry
+  // (resolveSchedulingService is fail-closed on a configured catalog), so this
+  // screen has to know before it offers a free-text box the server will refuse.
+  const [serviceCatalog, setServiceCatalog] = useState<ServiceCatalogItem[]>([]);
+  const reloadServices = useCallback(() => {
+    void servicesApi.list().then(setServiceCatalog).catch(() => setServiceCatalog([]));
+  }, []);
+  useEffect(() => { reloadServices(); }, [reloadServices]);
+  const bookableServices = useMemo(() => activeServices(serviceCatalog), [serviceCatalog]);
+  const catalogGoverns = bookableServices.length > 0;
   const [showBooking, setShowBooking] = useState(false);
   const [paymentApptId, setPaymentApptId] = useState<string | null>(null);
-  const [booking, setBooking] = useState(emptyBooking);
+  const [booking, setBooking] = useState(() => emptyBooking(''));
+  // Resolved after the booking state exists, since it reads the chosen name.
+  const chosenService = useMemo(
+    () => bookableServices.find(item => item.name === booking.service) ?? null,
+    [bookableServices, booking.service],
+  );
   const [saving, setSaving] = useState(false);
   const [bookingError, setBookingError] = useState<string | null>(null);
   // Real provider slots for the conflict-safe booking path.
@@ -91,16 +137,32 @@ export default function Scheduling() {
   const [rowBusy, setRowBusy] = useState<string | null>(null);
   const [rowNotice, setRowNotice] = useState<{ id: string; kind: 'error' | 'ok'; text: string } | null>(null);
   const [rescheduleFor, setRescheduleFor] = useState<string | null>(null);
-  const [rescheduleForm, setRescheduleForm] = useState({ date: todayDate, time: '10:00' });
+  const [rescheduleForm, setRescheduleForm] = useState<{ date: string | null; time: string }>({ date: null, time: '10:00' });
   const [intakeBusy, setIntakeBusy] = useState<string | null>(null);
 
   // Providers bookable for the chosen patient (same branch — the book route
   // requires the patient to belong to the provider's clinic).
-  const bookingPatient = patientRecords.find(p => p.id === booking.patientId);
-  const bookableProviders = useMemo(
+  // Pin the chosen patient. Once a selection is made the search can be retyped
+  // for a different field, and the picked patient may drop out of the current
+  // results — the branch-scoped provider list below must not collapse because
+  // of that.
+  const [pinnedPatient, setPinnedPatient] = useState<ReturnType<typeof mapPatient> | null>(null);
+  const bookingPatient = patientRecords.find(p => p.id === booking.patientId)
+    ?? (pinnedPatient?.id === booking.patientId ? pinnedPatient : undefined);
+  const clinicProviders = useMemo(
     () => (bookingPatient ? providerRecords.filter(p => p.branchId === bookingPatient.branchId) : []),
     [providerRecords, bookingPatient],
   );
+  // Only offer a provider the booking route can actually accept: on the schedule,
+  // and with working hours behind them. A provider with no hours has no open slot
+  // on any day, so offering them would be one more control that cannot do what it
+  // offers. `availabilityWindows === null` means the list did not carry the count,
+  // and an unknown is not a reason to hide someone.
+  const bookableProviders = useMemo(
+    () => clinicProviders.filter(p => p.active && p.availabilityWindows !== 0),
+    [clinicProviders],
+  );
+  const unbookableInClinic = clinicProviders.length - bookableProviders.length;
 
   // Load real open slots whenever a provider + date are chosen.
   useEffect(() => {
@@ -112,10 +174,13 @@ export default function Scheduling() {
       setSlotsLoading(true);
       setSlotsError(null);
       try {
-        const res = await schedulingApi.slots(booking.providerId, booking.date);
+        const res = await schedulingApi.slots(booking.providerId, booking.date, {
+          serviceCatalogItemId: chosenService?.id,
+          service: chosenService ? undefined : booking.service.trim() || undefined,
+        });
         if (!active) return;
         setSlots(res.slots);
-        if (res.slots.length === 0) setSlotsError('No open slots for this provider on this day. Set availability, pick another day, or use manual time entry below.');
+        if (res.slots.length === 0) setSlotsError('No open slots for this provider on this day. Pick another day, or change their working hours in Providers & availability.');
       } catch (err) {
         if (!active) return;
         setSlots([]);
@@ -125,7 +190,9 @@ export default function Scheduling() {
       }
     })();
     return () => { active = false; };
-  }, [showBooking, booking.providerId, booking.date]);
+    // chosenService changes the duration the slot grid is computed for, so a
+    // service change must re-ask rather than show slots sized for the last one.
+  }, [showBooking, booking.providerId, booking.date, booking.service, chosenService]);
 
   useEffect(() => {
     let active = true;
@@ -133,7 +200,10 @@ export default function Scheduling() {
       setQueueLoading(true);
       setQueueError(null);
       try {
-        const response = await fetchAppointmentVerificationQueue(selectedBranch === 'all' ? undefined : selectedBranch);
+        const response = await fetchAppointmentVerificationQueue(
+          selectedBranch === 'all' ? undefined : selectedBranch,
+          clinicDayRangeUtc(activeDate, clinicTimezone),
+        );
         if (!active) return;
         setInsuranceQueue(response.appointments);
       } catch (err) {
@@ -146,10 +216,13 @@ export default function Scheduling() {
     return () => {
       active = false;
     };
-  }, [selectedBranch]);
+  }, [selectedBranch, activeDate, clinicTimezone]);
 
   function closeBooking() {
-    setBooking(emptyBooking);
+    setBooking(emptyBooking(todayDate));
+    // The next booking starts from a clean search, not the last caller's name.
+    setPatientQuery('');
+    setPinnedPatient(null);
     setShowBooking(false);
     setSlots([]);
     setSlotsError(null);
@@ -174,6 +247,7 @@ export default function Scheduling() {
         startsAt: booking.slotStart,
         durationMin,
         service: booking.service.trim(),
+        serviceCatalogItemId: chosenService?.id,
         channel: booking.channel,
       });
       const bookedDate = booking.date;
@@ -181,12 +255,21 @@ export default function Scheduling() {
       setSelectedDate(bookedDate);
       reload();
     } catch (err) {
-      if (err instanceof ApiError && err.status === 409) {
+      // Two different 409s arrive here. Only one of them is a taken slot; saying
+      // "that slot was just taken" about a provider who was deactivated mid-flight
+      // would send the receptionist hunting for another time that does not exist.
+      if (err instanceof ApiError && err.status === 409 && err.code === 'provider_inactive') {
+        setBookingError(err.message);
+        setSlots([]);
+      } else if (err instanceof ApiError && err.status === 409) {
         setBookingError('That slot was just taken. Pick another open slot.');
         // Refresh slots so the taken one drops off.
         if (booking.providerId) {
           try {
-            const res = await schedulingApi.slots(booking.providerId, booking.date);
+            const res = await schedulingApi.slots(booking.providerId, booking.date, {
+              serviceCatalogItemId: chosenService?.id,
+              service: chosenService ? undefined : booking.service.trim() || undefined,
+            });
             setSlots(res.slots);
           } catch { /* keep prior slots */ }
         }
@@ -220,11 +303,14 @@ export default function Scheduling() {
   const cancelAppointment = (id: string) => runRowAction(id, () => appointmentsApi.cancel(id), 'Appointment canceled.');
 
   async function submitReschedule(id: string) {
-    const startsAt = new Date(`${rescheduleForm.date}T${rescheduleForm.time}:00`);
+    // Typed as clinic wall time. Parsing this with `new Date()` read it in the
+    // staff member's own zone, so a reschedule from anywhere but the clinic
+    // wrote a different hour than the one on screen — silently.
+    const startsAt = clinicTimeToUtc(rescheduleForm.date ?? todayDate, rescheduleForm.time, clinicTimezone);
     const endsAt = new Date(startsAt.getTime() + 30 * 60000);
     await runRowAction(id, () => appointmentsApi.reschedule(id, startsAt.toISOString(), endsAt.toISOString()), 'Appointment rescheduled.');
     setRescheduleFor(null);
-    setSelectedDate(rescheduleForm.date);
+    setSelectedDate(rescheduleForm.date ?? todayDate);
   }
 
   // ----- Originate an intake link for an appointment's patient ---------------
@@ -233,7 +319,7 @@ export default function Scheduling() {
     setRowNotice(null);
     try {
       const packet = await intakeApi.createPacket({ appointmentId: appt.id, source: 'staff' });
-      const link = packet.publicUrl || (packet.publicToken ? `/intake/${packet.publicToken}` : null);
+      const link = intakeLink(packet.publicUrl, packet.publicToken);
       if (link) await navigator.clipboard.writeText(link).catch(() => undefined);
       setRowNotice({ id: appt.id, kind: 'ok', text: link ? 'Intake link created and copied to clipboard.' : 'Intake packet created.' });
     } catch (err) {
@@ -302,11 +388,33 @@ export default function Scheduling() {
             <p className="text-sm font-bold text-t1 mb-3">Book appointment</p>
             {bookingError && <p role="alert" className="text-[11px] text-red-v mb-2">{bookingError}</p>}
             <div className="space-y-2.5">
-              <select aria-label="Patient" title="Patient" value={booking.patientId} onChange={e => setBooking(b => ({ ...b, patientId: e.target.value, providerId: '', slotStart: '', slotEnd: '' }))} className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
+              <input
+                aria-label="Search patients"
+                value={patientQuery}
+                onChange={e => setPatientQuery(e.target.value)}
+                placeholder="Search patients by name, phone, email or reference"
+                className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]"
+              />
+              <select aria-label="Patient" title="Patient" value={booking.patientId} onChange={e => { const chosen = patientRecords.find(p => p.id === e.target.value) ?? null; setPinnedPatient(chosen); setBooking(b => ({ ...b, patientId: e.target.value, providerId: '', slotStart: '', slotEnd: '' })); }} className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
                 <option value="">Select patient…</option>
+                {pinnedPatient && !patientRecords.some(p => p.id === pinnedPatient.id) && (
+                  <option value={pinnedPatient.id}>{pinnedPatient.name}</option>
+                )}
                 {patientRecords.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
               </select>
-              <input value={booking.service} onChange={e => setBooking(b => ({ ...b, service: e.target.value }))} placeholder="Service (e.g. Dermatology Review)" className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+              {debouncedPatientQuery.trim() && patientRecords.length === 0 && (
+                <p className="text-[11px] text-t3">No patient matches that search. Registering a new patient is on the Patients screen.</p>
+              )}
+              {catalogGoverns ? (
+                // Only what the server will accept. Typing a service that is not
+                // in the catalog is refused, so it must not be offered.
+                <select aria-label="Service" title="Service" value={booking.service} onChange={e => setBooking(b => ({ ...b, service: e.target.value, slotStart: '', slotEnd: '' }))} className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
+                  <option value="">Select service…</option>
+                  {bookableServices.map(item => <option key={item.id} value={item.name}>{item.name} · {durationLabel(item.defaultDurationMinutes)}</option>)}
+                </select>
+              ) : (
+                <input aria-label="Service" value={booking.service} onChange={e => setBooking(b => ({ ...b, service: e.target.value }))} placeholder="Service (e.g. Dermatology Review)" className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+              )}
               <div className="grid grid-cols-2 gap-2.5">
                 <select aria-label="Provider" title="Provider" disabled={!booking.patientId} value={booking.providerId} onChange={e => setBooking(b => ({ ...b, providerId: e.target.value, slotStart: '', slotEnd: '' }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-40">
                   <option value="">{booking.patientId ? 'Select provider…' : 'Pick patient first'}</option>
@@ -341,11 +449,20 @@ export default function Scheduling() {
               )}
 
               {booking.patientId && bookableProviders.length === 0 && (
-                <p role="alert" className="text-[11px] text-amber-v">No provider is configured for this patient's clinic. Configure a provider and availability before booking.</p>
+                <p role="alert" className="text-[11px] text-amber-v">
+                  {clinicProviders.length === 0
+                    ? "No provider is set up in this patient's clinic yet. Add one in Providers & availability, then set their working hours."
+                    : `Every provider in this patient's clinic is deactivated or has no working hours, so no appointment can be booked here yet. Set that up in Providers & availability.`}
+                </p>
+              )}
+              {booking.patientId && bookableProviders.length > 0 && unbookableInClinic > 0 && (
+                <p className="text-[11px] text-t3">
+                  {unbookableInClinic} other {unbookableInClinic === 1 ? 'provider' : 'providers'} in this clinic {unbookableInClinic === 1 ? 'is' : 'are'} not on the schedule (deactivated, or no working hours set).
+                </p>
               )}
             </div>
             <div className="flex gap-2 mt-4">
-              <button type="button" disabled={saving || !booking.providerId || !booking.slotStart} onClick={bookAppointment} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition disabled:opacity-40">{saving ? 'Booking…' : 'Book canonical slot'}</button>
+              <button type="button" disabled={saving || !booking.providerId || !booking.slotStart || !booking.service.trim()} onClick={bookAppointment} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition disabled:opacity-40">{saving ? 'Booking…' : 'Book canonical slot'}</button>
               <button type="button" onClick={closeBooking} className="px-4 py-2 rounded-lg border border-[var(--b1)] text-t2 text-xs font-semibold hover:bg-[var(--s3)] transition">Cancel</button>
             </div>
           </div>
@@ -370,10 +487,10 @@ export default function Scheduling() {
       <div className="flex items-center gap-3 flex-wrap">
         <div className="flex items-center gap-1 bg-[var(--s2)] border border-[var(--b1)] p-1 rounded-xl">
           {dateOptions.map(opt => (
-            <button key={opt.value} type="button" onClick={() => setSelectedDate(opt.value)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedDate === opt.value ? 'bg-[var(--indigo)] text-white' : 'text-t3 hover:text-t1'}`}>{opt.label}</button>
+            <button key={opt.value} type="button" onClick={() => setSelectedDate(opt.value)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${activeDate === opt.value ? 'bg-[var(--indigo)] text-white' : 'text-t3 hover:text-t1'}`}>{opt.label}</button>
           ))}
           {/* Pick any day server-side (not just Today/Tomorrow/+2). */}
-          <input type="date" aria-label="Pick a date" value={selectedDate} onChange={e => setSelectedDate(e.target.value || todayDate)} className={`px-2 py-1.5 rounded-lg text-xs font-semibold bg-transparent outline-none ${dateOptions.some(o => o.value === selectedDate) ? 'text-t3' : 'bg-[var(--indigo)] text-white'}`} />
+          <input type="date" aria-label="Pick a date" value={activeDate} onChange={e => setSelectedDate(e.target.value || todayDate)} className={`px-2 py-1.5 rounded-lg text-xs font-semibold bg-transparent outline-none ${dateOptions.some(o => o.value === activeDate) ? 'text-t3' : 'bg-[var(--indigo)] text-white'}`} />
         </div>
         <div className="flex items-center gap-1 bg-[var(--s2)] border border-[var(--b1)] p-1 rounded-xl">
           <button type="button" onClick={() => setSelectedBranch('all')} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedBranch === 'all' ? 'bg-[var(--s3)] text-t1' : 'text-t3 hover:text-t1'}`}>All branches</button>
@@ -458,7 +575,7 @@ export default function Scheduling() {
             )}
           </BentoCard>
 
-          <BentoCard title="Appointment timeline" subtitle={selectedDate === todayDate ? "Today's schedule" : new Date(`${selectedDate}T12:00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })} headerRight={
+          <BentoCard title="Appointment timeline" subtitle={activeDate === todayDate ? "Today's schedule" : clinicDateLabel(activeDate, clinicTimezone, { month: 'short', day: 'numeric', year: 'numeric' })} headerRight={
             <span className="text-xs font-semibold text-t3">{todayAppts.length} appointments · {formatCurrency(totalValue)}</span>
           }>
             <div className="space-y-2">
@@ -530,7 +647,7 @@ export default function Scheduling() {
                             )}
                             {rescheduleFor === appt.id && (
                               <div className="mt-2 flex items-center gap-1.5 flex-wrap">
-                                <input type="date" aria-label="New date" value={rescheduleForm.date} onChange={e => setRescheduleForm(f => ({ ...f, date: e.target.value }))} className="px-2 py-1 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-[11px] text-t1 outline-none focus:border-[var(--b3)]" />
+                                <input type="date" aria-label="New date" value={rescheduleForm.date ?? todayDate} onChange={e => setRescheduleForm(f => ({ ...f, date: e.target.value }))} className="px-2 py-1 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-[11px] text-t1 outline-none focus:border-[var(--b3)]" />
                                 <input type="time" aria-label="New time" value={rescheduleForm.time} onChange={e => setRescheduleForm(f => ({ ...f, time: e.target.value }))} className="px-2 py-1 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-[11px] text-t1 outline-none focus:border-[var(--b3)]" />
                                 <button type="button" disabled={busy} onClick={() => void submitReschedule(appt.id)} className="px-2.5 py-1 rounded-lg bg-[var(--indigo)] text-white text-[11px] font-semibold hover:opacity-90 disabled:opacity-40">{busy ? 'Saving…' : 'Confirm'}</button>
                               </div>
@@ -554,6 +671,19 @@ export default function Scheduling() {
 
         {/* Right sidebar */}
         <div className="space-y-4">
+          {/* Provider records + working hours — what every booking resolves against */}
+          <ProviderSetupPanel
+            user={user}
+            providers={providerRecords}
+            loading={providersLoading}
+            error={providerError}
+            branches={branchRecords}
+            onProvidersChanged={reloadProviders}
+          />
+
+          {/* What the clinic offers. Empty here means free-text bookings. */}
+          <ServiceCatalogPanel user={user} onCatalogChanged={reloadServices} />
+
           {/* Deposit payment requests queue */}
           <PaymentRequestsPanel />
 
@@ -568,6 +698,7 @@ export default function Scheduling() {
                         {doc.name.split(' ').slice(-1)[0][0]}
                       </div>
                       <p className="text-xs font-semibold text-t1 truncate max-w-[120px]">{doc.name}</p>
+                      {!doc.active && <span className="badge badge-red shrink-0">Off schedule</span>}
                     </div>
                     <div className="flex items-center gap-1.5">
                       <Clock className="w-3 h-3 text-t3" />

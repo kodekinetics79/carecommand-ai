@@ -2,6 +2,7 @@ import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
+import { queueAppointmentConfirmations } from '../../lib/receptionist/confirmationOutbox';
 import { requirePermission } from '../../lib/permissions';
 import { assertBranchAccess } from '../../lib/scope';
 import { recordWorkflowEvent } from '../../lib/intelligence';
@@ -33,12 +34,22 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
   async function loadProvider(request: FastifyRequest, providerId: string) {
     const provider = await db.providerProfile.findFirst({
       where: { id: providerId, tenantId: request.auth.tenantId },
-      select: { id: true, branchId: true, userId: true },
+      select: { id: true, branchId: true, userId: true, active: true },
     });
     if (!provider) throw app.httpErrors.notFound('Provider not found');
     assertBranchAccess(request, provider.branchId);
     return provider;
   }
+
+  // A deactivated provider is off the schedule: no slots are advertised and no
+  // booking is accepted. Said explicitly rather than answered with an empty slot
+  // list, which reads as "fully booked today" and is a different fact. Editing
+  // their hours and time off stays open so a clinic can prepare a provider
+  // before putting them back on the schedule.
+  const PROVIDER_INACTIVE = {
+    error: 'provider_inactive',
+    message: 'This provider is deactivated and is not on the booking schedule. Reactivate the provider to book them.',
+  } as const;
 
   // ----- Self-scheduling policy (per tenant) --------------------------------
   app.get('/policy', async request => getSchedulingPolicy(request.auth.tenantId));
@@ -50,6 +61,8 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
       requireIntakeForSelfBook: z.boolean().optional(),
       maxHorizonDays: z.number().int().min(1).max(365).optional(),
       minNoticeHours: z.number().int().min(0).max(720).optional(),
+      confirmBookingsBySms: z.boolean().optional(),
+      confirmBookingsByEmail: z.boolean().optional(),
     }).parse(request.body);
     await db.schedulingPolicy.upsert({
       where: { tenantId: request.auth.tenantId },
@@ -65,6 +78,20 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
     const { providerId } = providerParam.parse(request.params);
     const { windows } = z.object({ windows: z.array(windowSchema).max(50) }).parse(request.body);
     const provider = await loadProvider(request, providerId);
+    // Two windows that overlap on the same weekday would advertise the same
+    // minute twice, and two windows with the same start minute collide on the
+    // (provider, day, startMinute) key — which createMany's skipDuplicates would
+    // drop in silence, saving less than the caller asked for and reporting
+    // success. Refuse the ambiguous set instead of half-saving it.
+    const byDay = new Map<number, Array<{ startMinute: number; endMinute: number }>>();
+    for (const window of windows) {
+      const day = byDay.get(window.dayOfWeek) ?? [];
+      if (day.some(other => window.startMinute < other.endMinute && other.startMinute < window.endMinute)) {
+        throw app.httpErrors.badRequest('Working hours overlap on the same weekday. Merge the overlapping windows and save again.');
+      }
+      day.push(window);
+      byDay.set(window.dayOfWeek, day);
+    }
 
     await db.$transaction(async tx => {
       await tx.providerAvailability.deleteMany({ where: { tenantId: request.auth.tenantId, providerProfileId: providerId } });
@@ -97,11 +124,35 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
     return reply.code(201).send(row);
   });
 
+  app.get('/providers/:providerId/time-off', async request => {
+    const { providerId } = providerParam.parse(request.params);
+    const query = z.object({ from: z.coerce.date().optional() }).parse(request.query);
+    await loadProvider(request, providerId);
+    // Time off that has not finished yet — what still affects bookability. A
+    // caller that wants the history passes `from`.
+    const from = query.from ?? new Date();
+    const timeOff = await db.providerTimeOff.findMany({
+      where: { tenantId: request.auth.tenantId, providerProfileId: providerId, endsAt: { gte: from } },
+      orderBy: { startsAt: 'asc' }, take: 100,
+    });
+    return { providerId, from: from.toISOString(), timeOff };
+  });
+
+  app.delete('/providers/:providerId/time-off/:timeOffId', { preHandler: canManageSchedule }, async (request, reply) => {
+    const { providerId, timeOffId } = z.object({ providerId: uuid, timeOffId: uuid }).parse(request.params);
+    await loadProvider(request, providerId);
+    const removed = await db.providerTimeOff.deleteMany({ where: { id: timeOffId, tenantId: request.auth.tenantId, providerProfileId: providerId } });
+    if (removed.count === 0) throw app.httpErrors.notFound('Time off not found');
+    await audit(request, { action: 'schedule.time_off.removed', resource: 'providerProfile', resourceId: providerId, metadata: { timeOffId } });
+    return reply.code(204).send();
+  });
+
   // ----- Open slots (read) --------------------------------------------------
-  app.get('/providers/:providerId/slots', async request => {
+  app.get('/providers/:providerId/slots', async (request, reply) => {
     const { providerId } = providerParam.parse(request.params);
     const query = z.object({ date: dateISO, serviceCatalogItemId: uuid.optional(), service: z.string().trim().min(1).max(160).optional(), durationMin: z.coerce.number().int().min(5).max(240).optional() }).parse(request.query);
-    await loadProvider(request, providerId);
+    const provider = await loadProvider(request, providerId);
+    if (!provider.active) return reply.code(409).send(PROVIDER_INACTIVE);
     const service = await resolveSchedulingService({ tenantId: request.auth.tenantId, serviceCatalogItemId: query.serviceCatalogItemId, service: query.service, fallbackDurationMin: query.durationMin });
     if (!service) throw app.httpErrors.badRequest('Select an active service before checking availability');
     const slots = await computeProviderSlots({ tenantId: request.auth.tenantId, providerProfileId: providerId, dateISO: query.date, durationMin: service.durationMin });
@@ -120,18 +171,20 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
       channel: z.enum(['WHATSAPP', 'SMS', 'EMAIL', 'PUSH', 'CALL', 'VIDEO']).default('EMAIL'),
     }).parse(request.body);
     const provider = await loadProvider(request, providerId);
+    if (!provider.active) return reply.code(409).send(PROVIDER_INACTIVE);
     const service = await resolveSchedulingService({ tenantId: request.auth.tenantId, serviceCatalogItemId: body.serviceCatalogItemId, service: body.service, fallbackDurationMin: body.durationMin });
     if (!service) throw app.httpErrors.badRequest('Select an active service before booking');
 
-    const patient = await db.patient.findFirst({ where: { id: body.patientId, tenantId: request.auth.tenantId, branchId: provider.branchId, deletedAt: null }, select: { id: true } });
+    const patient = await db.patient.findFirst({ where: { id: body.patientId, tenantId: request.auth.tenantId, branchId: provider.branchId, deletedAt: null }, select: { id: true, phone: true, email: true } });
     if (!patient) throw app.httpErrors.badRequest('Patient not found in this provider\'s clinic');
 
     const endsAt = new Date(body.startsAt.getTime() + service.durationMin * 60_000);
+    const policy = await getSchedulingPolicy(request.auth.tenantId);
 
     // Conflict check + create in one transaction so the slot can't be double-booked
     // between check and insert. The DB exclusion constraint is the final guard if a
     // concurrent booking still races past the in-transaction check.
-    let result: { conflict: Awaited<ReturnType<typeof findSlotConflict>> } | { appointment: Awaited<ReturnType<typeof db.appointment.create>> };
+    let result: { conflict: Awaited<ReturnType<typeof findSlotConflict>> } | { appointment: Awaited<ReturnType<typeof db.appointment.create>>; queued: Awaited<ReturnType<typeof queueAppointmentConfirmations>> };
     try {
       result = await db.$transaction(async tx => {
         const conflict = await findSlotConflict({ tenantId: request.auth.tenantId, providerProfileId: providerId, startsAt: body.startsAt, durationMin: service.durationMin }, tx);
@@ -143,7 +196,20 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
             status: 'CONFIRMED', channel: body.channel,
           },
         });
-        return { appointment } as const;
+        // Queue the confirmation with the booking, so a clinic that has opted
+        // in cannot end up with an appointment and no message arranged. This
+        // only enqueues: consent, quiet hours and the DNC fence are all still
+        // decided at the delivery boundary, exactly as for the voice path.
+        const queued = await queueAppointmentConfirmations(tx, {
+          tenantId: request.auth.tenantId,
+          appointmentId: appointment.id,
+          patientId: patient.id,
+          smsEnabled: policy.confirmBookingsBySms,
+          emailEnabled: policy.confirmBookingsByEmail,
+          phone: patient.phone,
+          email: patient.email,
+        });
+        return { appointment, queued } as const;
       });
     } catch (error) {
       if (isDoubleBookConflictError(error)) return reply.code(409).send({ error: 'slot_unavailable', reason: 'already_booked' });
@@ -156,6 +222,8 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
 
     await audit(request, { action: 'appointment.booked', resource: 'appointment', resourceId: result.appointment.id, metadata: { providerId, startsAt: body.startsAt.toISOString() } });
     await recordWorkflowEvent(request.auth.tenantId, { eventType: 'appointment.created', entityType: 'appointment', entityId: result.appointment.id, sourceModule: 'scheduling', payload: { providerId, branchId: provider.branchId } });
-    return reply.code(201).send(result.appointment);
+    // Name the channels that were QUEUED, not "confirmation sent". Nothing has
+    // been delivered yet, and the delivery boundary may still suppress it.
+    return reply.code(201).send({ ...result.appointment, confirmationsQueued: result.queued });
   });
 };

@@ -1,8 +1,9 @@
 import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Prisma } from '../generated/prisma/client';
 import { fixtureDb as db } from './helpers/fixtureDb';
+import { requireQueueRedis } from './helpers/requireQueueRedis';
 import {
   reconcileQueuedAutopilotDispatch,
   reconcileStrandedAutopilotDispatches,
@@ -11,6 +12,8 @@ import {
 import { autopilotQueue } from '../workers/queues';
 
 const tenantIds: string[] = [];
+
+beforeAll(requireQueueRedis);
 
 async function queuedApproval() {
   const tenantId = randomUUID();

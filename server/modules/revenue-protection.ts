@@ -1872,12 +1872,33 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
   });
 
   app.get('/appointment-queue', { preHandler: [insuranceFeature, billingRead] }, async request => {
-    const query = listLimit.parse(request.query);
+    const query = listLimit.extend({
+      // The clinic day the desk is working, as UTC instants. The caller knows
+      // its own timezone; this route must not guess one.
+      from: z.coerce.date().optional(),
+      to: z.coerce.date().optional(),
+    }).parse(request.query);
     const filter = branchFilter(request, query.branchId);
+
+    // A check-in queue is about visits that are still going to happen. This
+    // route selected every appointment the tenant had ever recorded, oldest
+    // first, so a receptionist opened it onto months-old cancellations and
+    // no-shows sitting beside a live "Request eligibility response" button — at
+    // the busiest moment of the day. Nothing can be verified for a visit that
+    // was cancelled, missed or already completed.
+    const VERIFIABLE = ['CONFIRMED', 'RISKY', 'ARRIVED', 'WAITLIST'] as const;
+    const window = query.from || query.to
+      ? { ...(query.from ? { gte: query.from } : {}), ...(query.to ? { lt: query.to } : {}) }
+      // No window named: today onward, with a day of slack so no timezone can
+      // hide this morning's arrivals from a clinic that did not send one.
+      : { gte: new Date(Date.now() - 86_400_000) };
+
     const rows = await db.appointment.findMany({
       where: {
         tenantId: request.auth.tenantId,
         deletedAt: null,
+        status: { in: [...VERIFIABLE] },
+        startsAt: window,
         ...filter,
       },
       orderBy: { startsAt: 'asc' },

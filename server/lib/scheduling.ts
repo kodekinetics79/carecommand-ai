@@ -13,6 +13,9 @@ export interface SchedulingPolicy {
   requireIntakeForSelfBook: boolean;
   maxHorizonDays: number;
   minNoticeHours: number;
+  /** Confirm appointments a human books. Opt-in; see the migration for why. */
+  confirmBookingsBySms: boolean;
+  confirmBookingsByEmail: boolean;
 }
 
 export const DEFAULT_SCHEDULING_POLICY: SchedulingPolicy = {
@@ -21,6 +24,8 @@ export const DEFAULT_SCHEDULING_POLICY: SchedulingPolicy = {
   requireIntakeForSelfBook: false,
   maxHorizonDays: 90,
   minNoticeHours: 0,
+  confirmBookingsBySms: false,
+  confirmBookingsByEmail: false,
 };
 
 type Client = typeof db | Prisma.TransactionClient;
@@ -34,6 +39,8 @@ export async function getSchedulingPolicy(tenantId: string, client: Client = db)
     requireIntakeForSelfBook: row.requireIntakeForSelfBook,
     maxHorizonDays: row.maxHorizonDays,
     minNoticeHours: row.minNoticeHours,
+    confirmBookingsBySms: row.confirmBookingsBySms,
+    confirmBookingsByEmail: row.confirmBookingsByEmail,
   };
 }
 
@@ -154,11 +161,17 @@ export function parseClinicSlot(dateISO: string, time: string, timezone: string)
   catch { return null; }
 }
 
+/**
+ * The one place a provider is decided to be schedulable. A deactivated profile,
+ * or one in a closed branch, resolves to null — so every caller (open slots,
+ * conflict checks, the receptionist adapter, the patient portal) fails closed on
+ * it without each having to remember the rule.
+ */
 export async function resolveProviderSchedulingContext(
   tenantId: string, providerProfileId: string, branchId?: string, client: Client = db,
 ): Promise<ProviderSchedulingContext | null> {
   const provider = await client.providerProfile.findFirst({
-    where: { id: providerProfileId, tenantId, branchId },
+    where: { id: providerProfileId, tenantId, branchId, active: true },
     select: { id: true, branchId: true, branch: { select: { timezone: true, active: true } } },
   });
   if (!provider || !provider.branch.active) return null;

@@ -1,0 +1,13 @@
+-- Provider activation.
+--
+-- A clinic needs to retire a clinician without deleting the identity that its
+-- existing appointments, reviews and revenue rows point at. ProviderProfile had
+-- no such flag, so the only ways to take a provider off the schedule were to
+-- delete the profile (refused by the appointment foreign key) or to silently
+-- wipe their working hours, which leaves the provider still on offer in every
+-- booking picker with no slots behind it.
+--
+-- Defaulting to true keeps every existing provider bookable exactly as before.
+-- IF NOT EXISTS so the statement is safe to re-run against an environment where
+-- it has already been applied by hand.
+ALTER TABLE "ProviderProfile" ADD COLUMN IF NOT EXISTS "active" BOOLEAN NOT NULL DEFAULT true;
