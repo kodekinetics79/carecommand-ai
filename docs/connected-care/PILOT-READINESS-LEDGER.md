@@ -111,12 +111,25 @@ so a device that had never reported still showed a green "Online" badge. Fixed i
 now renders the derived value and the labels describe observation (Reporting / Not reporting / Never
 reported) rather than asserting a live connection.
 
+## Wave 4 — the three remaining items, delivered (2026-08-29)
+
+**152 passing across 13 server suites + 3 E2E.** Commit 3314da0.
+
+| Was | Now |
+|-----|-----|
+| Alerts created a `queued` NotificationEvent that nothing ever drained; no route returned them. A critical alert notified nobody. | `GET /v1/monitoring/notifications` + `POST /:id/acknowledge`. Delivery and acknowledgement recorded as separate facts. Only rows addressed to the reader are marked delivered, so an unowned alert cannot vanish from everyone else's queue because one clinician glanced at theirs. |
+| Billing period was a UTC month for every clinic. A clinic at UTC-7 could not record a review after ~17:00 on the last local day of the month. | Period is the branch's local calendar month. Unresolvable zone falls back to UTC rather than throwing. |
+| Device-days bucketed by UTC date, so one local day straddling UTC midnight counted twice — 8 local days could satisfy a 16-day CMS threshold. | Bucketed by local calendar date. |
+| Every call site computed the CURRENT month, so a closed month — the only kind anyone bills — was unreachable. | `periodStart` on readiness and signoff; any instant inside a month normalises to that month. |
+
+Evidence version **v5** + migration `20260829160000_rpm_evidence_v5_local_period`, clearing prior
+signoffs: local-day bucketing can reduce a recorded device-day count, so a standing attestation could
+otherwise cover a period that no longer meets its own threshold.
+
+New suites: `alertInbox.integration.test.ts` (7), `rpmPeriodBoundary.integration.test.ts` (7),
+`rpmPeriod.test.ts` (15 — DST boundaries, half-hour zones, round-trips).
+
 ## Still open
-- **Notification delivery.** Monitoring alerts create NotificationEvent rows that nothing drains; the
-  only drainer is appointment-scoped. An alert notifies nobody. Highest-value remaining item.
-- **Prior-period attestation (F8).** Every call site uses the CURRENT month, so a closed month cannot
-  be reviewed or attested — and billing happens after a period closes.
-- **UTC month boundary (F4/F5).** Non-UTC clinics lose the last evening of the local month, and one
-  local day can bucket as two device-days.
+
 - **Threshold-editing screen.** API + 8 tests shipped; no UI yet.
 - **Consent annual expiry.** CY2020 requires consent at least annually; PatientConsent has no expiry.
