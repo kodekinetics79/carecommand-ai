@@ -50,7 +50,11 @@ describe('CRM and dashboard truthfulness contracts', () => {
     const opportunities = source('src/pages/OpportunityCenter.tsx');
     const dashboard = source('src/pages/Dashboard.tsx');
 
-    expect(crm).toContain('CRM data unavailable');
+    // The failure copy was rewritten from compliance-speak to clinic language;
+    // the invariant is unchanged — a load failure must name itself and forbid
+    // reading the gap as zero or as an empty workspace.
+    expect(crm).toContain('did not load');
+    expect(crm).toContain('not zero, and not empty');
     expect(opportunities).toContain('Zero leaks or revenue cannot be inferred');
 
     // The dashboard's "don't read this as zero" caution used to be one sentence
@@ -78,7 +82,11 @@ describe('CRM and dashboard truthfulness contracts', () => {
 
     expect(crmService).not.toContain('campaignReady');
     expect(crmPage).not.toContain('AI-ranked');
-    expect(crmPage).toContain('unvalidated fixed planning heuristic');
+    // Same invariant, new voice: the ranking must still declare itself a fixed
+    // rule and disclaim outcome validation — it just says so in words a clinic
+    // reads, not a compliance reviewer.
+    expect(crmPage).toContain('not a trained model');
+    expect(crmPage).toContain('not been validated against booking outcomes');
     expect(dashboardService).not.toContain('aiConfidence:');
     expect(priorityRail).not.toContain('AI-ranked');
     expect(priorityRail).not.toContain('confidence');

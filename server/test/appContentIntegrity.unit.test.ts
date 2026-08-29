@@ -9,7 +9,10 @@ describe('general app content integrity', () => {
   it('does not present a local Autopilot toggle as a tenant-wide pause control', () => {
     const page = source('src/pages/Autopilot.tsx');
 
-    expect(page).toContain('A tenant-wide pause control is not available on this page.');
+    // The warning banner became guidance-first copy; the invariant is intact —
+    // the page must state that nothing on it stops an automation tenant-wide.
+    expect(page).toContain('This page has no tenant-wide pause control');
+    expect(page).toContain('nothing here will stop an automation for you');
     expect(page).not.toContain('Pause Autopilot');
     expect(page).not.toContain('Resume Autopilot');
     expect(page).not.toContain('Live Autopilot');
@@ -27,7 +30,9 @@ describe('general app content integrity', () => {
   it('keeps review records distinct from external publication and removes fixed metrics', () => {
     const page = source('src/pages/Reviews.tsx');
 
-    expect(page).toContain('External delivery is not confirmed here.');
+    // Reworded from a disclaimer into an instruction; the claim is the same —
+    // saving a response here never asserts the platform published it.
+    expect(page).toContain('It has not been published to the source platform');
     // The canned-compliment button became a real composer: staff must type the
     // response, so the label changed. What must NOT change is that recording a
     // response never claims the platform published it.

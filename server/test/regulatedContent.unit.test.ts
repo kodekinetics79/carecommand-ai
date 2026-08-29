@@ -81,7 +81,11 @@ describe('regulated product content guardrails', () => {
     // Attributed revenue has no writer yet, so the tile states the absence
     // rather than rendering a confident zero.
     expect(campaigner).toContain('Not recorded yet');
-    expect(campaigner).toContain('no amount — including $0 — can be shown');
+    // The $0-absence sentence moved into the shared attribution summarizer in
+    // crm.ts, which is where every surface now gets it — one source, not one
+    // page. The page keeps the absence tile; the sentence is pinned at its
+    // single home.
+    expect(crm).toContain('no amount — including $0 — can be shown');
 
     // Absent evidence is never an all-clear, for audience or for dispatch.
     expect(campaigner).toContain('Audience evidence is unavailable. Do not infer that no recipients are eligible or suppressed.');
