@@ -16,6 +16,7 @@ import { mapAppointment, mapProviderProfile, mapPatient, type ApiAppointment, ty
 import { ApiError } from '../lib/api';
 import { appointmentsApi, schedulingApi, type LifecycleStatus, type ProviderSlot } from '../lib/appointments';
 import { intakeApi, intakeLink } from '../lib/intake';
+import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { useSession } from '../hooks/useSession';
 import { checkEligibility, fetchAppointmentVerificationQueue, type AppointmentVerificationQueueRow } from '../lib/revenueProtection';
 
@@ -76,7 +77,17 @@ export default function Scheduling() {
   }, [selectedDate, selectedBranch]);
   const { data: appointmentRecords, source, error: appointmentError, reload } = useApiResource<ApiAppointment, ReturnType<typeof mapAppointment>>(appointmentsPath, [], mapAppointment);
   const { data: providerRecords, error: providerError, loading: providersLoading, reload: reloadProviders } = useApiResource<ApiProviderProfile, ReturnType<typeof mapProviderProfile>>('/v1/providers/overview?limit=100', [], mapProviderProfile);
-  const { data: patientRecords, error: patientError } = useApiResource<ApiPatient, ReturnType<typeof mapPatient>>('/v1/patients?limit=100', [], mapPatient);
+  // The booking picker searches on the SERVER. It used to list the first 100
+  // patients ordered by UUID, so in a clinic with more than that the caller on
+  // the phone simply was not in the dropdown and could not be booked at all.
+  const [patientQuery, setPatientQuery] = useState('');
+  const debouncedPatientQuery = useDebouncedValue(patientQuery);
+  const patientsPath = useMemo(() => {
+    const params = new URLSearchParams({ limit: '100' });
+    if (debouncedPatientQuery.trim()) params.set('search', debouncedPatientQuery.trim());
+    return `/v1/patients?${params.toString()}`;
+  }, [debouncedPatientQuery]);
+  const { data: patientRecords, error: patientError } = useApiResource<ApiPatient, ReturnType<typeof mapPatient>>(patientsPath, [], mapPatient);
   const { data: branchRecords, error: branchError } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
 
   const [showBooking, setShowBooking] = useState(false);
@@ -97,7 +108,13 @@ export default function Scheduling() {
 
   // Providers bookable for the chosen patient (same branch — the book route
   // requires the patient to belong to the provider's clinic).
-  const bookingPatient = patientRecords.find(p => p.id === booking.patientId);
+  // Pin the chosen patient. Once a selection is made the search can be retyped
+  // for a different field, and the picked patient may drop out of the current
+  // results — the branch-scoped provider list below must not collapse because
+  // of that.
+  const [pinnedPatient, setPinnedPatient] = useState<ReturnType<typeof mapPatient> | null>(null);
+  const bookingPatient = patientRecords.find(p => p.id === booking.patientId)
+    ?? (pinnedPatient?.id === booking.patientId ? pinnedPatient : undefined);
   const clinicProviders = useMemo(
     () => (bookingPatient ? providerRecords.filter(p => p.branchId === bookingPatient.branchId) : []),
     [providerRecords, bookingPatient],
@@ -161,6 +178,9 @@ export default function Scheduling() {
 
   function closeBooking() {
     setBooking(emptyBooking);
+    // The next booking starts from a clean search, not the last caller's name.
+    setPatientQuery('');
+    setPinnedPatient(null);
     setShowBooking(false);
     setSlots([]);
     setSlotsError(null);
@@ -319,10 +339,23 @@ export default function Scheduling() {
             <p className="text-sm font-bold text-t1 mb-3">Book appointment</p>
             {bookingError && <p role="alert" className="text-[11px] text-red-v mb-2">{bookingError}</p>}
             <div className="space-y-2.5">
-              <select aria-label="Patient" title="Patient" value={booking.patientId} onChange={e => setBooking(b => ({ ...b, patientId: e.target.value, providerId: '', slotStart: '', slotEnd: '' }))} className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
+              <input
+                aria-label="Search patients"
+                value={patientQuery}
+                onChange={e => setPatientQuery(e.target.value)}
+                placeholder="Search patients by name, phone, email or reference"
+                className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]"
+              />
+              <select aria-label="Patient" title="Patient" value={booking.patientId} onChange={e => { const chosen = patientRecords.find(p => p.id === e.target.value) ?? null; setPinnedPatient(chosen); setBooking(b => ({ ...b, patientId: e.target.value, providerId: '', slotStart: '', slotEnd: '' })); }} className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
                 <option value="">Select patient…</option>
+                {pinnedPatient && !patientRecords.some(p => p.id === pinnedPatient.id) && (
+                  <option value={pinnedPatient.id}>{pinnedPatient.name}</option>
+                )}
                 {patientRecords.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
               </select>
+              {debouncedPatientQuery.trim() && patientRecords.length === 0 && (
+                <p className="text-[11px] text-t3">No patient matches that search. Registering a new patient is on the Patients screen.</p>
+              )}
               <input aria-label="Service" value={booking.service} onChange={e => setBooking(b => ({ ...b, service: e.target.value }))} placeholder="Service (e.g. Dermatology Review)" className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
               <div className="grid grid-cols-2 gap-2.5">
                 <select aria-label="Provider" title="Provider" disabled={!booking.patientId} value={booking.providerId} onChange={e => setBooking(b => ({ ...b, providerId: e.target.value, slotStart: '', slotEnd: '' }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-40">
