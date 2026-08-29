@@ -5,7 +5,7 @@ import { audit } from '../../lib/audit';
 import { requireRoles } from '../../plugins/roles';
 import { requireFeature } from '../../lib/entitlements';
 import { assertBranchAccess, branchScope } from '../../lib/scope';
-import { resolveRule, evaluateSeverity, computeRiskScore, SEVERITY_RANK, DEFAULT_THRESHOLDS, weightBaselines } from '../../lib/monitoring';
+import { resolveRule, evaluateSeverity, computeRiskScore, SEVERITY_RANK, DEFAULT_THRESHOLDS, weightBaselines, severityRank, OPEN_ALERT_STATUSES } from '../../lib/monitoring';
 import { aiMorningBriefingService } from '../../lib/ai/services';
 import { invalidateRpmProviderSignoff, lockRpmEvidence, rpmPeriodBounds } from '../../lib/connectedCare/rpmEvidence';
 import { countCurrentReadyRpmPatients } from '../../lib/connectedCare/rpmReadinessService';
@@ -183,12 +183,35 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
 
   // ── Alert queue ────────────────────────────────────────────────────────────
   app.get('/alerts', async request => {
-    const q = z.object({ status: z.enum(['open', 'acknowledged', 'assigned', 'resolved']).optional(), severity: z.enum(['normal', 'warning', 'high', 'critical']).optional() }).parse(request.query);
+    const q = z.object({
+      status: z.enum(['open', 'acknowledged', 'assigned', 'resolved']).optional(),
+      severity: z.enum(['normal', 'warning', 'high', 'critical']).optional(),
+      // Default to outstanding work. The queue previously fetched the 100 most
+      // RECENT alerts of ANY status and sorted by severity only AFTER
+      // truncating, while the client filtered resolved ones out in the browser.
+      // A tenant with 100+ recent resolved alerts therefore rendered "no open
+      // alerts" while genuinely open criticals sat just outside the window — a
+      // false all-clear in a patient-monitoring queue.
+      includeResolved: z.coerce.boolean().default(false),
+      limit: z.coerce.number().min(1).max(200).default(100),
+    }).parse(request.query);
     const tenantId = request.auth.tenantId;
-    const rows = await db.readingAlert.findMany({
-      where: { tenantId, ...branchScope(request), ...(q.status ? { status: q.status } : {}), ...(q.severity ? { severity: q.severity } : {}) },
-      orderBy: { createdAt: 'desc' }, take: 100,
-    });
+    const where = {
+      tenantId,
+      ...branchScope(request),
+      ...(q.status ? { status: q.status } : q.includeResolved ? {} : { status: { in: [...OPEN_ALERT_STATUSES] } }),
+      ...(q.severity ? { severity: q.severity } : {}),
+    };
+    // Acuity ordering is applied by the DATABASE, before the row limit, so the
+    // most severe alerts can never be truncated away by newer trivial ones.
+    const [rows, matching] = await Promise.all([
+      db.readingAlert.findMany({
+        where,
+        orderBy: [{ severityRank: 'desc' }, { createdAt: 'desc' }],
+        take: q.limit,
+      }),
+      db.readingAlert.count({ where }),
+    ]);
     const pNames = await patientNameMap(tenantId, rows.map(r => r.patientId));
     const uNames = await userNameMap(tenantId, rows.map(r => r.assignedToUserId));
     const readingIds = rows.map(r => r.readingId).filter((v): v is string => !!v);
@@ -196,7 +219,7 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
     const rMap = new Map(readings.map(r => [r.id, r]));
     // HIPAA access accounting — alert queue surfaces patient names. Id-only.
     await audit(request, { action: 'monitoring.read', resource: 'monitoring', metadata: { view: 'alerts', count: rows.length } });
-    return rows
+    const items = rows
       .map(a => {
         const reading = a.readingId ? rMap.get(a.readingId) : null;
         return {
@@ -208,6 +231,9 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
         };
       })
       .sort((a, b) => (SEVERITY_RANK[b.severity] ?? 0) - (SEVERITY_RANK[a.severity] ?? 0));
+    // `truncated` lets the UI say "showing 100 of 143" instead of silently
+    // implying the list is the whole queue.
+    return { items, total: matching, limit: q.limit, truncated: matching > items.length };
   });
 
   // ── Alert actions (acknowledge / assign / resolve) ─────────────────────────
@@ -547,7 +573,7 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
       let alertId: string | null = null;
       if (severity !== 'normal') {
         const alert = await tx.readingAlert.create({
-          data: { tenantId, patientId: body.patientId ?? null, deviceId: body.deviceId ?? null, readingId: reading.id, branchId, severity, alertType: 'abnormal_reading', status: 'open', generatedReason: reason, assignedToUserId: rule?.assignedToUserId ?? null },
+          data: { tenantId, patientId: body.patientId ?? null, deviceId: body.deviceId ?? null, readingId: reading.id, branchId, severity, severityRank: severityRank(severity), alertType: 'abnormal_reading', status: 'open', generatedReason: reason, assignedToUserId: rule?.assignedToUserId ?? null },
           select: { id: true },
         });
         alertId = alert.id;

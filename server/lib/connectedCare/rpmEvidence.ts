@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Prisma } from '../../generated/prisma/client';
 
-export const RPM_EVIDENCE_VERSION = 'rpm-readiness-evidence-v3';
+export const RPM_EVIDENCE_VERSION = 'rpm-readiness-evidence-v4';
 export const RPM_SIGNOFF_ATTESTATION_REVISION = 'rpm-provider-attestation-v1';
 
 export interface RpmPeriod {
@@ -96,12 +96,17 @@ export async function buildRpmEvidenceSnapshot(
         sourceProviderKey: true, sourceEnrollmentId: true,
       },
     }),
+    // Filter by patient IN THE QUERY. Without the metadata predicate this loaded
+    // the tenant's entire month of review-evidence audit rows for EVERY patient
+    // and filtered in JS — an N+1 nested inside the per-patient fan-out. The
+    // same predicate is already used by the /review route's overlap scan.
     tx.auditEvent.findMany({
       where: {
         tenantId,
         action: 'connectedcare.rpm.review_evidence_recorded',
         resource: 'rpmReviewSession',
         occurredAt: { gte: period.start, lte: period.asOf },
+        metadata: { path: ['patientId'], equals: patientId },
       },
       orderBy: { id: 'asc' },
       select: { id: true, resourceId: true, occurredAt: true, metadata: true },
@@ -151,6 +156,10 @@ export async function buildRpmEvidenceSnapshot(
     else if (reading.capturedAt < enrollment.enrolledAt || (enrollment.endedAt && reading.capturedAt >= enrollment.endedAt)) exception = 'outside_enrollment_term';
     else if (!enrollment.deviceId || !reading.deviceId || reading.deviceId !== enrollment.deviceId) exception = 'device_link_mismatch';
     else if (!device || (device.branchId && device.branchId !== enrollment.branchId)) exception = 'device_record_mismatch';
+    // `active` was selected into the snapshot but never tested. A deactivated
+    // device kept contributing CMS device-days — the one hole in an otherwise
+    // exhaustive gate.
+    else if (!device.active) exception = 'device_deactivated';
     return { reading, exception, qualifies: exception === null };
   });
   const qualifyingReadings = classifiedReadings.filter(item => item.qualifies).map(item => item.reading);
@@ -182,11 +191,19 @@ export async function buildRpmEvidenceSnapshot(
       provenance: typeof metadata.provenance === 'string' ? metadata.provenance : null,
       startedAt,
       endedAt,
+      elapsedMs,
       reviewMinutes: Math.floor(elapsedMs / 60_000),
       communicationFlag: metadata.communicationFlag === true,
     }];
   });
-  const reviewMinutes = patientReviewEvents.reduce((total, event) => total + event.reviewMinutes, 0);
+  // Sum the elapsed MILLISECONDS and floor once at the end. Flooring each
+  // session first discarded up to 59s per session: twelve 1m59s reviews are
+  // 23.8 real minutes but recorded 12, failing the 20-minute gate on work that
+  // was actually performed. The per-event `reviewMinutes` above stays for
+  // display; only this total drives the requirement.
+  const reviewMinutes = Math.floor(
+    patientReviewEvents.reduce((totalMs, event) => totalMs + event.elapsedMs, 0) / 60_000,
+  );
   const communicationFlag = patientReviewEvents.some(event => event.communicationFlag);
   const evidenceAsOf = new Date(Math.max(
     period.start.getTime(),

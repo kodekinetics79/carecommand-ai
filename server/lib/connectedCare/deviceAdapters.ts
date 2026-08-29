@@ -22,9 +22,20 @@ const CANONICAL_UNITS: Partial<Record<string, ReadonlyArray<string>>> = {
   temperature: ['°C'], heart_rate: ['bpm'],
 };
 
+// How far back a provider may date a reading at ingest. A real device or
+// gateway reports continuously; a generous window still lets one catch up after
+// being offline for a few days. Without a LOWER bound, a single signed webhook
+// could carry readings backdated across 16 distinct calendar days and mint a
+// full CMS device-day requirement instantly — the HMAC secret is held by the
+// tenant, so provenance proves "somebody with this tenant's key asserted this",
+// not "the vendor observed this".
+export const MAX_READING_BACKDATE_HOURS = 7 * 24;
+
 /** Fail closed on impossible or non-canonical provider measurements. */
 export function isPlausibleNormalizedReading(reading: NormalizedReading, now = new Date()): boolean {
-  if (!Number.isFinite(reading.capturedAt.getTime()) || reading.capturedAt.getTime() > now.getTime() + 5 * 60_000) return false;
+  const capturedMs = reading.capturedAt.getTime();
+  if (!Number.isFinite(capturedMs) || capturedMs > now.getTime() + 5 * 60_000) return false;
+  if (capturedMs < now.getTime() - MAX_READING_BACKDATE_HOURS * 36e5) return false;
   if (reading.readingType === 'ecg') return reading.value.trim().length > 0;
   const allowedUnits = CANONICAL_UNITS[reading.readingType];
   if (!allowedUnits || !reading.unit || !allowedUnits.includes(reading.unit)) return false;
