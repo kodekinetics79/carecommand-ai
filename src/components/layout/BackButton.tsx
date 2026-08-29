@@ -11,7 +11,7 @@ const SUBROUTE_PARENTS: Record<string, string> = {
   '/enrollments': '/monitoring',
   '/rpm-readiness': '/monitoring',
   '/receptionist-studio': '/ai-receptionist',
-  '/reactivation': '/crm',
+  '/campaigns': '/crm',
 };
 
 /** Best-effort parent route for a path (used only when history can't be popped). */

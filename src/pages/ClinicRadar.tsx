@@ -303,7 +303,7 @@ export default function ClinicRadar() {
     <div className="space-y-6 pb-8">
       <PageHeader
         title="ClinicRadar"
-        subtitle="Review stored reputation and competitor records as operational signals before deciding what to do next."
+        subtitle="Your reputation cases and nearby competitor records, ranked as signals so you can decide what to act on."
         badge={
           signalTotals.status === 'loading' ? 'Loading signals'
             : signalTotals.status === 'error' ? 'Data unavailable'
@@ -337,17 +337,17 @@ export default function ClinicRadar() {
               <div className="bg-[var(--s2)] rounded-2xl border border-[var(--b1)] p-4">
                 <p className="text-[10px] font-bold uppercase tracking-widest text-t3 mb-2">Signals loaded</p>
                 <p className="text-2xl font-bold text-t1 tabular-nums">{totals.total}</p>
-                <p className="text-xs text-t3 mt-0.5">Current result set · most recent {RADAR_PAGE_SIZE} of each feed</p>
+                <p className="text-xs text-t3 mt-0.5">Most recent {RADAR_PAGE_SIZE} reputation cases and {RADAR_PAGE_SIZE} competitor records</p>
               </div>
               <div className="bg-[var(--red-soft)] rounded-2xl border border-[var(--b1)] p-4">
                 <p className="text-[10px] font-bold uppercase tracking-widest text-red-v mb-2">High Priority</p>
                 <p className="text-2xl font-bold text-red-v tabular-nums">{totals.high}</p>
-                <p className="text-xs text-red-v/70 mt-0.5">Signals needing action now</p>
+                <p className="text-xs text-red-v/70 mt-0.5">At or past your high-severity threshold</p>
               </div>
               <div className="bg-[var(--amber-soft)] rounded-2xl border border-[var(--b1)] p-4">
                 <p className="text-[10px] font-bold uppercase tracking-widest text-amber-v mb-2">Medium Priority</p>
                 <p className="text-2xl font-bold text-amber-v tabular-nums">{totals.medium}</p>
-                <p className="text-xs text-amber-v/70 mt-0.5">Monitor and schedule</p>
+                <p className="text-xs text-amber-v/70 mt-0.5">At or past your medium-severity threshold</p>
               </div>
             </>
           )}
@@ -377,11 +377,14 @@ export default function ClinicRadar() {
           policy has answered: an unstated rule is bad, but a stated rule that
           is not the one being applied is worse. */}
       {receivedPolicy && (
-        <p className="text-[11px] text-t3">
-          Reputation cases count as high at a recorded risk ≥ {receivedPolicy.reputationRiskHigh} and medium at ≥ {receivedPolicy.reputationRiskMedium}.
-          {' '}Competitors count as high at a rating ≤ {formatRatingThreshold(receivedPolicy.competitorRatingHighSeverityMax)} or more than {receivedPolicy.competitorReviewVolumeHigh} reviews, and medium at a rating ≤ {formatRatingThreshold(receivedPolicy.competitorRatingMediumSeverityMax)}.
-          {' '}{growthPolicyProvenance(receivedPolicy)}
-        </p>
+        <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-3">
+          <p className="mb-1 text-[10px] font-bold uppercase tracking-widest text-t3">How these are classified</p>
+          <p className="text-[13px] leading-relaxed text-t2">
+            Reputation cases count as high at a recorded risk ≥ {receivedPolicy.reputationRiskHigh} and medium at ≥ {receivedPolicy.reputationRiskMedium}.
+            {' '}Competitors count as high at a rating ≤ {formatRatingThreshold(receivedPolicy.competitorRatingHighSeverityMax)} or more than {receivedPolicy.competitorReviewVolumeHigh} reviews, and medium at a rating ≤ {formatRatingThreshold(receivedPolicy.competitorRatingMediumSeverityMax)}.
+            {' '}{growthPolicyProvenance(receivedPolicy)}
+          </p>
+        </div>
       )}
 
       <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-3">
@@ -395,7 +398,7 @@ export default function ClinicRadar() {
           <option value="all">All clinics</option>
           {branchOptions.map(branch => <option key={branch.id} value={branch.id}>{branch.name}</option>)}
         </select>
-        <p className="text-xs text-t3">Showing signals for {selectedBranchName}.</p>
+        <p className="text-xs text-t2">Showing signals for {selectedBranchName}.</p>
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_340px]">
@@ -430,8 +433,8 @@ export default function ClinicRadar() {
             </div>
 
             {anyFeedFailed && reputation.state.status !== competitors.state.status && (
-              <p role="status" className="mb-3 rounded-xl border border-[var(--b1)] bg-[var(--amber-soft)] px-3 py-2 text-[11px] text-amber-v">
-                {reputation.state.status === 'error' ? 'Reputation cases' : 'Competitor records'} did not load, so this board shows only the {reputation.state.status === 'error' ? 'competitor' : 'reputation'} signals. It is not a complete picture.
+              <p role="status" className="mb-3 rounded-xl border border-[var(--b1)] bg-[var(--amber-soft)] px-3 py-2 text-[12px] leading-relaxed text-amber-v">
+                {reputation.state.status === 'error' ? 'Reputation cases' : 'Competitor records'} did not load, so this board is showing only the {reputation.state.status === 'error' ? 'competitor' : 'reputation'} signals. It is not the full picture — refresh signals to fill it in.
               </p>
             )}
 
@@ -452,14 +455,14 @@ export default function ClinicRadar() {
                     <EmptyStatePremium
                       icon={<Filter className="w-5 h-5" />}
                       title="No signals match these filters"
-                      description={`${signals.length} signal${signals.length === 1 ? ' is' : 's are'} loaded, and none of them match the current clinic, category and severity selection.`}
+                      description={`${signals.length} signal${signals.length === 1 ? ' is' : 's are'} loaded, and none match the current clinic, category and severity selection. Clear the filters to see all of them.`}
                       cta={{ label: 'Clear filters', onClick: () => { setActiveCategory('all'); setActiveTab('all'); setSelectedBranchId('all'); } }}
                     />
                   ) : (
                     <EmptyStatePremium
                       icon={<Radar className="w-5 h-5" />}
                       title="No signals recorded"
-                      description="Both feeds loaded successfully and this workspace has no reputation cases or competitor records to raise. Nothing here needs action right now."
+                      description="Both feeds loaded and this workspace has no reputation cases or competitor records on file. Nothing needs action right now — new cases and competitor records appear here as they are recorded."
                       cta={{ label: 'Refresh signals', onClick: reloadSignals }}
                     />
                   );
@@ -490,7 +493,7 @@ export default function ClinicRadar() {
                                 )}
                               </div>
 
-                              <p className="text-xs text-t3 leading-relaxed mb-3">{alert.description}</p>
+                              <p className="text-[13px] text-t2 leading-relaxed mb-3">{alert.description}</p>
 
                               <div className="flex items-center justify-end gap-3">
                                 <div className="flex items-center gap-2">
@@ -505,8 +508,8 @@ export default function ClinicRadar() {
                               </div>
 
                               <div className="mt-3 p-2.5 rounded-xl bg-[var(--s3)] border border-[var(--b1)]">
-                                <p className="text-[11px] font-semibold text-t2">
-                                  <span className="text-t3 mr-1">Recommended:</span>
+                                <p className="text-[12px] font-semibold leading-relaxed text-t2">
+                                  <span className="text-t3 mr-1">Suggested next step:</span>
                                   {alert.action}
                                 </p>
                               </div>
@@ -524,7 +527,7 @@ export default function ClinicRadar() {
 
         {/* Right sidebar */}
         <div className="space-y-4">
-          <BentoCard title="Nearby Competitors" subtitle="Local openings, ratings, and complaint themes">
+          <BentoCard title="Nearby Competitors" subtitle="Ratings, offers, and complaint themes on file">
             <ResourceSection
               label="Competitor records"
               state={competitors.state}
@@ -534,7 +537,7 @@ export default function ClinicRadar() {
               empty={{
                 icon: <Store className="w-5 h-5" />,
                 title: 'No competitor records',
-                description: 'The competitor radar loaded successfully and this workspace has no competitor records on file.',
+                description: 'The competitor radar loaded and this workspace has no competitor records on file yet.',
               }}
             >
               {rows => {
@@ -544,7 +547,7 @@ export default function ClinicRadar() {
                     <EmptyStatePremium
                       icon={<Filter className="w-5 h-5" />}
                       title="No competitors for this clinic"
-                      description={`${rows.length} competitor record${rows.length === 1 ? ' is' : 's are'} loaded, and none of them are recorded against ${selectedBranchName}.`}
+                      description={`${rows.length} competitor record${rows.length === 1 ? ' is' : 's are'} loaded, and none are recorded against ${selectedBranchName}. Switch back to all clinics to see them.`}
                       cta={{ label: 'Show all clinics', onClick: () => setSelectedBranchId('all') }}
                     />
                   );
@@ -589,7 +592,7 @@ export default function ClinicRadar() {
             </ResourceSection>
           </BentoCard>
 
-          <BentoCard title="Signals by branch" subtitle="Count of loaded records that need review" headerRight={<BarChart3 className="w-4 h-4 text-t3" />}>
+          <BentoCard title="Signals by branch" subtitle="Loaded signals, by clinic" headerRight={<BarChart3 className="w-4 h-4 text-t3" />}>
             <ResourceSection
               label="Signals by branch"
               state={combineResourceStates(branches.state, signalTotals, (branchRows) => branchRows)}
@@ -598,7 +601,7 @@ export default function ClinicRadar() {
               rowClassName="h-12 rounded-xl"
               empty={{
                 title: 'No clinics recorded',
-                description: 'The clinic list loaded successfully and this workspace has no clinic records.',
+                description: 'The clinic list loaded and this workspace has no clinic records to group signals by.',
               }}
             >
               {rows => (
@@ -611,7 +614,7 @@ export default function ClinicRadar() {
                           <p className="text-xs font-semibold text-t2 truncate">{branch.name}</p>
                           <span className={`badge ${signalCount > 0 ? 'badge-amber' : 'badge-blue'}`}>{signalCount} signal{signalCount === 1 ? '' : 's'}</span>
                         </div>
-                        <p className="text-[11px] text-t3">{signalCount > 0 ? 'Review source records before taking action.' : 'No current signals in this result set.'}</p>
+                        <p className="text-[12px] text-t2">{signalCount > 0 ? 'Open the source record before you act on it.' : 'No signals for this clinic in the loaded set.'}</p>
                       </div>
                     );
                   })}
@@ -631,7 +634,7 @@ export default function ClinicRadar() {
               empty={{
                 icon: <Radar className="w-5 h-5" />,
                 title: 'No detections recorded',
-                description: 'Both feeds loaded successfully and neither has a record to place on the timeline.',
+                description: 'Both feeds loaded and neither has a record to place on the timeline yet.',
               }}
             >
               {rows => {
@@ -660,7 +663,7 @@ export default function ClinicRadar() {
                       </div>
                     ))}
                     {rows.length > visible.length && (
-                      <p className="text-[10px] text-t3">
+                      <p className="text-[11px] leading-snug text-t2">
                         Most recent {visible.length} of {rows.length} loaded detections.
                       </p>
                     )}
@@ -674,14 +677,14 @@ export default function ClinicRadar() {
           <BentoCard title="Before you act" subtitle="Checks for staff reviewing a signal">
             <div className="space-y-2.5">
               {[
-                'Open the source record and confirm it is current.',
-                'Confirm authority, consent, and suppression status in the destination workflow.',
+                'Open the source record and confirm it is still current.',
+                'Confirm authority, consent, and suppression status in the destination workflow before contacting anyone.',
                 'Treat estimated or suggested language as guidance, not a verified outcome.',
-                'Use the Control Plane to review available audit and integration evidence.',
+                'Use the Control Plane to review the available audit and integration evidence.',
               ].map((text, i) => (
                 <div key={i} className="flex items-center gap-2.5">
                   <AlertCircle className="w-3.5 h-3.5 text-amber-v shrink-0" />
-                  <p className="text-xs text-t2">{text}</p>
+                  <p className="text-[13px] leading-relaxed text-t2">{text}</p>
                 </div>
               ))}
             </div>

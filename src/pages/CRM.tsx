@@ -31,7 +31,7 @@ const TABS: Array<{ key: TabKey; label: string }> = [
   { key: 'automation', label: 'Automation Rules' },
 ];
 
-const LOAD_ERROR = 'CRM data is unavailable. No empty-pipeline, consent, or value conclusions can be drawn until the service responds.';
+const LOAD_ERROR = 'Your CRM data did not load. The pipeline, consent and value figures on this page are unknown right now — not zero, and not empty.';
 
 export default function CRM() {
   const navigate = useNavigate();
@@ -160,9 +160,10 @@ export default function CRM() {
       </div>
 
       {loadError ? (
-        <BentoCard title="CRM data unavailable" subtitle="The service did not return a complete CRM dataset">
+        <BentoCard title="CRM data didn&rsquo;t load">
           <div role="alert" className="rounded-xl border border-red-soft bg-red-soft p-4">
             <p className="text-sm font-semibold text-red-v">{loadError}</p>
+            <p className="mt-1.5 text-[13px] leading-relaxed text-red-v">This is a loading failure, not a quiet workspace. Retry to see the real numbers.</p>
             <button type="button" onClick={() => void reload()} className="mt-3 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-xs font-semibold text-t1 hover:bg-[var(--s2)]">Retry</button>
           </div>
         </BentoCard>
@@ -171,11 +172,31 @@ export default function CRM() {
           <div className="space-y-4">
             <CRMMetricsStrip m={metrics} onNavigate={navigate} />
             <BentoCard
-              title="Rule-based planning suggestions"
-              subtitle={`Leads ordered by an unvalidated fixed planning heuristic across all ${metrics.basis.openLeadCount.toLocaleString()} open leads`}
-              headerRight={<span className="inline-flex items-center gap-1 text-[11px] font-bold text-amber-v"><Sparkles className="w-3.5 h-3.5" /> Not an AI prediction</span>}>
+              title="Where to spend your time first"
+              headerRight={<span className="inline-flex items-center gap-1 text-[11px] font-bold text-amber-v"><Sparkles className="w-3.5 h-3.5" /> Rules, not AI</span>}>
+              <div className="mb-3 space-y-1">
+                <p className="text-[13px] leading-relaxed text-t2">
+                  Your highest-priority open leads, ranked by pipeline stage, estimated value, how recent the inquiry is,
+                  and whether the recorded channel is reachable. Ranked across all {metrics.basis.openLeadCount.toLocaleString()} open leads in this workspace, not just the ones loaded below.
+                </p>
+                <p className="text-[12px] leading-relaxed text-t3">
+                  These are fixed scoring rules, not a trained model, and the ranking has not been validated against booking outcomes.
+                </p>
+              </div>
               {hotLeads.length === 0
-                ? <EmptyStatePremium icon={<Flame className="w-5 h-5" />} title="No priority leads in this workspace" description={`No open lead scores ${metrics.policy.hotLeadScore} or above on the rule-based planning heuristic. Every lead was checked, not just a loaded page. This is not an AI prediction.`} />
+                ? metrics.basis.openLeadCount === 0
+                  ? <EmptyStatePremium
+                      icon={<Flame className="w-5 h-5" />}
+                      title="No open leads yet"
+                      description="There is nothing in the pipeline to rank. New inquiries appear here as soon as a lead source — your receptionist, a web form, or an import — starts sending them to CareCommand."
+                      cta={{ label: 'Review lead sources', onClick: () => navigate('/integrations') }}
+                    />
+                  : <EmptyStatePremium
+                      icon={<Flame className="w-5 h-5" />}
+                      title="None of your open leads can be ranked yet"
+                      description={`Ranking starts from the pipeline stage, and every open lead in this workspace carries a stage these rules do not cover — so no priority order can be derived from them. Correct the recorded stage and the lead is ranked here. All ${metrics.basis.openLeadCount.toLocaleString()} open leads were checked, not just a loaded page.`}
+                      cta={{ label: 'Open the pipeline', onClick: () => setTab('pipeline') }}
+                    />
                 : <div className="space-y-2">{hotLeads.map(l => (
                   <div key={l.id} className="hover-lift flex items-center gap-3 rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3">
                     <span className="grid place-items-center w-9 h-9 rounded-lg bg-emerald-soft text-emerald-v text-[12px] font-bold shrink-0">{l.score ?? '—'}</span>
@@ -207,9 +228,8 @@ export default function CRM() {
                   placeholder="Search patients…" className="w-full bg-transparent text-xs text-t1 outline-none placeholder:text-t3" />
               </div>
             }>
-            <p className="text-[11px] text-t3 mb-2">
-              Search runs against every patient record in this workspace, not the rows below.
-              {' '}This workspace has {metrics.basis.patientCount.toLocaleString()} patients.
+            <p className="text-[12px] text-t2 mb-2">
+              Search covers all {metrics.basis.patientCount.toLocaleString()} patients in this workspace, not just the rows below.
             </p>
             {patientsTruncated && (
               <p role="status" className="mb-2 inline-flex items-start gap-1.5 rounded-lg border border-amber-soft bg-amber-soft px-3 py-2 text-[11px] font-semibold text-amber-v">
@@ -218,7 +238,9 @@ export default function CRM() {
               </p>
             )}
             {patientsLoading ? <div className="space-y-2" aria-label="Loading patients">{Array.from({ length: 5 }).map((_, i) => <div key={i} className="skeleton-line h-12 rounded-lg" />)}</div>
-              : patientsSorted.length === 0 ? <EmptyStatePremium icon={<Users className="w-5 h-5" />} title="No patients found" description={patientSearch ? `No patient in this workspace matches “${patientSearch}”.` : 'Patient records will appear here.'} />
+              : patientsSorted.length === 0 ? (patientSearch
+                ? <EmptyStatePremium icon={<Users className="w-5 h-5" />} title="No patients found" description={`No patient in this workspace matches “${patientSearch}”. Try a shorter search, or part of a phone number or email.`} />
+                : <EmptyStatePremium icon={<Users className="w-5 h-5" />} title="No patient records yet" description="The patient list loaded and this workspace has no patient records. They appear here as patients are created from a booking, an intake form, or an import." />)
               : <div className="overflow-x-auto rounded-xl border border-[var(--b1)]">
                 <table className="w-full border-collapse text-left">
                   <thead>
@@ -256,12 +278,14 @@ export default function CRM() {
 
         {tab === 'segments' && (
           <div>
-            <p className="text-[12px] text-t3 mb-3">
-              Rule-based candidate groups counted across every patient in this workspace. Membership is not contact eligibility;
-              consent and suppression are verified during campaign preview and dispatch.
+            <p className="text-[13px] leading-relaxed text-t2 mb-3">
+              Groups of patients who match a rule you can act on, counted across every patient in this workspace.
+              Being in a group is not permission to contact: consent and suppression are verified again at campaign preview and again at dispatch.
             </p>
             {activeSegments.length === 0
-              ? <EmptyStatePremium icon={<Layers3 className="w-5 h-5" />} title="No candidate groups in this workspace" description="No patient in this workspace matches any configured candidate group. Groups appear as patients become inactive or at risk." />
+              ? segments.segments.length === 0
+                ? <EmptyStatePremium icon={<Layers3 className="w-5 h-5" />} title="No patient groups configured" description="The segment list loaded and this workspace has no candidate groups set up, so there is nothing to count patients against yet." />
+                : <EmptyStatePremium icon={<Layers3 className="w-5 h-5" />} title="No patient matches a group yet" description={`All ${segments.segments.length} configured group${segments.segments.length === 1 ? '' : 's'} came back with no matching patient in this workspace. A group fills up as patients pass its inactivity window or their recorded churn risk rises.`} />
               : <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{activeSegments.map(s => <SmartSegmentCard key={s.key} segment={s} recoverablePercent={segments.policy.recoverableLtvPercent} onCreateCampaign={() => navigate('/campaigner')} />)}</div>}
           </div>
         )}
@@ -279,13 +303,13 @@ export default function CRM() {
 
       {/* Modals */}
       {reasonModal && (
-        <ConfirmationModal title="Mark lead as lost?" message={`Record why "${reasonModal.name}" was lost. This is captured for lost-reason intelligence.`} confirmLabel="Mark lost" tone="red" requireReason
+        <ConfirmationModal title="Mark lead as lost?" message={`Record why ${reasonModal.name} was lost. The reason is stored on the lead and rolled up so you can see why deals are being lost.`} confirmLabel="Mark lost" tone="red" requireReason
           onClose={() => setReasonModal(null)}
           onConfirm={async (reason) => { await crmService.setStage(reasonModal.id, 'lost', reason); await reload(); }}
         />
       )}
       {commsModal && (
-        <ConfirmationModal title={CTA_LABEL[commsModal.cta] ?? 'Send communication'} message={`Request ${CTA_LABEL[commsModal.cta]?.toLowerCase() ?? 'a message'} to ${commsModal.lead.name}. Stored badges are not authorization; the server verifies current consent and suppression evidence at dispatch and blocks ineligible contact.`} confirmLabel="Verify & request send" tone="indigo"
+        <ConfirmationModal title={CTA_LABEL[commsModal.cta] ?? 'Send communication'} message={`Send ${CTA_LABEL[commsModal.cta]?.toLowerCase() ?? 'a message'} to ${commsModal.lead.name}? The consent badges on this record are stored history, not authorization. Before anything leaves, the server re-checks current consent and suppression evidence and blocks the send if this person is not eligible to be contacted.`} confirmLabel="Verify & request send" tone="indigo"
           onClose={() => setCommsModal(null)}
           onConfirm={async () => { await crmService.sendComms(commsModal.lead.id, commsModal.cta); }}
         />

@@ -44,16 +44,16 @@ export default function SmartSegmentCard({
           muted={s.plannedCostMinor === null}
         />
       </div>
-      {s.costUnavailableReason && <p className="text-[10px] text-t3 mt-1">{s.costUnavailableReason}</p>}
+      {s.costUnavailableReason && <p className="text-[11px] text-t2 mt-1">{s.costUnavailableReason}</p>}
 
       <div className="mt-3 rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2">
-        <p className="text-[10px] uppercase tracking-wide text-t3">Planning idea</p>
+        <p className="text-[10px] uppercase tracking-wide text-t3">Suggested offer</p>
         <p className="text-[12px] font-semibold text-t1">{s.planningOffer}</p>
-        <p className="text-[10px] text-amber-v mt-1">{s.assumptionNotice}</p>
+        <p className="text-[11px] leading-snug text-amber-v mt-1">{s.assumptionNotice}</p>
       </div>
 
       {excluded && (
-        <p className="mt-2 inline-flex items-start gap-1.5 text-[10px] text-t3">
+        <p className="mt-2 inline-flex items-start gap-1.5 text-[11px] text-t2">
           <EyeOff className="w-3 h-3 mt-px shrink-0" aria-hidden="true" />
           Excludes {s.neverVisitedCandidates} patient{s.neverVisitedCandidates === 1 ? '' : 's'} with no recorded last visit.
           Turn on “include never visited” for this group to count them.
@@ -61,7 +61,7 @@ export default function SmartSegmentCard({
       )}
 
       <div className="flex items-center justify-between gap-2 mt-3">
-        <span className="text-[10px] font-semibold text-amber-v">Contact, suppression, and purpose-specific authority are checked in the governed campaign workflow</span>
+        <span className="text-[11px] font-semibold leading-snug text-amber-v">Consent, suppression, and purpose-specific authority are all checked in the governed campaign workflow before anything is sent.</span>
         <button type="button" onClick={() => onCreateCampaign(s)}
           className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 transition">
           <Megaphone className="w-3.5 h-3.5" aria-hidden="true" /> Create campaign

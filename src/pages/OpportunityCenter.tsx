@@ -10,6 +10,7 @@ import OpportunityActionDrawer from '../components/opportunity/OpportunityAction
 import EmptyStatePremium from '../components/ui/EmptyStatePremium';
 import { formatCurrency } from '../utils/formatters';
 import { opportunityService, type RevenueLeak, type Opportunity } from '../lib/opportunityService';
+import type { CampaignHandoff } from '../lib/crm';
 
 export default function OpportunityCenter() {
   const navigate = useNavigate();
@@ -104,7 +105,7 @@ export default function OpportunityCenter() {
               loading={loading}
               selectedId={drawer?.id ?? null}
               onOpen={setDrawer}
-              onCreate={() => navigate('/campaigner')}
+              onCreate={() => navigate('/campaigns', { state: { source: 'Opportunity Center' } satisfies CampaignHandoff })}
             />
           </BentoCard>
         </div>
@@ -115,7 +116,7 @@ export default function OpportunityCenter() {
           opportunity={drawer}
           onClose={() => setDrawer(null)}
           onChanged={onChanged}
-          onNavigate={(r) => { setDrawer(null); navigate(r); }}
+          onNavigate={(r, handoff) => { setDrawer(null); navigate(r, handoff ? { state: handoff } : undefined); }}
         />
       )}
     </div>

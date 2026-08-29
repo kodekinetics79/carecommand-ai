@@ -29,7 +29,7 @@ export default function CRMMetricsStrip({ m, onNavigate }: { m: CommandMetrics; 
 
   return (
     <div className="space-y-2.5">
-      <p className="text-[11px] text-t3">
+      <p className="text-[12px] text-t2">
         {scoped
           ? `Patient figures cover every patient in your assigned branch. ${scope.note}`
           : `Every figure covers all ${basis.patientCount.toLocaleString()} patients and ${basis.leadCount.toLocaleString()} leads in this workspace — not a sample.`}
@@ -37,24 +37,24 @@ export default function CRMMetricsStrip({ m, onNavigate }: { m: CommandMetrics; 
       </p>
 
       <div className="grid gap-3 grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-        {card('openPipeline', { primary: true, label: 'Open pipeline', format: formatCurrency, subtitle: `${basis.openLeadCount.toLocaleString()} active deals`, icon: <Layers className="w-4 h-4" />, accent: 'emerald' })}
-        {card('hotLeads', { label: 'Priority leads', subtitle: `Rule-based score ≥ ${policy.hotLeadScore}`, icon: <Flame className="w-4 h-4" />, accent: 'red' })}
+        {card('openPipeline', { primary: true, label: 'Open pipeline', format: formatCurrency, subtitle: `Across ${basis.openLeadCount.toLocaleString()} open leads`, icon: <Layers className="w-4 h-4" />, accent: 'emerald' })}
+        {card('hotLeads', { label: 'Priority leads', subtitle: `Rule score ${policy.hotLeadScore} or higher`, icon: <Flame className="w-4 h-4" />, accent: 'red' })}
         {card('winRate', { label: 'Win rate', format: percent, subtitle: `Retained vs lost across ${basis.closedLeadCount.toLocaleString()} closed leads`, icon: <Trophy className="w-4 h-4" />, accent: 'violet' })}
-        {card('avgDeal', { label: 'Avg deal size', format: formatCurrency, subtitle: 'Per open lead, all leads', icon: <Target className="w-4 h-4" />, accent: 'blue' })}
+        {card('avgDeal', { label: 'Avg deal size', format: formatCurrency, subtitle: `Open pipeline ÷ ${basis.openLeadCount.toLocaleString()} open leads`, icon: <Target className="w-4 h-4" />, accent: 'blue' })}
         {card('avgChurnRisk', { label: 'Avg churn risk', format: percent, subtitle: `Across all ${basis.patientCount.toLocaleString()} patients`, icon: <TrendingDown className="w-4 h-4" />, accent: 'amber' })}
         {card('avgLtv', { label: 'Avg LTV per patient', format: formatCurrency, subtitle: `Across all ${basis.patientCount.toLocaleString()} patients`, icon: <Users className="w-4 h-4" />, accent: 'cyan', onClick: () => onNavigate('/patients') })}
-        {card('missedCallValue', { label: 'Missed-call value', format: formatCurrency, subtitle: 'Uncontacted callers', icon: <PhoneMissed className="w-4 h-4" />, accent: 'red', onClick: () => onNavigate('/ai-receptionist') })}
+        {card('missedCallValue', { label: 'Missed-call value', format: formatCurrency, subtitle: 'Recorded value of callers not yet contacted', icon: <PhoneMissed className="w-4 h-4" />, accent: 'red', onClick: () => onNavigate('/ai-receptionist') })}
         {card('inactiveRecoverable', {
           label: 'Inactive planning value', format: formatCurrency,
-          subtitle: `Unvalidated ${policy.recoverableLtvPercent}% LTV assumption over ${basis.inactivePatientCount.toLocaleString()} patients`,
+          subtitle: `Planning assumption: ${policy.recoverableLtvPercent}% of lifetime value across ${basis.inactivePatientCount.toLocaleString()} inactive patients`,
           icon: <RotateCcw className="w-4 h-4" />, accent: 'indigo',
         })}
-        {metrics.campaignRoi != null && <PremiumMetricCard label="Campaign ROI" value={metrics.campaignRoi} format={n => `${Math.round(n)}×`} subtitle="Blended" icon={<Megaphone className="w-4 h-4" />} accent="violet" onClick={() => onNavigate('/campaigner')} />}
+        {metrics.campaignRoi != null && <PremiumMetricCard label="Campaign ROI" value={metrics.campaignRoi} format={n => `${Math.round(n)}×`} subtitle="Blended across recorded campaigns" icon={<Megaphone className="w-4 h-4" />} accent="violet" onClick={() => onNavigate('/campaigner')} />}
       </div>
 
       {scoped && (
-        <p className="inline-flex items-center gap-1.5 text-[11px] text-t3">
-          <Building2 className="w-3 h-3" aria-hidden="true" /> Lead figures are tenant-wide: a lead record carries no branch.
+        <p className="inline-flex items-center gap-1.5 text-[12px] text-t2">
+          <Building2 className="w-3.5 h-3.5" aria-hidden="true" /> Lead figures cover the whole workspace: a lead record carries no branch.
         </p>
       )}
     </div>

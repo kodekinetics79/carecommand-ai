@@ -32,7 +32,7 @@ export default function LeadScoreExplanationDrawer({ lead, onClose }: { lead: Cr
         <div className="p-5 space-y-4">
           <div className="text-center rounded-2xl border border-[var(--b1)] bg-[var(--s1)] p-4">
             <p className={`text-3xl font-bold tabular-nums ${tone}`}>{lead.score ?? '—'}</p>
-            <p className="text-[11px] text-t3">Unvalidated rule-based planning priority · not an AI prediction</p>
+            <p className="text-[11px] text-t2">Rule-based priority · not AI, and not validated against outcomes</p>
             <p className="text-[12px] font-semibold text-t1 mt-1">{lead.name}</p>
           </div>
 
@@ -43,16 +43,16 @@ export default function LeadScoreExplanationDrawer({ lead, onClose }: { lead: Cr
           )}
 
           <Section title="Positive drivers" icon={<TrendingUp className="w-3.5 h-3.5 text-emerald-v" />}>
-            {positives.length ? positives.map((d, i) => <DriverRow key={i} label={d.label} weight={d.weight} positive />) : <p className="text-[11px] text-t3">No strong positives yet.</p>}
+            {positives.length ? positives.map((d, i) => <DriverRow key={i} label={d.label} weight={d.weight} positive />) : <p className="text-[12px] text-t2">Nothing in this lead is pushing the score up yet.</p>}
           </Section>
           <Section title="Negative drivers" icon={<TrendingDown className="w-3.5 h-3.5 text-red-v" />}>
-            {negatives.length ? negatives.map((d, i) => <DriverRow key={i} label={d.label} weight={d.weight} positive={false} />) : <p className="text-[11px] text-t3">No major risks detected.</p>}
+            {negatives.length ? negatives.map((d, i) => <DriverRow key={i} label={d.label} weight={d.weight} positive={false} />) : <p className="text-[12px] text-t2">Nothing in this lead is pulling the score down.</p>}
           </Section>
 
           <div className="rounded-xl border border-[var(--indigo-mid)] bg-[var(--indigo-soft)] p-3">
-            <p className="text-[10px] font-bold uppercase tracking-wide text-indigo mb-1">Rule-based planning suggestion</p>
+            <p className="text-[10px] font-bold uppercase tracking-wide text-indigo mb-1">Suggested next step · rule-based</p>
             <p className="text-[13px] font-semibold text-t1">
-              {lead.nextBestAction?.label ?? 'None — this lead\u2019s recorded stage is not one the heuristic covers.'}
+              {lead.nextBestAction?.label ?? 'No suggestion: this lead\u2019s recorded stage is not one the ranking rules cover.'}
             </p>
           </div>
 

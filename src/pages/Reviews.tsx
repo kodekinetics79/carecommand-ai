@@ -70,6 +70,15 @@ const REVIEW_PAGE_SIZE = 100;
  */
 const TOP_PROVIDER_LIST_SIZE = 5;
 
+/**
+ * How many reputation cases and review requests `/v1/reputation` is asked for.
+ *
+ * Also a page size. It matters in the copy because `summary.pendingReviewRequests`
+ * is counted over the rows the request returned, NOT over every request in the
+ * workspace — so the tile that prints it has to say which set it counted.
+ */
+const REPUTATION_PAGE_SIZE = 10;
+
 // Module-scope loaders: useResource keys a request by the identity of its
 // source, so these must not be re-created on every render.
 const loadReviews = async (signal: AbortSignal): Promise<ReviewRow[]> =>
@@ -77,6 +86,7 @@ const loadReviews = async (signal: AbortSignal): Promise<ReviewRow[]> =>
 const loadBranches = (signal: AbortSignal) => fetchList<BranchOption>('/v1/branches?limit=100', signal);
 const loadProviders = async (signal: AbortSignal) =>
   (await fetchList<ApiProviderProfile>('/v1/providers/overview?limit=100', signal)).map(mapProviderProfile);
+const REPUTATION_PATH = `/v1/reputation?limit=${REPUTATION_PAGE_SIZE}`;
 
 /**
  * Two feeds, one claim.
@@ -126,7 +136,7 @@ export default function Reviews() {
   const reviews = useResource<ReviewRow[]>(loadReviews);
   const branches = useResource<BranchOption[]>(loadBranches);
   const providers = useResource<ReturnType<typeof mapProviderProfile>[]>(loadProviders);
-  const reputation = useResource<ReputationResponse>('/v1/reputation?limit=10');
+  const reputation = useResource<ReputationResponse>(REPUTATION_PATH);
   // The clinic's own rating bands. A feed like any other: until it answers,
   // there is no band to draw, and if it fails, the panel that bands says so.
   const policy = useResource<GrowthPolicy>(loadGrowthPolicy);
@@ -162,7 +172,7 @@ export default function Reviews() {
         return next;
       });
       reviews.reload();
-      setResponseNotice({ kind: 'ok', text: 'Response recorded in CareCommand. External delivery is not confirmed here.' });
+      setResponseNotice({ kind: 'ok', text: 'Saved against this review in CareCommand. It has not been published to the source platform — publish it there if you want the public to see it.' });
     } catch (error) {
       setResponseNotice({ kind: 'error', text: error instanceof Error ? error.message : 'Unable to record response' });
     } finally {
@@ -174,7 +184,7 @@ export default function Reviews() {
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Reviews & Referrals"
-        subtitle="Review feedback, record responses, and open campaign setup for reputation and referral work."
+        subtitle="Read what patients said, record your reply, and set up review and referral campaigns."
         // "N need review" is a safety claim about open cases, so it waits for
         // the reputation response instead of counting an unanswered request.
         badge={
@@ -265,8 +275,8 @@ export default function Reviews() {
         >
           {data => (
             <>
-              <StatCard title="Review-risk score" value={`${data.summary.avgBadReviewRisk}%`} subtitle="Stored reputation cases · planning metric" icon={<ShieldCheck className="w-4 h-4" />} accent="red" />
-              <StatCard title="Pending requests" value={data.summary.pendingReviewRequests} subtitle="Recorded request status" icon={<BellRing className="w-4 h-4" />} accent="violet" />
+              <StatCard title="Review-risk score" value={`${data.summary.avgBadReviewRisk}%`} subtitle="Average recorded risk across your reputation cases · a planning figure" icon={<ShieldCheck className="w-4 h-4" />} accent="red" />
+              <StatCard title="Pending requests" value={data.summary.pendingReviewRequests} subtitle={`Not yet sent or delivered, of the ${REPUTATION_PAGE_SIZE} most recent`} icon={<BellRing className="w-4 h-4" />} accent="violet" />
             </>
           )}
         </ResourceSection>
@@ -274,7 +284,10 @@ export default function Reviews() {
 
       <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
         <div className="space-y-4">
-          <BentoCard title="Review feed" subtitle={`Most recent ${REVIEW_PAGE_SIZE} stored reviews`}>
+          <BentoCard title="Review feed">
+            <p className="mb-3 text-[13px] leading-relaxed text-t2">
+              The {REVIEW_PAGE_SIZE} most recent reviews stored in this workspace. Every figure on this page is counted over this set.
+            </p>
             <ResourceSection
               label="Review feed"
               state={reviews.state}
@@ -284,7 +297,7 @@ export default function Reviews() {
               empty={{
                 icon: <Inbox className="w-5 h-5" />,
                 title: 'No reviews recorded yet',
-                description: 'The review feed loaded successfully and this workspace has no stored reviews. Set up a governed request campaign to start collecting them.',
+                description: 'The review feed loaded and this workspace has no stored reviews yet. A governed request campaign is how you start asking patients for them.',
                 cta: { label: 'Review campaign setup', onClick: () => navigate('/campaigner') },
               }}
             >
@@ -307,7 +320,7 @@ export default function Reviews() {
                             {/* The reviews endpoint returns no author, so the
                                 row says so rather than showing a placeholder
                                 styled like a real name. */}
-                            <p className="text-xs font-semibold text-t3">Reviewer not identified in the review record</p>
+                            <p className="text-xs font-semibold text-t3">No reviewer name on this record</p>
                             <div className="flex items-center gap-1">
                               {rating == null
                                 ? <span className="text-[10px] font-semibold text-t3">Rating not recorded</span>
@@ -350,10 +363,10 @@ export default function Reviews() {
                             placeholder="Write the reply this clinic should stand behind for this review."
                             className="w-full resize-y rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs leading-relaxed text-t1 outline-none focus:border-[var(--b2)]"
                           />
-                          <p className="text-[10px] text-t3">
+                          <p className="text-[11px] leading-snug text-t2">
                             {prefilled
-                              ? 'Prefilled from the draft stored on this review. Read it against this rating before recording it.'
-                              : 'Recorded against the review in CareCommand. Nothing is published to the source platform from here.'}
+                              ? 'Prefilled from the draft stored on this review. Check it against this rating before you record it.'
+                              : 'This is saved against the review in CareCommand. Publishing it to the source platform is a separate step, taken there.'}
                           </p>
                           <div className="flex items-center gap-2">
                             <button
@@ -402,7 +415,7 @@ export default function Reviews() {
               empty={{
                 icon: <ShieldCheck className="w-5 h-5" />,
                 title: 'No open reputation cases',
-                description: 'The reputation feed loaded successfully and this clinic has no recorded unresolved cases.',
+                description: 'The reputation feed loaded and this clinic has no unresolved cases on record. Nothing here needs a recovery step right now.',
               }}
             >
               {data => (
@@ -420,7 +433,7 @@ export default function Reviews() {
                       <p className="text-[11px] text-t3 mt-2">Trend: {item.publicTrend} · NPS {item.npsScore}{item.staffComplaintDetected ? ' · staff issue detected' : ''}</p>
                       <p className="text-[11px] text-indigo mt-2 font-semibold">{item.recoveryWorkflow}</p>
                       <div className="mt-2 p-2.5 rounded-lg bg-[var(--s3)] border border-[var(--b1)]">
-                        <p className="text-[10px] font-bold text-t3 mb-1">Suggested message · review before use</p>
+                        <p className="text-[10px] font-bold uppercase tracking-wide text-t3 mb-1">Draft message · read it before you use it</p>
                         <p className="text-xs text-t2">{item.suggestedReply}</p>
                       </div>
                     </div>
@@ -441,7 +454,7 @@ export default function Reviews() {
               empty={{
                 icon: <BellRing className="w-5 h-5" />,
                 title: 'No review requests recorded',
-                description: 'The reputation feed loaded successfully and no review requests have been recorded for this clinic yet.',
+                description: 'The reputation feed loaded and no review request has been recorded for this clinic yet. A governed campaign is how you send the first one.',
                 cta: { label: 'Review campaign setup', onClick: () => navigate('/campaigner') },
               }}
             >
@@ -465,7 +478,10 @@ export default function Reviews() {
             </ResourceSection>
           </BentoCard>
 
-          <BentoCard title="Rating Distribution" subtitle={`Across the loaded review set · most recent ${REVIEW_PAGE_SIZE}`}>
+          <BentoCard title="Rating Distribution">
+            <p className="mb-3 text-[12px] leading-relaxed text-t2">
+              Across the {REVIEW_PAGE_SIZE} most recent stored reviews.
+            </p>
             <ResourceSection
               label="Rating distribution"
               state={reviews.state}
@@ -475,7 +491,7 @@ export default function Reviews() {
               empty={{
                 icon: <Star className="w-5 h-5" />,
                 title: 'No reviews to distribute',
-                description: 'The review feed loaded successfully and this workspace has no stored reviews yet.',
+                description: 'The review feed loaded and this workspace has no stored reviews yet, so there is nothing to distribute.',
               }}
             >
               {rows => {
@@ -494,7 +510,7 @@ export default function Reviews() {
                       </div>
                     ))}
                     {unrated > 0 && (
-                      <p className="text-[10px] text-t3">{unrated} loaded review{unrated === 1 ? ' carries' : 's carry'} no rating and {unrated === 1 ? 'is' : 'are'} not counted above.</p>
+                      <p className="text-[11px] leading-snug text-t2">{unrated} loaded review{unrated === 1 ? ' carries' : 's carry'} no rating and {unrated === 1 ? 'is' : 'are'} not counted above.</p>
                     )}
                   </div>
                 );
@@ -502,7 +518,7 @@ export default function Reviews() {
             </ResourceSection>
           </BentoCard>
 
-          <BentoCard title="Branch Reputation" subtitle="Average of loaded reviews, by clinic">
+          <BentoCard title="Rating by clinic">
             {/* Three feeds: the clinic list, the reviews being averaged, and the
                 bands they are judged against. All three have to answer before a
                 coloured per-clinic average means anything — a green 4.4 under a
@@ -521,7 +537,7 @@ export default function Reviews() {
               isEmpty={data => data.branchRows.length === 0}
               empty={{
                 title: 'No clinics recorded',
-                description: 'The clinic list loaded successfully and this workspace has no clinic records.',
+                description: 'The clinic list loaded and this workspace has no clinic records to rate.',
               }}
             >
               {({ branchRows, reviewRows, bands }) => (
@@ -529,7 +545,8 @@ export default function Reviews() {
                   {/* The bands are stated, and stated as the configured values.
                       The card used to colour silently against 4.5 / 4.0 and
                       never told anyone that was the rule. */}
-                  <p className="text-[10px] text-t3">
+                  <p className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-[12px] leading-relaxed text-t2">
+                    Each clinic&rsquo;s average across the {REVIEW_PAGE_SIZE} most recent stored reviews.{' '}
                     Green at ≥ {formatRatingThreshold(bands.reviewRatingGood)}, amber at ≥ {formatRatingThreshold(bands.reviewRatingFair)}, red below.{' '}
                     {growthPolicyProvenance(bands)}
                   </p>
@@ -558,7 +575,10 @@ export default function Reviews() {
             </ResourceSection>
           </BentoCard>
 
-          <BentoCard title="Top Provider Ratings" subtitle="Providers with at least one recorded review">
+          <BentoCard title="Top Provider Ratings">
+            <p className="mb-3 text-[12px] leading-relaxed text-t2">
+              Ranked by recorded rating. Only providers with at least one recorded review appear here.
+            </p>
             <ResourceSection
               label="Provider ratings"
               state={providers.state}
@@ -571,7 +591,7 @@ export default function Reviews() {
               empty={{
                 icon: <Star className="w-5 h-5" />,
                 title: 'No provider has a recorded rating',
-                description: 'The provider feed loaded successfully and no provider has a review recorded against them yet.',
+                description: 'The provider feed loaded and no provider has a review recorded against them yet, so there is no ranking to draw.',
               }}
             >
               {rows => {
@@ -595,7 +615,7 @@ export default function Reviews() {
                         whole list. The cap is a card size, so it is named as
                         one rather than dressed up as a clinical cut-off. */}
                     {ranked.length > visible.length && (
-                      <p className="text-[10px] text-t3">
+                      <p className="text-[11px] leading-snug text-t2">
                         Highest {visible.length} of {ranked.length} providers with a recorded rating.
                       </p>
                     )}
@@ -608,7 +628,7 @@ export default function Reviews() {
           <div className="rounded-2xl bg-[var(--s2)] border border-[var(--b1)] p-4">
             <p className="text-[10px] font-bold uppercase tracking-widest text-violet-v mb-2">Referral campaigns</p>
             <p className="text-sm font-bold text-t1 mb-1">Set up a governed referral workflow</p>
-            <p className="text-xs text-t2 mb-3">Open campaign setup to review audience, consent, message, and approval requirements. No referral results are inferred on this page.</p>
+            <p className="text-xs leading-relaxed text-t2 mb-3">Open campaign setup to choose the audience and message, and to clear the consent and approval requirements. This page reports no referral results, and infers none.</p>
             <button type="button" onClick={() => navigate('/campaigner')} className="w-full py-2 rounded-xl bg-[var(--s3)] hover:bg-[var(--b1)] text-t1 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
               <ArrowRight className="w-3.5 h-3.5" /> Review campaign setup
             </button>

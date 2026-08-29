@@ -109,7 +109,7 @@ function PipelineColumn({ stage, label, dot, leads, total, ...h }: {
       </div>
       <div className="p-2 space-y-2 min-h-[64px] flex-1">
         {leads.length === 0
-          ? <div className="rounded-lg border border-dashed border-[var(--b2)] py-6 text-center text-[11px] text-t3">{total.count === 0 ? 'No leads' : `${total.count} not loaded`}</div>
+          ? <div className="rounded-lg border border-dashed border-[var(--b2)] py-6 text-center text-[11px] text-t3">{total.count === 0 ? 'None in this stage' : `${total.count} in this stage, none loaded`}</div>
           : [...leads].sort((a, b) => (b.score ?? -1) - (a.score ?? -1)).map(l => <PipelineLeadCard key={l.id} lead={l} {...h} />)}
         {hidden > 0 && leads.length > 0 && (
           <p className="text-center text-[10px] text-t3" data-stage={stage}>{hidden} more in this stage not loaded</p>
@@ -153,9 +153,10 @@ export default function PipelineBoard({ pipeline, loading, ...h }: { pipeline: C
         ))}
       </div>
       {unknownStages.length > 0 && (
-        <p className="text-[11px] text-t3">
+        <p className="text-[12px] leading-relaxed text-t2">
           {unknownStages.length === 1 ? 'One stage is' : `${unknownStages.length} stages are`} not part of the standard pipeline
-          ({unknownStages.map(t => t.stage).join(', ')}). Leads there are shown but cannot be scored or given a suggested action.
+          ({unknownStages.map(t => t.stage).join(', ')}). Their leads are shown here, but cannot be scored or given a suggested
+          action until the recorded stage is one of the seven standard ones.
         </p>
       )}
     </div>

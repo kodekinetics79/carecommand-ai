@@ -172,7 +172,7 @@ export default function Autopilot() {
     <div className="space-y-6 pb-8">
       <PageHeader
         title="CareFlow Autopilot"
-        subtitle="Review configured automation playbooks, approval requests, and recorded activity."
+        subtitle="Your automation playbooks, the decisions waiting on you, and what has been approved so far."
         badge={
           playbooks.state.status === 'loading' ? 'Loading playbooks'
             : playbooks.state.status === 'error' ? 'Data unavailable'
@@ -184,7 +184,8 @@ export default function Autopilot() {
       {error && <div role="alert" className="rounded-2xl border border-[var(--red-soft)] bg-[var(--red-soft)] px-4 py-3 text-sm text-red-v">{error}</div>}
 
       <div role="note" className="rounded-2xl border border-[var(--amber-soft)] bg-[var(--amber-soft)] px-4 py-3 text-xs text-amber-v">
-        A tenant-wide pause control is not available on this page. Use the approved operational runbook before changing or stopping an active automation.
+        <span className="font-bold">To change or stop an active automation, follow your approved operational runbook.</span>{' '}
+        This page has no tenant-wide pause control, so nothing here will stop an automation for you.
       </div>
 
       <div className="autopilot-hero">
@@ -215,7 +216,7 @@ export default function Autopilot() {
               )}
             </ResourceSection>
             <p className="mt-2 max-w-3xl text-sm leading-relaxed text-t2">
-              Everything on this page is stored configuration and recorded approval activity. Playbook settings describe what an automation is set up to do; they are not evidence of what it has done.
+              This page shows your stored playbook configuration and the approval decisions on record. Settings describe what an automation is set up to do — the recorded activity below is the only evidence of what it has actually done.
             </p>
           </div>
           <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-5 py-4">
@@ -235,7 +236,7 @@ export default function Autopilot() {
                 </p>
               )}
             </ResourceSection>
-            <p className="text-xs text-t3">Stored setting; it does not prove unattended execution</p>
+            <p className="text-xs leading-relaxed text-t2">The highest level configured on your playbooks. It is a setting, not evidence that anything has run unattended.</p>
           </div>
         </div>
       </div>
@@ -255,8 +256,8 @@ export default function Autopilot() {
         >
           {rows => (
             <>
-              <StatCard title="Playbooks configured" value={rows.length} subtitle="Stored playbook records" icon={<Bot className="w-4 h-4" />} accent="violet" />
-              <StatCard title="Active playbooks" value={rows.filter(p => p.status === 'LIVE').length} subtitle="Status LIVE on the stored record" icon={<Zap className="w-4 h-4" />} accent="emerald" />
+              <StatCard title="Playbooks configured" value={rows.length} subtitle="Stored in this workspace" icon={<Bot className="w-4 h-4" />} accent="violet" />
+              <StatCard title="Active playbooks" value={rows.filter(p => p.status === 'LIVE').length} subtitle="Recorded status: live" icon={<Zap className="w-4 h-4" />} accent="emerald" />
             </>
           )}
         </ResourceSection>
@@ -268,7 +269,7 @@ export default function Autopilot() {
           loading={<div className="skeleton-line h-24 rounded-2xl" />}
           isEmpty={() => false}
         >
-          {rows => <StatCard title="Awaiting approval" value={rows.filter(a => a.status === 'PENDING').length} subtitle="Requests returned as PENDING" icon={<Inbox className="w-4 h-4" />} accent="amber" />}
+          {rows => <StatCard title="Awaiting approval" value={rows.filter(a => a.status === 'PENDING').length} subtitle="Waiting on a decision from you" icon={<Inbox className="w-4 h-4" />} accent="amber" />}
         </ResourceSection>
         <ResourceSection
           label="Recorded activity count"
@@ -278,7 +279,7 @@ export default function Autopilot() {
           loading={<div className="skeleton-line h-24 rounded-2xl" />}
           isEmpty={() => false}
         >
-          {rows => <StatCard title="Recorded decisions" value={rows.length} subtitle="Most recent approved or executed records" icon={<Activity className="w-4 h-4" />} accent="blue" />}
+          {rows => <StatCard title="Recorded decisions" value={rows.length} subtitle="Most recent approved or executed" icon={<Activity className="w-4 h-4" />} accent="blue" />}
         </ResourceSection>
       </div>
 
@@ -298,7 +299,7 @@ export default function Autopilot() {
               empty={{
                 icon: <Bot className="w-5 h-5" />,
                 title: 'No playbooks configured',
-                description: 'The playbook feed loaded successfully and this workspace has no automation playbooks configured yet.',
+                description: 'The playbook list loaded and this workspace has none yet. A playbook pairs a trigger with an action and holds it here for your approval before anything runs.',
               }}
             >
               {rows => (
@@ -326,7 +327,7 @@ export default function Autopilot() {
                             typed into the playbook by an operator; no run of
                             this automation ever updates them. */}
                         <div className="mt-3 border-t border-[var(--b1)] pt-3">
-                          <p className="mb-1.5 text-[10px] font-bold uppercase tracking-widest text-t3">Operator-entered settings · not measured</p>
+                          <p className="mb-1.5 text-[10px] font-bold uppercase tracking-widest text-t3">Operator settings · not measured results</p>
                           <div className="grid grid-cols-3 gap-2">
                             <div><p className="text-xs font-bold text-t1">{outcome}</p><p className="text-[10px] text-t3">Value setting</p></div>
                             <div><p className="text-xs font-bold text-t1">{pb.config.runs ?? 'Not set'}</p><p className="text-[10px] text-t3">Runs setting</p></div>
@@ -342,7 +343,10 @@ export default function Autopilot() {
           </BentoCard>
 
           {selected && (
-            <BentoCard title="Playbook decision design" subtitle="How the selected playbook is configured to evaluate an action" headerRight={<FileCheck2 className="w-4 h-4 text-indigo" />}>
+            <BentoCard title="Playbook decision design" headerRight={<FileCheck2 className="w-4 h-4 text-indigo" />}>
+              <p className="mb-3 text-[13px] leading-relaxed text-t2">
+                How <span className="font-semibold text-t1">{selected.name}</span> is set up to evaluate an action. These four steps describe the configuration on the record, not a run that has happened.
+              </p>
               <div className="space-y-3">
                 {[
                   { label: '1 · Detect', text: selected.config.trigger ?? selected.description, icon: Activity, color: 'text-blue-v bg-[var(--blue-soft)]' },
@@ -369,7 +373,7 @@ export default function Autopilot() {
         <div className="space-y-4">
           <BentoCard
             title="Approval Inbox"
-            subtitle="Higher-impact decisions need you"
+            subtitle="Actions waiting on your approval"
             headerRight={pendingCount === null ? undefined : <span className="badge badge-amber">{pendingCount} pending</span>}
           >
             <ResourceSection
@@ -381,7 +385,7 @@ export default function Autopilot() {
               empty={{
                 icon: <Inbox className="w-5 h-5" />,
                 title: 'No decisions awaiting approval',
-                description: 'The approval queue loaded successfully and nothing is waiting on you right now.',
+                description: 'The approval queue loaded and nothing is waiting on you right now. Playbooks that need a human decision will queue their requests here.',
               }}
             >
               {rows => (
@@ -419,7 +423,7 @@ export default function Autopilot() {
             </ResourceSection>
           </BentoCard>
 
-          <BentoCard title="Recorded approval activity" subtitle="Recent approved or executed records returned by the API" headerRight={<Activity className="w-4 h-4 text-indigo" />}>
+          <BentoCard title="Recorded approval activity" subtitle="Approved or executed, most recent first" headerRight={<Activity className="w-4 h-4 text-indigo" />}>
             <ResourceSection
               label="Recorded approval activity"
               state={activity.state}
@@ -429,7 +433,7 @@ export default function Autopilot() {
               empty={{
                 icon: <Activity className="w-5 h-5" />,
                 title: 'No approval activity recorded',
-                description: 'The activity feed loaded successfully and no approved or executed action has been recorded for this workspace yet.',
+                description: 'The activity feed loaded and nothing has been approved or executed in this workspace yet. Decisions you make in the approval inbox are recorded here.',
               }}
             >
               {rows => (
@@ -463,7 +467,7 @@ export default function Autopilot() {
               <p className="text-xs font-bold text-amber-v">Scope boundary</p>
             </div>
             <p className="text-[11px] leading-relaxed text-t2">
-              Autopilot is not intended to provide clinical advice, diagnosis, treatment changes, or consent exceptions. Verify each playbook and its integrations before activation.
+              Autopilot is for operational follow-up only. It is not intended to provide clinical advice, diagnosis, treatment changes, or consent exceptions. Verify each playbook and its integrations before you activate it.
             </p>
           </div>
         </div>
@@ -489,7 +493,7 @@ function DecisionOutcome({ decision, busy, onRetry }: { decision: Decision; busy
     return (
       <div className="mt-3">
         <p className="flex items-center gap-1 text-[11px] font-bold text-emerald-v"><CheckCircle2 className="w-3.5 h-3.5" /> Approved and queued for execution</p>
-        <p className="mt-1 text-[10px] leading-snug text-t3">A background job accepted this action. Execution is confirmed only when it appears in the recorded activity.</p>
+        <p className="mt-1 text-[11px] leading-snug text-t2">A background job accepted this action. Watch for it in the recorded approval activity — that is what confirms it ran.</p>
       </div>
     );
   }
@@ -501,7 +505,7 @@ function DecisionOutcome({ decision, busy, onRetry }: { decision: Decision; busy
     return (
       <div className="mt-3">
         <p className="flex items-center gap-1 text-[11px] font-bold text-amber-v"><Clock3 className="w-3.5 h-3.5" /> Approved · not dispatched</p>
-        <p className="mt-1 text-[10px] leading-snug text-t3">
+        <p className="mt-1 text-[11px] leading-snug text-t2">
           {decision.capability?.reason ?? 'The approval is stored and retryable, but no execution job has been accepted for it. Nothing will run until one is.'}
         </p>
         {retryable && (
@@ -516,7 +520,7 @@ function DecisionOutcome({ decision, busy, onRetry }: { decision: Decision; busy
   return (
     <div className="mt-3">
       <p className="flex items-center gap-1 text-[11px] font-bold text-red-v"><AlertTriangle className="w-3.5 h-3.5" /> Approved · dispatch failed</p>
-      <p className="mt-1 text-[10px] leading-snug text-t3">The approval was recorded, but handing it to a worker failed. No execution is queued for this action.</p>
+      <p className="mt-1 text-[11px] leading-snug text-t2">Your approval was recorded, but handing it to a worker failed. No execution is queued for this action — retry below.</p>
       <button type="button" disabled={busy} onClick={onRetry} className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-2.5 py-1 text-[10px] font-semibold text-t1 transition hover:bg-[var(--s2)] disabled:opacity-40">
         <RefreshCw className="w-3 h-3" /> {busy ? 'Retrying…' : 'Retry dispatch'}
       </button>

@@ -180,10 +180,12 @@ describe('CRM Command View figures', () => {
   it('renders every threshold from the policy the server reported, not a hardcoded 70 or 30%', async () => {
     renderPage();
 
-    expect(await screen.findByText('Rule-based score ≥ 55')).toBeInTheDocument();
-    expect(screen.queryByText('Rule-based score ≥ 70')).not.toBeInTheDocument();
-    expect(screen.getByText('Unvalidated 40% LTV assumption over 410 patients')).toBeInTheDocument();
-    expect(screen.queryByText(/Unvalidated 30% LTV assumption/)).not.toBeInTheDocument();
+    expect(await screen.findByText('Rule score 55 or higher')).toBeInTheDocument();
+    expect(screen.queryByText('Rule score 70 or higher')).not.toBeInTheDocument();
+    expect(screen.getByText('Planning assumption: 40% of lifetime value across 410 inactive patients')).toBeInTheDocument();
+    expect(screen.queryByText(/Planning assumption: 30%/)).not.toBeInTheDocument();
+    // The copy still names the figure as an assumption rather than a projection.
+    expect(screen.queryByText(/^Projected/)).not.toBeInTheDocument();
   });
 
   it('shows an uncomputable metric as an absence with the server\'s reason, never as zero', async () => {
@@ -208,11 +210,49 @@ describe('CRM Command View figures', () => {
     expect(screen.getByText(/across all 240 open leads/)).toBeInTheDocument();
   });
 
+  /**
+   * The priority list is the server's top N SCORED open leads — it is not
+   * filtered by `hotLeadScore`. The empty state used to say "no open lead
+   * scores 55 or above", which is a different, false claim: the list is empty
+   * when no open lead could be SCORED at all. These two tests pin the two real
+   * causes apart, because they need different actions from the reader.
+   */
+  it('tells a workspace with no open leads that nothing is in the pipeline yet', async () => {
+    apiRequestMock.mockImplementation((path: string) => {
+      if (path === '/v1/growth/metrics') {
+        return Promise.resolve({ ...METRICS, basis: { ...METRICS.basis, openLeadCount: 0 } });
+      }
+      if (path.startsWith('/v1/growth/leads')) return Promise.resolve({ ...PIPELINE, priority: [] });
+      return respond(path);
+    });
+    renderPage();
+
+    expect(await screen.findByText('No open leads yet')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Review lead sources' })).toBeInTheDocument();
+    // The retired copy asserted a threshold that does not gate this list.
+    expect(screen.queryByText(/No open lead scores 55 or above/)).not.toBeInTheDocument();
+    expect(screen.queryByText('None of your open leads can be ranked yet')).not.toBeInTheDocument();
+  });
+
+  it('tells a workspace whose open leads are all unscorable why none can be ranked', async () => {
+    apiRequestMock.mockImplementation((path: string) => {
+      if (path.startsWith('/v1/growth/leads')) return Promise.resolve({ ...PIPELINE, priority: [] });
+      return respond(path);
+    });
+    renderPage();
+
+    expect(await screen.findByText('None of your open leads can be ranked yet')).toBeInTheDocument();
+    // The count is still the tenant-wide one, not the loaded page.
+    expect(screen.getByText(/All 240 open leads were checked, not just a loaded page/)).toBeInTheDocument();
+    expect(screen.queryByText('No open leads yet')).not.toBeInTheDocument();
+  });
+
   it('surfaces the load failure instead of an empty pipeline', async () => {
     apiRequestMock.mockImplementation(() => Promise.reject(new Error('down')));
     renderPage();
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(/CRM data is unavailable/);
+    expect(await screen.findByRole('alert')).toHaveTextContent(/Your CRM data did not load/);
+    expect(screen.getByRole('alert')).toHaveTextContent(/not zero, and not empty/);
     expect(screen.queryAllByText(BARE_FIGURE)).toEqual([]);
   });
 });
@@ -244,7 +284,7 @@ describe('Patient Intelligence lookup', () => {
     fireEvent.change(screen.getByLabelText('Search patients'), { target: { value: 'zzz' } });
 
     expect(await screen.findByText('No patients found')).toBeInTheDocument();
-    expect(screen.getByText('No patient in this workspace matches “zzz”.')).toBeInTheDocument();
+    expect(screen.getByText(/No patient in this workspace matches “zzz”\./)).toBeInTheDocument();
   });
 
   it('says so when the table is showing a capped page', async () => {
@@ -255,7 +295,7 @@ describe('Patient Intelligence lookup', () => {
 
     expect(await screen.findByRole('status')).toHaveTextContent(/Showing the first 100 matching records/);
     expect(screen.getByText(/Sorting reorders these 100 only/)).toBeInTheDocument();
-    expect(screen.getByText(/This workspace has 1,240 patients/)).toBeInTheDocument();
+    expect(screen.getByText(/Search covers all 1,240 patients in this workspace/)).toBeInTheDocument();
   });
 
   it('bands churn risk against the configured threshold rather than a hardcoded 50', async () => {

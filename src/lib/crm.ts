@@ -301,4 +301,202 @@ export const crmApi = {
   archiveCampaign: (id: string) => apiRequest<Campaign>(`${base}/campaigns/${id}`, { method: 'DELETE' }),
   listDeliveries: (id: string) => apiRequest<CampaignDelivery[]>(`${base}/campaigns/${id}/deliveries`),
   listSuppressions: () => apiRequest<Array<{ id: string; channel: string; reason: string; patientId: string | null }>>(`${base}/suppressions`),
+  // Closed-loop attribution. Both reads are derived from CampaignAttribution
+  // rows and both ship the basis that produced them.
+  attributionSummary: (signal?: AbortSignal) =>
+    apiRequest<CampaignAttributionSummary>(`${base}/attribution/summary`, signal ? { signal } : undefined),
+  campaignAttribution: (id: string) => apiRequest<CampaignAttributionDetail>(`${base}/campaigns/${id}/attribution`),
 };
+
+// --- Closed-loop attribution ------------------------------------------------
+//
+// `GET /v1/crm/attribution/summary` and `GET /v1/crm/campaigns/:id/attribution`
+// are derived from CampaignAttribution rows and from nothing else. Every field
+// below mirrors what those routes send; the helpers underneath decide what a
+// screen is ALLOWED to print from it.
+//
+// The rule the helpers exist to enforce: `attributedValue` is a total, and a
+// total of no rows is the string '0.00'. Printing that as "$0 attributed" turns
+// an absence of evidence into a measurement — the exact move this product
+// refuses (Tebra multiplies volume by $3/reminder and $150/recall; RevenueWell
+// credits itself with all revenue within 60 days of an unmatched request). The
+// count of `paid` outcomes, never the value string, is what says money exists.
+
+export interface CampaignAttributionOutcomes {
+  engaged: number;
+  booked: number;
+  attended: number;
+  paid: number;
+}
+
+/**
+ * Engagement, always reported as unavailable with a reason. The server pins
+ * openRate/responseRate to null on purpose: normalizeProviderDeliveryStatus
+ * refuses a provider "opened" event, so there is no receipt to count.
+ */
+export interface CampaignEngagementDisclosure {
+  openRate: null;
+  responseRate: null;
+  unavailableReason: string;
+}
+
+/** The figures both attribution endpoints ship for a campaign. */
+export interface CampaignAttributionFigures {
+  outcomes: CampaignAttributionOutcomes;
+  /** A decimal STRING, and '0.00' whenever no `paid` row exists. Never print it directly. */
+  attributedValue: string;
+  currency: string | null;
+  windowDaysObserved: number[];
+  firstAttributedAt: string | null;
+  lastAttributedAt: string | null;
+  engagement: CampaignEngagementDisclosure;
+}
+
+export interface CampaignAttributionSummaryRow extends CampaignAttributionFigures {
+  campaignId: string;
+  name: string;
+  campaignType: string | null;
+  audienceType: string | null;
+  branchId: string | null;
+  status: string;
+  /** Campaign.sent — deliveries a provider actually accepted. */
+  providerAcceptedDeliveries: number;
+  deepLinkTarget: string;
+}
+
+/** How the figures were produced, shipped with the figures by the API. */
+export interface CampaignAttributionBasis {
+  derivedFrom: string;
+  rules: Record<string, string>;
+  evidenceableOutcomes: string[];
+  valueBasis: string;
+  windowSource: string;
+  notAttributed: string;
+}
+
+export interface CampaignAttributionSummary {
+  campaigns: CampaignAttributionSummaryRow[];
+  basis: CampaignAttributionBasis;
+}
+
+export interface CampaignAttributionRecord {
+  id: string;
+  outcomeType: string;
+  campaignDeliveryId: string;
+  patientId: string | null;
+  leadId: string | null;
+  branchId: string | null;
+  appointmentId: string | null;
+  paymentTransactionId: string | null;
+  attributedValue: string;
+  currency: string | null;
+  window: { days: number; startsAt: string; endsAt: string; recordedAtAttributionTime: boolean };
+  rule: string;
+  evidence: unknown;
+  attributedAt: string;
+}
+
+export interface CampaignAttributionDetail extends CampaignAttributionFigures {
+  campaignId: string;
+  attributions: CampaignAttributionRecord[];
+  deepLinkTarget: string;
+}
+
+/**
+ * What a screen may say about attributed money. `not_attributed` is a first
+ * class answer, not an error: it is what the data supports when no delivery is
+ * tied to a recorded payment.
+ */
+export type AttributedRevenue =
+  | {
+    status: 'attributed';
+    amount: number;
+    currency: string;
+    /** How many `paid` outcome rows produced this total. */
+    paidOutcomes: number;
+    /** How many campaigns contributed at least one of them. */
+    campaigns: number;
+  }
+  | { status: 'not_attributed'; reason: string };
+
+export const NO_ATTRIBUTED_PAYMENT_REASON =
+  'No delivery is tied to a booking or a payment yet, so no amount — including $0 — can be shown.';
+
+/**
+ * The one place a number is allowed out of an attribution payload.
+ *
+ * A `paid` outcome is the only row that carries money, so its COUNT is the test
+ * for whether an amount exists. `attributedValue` is consulted only after that
+ * count says there is something to read, which is why an empty workspace can
+ * never reach "$0 attributed".
+ */
+export function summarizeAttributedRevenue(rows: readonly CampaignAttributionFigures[]): AttributedRevenue {
+  const paying = rows.filter(row => (row.outcomes?.paid ?? 0) > 0);
+  const paidOutcomes = paying.reduce((sum, row) => sum + row.outcomes.paid, 0);
+  if (paying.length === 0 || paidOutcomes === 0) {
+    return { status: 'not_attributed', reason: NO_ATTRIBUTED_PAYMENT_REASON };
+  }
+
+  const currencies = [...new Set(paying.map(row => row.currency?.trim().toUpperCase()).filter((c): c is string => !!c))];
+  if (currencies.length === 0) {
+    return {
+      status: 'not_attributed',
+      reason: `${paidOutcomes} attributed payment${paidOutcomes === 1 ? '' : 's'} carry no recorded currency, so they cannot be shown as one amount. Open the campaign to read the rows.`,
+    };
+  }
+  if (currencies.length > 1) {
+    return {
+      status: 'not_attributed',
+      reason: `Attributed payments were recorded in ${currencies.join(' and ')}. Amounts in different currencies are not added together; open each campaign to read its own total.`,
+    };
+  }
+
+  const amount = paying.reduce((sum, row) => sum + Number(row.attributedValue), 0);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return {
+      status: 'not_attributed',
+      reason: `${paidOutcomes} attributed payment${paidOutcomes === 1 ? '' : 's'} carry no readable net amount, so no figure can be shown. Open the campaign to read the rows.`,
+    };
+  }
+  return { status: 'attributed', amount: Number(amount.toFixed(2)), currency: currencies[0], paidOutcomes, campaigns: paying.length };
+}
+
+/** Every attribution window that actually produced a row, ascending. */
+export function attributionWindowsObserved(rows: readonly CampaignAttributionFigures[]): number[] {
+  return [...new Set(rows.flatMap(row => row.windowDaysObserved ?? []))].sort((a, b) => a - b);
+}
+
+/** Total outcomes of one kind across a portfolio. */
+export function countAttributedOutcomes(rows: readonly CampaignAttributionFigures[], outcome: keyof CampaignAttributionOutcomes): number {
+  return rows.reduce((sum, row) => sum + (row.outcomes?.[outcome] ?? 0), 0);
+}
+
+/** Formats an attributed amount in the currency the evidence was recorded in. */
+export function formatAttributedAmount(amount: number, currency: string): string {
+  const code = currency.trim().toUpperCase();
+  try {
+    return new Intl.NumberFormat(undefined, { style: 'currency', currency: code, minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(amount);
+  } catch {
+    // An unrecognised code is still evidence; it is shown beside the number
+    // rather than dropped or silently rendered as dollars.
+    return `${amount.toFixed(2)} ${code}`;
+  }
+}
+
+const ENGAGEMENT_UNAVAILABLE_REASONS: Record<string, string> = {
+  no_truthful_open_or_reply_receipt:
+    'Open and reply rates are not reported: no provider gives this platform a truthful open or reply receipt, so no percentage — including 0% — can be shown.',
+};
+
+/**
+ * The engagement sentence. There is deliberately no numeric branch: a rate this
+ * platform cannot evidence is named as unavailable, never rendered as 0%.
+ */
+export function describeEngagementUnavailability(engagement: { unavailableReason?: string } | null | undefined): string {
+  const reason = engagement?.unavailableReason?.trim();
+  if (!reason) {
+    return 'Open and reply rates are not reported, and no reason was stated. No percentage — including 0% — can be shown.';
+  }
+  return ENGAGEMENT_UNAVAILABLE_REASONS[reason]
+    ?? `Open and reply rates are not reported (${reason}). No percentage — including 0% — can be shown.`;
+}

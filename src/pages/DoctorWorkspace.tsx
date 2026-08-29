@@ -7,6 +7,7 @@ import ProgressBar from '../components/ui/ProgressBar';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapProviderProfile, type ApiProviderProfile } from '../lib/apiAdapters';
 import { formatCurrency } from '../utils/formatters';
+import type { CampaignHandoff } from '../lib/crm';
 
 interface ApiBranchOption { id: string; name: string }
 
@@ -163,7 +164,9 @@ export default function DoctorWorkspace() {
               <p className="text-sm text-t3 text-center py-4">{metricsReady ? 'No providers in the loaded result set are below the follow-up threshold.' : 'Follow-up metrics are unavailable.'}</p>
             )}
           </div>
-          <button type="button" onClick={() => navigate('/campaigner')} className="mt-3 w-full flex items-center justify-center gap-1 text-xs font-semibold text-indigo py-2 border border-dashed border-[var(--b2)] rounded-xl hover:bg-[var(--s3)] transition-colors">
+          <button type="button" onClick={() => navigate('/campaigns', { state: {
+            goal: 'reviews', source: 'Doctor Workspace', contextLabel: 'Review campaign for all providers',
+          } satisfies CampaignHandoff })} className="mt-3 w-full flex items-center justify-center gap-1 text-xs font-semibold text-indigo py-2 border border-dashed border-[var(--b2)] rounded-xl hover:bg-[var(--s3)] transition-colors">
             Launch review campaign for all providers <ArrowRight className="w-3.5 h-3.5" />
           </button>
         </BentoCard>

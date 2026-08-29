@@ -197,7 +197,7 @@ describe('Reviews figures', () => {
     expect(screen.getByText('Rating not recorded')).toBeInTheDocument();
     expect(screen.getByText('sentiment not classified')).toBeInTheDocument();
     expect(screen.getByText('Platform not recorded')).toBeInTheDocument();
-    expect(screen.getAllByText('Reviewer not identified in the review record')).toHaveLength(REVIEWS.length);
+    expect(screen.getAllByText('No reviewer name on this record')).toHaveLength(REVIEWS.length);
     expect(screen.getByText('1 loaded review carries no rating and is not counted above.')).toBeInTheDocument();
   });
 });

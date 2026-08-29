@@ -34,9 +34,36 @@ export interface ProviderUtilization {
 }
 
 // ---- Campaign ROI -----------------------------------------------------------
+//
+// `booked` and `revenue` on a Campaign row are no longer writable columns: DB
+// triggers maintain them as a rollup of CampaignAttribution
+// (booked = COUNT(outcomeType 'booked'), revenue = SUM(attributedValue) over
+// 'paid' rows, and a 'paid' row is only ever written for a net > 0). So a
+// positive value here IS evidence, and a zero is the ABSENCE of evidence — not
+// a measured zero. Two consequences this type encodes:
+//
+//   * `attributedRevenue` is null when no attributed payment exists, so the
+//     panel cannot format 0 into "$0 attributed".
+//   * `conversionRate` is null unless it can be evidenced. The old computation
+//     was booked / audienceSize with a `: 0` fallback, which rendered "0%
+//     booking rate" for every campaign that had never dispatched. audienceSize
+//     is also the wrong denominator: only a provider-ACCEPTED delivery is
+//     attributable at all (campaignAttribution.ts rule 1), so the population
+//     that could have produced a booking is Campaign.sent, and a campaign with
+//     no accepted delivery has no rate rather than a rate of zero.
 export interface CampaignROI {
   id: string; name: string; status: string;
-  audienceSize: number; booked: number; revenue: number; conversionRate: number;
+  audienceSize: number; booked: number;
+  /** Rollup of attributed `paid` value. Read `attributedRevenue` to display it. */
+  revenue: number;
+  /** Attributed money, or null when no attributed payment is recorded. */
+  attributedRevenue: number | null;
+  /** Deliveries a provider accepted — the only population a booking can be attributed from. */
+  attributableDeliveries: number;
+  /** Percent, or null when no rate can be evidenced. Never 0 as a stand-in. */
+  conversionRate: number | null;
+  /** What the rate means, or why there is none. Always displayable. */
+  conversionBasis: string;
   estimatedAudience: number | null; estimatedRecoverable: number | null; nextAction: string;
 }
 
@@ -102,19 +129,7 @@ export const dashboardService = {
   async getCampaignROI(limit = 4): Promise<CampaignROI[]> {
     const res = await apiRequest<Array<Record<string, unknown>> | { data: Array<Record<string, unknown>> }>(`/v1/campaigns?limit=${limit}`);
     const rows = (Array.isArray(res) ? res : res.data ?? []);
-    return rows.slice(0, limit).map(c => {
-      const audienceSize = num(c.audienceSize); const booked = num(c.booked); const revenue = num(c.revenue);
-      const status = String(c.status ?? 'DRAFT').toLowerCase();
-      const conversionRate = audienceSize > 0 ? Math.round((booked / audienceSize) * 100) : 0;
-      const launched = audienceSize > 0 || revenue > 0;
-      return {
-        id: String(c.id), name: String(c.name ?? 'Campaign'), status,
-        audienceSize, booked, revenue, conversionRate,
-        estimatedAudience: launched ? null : (num(c.estimatedAudience) || null),
-        estimatedRecoverable: launched ? null : (num(c.estimatedRecoverable) || null),
-        nextAction: launched ? 'Review performance' : status === 'draft' ? 'Generate & approve' : 'Approve to launch',
-      };
-    });
+    return rows.slice(0, limit).map(campaignRoiFromRow);
   },
 
   // [LIVE] derived from /v1/opportunities + /v1/revenue-leaks into a unified rail.
@@ -126,6 +141,41 @@ export const dashboardService = {
     return buildPriorityActions(opps, leaks);
   },
 };
+
+/**
+ * Pure view mapping for one campaign row. Every branch here answers the same
+ * question: is there evidence for this number, or is there only the absence of
+ * evidence? A rate with no attributable population, and money with no attributed
+ * payment, are reported as absent — never as 0.
+ */
+export function campaignRoiFromRow(c: Record<string, unknown>): CampaignROI {
+  const audienceSize = num(c.audienceSize);
+  const booked = num(c.booked);
+  const revenue = num(c.revenue);
+  // Campaign.sent is the accepted-delivery count campaignDispatch writes, and
+  // the same number /v1/crm/attribution/summary publishes as
+  // `providerAcceptedDeliveries`.
+  const attributableDeliveries = num(c.sent);
+  const status = String(c.status ?? 'DRAFT').toLowerCase();
+  const conversionRate = attributableDeliveries > 0
+    ? Math.round((booked / attributableDeliveries) * 100)
+    : null;
+  const conversionBasis = conversionRate == null
+    ? 'No delivery has been accepted by a provider, so no booking rate can be evidenced — including 0%.'
+    : `Attributed bookings against ${attributableDeliveries} provider-accepted deliver${attributableDeliveries === 1 ? 'y' : 'ies'}.`;
+  const launched = attributableDeliveries > 0 || audienceSize > 0 || revenue > 0;
+  return {
+    id: String(c.id), name: String(c.name ?? 'Campaign'), status,
+    audienceSize, booked, revenue,
+    // A 'paid' attribution row is only written for a net above zero, so a
+    // rollup of 0 means no attributed payment exists, not a payment of nothing.
+    attributedRevenue: revenue > 0 ? revenue : null,
+    attributableDeliveries, conversionRate, conversionBasis,
+    estimatedAudience: launched ? null : (num(c.estimatedAudience) || null),
+    estimatedRecoverable: launched ? null : (num(c.estimatedRecoverable) || null),
+    nextAction: launched ? 'Review performance' : status === 'draft' ? 'Generate & approve' : 'Approve to launch',
+  };
+}
 
 /** Pure view mapping. It never manufactures confidence or financial values. */
 export function buildPriorityActions(opps: Array<Record<string, unknown>>, leaks: Array<Record<string, unknown>>): PriorityAction[] {

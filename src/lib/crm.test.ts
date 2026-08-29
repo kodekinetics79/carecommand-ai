@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
-  AUDIENCE_TYPES, CAMPAIGN_GOALS, CAMPAIGN_TYPES,
+  AUDIENCE_TYPES, CAMPAIGN_GOALS, CAMPAIGN_TYPES, NO_ATTRIBUTED_PAYMENT_REASON,
   isCampaignGoal, readCampaignHandoff, resolveHandoffDefaults,
+  summarizeAttributedRevenue, attributionWindowsObserved, countAttributedOutcomes,
+  describeEngagementUnavailability, formatAttributedAmount,
+  type CampaignAttributionFigures,
 } from './crm';
 
 /**
@@ -85,5 +88,106 @@ describe('readCampaignHandoff', () => {
     expect(handoff?.name).toHaveLength(160);
     expect(handoff?.contextLabel).toHaveLength(200);
     expect(readCampaignHandoff({ name: '   ' })).toBeNull();
+  });
+});
+
+
+/**
+ * Attribution, read honestly.
+ *
+ * The API sends `attributedValue` as a decimal STRING, and the sum of no rows
+ * is '0.00'. Reading that string as the answer is exactly how a workspace with
+ * no evidence ends up displaying "$0 attributed" — the claim this product
+ * exists not to make. The count of `paid` outcomes is the gate; the value is
+ * only consulted once that count says money exists.
+ */
+function figures(overrides: Partial<CampaignAttributionFigures> = {}): CampaignAttributionFigures {
+  return {
+    outcomes: { engaged: 0, booked: 0, attended: 0, paid: 0 },
+    attributedValue: '0.00',
+    currency: null,
+    windowDaysObserved: [],
+    firstAttributedAt: null,
+    lastAttributedAt: null,
+    engagement: { openRate: null, responseRate: null, unavailableReason: 'no_truthful_open_or_reply_receipt' },
+    ...overrides,
+  };
+}
+
+describe('summarizeAttributedRevenue', () => {
+  it('reports absence, not $0, when no campaign has an attributed payment', () => {
+    expect(summarizeAttributedRevenue([])).toEqual({ status: 'not_attributed', reason: NO_ATTRIBUTED_PAYMENT_REASON });
+    // The shape the server really sends for an unattributed campaign: zero
+    // outcomes beside the string '0.00'.
+    expect(summarizeAttributedRevenue([figures(), figures()]))
+      .toEqual({ status: 'not_attributed', reason: NO_ATTRIBUTED_PAYMENT_REASON });
+  });
+
+  it('does not read revenue out of bookings or attendances', () => {
+    // Rule 5 of the engine: a booking is not revenue and an attendance is not
+    // revenue. Both carry attributedValue 0, so only `paid` can produce money.
+    const booked = figures({ outcomes: { engaged: 0, booked: 12, attended: 7, paid: 0 }, windowDaysObserved: [30] });
+    expect(summarizeAttributedRevenue([booked]).status).toBe('not_attributed');
+    expect(countAttributedOutcomes([booked], 'booked')).toBe(12);
+  });
+
+  it('totals the attributed value once paid rows evidence it', () => {
+    const rows = [
+      figures({ outcomes: { engaged: 0, booked: 4, attended: 2, paid: 2 }, attributedValue: '1200.25', currency: 'usd', windowDaysObserved: [30] }),
+      figures({ outcomes: { engaged: 0, booked: 1, attended: 0, paid: 1 }, attributedValue: '300.75', currency: 'USD', windowDaysObserved: [45] }),
+      figures(),
+    ];
+    expect(summarizeAttributedRevenue(rows)).toEqual({
+      status: 'attributed', amount: 1501, currency: 'USD', paidOutcomes: 3, campaigns: 2,
+    });
+    expect(attributionWindowsObserved(rows)).toEqual([30, 45]);
+  });
+
+  it('refuses to add amounts recorded in different currencies', () => {
+    const result = summarizeAttributedRevenue([
+      figures({ outcomes: { engaged: 0, booked: 1, attended: 0, paid: 1 }, attributedValue: '100.00', currency: 'usd' }),
+      figures({ outcomes: { engaged: 0, booked: 1, attended: 0, paid: 1 }, attributedValue: '90.00', currency: 'eur' }),
+    ]);
+    expect(result.status).toBe('not_attributed');
+    expect(result).toMatchObject({ reason: expect.stringContaining('USD and EUR') });
+  });
+
+  it('states the absence rather than a number when the payload is unreadable', () => {
+    expect(summarizeAttributedRevenue([
+      figures({ outcomes: { engaged: 0, booked: 1, attended: 0, paid: 1 }, attributedValue: 'not-a-number', currency: 'usd' }),
+    ]).status).toBe('not_attributed');
+    // A paid row with no recorded currency cannot be labelled, so it is not
+    // shown as an amount in some assumed currency.
+    expect(summarizeAttributedRevenue([
+      figures({ outcomes: { engaged: 0, booked: 1, attended: 0, paid: 1 }, attributedValue: '10.00', currency: null }),
+    ]).status).toBe('not_attributed');
+  });
+
+  it('formats an amount in the currency the evidence was recorded in', () => {
+    expect(formatAttributedAmount(1501, 'USD')).toMatch(/1,501\.00/);
+    // An unfamiliar code is still evidence: the amount carries that code
+    // rather than being silently rendered as dollars.
+    const unfamiliar = formatAttributedAmount(10, 'zzz');
+    expect(unfamiliar).toMatch(/10\.00/);
+    expect(unfamiliar).toMatch(/ZZZ/);
+    expect(unfamiliar).not.toMatch(/\$/);
+  });
+});
+
+describe('describeEngagementUnavailability', () => {
+  it('explains the missing open rate instead of implying a measured 0%', () => {
+    const sentence = describeEngagementUnavailability({ unavailableReason: 'no_truthful_open_or_reply_receipt' });
+    expect(sentence).toContain('truthful open or reply receipt');
+    // The only percentage the sentence may contain is the one it refuses to
+    // print. It never reads as a measurement.
+    expect(sentence).toContain('no percentage — including 0% — can be shown');
+    expect(sentence.replace('including 0%', '')).not.toMatch(/\d+%/);
+  });
+
+  it('carries an unknown reason through rather than inventing one', () => {
+    expect(describeEngagementUnavailability({ unavailableReason: 'provider_receipts_disabled' }))
+      .toContain('provider_receipts_disabled');
+    expect(describeEngagementUnavailability(null)).toContain('no reason was stated');
+    expect(describeEngagementUnavailability(undefined).replace('including 0%', '')).not.toMatch(/\d+%/);
   });
 });

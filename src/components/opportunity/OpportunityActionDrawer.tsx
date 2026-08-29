@@ -3,22 +3,25 @@ import { X, Megaphone, MessageSquare, PhoneCall, CalendarPlus, Send, Users, Cloc
 import OpportunityDetailPanel from './OpportunityDetailPanel';
 import ConfirmationModal from '../workflow/ConfirmationModal';
 import { opportunityService, type Opportunity, type WorkflowVerb } from '../../lib/opportunityService';
+import type { CampaignHandoff } from '../../lib/crm';
 
 type CtaTone = 'indigo' | 'amber' | 'red';
-interface Cta { id: string; label: string; icon: typeof Megaphone; tone: CtaTone; confirm: { title: string; message: string }; verb?: WorkflowVerb; route?: string }
+interface Cta { id: string; label: string; icon: typeof Megaphone; tone: CtaTone; confirm: { title: string; message: string }; verb?: WorkflowVerb; route?: string; handoff?: CampaignHandoff }
 
 function ctasFor(o: Opportunity): Cta[] {
   const out: Cta[] = [];
   if (o.approval === 'pending_approval') out.push({ id: 'approve', label: 'Approve Campaign', icon: CheckCircle2, tone: 'indigo', verb: 'approve_campaign', confirm: { title: 'Approve campaign?', message: `This approves "${o.title}" for execution and removes the approval hold.` } });
-  if (o.category === 'inactive-patients' || o.category === 'reputation') out.push({ id: 'recovery', label: 'Build Recovery Campaign', icon: MessageSquare, tone: 'indigo', route: '/campaigner', confirm: { title: 'Open Campaigner?', message: 'Build and approve a consent-checked recovery campaign before any message is sent.' } });
+  if (o.category === 'inactive-patients' || o.category === 'reputation') out.push({ id: 'recovery', label: 'Build Recovery Campaign', icon: MessageSquare, tone: 'indigo', route: '/campaigns', handoff: { goal: o.category === 'inactive-patients' ? 'winback' : 'reviews', source: 'Opportunity Center', contextLabel: o.title }, confirm: { title: 'Open Campaigner?', message: 'Build and approve a consent-checked recovery campaign before any message is sent.' } });
   if (o.category === 'front-desk') out.push({ id: 'callback', label: 'Assign Callback Queue', icon: PhoneCall, tone: 'indigo', verb: 'assign_callback', confirm: { title: 'Assign callback queue?', message: 'Uncontacted callers will be routed to the front-desk callback queue.' } });
-  if (o.category === 'no-show' || o.category === 'scheduling') out.push({ id: 'fill', label: 'Build Schedule Fill Campaign', icon: CalendarPlus, tone: 'indigo', route: '/campaigner', confirm: { title: 'Open Campaigner?', message: 'Build and approve a schedule-fill campaign before any outreach occurs.' } });
+  if (o.category === 'no-show' || o.category === 'scheduling') out.push({ id: 'fill', label: 'Build Schedule Fill Campaign', icon: CalendarPlus, tone: 'indigo', route: '/campaigns', handoff: { goal: 'requests', source: 'Opportunity Center', contextLabel: o.title }, confirm: { title: 'Open Campaigner?', message: 'Build and approve a schedule-fill campaign before any outreach occurs.' } });
   out.push({ id: 'frontdesk', label: 'Send to Front Desk', icon: Send, tone: 'amber', verb: 'send_front_desk', confirm: { title: 'Send to front desk?', message: 'This assigns the action to the branch front-desk team.' } });
   return out;
 }
 
 export default function OpportunityActionDrawer({ opportunity, onClose, onChanged, onNavigate }: {
-  opportunity: Opportunity; onClose: () => void; onChanged: (o: Opportunity) => void; onNavigate: (route: string) => void;
+  opportunity: Opportunity; onClose: () => void; onChanged: (o: Opportunity) => void;
+  /** Campaign routes carry the decision that was just confirmed as a handoff. */
+  onNavigate: (route: string, handoff?: CampaignHandoff) => void;
 }) {
   const [confirm, setConfirm] = useState<Cta | null>(null);
   const [reasonAction, setReasonAction] = useState<{ kind: 'dismiss' | 'snooze' } | null>(null);
@@ -72,7 +75,7 @@ export default function OpportunityActionDrawer({ opportunity, onClose, onChange
           title={confirm.confirm.title} message={confirm.confirm.message} confirmLabel={confirm.label} tone={confirm.tone}
           onClose={() => setConfirm(null)}
           onConfirm={async () => {
-            if (confirm.route) { onNavigate(confirm.route); return; }
+            if (confirm.route) { onNavigate(confirm.route, confirm.handoff); return; }
             if (confirm.verb) { const updated = await opportunityService.runWorkflow(opportunity.id, confirm.verb); onChanged(updated); }
           }}
         />

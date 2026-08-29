@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import {
-  AlertCircle, AlertTriangle, Ban, CheckCircle2, Filter, HelpCircle, Loader2, Megaphone, Pause,
+  AlertCircle, AlertTriangle, Ban, CalendarCheck, CheckCircle2, Filter, HelpCircle, Loader2, Megaphone, Pause,
   Pencil, Plus, Save, Send, ShieldAlert, Sparkles, Trash2, Users, X,
 } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
@@ -16,9 +16,12 @@ import { receivedData } from '../lib/resourceState';
 import {
   crmApi, AUDIENCE_TYPES, CAMPAIGN_TYPES, CAMPAIGN_GOALS, CAMPAIGN_STATUS_META, DELIVERY_STATUS_META,
   readCampaignHandoff, resolveHandoffDefaults,
+  summarizeAttributedRevenue, attributionWindowsObserved, countAttributedOutcomes,
+  formatAttributedAmount, describeEngagementUnavailability,
   type Campaign, type AudiencePreview, type CampaignDraft, type LaunchResult, type CampaignDelivery,
   type AudienceType, type CampaignType, type CommChannel, type CampaignLaunchPreview, type CampaignGoal,
-  type CampaignHandoff,
+  type CampaignHandoff, type CampaignAttributionSummary, type CampaignAttributionBasis,
+  type CampaignAttributionDetail,
 } from '../lib/crm';
 
 /**
@@ -50,6 +53,7 @@ function displayLabel(value: string | null): string {
 // Module-scope loader: useResource keys a request by the identity of its
 // source, so this must not be re-created on every render.
 const loadCampaigns = (signal: AbortSignal): Promise<Campaign[]> => crmApi.listCampaigns(signal);
+const loadAttribution = (signal: AbortSignal): Promise<CampaignAttributionSummary> => crmApi.attributionSummary(signal);
 
 const STATUS_FILTERS = [
   { id: 'all', label: 'All', match: () => true },
@@ -73,10 +77,17 @@ export default function Campaigner() {
   const [chosenId, setChosenId] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const campaigns = useResource<Campaign[]>(loadCampaigns);
+  // The closed loop. Its own request, because attribution is evidence the
+  // campaign list does not carry: the list says what exists, this says what any
+  // of it earned, and neither may stand in for the other while it loads.
+  const attribution = useResource<CampaignAttributionSummary>(loadAttribution);
 
   // Only ever non-null once a response arrived. Nothing below may print a
   // figure, a rate or a count from anything else.
   const campaignRecords = receivedData(campaigns.state);
+  // Decoration only: the basis note explains a figure that is rendered inside a
+  // ResourceSection, so it exists only once that same response has arrived.
+  const attributionRecords = receivedData(attribution.state);
 
   // Derived, not stored. The response is the only authority on what exists, so
   // a selection that no longer resolves (archived, cancelled, filtered out by a
@@ -119,11 +130,12 @@ export default function Campaigner() {
         }
       />
 
-      {/* Portfolio state. Each tile is an aggregate of the whole list, so the
-          three that CAN be evidenced live behind one resolved state: a workspace
-          with no campaigns really does have zero running, but a request that has
-          not answered does not. The fourth is not a loading problem — no code
-          path records campaign revenue at all — so it says that instead. */}
+      {/* Portfolio state. Each tile is an aggregate of a whole response, so it
+          lives behind one resolved state: a workspace with no campaigns really
+          does have zero running, but a request that has not answered does not.
+          The first three come from the campaign list; the fourth comes from the
+          attribution read, and prints an amount only when a `paid` outcome row
+          exists to produce one. */}
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
         <ResourceSection
           label="Campaign totals"
@@ -143,11 +155,28 @@ export default function Campaigner() {
             </>
           )}
         </ResourceSection>
-        <UnevidencedStat
-          title="Attributed revenue"
-          reason="No delivery is tied to a booking or a payment yet, so no amount — including $0 — can be shown."
-        />
+        {/* The fourth tile is now evidenced — or honestly absent. It never
+            resolves an in-flight or failed request into $0: a figure lives only
+            in the resolved branch, and a resolved response with no `paid`
+            outcome states the absence instead of totalling nothing. */}
+        <ResourceSection
+          label="Attributed revenue"
+          state={attribution.state}
+          onRetry={attribution.reload}
+          compact
+          // The default skeleton, which announces the wait to a screen reader
+          // ("Loading Attributed revenue…") instead of showing a silent box.
+          lines={1}
+          rowClassName="h-24 rounded-2xl"
+          // A workspace with no attributed campaign is not an empty panel; the
+          // tile itself is what says so, in the words the evidence supports.
+          isEmpty={() => false}
+        >
+          {summary => <AttributedRevenueTile summary={summary} />}
+        </ResourceSection>
       </div>
+
+      {attributionRecords && <AttributionBasisNote basis={attributionRecords.basis} windows={attributionWindowsObserved(attributionRecords.campaigns)} />}
 
       {handoff?.contextLabel && (
         <div className="rounded-xl border border-[var(--b2)] bg-[var(--indigo-soft)] px-3 py-2 text-xs text-t1">
@@ -308,15 +337,15 @@ export default function Campaigner() {
 }
 
 /**
- * A figure the product cannot evidence yet.
+ * A figure the evidence does not support.
  *
- * `Campaign.revenue`, `.opened` and `.booked` exist on the table and no code
- * path writes them, so any total computed from them is a structural zero. "$0
- * attributed" is a claim a clinic owner would act on, and it is not one the
- * data supports. The tile states the absence instead. When attribution lands
- * this becomes an ordinary StatCard.
+ * Reached only from a RESOLVED response: the request answered, and what it
+ * carried does not add up to an amount. "$0 attributed" is a claim a clinic
+ * owner would act on and it is not one the data supports, so the tile states
+ * the absence and the reason for it instead. During load and after a failure
+ * this component is not rendered at all — ResourceSection owns those states.
  */
-function UnevidencedStat({ title, reason }: { title: string; reason: string }) {
+function UnevidencedStat({ title, reason, footnote }: { title: string; reason: string; footnote?: string }) {
   return (
     <div className="cc-card p-4 flex flex-col gap-3 border-dashed">
       <div className="stat-icon stat-icon-amber"><HelpCircle className="w-4 h-4" aria-hidden="true" /></div>
@@ -324,8 +353,74 @@ function UnevidencedStat({ title, reason }: { title: string; reason: string }) {
         <p className="text-sm font-bold leading-snug text-t2">Not recorded yet</p>
         <p className="text-[11px] font-medium mt-1.5 text-t3">{title}</p>
         <p className="text-[10px] mt-0.5 text-t3">{reason}</p>
+        {footnote && <p className="text-[10px] mt-1 text-t3">{footnote}</p>}
       </div>
     </div>
+  );
+}
+
+/**
+ * Attributed revenue across the portfolio.
+ *
+ * The count of `paid` outcomes decides whether there is an amount to print;
+ * `attributedValue` is a sum, and the sum of no rows is the string '0.00'.
+ * Reading the string first is how a workspace with no evidence would end up
+ * displaying "$0 attributed", which is the whole defect.
+ */
+function AttributedRevenueTile({ summary }: { summary: CampaignAttributionSummary }) {
+  const revenue = summarizeAttributedRevenue(summary.campaigns);
+  const booked = countAttributedOutcomes(summary.campaigns, 'booked');
+  const bookingNote = booked > 0
+    ? `${booked} attributed booking${booked === 1 ? '' : 's'} recorded. A booking is an outcome, not revenue.`
+    : undefined;
+
+  if (revenue.status === 'not_attributed') {
+    return <UnevidencedStat title="Attributed revenue" reason={revenue.reason} footnote={bookingNote} />;
+  }
+  return (
+    <StatCard
+      title="Attributed revenue"
+      value={formatAttributedAmount(revenue.amount, revenue.currency)}
+      subtitle={`${revenue.paidOutcomes} attributed payment${revenue.paidOutcomes === 1 ? '' : 's'} across ${revenue.campaigns} campaign${revenue.campaigns === 1 ? '' : 's'}`}
+      icon={<CalendarCheck className="w-4 h-4" />}
+      accent="emerald"
+    />
+  );
+}
+
+/**
+ * The provenance, in the API's own words.
+ *
+ * A revenue figure whose arithmetic cannot be inspected is indistinguishable
+ * from one multiplied out of hardcoded constants. This is what separates the
+ * number above from that: the rules that made each link, the basis of the
+ * value, and where the window came from — all shipped by the same response
+ * that shipped the figure, never restated in this file.
+ */
+function AttributionBasisNote({ basis, windows }: { basis: CampaignAttributionBasis; windows: number[] }) {
+  const windowLine = windows.length > 0
+    ? `${windows.map(days => `${days}-day`).join(', ')} — ${basis.windowSource}`
+    : basis.windowSource;
+  return (
+    <details className="rounded-xl border border-[var(--b2)] bg-[var(--s2)] px-3 py-2 text-[11px] text-t3">
+      <summary className="cursor-pointer font-semibold text-t2">How every attributed figure on this page was produced</summary>
+      <dl className="mt-2 space-y-1.5">
+        <div><dt className="inline font-semibold text-t2">Attribution window: </dt><dd className="inline">{windowLine}</dd></div>
+        <div><dt className="inline font-semibold text-t2">Value basis: </dt><dd className="inline">{basis.valueBasis}</dd></div>
+        <div><dt className="inline font-semibold text-t2">Derived from: </dt><dd className="inline">{basis.derivedFrom}</dd></div>
+        <div><dt className="inline font-semibold text-t2">Not attributed: </dt><dd className="inline">{basis.notAttributed}</dd></div>
+        <div>
+          <dt className="font-semibold text-t2">Rules in force</dt>
+          <dd>
+            <ul className="mt-0.5 space-y-0.5">
+              {Object.entries(basis.rules).map(([outcome, rule]) => (
+                <li key={outcome}>{outcome}: <span className="font-mono">{rule}</span></li>
+              ))}
+            </ul>
+          </dd>
+        </div>
+      </dl>
+    </details>
   );
 }
 
@@ -416,6 +511,9 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
   const [audienceError, setAudienceError] = useState<string | null>(null);
   const [deliveryError, setDeliveryError] = useState<string | null>(null);
   const [deliveryEvidenceLoaded, setDeliveryEvidenceLoaded] = useState(false);
+  const [attribution, setAttribution] = useState<CampaignAttributionDetail | null>(null);
+  const [attributionError, setAttributionError] = useState<string | null>(null);
+  const [attributionLoaded, setAttributionLoaded] = useState(false);
   const [confirmation, setConfirmation] = useState<{ kind: 'approve' | 'launch'; preview: CampaignLaunchPreview } | null>(null);
 
   const meta = CAMPAIGN_STATUS_META[campaign.status] ?? { label: campaign.status, badge: 'badge-blue' };
@@ -423,9 +521,10 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
   const channel = (campaign.channel ?? 'sms') as CommChannel;
 
   const loadAux = useCallback(async () => {
-    const [audienceResult, deliveryResult] = await Promise.allSettled([
+    const [audienceResult, deliveryResult, attributionResult] = await Promise.allSettled([
       crmApi.previewAudience(audienceType, channel),
       crmApi.listDeliveries(campaign.id),
+      crmApi.campaignAttribution(campaign.id),
     ]);
     if (audienceResult.status === 'fulfilled') {
       setPreview(audienceResult.value);
@@ -442,14 +541,24 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
       setDeliveryError('Dispatch evidence is unavailable. Do not infer that no dispatch occurred; review provider records before retrying.');
       setDeliveryEvidenceLoaded(false);
     }
+    if (attributionResult.status === 'fulfilled') {
+      setAttribution(attributionResult.value);
+      setAttributionError(null);
+      setAttributionLoaded(true);
+    } else {
+      setAttribution(null);
+      setAttributionError('Attribution evidence is unavailable. Do not infer that this campaign produced no bookings or no revenue.');
+      setAttributionLoaded(false);
+    }
   }, [audienceType, channel, campaign.id]);
 
   useEffect(() => {
     let active = true;
     void (async () => {
-      const [audienceResult, deliveryResult] = await Promise.allSettled([
+      const [audienceResult, deliveryResult, attributionResult] = await Promise.allSettled([
         crmApi.previewAudience(audienceType, channel),
         crmApi.listDeliveries(campaign.id),
+        crmApi.campaignAttribution(campaign.id),
       ]);
       if (!active) return;
       if (audienceResult.status === 'fulfilled') {
@@ -462,6 +571,13 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
       } else {
         setDeliveryError('Dispatch evidence is unavailable. Do not infer that no dispatch occurred; review provider records before retrying.');
         setDeliveryEvidenceLoaded(false);
+      }
+      if (attributionResult.status === 'fulfilled') {
+        setAttribution(attributionResult.value); setAttributionError(null); setAttributionLoaded(true);
+      } else {
+        setAttribution(null);
+        setAttributionError('Attribution evidence is unavailable. Do not infer that this campaign produced no bookings or no revenue.');
+        setAttributionLoaded(false);
       }
       setDraft(null); setLaunch(null); setNotice(null); setError(null);
     })();
@@ -520,10 +636,16 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
           {campaign.requiresApprovalPending && <span className="badge badge-amber">Approval required</span>}
           {campaign.dispatchAuthorizationRecorded && <span className="badge badge-emerald">Dispatch authorization recorded</span>}
         </div>
-        {/* Outcome fields exist on the row and nothing writes them, so this
-            campaign's "results" are stated as the absence they are. Dispatch
-            evidence below is the real record of what left the building. */}
-        <p className="text-[11px] text-t3">Response, open and revenue outcomes are not recorded for campaigns yet. Dispatch evidence below is the only outcome record this campaign has.</p>
+        {/* This campaign's outcomes, from the per-campaign attribution read.
+            Every count below is a count of CampaignAttribution rows; engagement
+            is the one figure the platform cannot evidence, and it is named as
+            unavailable rather than rendered as a small percentage. */}
+        <CampaignOutcomes
+          loaded={attributionLoaded}
+          error={attributionError}
+          detail={attribution}
+          onRetry={() => void loadAux()}
+        />
         {campaign.messageTemplate && <p className="text-xs text-t3 whitespace-pre-wrap rounded-lg border border-[var(--b1)] p-2.5">{campaign.messageSubject ? `${campaign.messageSubject}\n` : ''}{campaign.messageTemplate}</p>}
         {notice && <p className="text-[11px] text-emerald-v">{notice}</p>}
         {error && <p className="text-[11px] text-red-v">{error}</p>}
@@ -624,6 +746,58 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * One campaign's attributed outcomes.
+ *
+ * The counts are counts of evidence rows, so a resolved response carrying none
+ * is a truthful zero — it says this campaign has no attributed outcome, not
+ * that outcomes are unmeasured. Money is different: only a `paid` row carries
+ * an amount, so the absence of one is stated rather than totalled to $0. And
+ * engagement is never a number here at all; the API reports it as unavailable
+ * with a reason, and that reason is what is rendered.
+ */
+function CampaignOutcomes({ loaded, error, detail, onRetry }: {
+  loaded: boolean; error: string | null; detail: CampaignAttributionDetail | null; onRetry: () => void;
+}) {
+  if (error) {
+    return (
+      <p role="alert" className="text-[11px] text-red-v">
+        {error} <button type="button" onClick={onRetry} className="ml-1 font-semibold underline">Try again</button>
+      </p>
+    );
+  }
+  if (!loaded || !detail) {
+    return <p role="status" aria-live="polite" className="text-[11px] text-t3">Loading attributed outcomes…</p>;
+  }
+
+  const revenue = summarizeAttributedRevenue([detail]);
+  const windows = attributionWindowsObserved([detail]);
+  return (
+    <div className="rounded-lg border border-[var(--b1)] p-2.5 space-y-1.5">
+      <p className="text-[10px] font-bold uppercase tracking-wide text-t3">Attributed outcomes</p>
+      <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-t2">
+        <span><span className="font-bold text-t1 tabular-nums">{detail.outcomes.booked}</span> attributed booking{detail.outcomes.booked === 1 ? '' : 's'}</span>
+        <span><span className="font-bold text-t1 tabular-nums">{detail.outcomes.attended}</span> attended</span>
+        <span>
+          Attributed revenue:{' '}
+          {revenue.status === 'attributed'
+            ? <span className="font-bold text-emerald-v tabular-nums">{formatAttributedAmount(revenue.amount, revenue.currency)}</span>
+            : <span className="font-semibold text-t3">not recorded yet</span>}
+        </span>
+      </div>
+      {revenue.status === 'not_attributed' && <p className="text-[10px] text-t3">{revenue.reason}</p>}
+      {/* The engagement rate this platform refuses to invent. */}
+      <p className="text-[10px] text-t3">{describeEngagementUnavailability(detail.engagement)}</p>
+      <p className="text-[10px] text-t3">
+        {detail.attributions.length} evidence row{detail.attributions.length === 1 ? '' : 's'}
+        {windows.length > 0 ? ` · ${windows.map(days => `${days}-day`).join(', ')} attribution window as recorded on each row` : ''}
+        {detail.lastAttributedAt ? ` · last attributed ${new Date(detail.lastAttributedAt).toLocaleDateString()}` : ''}
+      </p>
+      <p className="text-[10px] text-t3">An outcome that cannot be tied to a provider-accepted delivery inside that delivery's window is not attributed at all. Dispatch evidence below records what left the building.</p>
     </div>
   );
 }
