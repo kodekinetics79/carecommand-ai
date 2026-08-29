@@ -140,6 +140,44 @@ export const FEATURE_LABELS: Record<string, string> = {
   custom_integrations: 'Custom Integrations',
 };
 
+// Company record an operator maintains for a client. Every field is nullable:
+// null means "not recorded" and must render as such, never as an empty value
+// the reader could mistake for a known blank.
+export interface TenantCompany {
+  legalName: string | null; companyNumber: string | null;
+  addressLine1: string | null; addressLine2: string | null;
+  city: string | null; region: string | null; postalCode: string | null; country: string | null;
+  mainPhone: string | null; website: string | null;
+  primaryContactName: string | null; primaryContactEmail: string | null; primaryContactPhone: string | null;
+  billingContactName: string | null; billingContactEmail: string | null;
+  accountNotes: string | null;
+}
+
+// The platform plane cannot read a tenant's staff list by design; it sees the
+// account owner, aggregate role counts, and branches. There is no roster here.
+export interface TenantAccountRecord {
+  tenantId: string; name: string; slug: string; status: string; createdAt: string;
+  company: TenantCompany;
+  accountOwner: {
+    id: string; displayName: string; email: string; role: string;
+    active: boolean; mfaEnabled: boolean; lastLoginAt: string | null; createdAt: string;
+  } | null;
+  roleBreakdown: Array<{ role: string; active: number; inactive: number }>;
+  branches: Array<{ id: string; name: string; location: string; timezone: string; active: boolean; createdAt: string }>;
+}
+
+// Staff roster, readable only under an open support session (break-glass).
+// The server returns 403 support_session_required when none is open, so an
+// empty list never stands in for "not permitted".
+export interface TenantRoster {
+  tenantId: string;
+  supportSession: { id: string; reason: string; expiresAt: string; operatorEmail: string | null };
+  users: Array<{
+    id: string; displayName: string; email: string; role: string; branchName: string | null;
+    active: boolean; mfaEnabled: boolean; lockedUntil: string | null; lastLoginAt: string | null; createdAt: string;
+  }>;
+}
+
 export const TENANT_STATUS_BADGE: Record<string, string> = { active: 'badge-emerald', suspended: 'badge-red', cancelled: 'badge-red' };
 export const SUB_STATUS_BADGE: Record<string, string> = { ACTIVE: 'badge-emerald', TRIAL: 'badge-violet', PAST_DUE: 'badge-amber', SUSPENDED: 'badge-red', CANCELLED: 'badge-red' };
 
@@ -156,6 +194,10 @@ export const platformAdmin = {
   tenant: (id: string) => pf<TenantSummary>(`/v1/platform/tenants/${id}`),
   createTenant: (body: { name: string; slug: string; planKey?: string; ownerName: string; ownerEmail: string; ownerPassword: string; defaultBranchName?: string; timezone?: string }) =>
     pf<TenantSummary>(`/v1/platform/tenants`, { method: 'POST', body: JSON.stringify(body) }),
+  company: (id: string) => pf<TenantAccountRecord>(`/v1/platform/tenants/${id}/company`),
+  updateCompany: (id: string, body: Partial<TenantCompany> & { reason: string }) =>
+    pf<{ tenantId: string; company: TenantCompany; changed: string[] }>(`/v1/platform/tenants/${id}/company`, { method: 'PATCH', body: JSON.stringify(body) }),
+  roster: (id: string) => pf<TenantRoster>(`/v1/platform/tenants/${id}/users`),
   suspend: (id: string) => pf<{ status: string }>(`/v1/platform/tenants/${id}/suspend`, { method: 'POST' }),
   reactivate: (id: string) => pf<{ status: string }>(`/v1/platform/tenants/${id}/reactivate`, { method: 'POST' }),
   changePlan: (id: string, planKey: string) => pf<TenantSummary>(`/v1/platform/tenants/${id}/subscription/change-plan`, { method: 'POST', body: JSON.stringify({ planKey }) }),

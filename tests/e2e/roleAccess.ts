@@ -54,8 +54,10 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
   { path: '/receptionist-studio', label: 'Receptionist Studio', primaryCall: '/v1/receptionist/overview' },
   { path: '/staff', label: 'Staff Tasks', primaryCall: '/v1/staff/overview' },
   { path: '/crm', label: 'CRM', primaryCall: '/v1/leads' },
-  { path: '/campaigner', label: 'Campaigner', primaryCall: '/v1/campaigns' },
-  { path: '/reactivation', label: 'Reactivation', primaryCall: '/v1/crm/campaigns' },
+  // /campaigner and /reactivation were one Campaign table behind two doors;
+  // they merged into the single /campaigns workspace (both old paths now
+  // redirect there — asserted by growth-redirects-and-nav.spec.ts).
+  { path: '/campaigns', label: 'Campaigns', primaryCall: '/v1/crm/campaigns' },
   { path: '/autopilot', label: 'Autopilot', primaryCall: '/v1/autopilot/playbooks' },
   { path: '/reviews', label: 'Reviews', primaryCall: '/v1/reviews' },
   { path: '/clinic-radar', label: 'ClinicRadar', primaryCall: '/v1/competitors/radar' },
@@ -95,30 +97,34 @@ export interface RoleAccessContract {
 
 export const ROLE_ACCESS: Record<CrawlRole, RoleAccessContract> = {
   // Every permission in the vocabulary: the whole inventory.
+  // 2026-08-29: 32 -> 31 when /campaigner and /reactivation merged into the
+  // single /campaigns destination.
   OWNER: {
-    navDestinations: 32,
-    mustOffer: ['/', '/settings', '/patients', '/scheduling', '/insurance', '/staff', '/integrations', '/monitoring', '/compliance', '/control-plane'],
+    navDestinations: 31,
+    mustOffer: ['/', '/settings', '/patients', '/scheduling', '/insurance', '/staff', '/integrations', '/monitoring', '/compliance', '/control-plane', '/campaigns'],
     mustNotOffer: [],
   },
   // Patient, billing, staff and CRM reads; no revenue, operations, integrations
-  // or compliance grant, and not on the connected-care role list.
+  // or compliance grant, and not on the connected-care role list. Holds both
+  // campaign:read and crm:read, so the merged campaign workspace is offered.
+  // 2026-08-29: 20 -> 19 for the same /campaigns merge (two entries became one).
   FRONT_DESK: {
-    navDestinations: 20,
-    mustOffer: ['/', '/settings', '/patients', '/scheduling', '/insurance', '/staff', '/crm'],
+    navDestinations: 19,
+    mustOffer: ['/', '/settings', '/patients', '/scheduling', '/insurance', '/staff', '/crm', '/campaigns'],
     mustNotOffer: ['/control-plane', '/compliance', '/integrations', '/monitoring', '/revenue', '/receptionist-studio'],
   },
   // Clinical reads plus the connected-care role list; no CRM, billing, revenue
-  // or compliance grant.
+  // or compliance grant — and therefore no campaign workspace.
   PROVIDER: {
     navDestinations: 17,
     mustOffer: ['/', '/settings', '/patients', '/scheduling', '/staff', '/monitoring', '/doctor-workspace'],
-    mustNotOffer: ['/control-plane', '/compliance', '/crm', '/insurance', '/revenue', '/integrations'],
+    mustNotOffer: ['/control-plane', '/compliance', '/crm', '/campaigns', '/insurance', '/revenue', '/integrations'],
   },
   // Compliance and audit reads and nothing operational.
   AUDITOR: {
     navDestinations: 9,
     mustOffer: ['/', '/settings', '/compliance'],
-    mustNotOffer: ['/control-plane', '/patients', '/scheduling', '/insurance', '/staff', '/integrations', '/monitoring', '/revenue'],
+    mustNotOffer: ['/control-plane', '/patients', '/scheduling', '/insurance', '/staff', '/integrations', '/monitoring', '/revenue', '/campaigns'],
   },
 };
 

@@ -6,7 +6,7 @@ import { requirePortalAccess, requirePortalFeature, portalAudit } from '../../li
 import { publicView, submitSectionMutation, emitSectionSubmissionEffects, submitPacketMutation, emitPacketSubmissionEffects, readinessScore } from '../../lib/intake';
 import { computeProviderSlots, findSlotConflict, getSchedulingPolicy, isDoubleBookConflictError, resolveSchedulingService, unmetPreVisitRequirements } from '../../lib/scheduling';
 import { evaluateDepositForAppointment } from '../../lib/deposits';
-import { canonicalDncDestination } from '../../lib/receptionist/dncFence';
+import { canonicalDncDestination, lockSuppressionFences } from '../../lib/receptionist/dncFence';
 
 // Appointment states a patient can still act on from the portal. COMPLETED /
 // ARRIVED / NO_SHOW are terminal-for-the-patient (staff-only from here on).
@@ -585,12 +585,37 @@ export const portalRoutes: FastifyPluginAsync = async app => {
     if (body.voice !== undefined) updates.push(['VOICE', body.voice]);
     if (body.marketing !== undefined) updates.push(['MARKETING', body.marketing]);
     await db.$transaction(async tx => {
+      // Suppression fences FIRST, in the SAME transaction as every write below —
+      // exactly what campaigns POST /consent and POST /suppressions do, and the
+      // mirror of what claimCampaignProviderIntent() /
+      // claimCampaignProviderSubmission() take before they re-read suppression.
+      //
+      // Two different keys are needed because this handler writes two
+      // differently-keyed opt-out records:
+      //   * ConsentEvent (SMS/EMAIL/WHATSAPP/MARKETING) is IDENTITY-keyed —
+      //     isSuppressedTx reads it by (tenantId, patientId, purpose), so the
+      //     patient identity fence is the one a dispatcher for this patient
+      //     also holds.
+      //   * ReceptionistOptOut (voice) is DESTINATION-keyed — isSuppressedTx
+      //     reaches it through isDestinationOptedOutTx(tenantId, destination),
+      //     and it suppresses that phone number for EVERY identity, including a
+      //     Lead this portal session knows nothing about. A dispatcher aimed at
+      //     such a lead holds only the destination fence, so the patient fence
+      //     alone would not serialize with it.
+      // The destination is resolved before the fence is taken so the lock is
+      // held across the read-modify-write, not just the write.
+      const voiceDestination = body.voice === undefined ? null : await portalVoiceOptOutDestination(tx, tenantId, patientId);
+      await lockSuppressionFences(tx, {
+        tenantId,
+        patientId,
+        destinations: voiceDestination ? [voiceDestination] : [],
+      });
       for (const [purpose, granted] of updates) {
         // Append-only consent history. SMS/EMAIL/WHATSAPP/MARKETING continue to
         // use ConsentEvent; voice uses CommunicationConsent so the portal can read
         // and persist it without expanding the legacy enum. No history is erased.
         if (purpose === 'VOICE') {
-          await recordPortalVoiceOptOut(tx, tenantId, patientId);
+          await recordPortalVoiceOptOut(tx, tenantId, voiceDestination!);
           continue;
         }
         await tx.consentEvent.create({ data: { tenantId, patientId, purpose: purpose as 'SMS' | 'EMAIL' | 'WHATSAPP' | 'MARKETING', granted, source: 'patient_portal' } });
@@ -654,10 +679,21 @@ function safePaymentUrl(value: string | null): string | null {
 }
 function maskMember(m: string): string { return m.length <= 4 ? '••••' : `••••${m.slice(-4)}`; }
 const insuranceSchema = z.object({ planName: z.string().trim().min(1).max(120), memberId: z.string().trim().min(2).max(80), groupNumber: z.string().trim().max(80).optional(), subscriberName: z.string().trim().max(120).optional() });
-async function recordPortalVoiceOptOut(tx: Prisma.TransactionClient, tenantId: string, patientId: string) {
+/**
+ * The canonical destination a portal voice opt-out will be written against.
+ * Split out of recordPortalVoiceOptOut so the caller can take the destination
+ * suppression fence BEFORE the read-modify-write below, in the same
+ * transaction. Throws the same error, at the same point in the same
+ * transaction, as before — so a patient with no phone still fails the whole
+ * preference update and writes nothing.
+ */
+async function portalVoiceOptOutDestination(tx: Prisma.TransactionClient, tenantId: string, patientId: string): Promise<string> {
   const patient = await tx.patient.findFirst({ where: { tenantId, id: patientId, deletedAt: null }, select: { phone: true } });
   const phone = canonicalDncDestination(patient?.phone ?? '');
   if (!phone) throw new Error('portal_voice_opt_out_destination_unavailable');
+  return phone;
+}
+async function recordPortalVoiceOptOut(tx: Prisma.TransactionClient, tenantId: string, phone: string) {
   const active = await tx.receptionistOptOut.findMany({
     where: { tenantId, revokedAt: null, channel: { in: ['ALL', 'VOICE'] }, contactPhone: { not: null } },
     select: { contactPhone: true },

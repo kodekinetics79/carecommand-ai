@@ -4,6 +4,7 @@ import {
   channelStatus, hasAffirmativeNonVoiceOutreachAuthority, isSuppressed,
   toE164, isValidE164, isValidEmail, type CommChannel,
 } from './campaigns';
+import { claimCampaignProviderSubmission, type CampaignSubmissionTicket } from './campaignIntegrity';
 
 // ===========================================================================
 // Real communications send abstraction. Dependency-free (raw HTTP, matching the
@@ -30,6 +31,21 @@ export interface SendContext {
   patientId?: string | null;
   leadId?: string | null;
   regulatedOutreach?: { purpose: string };
+  /**
+   * A durable, already-committed campaign submission claim (see
+   * campaignIntegrity.claimCampaignProviderIntent). Its presence is what makes
+   * a regulated live campaign send permissible at all, and it is claimed
+   * exactly once immediately before provider I/O so a second attempt for the
+   * same recipient is a no-op instead of a duplicate message.
+   *
+   * A caller with no fence (e.g. the per-lead CTA) simply omits it and stays
+   * blocked on the live path, exactly as before.
+   */
+  campaignSubmission?: {
+    campaignId: string;
+    fenceKey: string;
+    ticket: CampaignSubmissionTicket;
+  };
 }
 
 type ConfirmationAuthorization = {
@@ -96,10 +112,9 @@ export async function sendMessage(channel: CommChannel, destination: string, sub
 
   // Dev/test mock delivery stays available for synthetic pilots. A real
   // non-voice campaign boundary is stricter: it requires exact versioned
-  // authority, and remains conservatively disabled until consent capture and
-  // the provider submission claim can be linearized under one durable fence.
-  // This prevents an opt-out racing the last application check before provider
-  // I/O and makes unsafe live activation fail closed.
+  // authority AND a durable submission claim that linearizes the consent /
+  // opt-out decision with the provider hand-off. A caller that arrives without
+  // that fence still fails closed here, so no unfenced path can go live.
   const syntheticMock = status.mock && env.NODE_ENV !== 'production';
   if (context.regulatedOutreach && !syntheticMock && (channel === 'sms' || channel === 'email' || channel === 'whatsapp')) {
     const authorized = await hasAffirmativeNonVoiceOutreachAuthority(
@@ -111,7 +126,42 @@ export async function sendMessage(channel: CommChannel, destination: string, sub
     if (!authorized) {
       return { ok: false, status: 'failed', mode: 'live', failureReason: 'affirmative_outreach_authority_required' };
     }
-    return { ok: false, status: 'failed', mode: 'live', failureReason: 'live_outreach_atomic_boundary_not_activated' };
+    // No fence, or a fence that was not claimed under a live tenant activation
+    // → nothing is submitted. This is the same refusal the boundary has always
+    // returned; it is now a real test of durable evidence rather than a literal.
+    if (!context.campaignSubmission
+      || context.campaignSubmission.ticket.submissionMode !== 'live'
+      || !context.campaignSubmission.ticket.dispatchActivationId) {
+      return { ok: false, status: 'failed', mode: 'live', failureReason: 'live_outreach_atomic_boundary_not_activated' };
+    }
+  }
+
+  // Claim the submission exactly once, AFTER the suppression gate above and
+  // BEFORE any provider request. The database transaction is short and never
+  // spans the provider call.
+  if (context.campaignSubmission) {
+    const claim = await claimCampaignProviderSubmission({
+      tenantId: context.tenantId,
+      campaignId: context.campaignSubmission.campaignId,
+      channel,
+      destination,
+      idempotencyKey,
+      ticket: context.campaignSubmission.ticket,
+      fenceKey: context.campaignSubmission.fenceKey,
+    });
+    if (!claim.claimed) {
+      // An opt-out observed inside the claim transaction is a suppression, not
+      // a failure: nothing was submitted and nothing should be retried.
+      if (claim.reason === 'suppressed_at_submission') {
+        return { ok: false, status: 'suppressed', mode: 'suppressed', failureReason: 'suppressed_or_opted_out' };
+      }
+      return {
+        ok: false,
+        status: 'failed',
+        mode: syntheticMock ? 'mock_dev' : 'live',
+        failureReason: `campaign_submission_not_claimed:${claim.reason}`,
+      };
+    }
   }
 
   return sendToConfiguredProvider(channel, destination, subject, body, idempotencyKey, status);

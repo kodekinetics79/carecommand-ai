@@ -11,6 +11,7 @@ import type { Appointment, Doctor } from '../types';
 import { formatCurrency } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
 import { apiRequest } from '../lib/api';
+import type { CampaignHandoff } from '../lib/crm';
 import { mapAppointment, mapProviderProfile, mapRevenueSnapshot, type ApiAppointment, type ApiProviderProfile, type ApiRevenueSnapshot } from '../lib/apiAdapters';
 
 // Genuine revenue-protection aggregates from the DB (server computes these from real
@@ -294,7 +295,11 @@ export default function Revenue() {
               Example scenario (not current clinic figures): a network may record additional associated value after operational follow-up and an approved outreach campaign.
               This is not a forecast or causal attribution. Define the measurement period and validate every assumption with finance before using it for planning.
             </p>
-            <button type="button" onClick={() => navigate('/campaigner')} className="inline-flex items-center gap-1.5 text-sm font-semibold text-indigo hover:opacity-80 transition-colors">
+            {/* The plan above is an illustrative example, not a chosen audience or
+                goal — so the handoff says only where the click came from. */}
+            <button type="button" onClick={() => navigate('/campaigns', { state: {
+              source: 'Revenue', contextLabel: 'Revenue Action Plan',
+            } satisfies CampaignHandoff })} className="inline-flex items-center gap-1.5 text-sm font-semibold text-indigo hover:opacity-80 transition-colors">
               Review campaign setup <ArrowRight className="w-4 h-4" />
             </button>
           </div>

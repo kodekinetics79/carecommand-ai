@@ -1,6 +1,7 @@
 import { Sparkles, ArrowUpRight, Megaphone, Shield, ShieldAlert, ShieldCheck, TrendingDown, TrendingUp } from 'lucide-react';
 import { useCountUp } from '../../hooks/useCountUp';
 import { formatCurrency } from '../../utils/formatters';
+import type { CampaignHandoff } from '../../lib/crm';
 import type { DashboardSummary } from '../../lib/dashboardService';
 
 export interface SparkPoint { label: string; value: number }
@@ -29,7 +30,7 @@ export default function CommandDeck({
   summary: DashboardSummary;
   /** Chronological monthly revenue points; sparkline hides when < 2 (never faked). */
   spark: SparkPoint[];
-  onNavigate: (route: string) => void;
+  onNavigate: (route: string, options?: { state?: CampaignHandoff }) => void;
 }) {
   const risk = riskFrom(summary);
   const RiskIcon = risk.icon;
@@ -65,7 +66,7 @@ export default function CommandDeck({
               className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3.5 py-1.5 text-[12.5px] font-semibold text-white hover:opacity-90 transition">
               <Sparkles className="w-3.5 h-3.5" aria-hidden="true" /> Ask Advisors
             </button>
-            <button type="button" onClick={() => onNavigate('/campaigner')}
+            <button type="button" onClick={() => onNavigate('/campaigns', { state: { source: 'Dashboard' } })}
               className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-white px-3.5 py-1.5 text-[12.5px] font-semibold text-t1 hover:bg-[var(--s2)] transition">
               <Megaphone className="w-3.5 h-3.5 text-t3" aria-hidden="true" /> Review campaigns
             </button>

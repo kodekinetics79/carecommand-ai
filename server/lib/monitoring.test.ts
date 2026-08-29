@@ -70,3 +70,46 @@ describe('regression — existing numeric bands unchanged', () => {
     expect(evaluateSeverity('glucose', 110, null).severity).toBe('normal');
   });
 });
+
+// ── Fix 3: directional edge warnings ─────────────────────────────────────────
+// The proximity warning used to fire on BOTH edges of every band. For oxygen
+// the high edge is 100% — a physiologically perfect reading — so every ideal
+// pulse-ox result manufactured a `warning` ReadingAlert AND a NotificationEvent.
+// Those rows then consumed slots in the alert queue's fixed window, pushing real
+// open criticals out of the nurse's view. Normal readings must stay silent.
+describe('edge warnings are directional (no alerts on ideal readings)', () => {
+  it('SpO2 100% → normal (the high edge is the best possible result)', () => {
+    expect(evaluateSeverity('oxygen', 100, null).severity).toBe('normal');
+  });
+  it('SpO2 99% and 98% → normal', () => {
+    expect(evaluateSeverity('oxygen', 99, null).severity).toBe('normal');
+    expect(evaluateSeverity('oxygen', 98, null).severity).toBe('normal');
+  });
+  it('SpO2 92% → warning (the LOW edge still matters — desaturation)', () => {
+    expect(evaluateSeverity('oxygen', 92, null).severity).toBe('warning');
+  });
+  it('SpO2 90% → high, 88% → critical (leaving the band is unchanged)', () => {
+    expect(evaluateSeverity('oxygen', 90, null).severity).toBe('high');
+    expect(evaluateSeverity('oxygen', 88, null).severity).toBe('critical');
+  });
+  it('oxygen declares a low-only edge; the other bands stay two-sided', () => {
+    expect(DEFAULT_THRESHOLDS.oxygen.edgeWarn).toBe('low');
+    expect(DEFAULT_THRESHOLDS.glucose.edgeWarn).toBe('both');
+    expect(DEFAULT_THRESHOLDS.heart_rate.edgeWarn).toBe('both');
+  });
+  it('two-sided bands still warn near BOTH edges (glucose 70 / 178, HR 50)', () => {
+    expect(evaluateSeverity('glucose', 70, null).severity).toBe('warning');
+    expect(evaluateSeverity('glucose', 178, null).severity).toBe('warning');
+    expect(evaluateSeverity('heart_rate', 50, null).severity).toBe('warning');
+  });
+  it('a rule can override the direction per patient', () => {
+    const silent = { minValue: null, maxValue: null, criticalMin: null, criticalMax: null, edgeWarn: 'none' as const };
+    expect(evaluateSeverity('glucose', 70, silent).severity).toBe('normal');
+    // …without weakening the out-of-band result.
+    expect(evaluateSeverity('glucose', 320, silent).severity).toBe('critical');
+  });
+  it('names which edge drove the warning', () => {
+    expect(evaluateSeverity('oxygen', 92, null).reason).toContain('low edge');
+    expect(evaluateSeverity('glucose', 178, null).reason).toContain('high edge');
+  });
+});

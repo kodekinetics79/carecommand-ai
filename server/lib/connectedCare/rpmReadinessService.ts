@@ -7,6 +7,37 @@ import {
   rpmPeriodBounds,
 } from './rpmEvidence';
 
+/**
+ * RPM readiness is expensive per patient: one interactive transaction holding a
+ * pg advisory lock while it rebuilds and SHA-256s the whole evidence snapshot.
+ * The Prisma pool defaults to 10 connections, so an unbounded `Promise.all`
+ * over a panel of 200 patients opens 200 concurrent transactions against 10
+ * slots — queued transactions blow past the 2s maxWait / 5s timeout and the
+ * request 500s while starving every OTHER route in the process. Cap the
+ * in-flight count so a large panel degrades into a slower response instead of a
+ * tenant-wide outage.
+ */
+export const RPM_READINESS_CONCURRENCY = 4;
+
+/** Bounded-concurrency map that preserves input order. */
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    for (;;) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 export async function computeAndStoreRpmReadiness(tenantId: string, patientId: string, now = new Date()) {
   const period = rpmPeriodBounds(now);
   return db.$transaction(async tx => {
@@ -75,6 +106,7 @@ export async function countCurrentReadyRpmPatients(
     select: { patientId: true },
   });
   const uniquePatientIds = [...new Set(enrollments.map(enrollment => enrollment.patientId))];
-  const readiness = await Promise.all(uniquePatientIds.map(patientId => computeAndStoreRpmReadiness(tenantId, patientId, now)));
+  const readiness = await mapWithConcurrency(uniquePatientIds, RPM_READINESS_CONCURRENCY,
+    patientId => computeAndStoreRpmReadiness(tenantId, patientId, now));
   return readiness.filter(item => item.result.status === 'READY').length;
 }

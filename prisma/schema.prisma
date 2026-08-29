@@ -104,6 +104,26 @@ model Tenant {
   slug                                String                               @unique
   // Platform-controlled lifecycle status: active | suspended | cancelled.
   status                              String                               @default("active")
+  // Company record, maintained by platform operators (see
+  // 20260829040000_tenant_company_record). All nullable: an existing tenant has
+  // no company record yet, and a blank field must read as "not recorded"
+  // rather than as a fabricated value.
+  legalName                           String?
+  companyNumber                       String?
+  addressLine1                        String?
+  addressLine2                        String?
+  city                                String?
+  region                              String?
+  postalCode                          String?
+  country                             String?
+  mainPhone                           String?
+  website                             String?
+  primaryContactName                  String?
+  primaryContactEmail                 String?
+  primaryContactPhone                 String?
+  billingContactName                  String?
+  billingContactEmail                 String?
+  accountNotes                        String?
   createdAt                           DateTime                             @default(now())
   updatedAt                           DateTime                             @updatedAt
   branches                            Branch[]
@@ -219,6 +239,13 @@ model Tenant {
   aiUsageLogs                         AIUsageLog[]
   aiEvaluations                       AIEvaluation[]
   portalAccessRequests                PortalAccessRequest[]
+  leadActivities                      LeadActivity[]
+  growthPolicy                        GrowthPolicy?
+  growthSegmentDefinitions            GrowthSegmentDefinition[]
+  growthChannelCosts                  GrowthChannelCost[]
+  campaignSubmissionClaims            CampaignSubmissionClaim[]
+  campaignLiveDispatchActivations     CampaignLiveDispatchActivation[]
+  campaignAttributions                CampaignAttribution[]
 }
 
 model User {
@@ -262,6 +289,7 @@ model User {
   conversationReplyAttempts ConversationReplyAttempt[]
   eligibilityExecutions          EligibilityExecution[]          @relation("EligibilityExecutionActor")
   eligibilityReconciliationsVerified EligibilityExecution[]      @relation("EligibilityReconciliationVerifier")
+  leadActivities                 LeadActivity[]                  @relation("LeadActivityActor")
 
   @@unique([tenantId, email])
   @@unique([tenantId, id])
@@ -311,6 +339,8 @@ model Branch {
   devices                        Device[]
   receptionistLocations          ReceptionistLocation[]
   receptionistOutboundCampaignDefaults ReceptionistOutboundCampaign[] @relation("ReceptionistOutboundDefaultBranch")
+  campaigns                      Campaign[]
+  campaignAttributions           CampaignAttribution[]
 
   @@unique([tenantId, name])
   @@unique([tenantId, id])
@@ -369,6 +399,7 @@ model Patient {
   campaignSuppressions  CampaignSuppression[]
   intakePackets         PatientIntakePacket[]
   patientConsentRecords PatientConsentRecord[]
+  campaignAttributions  CampaignAttribution[]
   notificationEvents    NotificationEvent[]
   receptionistCallTargets ReceptionistCallTarget[]
   receptionistOutboundProviderIntents ReceptionistOutboundProviderIntent[]
@@ -422,6 +453,7 @@ model Appointment {
   sourceCallLog                  ReceptionistCallLog?             @relation("AppointmentSourceCall", fields: [tenantId, receptionistCallLogId], references: [tenantId, id], onDelete: Restrict)
   appointmentRequests            AppointmentRequest[]             @relation("AppointmentRequestBookedAppointment")
   notificationEvents             NotificationEvent[]
+  campaignAttributions           CampaignAttribution[]
 
   @@unique([tenantId, id])
   @@unique([tenantId, receptionistCallLogId])
@@ -514,6 +546,10 @@ model Lead {
   stage               String
   source              String
   estimatedValue      Decimal              @default(0) @db.Decimal(12, 2)
+  // Why the lead was lost, captured at the stage transition. The UI blocks the
+  // user until a justification is typed and promises it is recorded, so it is
+  // persisted here and echoed into the audit trail + LeadActivity history.
+  lostReason          String?
   deletedAt           DateTime?
   createdAt           DateTime             @default(now())
   updatedAt           DateTime             @updatedAt
@@ -523,9 +559,173 @@ model Lead {
   receptionistCallTargets ReceptionistCallTarget[]
   receptionistVoiceConsentEvents ReceptionistVoiceConsentEvent[]
   receptionistOutboundProviderIntents ReceptionistOutboundProviderIntent[]
+  activities          LeadActivity[]
+  campaignAttributions CampaignAttribution[]
 
   @@unique([tenantId, id])
   @@index([tenantId, stage, createdAt])
+}
+
+// Append-only-by-convention history of what happened to a lead. `Lead.stage` is
+// overwritten in place, so without this table a stage change leaves no trace and
+// "why are we losing leads?" has no answer. One row per transition, carrying the
+// operator's justification and the acting user.
+model LeadActivity {
+  id           String   @id @default(uuid()) @db.Uuid
+  tenantId     String   @db.Uuid
+  leadId       String   @db.Uuid
+  // stage_change today; the vocabulary widens as the module records more events.
+  activityType String
+  fromStage    String?
+  toStage      String?
+  reason       String?
+  actorUserId  String?  @db.Uuid
+  occurredAt   DateTime @default(now())
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade, map: "LeadActivity_tenant_fkey")
+  lead         Lead     @relation(fields: [tenantId, leadId], references: [tenantId, id], onDelete: Cascade, map: "LeadActivity_lead_scope_fkey")
+  actorUser    User?    @relation("LeadActivityActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, leadId, occurredAt])
+  @@index([tenantId, activityType, occurredAt])
+}
+
+// ===========================================================================
+// Growth configuration spine.
+//
+// The Growth module (CRM, segments, campaigner, reputation, competitor radar)
+// compiled ~40 clinic business rules into source. These three models are the
+// tenant-configurable home for them. Nothing reads them yet: the seeded values
+// reproduce today's constants exactly, and the call sites are rewired in a
+// later increment, so landing this changes no observable number.
+//
+// Threshold semantics (stated once, because ambiguity is how the module ended
+// up with four different churn-risk thresholds):
+//   * `...Score` / `...High` / `...Mid` / `...Good` / `...Fair` / `min...`
+//     are INCLUSIVE LOWER bounds  (value >= threshold).
+//   * `...SeverityMax` fields are INCLUSIVE UPPER bounds (value <= threshold).
+//   * `maxInactiveDays` is an EXCLUSIVE upper bound (days < threshold), which
+//     is what the 30–60 / 60–90 / 90–180 windows do today.
+//   * `competitorReviewVolumeHigh` is the one EXCLUSIVE lower bound
+//     (volume > threshold), preserving ClinicRadar's `reviewVolume > 350`.
+// ===========================================================================
+
+// One row per tenant. Absence = the column defaults below, which are the values
+// hardcoded in the frontend today, so a tenant that never opens the editor keeps
+// current behaviour (same contract as SchedulingPolicy).
+model GrowthPolicy {
+  id                              String   @id @default(uuid()) @db.Uuid
+  tenantId                        String   @unique @db.Uuid
+  // --- Lead scoring -------------------------------------------------------
+  hotLeadScore                    Int      @default(70)
+  scoreBandHigh                   Int      @default(70)
+  scoreBandMid                    Int      @default(40)
+  goingColdDays                   Int      @default(14)
+  // --- Retention / patient value ------------------------------------------
+  // 50 is the resolved single source of truth for "at risk". The frontend used
+  // >= 50 and server/modules/patients/routes.ts still uses >= 60; that call site
+  // is rewired to this column in the increment that starts reading this table.
+  churnRiskHigh                   Int      @default(50)
+  // Inclusive (>= 4000). The frontend used >= and the server used >, so a
+  // patient at exactly 4000 was high-value on one screen and not the other.
+  highValuePatientLtv             Decimal  @default(4000) @db.Decimal(12, 2)
+  // Explicitly unvalidated planning assumption, not a forecast.
+  recoverableLtvFraction          Decimal  @default(0.30) @db.Decimal(5, 4)
+  // --- Scheduling / no-show risk ------------------------------------------
+  // 50 is the resolved single source of truth for "high no-show risk"
+  // (INCLUSIVE, value >= threshold). Same resolution shape as churnRiskHigh:
+  // src/pages/Scheduling.tsx flagged at >= 50 (the clinic-visible rule),
+  // server/modules/advisory/service.ts counted at >= 60 and priced the count,
+  // and server/modules/revenue-protection.ts escalated at > 65. See
+  // THRESHOLD_RESOLUTIONS in server/modules/growth/defaults.ts. Added by
+  // 20260829130000_growth_policy_no_show_risk, which backfills existing rows
+  // via ADD COLUMN ... DEFAULT.
+  noShowRiskHigh                  Int      @default(50)
+  // --- Audience planning --------------------------------------------------
+  inactiveAudienceDays            Int      @default(180)
+  maxAudienceSize                 Int      @default(500)
+  slotFillHorizonDays             Int      @default(7)
+  // --- Reputation ---------------------------------------------------------
+  reviewRatingGood                Decimal  @default(4.5) @db.Decimal(3, 2)
+  reviewRatingFair                Decimal  @default(4.0) @db.Decimal(3, 2)
+  reputationRiskHigh              Int      @default(80)
+  reputationRiskMedium            Int      @default(55)
+  // --- Competitor radar ---------------------------------------------------
+  competitorRatingHighSeverityMax   Decimal  @default(4.2) @db.Decimal(3, 2)
+  competitorRatingMediumSeverityMax Decimal  @default(4.5) @db.Decimal(3, 2)
+  competitorReviewVolumeHigh      Int      @default(350)
+  // --- Outreach governance ------------------------------------------------
+  leadSendCooldownHours           Int      @default(24)
+  // --- Campaign attribution ------------------------------------------------
+  // How long after a delivery was ACCEPTED BY THE PROVIDER an outcome may still
+  // be linked to it. server/lib/campaignAttribution.ts reads this column and
+  // never a literal; the value in force at the moment a link is made is copied
+  // onto the CampaignAttribution row, so editing this number changes what will
+  // be attributed NEXT and never what was already attributed.
+  //
+  // Deliberately shorter than the only two vendors who publish a number:
+  // RevenueWell credits itself with all revenue from any appointment within 60
+  // days of an unmatched new-patient request. 30 days is a claim that can be
+  // defended one delivery at a time.
+  //
+  // Not carried in server/modules/growth/defaults.ts on purpose: that file's
+  // contract is "the constants the browser already shipped", and its seed block
+  // is pinned column-for-column by growthConfigSpine.unit.test.ts against an
+  // already-applied migration. This is a NEW decision, not a transcribed one,
+  // so its code-side default lives with the job that reads it
+  // (CAMPAIGN_ATTRIBUTION_WINDOW_DAYS_DEFAULT) and is pinned to this @default
+  // by campaignAttributionPolicy.unit.test.ts.
+  campaignAttributionWindowDays   Int      @default(30)
+  createdAt                       DateTime @default(now())
+  updatedAt                       DateTime @updatedAt
+  tenant                          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+}
+
+// Multi-row: the rule-based candidate groups the Growth module offers. Membership
+// is a planning candidate list, never a contact-eligibility decision — consent and
+// suppression are still verified at campaign preview and dispatch.
+model GrowthSegmentDefinition {
+  id                    String   @id @default(uuid()) @db.Uuid
+  tenantId              String   @db.Uuid
+  key                   String
+  label                 String
+  description           String
+  minInactiveDays       Int?
+  maxInactiveDays       Int?
+  // Today a patient with no recorded visit is treated as 9999 days inactive.
+  // This flag makes that behaviour explicit instead of an accident of arithmetic.
+  includeNeverVisited   Boolean  @default(false)
+  minLifetimeValue      Decimal? @db.Decimal(12, 2)
+  minChurnRisk          Int?
+  requiredTag           String?
+  suggestedChannel      String
+  plannedOffer          String
+  // Unvalidated planning assumption expressed as whole percent.
+  assumedBookingRatePct Int      @default(0)
+  active                Boolean  @default(true)
+  sortOrder             Int      @default(0)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+  tenant                Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, key])
+  @@index([tenantId, active, sortOrder])
+}
+
+// Planning cost per contact, per channel. Stored in integer MINOR units with an
+// explicit currency: the module previously computed `count * 3` and rendered it
+// through formatCurrency as "$120" for every tenant regardless of currency, and
+// float money cannot be summed safely.
+model GrowthChannelCost {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String   @db.Uuid
+  channel       String
+  unitCostMinor Int      @default(0)
+  currency      String   @default("USD")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, channel])
 }
 
 model Campaign {
@@ -537,6 +737,30 @@ model Campaign {
   channels         Channel[]
   audienceSize     Int                @default(0)
   sent             Int                @default(0)
+  // -------------------------------------------------------------------------
+  // DEPRECATED AS WRITABLE COLUMNS. These four are a MATERIALIZED ROLLUP of
+  // CampaignAttribution, maintained by database triggers
+  // (Campaign_attribution_rollup_guard / CampaignAttribution_rollup_refresh in
+  // migration 20260828230000_campaign_attribution). No application code path
+  // may set them: the guard raises P0001 for any statement that tries to move
+  // one to a value the evidence does not produce, and silently re-derives them
+  // on every other write, so an ordinary campaign UPDATE cannot leave a stale
+  // number behind either.
+  //
+  //   booked   = COUNT(CampaignAttribution WHERE outcomeType = 'booked')
+  //   revenue  = SUM(attributedValue) FILTER (outcomeType = 'paid') — money a
+  //              named PaymentTransaction actually recorded, never an imputed
+  //              per-event constant.
+  //   opened   = 0 and responded = 0, PINNED. This platform has no truthful
+  //              engagement receipt: normalizeProviderDeliveryStatus in
+  //              server/lib/campaignIntegrity.ts deliberately refuses to accept
+  //              a provider "opened" event, so there is nothing to count. They
+  //              are held at zero by construction rather than left at whatever
+  //              a caller last wrote.
+  //
+  // Read them for display only. server/lib/campaignAttribution.ts and the
+  // /v1/crm attribution endpoints derive every reported figure from the
+  // CampaignAttribution rows themselves, never from these columns.
   opened           Int                @default(0)
   responded        Int                @default(0)
   booked           Int                @default(0)
@@ -546,6 +770,15 @@ model Campaign {
   endsAt           DateTime?
   // CRM / reactivation engine (Phase A). Existing analytics fields above are
   // reused; these add playbook/approval/delivery semantics.
+  //
+  // Branch authority for the campaign. NULL means deliberately tenant-wide and
+  // is only creatable by an operator who is not restricted to a branch; a
+  // branch-restricted operator's campaign always carries their own branch. The
+  // audience query, the launch preview, the launch fingerprint and dispatch all
+  // resolve through this ONE column, so preview and dispatch can never disagree
+  // about who is in scope. Semantics match branchScope() in server/lib/scope.ts:
+  // exact match, and a NULL-branch row is out of scope for a scoped caller.
+  branchId         String?            @db.Uuid
   campaignType     String?
   audienceType     String?
   campaignChannel  String?
@@ -569,10 +802,16 @@ model Campaign {
   createdAt        DateTime           @default(now())
   updatedAt        DateTime           @updatedAt
   tenant           Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  // Tenant-consistent composite FK: a campaign can never be scoped to another
+  // tenant's branch, and RESTRICT stops a branch deletion from silently
+  // widening a scoped campaign back to tenant-wide.
+  branch           Branch?            @relation(fields: [tenantId, branchId], references: [tenantId, id], onDelete: Restrict)
   deliveries       CampaignDelivery[]
+  attributions     CampaignAttribution[]
 
   @@index([tenantId, status, createdAt])
   @@index([tenantId, archivedAt, createdAt])
+  @@index([tenantId, branchId, createdAt])
 }
 
 model Review {
@@ -1226,7 +1465,11 @@ model PaymentTransaction {
   appointment                 Appointment?               @relation(fields: [appointmentId], references: [id], onDelete: SetNull)
   paymentRequest              PaymentRequest?            @relation(fields: [paymentRequestId], references: [id], onDelete: SetNull)
   paymentProviderConnection   PaymentProviderConnection? @relation(fields: [paymentProviderConnectionId], references: [id], onDelete: SetNull)
+  campaignAttributions        CampaignAttribution[]
 
+  // Referenced by CampaignAttribution so an attributed payment can never belong
+  // to another tenant.
+  @@unique([tenantId, id])
   @@index([tenantId, branchId, createdAt])
   @@index([tenantId, status, createdAt])
 }
@@ -2821,8 +3064,13 @@ model CampaignDelivery {
   updatedAt         DateTime  @updatedAt
   tenant            Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   campaign          Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  submissionClaims  CampaignSubmissionClaim[]
+  attributions      CampaignAttribution[]
 
   @@unique([campaignId, patientId, leadId, channel])
+  // Referenced by CampaignSubmissionClaim so a claim can never be attached to a
+  // delivery row belonging to another tenant.
+  @@unique([tenantId, id])
   @@index([tenantId, status, createdAt])
   @@index([tenantId, providerMessageId])
 }
@@ -2833,6 +3081,194 @@ model CampaignDelivery {
 // object storage exists. Public access is via a hashed, expiring, packet-scoped
 // token. Reuses Patient/Appointment/Insurance/Payment/Consent foundations.
 // ===========================================================================
+// ---------------------------------------------------------------------------
+// Live campaign dispatch fence (Growth / CRM outreach).
+//
+// Two tables, one purpose: make the consent decision and the provider hand-off
+// inseparable, and keep live regulated outreach OFF until a named human turns it
+// on for their own tenant.
+// ---------------------------------------------------------------------------
+
+/// Durable, append-only submission evidence for ONE campaign recipient attempt.
+/// Ported from the receptionist appointment-confirmation outbox
+/// (NotificationDeliveryAttempt phases):
+///   PROVIDER_INTENT  - written by campaignDispatch inside the transaction that
+///                      holds the same suppression advisory fences opt-out
+///                      writers take and that re-reads suppression. This commit
+///                      is the linearization point: an opt-out is either visible
+///                      to it, or it lands strictly after the authorization.
+///   SUBMISSION_CLAIM - appended inside commsProvider immediately BEFORE
+///                      provider I/O, exactly once per attempt. The unique index
+///                      is what makes a second worker a no-op instead of a
+///                      duplicate send.
+///   RESULT           - the truthful outcome. `accepted` is provider acceptance,
+///                      never delivery.
+model CampaignSubmissionClaim {
+  id                   String    @id @default(uuid()) @db.Uuid
+  tenantId             String    @db.Uuid
+  campaignId           String    @db.Uuid
+  campaignDeliveryId   String    @db.Uuid
+  attemptNumber        Int
+  phase                String
+  status               String
+  channel              String
+  /// sha256 of the canonical destination. Evidence without PHI.
+  destinationHash      String
+  idempotencyKey       String
+  /// The exact operator authorization this attempt was submitted under.
+  launchFingerprint    String
+  consentEvidence      String
+  /// mock_dev | live. A live attempt additionally requires dispatchActivationId.
+  submissionMode       String
+  dispatchActivationId String?   @db.Uuid
+  provider             String?
+  providerMessageId    String?
+  failureCode          String?
+  startedAt            DateTime  @default(now())
+  completedAt          DateTime?
+  tenant               Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  campaignDelivery     CampaignDelivery @relation(fields: [tenantId, campaignDeliveryId], references: [tenantId, id], onDelete: Cascade)
+
+  @@unique([tenantId, campaignDeliveryId, attemptNumber, phase])
+  @@index([tenantId, phase, startedAt])
+  @@index([tenantId, campaignId, startedAt])
+}
+
+/// Per-tenant, per-channel authority to submit LIVE regulated campaign traffic.
+///
+/// Absence means OFF. There is deliberately no column default, no seed, no
+/// migration backfill and no provisioning hook that can create one: a row exists
+/// only because an OWNER/ADMIN called the activation endpoint and typed an
+/// explicit attestation while the channel provider was actually configured.
+/// Deactivation sets revokedAt instead of deleting, so the attestation that was
+/// in force for an already-submitted message stays readable.
+model CampaignLiveDispatchActivation {
+  id                String    @id @default(uuid()) @db.Uuid
+  tenantId          String    @db.Uuid
+  channel           String
+  activatedByUserId String    @db.Uuid
+  activatedAt       DateTime  @default(now())
+  /// The exact sentence the activating operator typed. Stored verbatim.
+  attestation       String
+  attestationHash   String
+  /// Which fence implementation the attestation was made against.
+  fenceVersion      String
+  /// Truthful provider state at activation time (env key NAMES only, no secrets).
+  providerSnapshot  Json
+  revokedAt         DateTime?
+  revokedByUserId   String?   @db.Uuid
+  revocationReason  String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  tenant            Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, channel])
+  @@index([tenantId, revokedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Closed-loop campaign attribution.
+//
+// Campaign.opened/responded/booked/revenue existed for months with NO code path
+// that wrote them: a campaign could run end to end and the dashboard still
+// reported $0, because nothing anywhere joined CampaignDelivery to Appointment
+// or to a payment. This table is that join, made durable and arguable.
+//
+// The competitive point is not having a number. Tebra multiplies volume by
+// hardcoded constants ($3 per reminder sent, $150 per recall appointment), so a
+// practice that sent 5,000 reminders is shown $15,000 of "ROI" against zero
+// production. RevenueWell credits itself with ALL revenue from any appointment
+// within 60 days of an unmatched new-patient request, plus flat $5/$10 imputed
+// values. Neither survives a practice manager asking "which message earned that
+// dollar?". Every row here answers exactly that, or the row does not exist.
+// ---------------------------------------------------------------------------
+
+/// Immutable evidence linking ONE CampaignDelivery to ONE outcome. Nothing in
+/// the application updates a row after it is written; re-running the
+/// attribution job inserts what is missing and touches nothing else.
+///
+/// THE WINDOW IS CAPTURED ON THE ROW ON PURPOSE. windowDays, windowStartsAt and
+/// windowEndsAt record the attribution window that was in force at the moment
+/// this link was made, not the window in force now. A later edit to
+/// GrowthPolicy.campaignAttributionWindowDays must change what gets attributed
+/// NEXT and must never retroactively rewrite, widen, narrow or invalidate an
+/// attribution that has already been claimed. Re-deriving the window at read
+/// time would do exactly that, and would make every historical number
+/// unreproducible the first time a tenant edited a setting.
+///
+/// attributedValue is money a named PaymentTransaction actually recorded. A
+/// booking is not revenue and an attendance is not revenue: both carry 0. There
+/// is deliberately no imputed per-event constant anywhere in this table.
+model CampaignAttribution {
+  id                   String              @id @default(uuid()) @db.Uuid
+  tenantId             String              @db.Uuid
+  /// The branch the outcome actually happened in. A branch-scoped campaign can
+  /// only ever attribute an outcome from its own branch (enforced by the job),
+  /// so for those campaigns this equals Campaign.branchId.
+  branchId             String?             @db.Uuid
+  campaignId           String              @db.Uuid
+  campaignDeliveryId   String              @db.Uuid
+  patientId            String?             @db.Uuid
+  leadId               String?             @db.Uuid
+  /// engaged | booked | attended | paid. The vocabulary lives in
+  /// server/lib/campaignAttribution.ts (CAMPAIGN_ATTRIBUTION_OUTCOMES); it is
+  /// not a database CHECK, for the same reason CampaignSubmissionClaim.phase is
+  /// not one. `engaged` is deliberately NEVER written today — see that module's
+  /// header for why a provider "open" is not evidence in this system.
+  outcomeType          String
+  appointmentId        String?             @db.Uuid
+  paymentTransactionId String?             @db.Uuid
+  attributedValue      Decimal             @default(0) @db.Decimal(12, 2)
+  currency             String              @default("USD")
+  /// The window that justified THIS link, as it stood when the link was made.
+  windowDays           Int
+  windowStartsAt       DateTime
+  windowEndsAt         DateTime
+  /// The named rule that produced the row, so any figure can be argued back to
+  /// the sentence that generated it.
+  rule                 String
+  /// Delivery acceptance timestamp, outcome timestamp, the rule applied, the
+  /// tie-break, and the exact record ids the value came from. Ids and
+  /// timestamps only — no PHI, no destinations, no message bodies.
+  evidence             Json
+  attributedAt         DateTime            @default(now())
+  createdAt            DateTime            @default(now())
+  tenant               Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  // Every parent link is tenant-composite: an attribution can never point at
+  // another tenant's campaign, delivery, patient, appointment or payment, even
+  // if an id is guessed. Cascade throughout — an attribution to a record that
+  // no longer exists is not evidence, so it must not outlive its subject, and
+  // no attribution row may block the deletion of the thing it describes.
+  branch               Branch?             @relation(fields: [tenantId, branchId], references: [tenantId, id], onDelete: Cascade)
+  // Campaign is referenced by id alone, deliberately. A (tenantId, id) unique on
+  // Campaign already exists in the deployed database under a migration-owned
+  // rls_uq_ name; declaring it in Prisma would turn a managed DROP INDEX into an
+  // ALTER INDEX ... RENAME in `prisma migrate diff` and move the pinned counts
+  // in server/modules/platform/prismaDriftGuard.ts, which this increment does
+  // not own. The guarantee is not lost: CampaignAttribution_tenant_consistency
+  // (migration 20260828230000) refuses any row whose campaignId is not a
+  // campaign of NEW."tenantId" AND is not the campaign the referenced delivery
+  // belongs to — which is strictly stronger than the composite FK would be.
+  campaign             Campaign            @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  delivery             CampaignDelivery    @relation(fields: [tenantId, campaignDeliveryId], references: [tenantId, id], onDelete: Cascade)
+  patient              Patient?            @relation(fields: [tenantId, patientId], references: [tenantId, id], onDelete: Cascade)
+  lead                 Lead?               @relation(fields: [tenantId, leadId], references: [tenantId, id], onDelete: Cascade)
+  appointment          Appointment?        @relation(fields: [tenantId, appointmentId], references: [tenantId, id], onDelete: Cascade)
+  payment              PaymentTransaction? @relation(fields: [tenantId, paymentTransactionId], references: [tenantId, id], onDelete: Cascade)
+
+  /// Idempotence. Re-running the attribution job can only ever be a no-op for a
+  /// delivery whose outcome of this type is already recorded.
+  @@unique([tenantId, campaignDeliveryId, outcomeType])
+  /// The anti-double-count. One appointment is claimed by at most ONE delivery
+  /// per outcome type, so two campaigns that both reached the same patient can
+  /// never both book the same booking. NULL appointmentIds stay distinct, which
+  /// is what lets a future non-appointment outcome coexist here.
+  @@unique([tenantId, outcomeType, appointmentId])
+  @@index([tenantId, campaignId, outcomeType])
+  @@index([tenantId, attributedAt])
+  @@index([tenantId, campaignDeliveryId])
+}
+
 model PatientIntakePacket {
   id                   String                  @id @default(uuid()) @db.Uuid
   tenantId             String                  @db.Uuid
@@ -3300,6 +3736,12 @@ model ReadingAlert {
   severity         String // normal | warning | high | critical
   alertType        String // abnormal_reading | missed_reading | device_offline | device_error | trend_risk
   status           String    @default("open") // open | acknowledged | assigned | resolved
+  // Numeric mirror of `severity` (normal 0 | warning 1 | high 2 | critical 3).
+  // The queue MUST order by acuity in the database, before the row limit is
+  // applied — sorting by severity in JS after truncation let newer low-severity
+  // alerts push genuinely open criticals outside the window, so the UI rendered
+  // a false all-clear. A string column cannot express that order, hence this.
+  severityRank     Int       @default(0)
   assignedToUserId String?   @db.Uuid
   generatedReason  String?
   createdAt        DateTime  @default(now())
@@ -3309,6 +3751,7 @@ model ReadingAlert {
 
   @@index([tenantId, status, severity])
   @@index([tenantId, patientId])
+  @@index([tenantId, status, severityRank, createdAt])
 }
 
 // Notification + delivery attempt log (consent-checked; channel + retry status).

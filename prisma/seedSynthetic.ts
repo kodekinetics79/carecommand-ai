@@ -4,6 +4,7 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { Prisma, PrismaClient } from '../server/generated/prisma/client';
 import { syntheticProfiles } from './synthetic/profileManifest';
 import { assertSyntheticSeedTarget } from './synthetic/seedSafety';
+import { seedGrowthDemo } from './synthetic/growthDemo';
 
 const target = assertSyntheticSeedTarget({
   nodeEnv: process.env.NODE_ENV,
@@ -13,6 +14,25 @@ const target = assertSyntheticSeedTarget({
 });
 const profile = syntheticProfiles[target.profile];
 const { connectionString, databaseName } = target;
+
+// The growth demo layer reuses the PRODUCTION entitlement resolver and the
+// PRODUCTION attribution job rather than reimplementing either. Both modules
+// import server/lib/db, which builds its singleton from env.DATABASE_URL at
+// import time. Rebinding DATABASE_URL to the already-verified disposable target
+// before those (dynamic) imports means that singleton can only ever point at
+// the synthetic database, even though every call site here passes its own
+// client explicitly.
+process.env.DATABASE_URL = connectionString;
+
+// Inactivity windows are evaluated against the API's wall clock, so a
+// `lastVisitAt` pinned to the controlled clock would fall out of the 30-60 /
+// 60-90 / 90-180 bands as soon as real time moved past it. Window-relative
+// timestamps are anchored here instead; set SYNTHETIC_DEMO_CLOCK to pin it.
+const demoClockRaw = process.env.SYNTHETIC_DEMO_CLOCK;
+if (demoClockRaw && Number.isNaN(Date.parse(demoClockRaw))) {
+  throw new Error('SYNTHETIC_DEMO_CLOCK must be an ISO-8601 timestamp');
+}
+const demoClock = demoClockRaw ? new Date(demoClockRaw) : new Date();
 
 const db = new PrismaClient({ adapter: new PrismaPg({ connectionString }) });
 const now = new Date(profile.controlledClock);
@@ -48,6 +68,7 @@ async function seed(): Promise<void> {
 
   const passwordHash = deterministicPasswordHash('SyntheticOnly!2026');
   const tenantIds: string[] = [];
+  const tenantStatuses: string[] = [];
   const branchIds: string[] = [];
   const receptionistClinicIds: string[] = [];
   const branchTenant: string[] = [];
@@ -66,6 +87,7 @@ async function seed(): Promise<void> {
       ? ['active', 'suspended', 'cancelled', 'active', 'suspended'][index % 5]
       : (profile.profile === 'PILOT' || profile.profile === 'TIER1') && index === profile.tenants - 1 ? 'suspended' : 'active';
     tenantIds.push(id);
+    tenantStatuses.push(status);
     tenants.push({
       id,
       name: `Synthetic ${profile.profile} Health Group ${index + 1}`,
@@ -326,6 +348,16 @@ async function seed(): Promise<void> {
     })),
   });
 
+  // Everything above is the operational spine. The Growth module needs a
+  // subscription, an inactivity history and its own records before any of its
+  // screens can show a working clinic; that layer is seeded here, on top of the
+  // records it references.
+  const growth = await seedGrowthDemo({
+    db, profile, now, demoClock, stableUuid,
+    tenantIds, tenantStatuses, branchIds, branchTenant,
+    userIds, userTenant, patientIds, patientTenant, patientBranch,
+  });
+
   const counts = {
     profile: profile.profile,
     database: databaseName,
@@ -342,7 +374,9 @@ async function seed(): Promise<void> {
     notifications: await db.notificationEvent.count(),
     auditEvents: await db.auditEvent.count(),
     controlledClock: profile.controlledClock,
+    demoClock: demoClock.toISOString(),
     fixedSeed: profile.fixedSeed,
+    growth,
   };
   console.log(JSON.stringify(counts));
 }

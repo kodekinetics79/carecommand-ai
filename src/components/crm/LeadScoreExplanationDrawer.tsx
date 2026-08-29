@@ -1,7 +1,14 @@
 import { useEffect } from 'react';
 import { X, TrendingUp, TrendingDown, Sparkles, Clock, Radio } from 'lucide-react';
 import { formatCurrency } from '../../utils/formatters';
-import type { CrmLead } from '../../lib/crmService';
+import type { CrmLead, ScoreBand } from '../../lib/crmService';
+
+// Tone follows the band the SERVER assigned from the tenant's configured
+// `scoreBandHigh` / `scoreBandMid`. It used to be `score >= 70 ... >= 40` here,
+// so the colour and the threshold could disagree with each other.
+const BAND_TONE: Record<ScoreBand, string> = {
+  high: 'text-emerald-v', medium: 'text-amber-v', low: 'text-red-v', unscored: 'text-t3',
+};
 
 export default function LeadScoreExplanationDrawer({ lead, onClose }: { lead: CrmLead; onClose: () => void }) {
   useEffect(() => {
@@ -12,7 +19,7 @@ export default function LeadScoreExplanationDrawer({ lead, onClose }: { lead: Cr
 
   const positives = lead.scoreDrivers.filter(d => d.positive);
   const negatives = lead.scoreDrivers.filter(d => !d.positive);
-  const tone = lead.score >= 70 ? 'text-emerald-v' : lead.score >= 40 ? 'text-amber-v' : 'text-red-v';
+  const tone = BAND_TONE[lead.scoreBand];
 
   return (
     <div className="fixed inset-0 z-[55] flex justify-end" role="dialog" aria-modal="true" aria-label="Lead score explanation">
@@ -24,21 +31,29 @@ export default function LeadScoreExplanationDrawer({ lead, onClose }: { lead: Cr
         </header>
         <div className="p-5 space-y-4">
           <div className="text-center rounded-2xl border border-[var(--b1)] bg-[var(--s1)] p-4">
-            <p className={`text-3xl font-bold tabular-nums ${tone}`}>{lead.score}</p>
-            <p className="text-[11px] text-t3">Unvalidated rule-based planning priority · not an AI prediction</p>
+            <p className={`text-3xl font-bold tabular-nums ${tone}`}>{lead.score ?? '—'}</p>
+            <p className="text-[11px] text-t2">Rule-based priority · not AI, and not validated against outcomes</p>
             <p className="text-[12px] font-semibold text-t1 mt-1">{lead.name}</p>
           </div>
 
+          {lead.scoreUnavailableReason && (
+            <div role="note" className="rounded-xl border border-amber-soft bg-amber-soft p-3">
+              <p className="text-[12px] font-semibold text-amber-v">{lead.scoreUnavailableReason}</p>
+            </div>
+          )}
+
           <Section title="Positive drivers" icon={<TrendingUp className="w-3.5 h-3.5 text-emerald-v" />}>
-            {positives.length ? positives.map((d, i) => <DriverRow key={i} label={d.label} weight={d.weight} positive />) : <p className="text-[11px] text-t3">No strong positives yet.</p>}
+            {positives.length ? positives.map((d, i) => <DriverRow key={i} label={d.label} weight={d.weight} positive />) : <p className="text-[12px] text-t2">Nothing in this lead is pushing the score up yet.</p>}
           </Section>
           <Section title="Negative drivers" icon={<TrendingDown className="w-3.5 h-3.5 text-red-v" />}>
-            {negatives.length ? negatives.map((d, i) => <DriverRow key={i} label={d.label} weight={d.weight} positive={false} />) : <p className="text-[11px] text-t3">No major risks detected.</p>}
+            {negatives.length ? negatives.map((d, i) => <DriverRow key={i} label={d.label} weight={d.weight} positive={false} />) : <p className="text-[12px] text-t2">Nothing in this lead is pulling the score down.</p>}
           </Section>
 
           <div className="rounded-xl border border-[var(--indigo-mid)] bg-[var(--indigo-soft)] p-3">
-            <p className="text-[10px] font-bold uppercase tracking-wide text-indigo mb-1">Rule-based planning suggestion</p>
-            <p className="text-[13px] font-semibold text-t1">{lead.nextBestAction.label}</p>
+            <p className="text-[10px] font-bold uppercase tracking-wide text-indigo mb-1">Suggested next step · rule-based</p>
+            <p className="text-[13px] font-semibold text-t1">
+              {lead.nextBestAction?.label ?? 'No suggestion: this lead\u2019s recorded stage is not one the ranking rules cover.'}
+            </p>
           </div>
 
           <div className="grid grid-cols-2 gap-2.5">

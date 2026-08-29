@@ -11,6 +11,7 @@ import { useApiResource } from '../hooks/useApiResource';
 import { useApiData } from '../hooks/useApiData';
 import { mapPatient, type ApiPatient } from '../lib/apiAdapters';
 import { apiRequest } from '../lib/api';
+import type { CampaignHandoff } from '../lib/crm';
 
 interface ApiBranchOption { id: string; name: string; active: boolean }
 interface PatientSummary {
@@ -314,7 +315,12 @@ export default function Patients() {
             </div>
             <p className="text-sm font-bold text-t1 mb-1">{summary ? `${summary.highRiskCount} patients are in the risk review queue` : 'Risk queue unavailable'}</p>
             <p className="text-xs text-t2 mb-3">This count uses stored risk scores across the displayed tenant or branch scope. It is a review queue, not an automated outreach decision; consent must be rechecked before contact.</p>
-            <button type="button" onClick={() => navigate('/campaigner')} className="w-full py-2 rounded-xl bg-[var(--violet-soft)] hover:bg-[var(--s3)] text-violet-v text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
+            <button type="button" onClick={() => navigate('/campaigns', { state: {
+              goal: 'winback', source: 'Patients',
+              // Echo the exact aggregate claim the operator acted on — a count,
+              // never patient-identifying detail beyond what this page shows.
+              ...(summary ? { contextLabel: `${summary.highRiskCount} patients in the risk review queue` } : {}),
+            } satisfies CampaignHandoff })} className="w-full py-2 rounded-xl bg-[var(--violet-soft)] hover:bg-[var(--s3)] text-violet-v text-xs font-semibold transition-colors flex items-center justify-center gap-1.5">
               <ArrowRight className="w-3.5 h-3.5" /> Open campaign planning
             </button>
           </div>

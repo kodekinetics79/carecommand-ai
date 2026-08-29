@@ -1,4 +1,15 @@
-import type { Appointment, Campaign, Doctor, Integration, InventoryItem, LabOrder, Lead, Opportunity, Patient, RevenueData, RevenueLeak, Review } from '../types';
+import type { Appointment, Campaign, Doctor, Integration, InventoryItem, LabOrder, Lead, Opportunity, Patient, RevenueData, RevenueLeak } from '../types';
+import { apiRequest } from './api';
+
+/**
+ * Reads a list endpoint, accepting both shapes the API uses: a bare array and
+ * a `cursorPage` envelope. Pass the caller's AbortSignal so the request is
+ * cancelled with the component that asked for it.
+ */
+export async function fetchList<T>(path: string, signal?: AbortSignal): Promise<T[]> {
+  const response = await apiRequest<T[] | { data: T[] }>(path, { signal });
+  return Array.isArray(response) ? response : response.data;
+}
 
 export interface ApiPatient {
   id: string;
@@ -66,6 +77,16 @@ export interface ApiInventoryItem {
   supplier: string;
 }
 
+/**
+ * The legacy `GET /v1/campaigns` row — the analytics read behind the dashboard's
+ * campaign panel.
+ *
+ * `revenue`, `opened` and `booked` are DB defaults that NO code path writes, and
+ * `status` here omits APPROVAL_REQUIRED / CANCELLED / FAILED, which the governed
+ * engine does persist. Do not build a campaign surface on this shape: the
+ * campaign product lives on `/v1/crm/campaigns` via src/lib/crm.ts, which is the
+ * only client that can set a campaign type, an audience or an approval.
+ */
 export interface ApiCampaign {
   id: string;
   name: string;
@@ -343,6 +364,7 @@ export function mapInventoryItem(row: ApiInventoryItem): InventoryItem {
   };
 }
 
+/** Legacy analytics rows only — see the note on ApiCampaign before reusing this. */
 export function mapCampaign(row: ApiCampaign): Campaign {
   return {
     ...row,
@@ -424,18 +446,54 @@ export function mapLead(row: ApiLead): Lead {
   };
 }
 
-export function mapReview(row: ApiReview): Review {
+/**
+ * A review as the API is actually able to describe it.
+ *
+ * `GET /v1/reviews` returns the stored Review row and nothing more: it loads no
+ * author relation, and `platform` / `sentiment` are free-text columns. The
+ * previous mapping papered over all three gaps — it stamped the same invented
+ * name on every row, folded every non-Google platform into "internal" (so a
+ * Yelp or Facebook review was displayed as a first-party one), and relabelled
+ * any unrecognised sentiment as "neutral", which silently deflated the
+ * positive-sentiment percentage. This shape keeps each absence visible so the
+ * screen can say "not recorded" instead of guessing.
+ */
+export interface ReviewRow {
+  id: string;
+  branchId: string;
+  /** null when the stored rating is not a usable number. */
+  rating: number | null;
+  text: string;
+  /** Exactly the platform string the row was stored with; never coerced. */
+  platform: string;
+  date: string;
+  responded: boolean;
+  /**
+   * The stored `aiDraftResponse` column: the recorded response once `responded`
+   * is true, and a stored draft awaiting review before that.
+   */
+  storedResponse?: string;
+  /** null when the stored sentiment is not one of the three known values. */
+  sentiment: 'positive' | 'neutral' | 'negative' | null;
+}
+
+const KNOWN_SENTIMENTS = ['positive', 'neutral', 'negative'] as const;
+
+export function mapReview(row: ApiReview): ReviewRow {
+  const rating = Number(row.rating);
+  const platform = row.platform?.trim() ?? '';
   return {
     id: row.id,
-    patientName: 'Reviewer name unavailable',
     branchId: row.branchId ?? '',
-    rating: row.rating,
+    rating: Number.isFinite(rating) ? rating : null,
     text: row.text,
-    platform: row.platform === 'google' ? 'google' : 'internal',
+    platform,
     date: row.createdAt.slice(0, 10),
     responded: row.responded,
-    aiDraftResponse: row.aiDraftResponse ?? undefined,
-    sentiment: ['positive', 'neutral', 'negative'].includes(row.sentiment) ? row.sentiment as Review['sentiment'] : 'neutral',
+    storedResponse: row.aiDraftResponse ?? undefined,
+    sentiment: (KNOWN_SENTIMENTS as readonly string[]).includes(row.sentiment)
+      ? row.sentiment as ReviewRow['sentiment']
+      : null,
   };
 }
 

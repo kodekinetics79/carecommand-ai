@@ -1,0 +1,24 @@
+-- noShowRiskHigh: the tenant-configurable "high no-show risk" threshold.
+--
+-- One concept held three numbers in three layers, none visible to the clinic:
+--   * src/pages/Scheduling.tsx flagged an appointment at noShowRisk >= 50,
+--   * server/modules/advisory/service.ts counted at >= 60 in three places and
+--     priced the count into an owner-facing expectedImpact currency figure,
+--   * server/modules/revenue-protection.ts escalated at > 65.
+-- This is the same defect class the growth config spine was built to close
+-- (see churnRiskHigh / reputationRiskHigh in THRESHOLD_RESOLUTIONS,
+-- server/modules/growth/defaults.ts); the concept simply had no column yet.
+--
+-- 50 wins, inclusive (value >= threshold), for the same reason churnRiskHigh
+-- chose the wider frontend bound: 50 is the number the clinic actually sees and
+-- acts on (the risk badge on every Scheduling row), and for a no-show
+-- prevention workflow a false positive costs a confirmation message while a
+-- false negative costs an empty chair. Moving to 60 would silently un-flag
+-- appointments in the 50-59 band that front desks have been calling.
+--
+-- ADD COLUMN with DEFAULT backfills every existing GrowthPolicy row, so a
+-- tenant that already stored a policy keeps exactly the behaviour its clinic
+-- screens were showing (>= 50). GrowthPolicy is already RLS-enrolled by
+-- 20260828140000_growth_config_spine (row policies apply to the whole row);
+-- a new column needs no additional policy or grant statements.
+ALTER TABLE "GrowthPolicy" ADD COLUMN "noShowRiskHigh" INTEGER NOT NULL DEFAULT 50;

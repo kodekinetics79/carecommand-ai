@@ -62,6 +62,74 @@ async function tenantActivityCounts(tenantId: string, client: PrismaClient | Pri
   return { activeUsers: Number(rows[0]?.active_users ?? 0), branches: Number(rows[0]?.branches ?? 0) };
 }
 
+// Company record fields an operator maintains. Every one is optional and stored
+// as typed-or-null: an empty string is normalised to null so a blank field reads
+// as "not recorded" instead of an empty value the console would render as known.
+const COMPANY_FIELDS = [
+  'legalName', 'companyNumber', 'addressLine1', 'addressLine2', 'city', 'region',
+  'postalCode', 'country', 'mainPhone', 'website', 'primaryContactName',
+  'primaryContactEmail', 'primaryContactPhone', 'billingContactName',
+  'billingContactEmail', 'accountNotes',
+] as const;
+
+const blankToNull = (max: number) =>
+  z.string().trim().max(max).transform(v => (v === '' ? null : v)).nullable().optional();
+const emailOrNull = z.string().trim().max(200)
+  .transform(v => (v === '' ? null : v))
+  .refine(v => v === null || z.string().email().safeParse(v).success, { message: 'must be a valid email address' })
+  .nullable().optional();
+
+const companyUpdateSchema = z.object({
+  legalName: blankToNull(200), companyNumber: blankToNull(80),
+  addressLine1: blankToNull(200), addressLine2: blankToNull(200),
+  city: blankToNull(120), region: blankToNull(120),
+  postalCode: blankToNull(40), country: blankToNull(120),
+  mainPhone: blankToNull(40), website: blankToNull(300),
+  primaryContactName: blankToNull(200), primaryContactEmail: emailOrNull,
+  primaryContactPhone: blankToNull(40),
+  billingContactName: blankToNull(200), billingContactEmail: emailOrNull,
+  accountNotes: blankToNull(4000),
+  reason: reasonSchema,
+});
+
+function companyView(tenant: Record<string, unknown>): Record<string, string | null> {
+  const out: Record<string, string | null> = {};
+  for (const f of COMPANY_FIELDS) out[f] = (tenant[f] as string | null) ?? null;
+  return out;
+}
+
+// The platform plane holds NO grants on "User" or "Branch" -- these read through
+// the narrow SECURITY DEFINER windows added in 20260829040000_tenant_company_record,
+// which expose the account owner, aggregate role counts and branch records only.
+// There is deliberately no staff-roster read here; that is break-glass only.
+async function tenantDirectory(tenantId: string) {
+  const [owner, roles, branches] = await Promise.all([
+    db.$queryRaw<Array<{ user_id: string; display_name: string; email: string; role: string; active: boolean; mfa_enabled: boolean; last_login_at: Date | null; created_at: Date }>>`
+      SELECT user_id, display_name, email, role, active, mfa_enabled, last_login_at, created_at
+      FROM app_platform_tenant_account_owner(${tenantId}::uuid)`,
+    db.$queryRaw<Array<{ role: string; active_count: bigint; inactive_count: bigint }>>`
+      SELECT role, active_count, inactive_count FROM app_platform_tenant_role_breakdown(${tenantId}::uuid)`,
+    db.$queryRaw<Array<{ branch_id: string; name: string; location: string; timezone: string; active: boolean; created_at: Date }>>`
+      SELECT branch_id, name, location, timezone, active, created_at FROM app_platform_tenant_branches(${tenantId}::uuid)`,
+  ]);
+  const o = owner[0];
+  return {
+    accountOwner: o
+      ? {
+          id: o.user_id, displayName: o.display_name, email: o.email, role: o.role,
+          active: o.active, mfaEnabled: o.mfa_enabled,
+          lastLoginAt: o.last_login_at?.toISOString() ?? null,
+          createdAt: o.created_at.toISOString(),
+        }
+      : null,
+    roleBreakdown: roles.map(r => ({ role: r.role, active: Number(r.active_count), inactive: Number(r.inactive_count) })),
+    branches: branches.map(b => ({
+      id: b.branch_id, name: b.name, location: b.location, timezone: b.timezone,
+      active: b.active, createdAt: b.created_at.toISOString(),
+    })),
+  };
+}
+
 // Role gates (PLATFORM_OWNER always passes — see platformRoleAllowed).
 const tenantManage = requirePlatformAccess('PLATFORM_ADMIN');
 const subscriptionManage = requirePlatformAccess('PLATFORM_ADMIN', 'PLATFORM_BILLING');
@@ -183,6 +251,100 @@ export const platformRoutes: FastifyPluginAsync = async app => {
     if (!summary.tenant) return reply.code(404).send({ error: 'not_found', message: 'Tenant not found' });
     const entitlements = await db.tenantFeatureEntitlement.findMany({ where: { tenantId }, orderBy: { featureKey: 'asc' }, select: { featureKey: true, enabled: true, source: true, limitValue: true } });
     return { ...summary, entitlements };
+  });
+
+  // Company record + the narrow directory windows. Read is open to any active
+  // platform actor (same as tenant read); writes require PLATFORM_ADMIN.
+  app.get('/tenants/:tenantId/company', async (request, reply) => {
+    const { tenantId } = z.object({ tenantId: uuid }).parse(request.params);
+    const tenant = await db.tenant.findUnique({ where: { id: tenantId } });
+    if (!tenant) return reply.code(404).send({ error: 'not_found', message: 'Tenant not found' });
+    return {
+      tenantId,
+      name: tenant.name,
+      slug: tenant.slug,
+      status: tenant.status,
+      createdAt: tenant.createdAt.toISOString(),
+      company: companyView(tenant as unknown as Record<string, unknown>),
+      ...(await tenantDirectory(tenantId)),
+    };
+  });
+
+  app.patch('/tenants/:tenantId/company', { preHandler: tenantManage }, async (request, reply) => {
+    const { tenantId } = z.object({ tenantId: uuid }).parse(request.params);
+    const body = companyUpdateSchema.parse(request.body);
+    const existing = await db.tenant.findUnique({ where: { id: tenantId } });
+    if (!existing) return reply.code(404).send({ error: 'not_found', message: 'Tenant not found' });
+
+    // Only fields actually present in the request are written, so a partial
+    // edit never blanks a field the operator did not touch.
+    const data: Record<string, string | null> = {};
+    const changed: string[] = [];
+    for (const f of COMPANY_FIELDS) {
+      if (!(f in body)) continue;
+      const next = (body as Record<string, string | null | undefined>)[f] ?? null;
+      const prev = (existing as unknown as Record<string, string | null>)[f] ?? null;
+      data[f] = next;
+      if (next !== prev) changed.push(f);
+    }
+    if (!changed.length) return { tenantId, company: companyView(existing as unknown as Record<string, unknown>), changed: [] };
+
+    const updated = await runPlatformAuditedMutation(request, {
+      action: 'tenant.company.updated',
+      target: { type: 'tenant', id: tenantId, tenantId },
+      // Field NAMES only: the values can carry a customer's contact details, and
+      // the audit log is read far more widely than the record itself.
+      metadata: { reason: body.reason, changedFields: changed },
+    }, tx => tx.tenant.update({ where: { id: tenantId }, data }));
+
+    return { tenantId, company: companyView(updated as unknown as Record<string, unknown>), changed };
+  });
+
+  // Break-glass staff roster. Readable only while an unexpired, unended
+  // SupportAccessSession exists for the tenant -- the database enforces that,
+  // not this handler. Without one the function raises 42501 and this returns 403
+  // with the remedy, so an operator is never shown an empty list they could
+  // mistake for "this clinic has no staff".
+  app.get('/tenants/:tenantId/users', { preHandler: tenantManage }, async (request, reply) => {
+    const { tenantId } = z.object({ tenantId: uuid }).parse(request.params);
+    const tenant = await db.tenant.findUnique({ where: { id: tenantId }, select: { id: true } });
+    if (!tenant) return reply.code(404).send({ error: 'not_found', message: 'Tenant not found' });
+
+    const session = await db.supportAccessSession.findFirst({
+      where: { tenantId, endedAt: null, expiresAt: { gt: new Date() } },
+      orderBy: { startedAt: 'desc' },
+    });
+    if (!session) {
+      return reply.code(403).send({
+        error: 'support_session_required',
+        message: 'Open a support session for this tenant to view its staff list. The session records your reason and expires on its own.',
+      });
+    }
+
+    const rows = await db.$queryRaw<Array<{
+      user_id: string; display_name: string; email: string; role: string; branch_name: string | null;
+      active: boolean; mfa_enabled: boolean; locked_until: Date | null; last_login_at: Date | null; created_at: Date;
+    }>>`
+      SELECT user_id, display_name, email, role, branch_name, active, mfa_enabled, locked_until, last_login_at, created_at
+      FROM app_platform_tenant_user_roster(${tenantId}::uuid)`;
+
+    // Viewing a roster is itself the sensitive act, so it is audited like a
+    // mutation -- count only, never the identities that were read.
+    await platformAuditEvent(request, 'tenant.roster.viewed', { type: 'tenant', id: tenantId, tenantId }, {
+      supportSessionId: session.id, reason: session.reason, userCount: rows.length,
+    });
+
+    return {
+      tenantId,
+      supportSession: { id: session.id, reason: session.reason, expiresAt: session.expiresAt.toISOString(), operatorEmail: session.operatorEmail },
+      users: rows.map(r => ({
+        id: r.user_id, displayName: r.display_name, email: r.email, role: r.role,
+        branchName: r.branch_name, active: r.active, mfaEnabled: r.mfa_enabled,
+        lockedUntil: r.locked_until?.toISOString() ?? null,
+        lastLoginAt: r.last_login_at?.toISOString() ?? null,
+        createdAt: r.created_at.toISOString(),
+      })),
+    };
   });
 
   app.get('/tenants/:tenantId/subscription', async (request, reply) => {

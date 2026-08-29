@@ -1,6 +1,7 @@
 import { db } from '../db';
 import type { Prisma } from '../../generated/prisma/client';
 import { forEachActiveJobTenant } from '../jobTenantResolver';
+import { severityRank } from '../monitoring';
 import {
   invalidateRpmProviderSignoff,
   lockRpmEvidenceForDevice,
@@ -138,7 +139,7 @@ export async function detectMissedReadings(only?: string, now = new Date()): Pro
           ? `No valid reading in ${Math.floor(hoursSince)}h (expected at least every ${missedAfterHours}h). Outreach to capture the missed reading.`
           : `No reading since enrollment ${Math.floor(hoursSince)}h ago (expected at least every ${missedAfterHours}h). Outreach to capture the first reading.`;
         const alert = await tx.readingAlert.create({
-          data: { tenantId, patientId: enr.patientId, branchId: currentEnrollment.branchId, severity: 'high', alertType: 'missed_reading', status: 'open', generatedReason: reason },
+          data: { tenantId, patientId: enr.patientId, branchId: currentEnrollment.branchId, severity: 'high', severityRank: severityRank('high'), alertType: 'missed_reading', status: 'open', generatedReason: reason },
           select: { id: true },
         });
         const recipientUserId = await queueStaffNotification(tx, { tenantId, alertId: alert.id, patientId: enr.patientId, branchId: currentEnrollment.branchId });
@@ -213,7 +214,7 @@ export async function detectOfflineDevices(only?: string, offlineAfterHours = DE
           return { alertId: null, flipped: true };
         }
         const alert = await tx.readingAlert.create({
-          data: { tenantId, deviceId: current.id, branchId: current.branchId, severity: 'high', alertType: 'device_offline', status: 'open', generatedReason: `${current.name} offline — no activity in ${hoursSince}h (threshold ${offlineAfterHours}h). Check the device/connection.` },
+          data: { tenantId, deviceId: current.id, branchId: current.branchId, severity: 'high', severityRank: severityRank('high'), alertType: 'device_offline', status: 'open', generatedReason: `${current.name} offline — no activity in ${hoursSince}h (threshold ${offlineAfterHours}h). Check the device/connection.` },
           select: { id: true },
         });
         const recipientUserId = await queueStaffNotification(tx, { tenantId, alertId: alert.id, branchId: current.branchId });

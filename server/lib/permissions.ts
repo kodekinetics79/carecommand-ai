@@ -60,6 +60,16 @@ export const PERMISSIONS = [
   'crm:write',
   'campaign:read',
   'campaign:manage',
+  // Campaign authority is scoped by campaign CLASS, not granted wholesale.
+  // `campaign:manage` is the broad grant and covers every class, including this
+  // one. This narrower grant covers ONLY the practice's own payment follow-up
+  // campaigns (unpaid deposit, failed payment, insurance/coverage update, prior
+  // authorization) — the class HIPAA treats as payment operations rather than
+  // marketing. It deliberately does NOT reach reactivation or any other
+  // marketing outreach, the live-dispatch activation switch, automation rules,
+  // or the opportunity scan. The single mapping of campaign type -> required
+  // grant is CAMPAIGN_CLASS_AUTHORITY in server/lib/campaigns.ts.
+  'campaign:payment-followup:manage',
   'revenue:read',
   'revenue:write',
   'inventory:read',
@@ -123,6 +133,12 @@ export const ROLE_PERMISSIONS: Record<UserRole, Permission[]> = {
     'billing:read', 'billing:write', 'settings:read', 'patient:read', 'intake:read', 'intake:write',
     'insurance:reconcile',
     'revenue:read', 'revenue:write',
+    // Revenue recovery, not marketing. Billing staff run the practice's own
+    // payment follow-up (unpaid deposit / failed payment / coverage update /
+    // prior auth) end to end. They still hold NEITHER 'campaign:manage' NOR
+    // 'campaign:read', so a reactivation or any other marketing campaign — and
+    // the campaign list that would disclose one — remains closed to them.
+    'campaign:payment-followup:manage',
   ],
   PROVIDER: [
     'patient:read', 'intake:read', 'appointment:read', 'appointment:write', 'schedule:manage', 'staff:read', 'settings:read',
@@ -202,6 +218,24 @@ export async function getRequestPermissions(request: FastifyRequest): Promise<Se
   return set;
 }
 
+/** True when the current request's effective grants include `permission`. */
+export async function hasPermission(request: FastifyRequest, permission: Permission): Promise<boolean> {
+  return (await getRequestPermissions(request)).has(permission);
+}
+
+/**
+ * The single 403 shape for a permission refusal. `permission` names the grant
+ * the caller would need; when several grants are accepted it names the broad
+ * one, because that is the grant an administrator would actually assign.
+ */
+export function denyPermission(reply: FastifyReply, permission: Permission) {
+  return reply.code(403).send({
+    error: 'insufficient_permission',
+    permission,
+    message: `Your role does not have the required permission (${permission}) for this action.`,
+  });
+}
+
 /**
  * preHandler guard: requires ALL listed permissions. Returns 403
  * `insufficient_permission` (with the missing permission) when any is absent —
@@ -211,12 +245,22 @@ export function requirePermission(...required: Permission[]) {
   return async (request: FastifyRequest, reply: FastifyReply) => {
     const granted = await getRequestPermissions(request);
     const missing = required.find(perm => !granted.has(perm));
-    if (missing) {
-      return reply.code(403).send({
-        error: 'insufficient_permission',
-        permission: missing,
-        message: `Your role does not have the required permission (${missing}) for this action.`,
-      });
-    }
+    if (missing) return denyPermission(reply, missing);
+  };
+}
+
+/**
+ * preHandler guard for a resource whose exact required grant depends on the
+ * resource itself (see CAMPAIGN_CLASS_AUTHORITY in server/lib/campaigns.ts):
+ * requires ANY ONE of `accepted`, so a caller holding none of them is refused
+ * BEFORE the route reads the record, and the narrower per-record check then
+ * runs inside the handler once the record's class is known. `accepted[0]` is
+ * the broad grant and is what a refusal reports.
+ */
+export function requireAnyPermission(...accepted: [Permission, ...Permission[]]) {
+  return async (request: FastifyRequest, reply: FastifyReply) => {
+    const granted = await getRequestPermissions(request);
+    if (accepted.some(perm => granted.has(perm))) return;
+    return denyPermission(reply, accepted[0]);
   };
 }

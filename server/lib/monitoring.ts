@@ -5,17 +5,28 @@ import { db } from './db';
 // to staff — NOT diagnosis or treatment guidance. They flag readings a human
 // should look at. Real clinical thresholds belong in patient-specific
 // MonitoringRule rows configured by the care team.
-export interface ThresholdBand { min: number; max: number; critMin: number; critMax: number; unit: string; label: string }
+// `edgeWarn` names WHICH edges of the safe band deserve a "monitor the next
+// reading" warning. It is not cosmetic: a band edge that coincides with a
+// physiological ceiling (SpO2 100%) is the BEST possible result, and warning on
+// it manufactures false alerts that crowd real ones out of the queue.
+//   'both' — approaching either edge is meaningful (glucose, heart rate)
+//   'low'  — only the low edge is meaningful (oxygen: 100% is ideal)
+//   'high' — only the high edge is meaningful
+//   'none' — never warn on proximity, only on leaving the band
+export type EdgeWarn = 'both' | 'low' | 'high' | 'none';
+export interface ThresholdBand { min: number; max: number; critMin: number; critMax: number; unit: string; label: string; edgeWarn: EdgeWarn }
 export const DEFAULT_THRESHOLDS: Record<string, ThresholdBand> = {
-  glucose:        { min: 70,  max: 180, critMin: 54,  critMax: 300, unit: 'mg/dL', label: 'Glucose' },
-  blood_pressure: { min: 90,  max: 140, critMin: 80,  critMax: 180, unit: 'mmHg',  label: 'Blood pressure (systolic)' },
+  glucose:        { min: 70,  max: 180, critMin: 54,  critMax: 300, unit: 'mg/dL', label: 'Glucose', edgeWarn: 'both' },
+  blood_pressure: { min: 90,  max: 140, critMin: 80,  critMax: 180, unit: 'mmHg',  label: 'Blood pressure (systolic)', edgeWarn: 'both' },
   // Diastolic bands mirror standard hypertensive-crisis thresholds: ≥120 is a
   // crisis (critical), 90–119 is elevated/stage-2 (high), <60 is hypotensive.
   // Evaluated ALONGSIDE systolic — the worst of the two wins for blood_pressure.
-  blood_pressure_diastolic: { min: 60, max: 90, critMin: 40, critMax: 120, unit: 'mmHg', label: 'Blood pressure (diastolic)' },
-  oxygen:         { min: 92,  max: 100, critMin: 88,  critMax: 101, unit: '%',     label: 'Oxygen saturation' },
-  heart_rate:     { min: 50,  max: 110, critMin: 40,  critMax: 130, unit: 'bpm',   label: 'Heart rate' },
-  temperature:    { min: 35.5, max: 38, critMin: 35,  critMax: 39.5, unit: '°C',   label: 'Temperature' },
+  blood_pressure_diastolic: { min: 60, max: 90, critMin: 40, critMax: 120, unit: 'mmHg', label: 'Blood pressure (diastolic)', edgeWarn: 'both' },
+  // SpO2 tops out at 100%. The high edge is the ideal result, never a warning —
+  // only desaturation toward 92% is worth surfacing.
+  oxygen:         { min: 92,  max: 100, critMin: 88,  critMax: 101, unit: '%',     label: 'Oxygen saturation', edgeWarn: 'low' },
+  heart_rate:     { min: 50,  max: 110, critMin: 40,  critMax: 130, unit: 'bpm',   label: 'Heart rate', edgeWarn: 'both' },
+  temperature:    { min: 35.5, max: 38, critMin: 35,  critMax: 39.5, unit: '°C',   label: 'Temperature', edgeWarn: 'both' },
 };
 
 // ── Weight change bands (CHF fluid-overload early warning) ───────────────────
@@ -43,6 +54,8 @@ export type Severity = 'normal' | 'warning' | 'high' | 'critical';
 
 export interface RuleLike {
   minValue: number | null; maxValue: number | null; criticalMin: number | null; criticalMax: number | null;
+  /** Optional per-rule override of the band's edge-warning direction. */
+  edgeWarn?: EdgeWarn | null;
 }
 
 // Optional per-reading context the callers assemble (diastolic value, ECG rhythm
@@ -66,8 +79,16 @@ function toKg(value: number, unit: string | null | undefined): number {
  * Precedence: patient-specific > device-type > branch > organization default.
  */
 export async function resolveRule(tenantId: string, opts: { readingType: string; patientId?: string | null; deviceType?: string | null; branchId?: string | null }) {
+  // DETERMINISM: the ordering below is load-bearing, not cosmetic. Without a
+  // total order, two equally-specific equal-priority rules with different
+  // thresholds resolve by Postgres heap order — so the same reading alerts or
+  // stays silent depending on physical row placement, and the outcome can flip
+  // after any UPDATE or VACUUM. A monitoring rule that fires at random is worse
+  // than no rule. `createdAt` then `id` makes the winner stable and explainable:
+  // the rule written first wins a tie, forever.
   const rules = await db.monitoringRule.findMany({
     where: { tenantId, readingType: opts.readingType, active: true },
+    orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }, { id: 'asc' }],
   });
   const score = (r: typeof rules[number]): number => {
     if (r.scope === 'patient' && r.patientId && r.patientId === opts.patientId) return 4;
@@ -77,9 +98,10 @@ export async function resolveRule(tenantId: string, opts: { readingType: string;
     return 0;
   };
   return rules
-    .map(r => ({ r, s: score(r) }))
+    .map((r, index) => ({ r, s: score(r), index }))
     .filter(x => x.s > 0)
-    .sort((a, b) => b.s - a.s || b.r.priority - a.r.priority)[0]?.r ?? null;
+    // Specificity first, then priority, then the stable DB order above.
+    .sort((a, b) => b.s - a.s || b.r.priority - a.r.priority || a.index - b.index)[0]?.r ?? null;
 }
 
 const WORSE = (a: Severity, b: Severity): Severity => (SEVERITY_RANK[a] >= SEVERITY_RANK[b] ? a : b);
@@ -104,9 +126,17 @@ function scoreNumericBand(bandKey: string, value: number, rule: RuleLike | null)
   if (value < min || value > max) {
     return { severity: 'high', reason: `${label} ${value}${unit} is outside the expected range (${min}–${max}${unit}). Nurse follow-up recommended.` };
   }
+  // Proximity warning, but only on the edges the band says are meaningful.
+  // Warning on a physiological ceiling (SpO2 100%) would flood the queue with
+  // alerts on ideal readings and bury the ones that need a human.
+  const edgeWarn: EdgeWarn = rule?.edgeWarn ?? band?.edgeWarn ?? 'both';
   const span = (max - min) || 1;
-  if (value - min < span * 0.05 || max - value < span * 0.05) {
-    return { severity: 'warning', reason: `${label} ${value}${unit} is near the edge of the expected range (${min}–${max}${unit}). Monitor next reading.` };
+  const nearLow = value - min < span * 0.05;
+  const nearHigh = max - value < span * 0.05;
+  const warnLow = nearLow && (edgeWarn === 'both' || edgeWarn === 'low');
+  const warnHigh = nearHigh && (edgeWarn === 'both' || edgeWarn === 'high');
+  if (warnLow || warnHigh) {
+    return { severity: 'warning', reason: `${label} ${value}${unit} is near the ${warnLow ? 'low' : 'high'} edge of the expected range (${min}–${max}${unit}). Monitor next reading.` };
   }
   return { severity: 'normal', reason: `${label} ${value}${unit} within expected range.` };
 }
@@ -184,6 +214,19 @@ export function evaluateSeverity(readingType: string, numericValue: number | nul
 }
 
 export const SEVERITY_RANK: Record<string, number> = { normal: 0, warning: 1, high: 2, critical: 3 };
+
+/** Alert statuses that still represent outstanding work. */
+export const OPEN_ALERT_STATUSES = ['open', 'acknowledged', 'assigned'] as const;
+
+/**
+ * Numeric acuity for a severity string. Persisted on every ReadingAlert as
+ * `severityRank` so the queue can order by acuity IN THE DATABASE, before the
+ * row limit — otherwise a burst of low-severity alerts truncates genuinely open
+ * criticals out of the nurse's view and the UI shows a false all-clear.
+ */
+export function severityRank(severity: string): number {
+  return SEVERITY_RANK[severity] ?? 0;
+}
 
 /**
  * Assemble the recent weight baselines (in kg) for a patient so evaluateWeight

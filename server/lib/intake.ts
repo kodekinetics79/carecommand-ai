@@ -3,6 +3,7 @@ import { db } from './db';
 import { env } from './../config/env';
 import { runWithTenantContext } from './tenantContext';
 import { emitBusinessEvent, upsertSignal, createRecommendation } from './intelligence';
+import { lockSuppressionFences } from './receptionist/dncFence';
 import type { Prisma } from '../generated/prisma/client';
 
 // ===========================================================================
@@ -317,11 +318,32 @@ function str(v: unknown): string | null { return typeof v === 'string' && v.trim
 const CHANNEL_CONSENT_TYPE: Record<string, string> = { sms: 'communication_sms', email: 'communication_email', voice: 'communication_voice' };
 
 async function applyCommunicationConsent(tx: Prisma.TransactionClient, tenantId: string, packet: { id: string; patientId: string | null; leadId: string | null }, data: Record<string, unknown>, ctx: SectionSubmitContext, actorUserId: string | null | undefined, consentEvents: SectionSubmissionOutcome['consentEvents']) {
-  for (const channel of ['sms', 'email', 'voice'] as const) {
-    // The generic intake disclosure is not a purpose/channel-specific grant.
-    // It can preserve a patient's restrictive choice, but never create or
-    // restore outbound authority from a checked box.
-    if (data[channel] !== false) continue;
+  // The generic intake disclosure is not a purpose/channel-specific grant.
+  // It can preserve a patient's restrictive choice, but never create or
+  // restore outbound authority from a checked box.
+  const optOutChannels = (['sms', 'email', 'voice'] as const).filter(channel => data[channel] === false);
+  if (optOutChannels.length === 0) return;
+
+  // Suppression fences before the CommunicationConsent writes, in the caller's
+  // transaction — the same locks campaigns POST /consent takes and the same
+  // ones claimCampaignProviderIntent() / claimCampaignProviderSubmission() hold
+  // while they re-read suppression. CommunicationConsent is IDENTITY-keyed:
+  // isSuppressedTx counts it by (tenantId, patientId, leadId, channel), so the
+  // identity fence for whichever of the two this packet is bound to is exactly
+  // the key a dispatcher aimed at that identity also holds. A packet always
+  // has at most one of them, so at most one identity key is taken.
+  //
+  // RESIDUAL, deliberately not papered over: a packet generated from an
+  // AppointmentRequest that has neither a Patient nor a Lead writes a
+  // (patientId=null, leadId=null) row, which no identity fence can name. The
+  // only dispatcher that can read such a row is a candidate that is itself
+  // identity-less, and that dispatcher holds only a destination fence — a key
+  // this record does not carry. Fencing it would require an identity on the
+  // packet (a schema change, outside this increment); inventing a key here
+  // would look correct without serializing anything.
+  await lockSuppressionFences(tx, { tenantId, patientId: packet.patientId, leadId: packet.leadId });
+
+  for (const channel of optOutChannels) {
     const optedIn = false;
     const status = 'opted_out';
     const existing = await tx.communicationConsent.findFirst({ where: { tenantId, patientId: packet.patientId ?? null, leadId: packet.leadId ?? null, channel } });

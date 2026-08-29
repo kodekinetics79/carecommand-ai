@@ -3,6 +3,7 @@ import { Search, Megaphone, Users, Phone, TrendingUp, Star, BarChart2, UserPlus,
 import { useNavigate } from 'react-router';
 import { canOpenPath, type RoutePath } from '../../lib/access';
 import type { SessionUser } from '../../lib/session';
+import type { CampaignHandoff } from '../../lib/crm';
 
 interface Command {
   id: string;
@@ -12,12 +13,14 @@ interface Command {
   // Declared destinations only — the same registry the sidebar gates on, so a
   // command can never offer a page the user's role does not cover.
   path?: RoutePath;
+  /** Context carried into the campaign workspace so it isn't asked for again. */
+  handoff?: CampaignHandoff;
   action?: string;
   category: string;
 }
 
 const commands: Command[] = [
-  { id: 'c1', label: 'Create campaign', description: 'Open campaign setup and review', icon: <Megaphone className="w-4 h-4" />, path: '/campaigner', action: 'navigate', category: 'Actions' },
+  { id: 'c1', label: 'Create campaign', description: 'Open campaign setup and review', icon: <Megaphone className="w-4 h-4" />, path: '/campaigns', handoff: { source: 'Command palette' }, action: 'navigate', category: 'Actions' },
   { id: 'c2', label: 'Find patient', description: 'Search patient profiles and history', icon: <Search className="w-4 h-4" />, path: '/patients', action: 'navigate', category: 'Actions' },
   { id: 'c3', label: 'Review missed calls', description: 'Open the missed-call follow-up queue', icon: <Phone className="w-4 h-4" />, path: '/ai-receptionist', action: 'navigate', category: 'Actions' },
   { id: 'c4', label: 'View inactive patients', description: 'Review inactive and at-risk patient records', icon: <Users className="w-4 h-4" />, path: '/crm', action: 'navigate', category: 'Actions' },
@@ -79,7 +82,7 @@ export default function CommandPalette({ isOpen, onClose, user }: CommandPalette
   }, {});
 
   const handleSelect = (cmd: Command) => {
-    if (cmd.path) navigate(cmd.path);
+    if (cmd.path) navigate(cmd.path, cmd.handoff ? { state: cmd.handoff } : undefined);
     onClose();
   };
 

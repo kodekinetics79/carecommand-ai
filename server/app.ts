@@ -29,6 +29,7 @@ import { revenueProtectionRoutes, revenueProtectionWebhookRoutes } from './modul
 import { paymentsCheckoutRoutes, paymentsPublicRoutes } from './modules/payments/checkout';
 import { serviceCatalogRoutes } from './modules/services/routes';
 import { crmRoutes, crmWebhookRoutes } from './modules/campaigns/routes';
+import { growthRoutes } from './modules/growth/routes';
 import { intakeRoutes, intakePublicRoutes } from './modules/intake/routes';
 import { controlPlaneRoutes } from './modules/control-plane/routes';
 import { insuranceRoutes } from './modules/insurance/routes';
@@ -204,6 +205,7 @@ export async function buildApp() {
     await protectedApi.register(schedulingRoutes, { prefix: '/scheduling' });
     await protectedApi.register(serviceCatalogRoutes, { prefix: '/services' });
     await protectedApi.register(crmRoutes, { prefix: '/crm' });
+    await protectedApi.register(growthRoutes, { prefix: '/growth' });
     await protectedApi.register(intakeRoutes, { prefix: '/intake' });
     await protectedApi.register(autopilotRoutes, { prefix: '/autopilot' });
     await protectedApi.register(telehealthRoutes, { prefix: '/telehealth' });

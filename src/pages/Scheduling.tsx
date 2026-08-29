@@ -15,7 +15,10 @@ import ProgressBar from '../components/ui/ProgressBar';
 import { formatCurrency } from '../utils/formatters';
 import { useApiResource } from '../hooks/useApiResource';
 import { mapAppointment, mapProviderProfile, mapPatient, type ApiAppointment, type ApiProviderProfile, type ApiPatient } from '../lib/apiAdapters';
-import { ApiError } from '../lib/api';
+import { ApiError, apiRequest } from '../lib/api';
+import { useResource } from '../hooks/useResource';
+import { receivedData } from '../lib/resourceState';
+import { GROWTH_POLICY_PATH } from '../lib/growthPolicy';
 import { appointmentsApi, schedulingApi, type LifecycleStatus, type ProviderSlot } from '../lib/appointments';
 import { intakeApi, intakeLink } from '../lib/intake';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
@@ -52,6 +55,41 @@ const statusConfig: Record<string, { label: string; dot: string; bg: string; tex
 
 interface ApiBranchOption { id: string; name: string; timezone?: string | null }
 
+/**
+ * The tenant's configured "high no-show risk" threshold, from the same
+ * `GET /v1/growth/policy` document ClinicRadar and Reviews band with.
+ * INCLUSIVE lower bound (noShowRisk >= noShowRiskHigh), per the register in
+ * server/modules/growth/defaults.ts — and the SAME rule the advisory engine
+ * counts (and prices) with, so the board and the advisor flag identical rows.
+ *
+ * This page used to hardcode `>= 50` while the advisor counted `>= 60` and
+ * revenue-protection escalated at `> 65`. There is deliberately no local
+ * fallback threshold here: a risk flag drawn from a guessed number is a clinic
+ * rule the clinic never set, presented as if it had. No policy, no flags —
+ * and the failure is named next to the timeline instead.
+ */
+interface NoShowRiskPolicy { source: 'tenant' | 'default'; noShowRiskHigh: number }
+
+/** Module-scope loader: useResource keys the request by this identity. */
+const loadNoShowRiskPolicy = async (signal: AbortSignal): Promise<NoShowRiskPolicy> => {
+  const raw = await apiRequest<unknown>(GROWTH_POLICY_PATH, { signal });
+  const row = (raw !== null && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  const field = row.noShowRiskHigh;
+  // Decimal columns serialise as strings on some paths; absent/unparseable is
+  // a policy this screen cannot flag with, and it says so rather than coercing
+  // (Number(undefined) is NaN, and NaN >= x is always false — every flag would
+  // silently disappear while the page kept rendering).
+  const value = typeof field === 'number' && Number.isFinite(field)
+    ? field
+    : typeof field === 'string' && field.trim() !== '' && Number.isFinite(Number(field))
+      ? Number(field)
+      : null;
+  if (value === null) {
+    throw new Error('The configured no-show risk threshold could not be read, so appointments cannot be risk-flagged.');
+  }
+  return { source: row.source === 'tenant' ? 'tenant' : 'default', noShowRiskHigh: value };
+};
+
 export default function Scheduling() {
   const navigate = useNavigate();
   const { user } = useSession();
@@ -63,6 +101,11 @@ export default function Scheduling() {
   const [queueError, setQueueError] = useState<string | null>(null);
   const [queueBusy, setQueueBusy] = useState<string | null>(null);
   const { data: branchRecords, error: branchError } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
+  // The rule every risk flag on this page is decided by. Same contract as
+  // ClinicRadar's policy feed: until it answers, no row is flagged — not even
+  // provisionally — and a failed load is named next to the timeline.
+  const noShowPolicy = useResource<NoShowRiskPolicy>(loadNoShowRiskPolicy);
+  const receivedNoShowPolicy = receivedData(noShowPolicy.state);
 
   // The schedule belongs to the clinic, so every date on this screen is read in
   // the clinic's zone. With one branch chosen that is its zone; across all
@@ -578,12 +621,26 @@ export default function Scheduling() {
           <BentoCard title="Appointment timeline" subtitle={activeDate === todayDate ? "Today's schedule" : clinicDateLabel(activeDate, clinicTimezone, { month: 'short', day: 'numeric', year: 'numeric' })} headerRight={
             <span className="text-xs font-semibold text-t3">{todayAppts.length} appointments · {formatCurrency(totalValue)}</span>
           }>
+            {/* The rule the red flags below are asserted against, stated as the
+                value actually used — or the named failure when it could not be
+                read. Never a hardcoded number presented as configured. */}
+            {receivedNoShowPolicy ? (
+              <p className="mb-2 text-[11px] text-t3">
+                Appointments are flagged high no-show risk at a stored risk ≥ {receivedNoShowPolicy.noShowRiskHigh}.
+                {' '}{receivedNoShowPolicy.source === 'tenant' ? 'Configured for this workspace.' : 'Product default — this workspace has not set its own thresholds yet.'}
+              </p>
+            ) : noShowPolicy.state.status === 'error' ? (
+              <p role="alert" className="mb-2 text-[11px] font-semibold text-amber-v">
+                The configured no-show risk threshold could not be loaded, so risk flags are hidden.
+                {' '}<button type="button" onClick={noShowPolicy.reload} className="underline">Retry</button>
+              </p>
+            ) : null}
             <div className="space-y-2">
               {todayAppts.length === 0 ? (
                 <div className="py-8 text-center text-sm text-t3">No appointments match the selected date and branch.</div>
               ) : todayAppts.map((appt) => {
                 const sc = statusConfig[appt.status] ?? statusConfig['confirmed'];
-                const isRisky = appt.noShowRisk >= 50;
+                const isRisky = receivedNoShowPolicy !== null && appt.noShowRisk >= receivedNoShowPolicy.noShowRiskHigh;
                 return (
                   <div key={appt.id} data-appointment-id={appt.id} className={`flex items-start gap-3 p-3.5 rounded-xl border transition-all hover:bg-[var(--s3)] ${isRisky ? 'border-[var(--b2)] bg-[var(--red-soft)]' : 'border-[var(--b1)]'}`}>
                     <div className="text-center shrink-0 w-14">

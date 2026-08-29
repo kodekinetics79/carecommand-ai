@@ -8,19 +8,21 @@ import { requireFeature } from '../../lib/entitlements';
 import { assertBranchAccess, branchScope } from '../../lib/scope';
 import { decryptSecret } from '../../lib/security';
 import { verifyWebhookSignature, normalizeWebhook, readingDedupeKey, isPlausibleNormalizedReading } from '../../lib/connectedCare/deviceAdapters';
-import { resolveRule, evaluateSeverity, weightBaselines } from '../../lib/monitoring';
+import { resolveRule, evaluateSeverity, weightBaselines, severityRank } from '../../lib/monitoring';
 import { computeRpmReadiness, RPM_MIN_READING_DAYS } from '../../lib/connectedCare/rpmReadiness';
 import { DEVICE_KEYS } from '../../lib/connectedCare/catalog';
 import { enterTenantContext } from '../../lib/tenantContext';
 import { resolveDeviceWebhookVerifier } from '../../lib/tenantIngressResolvers';
 import {
+  COMMUNICATION_MODALITIES,
   buildRpmEvidenceSnapshot,
   invalidateRpmProviderSignoff,
   lockRpmEvidence,
   RPM_SIGNOFF_ATTESTATION_REVISION,
   rpmPeriodBounds,
 } from '../../lib/connectedCare/rpmEvidence';
-import { computeAndStoreRpmReadiness } from '../../lib/connectedCare/rpmReadinessService';
+import { computeAndStoreRpmReadiness, mapWithConcurrency, RPM_READINESS_CONCURRENCY } from '../../lib/connectedCare/rpmReadinessService';
+import { resolveRpmCodeLadder } from '../../lib/connectedCare/rpmBillingCodes';
 
 const uuid = z.string().uuid();
 const manageRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
@@ -214,10 +216,23 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
   // RPM billing readiness
   app.get('/rpm-readiness', async request => {
     const tenantId = request.auth.tenantId;
-    const enrollments = await db.patientDeviceEnrollment.findMany({ where: { tenantId, ...branchScope(request), status: 'active', programType: 'rpm' }, select: { patientId: true } });
-    const patientIds = [...new Set(enrollments.map(e => e.patientId))];
+    const q = z.object({
+      limit: z.coerce.number().min(1).max(100).default(50),
+      offset: z.coerce.number().min(0).default(0),
+    }).parse(request.query);
+    const enrollments = await db.patientDeviceEnrollment.findMany({
+      where: { tenantId, ...branchScope(request), status: 'active', programType: 'rpm' },
+      select: { patientId: true },
+      orderBy: { patientId: 'asc' },
+    });
+    const allPatientIds = [...new Set(enrollments.map(e => e.patientId))];
+    // Bounded page + bounded concurrency. Each patient costs one advisory-locked
+    // transaction that rebuilds and hashes a full evidence snapshot, so an
+    // unbounded fan-out over a large panel exhausts the connection pool and
+    // takes every other route down with it.
+    const patientIds = allPatientIds.slice(q.offset, q.offset + q.limit);
     const names = await patientNames(tenantId, patientIds);
-    const rows = await Promise.all(patientIds.map(async pid => {
+    const rows = await mapWithConcurrency(patientIds, RPM_READINESS_CONCURRENCY, async pid => {
       const { row, result, readingDays, evidence } = await computeAndStoreRpmReadiness(tenantId, pid);
       return {
         patientId: pid, patientName: names.get(pid) ?? 'Unknown', status: result.status,
@@ -229,10 +244,36 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
         qualifyingReadingCount: evidence.qualifyingReadingCount,
         excludedReadingCount: evidence.excludedReadingCount,
         deviceExceptions: evidence.deviceExceptions,
+        interactiveCommunication: evidence.interactiveCommunication,
+        sessionsMissingNarrative: evidence.sessionsMissingNarrative,
+        // Which codes the RECORDED EVIDENCE could support. Not coding advice,
+        // not a claim, not a payment guarantee — a coder still decides. The
+        // previous single READY boolean reported $0 for a device-supply month
+        // with no review minutes, which is a legitimately billable month.
+        billing: resolveRpmCodeLadder({
+          readingDays,
+          reviewMinutes: row.reviewMinutes,
+          interactiveCommunication: evidence.interactiveCommunication,
+          setupAlreadyBilled: false,
+          consentGranted: evidence.consentGranted,
+          enrollmentActive: evidence.enrollmentActive,
+        }),
       };
-    }));
-    await audit(request, { action: 'connectedcare.rpm_readiness.read', resource: 'rpmBillingReadiness', metadata: { patientCount: rows.length } });
-    return rows.sort((a, b) => (a.status === 'READY' ? 1 : 0) - (b.status === 'READY' ? 1 : 0));
+    });
+    await audit(request, { action: 'connectedcare.rpm_readiness.read', resource: 'rpmBillingReadiness', metadata: { patientCount: rows.length, total: allPatientIds.length } });
+    // Surface the rows a human must act on first: MISSING_REQUIREMENTS and
+    // NEEDS_REVIEW ahead of READY, and stable within each group.
+    const STATUS_ORDER: Record<string, number> = { NEEDS_REVIEW: 0, MISSING_REQUIREMENTS: 1, READY: 2 };
+    const items = rows.sort((a, b) =>
+      (STATUS_ORDER[a.status] ?? 3) - (STATUS_ORDER[b.status] ?? 3)
+      || a.patientName.localeCompare(b.patientName));
+    return {
+      items,
+      total: allPatientIds.length,
+      limit: q.limit,
+      offset: q.offset,
+      hasMore: q.offset + patientIds.length < allPatientIds.length,
+    };
   });
 
   // Record clinical review minutes / patient communication for the period.
@@ -244,7 +285,15 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
       provenance: z.enum(['EHR_TIMER', 'DEVICE_SESSION', 'MANUAL_ATTESTATION']),
       startedAt: z.coerce.date(),
       endedAt: z.coerce.date(),
-      communicationFlag: z.boolean().default(false),
+      // Auditors reject a bare duration: each entry needs date, minutes, AND
+      // what was done. "Reviewed RPM data" is explicitly not acceptable, so the
+      // narrative is required rather than optional.
+      activityNarrative: z.string().trim().min(12).max(2000),
+      // A management code requires a LIVE interactive communication. Recording
+      // this as a bare boolean could not distinguish a qualifying phone call
+      // from a text message. Non-live values are accepted on purpose so staff
+      // log real outreach without it inflating billable evidence.
+      communicationModality: z.enum(COMMUNICATION_MODALITIES).default('none'),
     }).parse(request.body ?? {});
     const tenantId = request.auth.tenantId;
     const period = rpmPeriodBounds();
@@ -253,23 +302,49 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
     if (elapsedMs < 60_000 || elapsedMs > 4 * 60 * 60_000) throw app.httpErrors.badRequest('Review session must be between 1 and 240 minutes');
     if (input.startedAt < period.start || input.endedAt > new Date(Date.now() + 60_000)) throw app.httpErrors.badRequest('Review session is outside the current period');
     const reviewMinutes = Math.floor(elapsedMs / 60_000);
+    const communicationFlag = input.communicationModality !== 'none';
     const recorded = await db.$transaction(async tx => {
       await lockRpmEvidence(tx, tenantId, patientId, period.start);
       const replay = await tx.auditEvent.findFirst({ where: { tenantId, action: 'connectedcare.rpm.review_evidence_recorded', resourceId: input.reviewEventId }, select: { id: true } });
       if (replay) return false;
+      // Overlap detection is scoped to the ACTOR across the whole period, not to
+      // one patient. Scoping it per-patient let a single wall-clock block be
+      // attested against an unlimited number of patients at once: 30 patients ×
+      // the same 14:00–14:20 window is 10 hours of billable clinical time that
+      // nobody worked, and a provider's hash-bound signoff then locks it in.
+      // A clinician occupies exactly one 20-minute block at a time.
       const prior = await tx.auditEvent.findMany({
-        where: { tenantId, action: 'connectedcare.rpm.review_evidence_recorded', resource: 'rpmReviewSession', occurredAt: { gte: period.start }, metadata: { path: ['patientId'], equals: patientId } },
-        select: { metadata: true },
+        where: {
+          tenantId,
+          action: 'connectedcare.rpm.review_evidence_recorded',
+          resource: 'rpmReviewSession',
+          occurredAt: { gte: period.start },
+          OR: [
+            { metadata: { path: ['patientId'], equals: patientId } },
+            ...(request.auth.userId ? [{ actorUserId: request.auth.userId }] : []),
+          ],
+        },
+        select: { metadata: true, actorUserId: true },
       });
       for (const event of prior) {
         const metadata = event.metadata && typeof event.metadata === 'object' && !Array.isArray(event.metadata) ? event.metadata as Record<string, unknown> : null;
-        if (metadata?.patientId !== patientId) continue;
+        if (!metadata) continue;
+        const samePatient = metadata.patientId === patientId;
+        const sameActor = Boolean(request.auth.userId) && event.actorUserId === request.auth.userId;
+        if (!samePatient && !sameActor) continue;
+        // A source reference identifies one real-world encounter. Reusing it —
+        // for this patient OR by this clinician for a different one — is a
+        // duplicate claim on the same block of work.
         if (metadata.sourceRef === input.sourceRef) throw app.httpErrors.conflict('Review source reference has already been recorded');
         const priorStart = typeof metadata.startedAt === 'string' ? new Date(metadata.startedAt) : null;
         const priorEnd = typeof metadata.endedAt === 'string' ? new Date(metadata.endedAt) : null;
-        if (priorStart && priorEnd && input.startedAt < priorEnd && input.endedAt > priorStart) throw app.httpErrors.conflict('Review session overlaps evidence already recorded for this patient');
+        if (priorStart && priorEnd && input.startedAt < priorEnd && input.endedAt > priorStart) {
+          throw app.httpErrors.conflict(samePatient
+            ? 'Review session overlaps evidence already recorded for this patient'
+            : 'Review session overlaps another patient\'s session already recorded by you for the same time');
+        }
       }
-      await tx.auditEvent.create({ data: { tenantId, actorUserId: request.auth.userId, action: 'connectedcare.rpm.review_evidence_recorded', resource: 'rpmReviewSession', resourceId: input.reviewEventId, requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'], metadata: { patientId, sourceRef: input.sourceRef, provenance: input.provenance, startedAt: input.startedAt.toISOString(), endedAt: input.endedAt.toISOString(), reviewMinutes, communicationFlag: input.communicationFlag } } });
+      await tx.auditEvent.create({ data: { tenantId, actorUserId: request.auth.userId, action: 'connectedcare.rpm.review_evidence_recorded', resource: 'rpmReviewSession', resourceId: input.reviewEventId, requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'], metadata: { patientId, sourceRef: input.sourceRef, provenance: input.provenance, startedAt: input.startedAt.toISOString(), endedAt: input.endedAt.toISOString(), reviewMinutes, communicationFlag, communicationModality: input.communicationModality, activityNarrative: input.activityNarrative, actorRole: request.auth.role ?? null } } });
       await invalidateRpmProviderSignoff(tx, {
         tenantId, patientId, periodStart: period.start,
         reason: 'review_evidence_mutated', actorUserId: request.auth.userId,
@@ -493,7 +568,7 @@ export const connectedCareWebhookRoutes: FastifyPluginAsync = async app => {
             const recipient = rule?.assignedToUserId
               ? await tx.user.findFirst({ where: { id: rule.assignedToUserId, tenantId, active: true }, select: { id: true, displayName: true, role: true } })
               : await tx.user.findFirst({ where: { tenantId, active: true, role: { in: ['PROVIDER', 'MANAGER', 'ADMIN', 'OWNER'] }, ...(branchId ? { OR: [{ branchId }, { role: { in: ['ADMIN', 'OWNER'] } }] } : {}) }, orderBy: { createdAt: 'asc' }, select: { id: true, displayName: true, role: true } });
-            const alert = await tx.readingAlert.create({ data: { tenantId, patientId, branchId, readingId: reading.id, severity, alertType: 'abnormal_reading', status: 'open', generatedReason: reason, assignedToUserId: recipient?.id ?? null }, select: { id: true } });
+            const alert = await tx.readingAlert.create({ data: { tenantId, patientId, branchId, readingId: reading.id, severity, severityRank: severityRank(severity), alertType: 'abnormal_reading', status: 'open', generatedReason: reason, assignedToUserId: recipient?.id ?? null }, select: { id: true } });
             alertId = alert.id;
             await tx.notificationEvent.create({ data: { tenantId, alertId, patientId, recipientType: recipient?.role.toLowerCase() ?? 'unassigned_staff', recipientUserId: recipient?.id ?? null, recipientLabel: recipient?.displayName ?? 'unassigned clinical safety queue', channel: 'in_app', status: 'queued', attempts: 0, consentChecked: true, consentResult: 'not_required' } });
           }

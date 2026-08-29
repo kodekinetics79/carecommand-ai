@@ -2,11 +2,23 @@ import { apiRequest } from './api';
 
 // ============================================================================
 // GrowthPulse CRM service — patient growth, retention & revenue recovery.
-// All page data flows through here (no hardcoded sample data in components).
-// Every callable method below is backed by a real endpoint or real-data derivation.
+//
+// This file used to COMPUTE. It fetched `/v1/leads?limit=100` and
+// `/v1/patients?limit=100`, discarded the `nextCursor` the server sent back, and
+// then averaged, scored, bucketed and priced whatever hundred rows happened to
+// arrive. Every currency and percentage on the CRM Command View was a statistic
+// about an arbitrary page, printed as a fact about a clinic.
+//
+// It now READS. `scoreLead`, `NBA`, `commandMetrics` and `smartSegments` are
+// gone; `/v1/growth/metrics`, `/v1/growth/leads` and `/v1/growth/segments/preview`
+// compute the same arithmetic over the whole tenant from GrowthPolicy,
+// GrowthSegmentDefinition and GrowthChannelCost. Every threshold this file used
+// to hardcode now arrives beside the number it produced, so the screen can state
+// its own rules instead of repeating them.
+//
+// Where a list is still capped, the cap and the total come back with it and the
+// UI says so. Nothing here fills a gap with a zero.
 // ============================================================================
-
-const num = (v: unknown): number => typeof v === 'string' ? Number(v) || 0 : typeof v === 'number' ? v : 0;
 
 export type Stage = 'new-inquiry' | 'contacted' | 'booked' | 'visited' | 'follow-up' | 'retained' | 'lost';
 export const STAGES: Stage[] = ['new-inquiry', 'contacted', 'booked', 'visited', 'follow-up', 'retained', 'lost'];
@@ -23,12 +35,23 @@ export interface ConsentFlags {
 export type ConsentEvidenceStatus = 'opted_in' | 'opted_out' | 'unknown';
 
 export interface ScoreDriver { label: string; positive: boolean; weight: number }
+
+/** Server-assigned band. `unscored` means the recorded stage is not one the heuristic knows. */
+export type ScoreBand = 'high' | 'medium' | 'low' | 'unscored';
+
 export interface CrmLead {
   id: string; name: string; phone: string; email?: string; channel: string;
-  service: string; stage: Stage; source: string; estimatedValue: number;
+  service: string; stage: string; knownStage: Stage | null; source: string; estimatedValue: number;
   createdAt: string; ageDays: number; owner: string; branchId: string;
-  score: number; scoreDrivers: ScoreDriver[];
-  nextBestAction: { label: string; cta: CtaId }; bestChannel: string; bestTime: string;
+  /** null when the server could not score the lead. Never a placeholder number. */
+  score: number | null;
+  scoreBand: ScoreBand;
+  scoreDrivers: ScoreDriver[];
+  scoreUnavailableReason: string | null;
+  hot: boolean;
+  goingCold: boolean;
+  nextBestAction: { label: string; cta: CtaId } | null;
+  bestChannel: string; bestTime: string;
   consent: ConsentFlags; isPatient: boolean;
 }
 
@@ -38,18 +61,100 @@ export interface CrmPatient {
   id: string; name: string; email?: string; phone?: string;
   lifecycleStage: string; churnRisk: number; lifetimeValue: number;
   lastVisit: string | null; nextVisit: string | null; tags: string[]; consent: ConsentFlags;
+  /**
+   * Band the server's configured `churnRiskHigh` puts this patient in. `null`
+   * when no policy was loaded alongside the record — an unknown band renders as
+   * an unknown band, never as "not at risk".
+   */
+  atRisk: boolean | null;
+}
+
+/** The configuration the server used, echoed so the screen never restates a threshold. */
+export interface GrowthPolicyEcho {
+  source: 'tenant' | 'default';
+  hotLeadScore: number;
+  scoreBandHigh: number;
+  scoreBandMid: number;
+  goingColdDays: number;
+  churnRiskHigh: number;
+  highValuePatientLtv: number;
+  recoverableLtvFraction: number;
+  recoverableLtvPercent: number;
+}
+
+export interface MetricScopeInfo {
+  patients: 'tenant' | 'assigned_branch';
+  leads: 'tenant' | 'assigned_branch';
+  branchId: string | null;
+  note: string;
 }
 
 export interface CommandMetrics {
-  openPipeline: number; hotLeads: number; winRate: number; avgDeal: number;
-  avgChurnRisk: number; avgLtv: number; missedCallValue: number; inactiveRecoverable: number;
-  campaignRoi: number | null;
+  asOf: string;
+  scope: MetricScopeInfo;
+  basis: {
+    leadCount: number; openLeadCount: number; closedLeadCount: number;
+    patientCount: number; inactivePatientCount: number; unscoredLeadCount: number;
+    truncated: boolean;
+  };
+  metrics: {
+    openPipeline: number;
+    hotLeads: number;
+    /** null when the tenant has nothing to compute the figure from. The card shows the reason. */
+    winRate: number | null;
+    avgDeal: number | null;
+    avgChurnRisk: number | null;
+    avgLtv: number | null;
+    missedCallValue: number;
+    inactiveRecoverable: number;
+    campaignRoi: number | null;
+  };
+  unavailable: Record<string, string>;
+  policy: GrowthPolicyEcho;
+}
+
+export interface StageTotal { stage: string; known: boolean; label: string | null; count: number; value: number }
+
+export interface CrmPipeline {
+  leads: CrmLead[];
+  /** Tenant-wide highest-priority open leads — not the top of the loaded page. */
+  priority: CrmLead[];
+  stageTotals: StageTotal[];
+  limit: number;
+  returned: number;
+  total: number;
+  truncated: boolean;
+  policy: GrowthPolicyEcho;
 }
 
 export interface SmartSegment {
-  id: string; label: string; description: string; patientCount: number; recoverableValue: number;
-  planningChannel: string; planningOffer: string; planningBookingRate: number; planningCost: number;
+  key: string; label: string; description: string;
+  patientCount: number; recoverableValue: number;
+  planningChannel: string; planningOffer: string; planningBookingRatePct: number;
+  /** Integer minor units (cents). null when the channel has no configured cost. */
+  plannedCostMinor: number | null;
+  currency: string | null;
+  costUnavailableReason: string | null;
+  criteria: {
+    minInactiveDays: number | null; maxInactiveDays: number | null; includeNeverVisited: boolean;
+    minLifetimeValue: number | null; minChurnRisk: number | null; requiredTag: string | null;
+  };
+  neverVisitedCandidates: number;
+  source: 'tenant' | 'default';
   assumptionNotice: string;
+}
+
+export interface SegmentPreview {
+  scope: { patients: 'tenant' | 'assigned_branch'; branchId: string | null };
+  segments: SmartSegment[];
+  policy: GrowthPolicyEcho;
+}
+
+export interface CrmPatientPage {
+  patients: CrmPatient[];
+  returned: number;
+  /** The server had more rows than it returned. The list is a page, and says so. */
+  truncated: boolean;
 }
 
 export interface AutomationRule {
@@ -80,125 +185,142 @@ export function consentFromCanonicalEvidence(rows: CommunicationConsentRow[], ta
   };
 }
 
-// ---- Unvalidated planning priority (fixed heuristic over real fields) ----
-const STAGE_INTENT: Record<Stage, number> = { 'new-inquiry': 20, contacted: 40, booked: 70, visited: 80, 'follow-up': 55, retained: 90, lost: 0 };
-function scoreLead(lead: { stage: Stage; estimatedValue: number; createdAt: string; channel: string }, maxValue: number): { score: number; drivers: ScoreDriver[] } {
-  const drivers: ScoreDriver[] = [];
-  const intent = STAGE_INTENT[lead.stage];
-  drivers.push({ label: `Pipeline stage: ${STAGE_LABEL[lead.stage]}`, positive: intent >= 40, weight: Math.round(intent * 0.4) });
-  const valueScore = maxValue > 0 ? Math.round((lead.estimatedValue / maxValue) * 30) : 0;
-  drivers.push({ label: `Estimated value ${lead.estimatedValue}`, positive: valueScore >= 12, weight: valueScore });
-  const ageDays = Math.max(0, Math.floor((Date.now() - new Date(lead.createdAt).getTime()) / 86400000));
-  const recency = ageDays <= 2 ? 20 : ageDays <= 7 ? 12 : ageDays <= 30 ? 4 : 0;
-  drivers.push({ label: ageDays <= 2 ? 'Fresh inquiry (< 48h)' : `Inquiry age ${ageDays}d`, positive: recency >= 12, weight: recency });
-  if (['whatsapp', 'sms'].includes(lead.channel.toLowerCase())) drivers.push({ label: `Reachable channel (${lead.channel})`, positive: true, weight: 8 });
-  const score = Math.max(0, Math.min(100, Math.round(intent * 0.4 + valueScore + recency + (['whatsapp', 'sms'].includes(lead.channel.toLowerCase()) ? 8 : 0))));
-  return { score, drivers };
+const num = (v: unknown): number => typeof v === 'string' ? Number(v) || 0 : typeof v === 'number' ? v : 0;
+
+const KNOWN_STAGES = new Set<string>(STAGES);
+
+interface ServerScoredLead {
+  id: string; name: string; phone: string | null; email: string | null; channel: string;
+  service: string; stage: string; knownStage: Stage | null; source: string;
+  estimatedValue: number | string; createdAt: string; patientId: string | null;
+  ageDays: number; score: number | null; scoreBand: ScoreBand; scoreDrivers: ScoreDriver[];
+  scoreUnavailableReason: string | null; hot: boolean; goingCold: boolean;
+  nextBestAction: { label: string; cta: string } | null; bestTime: string;
 }
 
-const NBA: Record<Stage, { label: string; cta: CtaId }> = {
-  'new-inquiry': { label: 'Call now & send booking link', cta: 'call_now' },
-  contacted: { label: 'Send booking link', cta: 'send_booking_link' },
-  booked: { label: 'Send intake form + deposit link', cta: 'send_intake_form' },
-  visited: { label: 'Send follow-up to rebook', cta: 'send_follow_up' },
-  'follow-up': { label: 'Confirm next visit', cta: 'confirm_visit' },
-  retained: { label: 'Nurture & request review', cta: 'mark_retained' },
-  lost: { label: 'Launch winback', cta: 'launch_winback' },
-};
+/** Adapts a server-scored lead. No arithmetic happens here — only shaping. */
+function adaptLead(row: ServerScoredLead, consents: CommunicationConsentRow[]): CrmLead {
+  return {
+    id: row.id,
+    name: row.name,
+    phone: row.phone ?? '',
+    email: row.email ?? undefined,
+    channel: row.channel,
+    service: row.service,
+    stage: row.stage,
+    knownStage: row.knownStage && KNOWN_STAGES.has(row.knownStage) ? row.knownStage : null,
+    source: row.source,
+    estimatedValue: num(row.estimatedValue),
+    createdAt: row.createdAt,
+    ageDays: row.ageDays,
+    // The Lead table has no owner or branch column, so neither is claimed here.
+    owner: 'Unassigned',
+    branchId: '',
+    score: row.score,
+    scoreBand: row.scoreBand,
+    scoreDrivers: row.scoreDrivers,
+    scoreUnavailableReason: row.scoreUnavailableReason,
+    hot: row.hot,
+    goingCold: row.goingCold,
+    nextBestAction: row.nextBestAction ? { label: row.nextBestAction.label, cta: row.nextBestAction.cta as CtaId } : null,
+    bestChannel: row.channel,
+    bestTime: row.bestTime,
+    consent: consentFromCanonicalEvidence(consents, { leadId: row.id }),
+    isPatient: row.patientId !== null,
+  };
+}
+
+function adaptPatient(
+  row: Record<string, unknown>,
+  consents: CommunicationConsentRow[],
+  churnRiskHigh: number | null,
+): CrmPatient {
+  const churnRisk = num(row.churnRisk);
+  return {
+    id: String(row.id),
+    name: `${String(row.firstName ?? '')} ${String(row.lastName ?? '')}`.trim(),
+    email: row.email ? String(row.email) : undefined,
+    phone: row.phone ? String(row.phone) : undefined,
+    lifecycleStage: String(row.lifecycleStage ?? 'ACTIVE'),
+    churnRisk,
+    lifetimeValue: num(row.lifetimeValue),
+    lastVisit: (row.lastVisitAt as string) ?? null,
+    nextVisit: (row.nextVisitAt as string) ?? null,
+    tags: (row.tags as string[]) ?? [],
+    consent: consentFromCanonicalEvidence(consents, { patientId: String(row.id) }),
+    atRisk: churnRiskHigh === null ? null : churnRisk >= churnRiskHigh,
+  };
+}
+
+/** How many patient rows one page of the Patient Intelligence table asks for. */
+export const PATIENT_PAGE_SIZE = 100;
 
 export const crmService = {
-  // [LIVE] GET /v1/leads + canonical communication-consent evidence.
-  async getLeads(): Promise<CrmLead[]> {
-    const [rows, consents] = await Promise.all([
-      apiRequest<Array<Record<string, unknown>>>('/v1/leads?limit=100'),
+  // [LIVE] GET /v1/growth/metrics — tenant-wide aggregates plus the policy used.
+  getMetrics: () => apiRequest<CommandMetrics>('/v1/growth/metrics'),
+
+  // [LIVE] GET /v1/growth/segments/preview — tenant-wide membership counted in SQL.
+  getSegments: () => apiRequest<SegmentPreview>('/v1/growth/segments/preview'),
+
+  // [LIVE] GET /v1/growth/leads + canonical communication-consent evidence.
+  // Scores, bands and next-best-actions are the server's; this only joins consent.
+  async getPipeline(limit = 200): Promise<CrmPipeline> {
+    const [board, consents] = await Promise.all([
+      apiRequest<{
+        data: ServerScoredLead[]; priority: ServerScoredLead[]; stageTotals: StageTotal[];
+        limit: number; returned: number; total: number; truncated: boolean; policy: GrowthPolicyEcho;
+      }>(`/v1/growth/leads?limit=${limit}`),
       apiRequest<CommunicationConsentRow[]>('/v1/crm/consent'),
     ]);
-    const maxValue = Math.max(1, ...rows.map(r => num(r.estimatedValue)));
-    return rows.map(r => {
-      const stage = (String(r.stage ?? 'new-inquiry') as Stage);
-      const createdAt = String(r.createdAt ?? new Date().toISOString());
-      const channel = String(r.channel ?? 'EMAIL');
-      const ev = num(r.estimatedValue);
-      const { score, drivers } = scoreLead({ stage, estimatedValue: ev, createdAt, channel }, maxValue);
-      const ageDays = Math.max(0, Math.floor((Date.now() - new Date(createdAt).getTime()) / 86400000));
-      return {
-        id: String(r.id), name: String(r.name ?? 'Lead'), phone: String(r.phone ?? ''), email: r.email ? String(r.email) : undefined,
-        channel, service: String(r.service ?? ''), stage, source: String(r.source ?? 'Unknown'), estimatedValue: ev,
-        createdAt, ageDays, owner: String(r.owner ?? 'Unassigned'), branchId: String(r.branchId ?? ''),
-        score, scoreDrivers: drivers,
-        nextBestAction: NBA[stage], bestChannel: channel, bestTime: ageDays <= 1 ? 'Planning assumption: prompt review now' : 'Planning assumption: review during staffed hours',
-        consent: consentFromCanonicalEvidence(consents, { leadId: String(r.id) }),
-        isPatient: false,
-      };
-    });
-  },
-
-  // [LIVE] GET /v1/patients
-  async getPatients(): Promise<CrmPatient[]> {
-    const [res, consents] = await Promise.all([
-      apiRequest<{ data: Array<Record<string, unknown>> }>('/v1/patients?limit=100'),
-      apiRequest<CommunicationConsentRow[]>('/v1/crm/consent'),
-    ]);
-    return (res.data ?? []).map(p => {
-      const tags = (p.tags as string[]) ?? [];
-      const lifecycle = String(p.lifecycleStage ?? 'ACTIVE');
-      return {
-        id: String(p.id), name: `${String(p.firstName ?? '')} ${String(p.lastName ?? '')}`.trim(),
-        email: p.email ? String(p.email) : undefined, phone: p.phone ? String(p.phone) : undefined,
-        lifecycleStage: lifecycle, churnRisk: num(p.churnRisk), lifetimeValue: num(p.lifetimeValue),
-        lastVisit: (p.lastVisitAt as string) ?? null, nextVisit: (p.nextVisitAt as string) ?? null,
-        tags, consent: consentFromCanonicalEvidence(consents, { patientId: String(p.id) }),
-      };
-    });
-  },
-
-  // [LIVE] PATCH /v1/leads/:id (stage transition — audited server-side)
-  async setStage(id: string, stage: Stage): Promise<void> {
-    await apiRequest(`/v1/leads/${id}`, { method: 'PATCH', body: JSON.stringify({ stage }) });
-  },
-
-  // Derived metrics. inactiveRecoverable is an explicitly unvalidated 30% planning assumption.
-  commandMetrics(leads: CrmLead[], patients: CrmPatient[], campaignRoi: number | null): CommandMetrics {
-    const open = leads.filter(l => l.stage !== 'lost' && l.stage !== 'retained');
-    const won = leads.filter(l => l.stage === 'retained').length;
-    const lost = leads.filter(l => l.stage === 'lost').length;
-    const hot = open.filter(l => l.score >= 70);
-    const inactive = patients.filter(p => ['INACTIVE', 'AT_RISK', 'LOST'].includes(p.lifecycleStage));
     return {
-      openPipeline: open.reduce((s, l) => s + l.estimatedValue, 0),
-      hotLeads: hot.length,
-      winRate: won + lost > 0 ? Math.round((won / (won + lost)) * 100) : 0,
-      avgDeal: open.length ? Math.round(open.reduce((s, l) => s + l.estimatedValue, 0) / open.length) : 0,
-      avgChurnRisk: patients.length ? Math.round(patients.reduce((s, p) => s + p.churnRisk, 0) / patients.length) : 0,
-      avgLtv: patients.length ? Math.round(patients.reduce((s, p) => s + p.lifetimeValue, 0) / patients.length) : 0,
-      missedCallValue: leads.filter(l => l.channel.toLowerCase() === 'call' && l.stage === 'new-inquiry').reduce((s, l) => s + l.estimatedValue, 0),
-      inactiveRecoverable: inactive.reduce((s, p) => s + Math.round(p.lifetimeValue * 0.3), 0),
-      campaignRoi,
+      leads: board.data.map(row => adaptLead(row, consents)),
+      priority: board.priority.map(row => adaptLead(row, consents)),
+      stageTotals: board.stageTotals,
+      limit: board.limit,
+      returned: board.returned,
+      total: board.total,
+      truncated: board.truncated,
+      policy: board.policy,
     };
   },
 
-  smartSegments(patients: CrmPatient[]): SmartSegment[] {
-    const daysSince = (d: string | null) => d ? Math.floor((Date.now() - new Date(d).getTime()) / 86400000) : 9999;
-    const recoverable = (ps: CrmPatient[]) => ps.reduce((s, p) => s + Math.round(p.lifetimeValue * 0.3), 0);
-    const defs: Array<{ id: string; label: string; description: string; filter: (p: CrmPatient) => boolean; offer: string; channel: string; rate: number }> = [
-      { id: 'inactive-30-60', label: '30–60 days inactive', description: 'Patients quiet 30–60 days', filter: p => { const d = daysSince(p.lastVisit); return d >= 30 && d < 60; }, offer: 'Gentle check-in + booking link', channel: 'SMS', rate: 18 },
-      { id: 'inactive-60-90', label: '60–90 days inactive', description: 'Patients quiet 60–90 days', filter: p => { const d = daysSince(p.lastVisit); return d >= 60 && d < 90; }, offer: 'Recall reminder + small incentive', channel: 'Email', rate: 14 },
-      { id: 'inactive-90-180', label: '90–180 days inactive', description: 'Reactivation candidates', filter: p => { const d = daysSince(p.lastVisit); return d >= 90 && d < 180; }, offer: 'Winback offer', channel: 'WhatsApp', rate: 11 },
-      { id: 'high-ltv-inactive', label: 'High-LTV inactive', description: 'Valuable patients gone quiet', filter: p => p.lifetimeValue >= 4000 && daysSince(p.lastVisit) >= 45, offer: 'Personal outreach from care team', channel: 'Voice', rate: 26 },
-      { id: 'at-risk', label: 'Patients at risk', description: 'High churn-risk patients', filter: p => p.churnRisk >= 50, offer: 'Retention outreach + next-visit booking', channel: 'SMS', rate: 20 },
-      { id: 'winback-tagged', label: 'Reactivation candidates', description: 'Tagged for winback', filter: p => p.tags.map(t => t.toLowerCase()).includes('winback'), offer: 'Limited-time winback', channel: 'WhatsApp', rate: 12 },
-    ];
-    return defs.map(d => {
-      // Candidate membership is not contact eligibility. Campaign preview/dispatch
-      // must re-check canonical consent and suppression evidence.
-      const ps = patients.filter(p => d.filter(p));
-      return {
-        id: d.id, label: d.label, description: d.description, patientCount: ps.length, recoverableValue: recoverable(ps),
-        planningChannel: d.channel, planningOffer: d.offer, planningBookingRate: d.rate,
-        planningCost: ps.length * (d.channel === 'Email' ? 0 : d.channel === 'Voice' ? 3 : 1),
-        assumptionNotice: 'Unvalidated planning assumptions only; not a forecast or consent decision.',
-      };
-    }).filter(s => s.patientCount > 0);
+  // [LIVE] GET /v1/patients — `search` is the SERVER's search parameter, so a
+  // lookup runs against every patient rather than the hundred rows in memory.
+  // "No patients found" is now an answer about the record system.
+  async listPatients(options: { search?: string; churnRiskHigh?: number | null } = {}): Promise<CrmPatientPage> {
+    const query = new URLSearchParams({ limit: String(PATIENT_PAGE_SIZE) });
+    const search = options.search?.trim();
+    if (search) query.set('search', search);
+    const [res, consents] = await Promise.all([
+      apiRequest<{ data: Array<Record<string, unknown>>; nextCursor?: string }>(`/v1/patients?${query.toString()}`),
+      apiRequest<CommunicationConsentRow[]>('/v1/crm/consent'),
+    ]);
+    const rows = res.data ?? [];
+    return {
+      patients: rows.map(row => adaptPatient(row, consents, options.churnRiskHigh ?? null)),
+      returned: rows.length,
+      // The cursor the previous implementation threw away. Its presence is the
+      // server saying "there is more", and the table now repeats that.
+      truncated: Boolean(res.nextCursor),
+    };
+  },
+
+  // [LIVE] GET /v1/patients — kept for pages that only need the records
+  // themselves. No policy is loaded, so no risk band is claimed.
+  async getPatients(): Promise<CrmPatient[]> {
+    return (await crmService.listPatients()).patients;
+  },
+
+  // [LIVE] PATCH /v1/leads/:id (stage transition — audited server-side).
+  // `lostReason` is required by the server when a lead moves to `lost`; it is
+  // persisted on the lead, recorded in the audit trail, and written to the
+  // lead's activity history, which is what the confirmation modal promises.
+  async setStage(id: string, stage: Stage, lostReason?: string): Promise<void> {
+    const reason = lostReason?.trim();
+    await apiRequest(`/v1/leads/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(reason ? { stage, lostReason: reason } : { stage }),
+    });
   },
 
   // Governed per-lead communications request. Synthetic mocks can execute;

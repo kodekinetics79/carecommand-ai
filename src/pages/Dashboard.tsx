@@ -13,6 +13,7 @@ import ActionDrawer from '../components/dashboard/ActionDrawer';
 import BranchHealthCard from '../components/dashboard/BranchHealthCard';
 import CampaignROIPanel from '../components/dashboard/CampaignROIPanel';
 import { apiRequest } from '../lib/api';
+import type { CampaignHandoff } from '../lib/crm';
 import { receivedData } from '../lib/resourceState';
 import { useResource } from '../hooks/useResource';
 import { mapRevenueSnapshot, type ApiRevenueSnapshot } from '../lib/apiAdapters';
@@ -74,6 +75,10 @@ export default function Dashboard() {
     : null;
 
   const openCta = (a: PriorityAction) => navigate(a.cta.route);
+  // Every route into the campaign workspace carries where the decision was
+  // made (and, when one CTA honestly implies it, the goal) — never an empty
+  // navigation that asks the user to repeat themselves one screen later.
+  const openCampaigns = (handoff: CampaignHandoff) => navigate('/campaigns', { state: handoff });
 
   return (
     <div className="dash-cockpit animate-fade-up">
@@ -181,7 +186,7 @@ export default function Dashboard() {
           </ResourceSection>
         </BentoCard>
         <BentoCard className="cockpit-card" title="Campaign performance evidence" subtitle="Stored audience, booking, and associated-value fields; causation not established"
-          headerRight={<button type="button" onClick={() => navigate('/campaigner')} className="text-xs font-semibold text-indigo hover:opacity-75 inline-flex items-center gap-1"><BarChart3 className="w-3.5 h-3.5" aria-hidden="true" /> All campaigns</button>}>
+          headerRight={<button type="button" onClick={() => openCampaigns({ source: 'Dashboard' })} className="text-xs font-semibold text-indigo hover:opacity-75 inline-flex items-center gap-1"><BarChart3 className="w-3.5 h-3.5" aria-hidden="true" /> All campaigns</button>}>
           <ResourceSection
             label="Campaign performance"
             state={campaigns.state}
@@ -190,7 +195,7 @@ export default function Dashboard() {
             // The panel owns the "no campaigns yet" claim and its create CTA.
             isEmpty={() => false}
           >
-            {rows => <CampaignROIPanel campaigns={rows} onViewAll={() => navigate('/campaigner')} onCreate={() => navigate('/campaigner')} />}
+            {rows => <CampaignROIPanel campaigns={rows} onViewAll={() => openCampaigns({ source: 'Dashboard' })} onCreate={() => openCampaigns({ goal: 'winback', source: 'Dashboard', contextLabel: 'No campaigns recorded yet' })} />}
           </ResourceSection>
         </BentoCard>
       </div>
@@ -201,7 +206,7 @@ export default function Dashboard() {
           label="Priority queue"
           state={actions.state}
           onRetry={actions.reload}
-          loading={<PriorityActionRail actions={[]} loading onOpen={setDrawerAction} onCta={openCta} onCreateCampaign={() => navigate('/campaigner')} />}
+          loading={<PriorityActionRail actions={[]} loading onOpen={setDrawerAction} onCta={openCta} onCreateCampaign={() => openCampaigns({ source: 'Dashboard' })} />}
           // An empty queue is the rail's own claim, made only on a real response.
           isEmpty={() => false}
         >
@@ -210,7 +215,7 @@ export default function Dashboard() {
               actions={rows}
               onOpen={setDrawerAction}
               onCta={openCta}
-              onCreateCampaign={() => navigate('/campaigner')}
+              onCreateCampaign={() => openCampaigns({ source: 'Dashboard' })}
             />
           )}
         </ResourceSection>

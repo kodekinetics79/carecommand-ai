@@ -5,9 +5,11 @@ import { audit } from '../../lib/audit';
 import { requireRoles } from '../../plugins/roles';
 import { requireFeature } from '../../lib/entitlements';
 import { assertBranchAccess } from '../../lib/scope';
-import { encryptSecret } from '../../lib/security';
+import { encryptSecret, decryptSecret } from '../../lib/security';
 import { DEVICE_PROVIDERS } from '../../lib/connectedCare/catalog';
 import { invalidateRpmSignoffsForDevice, rpmPeriodBounds } from '../../lib/connectedCare/rpmEvidence';
+import { DEVICE_OFFLINE_AFTER_HOURS } from '../../lib/connectedCare/safetyDetection';
+import { branchScope } from '../../lib/scope';
 
 function devStatus(category: string, mode: string, hasRequired: boolean): string {
   if (category === 'MANUAL') return 'ACTIVE';
@@ -21,6 +23,11 @@ const adminRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
 const DEVICE_TYPES = ['vitals_monitor', 'lab_analyzer', 'check_in_kiosk', 'document_scanner', 'imaging', 'wearable_gateway'] as const;
 const CONNECTION_TYPES = ['network', 'usb', 'bluetooth', 'cloud_api'] as const;
 const STATUSES = ['online', 'offline', 'error', 'pending'] as const;
+// A human may report that a device is BROKEN or RETIRED — both are observations
+// about the physical world a person can genuinely make. Nobody can assert that a
+// device is currently connected; that is only ever observed from telemetry.
+// 'online' is therefore not settable through the API.
+const HUMAN_SETTABLE_STATUSES = ['offline', 'error', 'pending'] as const;
 
 const createSchema = z.object({
   name: z.string().trim().min(2).max(120),
@@ -46,7 +53,7 @@ const updateSchema = z.object({
   location: z.string().trim().max(160).nullable().optional(),
   firmwareVersion: z.string().trim().max(60).nullable().optional(),
   notes: z.string().trim().max(500).nullable().optional(),
-  status: z.enum(STATUSES).optional(),
+  status: z.enum(HUMAN_SETTABLE_STATUSES).optional(),
   active: z.boolean().optional(),
 });
 
@@ -57,10 +64,40 @@ async function recordEvent(tenantId: string, deviceId: string, actorUserId: stri
   });
 }
 
+/**
+ * Connectivity is DERIVED from observed activity, never read from the stored
+ * column. The stored `status` is a human-settable field, so a staff member
+ * could assert "online" from a dropdown and the registry would render it as
+ * telemetry under a "Connected now" heading — a device last seen 71 days ago
+ * showed a green Online badge next to its own contradicting timestamp.
+ * A clinician reading that believes a patient is being monitored when nothing
+ * is listening. Reachability is observed or it is unknown; it is never claimed.
+ *
+ * Correctness must not depend on the background offline-sweep worker running,
+ * so this is computed on every read.
+ */
+export type Connectivity = 'reporting' | 'stale' | 'never_reported' | 'error' | 'retired';
+
+export function deriveConnectivity(
+  device: { status: string; active: boolean; lastSeenAt: Date | null },
+  lastReadingAt: Date | null,
+  now = new Date(),
+  offlineAfterHours = DEVICE_OFFLINE_AFTER_HOURS,
+): { connectivity: Connectivity; lastActivityAt: Date | null } {
+  const candidates = [device.lastSeenAt, lastReadingAt].filter((d): d is Date => d instanceof Date);
+  const lastActivityAt = candidates.length ? new Date(Math.max(...candidates.map(d => d.getTime()))) : null;
+  if (!device.active) return { connectivity: 'retired', lastActivityAt };
+  if (device.status === 'error') return { connectivity: 'error', lastActivityAt };
+  // No observation has ever been made — "pending" is honest, "online" is not.
+  if (!lastActivityAt) return { connectivity: 'never_reported', lastActivityAt };
+  const staleAfter = now.getTime() - offlineAfterHours * 36e5;
+  return { connectivity: lastActivityAt.getTime() >= staleAfter ? 'reporting' : 'stale', lastActivityAt };
+}
+
 const DEVICE_SELECT = {
   id: true, name: true, deviceType: true, vendor: true, model: true, serialNumber: true,
   connectionType: true, status: true, location: true, firmwareVersion: true, notes: true,
-  lastSeenAt: true, lastTestStatus: true, lastTestedAt: true, branchId: true,
+  lastSeenAt: true, lastTestStatus: true, lastTestedAt: true, branchId: true, active: true,
 } as const;
 
 export const deviceRoutes: FastifyPluginAsync = async app => {
@@ -70,15 +107,48 @@ export const deviceRoutes: FastifyPluginAsync = async app => {
   // Overview: connected-device registry + status summary for the practice.
   app.get('/overview', async request => {
     const tenantId = request.auth.tenantId;
+    // Branch-scoped, matching the detail route. Without this a branch-restricted
+    // user was refused GET /:id but had already received every device in every
+    // branch — serial numbers included — from this list.
     const [devices, branches] = await Promise.all([
-      db.device.findMany({ where: { tenantId, active: true }, orderBy: [{ status: 'asc' }, { name: 'asc' }], select: DEVICE_SELECT }),
+      db.device.findMany({ where: { tenantId, active: true, ...branchScope(request) }, orderBy: [{ status: 'asc' }, { name: 'asc' }], select: DEVICE_SELECT }),
       db.branch.findMany({ where: { tenantId, active: true }, select: { id: true, name: true } }),
     ]);
     const branchName = new Map(branches.map(b => [b.id, b.name]));
-    const byStatus = (s: string) => devices.filter(d => d.status === s).length;
+
+    // Newest reading per device — the other half of "has this thing spoken to
+    // us recently", alongside lastSeenAt.
+    const deviceIds = devices.map(d => d.id);
+    const lastReadings = deviceIds.length
+      ? await db.deviceReading.groupBy({
+          by: ['deviceId'],
+          where: { tenantId, deviceId: { in: deviceIds } },
+          _max: { capturedAt: true },
+        })
+      : [];
+    const lastReadingAt = new Map(lastReadings.map(r => [r.deviceId as string, r._max.capturedAt]));
+
+    const now = new Date();
+    const enriched = devices.map(d => {
+      const { connectivity, lastActivityAt } = deriveConnectivity(d, lastReadingAt.get(d.id) ?? null, now);
+      return {
+        ...d,
+        branchName: d.branchId ? branchName.get(d.branchId) ?? null : null,
+        connectivity,
+        lastActivityAt,
+        offlineAfterHours: DEVICE_OFFLINE_AFTER_HOURS,
+      };
+    });
+    const byConnectivity = (c: Connectivity) => enriched.filter(d => d.connectivity === c).length;
     return {
-      summary: { total: devices.length, online: byStatus('online'), offline: byStatus('offline'), error: byStatus('error'), pending: byStatus('pending') },
-      devices: devices.map(d => ({ ...d, branchName: d.branchId ? branchName.get(d.branchId) ?? null : null })),
+      summary: {
+        total: enriched.length,
+        reporting: byConnectivity('reporting'),
+        stale: byConnectivity('stale'),
+        neverReported: byConnectivity('never_reported'),
+        error: byConnectivity('error'),
+      },
+      devices: enriched,
       branches,
     };
   });
@@ -137,7 +207,10 @@ export const deviceRoutes: FastifyPluginAsync = async app => {
     const updated = await db.$transaction(async tx => {
       const row = await tx.device.update({
         where: { id: existing.id },
-        data: { ...input, lastSeenAt: input.status === 'online' ? new Date() : existing.lastSeenAt },
+        // lastSeenAt is telemetry. It is stamped by ingest, never by an edit —
+        // it previously moved to now() whenever a human picked "online", which
+        // manufactured the very evidence the staleness check relies on.
+        data: { ...input },
         select: { id: true, name: true, status: true, active: true },
       });
       if (statusChanged) {
@@ -230,6 +303,10 @@ export const deviceRoutes: FastifyPluginAsync = async app => {
   // ════════════════════════════════════════════════════════════════════════
   const devProviderKey = z.enum(['dexcom', 'withings', 'validic', 'terra', 'tenovi', 'manual']);
 
+  // A verdict older than this is reported as stale rather than rendered as if it
+  // were current. A health check describes the moment it ran, not forever.
+  const HEALTH_VERDICT_TTL_HOURS = 24;
+
   app.get('/providers', async request => {
     const rows = await db.deviceProvider.findMany({ where: { tenantId: request.auth.tenantId } });
     const byKey = new Map(rows.map(r => [r.providerKey, r]));
@@ -242,6 +319,12 @@ export const deviceRoutes: FastifyPluginAsync = async app => {
         configured: def.category === 'MANUAL' || (!!row && row.status !== 'NOT_CONFIGURED'),
         webhookConfigured: row?.webhookConfigured ?? false,
         lastHealthCheckAt: row?.lastHealthCheckAt ?? null, lastHealthStatus: row?.lastHealthStatus ?? null, healthMessage: row?.healthMessage ?? null, lastSyncAt: row?.lastSyncAt ?? null,
+        // The UI must be able to tell "checked and fine" from "checked once,
+        // months ago" without doing date arithmetic and getting it wrong.
+        healthVerdictStale: row?.lastHealthCheckAt
+          ? row.lastHealthCheckAt.getTime() < Date.now() - HEALTH_VERDICT_TTL_HOURS * 36e5
+          : null,
+        healthVerdictTtlHours: HEALTH_VERDICT_TTL_HOURS,
       };
     });
   });
@@ -258,7 +341,10 @@ export const deviceRoutes: FastifyPluginAsync = async app => {
     const row = await db.deviceProvider.upsert({
       where: { tenantId_providerKey: { tenantId: request.auth.tenantId, providerKey: key } },
       create: { tenantId: request.auth.tenantId, providerKey: key, displayName: def.displayName, category: def.category, mode, status, encryptedConfig },
-      update: { mode, status, ...(encryptedConfig ? { encryptedConfig } : {}) },
+      // Clear the prior health verdict: it described the OLD credentials. Leaving
+      // it in place produced "Health: healthy · checked 71d ago" in green next to
+      // credentials that had since been replaced.
+      update: { mode, status, ...(encryptedConfig ? { encryptedConfig } : {}), lastHealthCheckAt: null, lastHealthStatus: null, healthMessage: null },
       select: { id: true, providerKey: true, status: true, mode: true },
     });
     await audit(request, { action: 'device.provider.configured', resource: 'deviceProvider', resourceId: row.id, metadata: { providerKey: key, mode, status } });
@@ -269,10 +355,34 @@ export const deviceRoutes: FastifyPluginAsync = async app => {
     const { key } = z.object({ key: devProviderKey }).parse(request.params);
     const def = DEVICE_PROVIDERS.find(p => p.key === key)!;
     const row = await db.deviceProvider.findFirst({ where: { tenantId: request.auth.tenantId, providerKey: key } });
+    // TRUTHFULNESS: 'healthy' asserts this provider was reached. Nothing in this
+    // process can reach one — there is no HTTP client on this path and no vendor
+    // adapter yet. Reporting 'healthy' because a row exists whose status column
+    // the same tenant wrote 30 seconds earlier told an admin, in green, that
+    // their integration worked; they then enrolled patients against a connection
+    // that had never been tested. Until a live adapter exists, the honest
+    // verdict is 'unverified'.
     let healthStatus = 'error';
     let message = 'Provider is not configured.';
-    if (def.category === 'MANUAL') { healthStatus = 'healthy'; message = 'Manual entry is always available.'; }
-    else if (row && (row.status === 'SANDBOX' || row.status === 'ACTIVE')) { healthStatus = 'healthy'; message = `Credentials present (${row.mode}).`; }
+    if (def.category === 'MANUAL') {
+      // Manual entry involves no third party — this one IS verifiable locally.
+      healthStatus = 'healthy';
+      message = 'Manual entry is always available — no external provider involved.';
+    } else if (row && (row.status === 'SANDBOX' || row.status === 'ACTIVE')) {
+      // Decrypt-and-parse is a real local check: it catches the silent failure
+      // where a rotated encryption key leaves every stored credential unreadable
+      // while the old code still reported 'healthy'.
+      const decrypted = row.encryptedConfig ? decryptSecret(row.encryptedConfig) : null;
+      let parsed: Record<string, unknown> | null = null;
+      if (decrypted) { try { parsed = JSON.parse(decrypted) as Record<string, unknown>; } catch { parsed = null; } }
+      if (!parsed) {
+        healthStatus = 'error';
+        message = 'Stored credentials cannot be decrypted. The application encryption key may have changed since they were saved — re-enter them.';
+      } else {
+        healthStatus = 'unverified';
+        message = `Credentials stored and readable (${row.mode}). No live ${def.displayName} adapter exists yet, so reachability has never been tested.`;
+      }
+    }
     const updated = await db.deviceProvider.upsert({
       where: { tenantId_providerKey: { tenantId: request.auth.tenantId, providerKey: key } },
       create: { tenantId: request.auth.tenantId, providerKey: key, displayName: def.displayName, category: def.category, status: def.category === 'MANUAL' ? 'ACTIVE' : 'NOT_CONFIGURED', lastHealthCheckAt: new Date(), lastHealthStatus: healthStatus, healthMessage: message },

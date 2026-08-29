@@ -1,8 +1,9 @@
 import { db } from './db';
 import { env } from '../config/env';
-import { runWithTenantContext } from './tenantContext';
-import type { ReceptionistOptOutChannel } from '../generated/prisma/client';
-import { canonicalDncDestination } from './receptionist/dncFence';
+import { runWithTenantContext, type TenantTxClient } from './tenantContext';
+import type { CampaignLiveDispatchActivation, ReceptionistOptOutChannel } from '../generated/prisma/client';
+import { canonicalDncDestination, isDestinationOptedOutTx } from './receptionist/dncFence';
+import type { Permission } from './permissions';
 
 // ===========================================================================
 // CRM Campaign / Reactivation engine helpers. Deterministic, tenant-scoped
@@ -27,6 +28,125 @@ export type AudienceType = typeof AUDIENCE_TYPES[number];
 
 // Audiences that are intentionally STAFF-facing (never patient-blaming outreach).
 export const STAFF_FACING_AUDIENCES = new Set(['prior_auth_followup']);
+
+// ---------------------------------------------------------------------------
+// Campaign authority classes.
+//
+// Authority over a campaign is scoped by what the campaign IS, not granted
+// wholesale. Two different consent classes hide behind one "campaign" noun:
+//
+//   payment_followup    The practice chasing money it is already owed, or the
+//                       coverage that would pay it — unpaid deposit, failed
+//                       payment, insurance/coverage update, prior authorization.
+//                       Under HIPAA this is payment operations; it is NOT
+//                       marketing, and it is ordinary billing-staff work.
+//
+//   marketing_outreach  Everything else, including reactivation offers and
+//                       review requests. A different consent class entirely,
+//                       and the default for anything unrecognised.
+//
+// CAMPAIGN_CLASS_AUTHORITY below is the ONLY mapping of class -> required
+// grant. Routes read it; they never re-decide it. `campaign:manage` is the
+// broad grant and appears in every class, so no role that can manage campaigns
+// today loses anything.
+// ---------------------------------------------------------------------------
+export const CAMPAIGN_AUTHORITY_CLASSES = ['payment_followup', 'marketing_outreach'] as const;
+export type CampaignAuthorityClass = typeof CAMPAIGN_AUTHORITY_CLASSES[number];
+
+/** Every campaign type, classified exactly once. */
+export const CAMPAIGN_TYPE_AUTHORITY_CLASS: Record<CampaignType, CampaignAuthorityClass> = {
+  unpaid_deposit_followup: 'payment_followup',
+  failed_payment_recovery: 'payment_followup',
+  insurance_update_request: 'payment_followup',
+  prior_auth_followup: 'payment_followup',
+  appointment_reminder: 'marketing_outreach',
+  appointment_confirmation: 'marketing_outreach',
+  no_show_recovery: 'marketing_outreach',
+  inactive_patient_reactivation: 'marketing_outreach',
+  missed_call_recovery: 'marketing_outreach',
+  appointment_request_followup: 'marketing_outreach',
+  review_request: 'marketing_outreach',
+  custom: 'marketing_outreach',
+};
+
+/** Every audience source, classified exactly once. */
+export const AUDIENCE_TYPE_AUTHORITY_CLASS: Record<AudienceType, CampaignAuthorityClass> = {
+  unpaid_deposit_followup: 'payment_followup',
+  failed_payment_recovery: 'payment_followup',
+  insurance_update_request: 'payment_followup',
+  inactive_patients: 'marketing_outreach',
+  no_show_recovery: 'marketing_outreach',
+  appointment_request_followup: 'marketing_outreach',
+  review_request: 'marketing_outreach',
+};
+
+/**
+ * The class a campaign is governed by. Fails CLOSED in every ambiguous case:
+ * an unrecognised type, a missing audience, or a payment-labelled campaign
+ * pointed at a marketing audience all resolve to `marketing_outreach`. That
+ * last case is the one that matters — without it, labelling a campaign
+ * `unpaid_deposit_followup` while aiming it at `inactive_patients` would let
+ * payment authority reach the whole patient base.
+ */
+export function campaignAuthorityClass(campaign: { campaignType?: string | null; audienceType?: string | null }): CampaignAuthorityClass {
+  const byType = campaign.campaignType
+    ? (CAMPAIGN_TYPE_AUTHORITY_CLASS as Record<string, CampaignAuthorityClass | undefined>)[campaign.campaignType]
+    : undefined;
+  if (byType !== 'payment_followup') return 'marketing_outreach';
+  const byAudience = campaign.audienceType
+    ? (AUDIENCE_TYPE_AUTHORITY_CLASS as Record<string, CampaignAuthorityClass | undefined>)[campaign.audienceType]
+    : undefined;
+  return byAudience === 'payment_followup' ? 'payment_followup' : 'marketing_outreach';
+}
+
+/**
+ * Class -> the grants that authorize it. ANY ONE of `manage` authorizes a
+ * write; any one of `read` authorizes a read. Element [0] is the broad grant
+ * and is what a refusal reports, because it is the grant an administrator
+ * would actually assign.
+ */
+export const CAMPAIGN_CLASS_AUTHORITY: Record<CampaignAuthorityClass, {
+  manage: readonly [Permission, ...Permission[]];
+  read: readonly [Permission, ...Permission[]];
+}> = {
+  marketing_outreach: {
+    manage: ['campaign:manage'],
+    read: ['campaign:read'],
+  },
+  payment_followup: {
+    manage: ['campaign:manage', 'campaign:payment-followup:manage'],
+    read: ['campaign:read', 'campaign:payment-followup:manage'],
+  },
+};
+
+function unionAuthority(mode: 'manage' | 'read'): [Permission, ...Permission[]] {
+  const broad = CAMPAIGN_CLASS_AUTHORITY.marketing_outreach[mode][0];
+  const rest = [...new Set(CAMPAIGN_AUTHORITY_CLASSES.flatMap(c => [...CAMPAIGN_CLASS_AUTHORITY[c][mode]]))]
+    .filter(permission => permission !== broad);
+  return [broad, ...rest];
+}
+
+/**
+ * The coarse any-of gate a per-campaign route installs as its preHandler: a
+ * caller holding none of these is refused before the route reads any record.
+ * Derived from the table above so the gate can never drift from it.
+ */
+export const CAMPAIGN_ANY_MANAGE_AUTHORITY = unionAuthority('manage');
+export const CAMPAIGN_ANY_READ_AUTHORITY = unionAuthority('read');
+
+/** The campaign/audience vocabulary a given class covers (for list filtering). */
+export const PAYMENT_FOLLOWUP_CAMPAIGN_TYPES = CAMPAIGN_TYPES.filter(t => CAMPAIGN_TYPE_AUTHORITY_CLASS[t] === 'payment_followup');
+export const PAYMENT_FOLLOWUP_AUDIENCE_TYPES = AUDIENCE_TYPES.filter(a => AUDIENCE_TYPE_AUTHORITY_CLASS[a] === 'payment_followup');
+
+// Canonical Lead.stage vocabulary. `Lead.stage` is a free `String` column, so
+// the ONLY place the vocabulary can be enforced is the API boundary. Declared
+// here (next to the other Growth vocabularies) so every boundary that accepts
+// or filters a stage uses `z.enum(LEAD_STAGES)` instead of a free string, and
+// so it cannot drift from the client contract in src/lib/crmService.ts.
+export const LEAD_STAGES = [
+  'new-inquiry', 'contacted', 'booked', 'visited', 'follow-up', 'retained', 'lost',
+] as const;
+export type LeadStage = typeof LEAD_STAGES[number];
 
 export type CommChannel = 'sms' | 'email' | 'voice' | 'whatsapp';
 const INACTIVE_DAYS_DEFAULT = 180;
@@ -152,6 +272,154 @@ export function providerModeFor(channel: CommChannel): ProviderMode {
   return 'configured_pending_provider';
 }
 
+// --- Live campaign dispatch activation (DEFAULT OFF) -----------------------
+//
+// Three independent conditions must ALL hold before one live regulated campaign
+// message may be submitted, and `providerReadiness()` reports each of them
+// separately so an operator can see what is actually missing:
+//
+//   1. the durable submission fence exists (CampaignSubmissionClaim +
+//      campaignIntegrity.claimCampaignProviderIntent);
+//   2. the channel has a real live provider wired (providerModeFor === live_supported);
+//   3. an OWNER/ADMIN wrote a CampaignLiveDispatchActivation row for THIS tenant
+//      and channel with an explicit attestation.
+//
+// Condition 3 has no default, no seed and no backfill: absence means OFF.
+export const CAMPAIGN_CHANNELS: readonly CommChannel[] = ['sms', 'email', 'voice', 'whatsapp'];
+
+/**
+ * Identifies the fence implementation an activation attestation was made
+ * against. Changing the fence's safety properties must bump this constant so
+ * every existing attestation is refused until it is re-made against the new
+ * boundary — an activation is consent to a specific mechanism, not a forever
+ * blank cheque.
+ */
+export const LIVE_DISPATCH_FENCE_VERSION = 'campaign-submission-claim.v1';
+
+/** Channels a live regulated campaign message can be submitted on at all. */
+export const LIVE_DISPATCH_CHANNELS: readonly CommChannel[] = ['sms', 'email', 'whatsapp'];
+
+export type LiveDispatchBlocker =
+  | 'fence_not_implemented'
+  | 'channel_not_eligible_for_live_dispatch'
+  | 'provider_not_configured'
+  | 'provider_is_development_mock'
+  | 'provider_has_no_live_sender'
+  | 'tenant_activation_missing'
+  | 'tenant_activation_revoked'
+  | 'tenant_activation_fence_version_stale';
+
+export interface ChannelDispatchActivation {
+  channel: CommChannel;
+  providerMode: ProviderMode;
+  providerConfigured: boolean;
+  /** A real live sender is wired for this channel (not a dev mock, not pending). */
+  liveProviderReady: boolean;
+  /** The durable submission fence is compiled into this build. */
+  fencePresent: boolean;
+  /** An unrevoked, current-version activation row exists for this tenant. */
+  tenantActivated: boolean;
+  /** All three conditions hold. This is the only field dispatch may act on. */
+  liveDispatchActivated: boolean;
+  activationId: string | null;
+  activatedAt: string | null;
+  activatedByUserId: string | null;
+  attestation: string | null;
+  blockingReasons: LiveDispatchBlocker[];
+}
+
+export type DispatchActivationRecord = Pick<CampaignLiveDispatchActivation,
+  'id' | 'channel' | 'activatedAt' | 'activatedByUserId' | 'attestation' | 'fenceVersion' | 'revokedAt'
+>;
+
+/**
+ * Pure resolver. `record` is the tenant's activation row for this channel, or
+ * null when none exists — which is the state every tenant is in until someone
+ * deliberately changes it.
+ */
+export function resolveChannelDispatchActivation(
+  channel: CommChannel,
+  record: DispatchActivationRecord | null,
+  fencePresent = true,
+): ChannelDispatchActivation {
+  const status = channelStatus(channel);
+  const providerMode = providerModeFor(channel);
+  const liveProviderReady = providerMode === 'live_supported';
+  const blockingReasons: LiveDispatchBlocker[] = [];
+  if (!fencePresent) blockingReasons.push('fence_not_implemented');
+  if (!LIVE_DISPATCH_CHANNELS.includes(channel)) blockingReasons.push('channel_not_eligible_for_live_dispatch');
+  if (!status.configured) blockingReasons.push('provider_not_configured');
+  else if (providerMode === 'mock_dev') blockingReasons.push('provider_is_development_mock');
+  else if (!liveProviderReady) blockingReasons.push('provider_has_no_live_sender');
+  if (!record) blockingReasons.push('tenant_activation_missing');
+  else if (record.revokedAt) blockingReasons.push('tenant_activation_revoked');
+  else if (record.fenceVersion !== LIVE_DISPATCH_FENCE_VERSION) blockingReasons.push('tenant_activation_fence_version_stale');
+  const tenantActivated = Boolean(record && !record.revokedAt && record.fenceVersion === LIVE_DISPATCH_FENCE_VERSION);
+  return {
+    channel,
+    providerMode,
+    providerConfigured: status.configured,
+    liveProviderReady,
+    fencePresent,
+    tenantActivated,
+    liveDispatchActivated: blockingReasons.length === 0,
+    activationId: tenantActivated ? record!.id : null,
+    activatedAt: record?.activatedAt?.toISOString() ?? null,
+    activatedByUserId: record?.activatedByUserId ?? null,
+    attestation: record?.attestation ?? null,
+    blockingReasons,
+  };
+}
+
+const ACTIVATION_SELECT = {
+  id: true, channel: true, activatedAt: true, activatedByUserId: true,
+  attestation: true, fenceVersion: true, revokedAt: true,
+} as const;
+
+/** Transactional read, so the fence can linearize activation with deactivation. */
+export async function resolveDispatchActivationTx(
+  tx: TenantTxClient,
+  tenantId: string,
+  channel: CommChannel,
+): Promise<ChannelDispatchActivation> {
+  const record = await tx.campaignLiveDispatchActivation.findUnique({
+    where: { tenantId_channel: { tenantId, channel } },
+    select: ACTIVATION_SELECT,
+  });
+  return resolveChannelDispatchActivation(channel, record);
+}
+
+export async function resolveDispatchActivation(tenantId: string, channel: CommChannel): Promise<ChannelDispatchActivation> {
+  return runWithTenantContext(tenantId, tx => resolveDispatchActivationTx(tx, tenantId, channel));
+}
+
+export async function resolveDispatchActivations(tenantId: string): Promise<Record<CommChannel, ChannelDispatchActivation>> {
+  const records = await runWithTenantContext(tenantId, tx => tx.campaignLiveDispatchActivation.findMany({
+    where: { tenantId },
+    select: ACTIVATION_SELECT,
+  }));
+  const byChannel = new Map(records.map(record => [record.channel, record]));
+  return Object.fromEntries(CAMPAIGN_CHANNELS.map(channel =>
+    [channel, resolveChannelDispatchActivation(channel, byChannel.get(channel) ?? null)],
+  )) as Record<CommChannel, ChannelDispatchActivation>;
+}
+
+function activationNoticeFor(activation: Record<CommChannel, ChannelDispatchActivation>): string {
+  const active = CAMPAIGN_CHANNELS.filter(c => activation[c].liveDispatchActivated);
+  if (active.length > 0) {
+    return `Live campaign delivery is ACTIVE for ${active.join(', ')}. Every recipient still passes the durable submission claim and the last-second opt-out check before any provider request, and a second attempt for the same recipient is a no-op.`;
+  }
+  const eligible = LIVE_DISPATCH_CHANNELS.filter(c => activation[c].liveProviderReady);
+  if (eligible.length === 0) {
+    return 'Live campaign delivery is not activated. The durable submission fence is in place, but no channel has a live provider wired, so there is nothing to activate yet.';
+  }
+  const awaitingTenant = eligible.filter(c => !activation[c].tenantActivated);
+  if (awaitingTenant.length > 0) {
+    return `Live campaign delivery is not activated. The durable submission fence is in place and ${awaitingTenant.join(', ')} has a live provider, but no OWNER or ADMIN has recorded an activation attestation for this tenant.`;
+  }
+  return 'Live campaign delivery is not activated. See channelActivation for the exact blocking reason on each channel.';
+}
+
 // Structured communications readiness (no secret values; env key NAMES only).
 export interface ProviderReadiness {
   smsConfigured: boolean;
@@ -165,16 +433,34 @@ export interface ProviderReadiness {
   liveSendingSupported: boolean;
   liveCampaignDispatchActivated: boolean;
   activationNotice: string;
+  /** The fence exists in this build; `liveDispatchFenceVersion` names which one. */
+  liveDispatchFenceImplemented: boolean;
+  liveDispatchFenceVersion: string;
+  /** Channels with a real live sender wired, regardless of tenant activation. */
+  liveProviderChannels: CommChannel[];
+  /** Channels this tenant may actually submit live traffic on right now. */
+  activatedChannels: CommChannel[];
+  /** Per-channel truth, including WHY a channel is not activated. */
+  channelActivation: Record<CommChannel, ChannelDispatchActivation>;
 }
 
-export function providerReadiness(): ProviderReadiness {
-  const channels: CommChannel[] = ['sms', 'email', 'voice', 'whatsapp'];
+/**
+ * Truthful readiness. `activation` carries this tenant's activation rows; when
+ * it is omitted the answer is the honest "no tenant activation is in force",
+ * which is also the correct answer for any caller that has no tenant in hand.
+ */
+export function providerReadiness(
+  activation?: Record<CommChannel, ChannelDispatchActivation>,
+): ProviderReadiness {
+  const channels = [...CAMPAIGN_CHANNELS];
   const statuses = Object.fromEntries(channels.map(c => [c, channelStatus(c)])) as Record<CommChannel, ChannelStatus>;
   const modes = Object.fromEntries(channels.map(c => [c, providerModeFor(c)])) as Record<CommChannel, ProviderMode>;
   const missingEnvKeys = [...new Set(channels.flatMap(c => statuses[c].missing))];
-  // "Supported" = can produce a real (mock_dev) or queued delivery; never a
-  // live-sent claim, since no concrete provider sender is wired.
+  // "Supported" = can produce a real (mock_dev) or queued delivery.
   const supportedChannels = channels.filter(c => modes[c] === 'mock_dev' || modes[c] === 'configured_pending_provider' || modes[c] === 'live_supported');
+  const channelActivation = activation
+    ?? Object.fromEntries(channels.map(c => [c, resolveChannelDispatchActivation(c, null)])) as Record<CommChannel, ChannelDispatchActivation>;
+  const activatedChannels = channels.filter(c => channelActivation[c].liveDispatchActivated);
   return {
     smsConfigured: statuses.sms.configured,
     emailConfigured: statuses.email.configured,
@@ -184,12 +470,17 @@ export function providerReadiness(): ProviderReadiness {
     supportedChannels,
     unsupportedChannels: channels.filter(c => !supportedChannels.includes(c)),
     schedulerEnforced: true,   // approved SCHEDULED campaigns run via the campaign-scheduler worker
-    // Provider adapters exist, but regulated campaign submission stays disabled
-    // until the consent/opt-out decision and durable provider claim share one
-    // database-linearized boundary.
-    liveSendingSupported: false,
-    liveCampaignDispatchActivated: false,
-    activationNotice: 'Live campaign delivery is disabled until the required consent and last-second opt-out safety control is activated and validated.',
+    // These two are no longer literals. Both mean "can THIS tenant submit live
+    // regulated campaign traffic right now", which is false until a named
+    // OWNER/ADMIN activates a channel whose provider is genuinely wired.
+    liveSendingSupported: activatedChannels.length > 0,
+    liveCampaignDispatchActivated: activatedChannels.length > 0,
+    activationNotice: activationNoticeFor(channelActivation),
+    liveDispatchFenceImplemented: true,
+    liveDispatchFenceVersion: LIVE_DISPATCH_FENCE_VERSION,
+    liveProviderChannels: LIVE_DISPATCH_CHANNELS.filter(c => channelActivation[c].liveProviderReady),
+    activatedChannels,
+    channelActivation,
   };
 }
 
@@ -273,37 +564,58 @@ export async function isDestinationOptedOut(tenantId: string, destination: strin
   return rows.some(r => canonicalDncDestination(r.contactPhone ?? '') === canonicalDncDestination(value));
 }
 
-export async function isSuppressed(tenantId: string, target: { patientId?: string | null; leadId?: string | null; destination?: string | null }, channel: CommChannel): Promise<boolean> {
+export type SuppressionTarget = { patientId?: string | null; leadId?: string | null; destination?: string | null };
+
+/**
+ * Identity-keyed half of the suppression decision, on a caller-supplied tenant
+ * transaction. Factored out of isSuppressed() so the durable submission fence
+ * can take the SAME decision inside the transaction that commits the provider
+ * intent, without the two checks ever drifting apart.
+ */
+async function identitySuppressedTx(tx: TenantTxClient, tenantId: string, target: SuppressionTarget, channel: CommChannel): Promise<boolean> {
+  const where = { tenantId, patientId: target.patientId ?? null, leadId: target.leadId ?? null };
+  const [optedOut, suppressed] = await Promise.all([
+    tx.communicationConsent.count({ where: { ...where, channel, status: 'opted_out' } }),
+    tx.campaignSuppression.count({ where: { ...where, channel, active: true } }),
+  ]);
+  if (optedOut > 0 || suppressed > 0) return true;
+
+  // Honor an explicit legacy ConsentEvent opt-out (latest event per purpose).
+  // Never fabricates opt-in — only an explicit granted=false suppresses.
+  // A MARKETING opt-out suppresses ALL channels (cross-channel marketing consent);
+  // SMS/EMAIL/WHATSAPP opt-outs suppress their mapped channel.
+  if (target.patientId) {
+    const purpose = CONSENT_PURPOSE[channel];
+    const purposes = purpose ? [purpose, 'MARKETING' as const] : ['MARKETING' as const];
+    const events = await tx.consentEvent.findMany({ where: { tenantId, patientId: target.patientId, purpose: { in: purposes } }, orderBy: { occurredAt: 'desc' } });
+    const seen = new Set<string>();
+    for (const e of events) {
+      if (seen.has(e.purpose)) continue; // latest per purpose only
+      seen.add(e.purpose);
+      if (e.granted === false) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The full suppression decision on ONE transaction. Callers that need the
+ * decision linearized with a durable claim (see campaignIntegrity) must use
+ * this and must hold the receptionist suppression advisory fences first.
+ */
+export async function isSuppressedTx(tx: TenantTxClient, tenantId: string, target: SuppressionTarget, channel: CommChannel): Promise<boolean> {
+  if (await identitySuppressedTx(tx, tenantId, target, channel)) return true;
+  if (target.destination && await isDestinationOptedOutTx(tx, tenantId, target.destination, channel)) return true;
+  return false;
+}
+
+export async function isSuppressed(tenantId: string, target: SuppressionTarget, channel: CommChannel): Promise<boolean> {
   // ConsentEvent is RLS-enrolled, so the consent reads run inside a tenant
   // transaction (GUC set on the same connection). Without it the legacy
   // ConsentEvent opt-out check would silently see zero rows under app_rls and
   // fail OPEN (a real opt-out would be missed). CommunicationConsent /
   // CampaignSuppression are not enrolled but are read here for a single context.
-  const identitySuppressed = await runWithTenantContext(tenantId, async tx => {
-    const where = { tenantId, patientId: target.patientId ?? null, leadId: target.leadId ?? null };
-    const [optedOut, suppressed] = await Promise.all([
-      tx.communicationConsent.count({ where: { ...where, channel, status: 'opted_out' } }),
-      tx.campaignSuppression.count({ where: { ...where, channel, active: true } }),
-    ]);
-    if (optedOut > 0 || suppressed > 0) return true;
-
-    // Honor an explicit legacy ConsentEvent opt-out (latest event per purpose).
-    // Never fabricates opt-in — only an explicit granted=false suppresses.
-    // A MARKETING opt-out suppresses ALL channels (cross-channel marketing consent);
-    // SMS/EMAIL/WHATSAPP opt-outs suppress their mapped channel.
-    if (target.patientId) {
-      const purpose = CONSENT_PURPOSE[channel];
-      const purposes = purpose ? [purpose, 'MARKETING' as const] : ['MARKETING' as const];
-      const events = await tx.consentEvent.findMany({ where: { tenantId, patientId: target.patientId, purpose: { in: purposes } }, orderBy: { occurredAt: 'desc' } });
-      const seen = new Set<string>();
-      for (const e of events) {
-        if (seen.has(e.purpose)) continue; // latest per purpose only
-        seen.add(e.purpose);
-        if (e.granted === false) return true;
-      }
-    }
-    return false;
-  });
+  const identitySuppressed = await runWithTenantContext(tenantId, tx => identitySuppressedTx(tx, tenantId, target, channel));
   if (identitySuppressed) return true;
 
   // Cross-module: a receptionist-call opt-out (destination-keyed) suppresses too.
@@ -316,8 +628,25 @@ export async function isSuppressed(tenantId: string, target: { patientId?: strin
 // --- Audience candidates ---------------------------------------------------
 export interface AudienceCandidate { patientId: string | null; leadId: string | null; name: string; email: string | null; phone: string | null; reason: string }
 
-export async function buildAudience(tenantId: string, audienceType: AudienceType, opts: { inactiveDays?: number } = {}): Promise<AudienceCandidate[]> {
+/** Audience generation options. */
+export interface AudienceOptions {
+  /** Inactivity window (days) for the `inactive_patients` audience. */
+  inactiveDays?: number;
+  /**
+   * Branch isolation. Audience sources previously filtered on tenantId ONLY, so
+   * a branch-restricted operator could preview and target patients belonging to
+   * branches they cannot otherwise see. Callers pass `request.auth.branchId`;
+   * null/undefined means the caller is tenant-wide. Semantics deliberately match
+   * `branchScope()` in server/lib/scope.ts: an exact branchId match, so rows
+   * with no branch assigned (e.g. an unrouted AppointmentRequest) fail CLOSED
+   * for a scoped caller rather than leaking into their audience.
+   */
+  branchId?: string | null;
+}
+
+export async function buildAudience(tenantId: string, audienceType: AudienceType, opts: AudienceOptions = {}): Promise<AudienceCandidate[]> {
   const now = Date.now();
+  const branchFilter = opts.branchId ? { branchId: opts.branchId } : {};
   // Audience sources read RLS-enrolled PHI tables (Patient, Appointment,
   // PaymentRequest, DepositRequirement, EligibilityVerification). Run inside a
   // tenant transaction so app.current_tenant_id is set on the SAME connection —
@@ -328,27 +657,27 @@ export async function buildAudience(tenantId: string, audienceType: AudienceType
       case 'inactive_patients': {
         const cutoff = new Date(now - (opts.inactiveDays ?? INACTIVE_DAYS_DEFAULT) * 86400000);
         const rows = await tx.patient.findMany({
-          where: { tenantId, deletedAt: null, lifecycleStage: { not: 'LOST' }, OR: [{ lastVisitAt: { lt: cutoff } }, { lastVisitAt: null, createdAt: { lt: cutoff } }] },
+          where: { tenantId, ...branchFilter, deletedAt: null, lifecycleStage: { not: 'LOST' }, OR: [{ lastVisitAt: { lt: cutoff } }, { lastVisitAt: null, createdAt: { lt: cutoff } }] },
           select: { id: true, firstName: true, lastName: true, email: true, phone: true }, take: 500,
         });
         return rows.map(p => ({ patientId: p.id, leadId: null, name: `${p.firstName} ${p.lastName}`, email: p.email, phone: p.phone, reason: 'No recent visit' }));
       }
       case 'no_show_recovery': {
-        const appts = await tx.appointment.findMany({ where: { tenantId, status: 'NO_SHOW', deletedAt: null }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { startsAt: 'desc' }, take: 500 });
+        const appts = await tx.appointment.findMany({ where: { tenantId, ...branchFilter, status: 'NO_SHOW', deletedAt: null }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { startsAt: 'desc' }, take: 500 });
         const seen = new Set<string>();
         const out: AudienceCandidate[] = [];
         for (const a of appts) { if (seen.has(a.patientId)) continue; seen.add(a.patientId); out.push({ patientId: a.patientId, leadId: null, name: `${a.patient.firstName} ${a.patient.lastName}`, email: a.patient.email, phone: a.patient.phone, reason: 'Missed appointment' }); }
         return out;
       }
       case 'unpaid_deposit_followup': {
-        const reqs = await tx.depositRequirement.findMany({ where: { tenantId, status: { in: ['required', 'requested', 'link_sent'] }, patientId: { not: null } }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, take: 500 });
+        const reqs = await tx.depositRequirement.findMany({ where: { tenantId, ...branchFilter, status: { in: ['required', 'requested', 'link_sent'] }, patientId: { not: null } }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, take: 500 });
         const seen = new Set<string>();
         const out: AudienceCandidate[] = [];
         for (const r of reqs) { if (!r.patientId || seen.has(r.patientId)) continue; seen.add(r.patientId); out.push({ patientId: r.patientId, leadId: null, name: r.patient ? `${r.patient.firstName} ${r.patient.lastName}` : 'Patient', email: r.patient?.email ?? null, phone: r.patient?.phone ?? null, reason: 'Unpaid deposit' }); }
         return out;
       }
       case 'failed_payment_recovery': {
-        const prs = await tx.paymentRequest.findMany({ where: { tenantId, status: { in: ['failed', 'expired'] }, patientId: { not: null } }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { createdAt: 'desc' }, take: 500 });
+        const prs = await tx.paymentRequest.findMany({ where: { tenantId, ...branchFilter, status: { in: ['failed', 'expired'] }, patientId: { not: null } }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { createdAt: 'desc' }, take: 500 });
         const seen = new Set<string>();
         const out: AudienceCandidate[] = [];
         for (const r of prs) { if (!r.patientId || seen.has(r.patientId)) continue; seen.add(r.patientId); out.push({ patientId: r.patientId, leadId: null, name: r.patient ? `${r.patient.firstName} ${r.patient.lastName}` : 'Patient', email: r.patient?.email ?? null, phone: r.patient?.phone ?? null, reason: 'Failed/expired payment' }); }
@@ -356,18 +685,18 @@ export async function buildAudience(tenantId: string, audienceType: AudienceType
       }
       case 'insurance_update_request': {
         // Patient-facing "please update your insurance" — uses ineligible checks.
-        const vers = await tx.eligibilityVerification.findMany({ where: { tenantId, coverageActive: false }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { checkedAt: 'desc' }, take: 500 });
+        const vers = await tx.eligibilityVerification.findMany({ where: { tenantId, ...branchFilter, coverageActive: false }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { checkedAt: 'desc' }, take: 500 });
         const seen = new Set<string>();
         const out: AudienceCandidate[] = [];
         for (const v of vers) { if (seen.has(v.patientId)) continue; seen.add(v.patientId); out.push({ patientId: v.patientId, leadId: null, name: `${v.patient.firstName} ${v.patient.lastName}`, email: v.patient.email, phone: v.patient.phone, reason: 'Insurance needs update' }); }
         return out;
       }
       case 'appointment_request_followup': {
-        const reqs = await tx.appointmentRequest.findMany({ where: { tenantId, status: { in: ['PENDING_REVIEW', 'MISSING_INFO'] } }, select: { id: true, patientId: true, leadId: true, collectedName: true, collectedPhone: true, collectedEmail: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, take: 500 });
+        const reqs = await tx.appointmentRequest.findMany({ where: { tenantId, ...branchFilter, status: { in: ['PENDING_REVIEW', 'MISSING_INFO'] } }, select: { id: true, patientId: true, leadId: true, collectedName: true, collectedPhone: true, collectedEmail: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, take: 500 });
         return reqs.map(r => ({ patientId: r.patientId, leadId: r.leadId, name: r.patient ? `${r.patient.firstName} ${r.patient.lastName}` : (r.collectedName ?? 'Lead'), email: r.patient?.email ?? r.collectedEmail, phone: r.patient?.phone ?? r.collectedPhone, reason: 'Pending appointment request' }));
       }
       case 'review_request': {
-        const appts = await tx.appointment.findMany({ where: { tenantId, status: 'COMPLETED', deletedAt: null }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { startsAt: 'desc' }, take: 500 });
+        const appts = await tx.appointment.findMany({ where: { tenantId, ...branchFilter, status: 'COMPLETED', deletedAt: null }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { startsAt: 'desc' }, take: 500 });
         const seen = new Set<string>();
         const out: AudienceCandidate[] = [];
         for (const a of appts) { if (seen.has(a.patientId)) continue; seen.add(a.patientId); out.push({ patientId: a.patientId, leadId: null, name: `${a.patient.firstName} ${a.patient.lastName}`, email: a.patient.email, phone: a.patient.phone, reason: 'Completed visit' }); }
@@ -382,8 +711,10 @@ export async function buildAudience(tenantId: string, audienceType: AudienceType
 // Preview: deterministic counts after consent/suppression + contact gating.
 export interface AudiencePreview { audienceType: AudienceType; channel: CommChannel; total: number; eligible: number; suppressed: number; missingContact: number; sample: Array<{ name: string; reason: string; destinationMasked: string | null }> }
 
-export async function previewAudience(tenantId: string, audienceType: AudienceType, channel: CommChannel): Promise<AudiencePreview> {
-  const candidates = await buildAudience(tenantId, audienceType);
+export async function previewAudience(tenantId: string, audienceType: AudienceType, channel: CommChannel, opts: AudienceOptions = {}): Promise<AudiencePreview> {
+  // The sample returns REAL patient names + a reason string, so the branch scope
+  // of the caller must reach the audience query itself — not just the response.
+  const candidates = await buildAudience(tenantId, audienceType, opts);
   let eligible = 0, suppressed = 0, missingContact = 0;
   const sample: AudiencePreview['sample'] = [];
   const field = channelField(channel);
@@ -406,12 +737,14 @@ const SLOT_MINUTES = 30;
 const DAY_START_HOUR = 9;
 const DAY_END_HOUR = 17;
 
-export async function countOpenSlots(tenantId: string, days = 7): Promise<number> {
+export async function countOpenSlots(tenantId: string, days = 7, opts: { branchId?: string | null } = {}): Promise<number> {
   const now = new Date();
   const horizon = new Date(now.getTime() + days * 86400000);
+  // A branch-restricted caller must not learn the capacity of other branches.
+  const branchFilter = opts.branchId ? { branchId: opts.branchId } : {};
   const [branches, appts] = await Promise.all([
-    db.branch.findMany({ where: { tenantId, active: true }, select: { id: true } }),
-    db.appointment.findMany({ where: { tenantId, deletedAt: null, startsAt: { gte: now, lt: horizon }, status: { notIn: ['CANCELED', 'NO_SHOW', 'COMPLETED'] } }, select: { branchId: true, startsAt: true, endsAt: true } }),
+    db.branch.findMany({ where: { tenantId, active: true, ...(opts.branchId ? { id: opts.branchId } : {}) }, select: { id: true } }),
+    db.appointment.findMany({ where: { tenantId, ...branchFilter, deletedAt: null, startsAt: { gte: now, lt: horizon }, status: { notIn: ['CANCELED', 'NO_SHOW', 'COMPLETED'] } }, select: { branchId: true, startsAt: true, endsAt: true } }),
   ]);
   const busyByBranch = new Map<string, Array<{ start: number; end: number }>>();
   for (const a of appts) {

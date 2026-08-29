@@ -5,6 +5,8 @@ import { cursorPage, paginationSchema } from '../../lib/pagination';
 import { requirePermission } from '../../lib/permissions';
 import { assertBranchAccess, branchScope } from '../../lib/scope';
 import { runWithTenantContext } from '../../lib/tenantContext';
+import { lockSuppressionFences } from '../../lib/receptionist/dncFence';
+import { getEffectiveGrowthPolicy } from '../growth/service';
 import { Prisma } from '../../generated/prisma/client';
 
 // Patient mutations now gate on the action permission `patient:write` (default
@@ -199,8 +201,20 @@ export const patientRoutes: FastifyPluginAsync = async app => {
       });
       const lifecycle = await tx.patient.groupBy({ by: ['lifecycleStage'], where, _count: { _all: true } });
       const branches = await tx.patient.groupBy({ by: ['branchId'], where, _count: { _all: true } });
-      const highRiskCount = await tx.patient.count({ where: { ...where, churnRisk: { gte: 60 } } });
-      const highLifetimeValueCount = await tx.patient.count({ where: { ...where, lifetimeValue: { gt: 4000 } } });
+      // Tenant-configurable thresholds, not literals. Read on `tx` because
+      // GrowthPolicy is RLS-enrolled: on the global client under app_rls the
+      // row is invisible and getEffectiveGrowthPolicy would silently fall back
+      // to code defaults, which is a fail-open on a tenant's own configuration.
+      //
+      // Both bounds are INCLUSIVE, per GROWTH_POLICY_DEFAULTS. highRiskCount
+      // therefore moves from >= 60 to >= churnRiskHigh (default 50): the
+      // intended convergence with CRM.tsx and the `at-risk` segment, which have
+      // always used >= 50, so a patient at 55% is no longer at-risk on one
+      // screen and healthy on another. highLifetimeValueCount moves from > 4000
+      // to >= highValuePatientLtv, so a patient at exactly the threshold counts.
+      const growthPolicy = await getEffectiveGrowthPolicy(request.auth.tenantId, tx);
+      const highRiskCount = await tx.patient.count({ where: { ...where, churnRisk: { gte: growthPolicy.churnRiskHigh } } });
+      const highLifetimeValueCount = await tx.patient.count({ where: { ...where, lifetimeValue: { gte: growthPolicy.highValuePatientLtv } } });
       const consentRows = await tx.$queryRaw<Array<{ purpose: string; granted_count: bigint }>>`
         WITH scoped_patients AS (
           SELECT p.id FROM "Patient" p
@@ -366,9 +380,22 @@ export const patientRoutes: FastifyPluginAsync = async app => {
     }));
     if (!patient) throw app.httpErrors.notFound('Patient not found');
 
-    const consent = await runWithTenantContext(request.auth.tenantId, tx => tx.consentEvent.create({
-      data: { tenantId: request.auth.tenantId, patientId: patient.id, ...input },
-    }));
+    const consent = await runWithTenantContext(request.auth.tenantId, async tx => {
+      // Staff-entered opt-outs land in the same ConsentEvent table the campaign
+      // dispatch fence re-reads, so they take the same advisory fences campaigns
+      // POST /consent takes — inside the transaction that writes the row.
+      // ConsentEvent is IDENTITY-keyed (isSuppressedTx reads it by tenantId +
+      // patientId + purpose), and this route is always about exactly one
+      // patient of the authenticated tenant, so the patient identity fence is
+      // the key. No destination fence: nothing written here is keyed by a phone
+      // number or address, and taking one would fence a key this row cannot be
+      // found by. `patient` was already proven tenant- and branch-scoped above;
+      // the authority check is unchanged and still precedes this write.
+      await lockSuppressionFences(tx, { tenantId: request.auth.tenantId, patientId: patient.id });
+      return tx.consentEvent.create({
+        data: { tenantId: request.auth.tenantId, patientId: patient.id, ...input },
+      });
+    });
     await audit(request, { action: 'patient.consent.recorded', resource: 'patient', resourceId: patient.id, metadata: { purpose: input.purpose, granted: input.granted } });
     return reply.code(201).send(consent);
   });

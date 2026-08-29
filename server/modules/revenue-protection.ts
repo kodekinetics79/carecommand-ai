@@ -7,7 +7,7 @@ import { audit } from '../lib/audit';
 import { assertBranchAccess } from '../lib/scope';
 import { requirePermission } from '../lib/permissions';
 import { requireFeature } from '../lib/entitlements';
-import { enterTenantContext, runWithTenantContext } from '../lib/tenantContext';
+import { enterTenantContext, getTenantContext, runWithJobTenantContext, runWithTenantContext, type TenantTxClient } from '../lib/tenantContext';
 import { resolveIngressTenant } from '../lib/tenantIngressResolvers';
 import { recordWorkflowEvent, emitBusinessEvent } from '../lib/intelligence';
 import { eligibilityProviderStatus, runDenialPreventionForAppointment } from '../lib/insuranceIntelligence';
@@ -18,6 +18,8 @@ import {
   eligibilityIdempotencyKey,
   runEligibilityExecution,
 } from '../lib/eligibilityExecution';
+import { getEffectiveGrowthPolicy } from './growth/service';
+import { GROWTH_POLICY_DEFAULTS } from './growth/defaults';
 
 // --- Idempotency -----------------------------------------------------------
 // Claims a unique (scope,key). Returns claimed=false on redelivery, exposing
@@ -139,9 +141,57 @@ type RevenueContext = {
   branchId?: string;
 };
 
+/**
+ * The tenant's configured risk thresholds, from GrowthPolicy. Both are
+ * INCLUSIVE lower bounds (value >= threshold), per the register in
+ * server/modules/growth/defaults.ts. The mock eligibility simulation used to
+ * escalate at `(churnRisk ?? noShowRisk ?? 0) > 65` — one unowned literal
+ * borrowed by two different concepts, diverging from the >= 50 rule every
+ * clinic-facing surface applies. Each concept now uses its own configured
+ * threshold: `churnRiskHigh` for a patient's churn risk, `noShowRiskHigh` for
+ * an appointment's no-show risk.
+ */
+export type EligibilityRiskThresholds = {
+  churnRiskHigh: number;
+  noShowRiskHigh: number;
+};
+
+/**
+ * Resolve the calling tenant's thresholds for the eligibility simulation.
+ *
+ * GrowthPolicy is RLS-enrolled: read on the global client outside tenant
+ * context it returns NO ROW and silently resolves to the code defaults — a
+ * fail-open on the tenant's own configuration that looks exactly like working
+ * code. The read is therefore made inside a tenant transaction, with the
+ * transaction client passed explicitly, so it is correct by construction from
+ * every caller: request, worker, job or script.
+ */
+async function loadEligibilityRiskThresholds(tenantId: string): Promise<EligibilityRiskThresholds> {
+  // A caller already inside a request/worker context inherits it unchanged
+  // (runWithTenantContext refuses a tenant change, fail-closed). With no
+  // ambient context at all — a script, a job, or a direct provider call — the
+  // read runs under a named worker identity, which the RLS actor rules accept
+  // for exactly this kind of unattended read. Either way the policy is read on
+  // a tenant TRANSACTION client, never the global client: under RLS the global
+  // client returns no row and silently resolves to the code defaults, which is
+  // the fail-open this whole increment exists to remove.
+  const read = (tx: TenantTxClient) => getEffectiveGrowthPolicy(tenantId, tx);
+  const policy = getTenantContext()
+    ? await runWithTenantContext(tenantId, read)
+    : await runWithJobTenantContext(tenantId, read, 'worker:eligibility-risk-thresholds');
+  return { churnRiskHigh: policy.churnRiskHigh, noShowRiskHigh: policy.noShowRiskHigh };
+}
+
 type EligibilityCheckContext = RevenueContext & {
   providerExecutionKey?: string;
   serviceType?: string;
+  /**
+   * Optional because callers outside this module construct the context;
+   * `MockEligibilityProvider.runEligibilityCheck` resolves the tenant's
+   * configured values itself when they are absent, so every execution path
+   * classifies with the tenant's own rule.
+   */
+  riskThresholds?: EligibilityRiskThresholds;
   patient?: {
     id: string;
     firstName: string;
@@ -590,7 +640,21 @@ class MockEligibilityProvider {
     const payerName = context.payer?.name ?? 'Mock Payer';
     const planName = context.policy?.planName ?? `${payerName} Standard`;
     const memberId = context.policy?.memberId ?? `TEST-${(patient?.id ?? appointment?.id ?? randomUUID()).slice(0, 8).toUpperCase()}`;
-    const highRisk = (patient?.churnRisk ?? appointment?.noShowRisk ?? 0) > 65;
+    // Each concept classified with its own configured threshold, INCLUSIVE
+    // (>=), matching the Scheduling board, the CRM at-risk badge and the
+    // advisory engine. The old expression escalated either concept at an
+    // unowned `> 65`. A direct normalize call without resolved thresholds
+    // (runEligibilityCheck always resolves them) simulates against the named
+    // product defaults — the same values an unconfigured tenant resolves to.
+    const riskThresholds = context.riskThresholds ?? {
+      churnRiskHigh: GROWTH_POLICY_DEFAULTS.churnRiskHigh,
+      noShowRiskHigh: GROWTH_POLICY_DEFAULTS.noShowRiskHigh,
+    };
+    const highRisk = patient !== undefined
+      ? patient.churnRisk >= riskThresholds.churnRiskHigh
+      : appointment !== undefined
+        ? appointment.noShowRisk >= riskThresholds.noShowRiskHigh
+        : false;
     const coverageActive = !(patient?.lifecycleStage === 'LOST' || patient?.lifecycleStage === 'INACTIVE') || (patient?.churnRisk ?? 0) < 75;
     const deductibleRemaining = numberFromDateDistance(
       appointment?.value ?? 150,
@@ -632,8 +696,13 @@ class MockEligibilityProvider {
     };
   }
 
-  async runEligibilityCheck(_input: EligibilityCheckContext): Promise<EligibilityOutcome> {
-    return this.normalizeEligibilityResponse({}, _input);
+  async runEligibilityCheck(input: EligibilityCheckContext): Promise<EligibilityOutcome> {
+    // Resolve the tenant's configured risk thresholds unless the caller
+    // already did. This keeps every caller of the provider contract —
+    // including modules that construct their own context — on the tenant's
+    // own rule rather than a private default.
+    const riskThresholds = input.riskThresholds ?? await loadEligibilityRiskThresholds(input.tenantId);
+    return this.normalizeEligibilityResponse({}, { ...input, riskThresholds });
   }
 }
 
