@@ -99,13 +99,24 @@ with isolated tenants.
   records real start/end instants and the server recomputes from them.
 - No incumbent auto-selects between the mutually exclusive CY2026 pairs (99445/99454, 99470/99457).
 
-## Wave 2 — NOT delivered, and why
-- **E2E spec written, typechecks, lints — but never executed.** `tests/e2e/connected-care.spec.ts` is
-  untracked and uncommitted. A concurrent session left `src/components/opportunity/OpportunityActionDrawer.tsx`
-  in an unmerged `UU` state with conflict markers, which fails `tsc -b` and so fails the Playwright
-  webServer build. Backed up to the session scratchpad. It is UNPROVEN until that merge resolves
-  and it is run.
-- Notification delivery (finding I): monitoring alerts still create NotificationEvent rows that nothing
-  drains. Not started.
-- Prior-period attestation (F8) and UTC-month boundary handling (F4/F5): not started.
-- Threshold-editing UI: API + tests shipped; no screen yet.
+## Wave 3 — harness proven (2026-08-29)
+
+`tests/e2e/connected-care.spec.ts` — **3/3 passing** on desktop-chromium against a disposable RLS
+database. No longer UNPROVEN. Covers: enrol with device binding -> consent with script and
+cost-sharing -> signed webhook ingest -> measured review session -> 99445 + 2 review minutes rendered.
+
+**The harness earned its keep on first run.** It caught a defect in the connectivity work: the server
+derived reachability correctly but `DeviceIntegration.tsx` still rendered the stored `status` column,
+so a device that had never reported still showed a green "Online" badge. Fixed in be06e18 — the page
+now renders the derived value and the labels describe observation (Reporting / Not reporting / Never
+reported) rather than asserting a live connection.
+
+## Still open
+- **Notification delivery.** Monitoring alerts create NotificationEvent rows that nothing drains; the
+  only drainer is appointment-scoped. An alert notifies nobody. Highest-value remaining item.
+- **Prior-period attestation (F8).** Every call site uses the CURRENT month, so a closed month cannot
+  be reviewed or attested — and billing happens after a period closes.
+- **UTC month boundary (F4/F5).** Non-UTC clinics lose the last evening of the local month, and one
+  local day can bucket as two device-days.
+- **Threshold-editing screen.** API + 8 tests shipped; no UI yet.
+- **Consent annual expiry.** CY2020 requires consent at least annually; PatientConsent has no expiry.
