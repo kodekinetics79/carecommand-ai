@@ -104,6 +104,26 @@ model Tenant {
   slug                                String                               @unique
   // Platform-controlled lifecycle status: active | suspended | cancelled.
   status                              String                               @default("active")
+  // Company record, maintained by platform operators (see
+  // 20260829040000_tenant_company_record). All nullable: an existing tenant has
+  // no company record yet, and a blank field must read as "not recorded"
+  // rather than as a fabricated value.
+  legalName                           String?
+  companyNumber                       String?
+  addressLine1                        String?
+  addressLine2                        String?
+  city                                String?
+  region                              String?
+  postalCode                          String?
+  country                             String?
+  mainPhone                           String?
+  website                             String?
+  primaryContactName                  String?
+  primaryContactEmail                 String?
+  primaryContactPhone                 String?
+  billingContactName                  String?
+  billingContactEmail                 String?
+  accountNotes                        String?
   createdAt                           DateTime                             @default(now())
   updatedAt                           DateTime                             @updatedAt
   branches                            Branch[]
@@ -610,6 +630,16 @@ model GrowthPolicy {
   highValuePatientLtv             Decimal  @default(4000) @db.Decimal(12, 2)
   // Explicitly unvalidated planning assumption, not a forecast.
   recoverableLtvFraction          Decimal  @default(0.30) @db.Decimal(5, 4)
+  // --- Scheduling / no-show risk ------------------------------------------
+  // 50 is the resolved single source of truth for "high no-show risk"
+  // (INCLUSIVE, value >= threshold). Same resolution shape as churnRiskHigh:
+  // src/pages/Scheduling.tsx flagged at >= 50 (the clinic-visible rule),
+  // server/modules/advisory/service.ts counted at >= 60 and priced the count,
+  // and server/modules/revenue-protection.ts escalated at > 65. See
+  // THRESHOLD_RESOLUTIONS in server/modules/growth/defaults.ts. Added by
+  // 20260829130000_growth_policy_no_show_risk, which backfills existing rows
+  // via ADD COLUMN ... DEFAULT.
+  noShowRiskHigh                  Int      @default(50)
   // --- Audience planning --------------------------------------------------
   inactiveAudienceDays            Int      @default(180)
   maxAudienceSize                 Int      @default(500)
@@ -3695,6 +3725,12 @@ model ReadingAlert {
   severity         String // normal | warning | high | critical
   alertType        String // abnormal_reading | missed_reading | device_offline | device_error | trend_risk
   status           String    @default("open") // open | acknowledged | assigned | resolved
+  // Numeric mirror of `severity` (normal 0 | warning 1 | high 2 | critical 3).
+  // The queue MUST order by acuity in the database, before the row limit is
+  // applied — sorting by severity in JS after truncation let newer low-severity
+  // alerts push genuinely open criticals outside the window, so the UI rendered
+  // a false all-clear. A string column cannot express that order, hence this.
+  severityRank     Int       @default(0)
   assignedToUserId String?   @db.Uuid
   generatedReason  String?
   createdAt        DateTime  @default(now())
@@ -3704,6 +3740,7 @@ model ReadingAlert {
 
   @@index([tenantId, status, severity])
   @@index([tenantId, patientId])
+  @@index([tenantId, status, severityRank, createdAt])
 }
 
 // Notification + delivery attempt log (consent-checked; channel + retry status).
