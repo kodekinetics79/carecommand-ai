@@ -69,24 +69,45 @@ describe('regulated product content guardrails', () => {
   });
 
   it('does not fabricate campaign consent, audience, or ROI evidence', () => {
+    // Campaigner and the Reactivation Engine were two pages over two backends;
+    // only one could dispatch, and the one users reached could not. They are now
+    // one page on the engine, so the governance strings this guards moved onto
+    // Campaigner with the flow. The invariants are unchanged: never state an
+    // outcome the evidence does not support, never imply acceptance is delivery,
+    // never let absent evidence read as an all-clear, never launch in one click.
     const campaigner = source('src/pages/Campaigner.tsx');
-
-    expect(campaigner).toContain('No ROI forecast is available');
-    expect(campaigner).toContain('No audience is inferred on this page');
-    expect(campaigner).toContain('Activation requirements · not verified on this page');
-    expect(campaigner).not.toContain('187 customers in final audience');
-    expect(campaigner).not.toContain('Consent check: <span className="font-semibold text-emerald-v">Active');
-    expect(campaigner).not.toContain('Launch Campaign Now');
-    expect(campaigner).toContain('Open approved campaign workflow');
-    expect(campaigner).not.toContain("setCampaignStatus(c.id, 'ACTIVE')");
-
-    const engine = source('src/pages/CampaignEngine.tsx');
     const crm = source('src/lib/crm.ts');
-    expect(engine).toContain('provider-accepted');
-    expect(engine).toContain('Provider acceptance is not confirmed delivery');
-    expect(engine).toContain('Dispatch evidence is unavailable. Do not infer that no dispatch occurred');
-    expect(engine).not.toContain('window.confirm');
-    expect(engine).not.toContain('badge="New"');
+
+    // Attributed revenue has no writer yet, so the tile states the absence
+    // rather than rendering a confident zero.
+    expect(campaigner).toContain('Not recorded yet');
+    expect(campaigner).toContain('no amount — including $0 — can be shown');
+
+    // Absent evidence is never an all-clear, for audience or for dispatch.
+    expect(campaigner).toContain('Audience evidence is unavailable. Do not infer that no recipients are eligible or suppressed.');
+    expect(campaigner).toContain('Dispatch evidence is unavailable. Do not infer that no dispatch occurred');
+
+    // Provider acceptance is not delivery, and a contact check is not authority.
+    expect(campaigner).toContain('Provider acceptance is not confirmed delivery');
+    expect(campaigner).toContain('This count is not live outreach authority');
+
+    // A draft authorizes nothing; dispatch re-checks consent and suppression.
+    expect(campaigner).toContain('Starting a draft does not authorize an audience, schedule delivery, or contact anyone.');
+    expect(campaigner).toContain('Live campaign delivery is not activated.');
+
+    // No fabricated audience, no one-click launch, no browser-native confirm in
+    // place of the exact-preview authorization.
+    expect(campaigner).not.toContain('187 customers in final audience');
+    expect(campaigner).not.toContain('Launch Campaign Now');
+    expect(campaigner).not.toContain("setCampaignStatus(c.id, 'ACTIVE')");
+    expect(campaigner).not.toContain('window.confirm');
+
+    // The second destination stays retired. If a page is reinstated here it must
+    // carry the governance above rather than reintroducing a door without it.
+    const engine = source('src/pages/CampaignEngine.tsx');
+    expect(engine).toContain('Navigate');
+    expect(engine).not.toContain('crmApi.launch');
+
     expect(crm).toContain("sent: { label: 'Provider accepted (legacy)'");
     expect(crm).toContain("accepted: { label: 'Provider accepted'");
   });

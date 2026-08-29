@@ -28,6 +28,10 @@ import { enterTenantContext } from '../../lib/tenantContext';
 import { resolveIngressTenant } from '../../lib/tenantIngressResolvers';
 import { appendChannelSafetyFooter, buildCampaignLaunchPreview, normalizeProviderDeliveryStatus } from '../../lib/campaignIntegrity';
 import { applyCampaignDeliveryWebhook } from '../../lib/campaignDeliveryWebhook';
+import {
+  CAMPAIGN_ENGAGEMENT_DISCLOSURE, CAMPAIGN_ATTRIBUTION_RULES, EVIDENCEABLE_OUTCOMES,
+  summarizeCampaignAttribution,
+} from '../../lib/campaignAttribution';
 
 // ===========================================================================
 // CRM Campaign / Reactivation engine routes (mounted at /v1/crm — distinct from
@@ -136,6 +140,43 @@ function mapCampaign(c: Campaign) {
     allowedActions: campaignActions(c),
     deepLinkTarget: `campaign/${c.id}`,
     requiresApprovalPending: c.requiresApproval && !c.approvedByUserId,
+  };
+}
+
+/**
+ * How every attribution figure on this surface was produced, shipped WITH the
+ * figures. Tebra multiplies volume by hardcoded constants ($3/reminder,
+ * $150/recall appointment) and RevenueWell credits itself with all revenue
+ * within 60 days of an unmatched request plus flat $5/$10 imputed values. The
+ * defence against being lumped in with that is not a disclaimer; it is that
+ * every number here is a count of evidence rows a caller can fetch and read.
+ */
+const ATTRIBUTION_BASIS = Object.freeze({
+  derivedFrom: 'CampaignAttribution rows only',
+  rules: CAMPAIGN_ATTRIBUTION_RULES,
+  evidenceableOutcomes: EVIDENCEABLE_OUTCOMES,
+  valueBasis: 'attributedValue is the net of PaymentTransactions actually recorded against the attributed appointment. A booking and an attendance carry 0. No per-event constant is imputed anywhere.',
+  windowSource: 'GrowthPolicy.campaignAttributionWindowDays, captured on each row at attribution time so a later policy change cannot rewrite it',
+  notAttributed: 'An outcome that cannot be tied to a provider-accepted delivery inside that delivery\'s window is not attributed at all.',
+});
+
+function attributionSummaryPayload(summary: {
+  outcomes: Record<string, number>;
+  attributedValue: string;
+  currency: string | null;
+  windowDaysObserved: number[];
+  firstAttributedAt: string | null;
+  lastAttributedAt: string | null;
+}) {
+  return {
+    outcomes: summary.outcomes,
+    attributedValue: summary.attributedValue,
+    currency: summary.currency,
+    windowDaysObserved: summary.windowDaysObserved,
+    firstAttributedAt: summary.firstAttributedAt,
+    lastAttributedAt: summary.lastAttributedAt,
+    // Reported as unavailable with a reason, never as a manufactured 0%.
+    engagement: CAMPAIGN_ENGAGEMENT_DISCLOSURE,
   };
 }
 
@@ -758,6 +799,95 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     if (!(await authorizedForCampaign(request, reply, c, 'read'))) return reply;
     const rows = await db.campaignDelivery.findMany({ where: { tenantId: request.auth.tenantId, campaignId: id }, orderBy: { createdAt: 'desc' }, take: 500 });
     return rows.map(d => ({ deliveryId: d.id, campaignId: d.campaignId, patientId: d.patientId, leadId: d.leadId, channel: d.channel, destinationMasked: d.destinationMasked, status: d.status, provider: d.provider, providerMessageId: d.providerMessageId, failureReason: d.failureReason, sentAt: d.sentAt?.toISOString() ?? null, providerAcceptedAt: d.providerAcceptedAt?.toISOString() ?? null, deliveredAt: d.deliveredAt?.toISOString() ?? null, statusUpdatedAt: d.statusUpdatedAt.toISOString(), deepLinkTarget: `campaign/${id}` }));
+  });
+
+  // ----- Attribution (closed loop) ----------------------------------------
+  // Everything below is derived from CampaignAttribution rows. Nothing reads
+  // Campaign.opened/responded/booked/revenue: those are a materialized rollup of
+  // exactly these rows, kept only so the legacy screens that already read them
+  // stop reporting a number no code produced.
+  //
+  // Authorization is the SAME grant the neighbouring campaign reads take — the
+  // coarse any-of gate first, then the exact per-class check on the loaded
+  // record — so a billing-only holder of campaign:payment-followup:manage sees
+  // payment-class campaigns and no others.
+  app.get('/campaigns/:id/attribution', { preHandler: [campaignEntityRead, campaignFeature] }, async (request, reply) => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const c = await db.campaign.findFirst({ where: { id, ...campaignScopeWhere(request) } });
+    if (!c) throw app.httpErrors.notFound('Campaign not found');
+    if (!(await authorizedForCampaign(request, reply, c, 'read'))) return reply;
+
+    const summary = (await summarizeCampaignAttribution(request.auth.tenantId, [id])).get(id)!;
+    const rows = await db.campaignAttribution.findMany({
+      where: { tenantId: request.auth.tenantId, campaignId: id },
+      orderBy: [{ attributedAt: 'desc' }, { id: 'asc' }],
+      take: 500,
+    });
+    return {
+      campaignId: id,
+      ...attributionSummaryPayload(summary),
+      // One row per link, with the evidence that justified it. This is the whole
+      // product claim: every attributed number can be opened up and argued back
+      // to the delivery, the outcome record, the timestamps and the window that
+      // was in force when the link was made.
+      attributions: rows.map(row => ({
+        id: row.id,
+        outcomeType: row.outcomeType,
+        campaignDeliveryId: row.campaignDeliveryId,
+        patientId: row.patientId,
+        leadId: row.leadId,
+        branchId: row.branchId,
+        appointmentId: row.appointmentId,
+        paymentTransactionId: row.paymentTransactionId,
+        attributedValue: row.attributedValue.toFixed(2),
+        currency: row.currency,
+        // The window AS RECORDED on the row, never re-derived from the current
+        // policy: a later policy edit must not change what was already claimed.
+        window: {
+          days: row.windowDays,
+          startsAt: row.windowStartsAt.toISOString(),
+          endsAt: row.windowEndsAt.toISOString(),
+          recordedAtAttributionTime: true,
+        },
+        rule: row.rule,
+        evidence: row.evidence,
+        attributedAt: row.attributedAt.toISOString(),
+      })),
+      deepLinkTarget: `campaign/${id}`,
+    };
+  });
+
+  app.get('/attribution/summary', { preHandler: [campaignEntityRead, campaignFeature] }, async request => {
+    // Same class narrowing as GET /campaigns: a caller holding only the
+    // payment-follow-up grant is not entitled to learn that a marketing
+    // campaign exists, so the list is narrowed rather than refused wholesale.
+    const classFilter = await hasPermission(request, 'campaign:read')
+      ? {}
+      : { campaignType: { in: [...PAYMENT_FOLLOWUP_CAMPAIGN_TYPES] }, audienceType: { in: [...PAYMENT_FOLLOWUP_AUDIENCE_TYPES] } };
+    const campaigns = await db.campaign.findMany({
+      where: { ...campaignScopeWhere(request), campaignType: { not: null }, ...classFilter },
+      orderBy: { createdAt: 'desc' },
+      take: 200,
+      select: { id: true, name: true, campaignType: true, audienceType: true, branchId: true, status: true, sent: true },
+    });
+    const summaries = await summarizeCampaignAttribution(request.auth.tenantId, campaigns.map(c => c.id));
+    return {
+      campaigns: campaigns.map(campaign => {
+        const summary = summaries.get(campaign.id)!;
+        return {
+          campaignId: campaign.id,
+          name: campaign.name,
+          campaignType: campaign.campaignType,
+          audienceType: campaign.audienceType,
+          branchId: campaign.branchId,
+          status: campaign.status,
+          providerAcceptedDeliveries: campaign.sent,
+          ...attributionSummaryPayload(summary),
+          deepLinkTarget: `campaign/${campaign.id}`,
+        };
+      }),
+      basis: ATTRIBUTION_BASIS,
+    };
   });
 
   // ----- Opportunity scan: connect real audiences → signals + recs --------

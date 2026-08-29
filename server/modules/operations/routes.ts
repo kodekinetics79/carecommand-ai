@@ -622,6 +622,9 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
 
   // Campaign automation is feature-gated (campaign_automation entitlement).
   const campaignFeature = requireFeature('campaign_automation');
+  /** True when a body names `status` at all, including `status: null`. */
+  const hasStatusField = (body: unknown): boolean =>
+    typeof body === 'object' && body !== null && 'status' in (body as Record<string, unknown>);
   // Before → after: legacy campaign reads were authenticated-only and mutations
   // were OWNER/ADMIN/MANAGER. Dedicated grants now close reads without expanding
   // mutation authority to FRONT_DESK through crm:write.
@@ -629,26 +632,55 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     const { limit } = listLimit.parse(request.query);
     return db.campaign.findMany({ where: { tenantId: request.auth.tenantId }, take: limit, orderBy: { createdAt: 'desc' } });
   });
+  // Campaign STATE is not writable here.
+  //
+  // `Campaign` is one table serving two field families. The governed engine
+  // (server/modules/campaigns/routes.ts, mounted at /v1/crm) owns
+  // campaignType/audienceType/approval and moves a campaign through
+  // APPROVAL_REQUIRED -> approve (bound to a launch fingerprint over the exact
+  // audience, template, channel and provider) -> launch -> pause/cancel. These
+  // legacy routes owned none of that and still accepted
+  // `status: ACTIVE|SCHEDULED|COMPLETED` on any campaign in the tenant, with no
+  // fingerprint, no approval and no audience check — so a campaign could be
+  // made to READ as approved and running without ever passing the approval it
+  // exists to require. The dispatch path re-checks consent and suppression, so
+  // no message escaped that way, but every human and every screen reading
+  // `status` was being told something the governance machine never authorized.
+  //
+  // The status write is therefore retired: creation is always DRAFT, and
+  // transitions go through the endpoints that check them. GET stays — it is the
+  // analytics read behind the dashboard's campaign panel.
+  const STATUS_WRITE_RETIRED = 'Campaign status is not writable here. Use the governed campaign workflow — POST /v1/crm/campaigns/:id/approve, /launch, /pause or /cancel — which checks the approved audience, the launch fingerprint, and consent and suppression at dispatch.';
+  const ENGINE_MANAGED = 'This campaign is managed by the campaign workflow at /v1/crm/campaigns/:id, which enforces approval before dispatch. Edit it there.';
+
   app.post('/campaigns', { preHandler: [campaignManage, campaignFeature] }, async (request, reply) => {
+    // `status` is deliberately absent: a campaign cannot be born ACTIVE.
+    if (hasStatusField(request.body)) throw app.httpErrors.badRequest(STATUS_WRITE_RETIRED);
     const input = z.object({
       name: z.string().min(2).max(160), goal: z.string().min(2).max(300),
-      status: z.enum(['DRAFT', 'ACTIVE', 'PAUSED', 'COMPLETED', 'SCHEDULED']).default('DRAFT'),
       channels: z.array(channel).min(1), audienceSize: z.coerce.number().int().min(0).default(0),
       aiGenerated: z.boolean().default(false), startsAt: z.coerce.date().optional(), endsAt: z.coerce.date().optional(),
     }).parse(request.body);
-    const row = await db.campaign.create({ data: { tenantId: request.auth.tenantId, ...input } });
+    const row = await db.campaign.create({ data: { tenantId: request.auth.tenantId, ...input, status: 'DRAFT' } });
     await audit(request, { action: 'campaign.created', resource: 'campaign', resourceId: row.id });
     return reply.code(201).send(row);
   });
   app.patch('/campaigns/:id', { preHandler: [campaignManage, campaignFeature] }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
+    // Refused before the lookup: the answer does not depend on the record, and
+    // a caller reaching for a retired field should not learn what exists.
+    if (hasStatusField(request.body)) throw app.httpErrors.badRequest(STATUS_WRITE_RETIRED);
     const input = z.object({
-      status: z.enum(['DRAFT', 'ACTIVE', 'PAUSED', 'COMPLETED', 'SCHEDULED']).optional(),
       name: z.string().min(2).max(160).optional(),
       goal: z.string().min(2).max(300).optional(),
     }).parse(request.body);
     const existing = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!existing) throw app.httpErrors.notFound('Campaign not found');
+    // A campaign with a campaignType belongs to the engine, whose own PATCH
+    // refuses edits once a campaign has left DRAFT/APPROVAL_REQUIRED because the
+    // launch fingerprint is bound to what it edits. Renaming it from here would
+    // walk around that check.
+    if (existing.campaignType !== null) throw app.httpErrors.conflict(ENGINE_MANAGED);
     const row = await db.campaign.update({ where: { id }, data: input });
     await audit(request, { action: 'campaign.updated', resource: 'campaign', resourceId: id, metadata: input });
     return row;

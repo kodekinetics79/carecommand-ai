@@ -17,6 +17,9 @@ import Logo from '../ui/Logo';
 const NAV_FEATURE: Record<string, string> = {
   '/receptionist-studio': 'ai_receptionist',
   '/ai-receptionist': 'ai_receptionist',
+  '/campaigns': 'campaign_automation',
+  // Retired paths, still routable (they redirect to /campaigns). Kept here so a
+  // deep link into one is padlocked on the same entitlement as the destination.
   '/campaigner': 'campaign_automation',
   '/reactivation': 'campaign_automation',
   '/patient-intake': 'patient_crm',
@@ -75,8 +78,10 @@ const nav: NavSection[] = [
     label: 'Growth',
     items: [
       { label: 'CRM', path: '/crm', icon: Users2 },
-      { label: 'Campaigner', path: '/campaigner', icon: Megaphone },
-      { label: 'Reactivation', path: '/reactivation', icon: Megaphone },
+      // One entry, not two. "Campaigner" and "Reactivation" were the same
+      // Campaign rows read through two field families on two backends; they are
+      // one destination now and the old paths redirect into it.
+      { label: 'Campaigns', path: '/campaigns', icon: Megaphone },
       { label: 'Autopilot', path: '/autopilot', icon: Orbit },
       { label: 'Reviews', path: '/reviews', icon: Star },
       { label: 'ClinicRadar', path: '/clinic-radar', icon: Radar },

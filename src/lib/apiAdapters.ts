@@ -77,6 +77,16 @@ export interface ApiInventoryItem {
   supplier: string;
 }
 
+/**
+ * The legacy `GET /v1/campaigns` row — the analytics read behind the dashboard's
+ * campaign panel.
+ *
+ * `revenue`, `opened` and `booked` are DB defaults that NO code path writes, and
+ * `status` here omits APPROVAL_REQUIRED / CANCELLED / FAILED, which the governed
+ * engine does persist. Do not build a campaign surface on this shape: the
+ * campaign product lives on `/v1/crm/campaigns` via src/lib/crm.ts, which is the
+ * only client that can set a campaign type, an audience or an approval.
+ */
 export interface ApiCampaign {
   id: string;
   name: string;
@@ -338,6 +348,7 @@ export function mapInventoryItem(row: ApiInventoryItem): InventoryItem {
   };
 }
 
+/** Legacy analytics rows only — see the note on ApiCampaign before reusing this. */
 export function mapCampaign(row: ApiCampaign): Campaign {
   return {
     ...row,

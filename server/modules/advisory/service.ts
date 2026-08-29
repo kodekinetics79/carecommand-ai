@@ -4,6 +4,8 @@ import { env } from '../../config/env';
 import { branchScope, assertBranchAccess } from '../../lib/scope';
 import { runWithTenantContext } from '../../lib/tenantContext';
 import { aiGateway } from '../../lib/ai/gateway';
+import { getEffectiveGrowthPolicy } from '../growth/service';
+import { isHighReputationRisk, isLowRatedReview, LOW_RATED_REVIEW_MAX, reputationBandProvenance } from './thresholds';
 import { MockAdvisorProvider } from './providers';
 import type {
   AdvisorAnalysis,
@@ -64,7 +66,7 @@ async function loadContext(request: FastifyRequest, clinicId?: string, range?: A
   const branchWhere = branchId ? { branchId } : branchScope(request);
   const dateWhere = rangeFilter ? rangeFilter : undefined;
 
-  const [branches, patients, campaigns, revenueLeaks, opportunities, staffProfiles, providerProfiles, competitors, competitorInsights, reputationCases, reviewRequests, conversations, appointments, tasks, reviews] = await Promise.all([
+  const [branches, patients, campaigns, revenueLeaks, opportunities, staffProfiles, providerProfiles, competitors, competitorInsights, reputationCases, reviewRequests, conversations, appointments, tasks, reviews, growthPolicy] = await Promise.all([
     db.branch.findMany({
       where: { tenantId: request.auth.tenantId, active: true, ...(branchId ? { id: branchId } : {}) },
       orderBy: { name: 'asc' },
@@ -163,6 +165,21 @@ async function loadContext(request: FastifyRequest, clinicId?: string, range?: A
       take: 20,
       include: { branch: { select: { name: true } } },
     }),
+    // The tenant's effective Growth configuration, loaded ONCE per advisory
+    // context rather than per call site, so every advisor built from this
+    // context classifies with the same numbers the clinic configured.
+    //
+    // Read inside a tenant transaction, deliberately. GrowthPolicy is
+    // RLS-enrolled (rls_growth_policy_select ... USING app_rls_tenant_allowed),
+    // and `app_rls_tenant_allowed` returns false when no tenant GUC is set. A
+    // read that escapes tenant context therefore returns NO ROW, and
+    // `getEffectiveGrowthPolicy` resolves to the code defaults with
+    // `source: 'default'` — a silent fail-open on the tenant's own
+    // configuration that looks exactly like working code. Passing `tx` makes
+    // the read fail closed instead of fail quiet, in every caller: request,
+    // worker and job alike. server/test/advisoryThresholdRls.integration.test.ts
+    // fails if this argument goes away.
+    runWithTenantContext(request.auth.tenantId, tx => getEffectiveGrowthPolicy(request.auth.tenantId, tx)),
   ]);
 
   return {
@@ -182,6 +199,7 @@ async function loadContext(request: FastifyRequest, clinicId?: string, range?: A
     appointments,
     tasks,
     reviews,
+    growthPolicy,
   };
 }
 
@@ -305,8 +323,15 @@ function buildFrontDeskAdvisor(context: Awaited<ReturnType<typeof loadContext>>)
 function buildCompetitorAdvisor(context: Awaited<ReturnType<typeof loadContext>>, question?: string): AdvisorAnalysis {
   const topCompetitor = context.competitors[0];
   const topInsight = context.competitorInsights[0];
-  const reputationCases = context.reputationCases.filter(item => item.badReviewRisk >= 60).length;
-  const reviews = context.reviews.filter(review => review.rating <= 3).length;
+  // Both counts below are multiplied into `expectedImpact`, a currency figure a
+  // clinic acts on, so neither may be decided by a number the clinic cannot
+  // see. The reputation band is the tenant's configured one — the SAME
+  // `reputationRiskHigh` src/pages/ClinicRadar.tsx bands this exact field with.
+  // The low-rating bound is a named product constant, recorded with its reason
+  // in THRESHOLD_RESOLUTIONS (server/modules/growth/defaults.ts).
+  const policy = context.growthPolicy;
+  const reputationCases = context.reputationCases.filter(item => isHighReputationRisk(item.badReviewRisk, policy)).length;
+  const reviews = context.reviews.filter(review => isLowRatedReview(review.rating)).length;
   const summary = `Competitor pressure is mostly about review velocity, response speed, and complaint themes.`;
   const diagnosis = `Competitors are creating openings where they miss response-time expectations or repeat complaint themes, and your clinic can win with a faster recovery motion.`;
   const recommendedAction = topCompetitor
@@ -323,8 +348,11 @@ function buildCompetitorAdvisor(context: Awaited<ReturnType<typeof loadContext>>
     evidence: [
       topCompetitor ? `${topCompetitor.name}: ${Number(topCompetitor.googleRating).toFixed(1)} rating across ${topCompetitor.reviewVolume} reviews.` : 'No competitor data available for the selected clinic.',
       topInsight ? `Top complaint theme: ${topInsight.theme} (${topInsight.complaintCount} mentions).` : 'No competitor complaint insight available.',
-      `High-risk reputation cases: ${reputationCases}.`,
-      `Recent low-rated reviews: ${reviews}.`,
+      // A stated rule the clinic can check, not a bare count: an owner reading a
+      // dollar figure is entitled to see which threshold produced it and whose
+      // threshold it is.
+      `High-risk reputation cases (recorded risk ≥ ${policy.reputationRiskHigh}, ${reputationBandProvenance(policy)}): ${reputationCases}.`,
+      `Recent low-rated reviews (rating ≤ ${LOW_RATED_REVIEW_MAX}, product constant): ${reviews}.`,
     ],
     recommendations: [
       'Focus your next campaign on response speed and review recovery.',

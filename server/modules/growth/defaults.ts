@@ -86,13 +86,24 @@ export const MONEY_AFFECTING_POLICY_FIELDS = Object.freeze([
 ] as const);
 
 /**
- * The two thresholds where the codebase disagreed with ITSELF before this
- * increment. Recorded here (and asserted in the tests) so the resolution is
- * evidence rather than a commit message nobody reads.
+ * Every threshold where the codebase disagreed with ITSELF, and every threshold
+ * that stays a code constant on purpose. Recorded here (and asserted in the
+ * tests) so the resolution is evidence rather than a commit message nobody
+ * reads.
+ *
+ * `kind` says what the resolution WAS:
+ *   * 'divergence-resolved' — two layers held different numbers for one
+ *     concept; one number won and the other call site was rewired to this
+ *     configuration.
+ *   * 'code-constant' — the literal is named, documented and deliberately NOT a
+ *     GrowthPolicy column. An entry of this kind must state why a tenant does
+ *     not get to set it, because a threshold nobody wrote down is exactly how
+ *     the divergences above happened.
  */
 export const THRESHOLD_RESOLUTIONS = Object.freeze([
   Object.freeze({
     concept: 'churnRiskHigh',
+    kind: 'divergence-resolved' as const,
     chosen: 50,
     comparison: '>=' as const,
     frontend: 'src/pages/CRM.tsx:193 and src/lib/crmService.ts:188 use churnRisk >= 50',
@@ -102,6 +113,7 @@ export const THRESHOLD_RESOLUTIONS = Object.freeze([
   }),
   Object.freeze({
     concept: 'highValuePatientLtv',
+    kind: 'divergence-resolved' as const,
     chosen: 4000,
     comparison: '>=' as const,
     frontend: 'src/lib/crmService.ts:187 uses lifetimeValue >= 4000',
@@ -109,10 +121,44 @@ export const THRESHOLD_RESOLUTIONS = Object.freeze([
     reasoning:
       'Same number, different operator, so a patient at exactly 4000 was high-value on one screen and not on the other. >= wins: a clinic owner reads a "$4,000 high-value threshold" as "$4,000 and up", and the inclusive bound is the one already driving money-affecting outreach.',
   }),
+  Object.freeze({
+    concept: 'reputationRiskHigh',
+    kind: 'divergence-resolved' as const,
+    chosen: 80,
+    comparison: '>=' as const,
+    frontend: 'src/pages/ClinicRadar.tsx:116-120 bands badReviewRisk with the configured reputationRiskHigh / reputationRiskMedium',
+    server: 'server/modules/advisory/service.ts:308 used a hardcoded badReviewRisk >= 60',
+    reasoning:
+      'The worst kind of divergence: a DYNAMIC one. The screen moved with the tenant\'s configuration and the advisor did not, so raising reputationRiskHigh to 90 widened the gap silently and turned the configuration UI into a control half the product ignored. It was also priced — the advisor multiplies this count into an expectedImpact currency figure a clinic acts on, and a number presented as money must not come from a threshold the customer believes they changed. The configured value wins outright; there is no defensible reading in which the advisor keeps a private band for a field the tenant configures. The advisor now classifies through isHighReputationRisk (server/modules/advisory/thresholds.ts), which is the high band of ClinicRadar\'s severityFromRisk character for character, and states the threshold and its provenance in its own evidence.',
+  }),
+  Object.freeze({
+    concept: 'lowRatedReviewMax',
+    kind: 'code-constant' as const,
+    chosen: 3,
+    comparison: '<=' as const,
+    frontend: 'src/pages/Reviews.tsx bands a clinic AVERAGE with reviewRatingGood / reviewRatingFair; the only per-review classification is the fixed star-distribution legend (green at star >= 4, amber at 3, red below), which agrees with this bound',
+    server: 'server/modules/advisory/service.ts:309 used a hardcoded review.rating <= 3; it is now LOW_RATED_REVIEW_MAX in server/modules/advisory/thresholds.ts',
+    reasoning:
+      'Named, not configured, and here is why a tenant does not get a column for it. (1) Nothing to converge on: no clinic-facing surface classifies an individual review\'s rating against a tenant threshold, so unlike reputationRiskHigh there is no second number to disagree with. (2) reviewRatingGood / reviewRatingFair are NOT that number: they band a clinic AVERAGE, and binding a per-review money multiplier to a threshold a tenant set for its average would silently repurpose that tenant\'s rule — the same class of error as the reputation divergence, inverted. Review.rating is an Int, so <= 3 is exactly "below the 4.0 fair band" for every value the column can hold, which is why the two agree today without being wired together. (3) The cutoff sits inside one heuristic\'s pricing arithmetic beside three multipliers no tenant can set (x18 per competitor review, x250 per reputation case, x120 per low-rated review); making only the cutoff configurable would advertise control the tenant does not have, the same reasoning that keeps GROWTH_LEAD_SCORE_WEIGHTS out of the schema. If a clinic-facing surface ever classifies a single review, this stops being a constant and becomes a column, and the advisor must read it.',
+  }),
 ]);
 
 /**
  * The remaining call sites to rewire once a module is allowed to read this config.
+ *
+ * The Reviews.tsx and ClinicRadar.tsx entries are gone because they are DONE:
+ * both screens read `GET /v1/growth/policy` through src/lib/growthPolicy.ts and
+ * band from the resolved policy — Reviews.tsx a clinic average with
+ * `reviewRatingGood` / `reviewRatingFair`, ClinicRadar.tsx `badReviewRisk` with
+ * `reputationRiskHigh` / `reputationRiskMedium` and competitors with the
+ * `competitor*` bounds. Neither can draw a band before its policy arrives.
+ *
+ * The advisory entry never made it onto this list, which is how the divergence
+ * survived a whole increment: server/modules/advisory/service.ts classified the
+ * SAME `badReviewRisk` field at a hardcoded `>= 60` while ClinicRadar moved with
+ * the tenant's configuration. It now reads `reputationRiskHigh` off the
+ * effective policy, loaded once in `loadContext` inside a tenant transaction
+ * (GrowthPolicy is RLS-enrolled — see the note there).
  *
  * The CRM entries are gone because they are DONE: `commandMetrics`,
  * `smartSegments`, `scoreLead` and the next-best-action map were deleted from
@@ -129,10 +175,37 @@ export const THRESHOLD_RESOLUTIONS = Object.freeze([
  * churnRisk >= 60 where every clinic-facing surface counted >= 50, and it
  * counted lifetimeValue > 4000 where the rest of the product counted >= 4000.
  */
-export const PENDING_CONFIG_CALL_SITES = Object.freeze([
-  'src/pages/Reviews.tsx (reviewRatingGood / reviewRatingFair)',
-  'src/pages/ClinicRadar.tsx (reputationRisk* / competitor* severity bounds)',
-]);
+export const PENDING_CONFIG_CALL_SITES: readonly string[] = Object.freeze([]);
+
+/**
+ * The list above is EMPTY, and that is a claim, so here is exactly what it
+ * claims and what it does not.
+ *
+ * It claims: every call site that classifies with a concept GrowthPolicy owns a
+ * column for now reads that column. Reviews.tsx bands with `reviewRatingGood` /
+ * `reviewRatingFair`; ClinicRadar.tsx bands with `reputationRisk*` and the
+ * `competitor*` bounds; /v1/patients/summary counts with `churnRiskHigh` and
+ * `highValuePatientLtv`; and server/modules/advisory/service.ts —
+ * the last one, and the one that mattered most because it prices its counts
+ * into an owner-facing dollar figure — classifies `badReviewRisk` with
+ * `reputationRiskHigh`.
+ *
+ * It does NOT claim the product is free of threshold literals. Two are known
+ * and are outside this register because GrowthPolicy has no column for their
+ * concept, so there is nothing here to rewire them to:
+ *
+ *   * `review.rating <= 3` in the competitor advisor — deliberate, named
+ *     LOW_RATED_REVIEW_MAX, and recorded in THRESHOLD_RESOLUTIONS above.
+ *   * NO-SHOW RISK — genuinely divergent, and unowned. src/pages/Scheduling.tsx
+ *     flags an appointment at `noShowRisk >= 50`,
+ *     server/modules/advisory/service.ts counts at `>= 60` (three call sites,
+ *     one of them priced at $120–$150 a flag), and
+ *     server/modules/revenue-protection.ts escalates at `> 65`. One concept,
+ *     three numbers, three layers, none of them visible to the clinic — the
+ *     same defect this register exists to close, on a concept that has not been
+ *     given a column yet. Adding `noShowRiskHigh` is the next increment; until
+ *     it exists this stays written down here rather than discovered again.
+ */
 
 export type GrowthSegmentDefinitionValues = {
   key: string;

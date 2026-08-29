@@ -45,13 +45,22 @@ export type Permission =
 export interface RouteDefinition {
   /** Human name of the destination — breadcrumb, and the access notice. */
   label: string;
-  /** Permission its endpoints enforce via requirePermission(). */
-  permission?: Permission;
+  /**
+   * Permission(s) its endpoints enforce via requirePermission(). A list means
+   * the destination calls endpoints guarded by DIFFERENT grants and needs all
+   * of them: offering it to a user holding only one produces a page that half
+   * loads and half 403s, which is the shape this registry exists to stop.
+   */
+  permission?: Permission | readonly Permission[];
   /** Roles its endpoints enforce via requireRoles(). */
   roles?: readonly string[];
 }
 
 const OWNER_ADMIN = ['OWNER', 'ADMIN'] as const;
+// The campaign workspace reads two data classes: the campaigns themselves and
+// the patient contact evidence (audience preview, suppressions) it must show
+// before anyone can authorize an audience.
+const CAMPAIGN_WORKSPACE_GRANTS = ['campaign:read', 'crm:read'] as const;
 // Module-level preHandler on monitoring + connected-care routes.
 const CLINICAL_LEADERSHIP = ['OWNER', 'ADMIN', 'MANAGER', 'PROVIDER'] as const;
 
@@ -84,10 +93,16 @@ export const ROUTES = {
 
   // GET /v1/leads — requirePermission('crm:read')
   '/crm': { label: 'CRM', permission: 'crm:read' },
-  // GET /v1/campaigns — requirePermission('campaign:read')
-  '/campaigner': { label: 'Campaigner', permission: 'campaign:read' },
-  // GET /v1/crm/campaigns — entitlement only (campaign_automation), no permission.
-  '/reactivation': { label: 'Reactivation' },
+  // The one campaign workspace. GET /v1/crm/campaigns is guarded by the campaign
+  // read grants; the audience preview and suppression records it shows are
+  // patient contact evidence and take crm:read, the same grant as GET /v1/leads.
+  // A user with only one of the two reaches a page that cannot do its job.
+  '/campaigns': { label: 'Campaigns', permission: CAMPAIGN_WORKSPACE_GRANTS },
+  // Retired paths. Both redirect to /campaigns, so they must state the SAME
+  // requirement — a door that opens only to bounce the user into a section they
+  // cannot read would be worse than not offering it.
+  '/campaigner': { label: 'Campaigns', permission: CAMPAIGN_WORKSPACE_GRANTS },
+  '/reactivation': { label: 'Campaigns', permission: CAMPAIGN_WORKSPACE_GRANTS },
   // GET /v1/autopilot/playbooks, /approvals — authenticated only.
   '/autopilot': { label: 'Autopilot' },
   // GET /v1/reviews, /v1/reputation — requirePermission('crm:read')
@@ -167,7 +182,13 @@ export function hasRouteAccess(user: SessionUser | null | undefined, route: Rout
   if (!route.permission && !route.roles) return true;
   if (!user) return false;
   if (route.roles && !route.roles.includes(user.role)) return false;
-  if (route.permission && !(user.effectivePermissions ?? []).includes(route.permission)) return false;
+  if (route.permission) {
+    const required = typeof route.permission === 'string' ? [route.permission] : route.permission;
+    const held = user.effectivePermissions ?? [];
+    // Every listed grant is required: they gate different endpoints on the
+    // same page, so holding one of two is not access to the destination.
+    if (!required.every(permission => held.includes(permission))) return false;
+  }
   return true;
 }
 

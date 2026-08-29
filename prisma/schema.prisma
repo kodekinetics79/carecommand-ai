@@ -225,6 +225,7 @@ model Tenant {
   growthChannelCosts                  GrowthChannelCost[]
   campaignSubmissionClaims            CampaignSubmissionClaim[]
   campaignLiveDispatchActivations     CampaignLiveDispatchActivation[]
+  campaignAttributions                CampaignAttribution[]
 }
 
 model User {
@@ -319,6 +320,7 @@ model Branch {
   receptionistLocations          ReceptionistLocation[]
   receptionistOutboundCampaignDefaults ReceptionistOutboundCampaign[] @relation("ReceptionistOutboundDefaultBranch")
   campaigns                      Campaign[]
+  campaignAttributions           CampaignAttribution[]
 
   @@unique([tenantId, name])
   @@unique([tenantId, id])
@@ -377,6 +379,7 @@ model Patient {
   campaignSuppressions  CampaignSuppression[]
   intakePackets         PatientIntakePacket[]
   patientConsentRecords PatientConsentRecord[]
+  campaignAttributions  CampaignAttribution[]
   notificationEvents    NotificationEvent[]
   receptionistCallTargets ReceptionistCallTarget[]
   receptionistOutboundProviderIntents ReceptionistOutboundProviderIntent[]
@@ -430,6 +433,7 @@ model Appointment {
   sourceCallLog                  ReceptionistCallLog?             @relation("AppointmentSourceCall", fields: [tenantId, receptionistCallLogId], references: [tenantId, id], onDelete: Restrict)
   appointmentRequests            AppointmentRequest[]             @relation("AppointmentRequestBookedAppointment")
   notificationEvents             NotificationEvent[]
+  campaignAttributions           CampaignAttribution[]
 
   @@unique([tenantId, id])
   @@unique([tenantId, receptionistCallLogId])
@@ -536,6 +540,7 @@ model Lead {
   receptionistVoiceConsentEvents ReceptionistVoiceConsentEvent[]
   receptionistOutboundProviderIntents ReceptionistOutboundProviderIntent[]
   activities          LeadActivity[]
+  campaignAttributions CampaignAttribution[]
 
   @@unique([tenantId, id])
   @@index([tenantId, stage, createdAt])
@@ -620,6 +625,26 @@ model GrowthPolicy {
   competitorReviewVolumeHigh      Int      @default(350)
   // --- Outreach governance ------------------------------------------------
   leadSendCooldownHours           Int      @default(24)
+  // --- Campaign attribution ------------------------------------------------
+  // How long after a delivery was ACCEPTED BY THE PROVIDER an outcome may still
+  // be linked to it. server/lib/campaignAttribution.ts reads this column and
+  // never a literal; the value in force at the moment a link is made is copied
+  // onto the CampaignAttribution row, so editing this number changes what will
+  // be attributed NEXT and never what was already attributed.
+  //
+  // Deliberately shorter than the only two vendors who publish a number:
+  // RevenueWell credits itself with all revenue from any appointment within 60
+  // days of an unmatched new-patient request. 30 days is a claim that can be
+  // defended one delivery at a time.
+  //
+  // Not carried in server/modules/growth/defaults.ts on purpose: that file's
+  // contract is "the constants the browser already shipped", and its seed block
+  // is pinned column-for-column by growthConfigSpine.unit.test.ts against an
+  // already-applied migration. This is a NEW decision, not a transcribed one,
+  // so its code-side default lives with the job that reads it
+  // (CAMPAIGN_ATTRIBUTION_WINDOW_DAYS_DEFAULT) and is pinned to this @default
+  // by campaignAttributionPolicy.unit.test.ts.
+  campaignAttributionWindowDays   Int      @default(30)
   createdAt                       DateTime @default(now())
   updatedAt                       DateTime @updatedAt
   tenant                          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
@@ -682,6 +707,30 @@ model Campaign {
   channels         Channel[]
   audienceSize     Int                @default(0)
   sent             Int                @default(0)
+  // -------------------------------------------------------------------------
+  // DEPRECATED AS WRITABLE COLUMNS. These four are a MATERIALIZED ROLLUP of
+  // CampaignAttribution, maintained by database triggers
+  // (Campaign_attribution_rollup_guard / CampaignAttribution_rollup_refresh in
+  // migration 20260828230000_campaign_attribution). No application code path
+  // may set them: the guard raises P0001 for any statement that tries to move
+  // one to a value the evidence does not produce, and silently re-derives them
+  // on every other write, so an ordinary campaign UPDATE cannot leave a stale
+  // number behind either.
+  //
+  //   booked   = COUNT(CampaignAttribution WHERE outcomeType = 'booked')
+  //   revenue  = SUM(attributedValue) FILTER (outcomeType = 'paid') — money a
+  //              named PaymentTransaction actually recorded, never an imputed
+  //              per-event constant.
+  //   opened   = 0 and responded = 0, PINNED. This platform has no truthful
+  //              engagement receipt: normalizeProviderDeliveryStatus in
+  //              server/lib/campaignIntegrity.ts deliberately refuses to accept
+  //              a provider "opened" event, so there is nothing to count. They
+  //              are held at zero by construction rather than left at whatever
+  //              a caller last wrote.
+  //
+  // Read them for display only. server/lib/campaignAttribution.ts and the
+  // /v1/crm attribution endpoints derive every reported figure from the
+  // CampaignAttribution rows themselves, never from these columns.
   opened           Int                @default(0)
   responded        Int                @default(0)
   booked           Int                @default(0)
@@ -728,6 +777,7 @@ model Campaign {
   // widening a scoped campaign back to tenant-wide.
   branch           Branch?            @relation(fields: [tenantId, branchId], references: [tenantId, id], onDelete: Restrict)
   deliveries       CampaignDelivery[]
+  attributions     CampaignAttribution[]
 
   @@index([tenantId, status, createdAt])
   @@index([tenantId, archivedAt, createdAt])
@@ -1374,7 +1424,11 @@ model PaymentTransaction {
   appointment                 Appointment?               @relation(fields: [appointmentId], references: [id], onDelete: SetNull)
   paymentRequest              PaymentRequest?            @relation(fields: [paymentRequestId], references: [id], onDelete: SetNull)
   paymentProviderConnection   PaymentProviderConnection? @relation(fields: [paymentProviderConnectionId], references: [id], onDelete: SetNull)
+  campaignAttributions        CampaignAttribution[]
 
+  // Referenced by CampaignAttribution so an attributed payment can never belong
+  // to another tenant.
+  @@unique([tenantId, id])
   @@index([tenantId, branchId, createdAt])
   @@index([tenantId, status, createdAt])
 }
@@ -2970,6 +3024,7 @@ model CampaignDelivery {
   tenant            Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   campaign          Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
   submissionClaims  CampaignSubmissionClaim[]
+  attributions      CampaignAttribution[]
 
   @@unique([campaignId, patientId, leadId, channel])
   // Referenced by CampaignSubmissionClaim so a claim can never be attached to a
@@ -3068,6 +3123,109 @@ model CampaignLiveDispatchActivation {
 
   @@unique([tenantId, channel])
   @@index([tenantId, revokedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Closed-loop campaign attribution.
+//
+// Campaign.opened/responded/booked/revenue existed for months with NO code path
+// that wrote them: a campaign could run end to end and the dashboard still
+// reported $0, because nothing anywhere joined CampaignDelivery to Appointment
+// or to a payment. This table is that join, made durable and arguable.
+//
+// The competitive point is not having a number. Tebra multiplies volume by
+// hardcoded constants ($3 per reminder sent, $150 per recall appointment), so a
+// practice that sent 5,000 reminders is shown $15,000 of "ROI" against zero
+// production. RevenueWell credits itself with ALL revenue from any appointment
+// within 60 days of an unmatched new-patient request, plus flat $5/$10 imputed
+// values. Neither survives a practice manager asking "which message earned that
+// dollar?". Every row here answers exactly that, or the row does not exist.
+// ---------------------------------------------------------------------------
+
+/// Immutable evidence linking ONE CampaignDelivery to ONE outcome. Nothing in
+/// the application updates a row after it is written; re-running the
+/// attribution job inserts what is missing and touches nothing else.
+///
+/// THE WINDOW IS CAPTURED ON THE ROW ON PURPOSE. windowDays, windowStartsAt and
+/// windowEndsAt record the attribution window that was in force at the moment
+/// this link was made, not the window in force now. A later edit to
+/// GrowthPolicy.campaignAttributionWindowDays must change what gets attributed
+/// NEXT and must never retroactively rewrite, widen, narrow or invalidate an
+/// attribution that has already been claimed. Re-deriving the window at read
+/// time would do exactly that, and would make every historical number
+/// unreproducible the first time a tenant edited a setting.
+///
+/// attributedValue is money a named PaymentTransaction actually recorded. A
+/// booking is not revenue and an attendance is not revenue: both carry 0. There
+/// is deliberately no imputed per-event constant anywhere in this table.
+model CampaignAttribution {
+  id                   String              @id @default(uuid()) @db.Uuid
+  tenantId             String              @db.Uuid
+  /// The branch the outcome actually happened in. A branch-scoped campaign can
+  /// only ever attribute an outcome from its own branch (enforced by the job),
+  /// so for those campaigns this equals Campaign.branchId.
+  branchId             String?             @db.Uuid
+  campaignId           String              @db.Uuid
+  campaignDeliveryId   String              @db.Uuid
+  patientId            String?             @db.Uuid
+  leadId               String?             @db.Uuid
+  /// engaged | booked | attended | paid. The vocabulary lives in
+  /// server/lib/campaignAttribution.ts (CAMPAIGN_ATTRIBUTION_OUTCOMES); it is
+  /// not a database CHECK, for the same reason CampaignSubmissionClaim.phase is
+  /// not one. `engaged` is deliberately NEVER written today — see that module's
+  /// header for why a provider "open" is not evidence in this system.
+  outcomeType          String
+  appointmentId        String?             @db.Uuid
+  paymentTransactionId String?             @db.Uuid
+  attributedValue      Decimal             @default(0) @db.Decimal(12, 2)
+  currency             String              @default("USD")
+  /// The window that justified THIS link, as it stood when the link was made.
+  windowDays           Int
+  windowStartsAt       DateTime
+  windowEndsAt         DateTime
+  /// The named rule that produced the row, so any figure can be argued back to
+  /// the sentence that generated it.
+  rule                 String
+  /// Delivery acceptance timestamp, outcome timestamp, the rule applied, the
+  /// tie-break, and the exact record ids the value came from. Ids and
+  /// timestamps only — no PHI, no destinations, no message bodies.
+  evidence             Json
+  attributedAt         DateTime            @default(now())
+  createdAt            DateTime            @default(now())
+  tenant               Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  // Every parent link is tenant-composite: an attribution can never point at
+  // another tenant's campaign, delivery, patient, appointment or payment, even
+  // if an id is guessed. Cascade throughout — an attribution to a record that
+  // no longer exists is not evidence, so it must not outlive its subject, and
+  // no attribution row may block the deletion of the thing it describes.
+  branch               Branch?             @relation(fields: [tenantId, branchId], references: [tenantId, id], onDelete: Cascade)
+  // Campaign is referenced by id alone, deliberately. A (tenantId, id) unique on
+  // Campaign already exists in the deployed database under a migration-owned
+  // rls_uq_ name; declaring it in Prisma would turn a managed DROP INDEX into an
+  // ALTER INDEX ... RENAME in `prisma migrate diff` and move the pinned counts
+  // in server/modules/platform/prismaDriftGuard.ts, which this increment does
+  // not own. The guarantee is not lost: CampaignAttribution_tenant_consistency
+  // (migration 20260828230000) refuses any row whose campaignId is not a
+  // campaign of NEW."tenantId" AND is not the campaign the referenced delivery
+  // belongs to — which is strictly stronger than the composite FK would be.
+  campaign             Campaign            @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  delivery             CampaignDelivery    @relation(fields: [tenantId, campaignDeliveryId], references: [tenantId, id], onDelete: Cascade)
+  patient              Patient?            @relation(fields: [tenantId, patientId], references: [tenantId, id], onDelete: Cascade)
+  lead                 Lead?               @relation(fields: [tenantId, leadId], references: [tenantId, id], onDelete: Cascade)
+  appointment          Appointment?        @relation(fields: [tenantId, appointmentId], references: [tenantId, id], onDelete: Cascade)
+  payment              PaymentTransaction? @relation(fields: [tenantId, paymentTransactionId], references: [tenantId, id], onDelete: Cascade)
+
+  /// Idempotence. Re-running the attribution job can only ever be a no-op for a
+  /// delivery whose outcome of this type is already recorded.
+  @@unique([tenantId, campaignDeliveryId, outcomeType])
+  /// The anti-double-count. One appointment is claimed by at most ONE delivery
+  /// per outcome type, so two campaigns that both reached the same patient can
+  /// never both book the same booking. NULL appointmentIds stay distinct, which
+  /// is what lets a future non-appointment outcome coexist here.
+  @@unique([tenantId, outcomeType, appointmentId])
+  @@index([tenantId, campaignId, outcomeType])
+  @@index([tenantId, attributedAt])
+  @@index([tenantId, campaignDeliveryId])
 }
 
 model PatientIntakePacket {

@@ -169,12 +169,23 @@ export const campaignQueue: Queue<ScheduledQueueData, void, string> = QUEUES_ENA
 export async function registerCampaignSchedules() {
   // Every 5 minutes — picks up due scheduled campaigns.
   await campaignQueue.upsertJobScheduler('campaign-dispatch', { pattern: '*/5 * * * *' }, { name: 'dispatch-scheduled', data: {} });
+  // Hourly at :20 — closed-loop attribution. Deliberately NOT on the dispatch
+  // cadence: attribution only reads delivery/appointment/payment evidence that
+  // already exists and writes append-only CampaignAttribution rows, so it never
+  // needs to keep pace with sending, and running it away from the dispatch
+  // minute keeps the two jobs off each other's rows.
+  await campaignQueue.upsertJobScheduler('campaign-attribution', { pattern: '20 * * * *' }, { name: 'attribute-outcomes', data: {} });
 }
 
 
 export async function enqueueCampaignTenantJob(tenantId: string) {
   const data = createTenantJobEnvelope({ queue: 'campaign-scheduler', operation: 'dispatch-scheduled', tenantId, _otel: currentTraceCarrier() });
   await campaignQueue.add('dispatch-scheduled-tenant', data, { jobId: tenantJobId(data) });
+}
+
+export async function enqueueCampaignAttributionTenantJob(tenantId: string) {
+  const data = createTenantJobEnvelope({ queue: 'campaign-scheduler', operation: 'attribute-outcomes', tenantId, _otel: currentTraceCarrier() });
+  await campaignQueue.add('attribute-outcomes-tenant', data, { jobId: tenantJobId(data) });
 }
 
 // ---- Monitoring safety-net queue ------------------------------------------
