@@ -67,11 +67,16 @@ export default function PatientGrowthDrawer({ lead, patient, onClose, onNavigate
           <div className="grid grid-cols-2 gap-2.5">
             {isPatient ? <>
               <Metric label="Lifetime value" value={formatCurrency(patient!.lifetimeValue)} accent />
-              <Metric label="Churn risk" value={`${patient!.churnRisk}%`} danger={patient!.churnRisk >= 50} />
+              {/* The band comes from the server's configured churnRiskHigh; an
+                  unknown band is shown as a number without a verdict, never as
+                  "not at risk". */}
+              <Metric label="Churn risk" value={`${patient!.churnRisk}%`} danger={patient!.atRisk === true} />
               <Metric label="Last visit" value={patient!.lastVisit ? new Date(patient!.lastVisit).toLocaleDateString() : '—'} />
               <Metric label="Next visit" value={patient!.nextVisit ? new Date(patient!.nextVisit).toLocaleDateString() : 'Not booked'} />
             </> : <>
-              <Metric label="Planning priority" value={String(lead!.score)} accent={lead!.score >= 70} />
+              {/* `hot` is the server's verdict against the configured
+                  hotLeadScore; a lead it could not score shows no number. */}
+              <Metric label="Planning priority" value={lead!.score === null ? '—' : String(lead!.score)} accent={lead!.hot} />
               <Metric label="Estimated value" value={formatCurrency(lead!.estimatedValue)} />
               <Metric label="Stage" value={lead!.stage.replace('-', ' ')} />
               <Metric label="Age" value={`${lead!.ageDays}d`} />

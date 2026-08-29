@@ -223,6 +223,8 @@ model Tenant {
   growthPolicy                        GrowthPolicy?
   growthSegmentDefinitions            GrowthSegmentDefinition[]
   growthChannelCosts                  GrowthChannelCost[]
+  campaignSubmissionClaims            CampaignSubmissionClaim[]
+  campaignLiveDispatchActivations     CampaignLiveDispatchActivation[]
 }
 
 model User {
@@ -2952,8 +2954,12 @@ model CampaignDelivery {
   updatedAt         DateTime  @updatedAt
   tenant            Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   campaign          Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  submissionClaims  CampaignSubmissionClaim[]
 
   @@unique([campaignId, patientId, leadId, channel])
+  // Referenced by CampaignSubmissionClaim so a claim can never be attached to a
+  // delivery row belonging to another tenant.
+  @@unique([tenantId, id])
   @@index([tenantId, status, createdAt])
   @@index([tenantId, providerMessageId])
 }
@@ -2964,6 +2970,91 @@ model CampaignDelivery {
 // object storage exists. Public access is via a hashed, expiring, packet-scoped
 // token. Reuses Patient/Appointment/Insurance/Payment/Consent foundations.
 // ===========================================================================
+// ---------------------------------------------------------------------------
+// Live campaign dispatch fence (Growth / CRM outreach).
+//
+// Two tables, one purpose: make the consent decision and the provider hand-off
+// inseparable, and keep live regulated outreach OFF until a named human turns it
+// on for their own tenant.
+// ---------------------------------------------------------------------------
+
+/// Durable, append-only submission evidence for ONE campaign recipient attempt.
+/// Ported from the receptionist appointment-confirmation outbox
+/// (NotificationDeliveryAttempt phases):
+///   PROVIDER_INTENT  - written by campaignDispatch inside the transaction that
+///                      holds the same suppression advisory fences opt-out
+///                      writers take and that re-reads suppression. This commit
+///                      is the linearization point: an opt-out is either visible
+///                      to it, or it lands strictly after the authorization.
+///   SUBMISSION_CLAIM - appended inside commsProvider immediately BEFORE
+///                      provider I/O, exactly once per attempt. The unique index
+///                      is what makes a second worker a no-op instead of a
+///                      duplicate send.
+///   RESULT           - the truthful outcome. `accepted` is provider acceptance,
+///                      never delivery.
+model CampaignSubmissionClaim {
+  id                   String    @id @default(uuid()) @db.Uuid
+  tenantId             String    @db.Uuid
+  campaignId           String    @db.Uuid
+  campaignDeliveryId   String    @db.Uuid
+  attemptNumber        Int
+  phase                String
+  status               String
+  channel              String
+  /// sha256 of the canonical destination. Evidence without PHI.
+  destinationHash      String
+  idempotencyKey       String
+  /// The exact operator authorization this attempt was submitted under.
+  launchFingerprint    String
+  consentEvidence      String
+  /// mock_dev | live. A live attempt additionally requires dispatchActivationId.
+  submissionMode       String
+  dispatchActivationId String?   @db.Uuid
+  provider             String?
+  providerMessageId    String?
+  failureCode          String?
+  startedAt            DateTime  @default(now())
+  completedAt          DateTime?
+  tenant               Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  campaignDelivery     CampaignDelivery @relation(fields: [tenantId, campaignDeliveryId], references: [tenantId, id], onDelete: Cascade)
+
+  @@unique([tenantId, campaignDeliveryId, attemptNumber, phase])
+  @@index([tenantId, phase, startedAt])
+  @@index([tenantId, campaignId, startedAt])
+}
+
+/// Per-tenant, per-channel authority to submit LIVE regulated campaign traffic.
+///
+/// Absence means OFF. There is deliberately no column default, no seed, no
+/// migration backfill and no provisioning hook that can create one: a row exists
+/// only because an OWNER/ADMIN called the activation endpoint and typed an
+/// explicit attestation while the channel provider was actually configured.
+/// Deactivation sets revokedAt instead of deleting, so the attestation that was
+/// in force for an already-submitted message stays readable.
+model CampaignLiveDispatchActivation {
+  id                String    @id @default(uuid()) @db.Uuid
+  tenantId          String    @db.Uuid
+  channel           String
+  activatedByUserId String    @db.Uuid
+  activatedAt       DateTime  @default(now())
+  /// The exact sentence the activating operator typed. Stored verbatim.
+  attestation       String
+  attestationHash   String
+  /// Which fence implementation the attestation was made against.
+  fenceVersion      String
+  /// Truthful provider state at activation time (env key NAMES only, no secrets).
+  providerSnapshot  Json
+  revokedAt         DateTime?
+  revokedByUserId   String?   @db.Uuid
+  revocationReason  String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  tenant            Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, channel])
+  @@index([tenantId, revokedAt])
+}
+
 model PatientIntakePacket {
   id                   String                  @id @default(uuid()) @db.Uuid
   tenantId             String                  @db.Uuid

@@ -1,8 +1,8 @@
 import { db } from './db';
 import { env } from '../config/env';
-import { runWithTenantContext } from './tenantContext';
-import type { ReceptionistOptOutChannel } from '../generated/prisma/client';
-import { canonicalDncDestination } from './receptionist/dncFence';
+import { runWithTenantContext, type TenantTxClient } from './tenantContext';
+import type { CampaignLiveDispatchActivation, ReceptionistOptOutChannel } from '../generated/prisma/client';
+import { canonicalDncDestination, isDestinationOptedOutTx } from './receptionist/dncFence';
 
 // ===========================================================================
 // CRM Campaign / Reactivation engine helpers. Deterministic, tenant-scoped
@@ -162,6 +162,154 @@ export function providerModeFor(channel: CommChannel): ProviderMode {
   return 'configured_pending_provider';
 }
 
+// --- Live campaign dispatch activation (DEFAULT OFF) -----------------------
+//
+// Three independent conditions must ALL hold before one live regulated campaign
+// message may be submitted, and `providerReadiness()` reports each of them
+// separately so an operator can see what is actually missing:
+//
+//   1. the durable submission fence exists (CampaignSubmissionClaim +
+//      campaignIntegrity.claimCampaignProviderIntent);
+//   2. the channel has a real live provider wired (providerModeFor === live_supported);
+//   3. an OWNER/ADMIN wrote a CampaignLiveDispatchActivation row for THIS tenant
+//      and channel with an explicit attestation.
+//
+// Condition 3 has no default, no seed and no backfill: absence means OFF.
+export const CAMPAIGN_CHANNELS: readonly CommChannel[] = ['sms', 'email', 'voice', 'whatsapp'];
+
+/**
+ * Identifies the fence implementation an activation attestation was made
+ * against. Changing the fence's safety properties must bump this constant so
+ * every existing attestation is refused until it is re-made against the new
+ * boundary — an activation is consent to a specific mechanism, not a forever
+ * blank cheque.
+ */
+export const LIVE_DISPATCH_FENCE_VERSION = 'campaign-submission-claim.v1';
+
+/** Channels a live regulated campaign message can be submitted on at all. */
+export const LIVE_DISPATCH_CHANNELS: readonly CommChannel[] = ['sms', 'email', 'whatsapp'];
+
+export type LiveDispatchBlocker =
+  | 'fence_not_implemented'
+  | 'channel_not_eligible_for_live_dispatch'
+  | 'provider_not_configured'
+  | 'provider_is_development_mock'
+  | 'provider_has_no_live_sender'
+  | 'tenant_activation_missing'
+  | 'tenant_activation_revoked'
+  | 'tenant_activation_fence_version_stale';
+
+export interface ChannelDispatchActivation {
+  channel: CommChannel;
+  providerMode: ProviderMode;
+  providerConfigured: boolean;
+  /** A real live sender is wired for this channel (not a dev mock, not pending). */
+  liveProviderReady: boolean;
+  /** The durable submission fence is compiled into this build. */
+  fencePresent: boolean;
+  /** An unrevoked, current-version activation row exists for this tenant. */
+  tenantActivated: boolean;
+  /** All three conditions hold. This is the only field dispatch may act on. */
+  liveDispatchActivated: boolean;
+  activationId: string | null;
+  activatedAt: string | null;
+  activatedByUserId: string | null;
+  attestation: string | null;
+  blockingReasons: LiveDispatchBlocker[];
+}
+
+export type DispatchActivationRecord = Pick<CampaignLiveDispatchActivation,
+  'id' | 'channel' | 'activatedAt' | 'activatedByUserId' | 'attestation' | 'fenceVersion' | 'revokedAt'
+>;
+
+/**
+ * Pure resolver. `record` is the tenant's activation row for this channel, or
+ * null when none exists — which is the state every tenant is in until someone
+ * deliberately changes it.
+ */
+export function resolveChannelDispatchActivation(
+  channel: CommChannel,
+  record: DispatchActivationRecord | null,
+  fencePresent = true,
+): ChannelDispatchActivation {
+  const status = channelStatus(channel);
+  const providerMode = providerModeFor(channel);
+  const liveProviderReady = providerMode === 'live_supported';
+  const blockingReasons: LiveDispatchBlocker[] = [];
+  if (!fencePresent) blockingReasons.push('fence_not_implemented');
+  if (!LIVE_DISPATCH_CHANNELS.includes(channel)) blockingReasons.push('channel_not_eligible_for_live_dispatch');
+  if (!status.configured) blockingReasons.push('provider_not_configured');
+  else if (providerMode === 'mock_dev') blockingReasons.push('provider_is_development_mock');
+  else if (!liveProviderReady) blockingReasons.push('provider_has_no_live_sender');
+  if (!record) blockingReasons.push('tenant_activation_missing');
+  else if (record.revokedAt) blockingReasons.push('tenant_activation_revoked');
+  else if (record.fenceVersion !== LIVE_DISPATCH_FENCE_VERSION) blockingReasons.push('tenant_activation_fence_version_stale');
+  const tenantActivated = Boolean(record && !record.revokedAt && record.fenceVersion === LIVE_DISPATCH_FENCE_VERSION);
+  return {
+    channel,
+    providerMode,
+    providerConfigured: status.configured,
+    liveProviderReady,
+    fencePresent,
+    tenantActivated,
+    liveDispatchActivated: blockingReasons.length === 0,
+    activationId: tenantActivated ? record!.id : null,
+    activatedAt: record?.activatedAt?.toISOString() ?? null,
+    activatedByUserId: record?.activatedByUserId ?? null,
+    attestation: record?.attestation ?? null,
+    blockingReasons,
+  };
+}
+
+const ACTIVATION_SELECT = {
+  id: true, channel: true, activatedAt: true, activatedByUserId: true,
+  attestation: true, fenceVersion: true, revokedAt: true,
+} as const;
+
+/** Transactional read, so the fence can linearize activation with deactivation. */
+export async function resolveDispatchActivationTx(
+  tx: TenantTxClient,
+  tenantId: string,
+  channel: CommChannel,
+): Promise<ChannelDispatchActivation> {
+  const record = await tx.campaignLiveDispatchActivation.findUnique({
+    where: { tenantId_channel: { tenantId, channel } },
+    select: ACTIVATION_SELECT,
+  });
+  return resolveChannelDispatchActivation(channel, record);
+}
+
+export async function resolveDispatchActivation(tenantId: string, channel: CommChannel): Promise<ChannelDispatchActivation> {
+  return runWithTenantContext(tenantId, tx => resolveDispatchActivationTx(tx, tenantId, channel));
+}
+
+export async function resolveDispatchActivations(tenantId: string): Promise<Record<CommChannel, ChannelDispatchActivation>> {
+  const records = await runWithTenantContext(tenantId, tx => tx.campaignLiveDispatchActivation.findMany({
+    where: { tenantId },
+    select: ACTIVATION_SELECT,
+  }));
+  const byChannel = new Map(records.map(record => [record.channel, record]));
+  return Object.fromEntries(CAMPAIGN_CHANNELS.map(channel =>
+    [channel, resolveChannelDispatchActivation(channel, byChannel.get(channel) ?? null)],
+  )) as Record<CommChannel, ChannelDispatchActivation>;
+}
+
+function activationNoticeFor(activation: Record<CommChannel, ChannelDispatchActivation>): string {
+  const active = CAMPAIGN_CHANNELS.filter(c => activation[c].liveDispatchActivated);
+  if (active.length > 0) {
+    return `Live campaign delivery is ACTIVE for ${active.join(', ')}. Every recipient still passes the durable submission claim and the last-second opt-out check before any provider request, and a second attempt for the same recipient is a no-op.`;
+  }
+  const eligible = LIVE_DISPATCH_CHANNELS.filter(c => activation[c].liveProviderReady);
+  if (eligible.length === 0) {
+    return 'Live campaign delivery is not activated. The durable submission fence is in place, but no channel has a live provider wired, so there is nothing to activate yet.';
+  }
+  const awaitingTenant = eligible.filter(c => !activation[c].tenantActivated);
+  if (awaitingTenant.length > 0) {
+    return `Live campaign delivery is not activated. The durable submission fence is in place and ${awaitingTenant.join(', ')} has a live provider, but no OWNER or ADMIN has recorded an activation attestation for this tenant.`;
+  }
+  return 'Live campaign delivery is not activated. See channelActivation for the exact blocking reason on each channel.';
+}
+
 // Structured communications readiness (no secret values; env key NAMES only).
 export interface ProviderReadiness {
   smsConfigured: boolean;
@@ -175,16 +323,34 @@ export interface ProviderReadiness {
   liveSendingSupported: boolean;
   liveCampaignDispatchActivated: boolean;
   activationNotice: string;
+  /** The fence exists in this build; `liveDispatchFenceVersion` names which one. */
+  liveDispatchFenceImplemented: boolean;
+  liveDispatchFenceVersion: string;
+  /** Channels with a real live sender wired, regardless of tenant activation. */
+  liveProviderChannels: CommChannel[];
+  /** Channels this tenant may actually submit live traffic on right now. */
+  activatedChannels: CommChannel[];
+  /** Per-channel truth, including WHY a channel is not activated. */
+  channelActivation: Record<CommChannel, ChannelDispatchActivation>;
 }
 
-export function providerReadiness(): ProviderReadiness {
-  const channels: CommChannel[] = ['sms', 'email', 'voice', 'whatsapp'];
+/**
+ * Truthful readiness. `activation` carries this tenant's activation rows; when
+ * it is omitted the answer is the honest "no tenant activation is in force",
+ * which is also the correct answer for any caller that has no tenant in hand.
+ */
+export function providerReadiness(
+  activation?: Record<CommChannel, ChannelDispatchActivation>,
+): ProviderReadiness {
+  const channels = [...CAMPAIGN_CHANNELS];
   const statuses = Object.fromEntries(channels.map(c => [c, channelStatus(c)])) as Record<CommChannel, ChannelStatus>;
   const modes = Object.fromEntries(channels.map(c => [c, providerModeFor(c)])) as Record<CommChannel, ProviderMode>;
   const missingEnvKeys = [...new Set(channels.flatMap(c => statuses[c].missing))];
-  // "Supported" = can produce a real (mock_dev) or queued delivery; never a
-  // live-sent claim, since no concrete provider sender is wired.
+  // "Supported" = can produce a real (mock_dev) or queued delivery.
   const supportedChannels = channels.filter(c => modes[c] === 'mock_dev' || modes[c] === 'configured_pending_provider' || modes[c] === 'live_supported');
+  const channelActivation = activation
+    ?? Object.fromEntries(channels.map(c => [c, resolveChannelDispatchActivation(c, null)])) as Record<CommChannel, ChannelDispatchActivation>;
+  const activatedChannels = channels.filter(c => channelActivation[c].liveDispatchActivated);
   return {
     smsConfigured: statuses.sms.configured,
     emailConfigured: statuses.email.configured,
@@ -194,12 +360,17 @@ export function providerReadiness(): ProviderReadiness {
     supportedChannels,
     unsupportedChannels: channels.filter(c => !supportedChannels.includes(c)),
     schedulerEnforced: true,   // approved SCHEDULED campaigns run via the campaign-scheduler worker
-    // Provider adapters exist, but regulated campaign submission stays disabled
-    // until the consent/opt-out decision and durable provider claim share one
-    // database-linearized boundary.
-    liveSendingSupported: false,
-    liveCampaignDispatchActivated: false,
-    activationNotice: 'Live campaign delivery is disabled until the required consent and last-second opt-out safety control is activated and validated.',
+    // These two are no longer literals. Both mean "can THIS tenant submit live
+    // regulated campaign traffic right now", which is false until a named
+    // OWNER/ADMIN activates a channel whose provider is genuinely wired.
+    liveSendingSupported: activatedChannels.length > 0,
+    liveCampaignDispatchActivated: activatedChannels.length > 0,
+    activationNotice: activationNoticeFor(channelActivation),
+    liveDispatchFenceImplemented: true,
+    liveDispatchFenceVersion: LIVE_DISPATCH_FENCE_VERSION,
+    liveProviderChannels: LIVE_DISPATCH_CHANNELS.filter(c => channelActivation[c].liveProviderReady),
+    activatedChannels,
+    channelActivation,
   };
 }
 
@@ -283,37 +454,58 @@ export async function isDestinationOptedOut(tenantId: string, destination: strin
   return rows.some(r => canonicalDncDestination(r.contactPhone ?? '') === canonicalDncDestination(value));
 }
 
-export async function isSuppressed(tenantId: string, target: { patientId?: string | null; leadId?: string | null; destination?: string | null }, channel: CommChannel): Promise<boolean> {
+export type SuppressionTarget = { patientId?: string | null; leadId?: string | null; destination?: string | null };
+
+/**
+ * Identity-keyed half of the suppression decision, on a caller-supplied tenant
+ * transaction. Factored out of isSuppressed() so the durable submission fence
+ * can take the SAME decision inside the transaction that commits the provider
+ * intent, without the two checks ever drifting apart.
+ */
+async function identitySuppressedTx(tx: TenantTxClient, tenantId: string, target: SuppressionTarget, channel: CommChannel): Promise<boolean> {
+  const where = { tenantId, patientId: target.patientId ?? null, leadId: target.leadId ?? null };
+  const [optedOut, suppressed] = await Promise.all([
+    tx.communicationConsent.count({ where: { ...where, channel, status: 'opted_out' } }),
+    tx.campaignSuppression.count({ where: { ...where, channel, active: true } }),
+  ]);
+  if (optedOut > 0 || suppressed > 0) return true;
+
+  // Honor an explicit legacy ConsentEvent opt-out (latest event per purpose).
+  // Never fabricates opt-in — only an explicit granted=false suppresses.
+  // A MARKETING opt-out suppresses ALL channels (cross-channel marketing consent);
+  // SMS/EMAIL/WHATSAPP opt-outs suppress their mapped channel.
+  if (target.patientId) {
+    const purpose = CONSENT_PURPOSE[channel];
+    const purposes = purpose ? [purpose, 'MARKETING' as const] : ['MARKETING' as const];
+    const events = await tx.consentEvent.findMany({ where: { tenantId, patientId: target.patientId, purpose: { in: purposes } }, orderBy: { occurredAt: 'desc' } });
+    const seen = new Set<string>();
+    for (const e of events) {
+      if (seen.has(e.purpose)) continue; // latest per purpose only
+      seen.add(e.purpose);
+      if (e.granted === false) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The full suppression decision on ONE transaction. Callers that need the
+ * decision linearized with a durable claim (see campaignIntegrity) must use
+ * this and must hold the receptionist suppression advisory fences first.
+ */
+export async function isSuppressedTx(tx: TenantTxClient, tenantId: string, target: SuppressionTarget, channel: CommChannel): Promise<boolean> {
+  if (await identitySuppressedTx(tx, tenantId, target, channel)) return true;
+  if (target.destination && await isDestinationOptedOutTx(tx, tenantId, target.destination, channel)) return true;
+  return false;
+}
+
+export async function isSuppressed(tenantId: string, target: SuppressionTarget, channel: CommChannel): Promise<boolean> {
   // ConsentEvent is RLS-enrolled, so the consent reads run inside a tenant
   // transaction (GUC set on the same connection). Without it the legacy
   // ConsentEvent opt-out check would silently see zero rows under app_rls and
   // fail OPEN (a real opt-out would be missed). CommunicationConsent /
   // CampaignSuppression are not enrolled but are read here for a single context.
-  const identitySuppressed = await runWithTenantContext(tenantId, async tx => {
-    const where = { tenantId, patientId: target.patientId ?? null, leadId: target.leadId ?? null };
-    const [optedOut, suppressed] = await Promise.all([
-      tx.communicationConsent.count({ where: { ...where, channel, status: 'opted_out' } }),
-      tx.campaignSuppression.count({ where: { ...where, channel, active: true } }),
-    ]);
-    if (optedOut > 0 || suppressed > 0) return true;
-
-    // Honor an explicit legacy ConsentEvent opt-out (latest event per purpose).
-    // Never fabricates opt-in — only an explicit granted=false suppresses.
-    // A MARKETING opt-out suppresses ALL channels (cross-channel marketing consent);
-    // SMS/EMAIL/WHATSAPP opt-outs suppress their mapped channel.
-    if (target.patientId) {
-      const purpose = CONSENT_PURPOSE[channel];
-      const purposes = purpose ? [purpose, 'MARKETING' as const] : ['MARKETING' as const];
-      const events = await tx.consentEvent.findMany({ where: { tenantId, patientId: target.patientId, purpose: { in: purposes } }, orderBy: { occurredAt: 'desc' } });
-      const seen = new Set<string>();
-      for (const e of events) {
-        if (seen.has(e.purpose)) continue; // latest per purpose only
-        seen.add(e.purpose);
-        if (e.granted === false) return true;
-      }
-    }
-    return false;
-  });
+  const identitySuppressed = await runWithTenantContext(tenantId, tx => identitySuppressedTx(tx, tenantId, target, channel));
   if (identitySuppressed) return true;
 
   // Cross-module: a receptionist-call opt-out (destination-keyed) suppresses too.

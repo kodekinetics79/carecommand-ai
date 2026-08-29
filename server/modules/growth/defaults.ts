@@ -111,11 +111,20 @@ export const THRESHOLD_RESOLUTIONS = Object.freeze([
   }),
 ]);
 
-/** The remaining call site to rewire once a module is allowed to read this config. */
+/**
+ * The remaining call site to rewire once a module is allowed to read this config.
+ *
+ * The CRM entries are gone because they are DONE: `commandMetrics`,
+ * `smartSegments`, `scoreLead` and the next-best-action map were deleted from
+ * src/lib/crmService.ts and now live in server/modules/growth/{scoring,metrics}.ts,
+ * reading GrowthPolicy / GrowthSegmentDefinition / GrowthChannelCost. The CRM
+ * page's at-risk badge renders the band the server computed from
+ * `churnRiskHigh`, so no threshold literal survives in that screen.
+ */
 export const PENDING_CONFIG_CALL_SITES = Object.freeze([
   'server/modules/patients/routes.ts:202-203 (/v1/patients/summary highRiskCount + highLifetimeValueCount)',
-  'src/lib/crmService.ts:160-202 (commandMetrics + smartSegments)',
-  'src/pages/CRM.tsx:193 (at-risk badge)',
+  'src/pages/Reviews.tsx (reviewRatingGood / reviewRatingFair)',
+  'src/pages/ClinicRadar.tsx (reputationRisk* / competitor* severity bounds)',
 ]);
 
 export type GrowthSegmentDefinitionValues = {
@@ -207,3 +216,128 @@ export const GROWTH_CHANNEL_COST_DEFAULTS: readonly GrowthChannelCostValues[] = 
   Object.freeze({ channel: 'WhatsApp', unitCostMinor: 100, currency: 'USD' }),
   Object.freeze({ channel: 'Voice', unitCostMinor: 300, currency: 'USD' }),
 ]);
+
+// ===========================================================================
+// Lead scoring weights.
+//
+// `src/lib/crmService.ts:84-97` computed a lead's planning priority in the
+// browser from eight bare numbers. They move here so the scorer has ONE source
+// of truth, and so `GET /v1/growth/leads` can publish the weights it actually
+// used next to the score it produced.
+//
+// These are deliberately NOT a Prisma model. GrowthPolicy owns the thresholds a
+// clinic reads and argues about (`hotLeadScore`, `scoreBand*`, `goingColdDays`);
+// these are the internal shape of one heuristic, and this increment adds no
+// schema. When a tenant needs to retune the curve itself, that is a migration
+// and a new table — not a literal smuggled back into a component.
+// ===========================================================================
+
+export type GrowthRecencyBucket = {
+  maxAgeDays: number;
+  weight: number;
+  /**
+   * Driver label for a lead inside this bucket. Only the freshest bucket had
+   * one in the browser ("Fresh inquiry (< 48h)"); every other age fell through
+   * to `Inquiry age Nd`. The copy is carried verbatim rather than derived from
+   * `maxAgeDays`, because `<= 2` days is up to 72 hours and the label said 48 —
+   * inventing a corrected number here would be a silent copy change, not a fix.
+   */
+  label?: string;
+};
+
+export type GrowthLeadScoreWeights = {
+  /** Pipeline-stage intent, before the stage multiplier. */
+  stageIntent: Readonly<Record<string, number>>;
+  stageIntentMultiplier: number;
+  /** Intent at or above which the stage reads as a POSITIVE driver. */
+  stageIntentPositiveMin: number;
+  /** Points allocated to `estimatedValue / maxValue`. */
+  valueWeight: number;
+  valuePositiveMin: number;
+  /** First bucket whose `maxAgeDays` covers the lead's age wins; otherwise 0. */
+  recencyBuckets: readonly GrowthRecencyBucket[];
+  recencyPositiveMin: number;
+  /** Lower-cased lead channels that are directly reachable. */
+  reachableChannels: readonly string[];
+  reachableChannelWeight: number;
+  minScore: number;
+  maxScore: number;
+};
+
+/** The seven pipeline stages, in board order (src/lib/crmService.ts:12). */
+export const GROWTH_LEAD_STAGES = Object.freeze([
+  'new-inquiry', 'contacted', 'booked', 'visited', 'follow-up', 'retained', 'lost',
+] as const);
+
+export type GrowthLeadStage = (typeof GROWTH_LEAD_STAGES)[number];
+
+export const GROWTH_STAGE_LABEL: Readonly<Record<GrowthLeadStage, string>> = Object.freeze({
+  'new-inquiry': 'New Inquiry', contacted: 'Contacted', booked: 'Booked', visited: 'Visited',
+  'follow-up': 'Follow-up', retained: 'Retained', lost: 'Lost',
+});
+
+/** Stages that are still in play — neither won nor written off. */
+export const GROWTH_CLOSED_STAGES = Object.freeze(['retained', 'lost'] as const);
+
+/** Stages a "going cold" warning applies to (src/components/crm/PipelineBoard.tsx:20). */
+export const GROWTH_GOING_COLD_STAGES = Object.freeze(['new-inquiry', 'contacted'] as const);
+
+/** Lifecycle stages the recoverable-value assumption is applied to. */
+export const GROWTH_INACTIVE_LIFECYCLE_STAGES = Object.freeze(['INACTIVE', 'AT_RISK', 'LOST'] as const);
+
+/** `missedCallValue` counts uncontacted inbound callers only. */
+export const GROWTH_MISSED_CALL_CHANNEL = 'CALL';
+export const GROWTH_MISSED_CALL_STAGE: GrowthLeadStage = 'new-inquiry';
+
+export const GROWTH_LEAD_SCORE_WEIGHTS: GrowthLeadScoreWeights = Object.freeze({
+  // src/lib/crmService.ts:84 — STAGE_INTENT, value for value.
+  stageIntent: Object.freeze({
+    'new-inquiry': 20, contacted: 40, booked: 70, visited: 80, 'follow-up': 55, retained: 90, lost: 0,
+  }),
+  // src/lib/crmService.ts:88,95 — `intent * 0.4`.
+  stageIntentMultiplier: 0.4,
+  // src/lib/crmService.ts:88 — `positive: intent >= 40`.
+  stageIntentPositiveMin: 40,
+  // src/lib/crmService.ts:89 — `(estimatedValue / maxValue) * 30`.
+  valueWeight: 30,
+  // src/lib/crmService.ts:90 — `positive: valueScore >= 12`.
+  valuePositiveMin: 12,
+  // src/lib/crmService.ts:92 — `<= 2 ? 20 : <= 7 ? 12 : <= 30 ? 4 : 0`.
+  recencyBuckets: Object.freeze([
+    Object.freeze({ maxAgeDays: 2, weight: 20, label: 'Fresh inquiry (< 48h)' }),
+    Object.freeze({ maxAgeDays: 7, weight: 12 }),
+    Object.freeze({ maxAgeDays: 30, weight: 4 }),
+  ]),
+  // src/lib/crmService.ts:93 — `positive: recency >= 12`.
+  recencyPositiveMin: 12,
+  // src/lib/crmService.ts:94-95 — `['whatsapp', 'sms'].includes(...)` worth 8.
+  reachableChannels: Object.freeze(['whatsapp', 'sms']),
+  reachableChannelWeight: 8,
+  // src/lib/crmService.ts:95 — `Math.max(0, Math.min(100, ...))`.
+  minScore: 0,
+  maxScore: 100,
+});
+
+export type GrowthNextBestAction = { label: string; cta: string };
+
+/** src/lib/crmService.ts:99-107 — NBA, stage for stage. */
+export const GROWTH_NEXT_BEST_ACTION: Readonly<Record<GrowthLeadStage, GrowthNextBestAction>> = Object.freeze({
+  'new-inquiry': Object.freeze({ label: 'Call now & send booking link', cta: 'call_now' }),
+  contacted: Object.freeze({ label: 'Send booking link', cta: 'send_booking_link' }),
+  booked: Object.freeze({ label: 'Send intake form + deposit link', cta: 'send_intake_form' }),
+  visited: Object.freeze({ label: 'Send follow-up to rebook', cta: 'send_follow_up' }),
+  'follow-up': Object.freeze({ label: 'Confirm next visit', cta: 'confirm_visit' }),
+  retained: Object.freeze({ label: 'Nurture & request review', cta: 'mark_retained' }),
+  lost: Object.freeze({ label: 'Launch winback', cta: 'launch_winback' }),
+});
+
+/** src/lib/crmService.ts:129 — the two review-timing planning strings. */
+export const GROWTH_REVIEW_TIMING = Object.freeze({
+  maxPromptAgeDays: 1,
+  prompt: 'Planning assumption: prompt review now',
+  staffedHours: 'Planning assumption: review during staffed hours',
+});
+
+/** src/lib/crmService.ts:206 — the notice every planning number carries. */
+export const GROWTH_ASSUMPTION_NOTICE =
+  'Unvalidated planning assumptions only; not a forecast or consent decision.';

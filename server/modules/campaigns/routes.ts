@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { db } from '../../lib/db';
 import { env } from '../../config/env';
@@ -12,8 +12,11 @@ import {
   CAMPAIGN_TYPES, AUDIENCE_TYPES, STAFF_FACING_AUDIENCES,
   buildAudience, previewAudience, generateDraft, providerReadiness, countOpenSlots,
   channelStatus, maskDestination, isSuppressed, NON_VOICE_OUTREACH_AUTHORITY_VERSION,
+  LIVE_DISPATCH_CHANNELS, LIVE_DISPATCH_FENCE_VERSION,
+  resolveDispatchActivations, resolveChannelDispatchActivation,
   type AudienceType, type CommChannel, type CampaignType,
 } from '../../lib/campaigns';
+import { lockSuppressionFences } from '../../lib/receptionist/dncFence';
 import { dispatchCampaign } from '../../lib/campaignDispatch';
 import { sendMessage } from '../../lib/commsProvider';
 import { aiProviderConfigured, draftWithAI } from '../../lib/campaignAI';
@@ -108,7 +111,151 @@ export const crmRoutes: FastifyPluginAsync = async app => {
   // entitlement. Guards are declared per route so each data class is explicit.
 
   // ----- Communications provider readiness (truthful; no secret values) ---
-  app.get('/provider-status', { preHandler: [campaignRead, campaignFeature] }, async () => providerReadiness());
+  // The two live-dispatch booleans are no longer literals: they answer "can THIS
+  // tenant submit live regulated campaign traffic right now", and
+  // `channelActivation` says exactly what is missing on each channel (fence
+  // present? provider configured? tenant activated?).
+  app.get('/provider-status', { preHandler: [campaignRead, campaignFeature] }, async request =>
+    providerReadiness(await resolveDispatchActivations(request.auth.tenantId)));
+
+  // ----- Live campaign dispatch activation (DEFAULT OFF) ------------------
+  // Building the fence does not turn anything on. A tenant may submit live
+  // regulated campaign traffic only after an OWNER or ADMIN records an explicit
+  // attestation here, for one channel, whose provider is genuinely configured.
+  const activationChannel = z.enum(['sms', 'email', 'whatsapp']);
+
+  function activationDenied(request: { auth: { role: string } }): boolean {
+    // Deliberately a role test on top of `campaign:manage`. Activating live
+    // regulated outreach is an accountable act by a named accountable person,
+    // so it is not delegable through a RoleDefinition override the way ordinary
+    // campaign management is.
+    return !['OWNER', 'ADMIN'].includes(request.auth.role);
+  }
+
+  app.get('/live-dispatch-activation', { preHandler: [campaignRead, campaignFeature] }, async request => {
+    const activation = await resolveDispatchActivations(request.auth.tenantId);
+    return {
+      fenceVersion: LIVE_DISPATCH_FENCE_VERSION,
+      eligibleChannels: LIVE_DISPATCH_CHANNELS,
+      channels: LIVE_DISPATCH_CHANNELS.map(channel => activation[channel]),
+    };
+  });
+
+  app.post('/live-dispatch-activation', { preHandler: [campaignManage, campaignFeature] }, async (request, reply) => {
+    if (activationDenied(request)) {
+      return reply.code(403).send({
+        error: 'owner_or_admin_required',
+        message: 'Activating live campaign delivery requires an OWNER or ADMIN. Nothing was changed.',
+      });
+    }
+    const input = z.object({
+      channel: activationChannel,
+      // The exact sentence the operator types, stored verbatim as evidence.
+      attestation: z.string().trim().min(40).max(1000),
+      // An explicit, un-defaultable acknowledgement — never a checkbox default.
+      confirmLiveSubmissionToRealRecipients: z.literal(true),
+      // Pinning the fence version means an attestation is consent to THIS
+      // boundary. A future change to the fence's safety properties bumps the
+      // constant and every existing activation stops being sufficient.
+      fenceVersion: z.literal(LIVE_DISPATCH_FENCE_VERSION),
+    }).parse(request.body);
+
+    const status = channelStatus(input.channel);
+    // Refuse activation when the provider is not actually configured: an
+    // activation record that cannot send anything is a false assurance.
+    const proposed = resolveChannelDispatchActivation(input.channel, null);
+    if (!proposed.liveProviderReady) {
+      await audit(request, {
+        action: 'campaign.live_dispatch.activation_refused', resource: 'campaignLiveDispatchActivation',
+        metadata: { channel: input.channel, reason: 'provider_not_live', blockingReasons: proposed.blockingReasons.filter(r => r !== 'tenant_activation_missing') },
+      });
+      return reply.code(409).send({
+        error: 'provider_not_configured',
+        channel: input.channel,
+        provider: status.provider,
+        missing: status.missing,
+        providerMode: proposed.providerMode,
+        message: `The ${input.channel} provider has no live sender configured, so live dispatch cannot be activated. Nothing was changed.`,
+      });
+    }
+
+    const attestationHash = createHash('sha256').update(input.attestation).digest('hex');
+    const now = new Date();
+    const providerSnapshot = {
+      provider: status.provider,
+      providerMode: proposed.providerMode,
+      configured: status.configured,
+      // Env key NAMES only — never a value.
+      missingEnvKeys: status.missing,
+    };
+    const row = await db.$transaction(async tx => {
+      const activation = await tx.campaignLiveDispatchActivation.upsert({
+        where: { tenantId_channel: { tenantId: request.auth.tenantId, channel: input.channel } },
+        create: {
+          tenantId: request.auth.tenantId, channel: input.channel,
+          activatedByUserId: request.auth.userId, activatedAt: now,
+          attestation: input.attestation, attestationHash,
+          fenceVersion: LIVE_DISPATCH_FENCE_VERSION, providerSnapshot,
+        },
+        update: {
+          activatedByUserId: request.auth.userId, activatedAt: now,
+          attestation: input.attestation, attestationHash,
+          fenceVersion: LIVE_DISPATCH_FENCE_VERSION, providerSnapshot,
+          revokedAt: null, revokedByUserId: null, revocationReason: null,
+        },
+      });
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+        action: 'campaign.live_dispatch.activated',
+        resource: 'campaignLiveDispatchActivation', resourceId: activation.id,
+        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
+        metadata: {
+          channel: input.channel, fenceVersion: LIVE_DISPATCH_FENCE_VERSION,
+          attestationHash, provider: status.provider, providerMode: proposed.providerMode,
+        },
+      } });
+      return activation;
+    });
+    return reply.code(201).send({
+      channel: input.channel,
+      activatedAt: row.activatedAt.toISOString(),
+      activatedByUserId: row.activatedByUserId,
+      fenceVersion: row.fenceVersion,
+      attestationHash: row.attestationHash,
+      state: await resolveDispatchActivations(request.auth.tenantId).then(a => a[input.channel]),
+    });
+  });
+
+  app.delete('/live-dispatch-activation/:channel', { preHandler: [campaignManage, campaignFeature] }, async (request, reply) => {
+    if (activationDenied(request)) {
+      return reply.code(403).send({
+        error: 'owner_or_admin_required',
+        message: 'Deactivating live campaign delivery requires an OWNER or ADMIN.',
+      });
+    }
+    const { channel } = z.object({ channel: activationChannel }).parse(request.params);
+    const reason = z.object({ reason: z.string().trim().min(2).max(240).default('operator_requested') }).parse(request.body ?? {}).reason;
+    const existing = await db.campaignLiveDispatchActivation.findUnique({
+      where: { tenantId_channel: { tenantId: request.auth.tenantId, channel } },
+    });
+    if (!existing || existing.revokedAt) {
+      return reply.code(200).send({ channel, revoked: true, alreadyInactive: true });
+    }
+    await db.$transaction(async tx => {
+      await tx.campaignLiveDispatchActivation.update({
+        where: { id: existing.id },
+        data: { revokedAt: new Date(), revokedByUserId: request.auth.userId, revocationReason: reason },
+      });
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+        action: 'campaign.live_dispatch.deactivated',
+        resource: 'campaignLiveDispatchActivation', resourceId: existing.id,
+        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
+        metadata: { channel, reason },
+      } });
+    });
+    return reply.code(200).send({ channel, revoked: true, alreadyInactive: false });
+  });
 
   // ----- Campaigns CRUD ---------------------------------------------------
   app.get('/campaigns', { preHandler: [campaignRead, campaignFeature] }, async request => {
@@ -314,13 +461,13 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     const newStatus = result.authorityBlocked > 0 || result.atomicBoundaryBlocked > 0
       ? 'APPROVAL_REQUIRED'
       : result.accepted > 0 || result.deliveryUnknown > 0 ? 'ACTIVE' : 'SCHEDULED';
-    await audit(request, { action: 'campaign.launched', resource: 'campaign', resourceId: id, metadata: { accepted: result.accepted, deliveryUnknown: result.deliveryUnknown, suppressed: result.suppressed, skipped: result.skipped, setupRequired: result.setupRequired, failed: result.failed, authorityBlocked: result.authorityBlocked, atomicBoundaryBlocked: result.atomicBoundaryBlocked, launchFingerprint: launchPreview.fingerprint, templateRevision: launchPreview.templateRevision, providerMode: launchPreview.providerMode } });
+    await audit(request, { action: 'campaign.launched', resource: 'campaign', resourceId: id, metadata: { accepted: result.accepted, deliveryUnknown: result.deliveryUnknown, suppressed: result.suppressed, skipped: result.skipped, setupRequired: result.setupRequired, failed: result.failed, authorityBlocked: result.authorityBlocked, atomicBoundaryBlocked: result.atomicBoundaryBlocked, activationBlockers: result.activationBlockers, launchFingerprint: launchPreview.fingerprint, templateRevision: launchPreview.templateRevision, providerMode: launchPreview.providerMode } });
     await emitBusinessEvent(request.auth.tenantId, { eventType: 'campaign.launched', entityType: 'campaign', entityId: id, sourceModule: 'crm', payload: { accepted: result.accepted, suppressed: result.suppressed } }).catch(() => {});
 
     return reply.send({
       campaignId: id, status: newStatus, setupRequired: result.setupRequired > 0 && result.accepted === 0,
       summary: { total: result.total, accepted: result.accepted, deliveryUnknown: result.deliveryUnknown, suppressed: result.suppressed, skipped: result.skipped, setupRequired: result.setupRequired, queued: result.queued, failed: result.failed, authorityBlocked: result.authorityBlocked, atomicBoundaryBlocked: result.atomicBoundaryBlocked },
-      provider: { channel: result.channel, configured: result.provider.configured, setupRequired: result.provider.setupRequired, missing: result.provider.missing, mode: launchPreview.providerMode, liveDispatchActivated: launchPreview.liveDispatchActivated },
+      provider: { channel: result.channel, configured: result.provider.configured, setupRequired: result.provider.setupRequired, missing: result.provider.missing, mode: launchPreview.providerMode, liveDispatchActivated: launchPreview.liveDispatchActivated, activationBlockers: result.activationBlockers },
       launchFingerprint: launchPreview.fingerprint,
       deepLinkTarget: `campaign/${id}`,
     });
@@ -437,7 +584,18 @@ export const crmRoutes: FastifyPluginAsync = async app => {
       return reply.code(409).send({
         status: 'blocked', reason: 'live_boundary_not_activated', channel,
         destinationMasked: maskDestination(destination),
-        message: 'Live outreach is not activated. Nothing was submitted because the last-second consent and opt-out safety control has not been validated.',
+        // Truthful and specific: this CTA has no per-recipient submission fence
+        // of its own, so it can never take the live regulated path regardless of
+        // the tenant's campaign activation.
+        blockingReasons: ['no_durable_submission_claim_for_this_path'],
+        message: 'Live outreach is not activated for this path. A single-lead send has no durable submission claim, so nothing was submitted.',
+      });
+    }
+    if (result.failureReason?.startsWith('campaign_submission_not_claimed:')) {
+      return reply.code(409).send({
+        status: 'blocked', reason: 'submission_claim_unavailable', channel,
+        destinationMasked: maskDestination(destination),
+        message: 'The durable submission claim for this send was already used or is no longer valid. Nothing was submitted.',
       });
     }
 
@@ -630,6 +788,17 @@ export const crmRoutes: FastifyPluginAsync = async app => {
       }
       const channelPurpose = input.channel === 'sms' ? 'SMS' as const : input.channel === 'email' ? 'EMAIL' as const : 'WHATSAPP' as const;
       const result = await db.$transaction(async tx => {
+        // Serialize with the campaign submission fence and the receptionist
+        // outbound/confirmation boundaries, which take these SAME advisory locks
+        // before they re-read suppression. Without this a revocation could
+        // commit between a dispatcher's last check and its provider request;
+        // with it, the revocation is either visible to that check or lands
+        // strictly after the authorization it could not have affected.
+        await lockSuppressionFences(tx, {
+          tenantId: request.auth.tenantId,
+          patientId: input.patientId ?? null,
+          leadId: input.leadId ?? null,
+        });
         const identityExists = input.patientId
           ? await tx.patient.count({ where: { id: input.patientId, tenantId: request.auth.tenantId, deletedAt: null } })
           : await tx.lead.count({ where: { id: input.leadId!, tenantId: request.auth.tenantId } });
@@ -747,7 +916,16 @@ export const crmRoutes: FastifyPluginAsync = async app => {
       ? await db.patient.count({ where: { id: input.patientId, tenantId: request.auth.tenantId, deletedAt: null } })
       : await db.lead.count({ where: { id: input.leadId!, tenantId: request.auth.tenantId } });
     if (identityExists !== 1) throw app.httpErrors.badRequest('Suppression identity must belong to the authenticated tenant');
-    const row = await db.campaignSuppression.create({ data: { tenantId: request.auth.tenantId, patientId: input.patientId, leadId: input.leadId, channel: input.channel, reason: input.reason, active: true } });
+    // Same advisory fences as POST /consent: a suppression written here must be
+    // seen by any dispatcher that has not yet committed its provider intent.
+    const row = await db.$transaction(async tx => {
+      await lockSuppressionFences(tx, {
+        tenantId: request.auth.tenantId,
+        patientId: input.patientId ?? null,
+        leadId: input.leadId ?? null,
+      });
+      return tx.campaignSuppression.create({ data: { tenantId: request.auth.tenantId, patientId: input.patientId, leadId: input.leadId, channel: input.channel, reason: input.reason, active: true } });
+    });
     await audit(request, { action: 'suppression.created', resource: 'campaignSuppression', resourceId: row.id, metadata: { channel: input.channel } });
     return reply.code(201).send(row);
   });

@@ -27,6 +27,17 @@ const schema = read('prisma/schema.prisma');
 const migration = read('prisma/migrations/20260828140000_growth_config_spine/migration.sql');
 const crmService = read('src/lib/crmService.ts');
 const patientRoutes = read('server/modules/patients/routes.ts');
+// The Growth module's arithmetic no longer lives in the browser. Two files now
+// carry the evidence that used to be read out of src/lib/crmService.ts:
+//   * legacyClient — a FROZEN transcription of the deleted browser code, so the
+//     constants that shipped still have a witness that cannot drift with the
+//     product;
+//   * the growth module itself, which must be shown to read the configuration
+//     rather than a literal.
+const legacyClient = read('server/test/helpers/legacyCrmClient.ts');
+const growthDefaults = read('server/modules/growth/defaults.ts');
+const growthScoring = read('server/modules/growth/scoring.ts');
+const growthMetrics = read('server/modules/growth/metrics.ts');
 
 const NEW_TENANT_MODELS = ['LeadActivity', 'GrowthPolicy', 'GrowthSegmentDefinition', 'GrowthChannelCost'] as const;
 
@@ -53,10 +64,10 @@ function seedBlock(marker: string): string {
   return migration.slice(start, end);
 }
 
-/** The line in crmService.ts's `defs` array that declares one segment. */
+/** The line in the frozen browser transcription's `defs` array that declares one segment. */
 function segmentSourceLine(key: string): string {
-  const line = crmService.split('\n').find(l => l.includes(`id: '${key}'`));
-  expect(line, `src/lib/crmService.ts no longer declares the '${key}' segment`).toBeTruthy();
+  const line = legacyClient.split('\n').find(l => l.includes(`id: '${key}'`));
+  expect(line, `the frozen browser transcription no longer declares the '${key}' segment`).toBeTruthy();
   return line!;
 }
 
@@ -111,13 +122,29 @@ describe('growth config spine — schema, migration and defaults.ts agree', () =
 });
 
 describe('growth config spine — the seed reproduces today\'s constants', () => {
-  it('keeps the hot-lead score and the recoverable-value assumption as crmService.ts uses them', () => {
-    expect(crmService).toContain(`l.score >= ${GROWTH_POLICY_DEFAULTS.hotLeadScore}`);
+  it('keeps the hot-lead score and the recoverable-value assumption the browser shipped', () => {
+    // The browser is out of this business entirely: it no longer scores a lead,
+    // averages a patient, or multiplies a lifetime value by anything.
+    expect(crmService).not.toContain('function scoreLead');
+    expect(crmService).not.toContain('commandMetrics(');
+    expect(crmService).not.toContain('smartSegments(');
+    expect(crmService).not.toMatch(/score >= \d/);
+    expect(crmService).not.toMatch(/lifetimeValue \* /);
+
+    // The constants it used to apply still have a witness, and the config still
+    // equals them.
+    expect(legacyClient).toContain(`l.score >= ${GROWTH_POLICY_DEFAULTS.hotLeadScore}`);
     // 0.30 is stored with four decimals; the source writes it as 0.3.
-    expect(crmService).toContain(`p.lifetimeValue * ${GROWTH_POLICY_DEFAULTS.recoverableLtvFraction}`);
+    expect(legacyClient).toContain(`p.lifetimeValue * ${GROWTH_POLICY_DEFAULTS.recoverableLtvFraction}`);
+
+    // ...and the server applies them FROM the configuration, not from a literal.
+    expect(growthScoring).toContain('context.policy.hotLeadScore');
+    expect(growthMetrics).toContain('policy.recoverableLtvFraction');
+    expect(growthMetrics).not.toMatch(/\* 0\.3\b/);
+    expect(growthScoring).not.toMatch(/score >= 70/);
   });
 
-  it('reproduces each of the six smart segments in crmService.ts, filter for filter', () => {
+  it('reproduces each of the six smart segments the browser shipped, filter for filter', () => {
     expect(GROWTH_SEGMENT_DEFAULTS).toHaveLength(6);
     for (const definition of GROWTH_SEGMENT_DEFAULTS) {
       const line = segmentSourceLine(definition.key);
@@ -146,9 +173,14 @@ describe('growth config spine — the seed reproduces today\'s constants', () =>
   });
 
   it('reproduces the per-channel planning cost in minor units instead of bare integers', () => {
-    // Today: `ps.length * (channel === 'Email' ? 0 : channel === 'Voice' ? 3 : 1)`,
+    // What shipped: `ps.length * (channel === 'Email' ? 0 : channel === 'Voice' ? 3 : 1)`,
     // rendered through formatCurrency with no currency awareness at all.
-    expect(crmService).toContain("d.channel === 'Email' ? 0 : d.channel === 'Voice' ? 3 : 1");
+    expect(legacyClient).toContain("d.channel === 'Email' ? 0 : d.channel === 'Voice' ? 3 : 1");
+    expect(crmService).not.toContain("? 3 : 1");
+    // The server prices a group from the tenant's configured per-channel cost,
+    // and says so when there isn't one rather than defaulting to a unit.
+    expect(growthMetrics).toContain('members * cost.unitCostMinor');
+    expect(growthMetrics).toContain('costUnavailableReason');
     const byChannel = new Map(GROWTH_CHANNEL_COST_DEFAULTS.map(c => [c.channel, c]));
     expect(byChannel.get('Email')?.unitCostMinor).toBe(0);
     expect(byChannel.get('Voice')?.unitCostMinor).toBe(3 * 100);
@@ -208,9 +240,54 @@ describe('growth config spine — the churn-risk / LTV threshold conflict is res
   it('makes one value per concept the single source of truth', () => {
     expect(GROWTH_POLICY_DEFAULTS.churnRiskHigh).toBe(50);
     expect(GROWTH_POLICY_DEFAULTS.highValuePatientLtv).toBe(4000);
-    // The frontend side of both conflicts still reads exactly these numbers.
-    expect(crmService).toContain(`p.churnRisk >= ${GROWTH_POLICY_DEFAULTS.churnRiskHigh}`);
-    expect(crmService).toContain(`p.lifetimeValue >= ${GROWTH_POLICY_DEFAULTS.highValuePatientLtv}`);
+    // Both numbers are exactly what the browser applied, per the frozen witness.
+    expect(legacyClient).toContain(`p.churnRisk >= ${GROWTH_POLICY_DEFAULTS.churnRiskHigh}`);
+    expect(legacyClient).toContain(`p.lifetimeValue >= ${GROWTH_POLICY_DEFAULTS.highValuePatientLtv}`);
+
+    // The frontend no longer restates either one. The at-risk badge renders the
+    // band the server computed; the segment floors come from the definitions.
+    expect(crmService).not.toMatch(/churnRisk >= \d/);
+    expect(crmService).not.toMatch(/lifetimeValue >= \d/);
+    expect(read('src/pages/CRM.tsx')).not.toMatch(/churnRisk >= \d/);
+    expect(growthMetrics).toContain('churnRiskHigh: policy.churnRiskHigh');
+
+    // The high-LTV segment floor and the policy's high-value threshold are the
+    // same concept, so they are the same number.
+    const highLtv = GROWTH_SEGMENT_DEFAULTS.find(definition => definition.key === 'high-ltv-inactive');
+    expect(highLtv?.minLifetimeValue).toBe(GROWTH_POLICY_DEFAULTS.highValuePatientLtv);
+    const atRisk = GROWTH_SEGMENT_DEFAULTS.find(definition => definition.key === 'at-risk');
+    expect(atRisk?.minChurnRisk).toBe(GROWTH_POLICY_DEFAULTS.churnRiskHigh);
+  });
+
+  it('replaces the 9999-day sentinel with a configured includeNeverVisited decision', () => {
+    // The sentinel is what made all three inactivity windows unreachable for a
+    // patient with no recorded visit, silently.
+    expect(legacyClient).toContain('9999');
+    expect(crmService).not.toContain('9999');
+    expect(growthMetrics).not.toContain('9999');
+    // The window is [min, max): inclusive floor, exclusive ceiling, in SQL.
+    expect(growthMetrics).toContain('${daysSinceVisit} >= ${definition.minInactiveDays}');
+    expect(growthMetrics).toContain('${daysSinceVisit} < ${definition.maxInactiveDays}');
+    expect(growthMetrics).toContain('definition.includeNeverVisited');
+  });
+
+  it('keeps every lead-scoring weight the browser used, now as named configuration', () => {
+    // Each weight is asserted against the frozen browser source, so a change to
+    // the curve has to be a deliberate edit to a documented constant rather than
+    // a number quietly drifting inside a component.
+    expect(growthDefaults).toContain('GROWTH_LEAD_SCORE_WEIGHTS');
+    expect(legacyClient).toContain('intent * 0.4');
+    expect(legacyClient).toContain('(lead.estimatedValue / maxValue) * 30');
+    expect(legacyClient).toContain('ageDays <= 2 ? 20 : ageDays <= 7 ? 12 : ageDays <= 30 ? 4 : 0');
+    expect(legacyClient).toContain("['whatsapp', 'sms'].includes(lead.channel.toLowerCase())");
+    for (const literal of ['stageIntentMultiplier: 0.4', 'valueWeight: 30', 'reachableChannelWeight: 8']) {
+      expect(growthDefaults, `GROWTH_LEAD_SCORE_WEIGHTS is missing ${literal}`).toContain(literal);
+    }
+    // The denominator is a tenant-wide MAX, not the maximum of a loaded page —
+    // which is what made the same lead score differently on different screens.
+    expect(legacyClient).toContain('Math.max(1, ...rows.map(r => num(r.estimatedValue)))');
+    expect(growthMetrics).toContain('_max: { estimatedValue: true }');
+    expect(crmService).not.toContain('Math.max(1, ...');
   });
 
   it('still shows the server disagreeing, and names it as the call site left to rewire', () => {

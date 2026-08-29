@@ -3,7 +3,14 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { getRequestPermissions, requirePermission } from '../../lib/permissions';
+import { branchScope } from '../../lib/scope';
 import { MONEY_AFFECTING_POLICY_FIELDS } from './defaults';
+import {
+  computeGrowthMetrics,
+  listScoredLeads,
+  previewGrowthSegments,
+  type GrowthScopeInput,
+} from './metrics';
 import {
   getEffectiveGrowthPolicy,
   listEffectiveChannelCosts,
@@ -34,6 +41,12 @@ import {
 
 const configRead = requirePermission('settings:read');
 const configWrite = requirePermission('settings:write');
+
+// The reporting surface is a patient-data read, so it takes the grant
+// `GET /v1/leads` already requires — `crm:read` (OWNER/ADMIN/MANAGER/FRONT_DESK/
+// ANALYST by default). No new permission name is invented, and a tenant that
+// re-cuts crm:read through RoleDefinition re-cuts these three routes with it.
+const growthRead = requirePermission('crm:read');
 
 const MONEY_PERMISSION = 'admin:manage' as const;
 
@@ -138,12 +151,74 @@ const channelCostSchema = z.object({
   currency: z.string().regex(/^[A-Z]{3}$/, 'currency must be an ISO-4217 alphabetic code'),
 });
 
+/**
+ * `limit` is deliberately allowed past the shared `paginationSchema` ceiling of
+ * 100: the pipeline board renders every open lead it is given, and a hard 100
+ * was exactly what turned a board into a sample. It is still bounded, and the
+ * response always reports `total` and `truncated` so a capped board says so.
+ */
+const leadListQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(500).default(200),
+  priorityLimit: z.coerce.number().int().min(0).max(50).default(6),
+}).strict();
+
+/**
+ * Branch scope, resolved the way every sibling module resolves it. `branchScope`
+ * yields `{ branchId }` only for a branch-restricted user; an unrestricted user
+ * reads the whole tenant.
+ */
+function requestScope(request: FastifyRequest): GrowthScopeInput {
+  const scope = branchScope(request);
+  return { tenantId: request.auth.tenantId, branchId: scope.branchId ?? null };
+}
+
 /** A window whose lower bound is not below its exclusive upper bound is empty. */
 function invalidWindow(min: number | null | undefined, max: number | null | undefined): boolean {
   return typeof min === 'number' && typeof max === 'number' && max <= min;
 }
 
 export const growthRoutes: FastifyPluginAsync = async app => {
+
+  // ----- Reporting: tenant-wide metrics, scored leads, segment previews -----
+  //
+  // These three replace arithmetic that used to run in the browser over
+  // `/v1/leads?limit=100` and `/v1/patients?limit=100`. Each one states its own
+  // scope and its own truncation, because a figure whose basis is invisible is
+  // indistinguishable from a wrong figure.
+
+  app.get('/metrics', { preHandler: growthRead }, async request => {
+    const scope = requestScope(request);
+    const policy = await getEffectiveGrowthPolicy(scope.tenantId);
+    return computeGrowthMetrics(scope, policy, new Date());
+  });
+
+  app.get('/leads', { preHandler: growthRead }, async request => {
+    const query = leadListQuery.parse(request.query);
+    const scope = requestScope(request);
+    const policy = await getEffectiveGrowthPolicy(scope.tenantId);
+    const result = await listScoredLeads(scope, policy, new Date(), {
+      limit: query.limit,
+      priorityLimit: query.priorityLimit,
+    });
+    // Identifiable lead records left the system: record the access, ids only.
+    await audit(request, {
+      action: 'growth.leads.list',
+      resource: 'lead',
+      metadata: { returned: result.returned, total: result.total, truncated: result.truncated },
+    });
+    return result;
+  });
+
+  app.get('/segments/preview', { preHandler: growthRead }, async request => {
+    const scope = requestScope(request);
+    const [policy, definitions, channelCosts] = await Promise.all([
+      getEffectiveGrowthPolicy(scope.tenantId),
+      listEffectiveSegmentDefinitions(scope.tenantId),
+      listEffectiveChannelCosts(scope.tenantId),
+    ]);
+    return previewGrowthSegments(scope, policy, definitions, channelCosts, new Date());
+  });
+
   // ----- Policy ------------------------------------------------------------
 
   app.get('/policy', { preHandler: configRead }, async request => getEffectiveGrowthPolicy(request.auth.tenantId));
