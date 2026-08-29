@@ -30,6 +30,9 @@ test.describe('growth CRM journey', () => {
   let tenant: GrowthTenant;
   let leadIds: Record<string, string>;
 
+  // Playwright resolves fixtures by parsing this destructuring pattern; the
+  // empty pattern is its required spelling of 'no fixtures, only testInfo'.
+  // eslint-disable-next-line no-empty-pattern
   test.beforeEach(async ({}, testInfo) => {
     tenant = await createGrowthTenant(`crm-${testInfo.project.name}`, ['OWNER']);
     leadIds = await seedCrmPipeline(tenant);

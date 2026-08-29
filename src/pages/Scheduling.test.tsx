@@ -128,7 +128,8 @@ describe('Scheduling — the risk flag is the configured rule, not a literal', (
 
     expect(await screen.findByText('Patient a')).toBeInTheDocument();
     await waitFor(() => {
-      expect(screen.getByRole('alert')).toHaveTextContent(/no-show risk threshold could not be loaded/i);
+      const riskAlert = screen.getAllByRole('alert').find(el => /no-show risk threshold could not be loaded/i.test(el.textContent ?? ''));
+      expect(riskAlert).toBeDefined();
     });
     expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
     expect(screen.queryByText('99% risk')).not.toBeInTheDocument();
@@ -147,7 +148,8 @@ describe('Scheduling — the risk flag is the configured rule, not a literal', (
 
     expect(await screen.findByText('Patient a')).toBeInTheDocument();
     await waitFor(() => {
-      expect(screen.getByRole('alert')).toHaveTextContent(/risk flags are hidden/i);
+      const hiddenAlert = screen.getAllByRole('alert').find(el => /risk flags are hidden/i.test(el.textContent ?? ''));
+      expect(hiddenAlert).toBeDefined();
     });
     expect(screen.queryByText('99% risk')).not.toBeInTheDocument();
   });

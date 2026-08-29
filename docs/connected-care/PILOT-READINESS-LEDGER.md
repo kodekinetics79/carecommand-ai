@@ -64,3 +64,48 @@ Cycle per feature: SDET audit → Consultant SME verdict → CTO decision → De
 - "Consent re-grant breaks the audit match" — FALSE. Traced grant/revoke/re-grant; the match holds.
 - "Readings accrue after discharge" — FALSE. Ingest correctly blocks non-active enrollments. The real bug is the inverse (P1-4).
 - "Health: healthy + NOT_CONFIGURED simultaneously" — unreachable for device providers. The reachable, equally damaging state is a stale green verdict.
+
+## Wave 2 — build (delivered, 2026-08-29)
+
+Baseline was 42 unit + 24 integration. Now **123 passing across 10 suites**, all against real Postgres
+with isolated tenants.
+
+### Commits on feat/growth-module-wave1-20260828
+| SHA | What |
+|-----|------|
+| d46d66a | Stop the module asserting things it never observed (E, D, F, K, G, H, M + device_deactivated, branch scope, N+1, pagination) |
+| 8ca6971 | CY2026 CPT code ladder replaces the single pass/fail gate (A-rules) |
+| 398099b | The screens the workflow needed: review timer, device binding, consent, trust primitives, WCAG |
+| 34ab461 | MonitoringRule write path — thresholds configurable, missed-reading detector unblocked (C) |
+
+### Verified fixes
+- resolveRule deterministic (was heap-order → alerts fired at random)
+- Alert queue orders by acuity in the DB before the limit; open-by-default; exposes total
+- SpO2 100% no longer manufactures a warning (directional edge warnings)
+- Review time overlap scoped to the ACTOR — one 20-min block can no longer be billed across a panel
+- Review minutes summed in ms, floored once (was losing up to 59s per session)
+- capturedAt lower-bounded — 16 device-days no longer mintable in one signed webhook
+- Health check reports `unverified`, does a real decrypt-parse, clears on reconfigure, exposes staleness
+- Device connectivity DERIVED on every read; `online` no longer human-settable
+- Readings from a deactivated device excluded from billable evidence
+- GET /rpm-readiness paginated + bounded concurrency (was unbounded advisory-locked txns on a pool of 10)
+- --t3 contrast 2.54:1 → 4.83:1 (computed), module-wide WCAG AA
+- MonitoringRule CRUD + coherence validation; delete deactivates so past alerts keep their explanation
+
+### Competitive position (4 independent research passes agreed)
+- No RPM vendor markets billing-evidence integrity — they market security certifications (HITRUST, ISO
+  27001), which is a different claim. Hash-bound attestation with automatic invalidation is unoccupied.
+- No competitor MEASURES clinical time; the strongest imputes minutes from event counts. The timer here
+  records real start/end instants and the server recomputes from them.
+- No incumbent auto-selects between the mutually exclusive CY2026 pairs (99445/99454, 99470/99457).
+
+## Wave 2 — NOT delivered, and why
+- **E2E spec written, typechecks, lints — but never executed.** `tests/e2e/connected-care.spec.ts` is
+  untracked and uncommitted. A concurrent session left `src/components/opportunity/OpportunityActionDrawer.tsx`
+  in an unmerged `UU` state with conflict markers, which fails `tsc -b` and so fails the Playwright
+  webServer build. Backed up to the session scratchpad. It is UNPROVEN until that merge resolves
+  and it is run.
+- Notification delivery (finding I): monitoring alerts still create NotificationEvent rows that nothing
+  drains. Not started.
+- Prior-period attestation (F8) and UTC-month boundary handling (F4/F5): not started.
+- Threshold-editing UI: API + tests shipped; no screen yet.

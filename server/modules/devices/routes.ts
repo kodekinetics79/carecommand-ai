@@ -22,7 +22,6 @@ const adminRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
 
 const DEVICE_TYPES = ['vitals_monitor', 'lab_analyzer', 'check_in_kiosk', 'document_scanner', 'imaging', 'wearable_gateway'] as const;
 const CONNECTION_TYPES = ['network', 'usb', 'bluetooth', 'cloud_api'] as const;
-const STATUSES = ['online', 'offline', 'error', 'pending'] as const;
 // A human may report that a device is BROKEN or RETIRED — both are observations
 // about the physical world a person can genuinely make. Nobody can assert that a
 // device is currently connected; that is only ever observed from telemetry.
