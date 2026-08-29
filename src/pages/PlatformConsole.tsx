@@ -10,6 +10,7 @@ import {
   platformAdmin, setPlatformToken, downloadAuditCsv, TENANT_STATUS_BADGE, SUB_STATUS_BADGE, FEATURE_LABELS,
   type PlatformMe, type TenantSummary, type SystemHealth, type TenantBilling, type AiUsageView, type SecurityView, type IntegrationView,
   type TenantAccountRecord, type TenantCompany, type TenantRoster,
+  type PlatformSettings, type PlatformSettingPreset,
 } from '../lib/platformAdmin';
 import PlatformPilot from './PlatformPilot';
 
@@ -1050,40 +1051,128 @@ function DangerRow({ label, desc, action, tone = 'red', onConfirm, busy }: { lab
 }
 
 function PlatformSettingsSection({ canManage }: { canManage: boolean }) {
-  const [name, setName] = useState(''); const [email, setEmail] = useState(''); const [trial, setTrial] = useState('14'); const [plan, setPlan] = useState('starter');
+  const [cfg, setCfg] = useState<PlatformSettings | null>(null);
+  const [presets, setPresets] = useState<PlatformSettingPreset[]>([]);
   const [plans, setPlans] = useState<Array<{ key: string; name: string }>>([]);
-  const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<string | null>(null);
-  useEffect(() => { let a = true; void (async () => {
-    const [s, p] = await Promise.all([platformAdmin.getSettings(), platformAdmin.plans().catch(() => [])]);
-    if (!a) return;
-    setName(s.platformName); setEmail(s.supportEmail ?? ''); setTrial(String(s.defaultTrialDays)); setPlan(s.defaultPlanKey); setPlans(p); setLoaded(true);
-  })(); return () => { a = false; }; }, []);
-  async function save() {
-    setBusy(true); setMsg(null);
-    try { await platformAdmin.updateSettings({ platformName: name.trim(), supportEmail: email.trim() || null, defaultTrialDays: Number(trial), defaultPlanKey: plan }); setMsg('Settings saved.'); }
-    catch (e) { setMsg(e instanceof Error ? e.message : 'Save failed'); } finally { setBusy(false); }
+  const [msg, setMsg] = useState<{ tone: 'ok' | 'bad'; text: string } | null>(null);
+
+  useEffect(() => { let alive = true; void (async () => {
+    try {
+      const [settings, presetList, planList] = await Promise.all([
+        platformAdmin.getSettings(),
+        platformAdmin.settingPresets().then(r => r.presets).catch(() => [] as PlatformSettingPreset[]),
+        platformAdmin.plans().catch(() => [] as Array<{ key: string; name: string }>),
+      ]);
+      if (!alive) return;
+      setCfg(settings); setPresets(presetList); setPlans(planList);
+    } catch (e) {
+      // Without this the page was an eternal spinner on any 401/500 - which is
+      // exactly what "the settings page is dead" looked like from the outside.
+      if (alive) setLoadError(e instanceof Error ? e.message : 'Platform settings could not be loaded');
+    }
+  })(); return () => { alive = false; }; }, []);
+
+  function patch(next: Partial<PlatformSettings>) { setCfg(prev => (prev ? { ...prev, ...next } : prev)); setMsg(null); }
+  function applyPreset(key: string) {
+    const preset = presets.find(p => p.key === key);
+    // A preset fills the form; it does not lock anything. The operator can edit
+    // every field afterwards and only the Save writes.
+    if (preset) patch({ ...preset.values, presetKey: preset.key });
+    else patch({ presetKey: 'custom' });
   }
+  async function save() {
+    if (!cfg) return;
+    setBusy(true); setMsg(null);
+    try {
+      const saved = await platformAdmin.updateSettings({
+        platformName: cfg.platformName.trim(), supportEmail: cfg.supportEmail?.trim() || null,
+        defaultTrialDays: cfg.defaultTrialDays, defaultPlanKey: cfg.defaultPlanKey,
+        defaultTimezone: cfg.defaultTimezone.trim(), defaultCountry: cfg.defaultCountry.trim().toUpperCase(),
+        defaultBranchName: cfg.defaultBranchName.trim(), defaultVoiceMinutes: cfg.defaultVoiceMinutes,
+        requireMfaFloor: cfg.requireMfaFloor, sessionTimeoutMaxMinutes: cfg.sessionTimeoutMaxMinutes,
+        presetKey: cfg.presetKey,
+      });
+      setCfg(saved); // show what the server stored, not what we sent
+      setMsg({ tone: 'ok', text: 'Saved. New companies provision with these values.' });
+    } catch (e) { setMsg({ tone: 'bad', text: e instanceof Error ? e.message : 'Save failed' }); }
+    finally { setBusy(false); }
+  }
+
   const field = 'w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--indigo)]';
-  if (!loaded) return <div className="py-10 text-center"><Loader2 className="inline w-5 h-5 animate-spin text-indigo" /></div>;
+  const hint = 'text-[10px] text-t3';
+  if (loadError) return <Panel title="Platform settings" subtitle="Global configuration applied to new tenant provisioning"><p className="text-sm text-red-v" role="alert">{loadError}</p></Panel>;
+  if (!cfg) return <div className="py-10 text-center"><Loader2 className="inline w-5 h-5 animate-spin text-indigo" /></div>;
   return (
-    <Panel title="Platform settings" subtitle="Global configuration applied to new tenant provisioning and operator branding">
-      <div className="grid sm:grid-cols-2 gap-4 max-w-2xl">
-        <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Platform name</span><input disabled={!canManage} className={field} value={name} onChange={e => setName(e.target.value)} /></label>
-        <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Support email</span><input disabled={!canManage} className={field} type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="support@…" /></label>
-        <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Default trial length (days)</span><input disabled={!canManage} className={field} value={trial} onChange={e => setTrial(e.target.value.replace(/[^0-9]/g, ''))} /></label>
-        <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Default plan for new tenants</span>
-          <select aria-label="Default plan" disabled={!canManage} className={field} value={plan} onChange={e => setPlan(e.target.value)}>{(plans.length ? plans : [{ key: 'starter', name: 'Starter' }]).map(p => <option key={p.key} value={p.key}>{p.name}</option>)}</select>
+    <Panel title="Platform settings" subtitle="Every field here is read when you provision a company. Nothing on this page is decorative.">
+      <div className="max-w-3xl space-y-5">
+        <label className="block space-y-1">
+          <span className="text-[11px] font-semibold text-t3">Start from a preset</span>
+          <select aria-label="Settings preset" disabled={!canManage} className={field} value={cfg.presetKey} onChange={e => applyPreset(e.target.value)}>
+            <option value="custom">Custom (current values)</option>
+            {presets.map(p => <option key={p.key} value={p.key}>{p.label}</option>)}
+          </select>
+          <span className={hint}>{presets.find(p => p.key === cfg.presetKey)?.description ?? 'A preset fills the fields below; you can edit any of them before saving.'}</span>
         </label>
-      </div>
-      <p className="mt-3 text-[11px] text-t3">Default trial length and plan are applied automatically when you provision a new company.</p>
-      {canManage && (
-        <div className="mt-4 flex items-center gap-3">
-          <button type="button" disabled={busy || name.trim().length < 2} onClick={save} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50">{busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Settings className="w-4 h-4" />} Save settings</button>
-          {msg && <span className="text-[12px] text-emerald-v">{msg}</span>}
+
+        <div>
+          <p className="text-[11px] font-bold uppercase tracking-wide text-t3 mb-2">Provisioning defaults</p>
+          <div className="grid sm:grid-cols-2 gap-4">
+            <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Default plan for new companies</span>
+              <select aria-label="Default plan" disabled={!canManage || !plans.length} className={field} value={cfg.defaultPlanKey} onChange={e => patch({ defaultPlanKey: e.target.value, presetKey: 'custom' })}>
+                {plans.length ? plans.map(p => <option key={p.key} value={p.key}>{p.name}</option>) : <option value={cfg.defaultPlanKey}>{cfg.defaultPlanKey}</option>}
+              </select>
+              {!plans.length && <span className="text-[10px] text-amber-v">Plan catalog unavailable - showing the stored key.</span>}
+            </label>
+            <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Default trial length (days)</span>
+              <input disabled={!canManage} className={field} inputMode="numeric" value={String(cfg.defaultTrialDays)} onChange={e => patch({ defaultTrialDays: Number(e.target.value.replace(/[^0-9]/g, '') || 0), presetKey: 'custom' })} />
+              <span className={hint}>0 means the company starts active with no trial.</span></label>
+            <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Default clinic timezone</span>
+              <input disabled={!canManage} className={field} value={cfg.defaultTimezone} onChange={e => patch({ defaultTimezone: e.target.value, presetKey: 'custom' })} placeholder="America/New_York" />
+              <span className={hint}>IANA name. Used when the create form leaves timezone blank.</span></label>
+            <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Default country</span>
+              <input disabled={!canManage} className={field} maxLength={2} value={cfg.defaultCountry} onChange={e => patch({ defaultCountry: e.target.value.toUpperCase(), presetKey: 'custom' })} placeholder="US" />
+              <span className={hint}>ISO-3166 alpha-2. Drives locale and emergency-number handling.</span></label>
+            <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Default first branch name</span>
+              <input disabled={!canManage} className={field} value={cfg.defaultBranchName} onChange={e => patch({ defaultBranchName: e.target.value, presetKey: 'custom' })} placeholder="Main Branch" /></label>
+            <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Included voice minutes</span>
+              <input disabled={!canManage} className={field} inputMode="numeric" value={String(cfg.defaultVoiceMinutes)} onChange={e => patch({ defaultVoiceMinutes: Number(e.target.value.replace(/[^0-9]/g, '') || 0), presetKey: 'custom' })} />
+              <span className={hint}>Seeds the new tenant&apos;s voice quota. Calls are refused once it is reached unless overage is allowed.</span></label>
+          </div>
         </div>
-      )}
+
+        <div>
+          <p className="text-[11px] font-bold uppercase tracking-wide text-t3 mb-2">Security floor for new companies</p>
+          <p className="text-[11px] text-t3 mb-2">A floor, not a setting: a clinic can make its own security stricter than this, never weaker.</p>
+          <div className="grid sm:grid-cols-2 gap-4">
+            <label className="flex items-center gap-2 text-sm text-t2">
+              <input type="checkbox" disabled={!canManage} checked={cfg.requireMfaFloor} onChange={e => patch({ requireMfaFloor: e.target.checked, presetKey: 'custom' })} />
+              Require MFA from day one
+            </label>
+            <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Maximum session length (minutes)</span>
+              <input disabled={!canManage} className={field} inputMode="numeric" value={String(cfg.sessionTimeoutMaxMinutes)} onChange={e => patch({ sessionTimeoutMaxMinutes: Number(e.target.value.replace(/[^0-9]/g, '') || 0), presetKey: 'custom' })} /></label>
+          </div>
+        </div>
+
+        <div>
+          <p className="text-[11px] font-bold uppercase tracking-wide text-t3 mb-2">Operator branding</p>
+          <div className="grid sm:grid-cols-2 gap-4">
+            <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Platform name</span>
+              <input disabled={!canManage} className={field} value={cfg.platformName} onChange={e => patch({ platformName: e.target.value })} /></label>
+            <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Support email</span>
+              <input disabled={!canManage} className={field} type="email" value={cfg.supportEmail ?? ''} onChange={e => patch({ supportEmail: e.target.value })} placeholder="support@…" /></label>
+          </div>
+        </div>
+
+        {canManage ? (
+          <div className="flex items-center gap-3">
+            <button type="button" disabled={busy || cfg.platformName.trim().length < 2} onClick={() => void save()} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50">{busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Settings className="w-4 h-4" />} Save settings</button>
+            {msg && <span className={`text-[12px] ${msg.tone === 'ok' ? 'text-emerald-v' : 'text-red-v'}`} role="status">{msg.text}</span>}
+            <span className={hint}>Last saved {new Date(cfg.updatedAt).toLocaleString()}</span>
+          </div>
+        ) : <p className={hint}>Your platform role can view these settings but not change them.</p>}
+      </div>
     </Panel>
   );
 }
@@ -1201,11 +1290,19 @@ function TenantsTab({ onOpenTenant }: { onOpenTenant?: (t: TenantSummary) => voi
   const [expanded, setExpanded] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
 
-  const reload = useCallback(async () => {
-    const [t, p] = await Promise.all([platformAdmin.tenants(), platformAdmin.plans().catch(() => [])]);
-    setTenants(t); setPlans(p);
+  // A failed plan catalog used to be indistinguishable from an empty one, so a
+  // broken/unmigrated catalog rendered as a healthy single "Starter" option and
+  // provisioning then 400'd with "Subscription catalog is not seeded".
+  const [plansError, setPlansError] = useState<string | null>(null);
+  const loadPlans = useCallback(async () => {
+    try { const p = await platformAdmin.plans(); setPlansError(p.length ? null : 'The plan catalog is empty. Run the subscription catalog migration before provisioning.'); return p; }
+    catch (e) { setPlansError(e instanceof Error ? e.message : 'Plan catalog could not be loaded'); return []; }
   }, []);
-  useEffect(() => { let a = true; void (async () => { const [t, p] = await Promise.all([platformAdmin.tenants(), platformAdmin.plans().catch(() => [])]); if (a) { setTenants(t); setPlans(p); } })(); return () => { a = false; }; }, []);
+  const reload = useCallback(async () => {
+    const [t, p] = await Promise.all([platformAdmin.tenants(), loadPlans()]);
+    setTenants(t); setPlans(p);
+  }, [loadPlans]);
+  useEffect(() => { let a = true; void (async () => { const [t, p] = await Promise.all([platformAdmin.tenants(), loadPlans()]); if (a) { setTenants(t); setPlans(p); } })(); return () => { a = false; }; }, [loadPlans]);
 
   async function act(id: string, fn: () => Promise<unknown>) {
     setBusy(id); setError(null);
@@ -1228,7 +1325,7 @@ function TenantsTab({ onOpenTenant }: { onOpenTenant?: (t: TenantSummary) => voi
           </button>
         </div>
       }>
-      {creating && <CreateCompanyForm plans={plans} onCancel={() => setCreating(false)} onCreated={async () => { setCreating(false); await reload(); }} />}
+      {creating && <CreateCompanyForm plans={plans} plansError={plansError} onCancel={() => setCreating(false)} onCreated={async () => { setCreating(false); await reload(); }} />}
       {error && <div className="mb-3 rounded-lg bg-red-soft border border-[rgba(220,38,38,0.18)] px-3 py-2 text-xs text-red-v">{error}</div>}
       {rows.length === 0 ? <EmptyState icon={Building2} text={q ? 'No tenants match your search.' : 'No tenants provisioned yet.'} /> : (
         <div className="overflow-hidden rounded-xl border border-[var(--b1)] divide-y divide-[var(--b1)]">
@@ -1293,21 +1390,39 @@ function TenantsTab({ onOpenTenant }: { onOpenTenant?: (t: TenantSummary) => voi
 }
 
 /* ─────────────────────────────────────────────────────────── */
-function CreateCompanyForm({ plans, onCancel, onCreated }: { plans: Array<{ key: string; name: string }>; onCancel: () => void; onCreated: () => void }) {
+// Mirrors PLATFORM_SLUG_PATTERN in server/modules/platform/routes.ts, which in
+// turn mirrors app_platform_provision_tenant. Three copies, one contract.
+const SLUG_PATTERN = /^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])$/;
+
+function CreateCompanyForm({ plans, plansError, onCancel, onCreated }: { plans: Array<{ key: string; name: string }>; plansError?: string | null; onCancel: () => void; onCreated: () => void }) {
   const [name, setName] = useState('');
   const [slug, setSlug] = useState('');
   const [slugEdited, setSlugEdited] = useState(false);
-  const [planKey, setPlanKey] = useState('starter');
+  const [planKey, setPlanKey] = useState('');
   const [ownerName, setOwnerName] = useState('');
   const [ownerEmail, setOwnerEmail] = useState('');
   const [ownerPassword, setOwnerPassword] = useState('');
   const [branch, setBranch] = useState('Main Branch');
   const [timezone, setTimezone] = useState(() => Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/New_York');
+  // Seed the form from Platform Settings so the operator can SEE the platform
+  // defaults being applied. Previously the plan was hardcoded 'starter' here,
+  // which meant Platform Settings' "default plan" could never take effect.
+  useEffect(() => {
+    let alive = true;
+    void platformAdmin.getSettings().then(cfg => {
+      if (!alive) return;
+      setPlanKey(prev => prev || cfg.defaultPlanKey);
+      setBranch(prev => (prev === 'Main Branch' ? cfg.defaultBranchName : prev));
+      if (cfg.defaultTimezone) setTimezone(prev => prev || cfg.defaultTimezone);
+    }).catch(() => { setPlanKey(prev => prev || 'starter'); });
+    return () => { alive = false; };
+  }, []);
   const [busy, setBusy] = useState(false);
+  const [touched, setTouched] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<{ email: string } | null>(null);
 
-  const autoSlug = (v: string) => v.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+  const autoSlug = (v: string) => v.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
   const inputCls = 'w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--indigo)]';
 
   async function submit() {
@@ -1334,18 +1449,34 @@ function CreateCompanyForm({ plans, onCancel, onCreated }: { plans: Array<{ key:
     );
   }
 
-  const canSubmit = name.trim().length >= 2 && slug.trim().length >= 2 && ownerName.trim().length >= 2 && /.+@.+\..+/.test(ownerEmail) && ownerPassword.length >= 8;
+  // Every unmet requirement is named. A greyed-out button that will not say
+  // what it wants is indistinguishable from a broken button.
+  const issues: Array<{ field: string; message: string }> = [];
+  if (name.trim().length < 2) issues.push({ field: 'name', message: 'Company name needs at least 2 characters.' });
+  if (!SLUG_PATTERN.test(slug.trim())) issues.push({ field: 'slug', message: 'Slug must be 3-40 characters: lowercase letters, numbers, and inner hyphens.' });
+  if (ownerName.trim().length < 2) issues.push({ field: 'ownerName', message: 'Owner name needs at least 2 characters.' });
+  if (!/.+@.+\..+/.test(ownerEmail)) issues.push({ field: 'ownerEmail', message: 'Owner email must be a valid address.' });
+  if (ownerPassword.length < 8) issues.push({ field: 'ownerPassword', message: 'Initial password needs at least 8 characters.' });
+  if (!planKey) issues.push({ field: 'planKey', message: 'Choose a plan.' });
+  if (plansError) issues.push({ field: 'planKey', message: plansError });
+  const issueFor = (field: string) => issues.find(i => i.field === field)?.message;
+  const canSubmit = issues.length === 0;
   return (
     <div className="mb-4 rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-4 space-y-3">
       <p className="text-[12px] font-bold uppercase tracking-wide text-t3">Create a client company</p>
-      {error && <p className="text-xs text-red-v">{error}</p>}
+      {error && <p className="text-xs text-red-v" role="alert">{error}</p>}
+      {plansError && <p className="text-xs text-amber-v" role="alert">{plansError}</p>}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Company name</span>
-          <input className={inputCls} value={name} onChange={e => { setName(e.target.value); if (!slugEdited) setSlug(autoSlug(e.target.value)); }} placeholder="Sunrise Dental Group" /></label>
+          <input className={inputCls} value={name} onChange={e => { setName(e.target.value); if (!slugEdited) setSlug(autoSlug(e.target.value)); }} placeholder="Sunrise Dental Group" />
+          {touched && issueFor('name') && <span className="text-[10px] text-red-v">{issueFor('name')}</span>}</label>
         <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Slug (URL id)</span>
-          <input className={inputCls} value={slug} onChange={e => { setSlug(autoSlug(e.target.value)); setSlugEdited(true); }} placeholder="sunrise-dental" /></label>
+          <input className={inputCls} value={slug} onChange={e => { setSlug(autoSlug(e.target.value)); setSlugEdited(true); }} placeholder="sunrise-dental" />
+          {touched && issueFor('slug') ? <span className="text-[10px] text-red-v">{issueFor('slug')}</span> : <span className="text-[10px] text-t3">3-40 characters, lowercase.</span>}</label>
         <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Plan</span>
-          <select aria-label="Plan" className={inputCls} value={planKey} onChange={e => setPlanKey(e.target.value)}>{(plans.length ? plans : [{ key: 'starter', name: 'Starter' }]).map(p => <option key={p.key} value={p.key}>{p.name}</option>)}</select></label>
+          <select aria-label="Plan" className={inputCls} value={planKey} onChange={e => setPlanKey(e.target.value)} disabled={!plans.length}>
+            {plans.length ? plans.map(p => <option key={p.key} value={p.key}>{p.name}</option>) : <option value="">No plans available</option>}
+          </select></label>
         <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Default branch</span>
           <input className={inputCls} value={branch} onChange={e => setBranch(e.target.value)} placeholder="Main Branch" /></label>
         <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Clinic timezone</span>
@@ -1355,16 +1486,26 @@ function CreateCompanyForm({ plans, onCancel, onCreated }: { plans: Array<{ key:
         <p className="text-[10px] font-semibold text-t3 mb-2">OWNER LOGIN (the client signs in with these)</p>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Owner name</span>
-            <input className={inputCls} value={ownerName} onChange={e => setOwnerName(e.target.value)} placeholder="Dr. Jane Doe" /></label>
+            <input className={inputCls} value={ownerName} onChange={e => setOwnerName(e.target.value)} placeholder="Dr. Jane Doe" />
+            {touched && issueFor('ownerName') && <span className="text-[10px] text-red-v">{issueFor('ownerName')}</span>}</label>
           <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Owner email</span>
-            <input className={inputCls} type="email" value={ownerEmail} onChange={e => setOwnerEmail(e.target.value)} placeholder="owner@clinic.com" /></label>
+            <input className={inputCls} type="email" value={ownerEmail} onChange={e => setOwnerEmail(e.target.value)} placeholder="owner@clinic.com" />
+            {touched && issueFor('ownerEmail') && <span className="text-[10px] text-red-v">{issueFor('ownerEmail')}</span>}</label>
           <label className="block space-y-1"><span className="text-[10px] font-semibold text-t3">Initial password (min 8)</span>
-            <input className={inputCls} type="password" autoComplete="new-password" value={ownerPassword} onChange={e => setOwnerPassword(e.target.value)} placeholder="Set an initial password" /></label>
+            <input className={inputCls} type="password" autoComplete="new-password" value={ownerPassword} onChange={e => setOwnerPassword(e.target.value)} placeholder="Set an initial password" />
+            {touched && issueFor('ownerPassword') ? <span className="text-[10px] text-red-v">{issueFor('ownerPassword')}</span> : <span className="text-[10px] text-t3">The server password policy is the authority and may require more.</span>}</label>
         </div>
       </div>
-      <div className="flex gap-2">
-        <button type="button" disabled={busy || !canSubmit} onClick={submit} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50">{busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Building2 className="w-4 h-4" />} Create company</button>
-        <button type="button" onClick={onCancel} className="rounded-lg border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s3)]">Cancel</button>
+      <div className="space-y-2">
+        <div className="flex gap-2">
+          <button type="button" disabled={busy} onClick={() => { setTouched(true); if (canSubmit) void submit(); }} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50">{busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Building2 className="w-4 h-4" />} Create company</button>
+          <button type="button" onClick={onCancel} className="rounded-lg border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s3)]">Cancel</button>
+        </div>
+        {!canSubmit && (
+          <p className="text-[11px] text-t3">
+            Still needed: {issues.map(i => i.message.replace(/\.$/, '')).join('; ')}.
+          </p>
+        )}
       </div>
     </div>
   );

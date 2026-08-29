@@ -246,6 +246,7 @@ export const platformAdmin = {
   toggleAnnouncement: (id: string, active: boolean) => pf<unknown>(`/v1/platform/announcements/${id}`, { method: 'PATCH', body: JSON.stringify({ active }) }),
 
   getSettings: () => pf<PlatformSettings>(`/v1/platform/settings`),
+  settingPresets: () => pf<{ presets: PlatformSettingPreset[] }>(`/v1/platform/settings/presets`),
   updateSettings: (body: Partial<Omit<PlatformSettings, 'updatedAt'>>) => pf<PlatformSettings>(`/v1/platform/settings`, { method: 'PATCH', body: JSON.stringify(body) }),
 
   getPilotChecklist: (tenantId: string) => pf<PilotChecklistView>(`/v1/platform/tenants/${tenantId}/pilot-checklist`),
@@ -286,7 +287,17 @@ export const platformAdmin = {
   addIntegrationField: (key: string, body: { label: string; secret: boolean; required: boolean }) => pf<IntegrationView>(`/v1/platform/integrations/${key}/fields`, { method: 'PATCH', body: JSON.stringify(body) }),
 };
 
-export interface PlatformSettings { platformName: string; supportEmail: string | null; defaultTrialDays: number; defaultPlanKey: string; updatedAt: string }
+export interface PlatformSettings {
+  platformName: string; supportEmail: string | null;
+  defaultTrialDays: number; defaultPlanKey: string;
+  defaultTimezone: string; defaultCountry: string; defaultBranchName: string; defaultVoiceMinutes: number;
+  requireMfaFloor: boolean; sessionTimeoutMaxMinutes: number;
+  presetKey: string; updatedAt: string;
+}
+export interface PlatformSettingPreset {
+  key: string; label: string; description: string;
+  values: Partial<Omit<PlatformSettings, 'updatedAt' | 'presetKey' | 'platformName' | 'supportEmail' | 'defaultBranchName'>>;
+}
 export interface IntegrationView {
   key: string; label: string; status: string; source: 'db' | 'env' | null; isCustom?: boolean;
   fields: Array<{ key: string; label: string; secret: boolean; isSet: boolean; masked: string | null }>;

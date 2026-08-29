@@ -409,7 +409,9 @@ describe('tenant provisioning atomicity', () => {
           tenantSecurityPolicy: { upsert: async () => ({}) },
           dataRetentionPolicy: { upsert: async () => ({}) },
           tenantSubscription: { findUnique: async () => ({ status: 'TRIAL', plan: { features: [] }, addons: [] }) },
-          tenantFeatureEntitlement: { upsert: async () => ({}) },
+          // findMany: recomputeEntitlements reads standing platform overrides
+          // before it rewrites the resolved rows.
+          tenantFeatureEntitlement: { findMany: async () => [], upsert: async () => ({}) },
         };
         const result = await operation(tx);
         committedTenants = draftTenants;

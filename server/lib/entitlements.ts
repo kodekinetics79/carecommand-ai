@@ -23,7 +23,7 @@ export async function recomputeEntitlements(
   });
 
   const resolved = new Map<string, ResolvedEntitlement>();
-  const entitled = subscription && ENTITLED_STATUSES.includes(subscription.status);
+  const entitled = Boolean(subscription && ENTITLED_STATUSES.includes(subscription.status));
   if (subscription && entitled) {
     for (const feature of subscription.plan.features) {
       if (feature.included) resolved.set(feature.featureKey, { featureKey: feature.featureKey, enabled: true, source: 'plan', limitValue: feature.limitValue });
@@ -42,9 +42,25 @@ export async function recomputeEntitlements(
     }
   }
 
+  // Standing platform overrides survive this recompute. Without this, every
+  // plan change / add-on edit / suspend / reactivate silently revoked features
+  // an operator had explicitly granted - while the console claimed otherwise.
+  const existing = await client.tenantFeatureEntitlement.findMany({
+    where: { tenantId },
+    select: { featureKey: true, overrideEnabled: true },
+  });
+  const overrides = new Map(existing.filter(r => r.overrideEnabled !== null).map(r => [r.featureKey, r.overrideEnabled as boolean]));
+
   const rows: ResolvedEntitlement[] = [];
   for (const key of FEATURE_KEYS) {
-    const ent = resolved.get(key) ?? { featureKey: key, enabled: false, source: 'plan', limitValue: null };
+    const planEnt = resolved.get(key) ?? { featureKey: key, enabled: false, source: 'plan', limitValue: null };
+    const override = overrides.get(key);
+    // An override decides the feature only while the subscription is entitled:
+    // a suspended or cancelled tenant loses access regardless, and the standing
+    // decision is preserved in overrideEnabled so reactivation restores it.
+    const ent: ResolvedEntitlement = override === undefined
+      ? planEnt
+      : { featureKey: key, enabled: entitled ? override : false, source: 'platform_override', limitValue: planEnt.limitValue };
     await client.tenantFeatureEntitlement.upsert({
       where: { tenantId_featureKey: { tenantId, featureKey: key } },
       update: { enabled: ent.enabled, source: ent.source, limitValue: ent.limitValue },

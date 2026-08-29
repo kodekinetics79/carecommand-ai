@@ -2722,6 +2722,11 @@ model TenantFeatureEntitlement {
   enabled    Boolean  @default(false)
   source     String   @default("plan")
   limitValue Int?
+  // A platform operator's explicit decision for this feature, independent of
+  // the plan. null = no override. `enabled` above is the RESOLVED answer, which
+  // a recompute rewrites; this column is what makes an override survive a plan
+  // change, a suspension and a reactivation instead of being silently wiped.
+  overrideEnabled Boolean?
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
   tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
@@ -3581,14 +3586,32 @@ model PatientPortalToken {
   @@index([tenantId])
 }
 
+// Global platform defaults. Every field here is READ at tenant provisioning
+// (server/lib/platformTenantProvisioning.ts) or at operator sign-in - a field
+// that nothing reads does not belong in this model. `presetKey` records which
+// starting point an operator applied; presets fill the form, they never lock
+// a field (see PLATFORM_SETTING_PRESETS in modules/platform/routes.ts).
 model PlatformConfig {
   id               String   @id @default("singleton")
   platformName     String   @default("CareCommand")
   supportEmail     String?
   defaultTrialDays Int      @default(14)
   defaultPlanKey   String   @default("starter")
-  updatedAt        DateTime @updatedAt
-  updatedById      String?  @db.Uuid
+
+  // Provisioning defaults - applied when the create-company request omits them.
+  defaultTimezone     String @default("America/New_York")
+  defaultCountry      String @default("US")
+  defaultBranchName   String @default("Main Branch")
+  defaultVoiceMinutes Int    @default(500)
+
+  // Security FLOOR, not a setting a tenant can lower. Provisioning seeds each
+  // new tenant's TenantSecurityPolicy from these; tenants may only tighten.
+  requireMfaFloor          Boolean @default(false)
+  sessionTimeoutMaxMinutes Int     @default(480)
+
+  presetKey   String   @default("custom")
+  updatedAt   DateTime @updatedAt
+  updatedById String?  @db.Uuid
 }
 
 model PlatformAnnouncement {

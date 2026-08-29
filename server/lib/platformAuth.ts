@@ -168,27 +168,39 @@ export async function platformAuditEvent(request: FastifyRequest | null, action:
 }
 
 /** Execute a platform-plane mutation and its audit evidence on one connection. */
+/**
+ * Transaction budget for a platform mutation. Prisma's default interactive
+ * transaction timeout is 5s, which is far too tight for provisioning: that
+ * path runs ~70 sequential round-trips (compliance baseline + entitlements)
+ * and a managed Postgres with 20-60ms RTT blows the default budget, surfacing
+ * as an unmapped P2028 -> HTTP 500 with no operator-readable cause.
+ */
+export interface PlatformMutationBudget { timeout?: number; maxWait?: number }
+
 export function runPlatformAuditedMutation<T>(
   request: FastifyRequest,
   event: (result: T) => { action: string; target: PlatformAuditTarget; metadata?: Prisma.InputJsonObject },
   mutate: (tx: Prisma.TransactionClient) => Promise<T>,
+  budget?: PlatformMutationBudget,
 ): Promise<T>;
 export function runPlatformAuditedMutation<T>(
   request: FastifyRequest,
   event: { action: string; target: PlatformAuditTarget; metadata?: Prisma.InputJsonObject },
   mutate: (tx: Prisma.TransactionClient) => Promise<T>,
+  budget?: PlatformMutationBudget,
 ): Promise<T>;
 export async function runPlatformAuditedMutation<T>(
   request: FastifyRequest,
   event: { action: string; target: PlatformAuditTarget; metadata?: Prisma.InputJsonObject } | ((result: T) => { action: string; target: PlatformAuditTarget; metadata?: Prisma.InputJsonObject }),
   mutate: (tx: Prisma.TransactionClient) => Promise<T>,
+  budget?: PlatformMutationBudget,
 ): Promise<T> {
   return platformDb.$transaction(async tx => {
     const result = await mutate(tx);
     const resolved = typeof event === 'function' ? event(result) : event;
     await createPlatformAuditEvent(tx, request, resolved.action, resolved.target, resolved.metadata);
     return result;
-  });
+  }, budget);
 }
 
 // --- First PLATFORM_OWNER seed (env-only; no weak default in production) ----

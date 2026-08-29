@@ -51,6 +51,67 @@ const USAGE_DEFAULTS: Record<string, { limit: number | null }> = {
 
 const uuid = z.string().uuid();
 
+// The slug contract is owned by app_platform_provision_tenant (3-40 chars,
+// lowercase alphanumeric with inner hyphens). It is restated here - and
+// mirrored in the console - so a rejection happens on the field, not after
+// submit. Any change must be made in all three places at once.
+export const PLATFORM_SLUG_PATTERN = /^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])$/;
+const slugInput = z.string().trim().toLowerCase().min(3).max(40).regex(PLATFORM_SLUG_PATTERN, 'Slug must be 3-40 chars: lowercase letters, numbers, and inner hyphens.');
+
+// Provisioning runs ~70 sequential statements (compliance baseline +
+// entitlements) inside one transaction. Prisma's 5s default is not a budget
+// for that on managed Postgres; a blown budget looked like a bare 500.
+const PROVISIONING_BUDGET = { timeout: 30_000, maxWait: 10_000 };
+
+/**
+ * Starting points for platform settings. A preset only fills the form - the
+ * operator can edit every field before saving, and `presetKey` records which
+ * one they started from. Kept deliberately short: these are the shapes we
+ * actually sell, not a catalog of everything expressible.
+ */
+export const PLATFORM_SETTING_PRESETS = [
+  {
+    key: 'us_pilot',
+    label: 'US clinic - pilot',
+    description: 'Two-week trial, Eastern time, modest voice allowance, MFA optional while the clinic onboards.',
+    values: { defaultTrialDays: 14, defaultPlanKey: 'starter', defaultTimezone: 'America/New_York', defaultCountry: 'US', defaultVoiceMinutes: 300, requireMfaFloor: false, sessionTimeoutMaxMinutes: 480 },
+  },
+  {
+    key: 'us_production',
+    label: 'US clinic - production',
+    description: 'No trial, Eastern time, full voice allowance, MFA required and an 8-hour session ceiling.',
+    values: { defaultTrialDays: 0, defaultPlanKey: 'growth', defaultTimezone: 'America/New_York', defaultCountry: 'US', defaultVoiceMinutes: 1500, requireMfaFloor: true, sessionTimeoutMaxMinutes: 480 },
+  },
+  {
+    key: 'uk_pilot',
+    label: 'UK clinic - pilot',
+    description: 'Two-week trial, London time, modest voice allowance, MFA optional while the clinic onboards.',
+    values: { defaultTrialDays: 14, defaultPlanKey: 'starter', defaultTimezone: 'Europe/London', defaultCountry: 'GB', defaultVoiceMinutes: 300, requireMfaFloor: false, sessionTimeoutMaxMinutes: 480 },
+  },
+  {
+    key: 'uk_production',
+    label: 'UK clinic - production',
+    description: 'No trial, London time, full voice allowance, MFA required and a 4-hour session ceiling.',
+    values: { defaultTrialDays: 0, defaultPlanKey: 'growth', defaultTimezone: 'Europe/London', defaultCountry: 'GB', defaultVoiceMinutes: 1500, requireMfaFloor: true, sessionTimeoutMaxMinutes: 240 },
+  },
+] as const;
+
+/** Race-free singleton read: two concurrent first-time GETs must not collide. */
+async function ensureConfig(client: PrismaClient | Prisma.TransactionClient = db) {
+  return client.platformConfig.upsert({ where: { id: 'singleton' }, update: {}, create: { id: 'singleton' } });
+}
+
+function settingsView(c: Awaited<ReturnType<typeof ensureConfig>>) {
+  return {
+    platformName: c.platformName, supportEmail: c.supportEmail,
+    defaultTrialDays: c.defaultTrialDays, defaultPlanKey: c.defaultPlanKey,
+    defaultTimezone: c.defaultTimezone, defaultCountry: c.defaultCountry,
+    defaultBranchName: c.defaultBranchName, defaultVoiceMinutes: c.defaultVoiceMinutes,
+    requireMfaFloor: c.requireMfaFloor, sessionTimeoutMaxMinutes: c.sessionTimeoutMaxMinutes,
+    presetKey: c.presetKey, updatedAt: c.updatedAt.toISOString(),
+  };
+}
+
 async function withTimeout<T>(op: Promise<T>, ms: number): Promise<T> {
   return Promise.race([op, new Promise<T>((_r, reject) => setTimeout(() => reject(new Error('timeout')), ms))]);
 }
@@ -377,7 +438,10 @@ export const platformRoutes: FastifyPluginAsync = async app => {
   app.post('/tenants', { preHandler: tenantManage }, async (request, reply) => {
     const body = z.object({
       name: z.string().trim().min(2).max(160),
-      slug: z.string().trim().min(2).max(80),
+      // The authority on slug shape is app_platform_provision_tenant (3-40,
+      // lowercase alnum + inner hyphens). Accepting anything looser here only
+      // moves the rejection to the end of a long form.
+      slug: slugInput,
       planKey: z.string().min(1).max(40).optional(),
       ownerName: z.string().trim().min(2).max(120),
       ownerEmail: z.string().email().trim().toLowerCase(),
@@ -386,23 +450,30 @@ export const platformRoutes: FastifyPluginAsync = async app => {
       timezone: timezoneInput.optional(),
     }).parse(request.body);
     if (await db.tenant.findUnique({ where: { slug: body.slug } })) throw app.httpErrors.conflict('Slug already in use');
-    // Apply global platform defaults (default plan + trial length) from settings.
-    const cfg = await db.platformConfig.findUnique({ where: { id: 'singleton' } });
+    // Apply the global platform defaults from Platform Settings.
+    const cfg = await ensureConfig();
     try {
       const result = await runPlatformAuditedMutation(request, (provisioned: Awaited<ReturnType<typeof platformProvisionTenant>>) => ({
         action: 'tenant.created',
         target: { type: 'tenant', id: provisioned.tenant.id, tenantId: provisioned.tenant.id },
-        metadata: { name: body.name, planKey: body.planKey },
+        metadata: { name: body.name, planKey: body.planKey ?? cfg.defaultPlanKey },
       }), tx => platformProvisionTenant({
         clinicName: body.name, clinicSlug: body.slug,
         ownerName: body.ownerName, ownerEmail: body.ownerEmail, ownerPassword: body.ownerPassword,
-        defaultBranchName: body.defaultBranchName ?? 'Main Branch',
-        timezone: body.timezone, planKey: body.planKey ?? cfg?.defaultPlanKey ?? 'starter',
-        trialDays: cfg?.defaultTrialDays ?? env.TRIAL_DAYS,
-      }, tx));
+        defaultBranchName: body.defaultBranchName ?? cfg.defaultBranchName,
+        timezone: body.timezone ?? cfg.defaultTimezone, planKey: body.planKey ?? cfg.defaultPlanKey,
+        trialDays: cfg.defaultTrialDays ?? env.TRIAL_DAYS,
+        voiceMinutesLimit: cfg.defaultVoiceMinutes,
+        securityFloor: { requireMfa: cfg.requireMfaFloor, sessionTimeoutMinutes: cfg.sessionTimeoutMaxMinutes },
+      }, tx), PROVISIONING_BUDGET);
       return reply.code(201).send(await tenantSummary(result.tenant.id));
     } catch (error) {
       if (error instanceof PlatformProvisionError) throw app.httpErrors.badRequest(error.message);
+      // A blown transaction budget is an infrastructure fact, not a bad
+      // request: say so instead of leaking P2028 as a bare 500.
+      if ((error as { code?: string }).code === 'P2028') {
+        throw app.httpErrors.serviceUnavailable('Provisioning timed out before it could finish. No company was created - retry, and check database latency if it repeats.');
+      }
       throw error;
     }
   });
@@ -495,8 +566,10 @@ export const platformRoutes: FastifyPluginAsync = async app => {
       action: 'entitlement.overridden', target: { type: 'tenant', id: tenantId, tenantId }, metadata: { featureKey, enabled },
     }, tx => tx.tenantFeatureEntitlement.upsert({
       where: { tenantId_featureKey: { tenantId, featureKey } },
-      update: { enabled, source: 'platform_override' },
-      create: { tenantId, featureKey, enabled, source: 'platform_override', limitValue: null },
+      // overrideEnabled is the standing decision; enabled is the resolved answer
+      // guards read. Recording both is what makes the override outlive a plan change.
+      update: { enabled, source: 'platform_override', overrideEnabled: enabled },
+      create: { tenantId, featureKey, enabled, source: 'platform_override', overrideEnabled: enabled, limitValue: null },
     }));
     return { tenantId, featureKey, enabled, source: 'platform_override' };
   });
@@ -857,29 +930,34 @@ export const platformRoutes: FastifyPluginAsync = async app => {
   });
 
   // ===== Control Tower: Platform Settings (global, singleton) ============
-  async function ensureConfig(client: PrismaClient | Prisma.TransactionClient = db) {
-    return (await client.platformConfig.findUnique({ where: { id: 'singleton' } }))
-      ?? client.platformConfig.create({ data: { id: 'singleton' } });
-  }
-  app.get('/settings', async () => {
-    const c = await ensureConfig();
-    return { platformName: c.platformName, supportEmail: c.supportEmail, defaultTrialDays: c.defaultTrialDays, defaultPlanKey: c.defaultPlanKey, updatedAt: c.updatedAt.toISOString() };
-  });
+  // Presets are a starting point, never a lock: applying one fills the form,
+  // and every field stays editable afterwards. They live on the server so the
+  // console has no hardcoded catalog of its own.
+  app.get('/settings/presets', async () => ({ presets: PLATFORM_SETTING_PRESETS }));
+  app.get('/settings', async () => settingsView(await ensureConfig()));
   app.patch('/settings', { preHandler: tenantManage }, async request => {
     const body = z.object({
       platformName: z.string().trim().min(2).max(80).optional(),
       supportEmail: z.string().email().trim().nullable().optional(),
       defaultTrialDays: z.number().int().min(0).max(365).optional(),
       defaultPlanKey: z.string().trim().max(40).optional(),
+      defaultTimezone: timezoneInput.optional(),
+      defaultCountry: z.string().trim().length(2).toUpperCase().optional(),
+      defaultBranchName: z.string().trim().min(2).max(160).optional(),
+      defaultVoiceMinutes: z.number().int().min(0).max(1_000_000).optional(),
+      requireMfaFloor: z.boolean().optional(),
+      sessionTimeoutMaxMinutes: z.number().int().min(5).max(1440).optional(),
+      presetKey: z.string().trim().max(40).optional(),
     }).parse(request.body);
     if (body.defaultPlanKey && !(await db.subscriptionPlan.findUnique({ where: { key: body.defaultPlanKey } }))) throw app.httpErrors.badRequest('Unknown plan');
+    if (body.presetKey && body.presetKey !== 'custom' && !PLATFORM_SETTING_PRESETS.some(p => p.key === body.presetKey)) throw app.httpErrors.badRequest('Unknown preset');
     const c = await runPlatformAuditedMutation(request, {
       action: 'settings.updated', target: { type: 'platform', id: 'config' }, metadata: body,
     }, async tx => {
       await ensureConfig(tx);
       return tx.platformConfig.update({ where: { id: 'singleton' }, data: { ...body, updatedById: request.platformUser?.id } });
     });
-    return { platformName: c.platformName, supportEmail: c.supportEmail, defaultTrialDays: c.defaultTrialDays, defaultPlanKey: c.defaultPlanKey, updatedAt: c.updatedAt.toISOString() };
+    return settingsView(c);
   });
 
   // ===== Control Tower: Integrations (encrypted credential store) ========

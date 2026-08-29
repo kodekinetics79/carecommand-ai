@@ -48,11 +48,28 @@ export default function PlatformPilot() {
   const [companyName, setCompanyName] = useState('');
   const [companySlug, setCompanySlug] = useState('');
   const [slugEdited, setSlugEdited] = useState(false);
-  const [planKey, setPlanKey] = useState('starter');
+  const [planKey, setPlanKey] = useState('');
+  const [planOptions, setPlanOptions] = useState<Array<{ key: string; name: string }>>([]);
   const [ownerName, setOwnerName] = useState('');
   const [ownerEmail, setOwnerEmail] = useState('');
   const [ownerPassword, setOwnerPassword] = useState('');
   const [branchName, setBranchName] = useState('Main Branch');
+  // Plan used to be a free-text box defaulting to a hardcoded 'starter': a typo
+  // produced a 400 at the end of a long form, and Platform Settings' default
+  // plan could never apply. Both are now driven by the server.
+  useEffect(() => {
+    let alive = true;
+    void Promise.all([
+      platformAdmin.plans().catch(() => [] as Array<{ key: string; name: string }>),
+      platformAdmin.getSettings().catch(() => null),
+    ]).then(([catalog, cfg]) => {
+      if (!alive) return;
+      setPlanOptions(catalog);
+      setPlanKey(prev => prev || cfg?.defaultPlanKey || catalog[0]?.key || 'starter');
+      if (cfg?.defaultBranchName) setBranchName(prev => (prev === 'Main Branch' ? cfg.defaultBranchName : prev));
+    });
+    return () => { alive = false; };
+  }, []);
   const [timezone, setTimezone] = useState(localTimezone);
 
   const [entityType, setEntityType] = useState<PilotEntityType>('patients');
@@ -404,7 +421,9 @@ export default function PlatformPilot() {
                   </label>
                   <label className="block space-y-1">
                     <span className="text-[11px] font-semibold text-t3">Plan</span>
-                    <input value={planKey} onChange={e => setPlanKey(e.target.value)} className="w-full rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="starter" />
+                    <select aria-label="Plan" value={planKey} onChange={e => setPlanKey(e.target.value)} disabled={!planOptions.length} className="w-full rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none">
+                      {planOptions.length ? planOptions.map(p => <option key={p.key} value={p.key}>{p.name}</option>) : <option value="">Plan catalog unavailable</option>}
+                    </select>
                   </label>
                   <label className="block space-y-1">
                     <span className="text-[11px] font-semibold text-t3">Default branch</span>
