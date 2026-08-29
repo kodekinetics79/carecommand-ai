@@ -2,6 +2,7 @@ import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
+import { queueAppointmentConfirmations } from '../../lib/receptionist/confirmationOutbox';
 import { requirePermission } from '../../lib/permissions';
 import { assertBranchAccess } from '../../lib/scope';
 import { recordWorkflowEvent } from '../../lib/intelligence';
@@ -60,6 +61,8 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
       requireIntakeForSelfBook: z.boolean().optional(),
       maxHorizonDays: z.number().int().min(1).max(365).optional(),
       minNoticeHours: z.number().int().min(0).max(720).optional(),
+      confirmBookingsBySms: z.boolean().optional(),
+      confirmBookingsByEmail: z.boolean().optional(),
     }).parse(request.body);
     await db.schedulingPolicy.upsert({
       where: { tenantId: request.auth.tenantId },
@@ -172,15 +175,16 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
     const service = await resolveSchedulingService({ tenantId: request.auth.tenantId, serviceCatalogItemId: body.serviceCatalogItemId, service: body.service, fallbackDurationMin: body.durationMin });
     if (!service) throw app.httpErrors.badRequest('Select an active service before booking');
 
-    const patient = await db.patient.findFirst({ where: { id: body.patientId, tenantId: request.auth.tenantId, branchId: provider.branchId, deletedAt: null }, select: { id: true } });
+    const patient = await db.patient.findFirst({ where: { id: body.patientId, tenantId: request.auth.tenantId, branchId: provider.branchId, deletedAt: null }, select: { id: true, phone: true, email: true } });
     if (!patient) throw app.httpErrors.badRequest('Patient not found in this provider\'s clinic');
 
     const endsAt = new Date(body.startsAt.getTime() + service.durationMin * 60_000);
+    const policy = await getSchedulingPolicy(request.auth.tenantId);
 
     // Conflict check + create in one transaction so the slot can't be double-booked
     // between check and insert. The DB exclusion constraint is the final guard if a
     // concurrent booking still races past the in-transaction check.
-    let result: { conflict: Awaited<ReturnType<typeof findSlotConflict>> } | { appointment: Awaited<ReturnType<typeof db.appointment.create>> };
+    let result: { conflict: Awaited<ReturnType<typeof findSlotConflict>> } | { appointment: Awaited<ReturnType<typeof db.appointment.create>>; queued: Awaited<ReturnType<typeof queueAppointmentConfirmations>> };
     try {
       result = await db.$transaction(async tx => {
         const conflict = await findSlotConflict({ tenantId: request.auth.tenantId, providerProfileId: providerId, startsAt: body.startsAt, durationMin: service.durationMin }, tx);
@@ -192,7 +196,20 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
             status: 'CONFIRMED', channel: body.channel,
           },
         });
-        return { appointment } as const;
+        // Queue the confirmation with the booking, so a clinic that has opted
+        // in cannot end up with an appointment and no message arranged. This
+        // only enqueues: consent, quiet hours and the DNC fence are all still
+        // decided at the delivery boundary, exactly as for the voice path.
+        const queued = await queueAppointmentConfirmations(tx, {
+          tenantId: request.auth.tenantId,
+          appointmentId: appointment.id,
+          patientId: patient.id,
+          smsEnabled: policy.confirmBookingsBySms,
+          emailEnabled: policy.confirmBookingsByEmail,
+          phone: patient.phone,
+          email: patient.email,
+        });
+        return { appointment, queued } as const;
       });
     } catch (error) {
       if (isDoubleBookConflictError(error)) return reply.code(409).send({ error: 'slot_unavailable', reason: 'already_booked' });
@@ -205,6 +222,8 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
 
     await audit(request, { action: 'appointment.booked', resource: 'appointment', resourceId: result.appointment.id, metadata: { providerId, startsAt: body.startsAt.toISOString() } });
     await recordWorkflowEvent(request.auth.tenantId, { eventType: 'appointment.created', entityType: 'appointment', entityId: result.appointment.id, sourceModule: 'scheduling', payload: { providerId, branchId: provider.branchId } });
-    return reply.code(201).send(result.appointment);
+    // Name the channels that were QUEUED, not "confirmation sent". Nothing has
+    // been delivered yet, and the delivery boundary may still suppress it.
+    return reply.code(201).send({ ...result.appointment, confirmationsQueued: result.queued });
   });
 };

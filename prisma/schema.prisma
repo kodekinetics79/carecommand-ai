@@ -725,6 +725,11 @@ model SchedulingPolicy {
   requireIntakeForSelfBook      Boolean  @default(false)
   maxHorizonDays                Int      @default(90)
   minNoticeHours                Int      @default(0)
+  // Confirmations for appointments a human books. Off by default: turning
+  // messaging on for an existing tenant would send patients messages the clinic
+  // never asked to send. A clinic opts in.
+  confirmBookingsBySms          Boolean  @default(false)
+  confirmBookingsByEmail        Boolean  @default(false)
   createdAt                     DateTime @default(now())
   updatedAt                     DateTime @updatedAt
   tenant                        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)

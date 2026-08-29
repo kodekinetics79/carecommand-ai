@@ -13,6 +13,9 @@ export interface SchedulingPolicy {
   requireIntakeForSelfBook: boolean;
   maxHorizonDays: number;
   minNoticeHours: number;
+  /** Confirm appointments a human books. Opt-in; see the migration for why. */
+  confirmBookingsBySms: boolean;
+  confirmBookingsByEmail: boolean;
 }
 
 export const DEFAULT_SCHEDULING_POLICY: SchedulingPolicy = {
@@ -21,6 +24,8 @@ export const DEFAULT_SCHEDULING_POLICY: SchedulingPolicy = {
   requireIntakeForSelfBook: false,
   maxHorizonDays: 90,
   minNoticeHours: 0,
+  confirmBookingsBySms: false,
+  confirmBookingsByEmail: false,
 };
 
 type Client = typeof db | Prisma.TransactionClient;
@@ -34,6 +39,8 @@ export async function getSchedulingPolicy(tenantId: string, client: Client = db)
     requireIntakeForSelfBook: row.requireIntakeForSelfBook,
     maxHorizonDays: row.maxHorizonDays,
     minNoticeHours: row.minNoticeHours,
+    confirmBookingsBySms: row.confirmBookingsBySms,
+    confirmBookingsByEmail: row.confirmBookingsByEmail,
   };
 }
 
