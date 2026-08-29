@@ -149,17 +149,25 @@ async function seed(): Promise<void> {
   for (let index = 0; index < profile.users; index += 1) {
     const tenantIndex = index % tenantIds.length;
     const candidateBranches = branchIds.filter((_, branchIndex) => branchTenant[branchIndex] === tenantIds[tenantIndex]);
-    const branchId = candidateBranches[index % candidateBranches.length];
+    const role = userRoles[index % userRoles.length];
+    const homeBranchId = candidateBranches[index % candidateBranches.length];
+    // The OWNER is the demo persona and owns the whole tenant: a branch
+    // RESTRICTION would hide every tenant-wide campaign from them, because
+    // branch scope is an exact match that deliberately fails closed on
+    // null-branch records. The owner keeps a primary clinic association below
+    // but carries no branch restriction; everyone else stays branch-assigned
+    // so the demo can also show scoping working.
+    const branchId = role === 'OWNER' ? null : homeBranchId;
     const id = stableUuid('user', index);
     userIds.push(id);
     userTenant.push(tenantIds[tenantIndex]);
-    userBranch.push(branchId);
+    userBranch.push(homeBranchId);
     users.push({
       id,
       tenantId: tenantIds[tenantIndex],
       branchId,
       email: `synthetic.user.${index + 1}@example.test`,
-      displayName: `Synthetic ${userRoles[index % userRoles.length]} ${index + 1}`,
+      displayName: `Synthetic ${role} ${index + 1}`,
       role: userRoles[index % userRoles.length],
       passwordHash,
       active: index % 17 !== 16,
