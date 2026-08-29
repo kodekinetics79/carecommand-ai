@@ -11,6 +11,7 @@ vi.mock('../lib/api', async () => {
 
 import { ApiError } from '../lib/api';
 import type { ApiReview } from '../lib/apiAdapters';
+import { GROWTH_POLICY_PATH } from '../lib/growthPolicy';
 import Reviews from './Reviews';
 
 /**
@@ -61,6 +62,24 @@ const REVIEWS: ApiReview[] = [
 
 const BRANCHES = [{ id: 'branch-1', name: 'Riverside Clinic' }];
 
+/**
+ * `GET /v1/growth/policy`. The seven fields the reputation screens classify
+ * with; the defaults here are the ones in server/modules/growth/defaults.ts.
+ */
+function growthPolicy(overrides: Record<string, unknown> = {}) {
+  return {
+    source: 'default',
+    reviewRatingGood: 4.5,
+    reviewRatingFair: 4.0,
+    reputationRiskHigh: 80,
+    reputationRiskMedium: 55,
+    competitorRatingHighSeverityMax: 4.2,
+    competitorRatingMediumSeverityMax: 4.5,
+    competitorReviewVolumeHigh: 350,
+    ...overrides,
+  };
+}
+
 const REPUTATION = {
   summary: { unresolvedCases: 3, avgBadReviewRisk: 62, avgNpsScore: 41, pendingReviewRequests: 2 },
   cases: [{
@@ -81,7 +100,8 @@ const answerEverything = (path: string) => Promise.resolve(
   path.startsWith('/v1/reviews') ? REVIEWS
     : path.startsWith('/v1/branches') ? BRANCHES
       : path.startsWith('/v1/providers') ? []
-        : REPUTATION,
+        : path.startsWith(GROWTH_POLICY_PATH) ? growthPolicy()
+          : REPUTATION,
 );
 
 beforeEach(() => {
@@ -190,10 +210,12 @@ describe('Reviews request volume', () => {
     await screen.findByText('Average rating');
     await new Promise(resolve => setTimeout(resolve, 60));
 
-    for (const endpoint of ['/v1/reviews', '/v1/branches', '/v1/providers/overview', '/v1/reputation']) {
+    for (const endpoint of ['/v1/reviews', '/v1/branches', '/v1/providers/overview', '/v1/reputation', GROWTH_POLICY_PATH]) {
       expect(apiRequestMock.mock.calls.filter(([path]) => String(path).startsWith(endpoint))).toHaveLength(1);
     }
-    expect(apiRequestMock).toHaveBeenCalledTimes(4);
+    // Five feeds, five requests. The policy is read once per mount like the
+    // rest — it is not re-fetched per clinic row it bands.
+    expect(apiRequestMock).toHaveBeenCalledTimes(5);
   });
 });
 
@@ -303,5 +325,169 @@ describe('Reviews response composer', () => {
     renderPage();
     await screen.findByText('Average rating');
     expect(document.body.textContent).not.toContain(CANNED_REPLY);
+  });
+});
+
+/**
+ * The clinic reputation bands used to be written into the JSX as `>= 4.5` and
+ * `>= 4`, so every tenant on the platform was told the same thing about what
+ * "good" means and none of them could see, let alone change, the rule. They now
+ * come from `GET /v1/growth/policy`.
+ *
+ * Two properties are held here. A tenant with different bands must get a
+ * different colour AND different copy — a band that ignores configuration is
+ * the original defect wearing a config read. And a band whose policy has not
+ * arrived, failed, or came back unusable must not be drawn at all: a green 4.4
+ * under a tenant whose "good" starts at 4.6 is not a late claim, it is a wrong
+ * one, and a hardcoded fallback would make it permanently wrong.
+ */
+
+/** Riverside averages 4.3 across three rated reviews; Harbour averages 2.0. */
+const BAND_BRANCHES = [
+  { id: 'branch-1', name: 'Riverside Clinic' },
+  { id: 'branch-2', name: 'Harbour Clinic' },
+];
+
+const bandReview = (id: string, branchId: string, rating: number): ApiReview => ({
+  id, branchId, rating, text: 'Recorded review.', platform: 'google',
+  createdAt: '2026-08-02T09:30:00.000Z', responded: false, aiDraftResponse: null, sentiment: 'positive',
+});
+
+const BAND_REVIEWS: ApiReview[] = [
+  bandReview('band-1', 'branch-1', 4),
+  bandReview('band-2', 'branch-1', 5),
+  bandReview('band-3', 'branch-1', 4),
+  bandReview('band-4', 'branch-2', 2),
+  bandReview('band-5', 'branch-2', 2),
+];
+
+/** Answers the banding fixture, with the policy request under the test's control. */
+function answerBands(policyStep: () => Promise<unknown>) {
+  return (path: string) => {
+    if (path.startsWith(GROWTH_POLICY_PATH)) return policyStep();
+    return Promise.resolve(
+      path.startsWith('/v1/reviews') ? BAND_REVIEWS
+        : path.startsWith('/v1/branches') ? BAND_BRANCHES
+          : path.startsWith('/v1/providers') ? []
+            : REPUTATION,
+    );
+  };
+}
+
+describe('Reviews clinic rating bands', () => {
+  it('bands and states the thresholds the product default configures', async () => {
+    respond = answerBands(() => Promise.resolve(growthPolicy()));
+    renderPage();
+
+    await screen.findByText('Riverside');
+
+    // 4.3 sits between the configured fair and good bounds; 2.0 is below both.
+    expect(screen.getByText('4.3')).toHaveClass('text-amber-v');
+    expect(screen.getByText('2.0')).toHaveClass('text-red-v');
+    expect(screen.getByText(/Green at ≥ 4.5, amber at ≥ 4.0, red below/)).toBeInTheDocument();
+    expect(screen.getByText(/this workspace has not set its own thresholds yet/)).toBeInTheDocument();
+  });
+
+  it('gives a tenant with different bands a different colour and different copy', async () => {
+    // Good starts at 4.2 and fair at 1.5, so BOTH clinics move a band: the 4.3
+    // clinic goes amber → green and the 2.0 clinic goes red → amber. Restoring
+    // either retired literal puts them back and fails this test.
+    respond = answerBands(() => Promise.resolve(growthPolicy({
+      source: 'tenant', reviewRatingGood: 4.2, reviewRatingFair: 1.5,
+    })));
+    renderPage();
+
+    await screen.findByText('Riverside');
+
+    expect(screen.getByText('4.3')).toHaveClass('text-emerald-v');
+    expect(screen.getByText('2.0')).toHaveClass('text-amber-v');
+    expect(screen.getByText(/Green at ≥ 4.2, amber at ≥ 1.5, red below/)).toBeInTheDocument();
+    expect(screen.getByText(/Configured for this workspace/)).toBeInTheDocument();
+    // The retired literals are nowhere in the copy.
+    expect(screen.queryByText(/Green at ≥ 4.5/)).not.toBeInTheDocument();
+  });
+
+  it('draws no band while the policy is still in flight, even though the reviews arrived', async () => {
+    respond = answerBands(PENDING_FOREVER);
+    renderPage();
+
+    // The rest of the page is entitled to speak: the average of the loaded
+    // reviews needs no policy, so it renders.
+    await screen.findByText('Average rating');
+    expect(figureFor('Average rating')).toBe('3.4');
+
+    // The banded panel does not.
+    expect(screen.queryByText('Riverside')).not.toBeInTheDocument();
+    expect(screen.queryByText('4.3')).not.toBeInTheDocument();
+    expect(screen.queryByText('2.0')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Green at ≥/)).not.toBeInTheDocument();
+    expect(screen.getByText('Loading Clinic ratings…')).toBeInTheDocument();
+  });
+
+  it('names the failure instead of falling back to a default band', async () => {
+    respond = answerBands(() => Promise.reject(
+      new ApiError(403, 'Forbidden', 'insufficient_permission')));
+    renderPage();
+
+    const heading = await screen.findByText('Clinic ratings could not be loaded');
+    expect(within(heading.closest('[role="alert"]') as HTMLElement)
+      .getByText(/no figure here should be read as zero, empty or healthy/)).toBeInTheDocument();
+
+    expect(screen.queryByText('4.3')).not.toBeInTheDocument();
+    expect(screen.queryByText('2.0')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Green at ≥/)).not.toBeInTheDocument();
+  });
+
+  it('refuses a policy it cannot classify with rather than banding against NaN', async () => {
+    // Every numeric bound missing. `Number(undefined)` is NaN and every `>=`
+    // against NaN is false, so a lenient adapter would have quietly published
+    // every clinic in this workspace as red.
+    respond = answerBands(() => Promise.resolve({ source: 'tenant' }));
+    renderPage();
+
+    await screen.findByText('Clinic ratings could not be loaded');
+    expect(screen.getByText(/configured growth thresholds are incomplete/)).toBeInTheDocument();
+    expect(screen.queryByText('4.3')).not.toBeInTheDocument();
+    expect(screen.queryByText('2.0')).not.toBeInTheDocument();
+  });
+});
+
+describe('Reviews top provider list', () => {
+  const provider = (id: string, name: string, rating: string) => ({
+    id, branchId: 'branch-1', specialty: 'General', utilization: 0, appointmentsToday: 0,
+    appointmentsThisMonth: 0, rating, reviewCount: 4, revenueThisMonth: '0',
+    repeatVisitRate: 0, followUpRate: 0, branch: { name: 'Riverside Clinic' },
+    user: { displayName: name },
+  });
+
+  it('says how much of the ranked list the card is showing when it cuts one', async () => {
+    const providers = [
+      provider('p1', 'Ada Okafor', '4.9'), provider('p2', 'Ben Cole', '4.8'),
+      provider('p3', 'Cara Diaz', '4.7'), provider('p4', 'Dev Rao', '4.6'),
+      provider('p5', 'Eve Marsh', '4.5'), provider('p6', 'Finn Ward', '4.4'),
+      provider('p7', 'Gia Nunes', '4.3'),
+    ];
+    respond = (path: string) => (path.startsWith('/v1/providers')
+      ? Promise.resolve(providers)
+      : answerEverything(path));
+    renderPage();
+
+    await screen.findByText('Ada Okafor');
+
+    // Five listed, and the card admits there are seven.
+    expect(screen.getByText('Highest 5 of 7 providers with a recorded rating.')).toBeInTheDocument();
+    expect(screen.queryByText('Finn Ward')).not.toBeInTheDocument();
+    expect(screen.queryByText('Gia Nunes')).not.toBeInTheDocument();
+  });
+
+  it('makes no truncation claim when the whole ranked list fits', async () => {
+    respond = (path: string) => (path.startsWith('/v1/providers')
+      ? Promise.resolve([provider('p1', 'Ada Okafor', '4.9'), provider('p2', 'Ben Cole', '4.8')])
+      : answerEverything(path));
+    renderPage();
+
+    await screen.findByText('Ada Okafor');
+    expect(screen.getByText('Ben Cole')).toBeInTheDocument();
+    expect(screen.queryByText(/providers with a recorded rating\./)).not.toBeInTheDocument();
   });
 });

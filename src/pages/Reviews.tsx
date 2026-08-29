@@ -10,6 +10,7 @@ import { useResource } from '../hooks/useResource';
 import { LOADING_STATE, receivedData, type ResourceState } from '../lib/resourceState';
 import { fetchList, mapProviderProfile, mapReview, type ApiProviderProfile, type ApiReview, type ReviewRow } from '../lib/apiAdapters';
 import { apiRequest } from '../lib/api';
+import { formatRatingThreshold, growthPolicyProvenance, loadGrowthPolicy, type GrowthPolicy } from '../lib/growthPolicy';
 
 interface ApiReputationCase {
   id: string;
@@ -58,6 +59,17 @@ interface BranchOption { id: string; name: string }
 /** The slice this screen actually asks for; every count below is of this slice. */
 const REVIEW_PAGE_SIZE = 100;
 
+/**
+ * How many providers the "Top Provider Ratings" card lists.
+ *
+ * This is a PAGE SIZE, not a clinic rule: it decides how much of a ranked list
+ * fits in a sidebar card, and no clinic would ever want to configure it. It is
+ * named rather than configured, and the card says how many of the ranked
+ * providers it is showing — a truncated list that does not admit it is a list
+ * that reads as "these are all of them".
+ */
+const TOP_PROVIDER_LIST_SIZE = 5;
+
 // Module-scope loaders: useResource keys a request by the identity of its
 // source, so these must not be re-created on every render.
 const loadReviews = async (signal: AbortSignal): Promise<ReviewRow[]> =>
@@ -91,12 +103,33 @@ function platformLabel(platform: string) {
   return platform.trim() || 'Platform not recorded';
 }
 
+/**
+ * Colour band for a clinic's average rating.
+ *
+ * The bounds used to be written into the JSX as `>= 4.5` and `>= 4`, so every
+ * tenant on the platform was told the same thing about what "good" means. They
+ * are now the tenant's own `reviewRatingGood` / `reviewRatingFair`, and the
+ * threshold is only reachable from a resolved policy — the function cannot be
+ * called without one, which is what stops a band being drawn from a guess.
+ *
+ * Both bounds are INCLUSIVE LOWER bounds, matching the comparison semantics
+ * recorded in server/modules/growth/defaults.ts.
+ */
+function ratingBandClass(average: number, policy: GrowthPolicy): string {
+  if (average >= policy.reviewRatingGood) return 'text-emerald-v';
+  if (average >= policy.reviewRatingFair) return 'text-amber-v';
+  return 'text-red-v';
+}
+
 export default function Reviews() {
   const navigate = useNavigate();
   const reviews = useResource<ReviewRow[]>(loadReviews);
   const branches = useResource<BranchOption[]>(loadBranches);
   const providers = useResource<ReturnType<typeof mapProviderProfile>[]>(loadProviders);
   const reputation = useResource<ReputationResponse>('/v1/reputation?limit=10');
+  // The clinic's own rating bands. A feed like any other: until it answers,
+  // there is no band to draw, and if it fails, the panel that bands says so.
+  const policy = useResource<GrowthPolicy>(loadGrowthPolicy);
 
   const [respondingId, setRespondingId] = useState<string | null>(null);
   const [editorId, setEditorId] = useState<string | null>(null);
@@ -470,12 +503,19 @@ export default function Reviews() {
           </BentoCard>
 
           <BentoCard title="Branch Reputation" subtitle="Average of loaded reviews, by clinic">
-            {/* Two feeds: the clinic list and the reviews being averaged. Both
-                have to answer before a per-clinic average means anything. */}
+            {/* Three feeds: the clinic list, the reviews being averaged, and the
+                bands they are judged against. All three have to answer before a
+                coloured per-clinic average means anything — a green 4.4 under a
+                tenant whose "good" starts at 4.6 is a wrong claim, not a late
+                one, so the policy waits with the rest. */}
             <ResourceSection
               label="Clinic ratings"
-              state={combineResourceStates(branches.state, reviews.state, (branchRows, reviewRows) => ({ branchRows, reviewRows }))}
-              onRetry={() => { branches.reload(); reviews.reload(); }}
+              state={combineResourceStates(
+                combineResourceStates(branches.state, reviews.state, (branchRows, reviewRows) => ({ branchRows, reviewRows })),
+                policy.state,
+                (rows, bands) => ({ ...rows, bands }),
+              )}
+              onRetry={() => { branches.reload(); reviews.reload(); policy.reload(); }}
               lines={3}
               rowClassName="h-14 rounded-xl"
               isEmpty={data => data.branchRows.length === 0}
@@ -484,8 +524,15 @@ export default function Reviews() {
                 description: 'The clinic list loaded successfully and this workspace has no clinic records.',
               }}
             >
-              {({ branchRows, reviewRows }) => (
+              {({ branchRows, reviewRows, bands }) => (
                 <div className="space-y-2.5">
+                  {/* The bands are stated, and stated as the configured values.
+                      The card used to colour silently against 4.5 / 4.0 and
+                      never told anyone that was the rule. */}
+                  <p className="text-[10px] text-t3">
+                    Green at ≥ {formatRatingThreshold(bands.reviewRatingGood)}, amber at ≥ {formatRatingThreshold(bands.reviewRatingFair)}, red below.{' '}
+                    {growthPolicyProvenance(bands)}
+                  </p>
                   {branchRows.map((b) => {
                     const rated = reviewRows.filter((r): r is ReviewRow & { rating: number } => r.branchId === b.id && r.rating != null);
                     const avg = rated.length > 0 ? rated.reduce((s, r) => s + r.rating, 0) / rated.length : null;
@@ -500,7 +547,7 @@ export default function Reviews() {
                         ) : (
                           <div className="flex items-center gap-1.5">
                             <Star className="w-3.5 h-3.5 fill-amber-400 text-amber-400" />
-                            <span className={`text-sm font-bold ${avg >= 4.5 ? 'text-emerald-v' : avg >= 4 ? 'text-amber-v' : 'text-red-v'}`}>{avg.toFixed(1)}</span>
+                            <span className={`text-sm font-bold ${ratingBandClass(avg, bands)}`}>{avg.toFixed(1)}</span>
                           </div>
                         )}
                       </div>
@@ -527,13 +574,14 @@ export default function Reviews() {
                 description: 'The provider feed loaded successfully and no provider has a review recorded against them yet.',
               }}
             >
-              {rows => (
-                <div className="space-y-2.5">
-                  {rows
-                    .filter(doc => doc.reviewCount > 0 && Number.isFinite(doc.rating))
-                    .sort((a, b) => b.rating - a.rating)
-                    .slice(0, 5)
-                    .map((doc) => (
+              {rows => {
+                const ranked = rows
+                  .filter(doc => doc.reviewCount > 0 && Number.isFinite(doc.rating))
+                  .sort((a, b) => b.rating - a.rating);
+                const visible = ranked.slice(0, TOP_PROVIDER_LIST_SIZE);
+                return (
+                  <div className="space-y-2.5">
+                    {visible.map((doc) => (
                       <div key={doc.id} className="flex items-center justify-between gap-3">
                         <p className="text-xs font-semibold text-t1 truncate">{doc.name}</p>
                         <div className="flex items-center gap-1.5 shrink-0">
@@ -543,8 +591,17 @@ export default function Reviews() {
                         </div>
                       </div>
                     ))}
-                </div>
-              )}
+                    {/* A cut list that does not say it was cut reads as the
+                        whole list. The cap is a card size, so it is named as
+                        one rather than dressed up as a clinical cut-off. */}
+                    {ranked.length > visible.length && (
+                      <p className="text-[10px] text-t3">
+                        Highest {visible.length} of {ranked.length} providers with a recorded rating.
+                      </p>
+                    )}
+                  </div>
+                );
+              }}
             </ResourceSection>
           </BentoCard>
 

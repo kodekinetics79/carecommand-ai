@@ -112,7 +112,7 @@ export const THRESHOLD_RESOLUTIONS = Object.freeze([
 ]);
 
 /**
- * The remaining call site to rewire once a module is allowed to read this config.
+ * The remaining call sites to rewire once a module is allowed to read this config.
  *
  * The CRM entries are gone because they are DONE: `commandMetrics`,
  * `smartSegments`, `scoreLead` and the next-best-action map were deleted from
@@ -120,9 +120,16 @@ export const THRESHOLD_RESOLUTIONS = Object.freeze([
  * reading GrowthPolicy / GrowthSegmentDefinition / GrowthChannelCost. The CRM
  * page's at-risk badge renders the band the server computed from
  * `churnRiskHigh`, so no threshold literal survives in that screen.
+ *
+ * /v1/patients/summary is gone too: `highRiskCount` and `highLifetimeValueCount`
+ * now read `churnRiskHigh` and `highValuePatientLtv` off the effective
+ * GrowthPolicy (inside the tenant transaction, because GrowthPolicy is
+ * RLS-enrolled), with the INCLUSIVE comparisons THRESHOLD_RESOLUTIONS chose.
+ * That ends both divergences the resolutions record: the server counted
+ * churnRisk >= 60 where every clinic-facing surface counted >= 50, and it
+ * counted lifetimeValue > 4000 where the rest of the product counted >= 4000.
  */
 export const PENDING_CONFIG_CALL_SITES = Object.freeze([
-  'server/modules/patients/routes.ts:202-203 (/v1/patients/summary highRiskCount + highLifetimeValueCount)',
   'src/pages/Reviews.tsx (reviewRatingGood / reviewRatingFair)',
   'src/pages/ClinicRadar.tsx (reputationRisk* / competitor* severity bounds)',
 ]);

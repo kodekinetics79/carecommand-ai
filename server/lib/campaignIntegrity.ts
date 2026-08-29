@@ -100,6 +100,13 @@ export type CampaignLaunchPreview = {
   finalConfirmationRequired: true;
   confirmationStatement: string;
   /**
+   * The branch this exact audience was resolved under, or null for a
+   * deliberately tenant-wide campaign. Shown so the operator authorizing the
+   * preview can see the scope they are authorizing; it is also inside the
+   * fingerprint, so changing it invalidates that authorization.
+   */
+  branchScope?: string | null;
+  /**
    * Exactly why live dispatch is not available for this channel, so the UI can
    * tell an operator what remains instead of only that "something" is off.
    * Optional: a preview built for a mock/dev provider has nothing to report.
@@ -119,6 +126,24 @@ export type CampaignLaunchFingerprintMaterial = {
   provider: string;
   providerMode: ReturnType<typeof providerModeFor>;
   clinicNameHash: string;
+  /**
+   * The campaign's branch scope (Campaign.branchId), or omitted when the
+   * campaign is deliberately tenant-wide.
+   *
+   * Scope is part of the authority, not just an input to it. Without this the
+   * audience rows alone could be identical across two different scopes — a
+   * tenant that happens to have patients in one branch only, a campaign moved
+   * between branches while its audience is unchanged — and a scope change
+   * between approval and dispatch would go undetected, which is exactly the
+   * drift the fingerprint exists to catch.
+   *
+   * Deliberately OPTIONAL rather than `string | null`: JSON.stringify drops an
+   * undefined value, so a tenant-wide campaign hashes byte-identically to the
+   * way it did before branch scope existed. Every campaign that predates the
+   * `Campaign.branchId` column keeps its already-authorized fingerprint and
+   * needs no re-approval; only a genuinely branch-scoped campaign changes.
+   */
+  branchScope?: string;
   audienceRows: Array<{ identity: string; destinationHash: string | null; eligibility: string; renderInputHash: string }>;
 };
 
@@ -159,7 +184,12 @@ export async function buildCampaignDispatchSnapshot(tenantId: string, campaign: 
   // live dispatch invalidates every fingerprint authorized before the change.
   const activation = await runWithTenantContext(tenantId, tx => resolveDispatchActivationTx(tx, tenantId, channel));
   const clinicName = await canonicalCampaignClinicName(tenantId);
-  const candidates = await buildAudience(tenantId, campaign.audienceType as AudienceType);
+  // The campaign's OWN branch scope, not the caller's. Preview, fingerprint and
+  // dispatch all read this one snapshot, so a branch-restricted operator whose
+  // preview showed only their branch cannot launch to the whole tenant, and a
+  // scheduler running with no request context resolves the identical audience.
+  const branchScope = campaign.branchId ?? undefined;
+  const candidates = await buildAudience(tenantId, campaign.audienceType as AudienceType, { branchId: branchScope ?? null });
   const authorizedPatientIds = mode === 'live_supported'
     ? await affirmativelyAuthorizedPatientIds(
         tenantId,
@@ -225,6 +255,7 @@ export async function buildCampaignDispatchSnapshot(tenantId: string, campaign: 
     provider,
     providerMode: mode,
     clinicNameHash: sha256(clinicName),
+    branchScope,
     audienceRows,
   });
   const preview: CampaignLaunchPreview = {
@@ -235,6 +266,7 @@ export async function buildCampaignDispatchSnapshot(tenantId: string, campaign: 
     provider,
     channel,
     scheduledAt: campaign.scheduledAt?.toISOString() ?? null,
+    branchScope: campaign.branchId ?? null,
     audience: { total: candidates.length, eligible, suppressed, missingContact, authorityRequired, atomicBoundaryBlocked },
     // Truthful, no longer a hardcoded mode test: a mock provider really does
     // dispatch (a clearly-mock message), and a live provider dispatches only

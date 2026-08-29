@@ -3,6 +3,7 @@ import { env } from '../config/env';
 import { runWithTenantContext, type TenantTxClient } from './tenantContext';
 import type { CampaignLiveDispatchActivation, ReceptionistOptOutChannel } from '../generated/prisma/client';
 import { canonicalDncDestination, isDestinationOptedOutTx } from './receptionist/dncFence';
+import type { Permission } from './permissions';
 
 // ===========================================================================
 // CRM Campaign / Reactivation engine helpers. Deterministic, tenant-scoped
@@ -27,6 +28,115 @@ export type AudienceType = typeof AUDIENCE_TYPES[number];
 
 // Audiences that are intentionally STAFF-facing (never patient-blaming outreach).
 export const STAFF_FACING_AUDIENCES = new Set(['prior_auth_followup']);
+
+// ---------------------------------------------------------------------------
+// Campaign authority classes.
+//
+// Authority over a campaign is scoped by what the campaign IS, not granted
+// wholesale. Two different consent classes hide behind one "campaign" noun:
+//
+//   payment_followup    The practice chasing money it is already owed, or the
+//                       coverage that would pay it — unpaid deposit, failed
+//                       payment, insurance/coverage update, prior authorization.
+//                       Under HIPAA this is payment operations; it is NOT
+//                       marketing, and it is ordinary billing-staff work.
+//
+//   marketing_outreach  Everything else, including reactivation offers and
+//                       review requests. A different consent class entirely,
+//                       and the default for anything unrecognised.
+//
+// CAMPAIGN_CLASS_AUTHORITY below is the ONLY mapping of class -> required
+// grant. Routes read it; they never re-decide it. `campaign:manage` is the
+// broad grant and appears in every class, so no role that can manage campaigns
+// today loses anything.
+// ---------------------------------------------------------------------------
+export const CAMPAIGN_AUTHORITY_CLASSES = ['payment_followup', 'marketing_outreach'] as const;
+export type CampaignAuthorityClass = typeof CAMPAIGN_AUTHORITY_CLASSES[number];
+
+/** Every campaign type, classified exactly once. */
+export const CAMPAIGN_TYPE_AUTHORITY_CLASS: Record<CampaignType, CampaignAuthorityClass> = {
+  unpaid_deposit_followup: 'payment_followup',
+  failed_payment_recovery: 'payment_followup',
+  insurance_update_request: 'payment_followup',
+  prior_auth_followup: 'payment_followup',
+  appointment_reminder: 'marketing_outreach',
+  appointment_confirmation: 'marketing_outreach',
+  no_show_recovery: 'marketing_outreach',
+  inactive_patient_reactivation: 'marketing_outreach',
+  missed_call_recovery: 'marketing_outreach',
+  appointment_request_followup: 'marketing_outreach',
+  review_request: 'marketing_outreach',
+  custom: 'marketing_outreach',
+};
+
+/** Every audience source, classified exactly once. */
+export const AUDIENCE_TYPE_AUTHORITY_CLASS: Record<AudienceType, CampaignAuthorityClass> = {
+  unpaid_deposit_followup: 'payment_followup',
+  failed_payment_recovery: 'payment_followup',
+  insurance_update_request: 'payment_followup',
+  inactive_patients: 'marketing_outreach',
+  no_show_recovery: 'marketing_outreach',
+  appointment_request_followup: 'marketing_outreach',
+  review_request: 'marketing_outreach',
+};
+
+/**
+ * The class a campaign is governed by. Fails CLOSED in every ambiguous case:
+ * an unrecognised type, a missing audience, or a payment-labelled campaign
+ * pointed at a marketing audience all resolve to `marketing_outreach`. That
+ * last case is the one that matters — without it, labelling a campaign
+ * `unpaid_deposit_followup` while aiming it at `inactive_patients` would let
+ * payment authority reach the whole patient base.
+ */
+export function campaignAuthorityClass(campaign: { campaignType?: string | null; audienceType?: string | null }): CampaignAuthorityClass {
+  const byType = campaign.campaignType
+    ? (CAMPAIGN_TYPE_AUTHORITY_CLASS as Record<string, CampaignAuthorityClass | undefined>)[campaign.campaignType]
+    : undefined;
+  if (byType !== 'payment_followup') return 'marketing_outreach';
+  const byAudience = campaign.audienceType
+    ? (AUDIENCE_TYPE_AUTHORITY_CLASS as Record<string, CampaignAuthorityClass | undefined>)[campaign.audienceType]
+    : undefined;
+  return byAudience === 'payment_followup' ? 'payment_followup' : 'marketing_outreach';
+}
+
+/**
+ * Class -> the grants that authorize it. ANY ONE of `manage` authorizes a
+ * write; any one of `read` authorizes a read. Element [0] is the broad grant
+ * and is what a refusal reports, because it is the grant an administrator
+ * would actually assign.
+ */
+export const CAMPAIGN_CLASS_AUTHORITY: Record<CampaignAuthorityClass, {
+  manage: readonly [Permission, ...Permission[]];
+  read: readonly [Permission, ...Permission[]];
+}> = {
+  marketing_outreach: {
+    manage: ['campaign:manage'],
+    read: ['campaign:read'],
+  },
+  payment_followup: {
+    manage: ['campaign:manage', 'campaign:payment-followup:manage'],
+    read: ['campaign:read', 'campaign:payment-followup:manage'],
+  },
+};
+
+function unionAuthority(mode: 'manage' | 'read'): [Permission, ...Permission[]] {
+  const broad = CAMPAIGN_CLASS_AUTHORITY.marketing_outreach[mode][0];
+  const rest = [...new Set(CAMPAIGN_AUTHORITY_CLASSES.flatMap(c => [...CAMPAIGN_CLASS_AUTHORITY[c][mode]]))]
+    .filter(permission => permission !== broad);
+  return [broad, ...rest];
+}
+
+/**
+ * The coarse any-of gate a per-campaign route installs as its preHandler: a
+ * caller holding none of these is refused before the route reads any record.
+ * Derived from the table above so the gate can never drift from it.
+ */
+export const CAMPAIGN_ANY_MANAGE_AUTHORITY = unionAuthority('manage');
+export const CAMPAIGN_ANY_READ_AUTHORITY = unionAuthority('read');
+
+/** The campaign/audience vocabulary a given class covers (for list filtering). */
+export const PAYMENT_FOLLOWUP_CAMPAIGN_TYPES = CAMPAIGN_TYPES.filter(t => CAMPAIGN_TYPE_AUTHORITY_CLASS[t] === 'payment_followup');
+export const PAYMENT_FOLLOWUP_AUDIENCE_TYPES = AUDIENCE_TYPES.filter(a => AUDIENCE_TYPE_AUTHORITY_CLASS[a] === 'payment_followup');
 
 // Canonical Lead.stage vocabulary. `Lead.stage` is a free `String` column, so
 // the ONLY place the vocabulary can be enforced is the API boundary. Declared

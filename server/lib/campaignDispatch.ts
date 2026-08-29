@@ -27,6 +27,14 @@ import {
 //   3. recordCampaignSubmissionResult() appends the truthful outcome.
 // A second dispatcher for the same recipient finds the delivery row already in
 // the claimed state and is a no-op instead of a duplicate send.
+//
+// BRANCH SCOPE. Dispatch never builds its own audience: it sends to exactly the
+// candidate list inside buildCampaignDispatchSnapshot, which resolves
+// Campaign.branchId. That is the same snapshot the launch preview and the
+// launch fingerprint are computed from, so a branch-restricted operator's
+// campaign cannot reach another branch's patients, and no dispatcher (route or
+// scheduler) can widen the audience past what was authorized — the fingerprint
+// check below carries the branch scope and fails closed if it changed.
 // ===========================================================================
 
 export interface DispatchSummary { total: number; accepted: number; deliveryUnknown: number; suppressed: number; skipped: number; setupRequired: number; queued: number; failed: number; authorityBlocked: number; atomicBoundaryBlocked: number; activationBlockers: LiveDispatchBlocker[] }

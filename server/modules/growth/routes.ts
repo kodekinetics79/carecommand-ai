@@ -48,6 +48,30 @@ const configWrite = requirePermission('settings:write');
 // re-cuts crm:read through RoleDefinition re-cuts these three routes with it.
 const growthRead = requirePermission('crm:read');
 
+/**
+ * Read gate for the policy document itself.
+ *
+ * These thresholds are the rules the product colours and classifies patient
+ * data by, so anyone already entitled to see that data is entitled to see the
+ * rule applied to it — reading the band is not settings administration. A
+ * single `settings:read` guard regressed FRONT_DESK, which holds `crm:read`
+ * without it and consequently lost the banded figures on /reviews; a straight
+ * swap to `crm:read` would instead have cut off BILLING and PROVIDER, which
+ * hold `settings:read` without `crm:read`. Either grant is therefore
+ * sufficient. Writes stay administrative: `settings:write`, plus `admin:manage`
+ * for the money-affecting fields.
+ */
+async function policyReadDenied(request: FastifyRequest, reply: FastifyReply): Promise<boolean> {
+  const granted = await getRequestPermissions(request);
+  if (granted.has('crm:read') || granted.has('settings:read')) return false;
+  await reply.code(403).send({
+    error: 'insufficient_permission',
+    permission: 'crm:read',
+    message: 'Reading the growth policy requires crm:read or settings:read.',
+  });
+  return true;
+}
+
 const MONEY_PERMISSION = 'admin:manage' as const;
 
 /**
@@ -221,7 +245,10 @@ export const growthRoutes: FastifyPluginAsync = async app => {
 
   // ----- Policy ------------------------------------------------------------
 
-  app.get('/policy', { preHandler: configRead }, async request => getEffectiveGrowthPolicy(request.auth.tenantId));
+  app.get('/policy', async (request, reply) => {
+    if (await policyReadDenied(request, reply)) return reply;
+    return getEffectiveGrowthPolicy(request.auth.tenantId);
+  });
 
   app.patch('/policy', { preHandler: configWrite }, async (request, reply) => {
     const input = policyPatchSchema.parse(request.body);

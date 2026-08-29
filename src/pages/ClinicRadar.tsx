@@ -11,6 +11,7 @@ import type { AlertCategory, AlertSeverity } from '../types';
 import { fetchList } from '../lib/apiAdapters';
 import { LOADING_STATE, receivedData, type ResourceState } from '../lib/resourceState';
 import { useResource } from '../hooks/useResource';
+import { formatRatingThreshold, growthPolicyProvenance, loadGrowthPolicy, type GrowthPolicy } from '../lib/growthPolicy';
 
 interface ApiBranchOption { id: string; name: string }
 
@@ -100,9 +101,21 @@ const severityConfig: Record<AlertSeverity, { border: string; glow: string }> = 
   low:    { border: 'border-l-[var(--b2)]', glow: '' },
 };
 
-function severityFromRisk(value: number): AlertSeverity {
-  if (value >= 80) return 'high';
-  if (value >= 55) return 'medium';
+/**
+ * Reputation severity, from the tenant's configured bands.
+ *
+ * This screen used to classify `badReviewRisk` at a hardcoded `>= 80` / `>= 55`
+ * while the server's advisory engine classified the SAME field at `>= 60`
+ * (server/modules/advisory/service.ts:308) — two layers, one concept, three
+ * numbers, and no way for a clinic to see which one it was reading. The bands
+ * are now GrowthPolicy's, so the classification is the tenant's own rule.
+ * Advisory still has its own literal and is the remaining divergence.
+ *
+ * Both bounds are INCLUSIVE LOWER bounds (server/modules/growth/defaults.ts).
+ */
+function severityFromRisk(value: number, policy: GrowthPolicy): AlertSeverity {
+  if (value >= policy.reputationRiskHigh) return 'high';
+  if (value >= policy.reputationRiskMedium) return 'medium';
   return 'low';
 }
 
@@ -118,18 +131,43 @@ function competitorRating(raw: string): number | null {
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
-function competitorSeverity(rating: number | null, reviewVolume: number): AlertSeverity {
-  const highVolume = reviewVolume > 350;
+/**
+ * Competitor severity, from the tenant's configured bounds.
+ *
+ * `competitorRating*SeverityMax` are INCLUSIVE UPPER bounds (<=) and
+ * `competitorReviewVolumeHigh` is the one EXCLUSIVE lower bound (>), which is
+ * exactly what the retired `rating <= 4.2` / `<= 4.5` / `reviewVolume > 350`
+ * literals did. The semantics are carried over with the numbers.
+ */
+function competitorSeverity(rating: number | null, reviewVolume: number, policy: GrowthPolicy): AlertSeverity {
+  const highVolume = reviewVolume > policy.competitorReviewVolumeHigh;
   if (rating === null) return highVolume ? 'high' : 'low';
-  if (rating <= 4.2 || highVolume) return 'high';
-  if (rating <= 4.5) return 'medium';
+  if (rating <= policy.competitorRatingHighSeverityMax || highVolume) return 'high';
+  if (rating <= policy.competitorRatingMediumSeverityMax) return 'medium';
   return 'low';
 }
 
-// Module-scope loaders: useResource keys a request by the identity of its
-// source, so these must not be re-created on every render.
+/**
+ * How many rows of each feed this board asks for.
+ *
+ * A PAGE SIZE, not a clinic rule. It decides how much of each feed one screen
+ * pulls, and no clinic would configure it — so it is named here rather than
+ * pushed into GrowthPolicy, and the "Signals loaded" tile says the count is of
+ * this page rather than of the workspace.
+ */
+const RADAR_PAGE_SIZE = 10;
+
+/**
+ * How many detections the timeline card shows. Also a page size: it is how many
+ * rows fit in a sidebar card. The card says when it has cut the list.
+ */
+const TIMELINE_ROW_COUNT = 6;
+
+// Module-scope loaders and paths: useResource keys a request by the identity of
+// its source, so these must not be re-created on every render.
 const loadBranches = (signal: AbortSignal) => fetchList<ApiBranchOption>('/v1/branches?limit=100', signal);
-const loadCompetitors = (signal: AbortSignal) => fetchList<ApiCompetitorRadar>('/v1/competitors/radar?limit=10', signal);
+const loadCompetitors = (signal: AbortSignal) => fetchList<ApiCompetitorRadar>(`/v1/competitors/radar?limit=${RADAR_PAGE_SIZE}`, signal);
+const REPUTATION_PATH = `/v1/reputation?limit=${RADAR_PAGE_SIZE}`;
 
 /**
  * Two feeds, one claim. See the note on the twin helper in Reviews.tsx: a count
@@ -149,15 +187,41 @@ function combineResourceStates<A, B, R>(
   return { status: 'ready', data: merge(a.data, b.data), receivedAt: Math.max(a.receivedAt, b.receivedAt) };
 }
 
+/**
+ * Three feeds, one claim.
+ *
+ * Every severity on this board is decided by the configured policy, so "2 high
+ * priority signals" is not a fact until the reputation cases, the competitor
+ * records AND the bands they are judged against have all arrived. Waiting on
+ * the third is not pedantry: the same case is high under one tenant's bands and
+ * medium under another's, so a count published before the bands land is a count
+ * of the wrong thing rather than an early count of the right one.
+ */
+function combineThree<A, B, C, R>(
+  a: ResourceState<A>,
+  b: ResourceState<B>,
+  c: ResourceState<C>,
+  merge: (a: A, b: B, c: C) => R,
+): ResourceState<R> {
+  return combineResourceStates(
+    combineResourceStates(a, b, (aValue, bValue) => [aValue, bValue] as const),
+    c,
+    ([aValue, bValue], cValue) => merge(aValue, bValue, cValue),
+  );
+}
+
 export default function ClinicRadar() {
   const navigate = useNavigate();
-  // Three independent requests rather than one Promise.all: a user who can read
+  // Four independent requests rather than one Promise.all: a user who can read
   // reputation but not the competitor radar (or the reverse) now sees the half
   // they are entitled to, with a named failure and a retry beside the half they
   // are not, instead of the whole screen collapsing to a single error.
   const branches = useResource<ApiBranchOption[]>(loadBranches);
-  const reputation = useResource<ReputationResponse>('/v1/reputation?limit=10');
+  const reputation = useResource<ReputationResponse>(REPUTATION_PATH);
   const competitors = useResource<ApiCompetitorRadar[]>(loadCompetitors);
+  // The bands every severity on this page is decided by. A fourth feed, held to
+  // the same contract: no band, no severity, and no count of severities.
+  const policy = useResource<GrowthPolicy>(loadGrowthPolicy);
 
   const [activeCategory, setActiveCategory] = useState<RadarCategory | 'all'>('all');
   const [activeTab, setActiveTab] = useState<'all' | 'risk'>('all');
@@ -168,26 +232,29 @@ export default function ClinicRadar() {
   const branchOptions = useMemo(() => receivedData(branches.state) ?? [], [branches.state]);
   const receivedReputation = receivedData(reputation.state);
   const receivedCompetitors = receivedData(competitors.state);
+  // Null until the policy answers. Every producer below is guarded on it, so an
+  // unclassifiable row is never given a severity — not even a provisional one.
+  const receivedPolicy = receivedData(policy.state);
 
-  const reputationSignals = useMemo<SignalRow[]>(() => (receivedReputation?.cases ?? []).map(caseRow => ({
+  const reputationSignals = useMemo<SignalRow[]>(() => (receivedPolicy === null ? [] : (receivedReputation?.cases ?? []).map(caseRow => ({
     id: caseRow.id,
     category: 'reputation' as const,
-    severity: severityFromRisk(caseRow.badReviewRisk),
+    severity: severityFromRisk(caseRow.badReviewRisk, receivedPolicy),
     title: `${caseRow.branch.name}: ${caseRow.workflowStatus}`,
     description: caseRow.unresolvedComplaint,
     action: caseRow.recoveryWorkflow,
     branchId: caseRow.branchId,
     branchName: caseRow.branch.name,
     createdAt: caseRow.createdAt,
-  })), [receivedReputation]);
+  }))), [receivedReputation, receivedPolicy]);
 
-  const competitorSignals = useMemo<SignalRow[]>(() => (receivedCompetitors ?? []).map(competitor => {
+  const competitorSignals = useMemo<SignalRow[]>(() => (receivedPolicy === null ? [] : (receivedCompetitors ?? []).map(competitor => {
     const rating = competitorRating(competitor.googleRating);
     const themes = competitor.complaintThemes.join(' · ');
     return {
       id: competitor.id,
       category: 'operations' as const,
-      severity: competitorSeverity(rating, competitor.reviewVolume),
+      severity: competitorSeverity(rating, competitor.reviewVolume, receivedPolicy),
       title: `${competitor.name} near ${competitor.branch.name}`,
       // States what the record holds. The old copy asserted that every
       // competitor row "is creating a market opening", including rows with no
@@ -197,7 +264,7 @@ export default function ClinicRadar() {
       branchName: competitor.branch.name,
       createdAt: competitor.createdAt,
     };
-  }), [receivedCompetitors]);
+  })), [receivedCompetitors, receivedPolicy]);
 
   const signals = useMemo(() => [...reputationSignals, ...competitorSignals], [competitorSignals, reputationSignals]);
 
@@ -213,18 +280,19 @@ export default function ClinicRadar() {
 
   const selectedBranchName = selectedBranchId === 'all' ? 'All clinics' : branchOptions.find(branch => branch.id === selectedBranchId)?.name ?? 'All clinics';
 
-  // The signal board itself is useful with one feed down, so it renders what
-  // arrived and names what did not. The counts above it are not: a total drawn
-  // from half the feeds is not a total, so it waits for both.
-  const signalTotals = combineResourceStates(reputation.state, competitors.state, () => ({
+  // The counts above the board are claims spanning every feed: a total drawn
+  // from some of them is not a total, and a severity split drawn without the
+  // bands is not a split, so all three have to answer first.
+  const signalTotals = combineThree(reputation.state, competitors.state, policy.state, () => ({
     total: signals.length,
     high: signals.filter(signal => signal.severity === 'high').length,
     medium: signals.filter(signal => signal.severity === 'medium').length,
   }));
-  const boardState = combineResourceStates(reputation.state, competitors.state, () => filtered);
+  const boardState = combineThree(reputation.state, competitors.state, policy.state, () => filtered);
+  const timelineState = combineThree(reputation.state, competitors.state, policy.state, () => signals);
   const anyFeedFailed = reputation.state.status === 'error' || competitors.state.status === 'error';
 
-  const reloadSignals = () => { reputation.reload(); competitors.reload(); };
+  const reloadSignals = () => { reputation.reload(); competitors.reload(); policy.reload(); };
 
   const signalTabs = [
     { id: 'all', label: 'All signals' },
@@ -269,7 +337,7 @@ export default function ClinicRadar() {
               <div className="bg-[var(--s2)] rounded-2xl border border-[var(--b1)] p-4">
                 <p className="text-[10px] font-bold uppercase tracking-widest text-t3 mb-2">Signals loaded</p>
                 <p className="text-2xl font-bold text-t1 tabular-nums">{totals.total}</p>
-                <p className="text-xs text-t3 mt-0.5">Current result set</p>
+                <p className="text-xs text-t3 mt-0.5">Current result set · most recent {RADAR_PAGE_SIZE} of each feed</p>
               </div>
               <div className="bg-[var(--red-soft)] rounded-2xl border border-[var(--b1)] p-4">
                 <p className="text-[10px] font-bold uppercase tracking-widest text-red-v mb-2">High Priority</p>
@@ -303,6 +371,18 @@ export default function ClinicRadar() {
           )}
         </ResourceSection>
       </div>
+
+      {/* The bands every "High"/"Medium" on this page is asserted against,
+          written out as the values actually used. They render only once the
+          policy has answered: an unstated rule is bad, but a stated rule that
+          is not the one being applied is worse. */}
+      {receivedPolicy && (
+        <p className="text-[11px] text-t3">
+          Reputation cases count as high at a recorded risk ≥ {receivedPolicy.reputationRiskHigh} and medium at ≥ {receivedPolicy.reputationRiskMedium}.
+          {' '}Competitors count as high at a rating ≤ {formatRatingThreshold(receivedPolicy.competitorRatingHighSeverityMax)} or more than {receivedPolicy.competitorReviewVolumeHigh} reviews, and medium at a rating ≤ {formatRatingThreshold(receivedPolicy.competitorRatingMediumSeverityMax)}.
+          {' '}{growthPolicyProvenance(receivedPolicy)}
+        </p>
+      )}
 
       <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-3">
         <p className="text-xs font-semibold text-t2">Clinic</p>
@@ -544,7 +624,7 @@ export default function ClinicRadar() {
           <BentoCard title="Signal Timeline" subtitle="Recent detections">
             <ResourceSection
               label="Signal timeline"
-              state={combineResourceStates(reputation.state, competitors.state, () => signals)}
+              state={timelineState}
               onRetry={reloadSignals}
               lines={3}
               rowClassName="h-10 rounded-xl"
@@ -554,28 +634,39 @@ export default function ClinicRadar() {
                 description: 'Both feeds loaded successfully and neither has a record to place on the timeline.',
               }}
             >
-              {rows => (
-                <div className="space-y-3">
-                  {rows.slice(0, 6).map((alert, i) => (
-                    <div key={alert.id} className="flex items-start gap-3">
-                      <div className="flex flex-col items-center gap-1">
-                        <div className={`w-2 h-2 rounded-full mt-1 shrink-0 ${
-                          alert.severity === 'high' ? 'bg-red-500' :
-                          alert.severity === 'medium' ? 'bg-amber-500' : 'bg-[var(--b2)]'
-                        }`} />
-                        {i < Math.min(rows.length, 6) - 1 && <div className="w-px h-6 bg-[var(--b1)]" />}
+              {rows => {
+                // One list drives both the rows and the connector. The
+                // connector used to re-derive the cut with its own
+                // `Math.min(rows.length, 6)`, so the two could disagree.
+                const visible = rows.slice(0, TIMELINE_ROW_COUNT);
+                return (
+                  <div className="space-y-3">
+                    {visible.map((alert, i) => (
+                      <div key={alert.id} className="flex items-start gap-3">
+                        <div className="flex flex-col items-center gap-1">
+                          <div className={`w-2 h-2 rounded-full mt-1 shrink-0 ${
+                            alert.severity === 'high' ? 'bg-red-500' :
+                            alert.severity === 'medium' ? 'bg-amber-500' : 'bg-[var(--b2)]'
+                          }`} />
+                          {i < visible.length - 1 && <div className="w-px h-6 bg-[var(--b1)]" />}
+                        </div>
+                        <div className="flex-1 min-w-0 pb-1">
+                          <p className="text-xs font-semibold text-t1 leading-tight">{alert.title.split(':')[0]}</p>
+                          <p className="text-[10px] text-t3 mt-0.5">
+                            {new Date(alert.createdAt).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} ·{' '}
+                            {new Date(alert.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}
+                          </p>
+                        </div>
                       </div>
-                      <div className="flex-1 min-w-0 pb-1">
-                        <p className="text-xs font-semibold text-t1 leading-tight">{alert.title.split(':')[0]}</p>
-                        <p className="text-[10px] text-t3 mt-0.5">
-                          {new Date(alert.createdAt).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} ·{' '}
-                          {new Date(alert.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}
-                        </p>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
+                    ))}
+                    {rows.length > visible.length && (
+                      <p className="text-[10px] text-t3">
+                        Most recent {visible.length} of {rows.length} loaded detections.
+                      </p>
+                    )}
+                  </div>
+                );
+              }}
             </ResourceSection>
           </BentoCard>
 

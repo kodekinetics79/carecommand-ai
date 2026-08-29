@@ -318,6 +318,7 @@ model Branch {
   devices                        Device[]
   receptionistLocations          ReceptionistLocation[]
   receptionistOutboundCampaignDefaults ReceptionistOutboundCampaign[] @relation("ReceptionistOutboundDefaultBranch")
+  campaigns                      Campaign[]
 
   @@unique([tenantId, name])
   @@unique([tenantId, id])
@@ -690,6 +691,15 @@ model Campaign {
   endsAt           DateTime?
   // CRM / reactivation engine (Phase A). Existing analytics fields above are
   // reused; these add playbook/approval/delivery semantics.
+  //
+  // Branch authority for the campaign. NULL means deliberately tenant-wide and
+  // is only creatable by an operator who is not restricted to a branch; a
+  // branch-restricted operator's campaign always carries their own branch. The
+  // audience query, the launch preview, the launch fingerprint and dispatch all
+  // resolve through this ONE column, so preview and dispatch can never disagree
+  // about who is in scope. Semantics match branchScope() in server/lib/scope.ts:
+  // exact match, and a NULL-branch row is out of scope for a scoped caller.
+  branchId         String?            @db.Uuid
   campaignType     String?
   audienceType     String?
   campaignChannel  String?
@@ -713,10 +723,15 @@ model Campaign {
   createdAt        DateTime           @default(now())
   updatedAt        DateTime           @updatedAt
   tenant           Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  // Tenant-consistent composite FK: a campaign can never be scoped to another
+  // tenant's branch, and RESTRICT stops a branch deletion from silently
+  // widening a scoped campaign back to tenant-wide.
+  branch           Branch?            @relation(fields: [tenantId, branchId], references: [tenantId, id], onDelete: Restrict)
   deliveries       CampaignDelivery[]
 
   @@index([tenantId, status, createdAt])
   @@index([tenantId, archivedAt, createdAt])
+  @@index([tenantId, branchId, createdAt])
 }
 
 model Review {

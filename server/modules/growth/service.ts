@@ -18,8 +18,11 @@ import {
 // rows and from then on the table is the truth — otherwise deleting a segment
 // would silently resurrect it from the defaults on the next read.
 //
-// Nothing outside this module and its tests reads any of this yet. Rewiring
-// crmService.ts and the /v1/patients/summary counters is a later increment.
+// crmService.ts and the /v1/patients/summary counters now read this (see
+// PENDING_CONFIG_CALL_SITES in ./defaults for what is left). GrowthPolicy is
+// RLS-enrolled, so a caller already inside a tenant transaction must pass that
+// transaction as `client`; reading it on the global client under app_rls
+// returns no row and silently resolves to the code defaults.
 // ===========================================================================
 
 type Client = Pick<typeof db, 'growthPolicy' | 'growthSegmentDefinition' | 'growthChannelCost'>;

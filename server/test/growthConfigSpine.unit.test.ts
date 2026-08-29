@@ -290,14 +290,19 @@ describe('growth config spine — the churn-risk / LTV threshold conflict is res
     expect(crmService).not.toContain('Math.max(1, ...');
   });
 
-  it('still shows the server disagreeing, and names it as the call site left to rewire', () => {
-    // This is the defect the config exists to end. It is deliberately NOT fixed
-    // here (patients/routes.ts belongs to another increment); it is recorded so
-    // it cannot be forgotten. When that call site starts reading GrowthPolicy,
-    // these two assertions are what tells you to delete them.
-    expect(patientRoutes).toContain('churnRisk: { gte: 60 }');
-    expect(patientRoutes).toContain('lifetimeValue: { gt: 4000 }');
-    expect(PENDING_CONFIG_CALL_SITES.some(site => site.includes('patients/routes.ts'))).toBe(true);
+  it('has the patients summary reading the policy instead of its own literals', () => {
+    // This assertion used to pin the divergence rather than the fix: the server
+    // counted churnRisk >= 60 while three frontend files used >= 50, so a
+    // patient at 55% was at risk on one screen and not another in the same
+    // session. That call site now reads GrowthPolicy, so the guard flips to
+    // pinning the convergence — the literals must not come back, and the read
+    // must stay.
+    expect(patientRoutes).not.toContain('churnRisk: { gte: 60 }');
+    expect(patientRoutes).not.toContain('lifetimeValue: { gt: 4000 }');
+    expect(patientRoutes).toContain('getEffectiveGrowthPolicy');
+    expect(patientRoutes).toContain('churnRiskHigh');
+    expect(patientRoutes).toContain('highValuePatientLtv');
+    expect(PENDING_CONFIG_CALL_SITES.some(site => site.includes('patients/routes.ts'))).toBe(false);
   });
 });
 

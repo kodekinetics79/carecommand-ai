@@ -1,15 +1,18 @@
-import type { FastifyPluginAsync } from 'fastify';
+import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { db } from '../../lib/db';
 import { env } from '../../config/env';
 import { audit } from '../../lib/audit';
-import { requirePermission } from '../../lib/permissions';
+import { requirePermission, requireAnyPermission, hasPermission, denyPermission } from '../../lib/permissions';
+import { branchScope, assertBranchAccess } from '../../lib/scope';
 import { requireFeature, isFeatureEnabled } from '../../lib/entitlements';
 import { emitBusinessEvent, upsertSignal, createRecommendation, type WorkflowEventType } from '../../lib/intelligence';
 import type { Campaign } from '../../generated/prisma/client';
 import {
   CAMPAIGN_TYPES, AUDIENCE_TYPES, STAFF_FACING_AUDIENCES,
+  CAMPAIGN_CLASS_AUTHORITY, CAMPAIGN_ANY_MANAGE_AUTHORITY, CAMPAIGN_ANY_READ_AUTHORITY,
+  PAYMENT_FOLLOWUP_CAMPAIGN_TYPES, PAYMENT_FOLLOWUP_AUDIENCE_TYPES, campaignAuthorityClass,
   buildAudience, previewAudience, generateDraft, providerReadiness, countOpenSlots,
   channelStatus, maskDestination, isSuppressed, NON_VOICE_OUTREACH_AUTHORITY_VERSION,
   LIVE_DISPATCH_CHANNELS, LIVE_DISPATCH_FENCE_VERSION,
@@ -49,7 +52,19 @@ const campaignFeature = requireFeature('campaign_automation');
 // the Patient CRM entitlement that every plan tier includes.
 const patientCrmFeature = requireFeature('patient_crm');
 const campaignRead = requirePermission('campaign:read');
+// Tenant-wide campaign machinery — the live-dispatch activation switch,
+// automation rules, the opportunity scan. These are not scoped to one campaign,
+// so they keep the single broad grant and are deliberately NOT reachable by the
+// narrow payment-follow-up authority.
 const campaignManage = requirePermission('campaign:manage');
+// Per-campaign routes. Authority over ONE campaign depends on what that
+// campaign is (CAMPAIGN_CLASS_AUTHORITY in server/lib/campaigns.ts), which the
+// route cannot know until it has read the record — and it must not read the
+// record for a caller with no campaign authority at all. So these routes carry
+// a coarse any-of gate, which refuses such a caller before any resource state
+// is touched, and then run the exact per-class check on the loaded campaign.
+const campaignEntityManage = requireAnyPermission(...CAMPAIGN_ANY_MANAGE_AUTHORITY);
+const campaignEntityRead = requireAnyPermission(...CAMPAIGN_ANY_READ_AUTHORITY);
 // Audience previews, consent, and suppression records expose patient identity
 // and contact evidence, so they take the SAME grant as GET /v1/leads.
 const crmRead = requirePermission('crm:read');
@@ -73,9 +88,42 @@ const AUDIENCE_FEATURE: Record<AudienceType, string> = {
   insurance_update_request: 'insurance_eligibility', appointment_request_followup: 'ai_receptionist',
 };
 
+/**
+ * The exact per-campaign authority check. `mode` is 'manage' for any write or
+ * launch surface and 'read' for a disclosure surface. Returns true when the
+ * caller may proceed; otherwise it has already sent the 403 naming the broad
+ * grant an administrator would assign for that class.
+ */
+async function authorizedForCampaign(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  campaign: { campaignType?: string | null; audienceType?: string | null },
+  mode: 'manage' | 'read',
+): Promise<boolean> {
+  const accepted = CAMPAIGN_CLASS_AUTHORITY[campaignAuthorityClass(campaign)][mode];
+  for (const permission of accepted) {
+    if (await hasPermission(request, permission)) return true;
+  }
+  await denyPermission(reply, accepted[0]);
+  return false;
+}
+
+/**
+ * Tenant + branch predicate for every campaign lookup in this module.
+ * `branchScope()` semantics exactly: an exact branchId match for a restricted
+ * caller, which means a tenant-wide (NULL-branch) campaign is OUT of scope for
+ * them and comes back as "not found". That is deliberate — a branch-restricted
+ * manager must not be able to open, edit or LAUNCH a campaign whose audience
+ * reaches branches they cannot read.
+ */
+function campaignScopeWhere(request: FastifyRequest) {
+  return { tenantId: request.auth.tenantId, ...branchScope(request) };
+}
+
 function mapCampaign(c: Campaign) {
   return {
     id: c.id, name: c.name, campaignType: c.campaignType, audienceType: c.audienceType,
+    branchId: c.branchId,
     channel: c.campaignChannel, status: c.status, requiresApproval: c.requiresApproval,
     approvedByUserId: c.approvedByUserId, approvedAt: c.approvedAt?.toISOString() ?? null,
     scheduledAt: c.scheduledAt?.toISOString() ?? null, messageSubject: c.messageSubject,
@@ -258,20 +306,27 @@ export const crmRoutes: FastifyPluginAsync = async app => {
   });
 
   // ----- Campaigns CRUD ---------------------------------------------------
-  app.get('/campaigns', { preHandler: [campaignRead, campaignFeature] }, async request => {
-    const rows = await db.campaign.findMany({ where: { tenantId: request.auth.tenantId, campaignType: { not: null }, archivedAt: null }, orderBy: { createdAt: 'desc' }, take: 100 });
+  app.get('/campaigns', { preHandler: [campaignEntityRead, campaignFeature] }, async request => {
+    // A caller who holds only the payment-follow-up grant is not entitled to
+    // learn that a reactivation campaign exists, so the list is narrowed to the
+    // classes their grants actually cover rather than 403-ing the whole page.
+    const classFilter = await hasPermission(request, 'campaign:read')
+      ? {}
+      : { campaignType: { in: [...PAYMENT_FOLLOWUP_CAMPAIGN_TYPES] }, audienceType: { in: [...PAYMENT_FOLLOWUP_AUDIENCE_TYPES] } };
+    const rows = await db.campaign.findMany({ where: { ...campaignScopeWhere(request), campaignType: { not: null }, archivedAt: null, ...classFilter }, orderBy: { createdAt: 'desc' }, take: 100 });
     return rows.map(mapCampaign);
   });
 
-  app.get('/campaigns/:id', { preHandler: [campaignRead, campaignFeature] }, async request => {
+  app.get('/campaigns/:id', { preHandler: [campaignEntityRead, campaignFeature] }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
-    const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    const c = await db.campaign.findFirst({ where: { id, ...campaignScopeWhere(request) } });
     if (!c) throw app.httpErrors.notFound('Campaign not found');
+    if (!(await authorizedForCampaign(request, reply, c, 'read'))) return reply;
     const deliveries = await db.campaignDelivery.groupBy({ by: ['status'], where: { tenantId: request.auth.tenantId, campaignId: id }, _count: true });
     return { ...mapCampaign(c), deliveryCounts: Object.fromEntries(deliveries.map(d => [d.status, d._count])) };
   });
 
-  app.post('/campaigns', { preHandler: [campaignManage, campaignFeature] }, async (request, reply) => {
+  app.post('/campaigns', { preHandler: [campaignEntityManage, campaignFeature] }, async (request, reply) => {
     const input = z.object({
       name: z.string().trim().min(2).max(160),
       campaignType: z.enum(CAMPAIGN_TYPES),
@@ -280,25 +335,51 @@ export const crmRoutes: FastifyPluginAsync = async app => {
       messageSubject: z.string().max(200).optional(),
       messageTemplate: z.string().max(2000).optional(),
       scheduledAt: z.coerce.date().optional(),
+      // Only meaningful for an unrestricted operator choosing to target one
+      // branch. A branch-restricted operator's own branch is stamped below and
+      // this field cannot be used to escape it.
+      branchId: uuid.optional(),
     }).parse(request.body);
+    if (!(await authorizedForCampaign(request, reply, input, 'manage'))) return reply;
+    // Branch authority, decided once, at the only moment scope is chosen.
+    // A branch-restricted caller ALWAYS gets their own branch and can never
+    // create a tenant-wide campaign; assertBranchAccess refuses an attempt to
+    // name a different one. An unrestricted caller may name a branch of their
+    // own tenant, or omit it for a deliberately tenant-wide campaign.
+    let branchId: string | null;
+    if (request.auth.branchId) {
+      if (input.branchId) assertBranchAccess(request, input.branchId);
+      branchId = request.auth.branchId;
+    } else if (input.branchId) {
+      const branch = await db.branch.findFirst({ where: { id: input.branchId, tenantId: request.auth.tenantId }, select: { id: true } });
+      if (!branch) throw app.httpErrors.notFound('Branch not found');
+      branchId = branch.id;
+    } else {
+      branchId = null;
+    }
     const row = await db.campaign.create({
       data: {
         tenantId: request.auth.tenantId, name: input.name, goal: input.campaignType, status: 'APPROVAL_REQUIRED', channels: [],
+        branchId,
         campaignType: input.campaignType, audienceType: input.audienceType, campaignChannel: input.channel,
         messageSubject: input.messageSubject, messageTemplate: input.messageTemplate,
         requiresApproval: true, scheduledAt: input.scheduledAt, createdByUserId: request.auth.userId, draftSource: 'rule_based',
       },
     });
-    await audit(request, { action: 'campaign.created', resource: 'campaign', resourceId: row.id, metadata: { campaignType: input.campaignType } });
+    await audit(request, { action: 'campaign.created', resource: 'campaign', resourceId: row.id, metadata: { campaignType: input.campaignType, branchScope: branchId ?? 'tenant' } });
     await emitBusinessEvent(request.auth.tenantId, { eventType: 'campaign.created', entityType: 'campaign', entityId: row.id, sourceModule: 'crm', payload: { campaignType: input.campaignType } }).catch(() => {});
     return reply.code(201).send(mapCampaign(row));
   });
 
-  app.patch('/campaigns/:id', { preHandler: [campaignManage, campaignFeature] }, async request => {
+  app.patch('/campaigns/:id', { preHandler: [campaignEntityManage, campaignFeature] }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const input = z.object({ name: z.string().trim().min(2).max(160).optional(), messageSubject: z.string().max(200).optional(), messageTemplate: z.string().max(2000).optional(), channel: channelEnum.optional(), scheduledAt: z.coerce.date().optional() }).parse(request.body);
-    const existing = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    const existing = await db.campaign.findFirst({ where: { id, ...campaignScopeWhere(request) } });
     if (!existing) throw app.httpErrors.notFound('Campaign not found');
+    if (!(await authorizedForCampaign(request, reply, existing, 'manage'))) return reply;
+    // Neither branch scope nor campaign/audience type is editable: both are the
+    // authority this campaign was created under, and the launch fingerprint is
+    // bound to them.
     if (!['DRAFT', 'APPROVAL_REQUIRED'].includes(existing.status)) throw app.httpErrors.conflict('Only draft/approval-required campaigns can be edited');
     const row = await db.campaign.update({ where: { id }, data: { name: input.name, messageSubject: input.messageSubject, messageTemplate: input.messageTemplate, campaignChannel: input.channel, scheduledAt: input.scheduledAt } });
     await audit(request, { action: 'campaign.updated', resource: 'campaign', resourceId: id });
@@ -306,10 +387,11 @@ export const crmRoutes: FastifyPluginAsync = async app => {
   });
 
   // ----- Rule-based draft generation (requires approval before launch) ----
-  app.post('/campaigns/:id/draft', { preHandler: [campaignManage, campaignFeature] }, async request => {
+  app.post('/campaigns/:id/draft', { preHandler: [campaignEntityManage, campaignFeature] }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
-    const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    const c = await db.campaign.findFirst({ where: { id, ...campaignScopeWhere(request) } });
     if (!c) throw app.httpErrors.notFound('Campaign not found');
+    if (!(await authorizedForCampaign(request, reply, c, 'manage'))) return reply;
     const campaignType = (c.campaignType ?? 'custom') as CampaignType;
     const channel = (c.campaignChannel ?? 'sms') as CommChannel;
     const draft = generateDraft(campaignType, channel, (c.audienceType ?? 'inactive_patients') as AudienceType);
@@ -343,14 +425,15 @@ export const crmRoutes: FastifyPluginAsync = async app => {
   });
 
   // ----- Approve ----------------------------------------------------------
-  app.post('/campaigns/:id/approve', { preHandler: [campaignManage, campaignFeature] }, async request => {
+  app.post('/campaigns/:id/approve', { preHandler: [campaignEntityManage, campaignFeature] }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const authorization = z.object({
       previewFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
       confirmExactAudienceTemplateProvider: z.literal(true),
     }).optional().parse(request.body);
-    const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    const c = await db.campaign.findFirst({ where: { id, ...campaignScopeWhere(request) } });
     if (!c) throw app.httpErrors.notFound('Campaign not found');
+    if (!(await authorizedForCampaign(request, reply, c, 'manage'))) return reply;
     let preview: Awaited<ReturnType<typeof buildCampaignLaunchPreview>> | null = null;
     if (authorization) {
       if (!c.audienceType) throw app.httpErrors.badRequest('Campaign has no audience type');
@@ -389,16 +472,19 @@ export const crmRoutes: FastifyPluginAsync = async app => {
   // The fingerprint binds the exact recipient eligibility snapshot, message
   // revision, channel, provider identity, and provider mode without returning
   // recipient identifiers or destinations to the browser.
-  app.get('/campaigns/:id/launch-preview', { preHandler: [campaignManage, campaignFeature] }, async request => {
+  app.get('/campaigns/:id/launch-preview', { preHandler: [campaignEntityManage, campaignFeature] }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
-    const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId, archivedAt: null } });
+    const c = await db.campaign.findFirst({ where: { id, ...campaignScopeWhere(request), archivedAt: null } });
     if (!c) throw app.httpErrors.notFound('Campaign not found');
+    if (!(await authorizedForCampaign(request, reply, c, 'manage'))) return reply;
     if (!c.audienceType) throw app.httpErrors.badRequest('Campaign has no audience type');
+    // Resolved from Campaign.branchId, not from this caller: the preview an
+    // operator authorizes is exactly the audience dispatch will resolve.
     return buildCampaignLaunchPreview(request.auth.tenantId, c);
   });
 
   // ----- Launch (build audience → idempotent deliveries) ------------------
-  app.post('/campaigns/:id/launch', { preHandler: [campaignManage, campaignFeature] }, async (request, reply) => {
+  app.post('/campaigns/:id/launch', { preHandler: [campaignEntityManage, campaignFeature] }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const body = z.object({
       force: z.boolean().default(false),
@@ -411,8 +497,9 @@ export const crmRoutes: FastifyPluginAsync = async app => {
         message: 'Bulk force retry is disabled. Reconcile provider evidence and authorize a recipient-scoped retry before resubmission.',
       });
     }
-    const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId, archivedAt: null } });
+    const c = await db.campaign.findFirst({ where: { id, ...campaignScopeWhere(request), archivedAt: null } });
     if (!c) throw app.httpErrors.notFound('Campaign not found');
+    if (!(await authorizedForCampaign(request, reply, c, 'manage'))) return reply;
     if (!c.audienceType) throw app.httpErrors.badRequest('Campaign has no audience type');
     if (c.requiresApproval && !c.approvedByUserId) throw app.httpErrors.conflict('Campaign requires approval before launch');
 
@@ -473,29 +560,32 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     });
   });
 
-  app.post('/campaigns/:id/pause', { preHandler: [campaignManage, campaignFeature] }, async request => {
+  app.post('/campaigns/:id/pause', { preHandler: [campaignEntityManage, campaignFeature] }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
-    const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    const c = await db.campaign.findFirst({ where: { id, ...campaignScopeWhere(request) } });
     if (!c) throw app.httpErrors.notFound('Campaign not found');
+    if (!(await authorizedForCampaign(request, reply, c, 'manage'))) return reply;
     const row = await db.campaign.update({ where: { id }, data: { status: 'PAUSED' } });
     await audit(request, { action: 'campaign.paused', resource: 'campaign', resourceId: id });
     return mapCampaign(row);
   });
 
-  app.post('/campaigns/:id/cancel', { preHandler: [campaignManage, campaignFeature] }, async request => {
+  app.post('/campaigns/:id/cancel', { preHandler: [campaignEntityManage, campaignFeature] }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
-    const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    const c = await db.campaign.findFirst({ where: { id, ...campaignScopeWhere(request) } });
     if (!c) throw app.httpErrors.notFound('Campaign not found');
+    if (!(await authorizedForCampaign(request, reply, c, 'manage'))) return reply;
     const row = await db.campaign.update({ where: { id }, data: { status: 'CANCELLED' } });
     await audit(request, { action: 'campaign.cancelled', resource: 'campaign', resourceId: id });
     return mapCampaign(row);
   });
 
   // ----- Archive (preserve campaign + delivery evidence) ------------------
-  app.delete('/campaigns/:id', { preHandler: [campaignManage, campaignFeature] }, async (request, reply) => {
+  app.delete('/campaigns/:id', { preHandler: [campaignEntityManage, campaignFeature] }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
-    const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    const c = await db.campaign.findFirst({ where: { id, ...campaignScopeWhere(request) } });
     if (!c) throw app.httpErrors.notFound('Campaign not found');
+    if (!(await authorizedForCampaign(request, reply, c, 'manage'))) return reply;
     if (c.archivedAt) return reply.send(mapCampaign(c));
     const row = await db.$transaction(async tx => {
       const archived = await tx.campaign.update({ where: { id }, data: { archivedAt: new Date(), status: 'CANCELLED' } });
@@ -659,8 +749,13 @@ export const crmRoutes: FastifyPluginAsync = async app => {
   });
 
   // ----- Delivery log (mobile-ready) --------------------------------------
-  app.get('/campaigns/:id/deliveries', { preHandler: [campaignRead, campaignFeature] }, async request => {
+  app.get('/campaigns/:id/deliveries', { preHandler: [campaignEntityRead, campaignFeature] }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
+    // The delivery log discloses who a campaign reached, so it takes the same
+    // branch scope and the same per-class read authority as the campaign itself.
+    const c = await db.campaign.findFirst({ where: { id, ...campaignScopeWhere(request) } });
+    if (!c) throw app.httpErrors.notFound('Campaign not found');
+    if (!(await authorizedForCampaign(request, reply, c, 'read'))) return reply;
     const rows = await db.campaignDelivery.findMany({ where: { tenantId: request.auth.tenantId, campaignId: id }, orderBy: { createdAt: 'desc' }, take: 500 });
     return rows.map(d => ({ deliveryId: d.id, campaignId: d.campaignId, patientId: d.patientId, leadId: d.leadId, channel: d.channel, destinationMasked: d.destinationMasked, status: d.status, provider: d.provider, providerMessageId: d.providerMessageId, failureReason: d.failureReason, sentAt: d.sentAt?.toISOString() ?? null, providerAcceptedAt: d.providerAcceptedAt?.toISOString() ?? null, deliveredAt: d.deliveredAt?.toISOString() ?? null, statusUpdatedAt: d.statusUpdatedAt.toISOString(), deepLinkTarget: `campaign/${id}` }));
   });

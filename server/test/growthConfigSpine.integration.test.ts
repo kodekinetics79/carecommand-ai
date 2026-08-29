@@ -26,8 +26,11 @@ const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { GROWTH_POLICY_DEFAULTS, GROWTH_SEGMENT_DEFAULTS, GROWTH_CHANNEL_COST_DEFAULTS } = await import('../modules/growth/defaults');
 
-type Role = 'OWNER' | 'ADMIN' | 'MANAGER' | 'FRONT_DESK' | 'ANALYST';
-const ROLES: Role[] = ['OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK', 'ANALYST'];
+type Role = 'OWNER' | 'ADMIN' | 'MANAGER' | 'FRONT_DESK' | 'ANALYST' | 'BILLING' | 'PROVIDER' | 'AUDITOR';
+// BILLING/PROVIDER hold settings:read without crm:read; FRONT_DESK holds
+// crm:read without settings:read; AUDITOR holds neither. The policy-read
+// gate is asserted against all four, so the fixture must mint all of them.
+const ROLES: Role[] = ['OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK', 'ANALYST', 'BILLING', 'PROVIDER', 'AUDITOR'];
 
 let app: FastifyInstance;
 const tenantIds: string[] = [];
@@ -151,14 +154,39 @@ describe('growth policy — authorization is by permission, and money is held hi
     });
   });
 
-  it('closes reads and writes to roles with no settings grant', async () => {
+  it('closes writes to roles with no settings grant while keeping the read open', async () => {
     const t = await makeTenant();
-    expect((await getPolicy(t, 'FRONT_DESK')).statusCode).toBe(403);
     const analystWrite = await patchPolicy(t, 'ANALYST', { goingColdDays: 3 });
     expect(analystWrite.statusCode).toBe(403);
     expect(analystWrite.json()).toMatchObject({ error: 'insufficient_permission', permission: 'settings:write' });
     // ANALYST may still read the configuration.
     expect((await getPolicy(t, 'ANALYST')).statusCode).toBe(200);
+  });
+
+  // These thresholds are the rules the product colours and classifies patient
+  // data by, so anyone entitled to see that data is entitled to see the rule
+  // applied to it. A single settings:read gate regressed FRONT_DESK, which holds
+  // crm:read without it and lost the banded figures on /reviews; swapping to
+  // crm:read alone would instead have cut off BILLING and PROVIDER, which hold
+  // settings:read without crm:read. Either grant reads; neither writes.
+  it('grants the policy read to crm:read and settings:read alike, and to neither without one', async () => {
+    const t = await makeTenant();
+
+    // crm:read without settings:read — the regression this closes.
+    expect((await getPolicy(t, 'FRONT_DESK')).statusCode).toBe(200);
+    // settings:read without crm:read — must not be traded away for the above.
+    expect((await getPolicy(t, 'BILLING')).statusCode).toBe(200);
+    expect((await getPolicy(t, 'PROVIDER')).statusCode).toBe(200);
+    // Holding neither is still refused.
+    const denied = await getPolicy(t, 'AUDITOR');
+    expect(denied.statusCode).toBe(403);
+    expect(denied.json()).toMatchObject({ error: 'insufficient_permission' });
+
+    // Reading never confers writing, for any of them.
+    for (const role of ['FRONT_DESK', 'BILLING', 'PROVIDER'] as const) {
+      expect((await patchPolicy(t, role, { goingColdDays: 5 })).statusCode).toBe(403);
+    }
+    expect(await db.growthPolicy.findUnique({ where: { tenantId: t.id } })).toBeNull();
   });
 
   it('refuses an incoherent policy instead of storing a band that can never match', async () => {
