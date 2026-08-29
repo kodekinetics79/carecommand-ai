@@ -2,19 +2,27 @@ import { useCallback, useEffect, useState } from 'react';
 import { ShieldCheck, Loader2 } from 'lucide-react';
 import { Field, TextArea } from '../ui/Field';
 import { receptionistApi as api, type CallLog, type AppointmentRequest, type OptOut } from '../../lib/receptionist';
+import { describeFailure, type ResourceFailure } from '../../lib/resourceState';
+import { isBusy, useMutationState } from '../../hooks/useMutationState';
 import ModuleTabs from '../ui/ModuleTabs';
 import { formatEnumLabel, maskedPhone, maskedProviderId, outcomeBadge } from './helpers';
 import { ConfirmedButton } from './shared';
+import { LoadFailureNotice, MutationNotice } from './MutationNotice';
+
+type ActivityPart = 'calls' | 'requests' | 'optouts';
+type LoadFailures = Partial<Record<ActivityPart, ResourceFailure>>;
 
 // ===== Activity Panel ======================================================
 
 export function ActivityPanel({ clinicId }: { clinicId: string }) {
   const [calls, setCalls] = useState<CallLog[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const [loadFailures, setLoadFailures] = useState<LoadFailures>({});
   const [selectedCall, setSelectedCall] = useState<CallLog | null>(null);
   const [callDetailLoading, setCallDetailLoading] = useState(false);
   const [callDetailError, setCallDetailError] = useState<string | null>(null);
-  const [reviewSaving, setReviewSaving] = useState(false);
-  const [reviewError, setReviewError] = useState<string | null>(null);
+  const reviewState = useMutationState();
+  const reviewSaving = isBusy(reviewState.state);
   const [noteSummary, setNoteSummary] = useState('');
   const [staffCorrection, setStaffCorrection] = useState('');
   const [callerIntent, setCallerIntent] = useState('');
@@ -27,23 +35,41 @@ export function ActivityPanel({ clinicId }: { clinicId: string }) {
   const [revokingId, setRevokingId] = useState<string | null>(null);
   const [revocationReason, setRevocationReason] = useState('');
   const [revocationAcknowledged, setRevocationAcknowledged] = useState(false);
-  const [revocationPending, setRevocationPending] = useState(false);
-  const [revocationError, setRevocationError] = useState<string | null>(null);
+  const revocationState = useMutationState();
+  const revocationPending = isBusy(revocationState.state);
 
+  // Each list settles on its own: a failed part is named (with a Retry) while
+  // the parts that did load stay visible. A failed load is never rendered as
+  // "No calls logged yet".
   const load = useCallback(async () => {
-    const [c, r, o] = await Promise.all([api.listCallLogs(clinicId), api.listAppointmentRequests(clinicId), api.listOptOuts()]);
-    setCalls(c); setRequests(r); setOptOuts(o);
+    const [c, r, o] = await Promise.allSettled([api.listCallLogs(clinicId), api.listAppointmentRequests(clinicId), api.listOptOuts()]);
+    const failures: LoadFailures = {};
+    if (c.status === 'fulfilled') setCalls(c.value); else failures.calls = describeFailure(c.reason);
+    if (r.status === 'fulfilled') setRequests(r.value); else failures.requests = describeFailure(r.reason);
+    if (o.status === 'fulfilled') setOptOuts(o.value); else failures.optouts = describeFailure(o.reason);
+    setLoadFailures(failures);
+    setLoaded(true);
   }, [clinicId]);
 
   useEffect(() => {
     let active = true;
-    (async () => {
-      const [c, r, o] = await Promise.all([api.listCallLogs(clinicId), api.listAppointmentRequests(clinicId), api.listOptOuts()]);
+    void (async () => {
+      const [c, r, o] = await Promise.allSettled([api.listCallLogs(clinicId), api.listAppointmentRequests(clinicId), api.listOptOuts()]);
       if (!active) return;
-      setCalls(c); setRequests(r); setOptOuts(o);
+      const failures: LoadFailures = {};
+      if (c.status === 'fulfilled') setCalls(c.value); else failures.calls = describeFailure(c.reason);
+      if (r.status === 'fulfilled') setRequests(r.value); else failures.requests = describeFailure(r.reason);
+      if (o.status === 'fulfilled') setOptOuts(o.value); else failures.optouts = describeFailure(o.reason);
+      setLoadFailures(failures);
+      setLoaded(true);
     })();
     return () => { active = false; };
   }, [clinicId]);
+
+  const emptyText = (part: ActivityPart, rows: unknown[], text: string) =>
+    loaded && !loadFailures[part] && rows.length === 0 ? <p className="text-xs text-t3 py-4 text-center">{text}</p> : null;
+  const partFailure = (part: ActivityPart, what: string) =>
+    loadFailures[part] ? <LoadFailureNotice what={what} message={loadFailures[part]!.message} onRetry={() => void load()} /> : null;
 
   function hydrateReview(call: CallLog) {
     setNoteSummary(call.operationalNotes?.summary ?? '');
@@ -55,7 +81,7 @@ export function ActivityPanel({ clinicId }: { clinicId: string }) {
   }
 
   async function openCall(callId: string) {
-    setCallDetailLoading(true); setCallDetailError(null); setReviewError(null);
+    setCallDetailLoading(true); setCallDetailError(null); reviewState.reset();
     try {
       const detail = await api.getCallLog(callId);
       setSelectedCall(detail);
@@ -71,8 +97,7 @@ export function ActivityPanel({ clinicId }: { clinicId: string }) {
   async function saveReview(operation: 'SAVE_DRAFT' | 'MARK_REVIEWED' | 'SIGN_OFF') {
     if (!selectedCall || selectedCall.reviewStatus === 'SIGNED_OFF') return;
     const unresolved = unresolvedActions.split('\n').map(value => value.trim()).filter(Boolean);
-    setReviewSaving(true); setReviewError(null);
-    try {
+    await reviewState.run(async () => {
       await api.updateCallReview(selectedCall.id, {
         operation,
         expectedRevision: selectedCall.reviewRevision ?? 0,
@@ -90,25 +115,18 @@ export function ActivityPanel({ clinicId }: { clinicId: string }) {
       setSelectedCall(detail);
       hydrateReview(detail);
       await load();
-    } catch (error) {
-      setReviewError(error instanceof Error ? error.message : 'The call review could not be saved. Reload the call before retrying.');
-    } finally {
-      setReviewSaving(false);
-    }
+    }, { successMessage: operation === 'SAVE_DRAFT' ? 'Draft saved' : operation === 'MARK_REVIEWED' ? 'Marked reviewed' : 'Signed off' });
   }
 
   async function revokeOptOut() {
     if (!revokingId || revocationReason.trim().length < 5 || !revocationAcknowledged) return;
-    setRevocationPending(true); setRevocationError(null);
-    try {
-      await api.revokeOptOut(revokingId, revocationReason.trim());
-      setRevokingId(null); setRevocationReason(''); setRevocationAcknowledged(false);
+    const id = revokingId;
+    const revoked = await revocationState.run(async () => {
+      await api.revokeOptOut(id, revocationReason.trim());
       await load();
-    } catch (error) {
-      setRevocationError(error instanceof Error ? error.message : 'Do-not-contact revocation was denied.');
-    } finally {
-      setRevocationPending(false);
-    }
+      return true;
+    }, { successMessage: 'Authorized reactivation recorded' });
+    if (revoked) { setRevokingId(null); setRevocationReason(''); setRevocationAcknowledged(false); }
   }
 
   return (
@@ -128,7 +146,8 @@ export function ActivityPanel({ clinicId }: { clinicId: string }) {
 
       {sub === 'calls' && (
         <div className="space-y-2">
-          {calls.length === 0 && <p className="text-xs text-t3 py-4 text-center">No calls logged yet. Calls appear here via the RetellAI webhook.</p>}
+          {partFailure('calls', 'Call logs')}
+          {emptyText('calls', calls, 'No calls logged yet. Calls appear here via the RetellAI webhook.')}
           {calls.map(call => (
             <button key={call.id} type="button" onClick={() => void openCall(call.id)} className="w-full flex items-start justify-between gap-3 rounded-xl border border-[var(--b1)] px-3 py-2.5 text-left hover:bg-[var(--s3)]">
               <div className="min-w-0">
@@ -220,7 +239,7 @@ export function ActivityPanel({ clinicId }: { clinicId: string }) {
               {selectedCall.operationalNotes && <p className="text-[10px] text-t3">Staff-note source: staff entered by user {selectedCall.operationalNotes.actorUserId} at {new Date(selectedCall.operationalNotes.recordedAt).toLocaleString()}.</p>}
               {selectedCall.reviewedAt && <p className="text-[10px] text-t3">Reviewed by {selectedCall.reviewedBy?.displayName ?? 'recorded user'} at {new Date(selectedCall.reviewedAt).toLocaleString()}.</p>}
               {selectedCall.signedOffAt && <p className="text-[10px] text-t3">Final sign-off by {selectedCall.signedOffBy?.displayName ?? 'recorded manager'} at {new Date(selectedCall.signedOffAt).toLocaleString()}.</p>}
-              {reviewError && <p role="alert" className="text-xs text-red-v">{reviewError}</p>}
+              <MutationNotice state={reviewState.state} />
               {selectedCall.reviewStatus !== 'SIGNED_OFF' && (
                 <div className="flex flex-wrap gap-2">
                   <button type="button" disabled={reviewSaving} onClick={() => void saveReview('SAVE_DRAFT')} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-t2 disabled:opacity-50">Save draft</button>
@@ -247,7 +266,8 @@ export function ActivityPanel({ clinicId }: { clinicId: string }) {
 
       {sub === 'requests' && (
         <div className="space-y-2">
-          {requests.length === 0 && <p className="text-xs text-t3 py-4 text-center">No appointment requests yet.</p>}
+          {partFailure('requests', 'Appointment requests')}
+          {emptyText('requests', requests, 'No appointment requests yet.')}
           {requests.map(req => (
             <div key={req.id} className="flex items-start justify-between gap-3 rounded-xl border border-[var(--b1)] px-3 py-2.5">
               <div className="min-w-0">
@@ -265,7 +285,9 @@ export function ActivityPanel({ clinicId }: { clinicId: string }) {
 
       {sub === 'optouts' && (
         <div className="space-y-2">
-          {optOuts.length === 0 && <p className="text-xs text-t3 py-4 text-center">No do-not-contact records.</p>}
+          {partFailure('optouts', 'Do-not-contact records')}
+          {emptyText('optouts', optOuts, 'No do-not-contact records.')}
+          <MutationNotice state={revocationState.state} showSaved={!revokingId} />
           {optOuts.map(o => (
             <div key={o.id} className="flex items-center justify-between gap-3 rounded-xl border border-[var(--b1)] px-3 py-2.5">
               <div className="min-w-0 flex items-center gap-2">
@@ -279,7 +301,7 @@ export function ActivityPanel({ clinicId }: { clinicId: string }) {
                 type="button"
                 aria-label="Review do-not-contact revocation"
                 title="Review reactivation"
-                onClick={() => { setRevokingId(o.id); setRevocationReason(''); setRevocationAcknowledged(false); setRevocationError(null); }}
+                onClick={() => { setRevokingId(o.id); setRevocationReason(''); setRevocationAcknowledged(false); revocationState.reset(); }}
                 className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--red-soft)] shrink-0"
               >Review reactivation</button>
             </div>
@@ -297,12 +319,11 @@ export function ActivityPanel({ clinicId }: { clinicId: string }) {
                 <input type="checkbox" checked={revocationAcknowledged} onChange={event => setRevocationAcknowledged(event.target.checked)} className="mt-0.5" />
                 <span>I confirm the reactivation was authorized and understand outbound contact may resume after this durable revocation is recorded.</span>
               </label>
-              {revocationError && <p role="alert" className="text-xs text-red-v">{revocationError}</p>}
               <div className="flex gap-2">
                 <button type="button" disabled={revocationPending || revocationReason.trim().length < 5 || !revocationAcknowledged} onClick={() => void revokeOptOut()} className="rounded-lg bg-red-v px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50">
                   {revocationPending ? 'Recording…' : 'Record authorized reactivation'}
                 </button>
-                <button type="button" disabled={revocationPending} onClick={() => { setRevokingId(null); setRevocationError(null); }} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-t2">Cancel</button>
+                <button type="button" disabled={revocationPending} onClick={() => { setRevokingId(null); revocationState.reset(); }} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-t2">Cancel</button>
               </div>
             </div>
           )}

@@ -1,24 +1,41 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Bot, Trash2, Check, Megaphone } from 'lucide-react';
 import { Field, TextInput, TextArea, Select, Toggle } from '../ui/Field';
 import { receptionistApi as api, CAMPAIGN_TYPES, type Clinic, type Campaign, type Agent } from '../../lib/receptionist';
+import { ApiError } from '../../lib/api';
+import { describeFailure, type ResourceFailure } from '../../lib/resourceState';
+import { isBusy, savedAtOf, useMutationState } from '../../hooks/useMutationState';
 import { formatEnumLabel } from './helpers';
 import { ConfirmedButton, SaveBar } from './shared';
+import { LoadFailureNotice, MutationNotice } from './MutationNotice';
 import { AgentEditor } from './AgentEditor';
 
 // ===== Campaign Panel (agent + campaign) ===================================
 
 export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic; campaign: Campaign; onChanged: () => Promise<unknown> }) {
   const [agents, setAgents] = useState<Agent[]>([]);
+  const [agentsFailure, setAgentsFailure] = useState<ResourceFailure | null>(null);
   const [draft, setDraft] = useState<Campaign>(campaign);
-  const [busy, setBusy] = useState(false);
-  const [savedAt, setSavedAt] = useState<number | null>(null);
+  const saveState = useMutationState();
+  const createAgentState = useMutationState();
+  const removeState = useMutationState();
   const [newAgentName, setNewAgentName] = useState('');
   const dirty = JSON.stringify(draft) !== JSON.stringify(campaign);
   const locations = clinic.locations ?? [];
   const rules = draft.bookingRules ?? {};
+  const busy = isBusy(saveState.state) || isBusy(createAgentState.state);
 
-  useEffect(() => { void api.listAgents(clinic.id).then(setAgents); }, [clinic.id]);
+  const loadAgents = useCallback(async () => {
+    try {
+      const rows = await api.listAgents(clinic.id);
+      setAgents(rows);
+      setAgentsFailure(null);
+    } catch (error) {
+      setAgentsFailure(describeFailure(error));
+    }
+  }, [clinic.id]);
+
+  useEffect(() => { void (async () => { await loadAgents(); })(); }, [loadAgents]);
 
   const set = <K extends keyof Campaign>(key: K, value: Campaign[K]) => setDraft(prev => ({ ...prev, [key]: value }));
   const setRule = (key: string, value: unknown) => setDraft(prev => ({ ...prev, bookingRules: { ...prev.bookingRules, [key]: value } }));
@@ -26,8 +43,7 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
   const activeAgent = agents.find(a => a.id === draft.agentId) ?? null;
 
   async function ensureAgentAndSave() {
-    setBusy(true);
-    try {
+    await saveState.run(async () => {
       await api.updateCampaign(campaign.id, {
         name: draft.name, campaignType: draft.campaignType, status: draft.status, agentId: draft.agentId,
         offerTitle: draft.offerTitle, offerDescription: draft.offerDescription, offerScript: draft.offerScript,
@@ -35,10 +51,11 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
         smsConfirmation: draft.smsConfirmation, emailConfirmation: draft.emailConfirmation,
       });
       await onChanged();
-      setSavedAt(Date.now());
-    } finally { setBusy(false); }
+    });
   }
 
+  // AgentEditor owns the mutation state for these two: it shows the server's
+  // code/message next to the provider evidence block. Both must throw.
   async function saveAgent(patch: Partial<Agent>) {
     if (!activeAgent) return;
     const updated = await api.updateAgent(activeAgent.id, patch);
@@ -50,28 +67,36 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
     try {
       const updated = await api.verifyAgentProvider(activeAgent.id);
       setAgents(prev => prev.map(a => (a.id === updated.id ? updated : a)));
-    } finally {
-      // A failed provider request still records a durable safe attempt state.
-      // Refresh so Studio shows that state even when the API returns 503/409.
-      setAgents(await api.listAgents(clinic.id));
+    } catch (error) {
+      // A failed provider request still records a durable attempt state, and
+      // the 409/503 body carries the row as `agent`. Show that state even
+      // though the request failed, then let the editor show the cause.
+      const row = error instanceof ApiError ? (error.details?.agent as Agent | undefined) : undefined;
+      if (row && typeof row === 'object' && typeof row.id === 'string') {
+        setAgents(prev => prev.map(a => (a.id === row.id ? row : a)));
+      } else {
+        await loadAgents();
+      }
+      throw error;
     }
   }
 
   async function createNamedAgent() {
     const name = newAgentName.trim();
     if (!name) return;
-    setBusy(true);
-    try {
+    await createAgentState.run(async () => {
       const created = await api.createAgent({ clinicId: clinic.id, name });
       setAgents(prev => [...prev, created]);
       setDraft(prev => ({ ...prev, agentId: created.id }));
       setNewAgentName('');
-    } finally { setBusy(false); }
+    }, { successMessage: `Agent "${name}" created — save the campaign to link it.` });
   }
 
   async function deleteCampaign() {
-    await api.deleteCampaign(campaign.id);
-    await onChanged();
+    await removeState.run(async () => {
+      await api.deleteCampaign(campaign.id);
+      await onChanged();
+    }, { rethrow: true });
   }
 
   function toggleLocation(id: string) {
@@ -85,23 +110,27 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
       {/* Agent */}
       <div className="cc-card p-5 space-y-4">
         <h3 className="text-sm font-bold text-t1 inline-flex items-center gap-2"><Bot className="w-4 h-4 text-violet-v" /> Agent</h3>
+        {agentsFailure && <LoadFailureNotice what="Agents" message={agentsFailure.message} onRetry={() => void loadAgents()} />}
         <Field label="Campaign agent" hint="Runnable campaigns require a fresh verified provider deployment.">
-          <Select value={draft.agentId ?? ''} onChange={e => set('agentId', e.target.value || null)}>
-            <option value="">No agent linked (draft only)</option>
+          <Select value={draft.agentId ?? ''} disabled={Boolean(agentsFailure)} onChange={e => set('agentId', e.target.value || null)}>
+            <option value="">{agentsFailure ? 'Agents could not be loaded' : 'No agent linked (draft only)'}</option>
             {agents.map(row => <option key={row.id} value={row.id}>{row.name} · {row.providerStatus}</option>)}
           </Select>
         </Field>
         {activeAgent ? (
           <AgentEditor
-            key={`${activeAgent.id}:${activeAgent.providerLastAttemptAt ?? 'never'}:${activeAgent.providerStatus}:${activeAgent.providerVersion ?? 'unbound'}`}
+            key={activeAgent.id}
             agent={activeAgent}
             onSave={saveAgent}
             onVerify={verifyAgent}
           />
         ) : (
-          <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
-            <TextInput aria-label="New agent name" placeholder="Enter a receptionist name" value={newAgentName} onChange={e => setNewAgentName(e.target.value)} />
-            <button type="button" disabled={!newAgentName.trim() || busy} onClick={createNamedAgent} className="rounded-xl bg-indigo px-3 py-2 text-sm font-semibold text-white disabled:opacity-40">Create agent</button>
+          <div className="space-y-2">
+            <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
+              <TextInput aria-label="New agent name" placeholder="Enter a receptionist name" value={newAgentName} onChange={e => setNewAgentName(e.target.value)} />
+              <button type="button" disabled={!newAgentName.trim() || busy || Boolean(agentsFailure)} onClick={createNamedAgent} className="rounded-xl bg-indigo px-3 py-2 text-sm font-semibold text-white disabled:opacity-40">Create agent</button>
+            </div>
+            <MutationNotice state={createAgentState.state} onRetry={newAgentName.trim() ? createNamedAgent : undefined} />
           </div>
         )}
       </div>
@@ -115,12 +144,14 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
             message={`Delete ${campaign.name} and its configuration? This action cannot be undone.`}
             confirmLabel="Delete campaign"
             tone="red"
+            disabled={isBusy(removeState.state)}
             onConfirm={deleteCampaign}
             className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--red-soft)]"
           >
             <Trash2 className="w-3 h-3" /> Delete
           </ConfirmedButton>
         </div>
+        <MutationNotice state={removeState.state} showSaved={false} />
         <div className="grid gap-4 md:grid-cols-2">
           <Field label="Campaign name" required><TextInput value={draft.name} onChange={e => set('name', e.target.value)} /></Field>
           <Field label="Campaign type">
@@ -176,7 +207,8 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
           <Toggle checked={draft.emailConfirmation} onChange={v => set('emailConfirmation', v)} label="Email confirmation" />
         </div>
 
-        <SaveBar dirty={dirty} busy={busy} onSave={ensureAgentAndSave} savedAt={savedAt} />
+        <MutationNotice state={saveState.state} showSaved={false} onRetry={dirty ? ensureAgentAndSave : undefined} />
+        <SaveBar dirty={dirty} busy={busy} onSave={ensureAgentAndSave} savedAt={savedAtOf(saveState.state)} />
       </div>
     </div>
   );

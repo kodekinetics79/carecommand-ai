@@ -1,22 +1,25 @@
-import { useEffect, useState } from 'react';
+import { useCallback } from 'react';
 import { Bot, Sparkles, Check, Megaphone, ListChecks, Loader2 } from 'lucide-react';
 import { receptionistApi as api, type PromptResult } from '../../lib/receptionist';
+import { useResource } from '../../hooks/useResource';
 import { CopyButton, SampleCard } from './shared';
+import { LoadFailureNotice } from './MutationNotice';
 
 // ===== Preview Panel =======================================================
 
 export function PreviewPanel({ campaignId }: { campaignId: string }) {
-  const [result, setResult] = useState<PromptResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const loadPrompt = useCallback(() => api.getPrompt(campaignId), [campaignId]);
+  const { state, reload } = useResource<PromptResult>(loadPrompt);
 
-  useEffect(() => {
-    let active = true;
-    api.getPrompt(campaignId).then(r => { if (active) setResult(r); }).catch(e => { if (active) setError(e instanceof Error ? e.message : 'Failed'); });
-    return () => { active = false; };
-  }, [campaignId]);
-
-  if (error) return <div className="cc-card p-6 text-sm text-red-v">{error}</div>;
-  if (!result) return <div className="cc-card p-10 text-center text-sm text-t3"><Loader2 className="w-4 h-4 animate-spin inline mr-2" /> Generating preview…</div>;
+  if (state.status === 'error') {
+    return (
+      <div className="cc-card p-6">
+        <LoadFailureNotice what="The prompt preview" message={state.failure.message} onRetry={reload} />
+      </div>
+    );
+  }
+  if (state.status === 'loading') return <div className="cc-card p-10 text-center text-sm text-t3" role="status"><Loader2 className="w-4 h-4 animate-spin inline mr-2" /> Generating preview…</div>;
+  const result = state.data;
 
   return (
     <div className="space-y-4">

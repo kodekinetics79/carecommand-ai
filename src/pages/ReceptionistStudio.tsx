@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router';
 import { Bot, Building2, Plus, Sparkles, Phone, PhoneOff, Megaphone, ListChecks, Eye, Code2, Activity, Loader2, AlertCircle, PhoneOutgoing } from 'lucide-react';
 import { receptionistApi as api, type Clinic, type Campaign, type Overview } from '../lib/receptionist';
+import { describeFailure } from '../lib/resourceState';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import FormDialog from '../components/workflow/FormDialog';
@@ -91,6 +92,10 @@ export default function ReceptionistStudio() {
       if (!active) return;
       setCampaigns(rows);
       setActiveCampaignId(prev => (prev && rows.some(r => r.id === prev) ? prev : rows[0]?.id ?? ''));
+      setError(null);
+    }).catch(cause => {
+      // A failed campaign list must not read as "No campaigns yet".
+      if (active) setError(`Campaigns could not be loaded: ${describeFailure(cause).message}`);
     });
     return () => { active = false; };
   }, [activeClinicId]);
@@ -123,7 +128,7 @@ export default function ReceptionistStudio() {
       />
 
       {error && (
-        <div className="flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--red-soft)] px-3 py-2 text-xs font-semibold text-red-v">
+        <div role="alert" className="flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--red-soft)] px-3 py-2 text-xs font-semibold text-red-v">
           <AlertCircle className="w-4 h-4" /> {error}
         </div>
       )}
@@ -222,7 +227,7 @@ export default function ReceptionistStudio() {
                 <p className="text-[10px] font-bold uppercase tracking-widest text-t3">Campaigns</p>
                 <button type="button" aria-label="Add campaign" title="Add campaign" onClick={handleCreateCampaign} className="text-t3 hover:text-indigo"><Plus className="w-3.5 h-3.5" /></button>
               </div>
-              {campaigns.length === 0 && <p className="px-1 text-[11px] text-t3">No campaigns yet.</p>}
+              {campaigns.length === 0 && !error && <p className="px-1 text-[11px] text-t3">No campaigns yet.</p>}
               {campaigns.map(campaign => (
                 <button
                   key={campaign.id}

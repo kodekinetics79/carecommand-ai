@@ -1,9 +1,12 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { PhoneOff, Activity, Loader2, AlertCircle, PhoneCall, PhoneOutgoing } from 'lucide-react';
 import { Field, TextInput } from '../../ui/Field';
 import { receptionistApi as api, OUTBOUND_RECONCILIATION_WARNING, launchControlsBlocked, mergeReconciliationRefresh, presentLaunchResult, clearTransportAmbiguityToken, readTransportAmbiguityToken, transportAmbiguityStorageKey, writeTransportAmbiguityToken, type CallLog, type RetellStatus, type OutboundCampaign, type CallTarget, type OutboundReconciliationEvidence } from '../../../lib/receptionist';
+import { describeFailure } from '../../../lib/resourceState';
+import { isBusy, useMutationState } from '../../../hooks/useMutationState';
 import { formatEnumLabel, maskedPhone, maskedProviderId, outcomeBadge } from '../helpers';
 import { ConfirmedButton } from '../shared';
+import { MutationNotice } from '../MutationNotice';
 import { TargetList } from './TargetList';
 
 export function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { campaign: OutboundCampaign; status: RetellStatus | null; outboundStopped: boolean; onChanged: () => void }) {
@@ -17,7 +20,9 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
   const [launchMsg, setLaunchMsg] = useState<{ kind: 'ok' | 'warn' | 'err'; text: string } | null>(null);
   const [transportAmbiguityToken, setTransportAmbiguityToken] = useState<string | null>(() => readTransportAmbiguityToken(window.localStorage, transportAmbiguityKey));
   const [launching, setLaunching] = useState(false);
-  const [campaignActionPending, setCampaignActionPending] = useState(false);
+  const campaignAction = useMutationState();
+  const campaignActionPending = isBusy(campaignAction.state);
+  const summaryRef = useRef<HTMLDivElement | null>(null);
   const [attachingLiveTarget, setAttachingLiveTarget] = useState(false);
   const [syncingCallId, setSyncingCallId] = useState<string | null>(null);
   const [providerStatusByCall, setProviderStatusByCall] = useState<Record<string, string>>({});
@@ -30,9 +35,9 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
       api.listOutboundReconciliations(campaign.id),
     ]);
     setDetailErrors([
-      ...(targetResult.status === 'rejected' ? ['Targets could not be loaded.'] : []),
-      ...(logResult.status === 'rejected' ? ['Call logs could not be loaded.'] : []),
-      ...(reconciliationResult.status === 'rejected' ? ['Reconciliation safety evidence could not be loaded.'] : []),
+      ...(targetResult.status === 'rejected' ? [`Targets could not be loaded (${describeFailure(targetResult.reason).message})`] : []),
+      ...(logResult.status === 'rejected' ? [`Call logs could not be loaded (${describeFailure(logResult.reason).message})`] : []),
+      ...(reconciliationResult.status === 'rejected' ? [`Reconciliation safety evidence could not be loaded (${describeFailure(reconciliationResult.reason).message})`] : []),
     ]);
     if (targetResult.status === 'fulfilled') setTargets(targetResult.value);
     if (logResult.status === 'fulfilled') setLogs(logResult.value);
@@ -70,9 +75,9 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
       clearTransportAmbiguityToken(window.localStorage, transportAmbiguityKey);
       setTransportAmbiguityToken(null);
       setLaunchMsg({ kind: 'warn', text: `Server-fenced attempt proof (${attempt.proof}) and durable call evidence were verified. The transport block was explicitly cleared.` });
-    } catch {
+    } catch (error) {
       setReconciliationVerified(false);
-      setLaunchMsg({ kind: 'err', text: `${OUTBOUND_RECONCILIATION_WARNING}. Durable evidence refresh failed, so the launch block remains.` });
+      setLaunchMsg({ kind: 'err', text: `${OUTBOUND_RECONCILIATION_WARNING}. Durable evidence refresh failed (${describeFailure(error).message}), so the launch block remains.` });
     } finally {
       setLaunching(false);
     }
@@ -98,9 +103,9 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
         await reloadDetail();
         onChanged();
       }
-    } catch {
+    } catch (error) {
       setReconciliationVerified(false);
-      setLaunchMsg({ kind: 'err', text: `The launch response was lost. ${OUTBOUND_RECONCILIATION_WARNING}. Refresh durable evidence and verify provider state before any retry.` });
+      setLaunchMsg({ kind: 'err', text: `The launch response was lost (${describeFailure(error).message}). ${OUTBOUND_RECONCILIATION_WARNING}. Refresh durable evidence and verify provider state before any retry.` });
       await reloadDetail();
     } finally {
       setLaunching(false);
@@ -150,25 +155,25 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
   const reconciliationBlocksLaunch = launchControlsBlocked({ transportAmbiguous, reconciliationVerified, reconciliations });
 
   async function approveAndRun() {
-    setCampaignActionPending(true); setLaunchMsg(null);
-    try {
+    setLaunchMsg(null);
+    // rethrow: the confirmation dialog stays open and shows the cause itself.
+    await campaignAction.run(async () => {
       await api.approveOutboundCampaign(campaign.id, 'RUNNING');
-      setLaunchMsg({ kind: 'ok', text: 'Authority approved and campaign started.' });
       await onChanged();
-    } catch (e) {
-      setLaunchMsg({ kind: 'err', text: e instanceof Error ? e.message : 'Approval failed.' });
-    } finally { setCampaignActionPending(false); }
+    }, { successMessage: 'Authority approved and campaign started.', rethrow: true });
   }
 
   async function pauseCampaign() {
-    setCampaignActionPending(true); setLaunchMsg(null);
-    try {
+    setLaunchMsg(null);
+    await campaignAction.run(async () => {
       await api.updateOutboundCampaign(campaign.id, { status: 'PAUSED' });
-      setLaunchMsg({ kind: 'ok', text: 'Campaign paused. No new calls can launch.' });
       await onChanged();
-    } catch (e) {
-      setLaunchMsg({ kind: 'err', text: e instanceof Error ? e.message : 'Pause failed.' });
-    } finally { setCampaignActionPending(false); }
+    }, { successMessage: 'Campaign paused. No new calls can launch.' });
+  }
+
+  function goToCampaignSettings() {
+    summaryRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
+    summaryRef.current?.focus?.();
   }
 
   return (
@@ -201,7 +206,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
           </div>
         </div>
       )}
-      <div className="cc-card p-5 space-y-3">
+      <div ref={summaryRef} tabIndex={-1} id={`outbound-campaign-${campaign.id}-settings`} className="cc-card p-5 space-y-3 outline-none">
         <div className="flex items-center justify-between gap-3">
           <h3 className="text-sm font-bold text-t1">{campaign.name}</h3>
           <div className="flex items-center gap-2">
@@ -220,9 +225,10 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
           </div>
         </div>
         <p className="text-[11px] text-t3">
-          Policy {campaign.policyVersion ?? 'not configured'} · {campaign.authorityApprovedAt ? `approved ${new Date(campaign.authorityApprovedAt).toLocaleString()} by ${campaign.authorityApprovedById ?? 'unknown'}` : 'not approved'}
+          Policy {campaign.policyVersion ?? 'not configured'} · purpose {campaign.purpose ? formatEnumLabel(campaign.purpose) : 'not set'} · legal basis {campaign.legalBasis ? formatEnumLabel(campaign.legalBasis) : 'not set'} · {campaign.authorityApprovedAt ? `approved ${new Date(campaign.authorityApprovedAt).toLocaleString()} by ${campaign.authorityApprovedById ?? 'unknown'}` : 'not approved'}
           {campaign.authorityFingerprint ? ` · evidence ${campaign.authorityFingerprint.slice(0, 12)}…` : ''}
         </p>
+        <MutationNotice state={campaignAction.state} />
         <p className="text-xs text-t3 whitespace-pre-wrap">{campaign.script}</p>
         <div className="flex flex-wrap gap-1.5">
           {campaign.requiredFields.map(f => <span key={f} className="badge badge-violet">{f}</span>)}
@@ -294,7 +300,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
       </div>
 
       {/* Targets */}
-      <TargetList campaign={campaign} targets={targets} onAdded={reloadDetail} onCall={(t) => launch(t.id)} canCall={!launching && !outboundStopped && !reconciliationBlocksLaunch && configured && campaign.status === 'RUNNING'} />
+      <TargetList campaign={campaign} targets={targets} onAdded={reloadDetail} onCall={(t) => launch(t.id)} canCall={!launching && !outboundStopped && !reconciliationBlocksLaunch && configured && campaign.status === 'RUNNING'} onConfigure={goToCampaignSettings} />
 
       {/* Call logs */}
       <div className="cc-card p-5">

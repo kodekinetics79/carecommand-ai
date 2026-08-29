@@ -2,37 +2,39 @@ import { useState } from 'react';
 import { ShieldCheck, Loader2 } from 'lucide-react';
 import { Field, TextInput, TextArea, Select, Toggle } from '../ui/Field';
 import { VOICE_OPTIONS, TONE_OPTIONS, LANGUAGE_OPTIONS, type Agent } from '../../lib/receptionist';
+import { isBusy, savedAtOf, useMutationState } from '../../hooks/useMutationState';
 import { SaveBar } from './shared';
+import { MutationNotice } from './MutationNotice';
 
+/** The fields this editor owns. Provider snapshot fields are read from the prop, never from the draft. */
+function editableFields(agent: Agent) {
+  return {
+    name: agent.name, voice: agent.voice, tone: agent.tone, language: agent.language,
+    persona: agent.persona, greetingOverride: agent.greetingOverride, active: agent.active,
+    providerAgentId: agent.providerAgentId, providerVersionTag: agent.providerVersionTag,
+  };
+}
+
+/**
+ * Keyed by agent id only (see CampaignPanel). It used to remount on every
+ * `providerLastAttemptAt` change, which wiped the drift / verification error
+ * the user had just been shown. The draft holds the editable subset; the
+ * provider evidence block always reads the latest `agent` prop.
+ */
 export function AgentEditor({ agent, onSave, onVerify }: { agent: Agent; onSave: (patch: Partial<Agent>) => Promise<void>; onVerify: () => Promise<void> }) {
   const [draft, setDraft] = useState<Agent>(agent);
-  const [busy, setBusy] = useState(false);
-  const [savedAt, setSavedAt] = useState<number | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const dirty = JSON.stringify(draft) !== JSON.stringify(agent);
+  const saveState = useMutationState();
+  const verifyState = useMutationState();
+  const busy = isBusy(saveState.state) || isBusy(verifyState.state);
+  const dirty = JSON.stringify(editableFields(draft)) !== JSON.stringify(editableFields(agent));
   const set = <K extends keyof Agent>(key: K, value: Agent[K]) => setDraft(prev => ({ ...prev, [key]: value }));
 
   async function save() {
-    setBusy(true);
-    setError(null);
-    try {
-      await onSave({
-        name: draft.name, voice: draft.voice, tone: draft.tone, language: draft.language,
-        persona: draft.persona, greetingOverride: draft.greetingOverride, active: draft.active,
-        providerAgentId: draft.providerAgentId, providerVersionTag: draft.providerVersionTag,
-      });
-      setSavedAt(Date.now());
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Unable to save the agent.');
-    } finally { setBusy(false); }
+    await saveState.run(() => onSave(editableFields(draft)));
   }
 
   async function verify() {
-    setBusy(true);
-    setError(null);
-    try { await onVerify(); }
-    catch (caught) { setError(caught instanceof Error ? caught.message : 'Provider verification failed.'); }
-    finally { setBusy(false); }
+    await verifyState.run(() => onVerify(), { successMessage: 'Provider deployment verified' });
   }
 
   return (
@@ -71,16 +73,21 @@ export function AgentEditor({ agent, onSave, onVerify }: { agent: Agent; onSave:
         </div>
         {agent.providerVersion !== null && <p className="text-[11px] text-t2">Pinned version {agent.providerVersion} · {agent.providerVoiceId ?? 'voice unavailable'} · {agent.providerLanguage ?? 'language unavailable'}</p>}
         {agent.providerVerifiedAt && <p className="text-[11px] text-t3">Verified {new Date(agent.providerVerifiedAt).toLocaleString()} · expires {agent.providerVerificationExpiresAt ? new Date(agent.providerVerificationExpiresAt).toLocaleString() : 'unknown'}</p>}
-        {agent.providerLastErrorCode && <p role="alert" className="text-xs font-semibold text-red-v">Provider check: {agent.providerLastErrorCode.replaceAll('_', ' ')}</p>}
+        {agent.providerLastErrorCode && (
+          <p role="alert" className="text-xs font-semibold text-red-v">
+            Last provider check{agent.providerLastAttemptAt ? ` (${new Date(agent.providerLastAttemptAt).toLocaleString()})` : ''}: {agent.providerLastErrorCode.replaceAll('_', ' ')}
+          </p>
+        )}
+        <MutationNotice state={verifyState.state} savedLabel="Provider deployment verified" onRetry={verifyState.state.status === 'error' && !dirty && agent.providerAgentId ? verify : undefined} retryLabel="Verify again" />
         <div className="flex flex-wrap items-center justify-between gap-3">
           <Toggle checked={draft.active} onChange={value => set('active', value)} label="Agent active" />
           <button type="button" disabled={busy || dirty || !agent.providerAgentId} onClick={verify} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t1 disabled:opacity-40">
-            {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />} Verify provider deployment
+            {isBusy(verifyState.state) ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />} Verify provider deployment
           </button>
         </div>
       </div>
-      {error && <p role="alert" className="text-xs font-semibold text-red-v">{error}</p>}
-      <SaveBar dirty={dirty} busy={busy} onSave={save} savedAt={savedAt} />
+      <MutationNotice state={saveState.state} showSaved={false} onRetry={dirty ? save : undefined} />
+      <SaveBar dirty={dirty} busy={busy} onSave={save} savedAt={savedAtOf(saveState.state)} />
     </div>
   );
 }

@@ -2,21 +2,22 @@ import { useState } from 'react';
 import { Trash2 } from 'lucide-react';
 import { Field, TextInput, TextArea, Select } from '../ui/Field';
 import { receptionistApi as api, LANGUAGE_OPTIONS, TIMEZONE_OPTIONS, type Clinic } from '../../lib/receptionist';
+import { isBusy, savedAtOf, useMutationState } from '../../hooks/useMutationState';
 import { ConfirmedButton, SaveBar } from './shared';
+import { MutationNotice } from './MutationNotice';
 import { LocationsEditor } from './LocationsEditor';
 
 // ===== Clinic Panel ========================================================
 
 export function ClinicPanel({ clinic, onChanged }: { clinic: Clinic; onChanged: () => Promise<unknown> }) {
   const [draft, setDraft] = useState<Clinic>(clinic);
-  const [busy, setBusy] = useState(false);
-  const [savedAt, setSavedAt] = useState<number | null>(null);
+  const saveState = useMutationState();
+  const removeState = useMutationState();
   const dirty = JSON.stringify(draft) !== JSON.stringify(clinic);
   const set = <K extends keyof Clinic>(key: K, value: Clinic[K]) => setDraft(prev => ({ ...prev, [key]: value }));
 
   async function save() {
-    setBusy(true);
-    try {
+    await saveState.run(async () => {
       await api.updateClinic(clinic.id, {
         name: draft.name, phone: draft.phone, logoUrl: draft.logoUrl, website: draft.website,
         addressLine: draft.addressLine, timezone: draft.timezone, defaultLanguage: draft.defaultLanguage,
@@ -24,13 +25,15 @@ export function ClinicPanel({ clinic, onChanged }: { clinic: Clinic; onChanged: 
         doNotContactPolicy: draft.doNotContactPolicy, active: draft.active,
       });
       await onChanged();
-      setSavedAt(Date.now());
-    } finally { setBusy(false); }
+    });
   }
 
   async function deleteClinic() {
-    await api.deleteClinic(clinic.id);
-    await onChanged();
+    // rethrow: the confirmation dialog stays open and shows the cause itself.
+    await removeState.run(async () => {
+      await api.deleteClinic(clinic.id);
+      await onChanged();
+    }, { rethrow: true });
   }
 
   return (
@@ -43,12 +46,14 @@ export function ClinicPanel({ clinic, onChanged }: { clinic: Clinic; onChanged: 
             message={`Delete ${clinic.name} and all receptionist campaigns under it? This cannot be undone.`}
             confirmLabel="Delete clinic"
             tone="red"
+            disabled={isBusy(removeState.state)}
             onConfirm={deleteClinic}
             className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--red-soft)]"
           >
             <Trash2 className="w-3 h-3" /> Delete
           </ConfirmedButton>
         </div>
+        <MutationNotice state={removeState.state} showSaved={false} />
         <div className="grid gap-4 md:grid-cols-2">
           <Field label="Clinic name" required><TextInput value={draft.name} onChange={e => set('name', e.target.value)} /></Field>
           <Field label="Phone number" required><TextInput value={draft.phone} onChange={e => set('phone', e.target.value)} /></Field>
@@ -75,7 +80,8 @@ export function ClinicPanel({ clinic, onChanged }: { clinic: Clinic; onChanged: 
         <Field label="Do-not-contact policy" hint="How the agent handles a request to stop being contacted.">
           <TextArea rows={2} value={draft.doNotContactPolicy} onChange={e => set('doNotContactPolicy', e.target.value)} />
         </Field>
-        <SaveBar dirty={dirty} busy={busy} onSave={save} savedAt={savedAt} />
+        <MutationNotice state={saveState.state} showSaved={false} onRetry={dirty ? save : undefined} />
+        <SaveBar dirty={dirty} busy={isBusy(saveState.state)} onSave={save} savedAt={savedAtOf(saveState.state)} />
       </div>
 
       <LocationsEditor clinic={clinic} onChanged={onChanged} />

@@ -2,13 +2,9 @@ import { useState } from 'react';
 import { Save, Megaphone, Loader2 } from 'lucide-react';
 import { Field, TextInput, TextArea, Select } from '../../ui/Field';
 import { receptionistApi as api, OUTBOUND_REQUIRED_FIELDS, validateOutboundQuietHours, type Campaign, type OutboundRequiredField, type OutboundBookingMode, type OutboundCampaignInput, type Location } from '../../../lib/receptionist';
-
-const EMPTY_CAMPAIGN: OutboundCampaignInput = {
-  clinicId: '', name: '', script: '', requiredFields: ['firstName', 'lastName', 'phone'],
-  consentText: '', humanHandoffInstruction: '', bookingMode: 'APPOINTMENT_REQUEST_ONLY',
-  receptionistCampaignId: '', purpose: 'CARE_COORDINATION', legalBasis: 'TREATMENT_OPERATIONS', policyVersion: '',
-  defaultBranchId: '', defaultService: '', quietHoursStart: '', quietHoursEnd: '', maxRetryAttempts: 1,
-};
+import { isBusy, useMutationState } from '../../../hooks/useMutationState';
+import { MutationNotice } from '../MutationNotice';
+import { EMPTY_CAMPAIGN, toOutboundCampaignPayload } from './campaignPayload';
 
 function RequiredFieldPicker({ value, onChange }: { value: OutboundRequiredField[]; onChange: (next: OutboundRequiredField[]) => void }) {
   return (
@@ -119,32 +115,17 @@ function CampaignFormFields({ form, set, bookingAuthorities, locations }: { form
 
 export function CampaignBuilder({ clinicId, bookingAuthorities, locations, timezone, onSaved, onCancel }: { clinicId: string; bookingAuthorities: Campaign[]; locations: Location[]; timezone: string; onSaved: (id: string) => void; onCancel: () => void }) {
   const [form, setForm] = useState<OutboundCampaignInput>({ ...EMPTY_CAMPAIGN, clinicId });
-  const [saving, setSaving] = useState(false);
+  const saveState = useMutationState();
+  const saving = isBusy(saveState.state);
   const [err, setErr] = useState<string | null>(null);
   const set = (patch: Partial<OutboundCampaignInput>) => setForm(prev => ({ ...prev, ...patch }));
 
   async function save() {
     const quietHoursError = validateOutboundQuietHours(form.quietHoursStart, form.quietHoursEnd, timezone);
     if (quietHoursError) { setErr(quietHoursError); return; }
-    setSaving(true); setErr(null);
-    try {
-      const payload: OutboundCampaignInput = {
-        ...form,
-        clinicId,
-        defaultBranchId: form.defaultBranchId || null,
-        defaultService: form.defaultService || null,
-        consentText: form.consentText || null,
-        humanHandoffInstruction: form.humanHandoffInstruction || null,
-        quietHoursStart: form.quietHoursStart || null,
-        quietHoursEnd: form.quietHoursEnd || null,
-      };
-      const row = await api.createOutboundCampaign(payload);
-      onSaved(row.id);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Failed to save campaign');
-    } finally {
-      setSaving(false);
-    }
+    setErr(null);
+    const row = await saveState.run(() => api.createOutboundCampaign(toOutboundCampaignPayload(form, clinicId)));
+    if (row) onSaved(row.id);
   }
 
   return (
@@ -152,7 +133,8 @@ export function CampaignBuilder({ clinicId, bookingAuthorities, locations, timez
       <h3 className="text-sm font-bold text-t1 flex items-center gap-2"><Megaphone className="w-4 h-4 text-indigo" /> New outbound campaign</h3>
       <CampaignFormFields form={form} set={set} bookingAuthorities={bookingAuthorities} locations={locations} />
       <p className="text-[11px] text-t3">Quiet hours are enforced in clinic timezone {timezone}. Overnight windows such as 21:00–08:00 are supported.</p>
-      {err && <p className="text-xs text-red-v">{err}</p>}
+      {err && <p role="alert" className="text-xs text-red-v">{err}</p>}
+      <MutationNotice state={saveState.state} showSaved={false} />
       <div className="flex gap-2">
         <button type="button" disabled={saving || !form.name || !form.script} onClick={save} className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50">
           {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Create campaign

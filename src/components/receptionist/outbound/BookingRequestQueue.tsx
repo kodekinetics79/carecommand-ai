@@ -3,8 +3,10 @@ import { CalendarClock } from 'lucide-react';
 import { Field, TextInput } from '../../ui/Field';
 import { getLocale } from '../../../lib/preferences';
 import { receptionistApi as api, type BookingRequest, type BookingRequestStatus } from '../../../lib/receptionist';
+import { isBusy, useMutationState } from '../../../hooks/useMutationState';
 import { formatEnumLabel } from '../helpers';
 import { ConfirmedButton } from '../shared';
+import { MutationNotice } from '../MutationNotice';
 
 const requestBadge: Record<BookingRequestStatus, string> = {
   PENDING_REVIEW: 'badge badge-amber', BOOKED: 'badge badge-emerald', REJECTED: 'badge badge-red',
@@ -25,8 +27,8 @@ export function BookingRequestQueue({ requests, onChanged }: { requests: Booking
   const [appointmentId, setAppointmentId] = useState('');
   const [reason, setReason] = useState('');
   const [acknowledged, setAcknowledged] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const action = useMutationState();
+  const busy = isBusy(action.state);
   const [reconciledCanonicalByRequest, setReconciledCanonicalByRequest] = useState<Record<string, CanonicalBookingDisplay>>({});
   const canonicalByRequest = useMemo(() => {
     const canonical: Record<string, CanonicalBookingDisplay> = {};
@@ -45,27 +47,23 @@ export function BookingRequestQueue({ requests, onChanged }: { requests: Booking
   }, [requests, reconciledCanonicalByRequest]);
 
   async function reject(id: string, outcomeReason: string) {
-    setBusy(true); setError(null);
-    try {
+    // rethrow: the confirmation dialog stays open and shows the cause itself.
+    await action.run(async () => {
       await api.updateBookingRequest(id, { status: 'REJECTED', outcomeReason });
       await onChanged();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'The rejection was not recorded.');
-    } finally { setBusy(false); }
+    }, { successMessage: 'Rejection recorded', rethrow: true });
   }
 
   async function reconcile(id: string) {
-    setBusy(true); setError(null);
-    try {
+    const linked = await action.run(async () => {
       const result = await api.reconcileBookingRequest(id, {
         appointmentId: appointmentId.trim(), outcomeReason: reason.trim(), acknowledgeRequestDifferences: true,
       });
       setReconciledCanonicalByRequest(current => ({ ...current, [id]: result.appointment }));
-      setReconcilingId(null); setAppointmentId(''); setReason(''); setAcknowledged(false);
       await onChanged();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'The appointment link was not recorded.');
-    } finally { setBusy(false); }
+      return true;
+    }, { successMessage: 'Canonical appointment linked' });
+    if (linked) { setReconcilingId(null); setAppointmentId(''); setReason(''); setAcknowledged(false); }
   }
   return (
     <div className="cc-card p-5">
@@ -86,7 +84,7 @@ export function BookingRequestQueue({ requests, onChanged }: { requests: Booking
                   {['PENDING_REVIEW', 'MISSING_INFO'].includes(r.status) && (
                     <>
                       <button type="button" disabled={busy} onClick={() => window.open('/scheduling', '_blank', 'noopener,noreferrer')} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-indigo hover:bg-[var(--s2)]">Open scheduler</button>
-                      <button type="button" disabled={busy} onClick={() => { setReconcilingId(r.id); setAppointmentId(''); setReason(''); setAcknowledged(false); setError(null); }} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-emerald-v hover:bg-[var(--s2)]">Link canonical appointment</button>
+                      <button type="button" disabled={busy} onClick={() => { setReconcilingId(r.id); setAppointmentId(''); setReason(''); setAcknowledged(false); action.reset(); }} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-emerald-v hover:bg-[var(--s2)]">Link canonical appointment</button>
                       <ConfirmedButton
                         dialogTitle="Reject appointment request?"
                         message="Record why this request cannot proceed. This changes the request status; it does not cancel or modify an appointment."
@@ -128,14 +126,14 @@ export function BookingRequestQueue({ requests, onChanged }: { requests: Booking
                   </label>
                   <div className="flex gap-2">
                     <button type="button" disabled={busy || !acknowledged || reason.trim().length < 5 || !/^[0-9a-f-]{36}$/i.test(appointmentId.trim())} onClick={() => void reconcile(r.id)} className="rounded-lg bg-indigo px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50">{busy ? 'Linking…' : 'Link appointment'}</button>
-                    <button type="button" disabled={busy} onClick={() => { setReconcilingId(null); setError(null); }} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-t2">Cancel</button>
+                    <button type="button" disabled={busy} onClick={() => { setReconcilingId(null); action.reset(); }} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-t2">Cancel</button>
                   </div>
                 </div>
               )}
             </div>
             );
           })}
-          {error && <p role="alert" className="text-xs font-semibold text-red-v">{error} Refresh before taking another action.</p>}
+          <MutationNotice state={action.state} action={action.state.status === 'error' ? <span className="text-[11px]">Refresh before taking another action.</span> : undefined} />
         </div>
       )}
     </div>

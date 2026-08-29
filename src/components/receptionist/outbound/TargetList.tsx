@@ -1,35 +1,73 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Plus, Phone, PhoneOutgoing } from 'lucide-react';
+import { Plus, Phone, PhoneOutgoing, Settings2 } from 'lucide-react';
 import { Field, Select } from '../../ui/Field';
 import { receptionistApi as api, type OutboundCampaign, type CallTarget, type OutboundTargetCandidate } from '../../../lib/receptionist';
+import { ApiError } from '../../../lib/api';
+import { describeFailure, type ResourceFailure } from '../../../lib/resourceState';
+import { isBusy, useMutationState } from '../../../hooks/useMutationState';
 import { formatEnumLabel, maskedPhone } from '../helpers';
 import { ConfirmedButton } from '../shared';
+import { LoadFailureNotice, MutationNotice } from '../MutationNotice';
 
-export function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign: OutboundCampaign; targets: CallTarget[]; onAdded: () => void; onCall: (t: CallTarget) => void; canCall: boolean }) {
+/**
+ * Why the candidate list is not showing rows. `policy_missing` is the 409 the
+ * server answers when the campaign has no purpose / legal basis / policy
+ * version yet: that is a configuration step, not a load failure, and it gets
+ * a guided state instead of the red "could not be loaded" notice.
+ */
+type CandidateState =
+  | { status: 'loading' }
+  | { status: 'ready' }
+  | { status: 'policy_missing'; message: string }
+  | { status: 'error'; failure: ResourceFailure };
+
+export const POLICY_MISSING_GUIDANCE = 'Set purpose, legal basis and policy version on this campaign before selecting targets.';
+
+function candidateFailureState(error: unknown): CandidateState {
+  if (error instanceof ApiError && error.status === 409) return { status: 'policy_missing', message: error.message };
+  return { status: 'error', failure: describeFailure(error) };
+}
+
+export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConfigure }: {
+  campaign: OutboundCampaign;
+  targets: CallTarget[];
+  onAdded: () => void;
+  onCall: (t: CallTarget) => void;
+  canCall: boolean;
+  /** Takes the user to where purpose / legal basis / policy version are set. */
+  onConfigure?: () => void;
+}) {
   const [candidates, setCandidates] = useState<OutboundTargetCandidate[]>([]);
+  const [candidateState, setCandidateState] = useState<CandidateState>({ status: 'loading' });
   const targetIdentityKey = targets
     .map(target => target.patientId ?? target.leadId ?? target.id)
     .sort()
     .join(',');
   const [selectedCandidate, setSelectedCandidate] = useState('');
-  const [busy, setBusy] = useState(false);
+  const addState = useMutationState();
+  const removeState = useMutationState();
   const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [candidateError, setCandidateError] = useState<string | null>(null);
+  const busy = isBusy(addState.state) || isBusy(removeState.state);
+
   const loadCandidates = useCallback(async () => {
+    setCandidateState({ status: 'loading' });
     try {
       const rows = await api.listOutboundTargetCandidates(campaign.id);
-      setCandidates(rows); setCandidateError(null);
-    } catch {
-      setCandidateError('Authorized target candidates could not be loaded. Existing rows are preserved; do not infer that no candidates exist.');
+      setCandidates(rows);
+      setCandidateState({ status: 'ready' });
+    } catch (error) {
+      setCandidateState(candidateFailureState(error));
     }
   }, [campaign.id]);
+
   useEffect(() => {
     let active = true;
     void api.listOutboundTargetCandidates(campaign.id).then(rows => {
       if (!active) return;
-      setCandidates(rows); setCandidateError(null);
-    }).catch(() => {
-      if (active) setCandidateError('Authorized target candidates could not be loaded. Existing rows are preserved; do not infer that no candidates exist.');
+      setCandidates(rows);
+      setCandidateState({ status: 'ready' });
+    }).catch(error => {
+      if (active) setCandidateState(candidateFailureState(error));
     });
     return () => { active = false; };
   }, [campaign.id, targetIdentityKey]);
@@ -37,41 +75,68 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall }: { ca
   async function add() {
     const candidate = candidates.find(item => `${item.type}:${item.id}` === selectedCandidate);
     if (!candidate) return;
-    setBusy(true);
-    try {
+    await addState.run(async () => {
       await api.addTargets(campaign.id, [{
         ...(candidate.type === 'patient' ? { patientId: candidate.id } : { leadId: candidate.id }),
       }]);
       setSelectedCandidate('');
       onAdded();
-    } finally {
-      setBusy(false);
-    }
+    }, { successMessage: `${candidate.name} added to the target list` });
   }
 
   async function remove(target: CallTarget) {
     setDeletingId(target.id);
     try {
-      await api.deleteTarget(campaign.id, target.id);
-      onAdded();
+      await removeState.run(async () => {
+        await api.deleteTarget(campaign.id, target.id);
+        onAdded();
+      }, { rethrow: true });
     } finally {
       setDeletingId(null);
     }
   }
 
+  const policyMissing = candidateState.status === 'policy_missing';
+  const readyCandidates = candidates.filter(candidate => candidate.voiceAuthorizationReady);
+
   return (
     <div className="cc-card p-5 space-y-3">
       <h4 className="text-sm font-bold text-t1 flex items-center gap-2"><Phone className="w-4 h-4 text-indigo" /> Target list ({targets.length})</h4>
-      {candidateError && <div role="alert" className="rounded-lg border border-red-v/40 bg-[var(--red-soft)] p-2 text-xs text-red-v">{candidateError} <button type="button" onClick={() => void loadCandidates()} className="ml-2 underline font-semibold">Retry</button></div>}
+      {candidateState.status === 'error' && (
+        <LoadFailureNotice
+          what="Authorized target candidates"
+          message={`${candidateState.failure.message} Existing rows are preserved; do not infer that no candidates exist.`}
+          onRetry={() => void loadCandidates()}
+        />
+      )}
+      {policyMissing && (
+        <div role="status" className="flex flex-wrap items-start gap-2 rounded-lg border border-amber-v/40 bg-amber-v/5 px-3 py-2 text-xs text-amber-v">
+          <Settings2 className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+          <div className="min-w-0 flex-1">
+            <p className="font-semibold text-t1">{POLICY_MISSING_GUIDANCE}</p>
+            <p className="mt-0.5 text-t2">Targets cannot be selected until the campaign states why it is calling and under which authority. {candidateState.message}</p>
+            {onConfigure && (
+              <button type="button" onClick={onConfigure} className="mt-1.5 rounded-lg border border-amber-v/40 px-2.5 py-1 text-[11px] font-semibold text-amber-v hover:bg-[var(--s2)]">Go to campaign settings</button>
+            )}
+          </div>
+        </div>
+      )}
       <div className="grid grid-cols-[1fr_auto] gap-2 items-end">
         <Field label="Authorized patient or lead">
-          <Select aria-label="Authorized outbound target" value={selectedCandidate} onChange={e => setSelectedCandidate(e.target.value)}>
-            <option value="">Select an identity with a canonical phone</option>
-            {candidates.filter(candidate => candidate.voiceAuthorizationReady).map(candidate => <option key={`${candidate.type}:${candidate.id}`} value={`${candidate.type}:${candidate.id}`}>{candidate.name} · {maskedPhone(candidate.phone)} · {candidate.voiceAuthorizationReason === 'compatible_immutable_consent' ? 'compatible consent evidence' : 'treatment/operations authority'}</option>)}
+          <Select aria-label="Authorized outbound target" value={selectedCandidate} disabled={policyMissing || candidateState.status === 'loading'} onChange={e => setSelectedCandidate(e.target.value)}>
+            <option value="">
+              {policyMissing ? 'Configure the campaign policy first'
+                : candidateState.status === 'loading' ? 'Loading authorized identities…'
+                  : candidateState.status === 'ready' && readyCandidates.length === 0 ? 'No authorized identity with a canonical phone yet'
+                    : 'Select an identity with a canonical phone'}
+            </option>
+            {readyCandidates.map(candidate => <option key={`${candidate.type}:${candidate.id}`} value={`${candidate.type}:${candidate.id}`}>{candidate.name} · {maskedPhone(candidate.phone)} · {candidate.voiceAuthorizationReason === 'compatible_immutable_consent' ? 'compatible consent evidence' : 'treatment/operations authority'}</option>)}
           </Select>
         </Field>
         <button type="button" disabled={busy || !selectedCandidate} onClick={add} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50 h-[38px]"><Plus className="w-4 h-4" /> Add</button>
       </div>
+      <MutationNotice state={addState.state} onRetry={selectedCandidate ? add : undefined} />
+      <MutationNotice state={removeState.state} showSaved={false} />
       {targets.length > 0 && (
         <div className="space-y-1.5">
               {targets.map(t => (

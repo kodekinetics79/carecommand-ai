@@ -1,25 +1,29 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useMemo } from 'react';
 import { Code2, Loader2 } from 'lucide-react';
 import { Field, TextInput } from '../ui/Field';
 import { receptionistApi as api, type RetellConfig } from '../../lib/receptionist';
+import { useResource } from '../../hooks/useResource';
+import { receivedData } from '../../lib/resourceState';
 import { CopyButton, KV } from './shared';
+import { LoadFailureNotice } from './MutationNotice';
 
 // ===== RetellAI Panel ======================================================
 
 export function RetellPanel({ campaignId }: { campaignId: string }) {
-  const [config, setConfig] = useState<RetellConfig | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    api.getRetellConfig(campaignId).then(r => { if (active) setConfig(r); }).catch(e => { if (active) setError(e instanceof Error ? e.message : 'Failed'); });
-    return () => { active = false; };
-  }, [campaignId]);
+  const loadConfig = useCallback(() => api.getRetellConfig(campaignId), [campaignId]);
+  const { state, reload } = useResource<RetellConfig>(loadConfig);
+  const config = receivedData(state);
 
   const fullJson = useMemo(() => (config ? JSON.stringify(config, null, 2) : ''), [config]);
 
-  if (error) return <div className="cc-card p-6 text-sm text-red-v">{error}</div>;
-  if (!config) return <div className="cc-card p-10 text-center text-sm text-t3"><Loader2 className="w-4 h-4 animate-spin inline mr-2" /> Building preview/export config…</div>;
+  if (state.status === 'error') {
+    return (
+      <div className="cc-card p-6">
+        <LoadFailureNotice what="The RetellAI export configuration" message={state.failure.message} onRetry={reload} />
+      </div>
+    );
+  }
+  if (!config) return <div className="cc-card p-10 text-center text-sm text-t3" role="status"><Loader2 className="w-4 h-4 animate-spin inline mr-2" /> Building preview/export config…</div>;
 
   return (
     <div className="space-y-4">
