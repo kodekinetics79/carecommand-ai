@@ -24,7 +24,13 @@
   /* ── Text ─────────────────────────────────────────── */
   --t1: #111827;
   --t2: #4B5563;
-  --t3: #9CA3AF;
+  /* #9CA3AF measured 2.54:1 on --s1, failing WCAG AA (4.5:1) and even AA-large
+     (3:1). It is the dominant secondary-text colour — every table header, every
+     caption, every metric label in the app — so the whole product was below the
+     accessibility bar a clinic's procurement review checks for. #6B7280 is
+     4.83:1 on the same background and keeps the intended hierarchy against
+     --t1/--t2. */
+  --t3: #6B7280;
 
   /* ── Brand — Indigo ───────────────────────────────── */
   --indigo:      #4F46E5;
