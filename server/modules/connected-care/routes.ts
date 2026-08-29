@@ -14,6 +14,7 @@ import { DEVICE_KEYS } from '../../lib/connectedCare/catalog';
 import { enterTenantContext } from '../../lib/tenantContext';
 import { resolveDeviceWebhookVerifier } from '../../lib/tenantIngressResolvers';
 import {
+  COMMUNICATION_MODALITIES,
   buildRpmEvidenceSnapshot,
   invalidateRpmProviderSignoff,
   lockRpmEvidence,
@@ -21,6 +22,7 @@ import {
   rpmPeriodBounds,
 } from '../../lib/connectedCare/rpmEvidence';
 import { computeAndStoreRpmReadiness, mapWithConcurrency, RPM_READINESS_CONCURRENCY } from '../../lib/connectedCare/rpmReadinessService';
+import { resolveRpmCodeLadder } from '../../lib/connectedCare/rpmBillingCodes';
 
 const uuid = z.string().uuid();
 const manageRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER');
@@ -242,6 +244,20 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
         qualifyingReadingCount: evidence.qualifyingReadingCount,
         excludedReadingCount: evidence.excludedReadingCount,
         deviceExceptions: evidence.deviceExceptions,
+        interactiveCommunication: evidence.interactiveCommunication,
+        sessionsMissingNarrative: evidence.sessionsMissingNarrative,
+        // Which codes the RECORDED EVIDENCE could support. Not coding advice,
+        // not a claim, not a payment guarantee — a coder still decides. The
+        // previous single READY boolean reported $0 for a device-supply month
+        // with no review minutes, which is a legitimately billable month.
+        billing: resolveRpmCodeLadder({
+          readingDays,
+          reviewMinutes: row.reviewMinutes,
+          interactiveCommunication: evidence.interactiveCommunication,
+          setupAlreadyBilled: false,
+          consentGranted: evidence.consentGranted,
+          enrollmentActive: evidence.enrollmentActive,
+        }),
       };
     });
     await audit(request, { action: 'connectedcare.rpm_readiness.read', resource: 'rpmBillingReadiness', metadata: { patientCount: rows.length, total: allPatientIds.length } });
@@ -269,7 +285,15 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
       provenance: z.enum(['EHR_TIMER', 'DEVICE_SESSION', 'MANUAL_ATTESTATION']),
       startedAt: z.coerce.date(),
       endedAt: z.coerce.date(),
-      communicationFlag: z.boolean().default(false),
+      // Auditors reject a bare duration: each entry needs date, minutes, AND
+      // what was done. "Reviewed RPM data" is explicitly not acceptable, so the
+      // narrative is required rather than optional.
+      activityNarrative: z.string().trim().min(12).max(2000),
+      // A management code requires a LIVE interactive communication. Recording
+      // this as a bare boolean could not distinguish a qualifying phone call
+      // from a text message. Non-live values are accepted on purpose so staff
+      // log real outreach without it inflating billable evidence.
+      communicationModality: z.enum(COMMUNICATION_MODALITIES).default('none'),
     }).parse(request.body ?? {});
     const tenantId = request.auth.tenantId;
     const period = rpmPeriodBounds();
@@ -278,6 +302,7 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
     if (elapsedMs < 60_000 || elapsedMs > 4 * 60 * 60_000) throw app.httpErrors.badRequest('Review session must be between 1 and 240 minutes');
     if (input.startedAt < period.start || input.endedAt > new Date(Date.now() + 60_000)) throw app.httpErrors.badRequest('Review session is outside the current period');
     const reviewMinutes = Math.floor(elapsedMs / 60_000);
+    const communicationFlag = input.communicationModality !== 'none';
     const recorded = await db.$transaction(async tx => {
       await lockRpmEvidence(tx, tenantId, patientId, period.start);
       const replay = await tx.auditEvent.findFirst({ where: { tenantId, action: 'connectedcare.rpm.review_evidence_recorded', resourceId: input.reviewEventId }, select: { id: true } });
@@ -319,7 +344,7 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
             : 'Review session overlaps another patient\'s session already recorded by you for the same time');
         }
       }
-      await tx.auditEvent.create({ data: { tenantId, actorUserId: request.auth.userId, action: 'connectedcare.rpm.review_evidence_recorded', resource: 'rpmReviewSession', resourceId: input.reviewEventId, requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'], metadata: { patientId, sourceRef: input.sourceRef, provenance: input.provenance, startedAt: input.startedAt.toISOString(), endedAt: input.endedAt.toISOString(), reviewMinutes, communicationFlag: input.communicationFlag } } });
+      await tx.auditEvent.create({ data: { tenantId, actorUserId: request.auth.userId, action: 'connectedcare.rpm.review_evidence_recorded', resource: 'rpmReviewSession', resourceId: input.reviewEventId, requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'], metadata: { patientId, sourceRef: input.sourceRef, provenance: input.provenance, startedAt: input.startedAt.toISOString(), endedAt: input.endedAt.toISOString(), reviewMinutes, communicationFlag, communicationModality: input.communicationModality, activityNarrative: input.activityNarrative, actorRole: request.auth.role ?? null } } });
       await invalidateRpmProviderSignoff(tx, {
         tenantId, patientId, periodStart: period.start,
         reason: 'review_evidence_mutated', actorUserId: request.auth.userId,

@@ -118,9 +118,9 @@ async function prepareRpmBaseEvidence(t: TenantFixture, deviceId?: string, lates
 async function rpmReadinessRow(patientId: string, headers: Record<string, string>) {
   const response = await app.inject({ method: 'GET', url: '/v1/connected-care/rpm-readiness', headers });
   expect(response.statusCode).toBe(200);
-  const row = (response.json() as Array<{
+  const row = (response.json() as { items: Array<{
     patientId: string; evidenceVersion: string; evidenceHash: string; signoffAttestationRevision: string;
-  }>).find(item => item.patientId === patientId);
+  }> }).items.find(item => item.patientId === patientId);
   expect(row).toBeTruthy();
   return row!;
 }
@@ -152,7 +152,8 @@ async function prepareCompleteRpmEvidence(t: TenantFixture, deviceId?: string, l
       provenance: 'EHR_TIMER',
       startedAt,
       endedAt,
-      communicationFlag: true,
+      activityNarrative: 'Reviewed BP trend, confirmed medication adherence, advised on cuff placement.',
+      communicationModality: 'live_phone',
     },
   });
   expect(review.statusCode).toBe(200);
@@ -506,7 +507,7 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: auth(admin), payload: { patientId: t.patientId, providerKey: 'withings', externalRef: 'EXT-DEDUP-1' } });
 
     // Same measurement (same captured timestamp/value) delivered twice.
-    const payload = { readings: [{ patientExternalRef: 'EXT-DEDUP-1', readingType: 'glucose', value: '330', numericValue: 330, unit: 'mg/dL', capturedAt: '2026-07-20T10:00:00.000Z' }] };
+    const payload = { readings: [{ patientExternalRef: 'EXT-DEDUP-1', readingType: 'glucose', value: '330', numericValue: 330, unit: 'mg/dL', capturedAt: new Date(Date.now() - 2 * 60 * 60_000).toISOString() }] };
     const { raw, sig } = signWebhook(SECRET, payload);
     const url = `/v1/connected-care/${t.id}/providers/withings/webhook`;
 
@@ -529,7 +530,7 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: auth(admin), payload: { patientId: t.patientId, providerKey: 'manual' } });
     await app.inject({ method: 'POST', url: '/v1/connected-care/consent', headers: auth(admin), payload: { patientId: t.patientId, consentType: 'rpm', granted: true } });
 
-    const readiness = JSON.parse((await app.inject({ method: 'GET', url: '/v1/connected-care/rpm-readiness', headers: auth(admin) })).body);
+    const readiness = JSON.parse((await app.inject({ method: 'GET', url: '/v1/connected-care/rpm-readiness', headers: auth(admin) })).body).items;
     expect(readiness.length).toBe(1);
     // Fresh patient has no device-days yet → not billable, requirement listed.
     expect(readiness[0].status).toBe('MISSING_REQUIREMENTS');
@@ -559,7 +560,7 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     expect(signed.json().status).toBe('READY');
     const firstSnapshot = await db.rPMBillingReadiness.findFirstOrThrow({ where: { tenantId: t.id, patientId: t.patientId } });
     expect(firstSnapshot.providerSignoffUserId).toBe(t.providerUserId);
-    expect(firstSnapshot.providerSignoffEvidenceVersion).toBe('rpm-readiness-evidence-v3');
+    expect(firstSnapshot.providerSignoffEvidenceVersion).toBe('rpm-readiness-evidence-v4');
     expect(firstSnapshot.providerSignoffAttestationRevision).toBe('rpm-provider-attestation-v1');
     expect(firstSnapshot.providerSignoffEvidenceHash).toMatch(/^[a-f0-9]{64}$/);
 
@@ -575,7 +576,8 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
         provenance: 'EHR_TIMER',
         startedAt: mutationStartedAt,
         endedAt: mutationEndedAt,
-        communicationFlag: true,
+        activityNarrative: 'Reviewed BP trend, confirmed medication adherence, advised on cuff placement.',
+      communicationModality: 'live_phone',
       },
     });
     expect(mutation.statusCode).toBe(200);
@@ -687,8 +689,16 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     expect(await db.auditEvent.count({ where: { tenantId: t.id, action: 'connectedcare.rpm.signoff_invalidated', resourceId: t.patientId, metadata: { path: ['reason'], equals: 'offline_detector_device_status_mutated' } } })).toBe(1);
 
     expect((await signoffRpm(t.patientId, provider)).json().status).toBe('READY');
-    const online = await app.inject({ method: 'PATCH', url: `/v1/devices/${device.id}`, headers: admin, payload: { status: 'online' } });
-    expect(online.statusCode).toBe(200);
+    // A device coming back is OBSERVED, never asserted. `online` is no longer a
+    // human-settable status — staff previously picked it from a dropdown and the
+    // backend stamped lastSeenAt, manufacturing the very telemetry the staleness
+    // check relies on. Recovery is expressed as fresh activity, as ingest does.
+    const humanClaimsOnline = await app.inject({ method: 'PATCH', url: `/v1/devices/${device.id}`, headers: admin, payload: { status: 'online' } });
+    expect(humanClaimsOnline.statusCode).toBe(400);
+    await inTenant(t, () => db.device.update({
+      where: { id: device.id },
+      data: { status: 'online', lastSeenAt: now },
+    }));
     expect((await signoffRpm(t.patientId, provider)).json().status).toBe('READY');
     // The suite clock is month-end, so advancing 25 hours would test a
     // different billing period. Make the owner-controlled fixture stale in
@@ -763,10 +773,11 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     expect((await app.inject({ method: 'POST', url: '/v1/connected-care/consent', headers: restricted, payload: { patientId: t.patientId, granted: true, method: 'verbal' } })).statusCode).toBe(403);
     const endedAt = new Date();
     const startedAt = new Date(endedAt.getTime() - 10 * 60_000);
-    expect((await app.inject({ method: 'PATCH', url: `/v1/connected-care/rpm-readiness/${t.patientId}/review`, headers: restricted, payload: { reviewEventId: randomUUID(), sourceRef: `ehr-${randomUUID()}`, provenance: 'EHR_TIMER', startedAt, endedAt } })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'PATCH', url: `/v1/connected-care/rpm-readiness/${t.patientId}/review`, headers: restricted, payload: { reviewEventId: randomUUID(), sourceRef: `ehr-${randomUUID()}`, provenance: 'EHR_TIMER', startedAt, endedAt, activityNarrative: 'Reviewed readings for the branch-scope probe.', communicationModality: 'live_phone' } })).statusCode).toBe(403);
     const readiness = await app.inject({ method: 'GET', url: '/v1/connected-care/rpm-readiness', headers: restricted });
     expect(readiness.statusCode).toBe(200);
-    expect(JSON.parse(readiness.body)).toEqual([]);
+    // Paged envelope: a branch-restricted user sees no rows from other branches.
+    expect(JSON.parse(readiness.body)).toMatchObject({ items: [], total: 0 });
   });
 
   it('validates enrolled devices and prevents ambiguous provider patient references', async () => {
@@ -799,7 +810,7 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     // prove that both immutable decisions exist and that current state is the
     // revocation below.
     expect(versions.map(v => (v.metadata as { granted: boolean }).granted)).toEqual(expect.arrayContaining([true, false]));
-    const readiness = (await app.inject({ method: 'GET', url: '/v1/connected-care/rpm-readiness', headers: admin })).json() as Array<{ requirements: Array<{ key: string; met: boolean }> }>;
+    const readiness = ((await app.inject({ method: 'GET', url: '/v1/connected-care/rpm-readiness', headers: admin })).json() as { items: Array<{ requirements: Array<{ key: string; met: boolean }> }> }).items;
     expect(readiness[0]?.requirements.find(r => r.key === 'consent')?.met).toBe(false);
   });
 
@@ -809,7 +820,7 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     await app.inject({ method: 'POST', url: '/v1/connected-care/enrollments', headers: admin, payload: { patientId: t.patientId, providerKey: 'manual' } });
     const endedAt = new Date();
     const startedAt = new Date(endedAt.getTime() - 10 * 60_000);
-    const payload = { reviewEventId: randomUUID(), sourceRef: `ehr-${randomUUID()}`, provenance: 'EHR_TIMER', startedAt, endedAt, communicationFlag: true };
+    const payload = { reviewEventId: randomUUID(), sourceRef: `ehr-${randomUUID()}`, provenance: 'EHR_TIMER', startedAt, endedAt, activityNarrative: 'Reviewed glucose trend and counselled the patient by phone.', communicationModality: 'live_phone' };
     const concurrent = await Promise.all([
       app.inject({ method: 'PATCH', url: `/v1/connected-care/rpm-readiness/${t.patientId}/review`, headers: admin, payload }),
       app.inject({ method: 'PATCH', url: `/v1/connected-care/rpm-readiness/${t.patientId}/review`, headers: admin, payload }),

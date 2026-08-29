@@ -4,6 +4,28 @@ import type { Prisma } from '../../generated/prisma/client';
 export const RPM_EVIDENCE_VERSION = 'rpm-readiness-evidence-v4';
 export const RPM_SIGNOFF_ATTESTATION_REVISION = 'rpm-provider-attestation-v1';
 
+/**
+ * How the clinician contacted the patient during a review session.
+ *
+ * CMS adopted CPT's "live, interactive communication" requirement for the
+ * management codes in CY2026 and expressly declined to extend it to
+ * asynchronous messaging. A bare `communicationFlag` boolean could not tell a
+ * qualifying phone call from a text message, so the most tamper-evident time
+ * record in the market was recording the wrong fact — provable minutes that
+ * still fail an audit.
+ *
+ * Non-live modalities are recordable ON PURPOSE: staff should log the outreach
+ * they actually did without it inflating billable evidence.
+ */
+export const LIVE_COMMUNICATION_MODALITIES = ['live_phone', 'video', 'live_chat'] as const;
+export const NON_LIVE_COMMUNICATION_MODALITIES = ['text_message', 'voicemail', 'secure_message', 'none'] as const;
+export const COMMUNICATION_MODALITIES = [...LIVE_COMMUNICATION_MODALITIES, ...NON_LIVE_COMMUNICATION_MODALITIES] as const;
+export type CommunicationModality = typeof COMMUNICATION_MODALITIES[number];
+
+export function isLiveInteractiveModality(modality: string | null | undefined): boolean {
+  return (LIVE_COMMUNICATION_MODALITIES as readonly string[]).includes(modality ?? '');
+}
+
 export interface RpmPeriod {
   /** Inclusive immutable UTC calendar-month billing boundary. */
   start: Date;
@@ -21,6 +43,10 @@ export interface RpmEvidenceSnapshot {
   readingDays: number;
   reviewMinutes: number;
   communicationFlag: boolean;
+  /** At least one session recorded a LIVE interactive communication. */
+  interactiveCommunication: boolean;
+  /** Sessions missing an activity narrative — auditors reject bare durations. */
+  sessionsMissingNarrative: number;
   qualifyingReadingCount: number;
   excludedReadingCount: number;
   deviceExceptions: Array<{ reason: string; count: number }>;
@@ -194,6 +220,8 @@ export async function buildRpmEvidenceSnapshot(
       elapsedMs,
       reviewMinutes: Math.floor(elapsedMs / 60_000),
       communicationFlag: metadata.communicationFlag === true,
+      communicationModality: typeof metadata.communicationModality === 'string' ? metadata.communicationModality : null,
+      activityNarrative: typeof metadata.activityNarrative === 'string' ? metadata.activityNarrative : null,
     }];
   });
   // Sum the elapsed MILLISECONDS and floor once at the end. Flooring each
@@ -205,6 +233,13 @@ export async function buildRpmEvidenceSnapshot(
     patientReviewEvents.reduce((totalMs, event) => totalMs + event.elapsedMs, 0) / 60_000,
   );
   const communicationFlag = patientReviewEvents.some(event => event.communicationFlag);
+  // Only a LIVE modality can support a management code. A session flagged as
+  // "communicated" by text message is recorded faithfully and excluded here.
+  const interactiveCommunication = patientReviewEvents.some(event => isLiveInteractiveModality(event.communicationModality));
+  // "Reviewed RPM data - 25 min" is explicitly not acceptable to auditors; each
+  // entry needs date, minutes, AND what was done. Surfaced so the UI can chase
+  // the gap while the clinician still remembers the session.
+  const sessionsMissingNarrative = patientReviewEvents.filter(event => !event.activityNarrative?.trim()).length;
   const evidenceAsOf = new Date(Math.max(
     period.start.getTime(),
     ...enrollments.map(enrollment => enrollment.updatedAt.getTime()),
@@ -245,6 +280,8 @@ export async function buildRpmEvidenceSnapshot(
     readingDays,
     reviewMinutes,
     communicationFlag,
+    interactiveCommunication,
+    sessionsMissingNarrative,
     qualifyingReadingCount: qualifyingReadings.length,
     excludedReadingCount: readings.length - qualifyingReadings.length,
     deviceExceptions,
