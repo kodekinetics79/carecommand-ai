@@ -25,6 +25,20 @@ const read = (relative: string) => readFileSync(`${root}${relative}`, 'utf8');
 
 const schema = read('prisma/schema.prisma');
 const migration = read('prisma/migrations/20260828140000_growth_config_spine/migration.sql');
+
+// Columns added to GrowthPolicy AFTER the spine migration. Each one is seeded
+// for every existing tenant by `ADD COLUMN ... DEFAULT` in its own migration
+// rather than by the spine's `-- @growth-seed policy` block, so the parity
+// assertions below pin that migration instead. The guard is EXTENDED, not
+// weakened: every defaults.ts column must still be seeded exactly once — by
+// the spine seed or by exactly one later ADD COLUMN — with the defaults.ts
+// value.
+const LATER_POLICY_COLUMNS: Record<string, { migration: string; sqlType: string }> = {
+  noShowRiskHigh: {
+    migration: 'prisma/migrations/20260829130000_growth_policy_no_show_risk/migration.sql',
+    sqlType: 'INTEGER',
+  },
+};
 const crmService = read('src/lib/crmService.ts');
 const patientRoutes = read('server/modules/patients/routes.ts');
 // The Growth module's arithmetic no longer lives in the browser. Two files now
@@ -95,10 +109,25 @@ describe('growth config spine — schema, migration and defaults.ts agree', () =
     expect(columns.length, 'seed column list and value list are different lengths').toBe(values.length);
     const seeded = new Map(columns.map((column, index) => [column, values[index]]));
     for (const [field, value] of Object.entries(GROWTH_POLICY_DEFAULTS)) {
+      const later = LATER_POLICY_COLUMNS[field];
+      if (later) {
+        // Backfilled by its own migration: existing tenants get exactly the
+        // defaults.ts value via the column DEFAULT.
+        expect(
+          read(later.migration),
+          `GrowthPolicy.${field} must be backfilled with its defaults.ts value by ${later.migration}`,
+        ).toContain(`ADD COLUMN "${field}" ${later.sqlType} NOT NULL DEFAULT ${value};`);
+        continue;
+      }
       expect(Number(seeded.get(field)), `seeded GrowthPolicy.${field}`).toBe(value);
     }
-    expect([...columns].sort(), 'the seed writes a column set defaults.ts does not own')
-      .toEqual(Object.keys(GROWTH_POLICY_DEFAULTS).sort());
+    // Exactly-once seeding: if a later column ever also appears in the spine
+    // seed (a duplicate), or a defaults.ts column is seeded nowhere, the sorted
+    // union stops matching.
+    expect(
+      [...columns, ...Object.keys(LATER_POLICY_COLUMNS)].sort(),
+      'every defaults.ts column is seeded exactly once — by the spine seed or by one later ADD COLUMN migration',
+    ).toEqual(Object.keys(GROWTH_POLICY_DEFAULTS).sort());
   });
 
   it('seeds the six segment definitions and four channel costs verbatim', () => {
@@ -235,6 +264,19 @@ describe('growth config spine — the churn-risk / LTV threshold conflict is res
     for (const resolution of THRESHOLD_RESOLUTIONS) {
       expect(resolution.reasoning.length, `${resolution.concept} needs a stated reason`).toBeGreaterThan(80);
     }
+  });
+
+  it('records the no-show divergence as resolved, with the register semantics', () => {
+    const noShow = THRESHOLD_RESOLUTIONS.find(r => r.concept === 'noShowRiskHigh');
+    expect(noShow, 'the Scheduling/advisory/revenue-protection no-show divergence is not recorded').toBeTruthy();
+    expect(noShow?.kind).toBe('divergence-resolved');
+    expect(noShow?.chosen).toBe(50);
+    expect(noShow?.comparison).toBe('>=');
+    expect(GROWTH_POLICY_DEFAULTS.noShowRiskHigh).toBe(50);
+    // The resolution must name all three formerly divergent layers.
+    expect(noShow?.frontend).toContain('Scheduling.tsx');
+    expect(noShow?.server).toContain('advisory');
+    expect(noShow?.server).toContain('revenue-protection');
   });
 
   it('makes one value per concept the single source of truth', () => {

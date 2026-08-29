@@ -14,7 +14,8 @@
 // already existed (see THRESHOLD_RESOLUTIONS below).
 //
 // Comparison semantics are part of the configuration, not folklore:
-//   * `hotLeadScore`, `scoreBand*`, `churnRiskHigh`, `highValuePatientLtv`,
+//   * `hotLeadScore`, `scoreBand*`, `churnRiskHigh`, `noShowRiskHigh`,
+//     `highValuePatientLtv`,
 //     `reviewRating*`, `reputationRisk*`, `minInactiveDays`, `minLifetimeValue`,
 //     `minChurnRisk` are INCLUSIVE LOWER bounds  (value >= threshold).
 //   * `competitorRating*SeverityMax` are INCLUSIVE UPPER bounds (value <= t).
@@ -30,6 +31,7 @@ export type GrowthPolicyValues = {
   scoreBandMid: number;
   goingColdDays: number;
   churnRiskHigh: number;
+  noShowRiskHigh: number;
   highValuePatientLtv: number;
   recoverableLtvFraction: number;
   inactiveAudienceDays: number;
@@ -54,6 +56,12 @@ export const GROWTH_POLICY_DEFAULTS: GrowthPolicyValues = Object.freeze({
   goingColdDays: 14,
   // RESOLVED CONFLICT — see THRESHOLD_RESOLUTIONS.
   churnRiskHigh: 50,
+  // RESOLVED CONFLICT — see THRESHOLD_RESOLUTIONS. src/pages/Scheduling.tsx
+  // flagged at >= 50; advisory counted at >= 60; revenue-protection at > 65.
+  // Seeded by ADD COLUMN ... DEFAULT in
+  // prisma/migrations/20260829130000_growth_policy_no_show_risk, not by the
+  // spine migration's @growth-seed block (the column postdates it).
+  noShowRiskHigh: 50,
   highValuePatientLtv: 4000,
   // src/lib/crmService.ts:175,182 — an explicitly unvalidated planning
   // assumption, never presented as a forecast.
@@ -132,6 +140,17 @@ export const THRESHOLD_RESOLUTIONS = Object.freeze([
       'The worst kind of divergence: a DYNAMIC one. The screen moved with the tenant\'s configuration and the advisor did not, so raising reputationRiskHigh to 90 widened the gap silently and turned the configuration UI into a control half the product ignored. It was also priced — the advisor multiplies this count into an expectedImpact currency figure a clinic acts on, and a number presented as money must not come from a threshold the customer believes they changed. The configured value wins outright; there is no defensible reading in which the advisor keeps a private band for a field the tenant configures. The advisor now classifies through isHighReputationRisk (server/modules/advisory/thresholds.ts), which is the high band of ClinicRadar\'s severityFromRisk character for character, and states the threshold and its provenance in its own evidence.',
   }),
   Object.freeze({
+    concept: 'noShowRiskHigh',
+    kind: 'divergence-resolved' as const,
+    chosen: 50,
+    comparison: '>=' as const,
+    frontend: 'src/pages/Scheduling.tsx:469 flagged an appointment risky at noShowRisk >= 50 (now reads the configured noShowRiskHigh)',
+    server:
+      'server/modules/advisory/service.ts counted at noShowRisk >= 60 in three places (front-desk, operations best-branch, operations evidence) and priced the count at $120-$150 a flag into expectedImpact; server/modules/revenue-protection.ts:593 escalated at (churnRisk ?? noShowRisk ?? 0) > 65 — mixing two concepts under one unowned literal',
+    reasoning:
+      'The churnRiskHigh resolution applies unchanged, and it applies twice over because this one was PRICED. 50 is the value the clinic actually sees and acts on: it drives the red risk badge on every appointment row on the Scheduling board, and front desks have been calling the 50-59 band because the product told them to. Moving to 60 or 65 would silently un-flag appointments a clinic has been acting on; keeping 50 only widens the advisory count and the eligibility simulation severity, both explicitly labelled heuristics. The cost asymmetry is the same as retention: a false positive costs one confirmation message or deposit request, a false negative costs an empty chair — the very $120-$150 the advisor prices per flag. The comparison is the register-standard INCLUSIVE lower bound (value >= threshold); revenue-protection additionally stops borrowing churnRisk\'s number for noShowRisk and now classifies each concept with its own configured threshold (churnRiskHigh for a patient\'s churn risk, noShowRiskHigh for an appointment\'s no-show risk).',
+  }),
+  Object.freeze({
     concept: 'lowRatedReviewMax',
     kind: 'code-constant' as const,
     chosen: 3,
@@ -190,21 +209,22 @@ export const PENDING_CONFIG_CALL_SITES: readonly string[] = Object.freeze([]);
  * into an owner-facing dollar figure — classifies `badReviewRisk` with
  * `reputationRiskHigh`.
  *
- * It does NOT claim the product is free of threshold literals. Two are known
- * and are outside this register because GrowthPolicy has no column for their
- * concept, so there is nothing here to rewire them to:
+ * NO-SHOW RISK, formerly the last named divergence in this block, is now
+ * resolved and recorded in THRESHOLD_RESOLUTIONS above: `noShowRiskHigh` is a
+ * GrowthPolicy column, src/pages/Scheduling.tsx flags with the configured
+ * value it reads from GET /v1/growth/policy, server/modules/advisory/service.ts
+ * classifies through `isHighNoShowRisk` (server/modules/advisory/thresholds.ts)
+ * off the policy loaded once in loadContext inside the tenant transaction, and
+ * server/modules/revenue-protection.ts classifies a patient's churn risk with
+ * `churnRiskHigh` and an appointment's no-show risk with `noShowRiskHigh`
+ * instead of `> 65` for either.
+ *
+ * It does NOT claim the product is free of threshold literals. One is known
+ * and is outside this register because GrowthPolicy deliberately has no column
+ * for its concept:
  *
  *   * `review.rating <= 3` in the competitor advisor — deliberate, named
  *     LOW_RATED_REVIEW_MAX, and recorded in THRESHOLD_RESOLUTIONS above.
- *   * NO-SHOW RISK — genuinely divergent, and unowned. src/pages/Scheduling.tsx
- *     flags an appointment at `noShowRisk >= 50`,
- *     server/modules/advisory/service.ts counts at `>= 60` (three call sites,
- *     one of them priced at $120–$150 a flag), and
- *     server/modules/revenue-protection.ts escalates at `> 65`. One concept,
- *     three numbers, three layers, none of them visible to the clinic — the
- *     same defect this register exists to close, on a concept that has not been
- *     given a column yet. Adding `noShowRiskHigh` is the next increment; until
- *     it exists this stays written down here rather than discovered again.
  */
 
 export type GrowthSegmentDefinitionValues = {

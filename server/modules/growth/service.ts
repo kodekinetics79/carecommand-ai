@@ -48,6 +48,7 @@ export async function getEffectiveGrowthPolicy(tenantId: string, client: Client 
     scoreBandMid: row.scoreBandMid,
     goingColdDays: row.goingColdDays,
     churnRiskHigh: row.churnRiskHigh,
+    noShowRiskHigh: row.noShowRiskHigh,
     highValuePatientLtv: toNumber(row.highValuePatientLtv),
     recoverableLtvFraction: toNumber(row.recoverableLtvFraction),
     inactiveAudienceDays: row.inactiveAudienceDays,

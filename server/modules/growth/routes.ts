@@ -102,6 +102,7 @@ const policyPatchSchema = z.object({
   scoreBandMid: score.optional(),
   goingColdDays: positiveDays.optional(),
   churnRiskHigh: score.optional(),
+  noShowRiskHigh: score.optional(),
   highValuePatientLtv: z.number().min(0).max(10_000_000).optional(),
   recoverableLtvFraction: z.number().min(0).max(1).optional(),
   inactiveAudienceDays: positiveDays.optional(),

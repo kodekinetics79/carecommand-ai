@@ -38,6 +38,33 @@ export function isHighReputationRisk(
 }
 
 /**
+ * Is this appointment at high risk of a no-show?
+ *
+ * INCLUSIVE LOWER bound, per GROWTH_POLICY_DEFAULTS in
+ * server/modules/growth/defaults.ts, and the same rule the Scheduling board
+ * flags with: src/pages/Scheduling.tsx paints the red risk badge on an
+ * appointment row at `noShowRisk >= noShowRiskHigh`, read from the SAME
+ * `GET /v1/growth/policy` payload this policy resolves.
+ *
+ * Why this function exists: the advisors used to count `noShowRisk >= 60` in
+ * three places while the board flagged at `>= 50` and revenue-protection
+ * escalated at `> 65` — one concept, three numbers, none visible to the
+ * clinic. Two of the advisory counts are multiplied into `expectedImpact`
+ * ($120 and $150 a flag), and a number presented as money must not come from
+ * a threshold the customer cannot see or change. See the `noShowRiskHigh`
+ * entry in THRESHOLD_RESOLUTIONS (server/modules/growth/defaults.ts).
+ *
+ * The advisor counts exactly the appointments the board flags — no more, no
+ * less.
+ */
+export function isHighNoShowRisk(
+  noShowRisk: number,
+  policy: Pick<EffectiveGrowthPolicy, 'noShowRiskHigh'>,
+): boolean {
+  return noShowRisk >= policy.noShowRiskHigh;
+}
+
+/**
  * The rating at or below which a single review counts as low-rated.
  *
  * This is the fourth literal that used to sit unnamed in

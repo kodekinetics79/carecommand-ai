@@ -5,7 +5,7 @@ import { branchScope, assertBranchAccess } from '../../lib/scope';
 import { runWithTenantContext } from '../../lib/tenantContext';
 import { aiGateway } from '../../lib/ai/gateway';
 import { getEffectiveGrowthPolicy } from '../growth/service';
-import { isHighReputationRisk, isLowRatedReview, LOW_RATED_REVIEW_MAX, reputationBandProvenance } from './thresholds';
+import { isHighNoShowRisk, isHighReputationRisk, isLowRatedReview, LOW_RATED_REVIEW_MAX, reputationBandProvenance } from './thresholds';
 import { MockAdvisorProvider } from './providers';
 import type {
   AdvisorAnalysis,
@@ -287,7 +287,11 @@ function buildFrontDeskAdvisor(context: Awaited<ReturnType<typeof loadContext>>)
   const totalMissedCalls = context.staffProfiles.reduce((sum, staff) => sum + staff.missedCalls, 0);
   const overdueTasks = context.tasks.filter(task => !task.dueAt || task.status !== 'COMPLETED').length;
   const unresolvedConversations = context.conversations.filter(conversation => conversation.status !== 'replied' && conversation.status !== 'ai-recovered').length;
-  const noShowRiskAppointments = context.appointments.filter(appointment => appointment.noShowRisk >= 60).length;
+  // The count is priced (× $120 into expectedImpact), so it is classified with
+  // the tenant's configured rule — the SAME `noShowRiskHigh` the Scheduling
+  // board flags with — never a private advisory band. See isHighNoShowRisk.
+  const policy = context.growthPolicy;
+  const noShowRiskAppointments = context.appointments.filter(appointment => isHighNoShowRisk(appointment.noShowRisk, policy)).length;
   const summary = `Front desk performance is driven by response time, missed calls, and unresolved tasks.`;
   const diagnosis = `The largest operational gain is in the slowest-response staff members and the missed-call queue, which is still leaving too much recoverable value on the table.`;
   const recommendedAction = 'Triage the missed-call queue, assign overdue tasks, and coach the slowest responders first.';
@@ -304,7 +308,7 @@ function buildFrontDeskAdvisor(context: Awaited<ReturnType<typeof loadContext>>)
       topStaff ? `${topStaff.user.displayName}: ${Number(topStaff.responseTime).toFixed(1)} min response time, ${topStaff.missedCalls} missed calls.` : 'No staff profile data available.',
       `Missed calls across staff: ${totalMissedCalls}.`,
       `Overdue / open tasks: ${overdueTasks}.`,
-      `High no-show risk appointments: ${noShowRiskAppointments}.`,
+      `High no-show risk appointments (stored risk ≥ ${policy.noShowRiskHigh}, ${reputationBandProvenance(policy)}): ${noShowRiskAppointments}.`,
       `Unresolved conversations in queue: ${unresolvedConversations}.`,
     ],
     recommendations: [
@@ -373,7 +377,9 @@ function buildOperationsAdvisor(context: Awaited<ReturnType<typeof loadContext>>
     const branchAppointments = context.appointments.filter(appointment => appointment.branchId === branch.id);
     const branchTasks = context.tasks.filter(task => task.branchId === branch.id);
     const utilization = branchProviders.reduce((sum, provider) => sum + provider.utilization, 0) / Math.max(branchProviders.length, 1);
-    const risk = branchAppointments.filter(appointment => appointment.noShowRisk >= 60).length;
+    // Priced at × $150 into expectedImpact below — the tenant's configured
+    // rule, same as the Scheduling board's flag. See isHighNoShowRisk.
+    const risk = branchAppointments.filter(appointment => isHighNoShowRisk(appointment.noShowRisk, context.growthPolicy)).length;
     return { branch, utilization, risk, branchTasks };
   }).sort((left, right) => right.utilization - left.utilization)[0];
 
@@ -396,7 +402,9 @@ function buildOperationsAdvisor(context: Awaited<ReturnType<typeof loadContext>>
       bestBranch ? `${bestBranch.branch.name}: ${bestBranch.utilization.toFixed(0)}% utilization with ${bestBranch.branchTasks.length} open tasks.` : 'No branch data available for operations review.',
       `Open / active schedule items: ${openSlots}.`,
       `Pending tasks across the network: ${tasksPending}.`,
-      `No-show risk appointments in scope: ${context.appointments.filter(appointment => appointment.noShowRisk >= 60).length}.`,
+      // A stated rule the clinic can check, not a bare count — and the same
+      // rule the Scheduling board and the front-desk advisor apply.
+      `No-show risk appointments in scope (stored risk ≥ ${context.growthPolicy.noShowRiskHigh}, ${reputationBandProvenance(context.growthPolicy)}): ${context.appointments.filter(appointment => isHighNoShowRisk(appointment.noShowRisk, context.growthPolicy)).length}.`,
     ],
     recommendations: [
       'Use the busiest clinic as the capacity benchmark.',
