@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import {
   AlertCircle, AlertTriangle, Ban, CalendarCheck, CheckCircle2, Filter, HelpCircle, Loader2, Megaphone, Pause,
@@ -93,8 +93,20 @@ export default function Campaigner() {
   // a selection that no longer resolves (archived, cancelled, filtered out by a
   // narrower grant) falls back to the most recent campaign instead of leaving
   // the pane pointed at a record the server did not send.
-  const selected = campaignRecords
-    ? campaignRecords.find(row => row.id === chosenId) ?? campaignRecords[0] ?? null
+  //
+  // During a reload the resource honestly reads as loading and receivedData()
+  // goes null — but unmounting the detail pane for that beat destroyed its
+  // local notice state, so the launch result ("dispatch complete: N accepted,
+  // M suppressed…") flashed and vanished the moment onChanged() refreshed the
+  // list. The pane derives from the last received list instead: it is the last
+  // answer the server gave, the pane makes no freshness claim, and every KPI
+  // figure on the page stays gated on the live resource state exactly as
+  // before. When the reload resolves, selection re-derives from fresh data.
+  const lastReceivedRecords = useRef<Campaign[] | null>(null);
+  if (campaignRecords) lastReceivedRecords.current = campaignRecords;
+  const paneRecords = campaignRecords ?? lastReceivedRecords.current;
+  const selected = paneRecords
+    ? paneRecords.find(row => row.id === chosenId) ?? paneRecords[0] ?? null
     : null;
 
   const filterTabs = campaignRecords && STATUS_FILTERS.map(tab => ({
