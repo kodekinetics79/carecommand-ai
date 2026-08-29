@@ -129,7 +129,21 @@ otherwise cover a period that no longer meets its own threshold.
 New suites: `alertInbox.integration.test.ts` (7), `rpmPeriodBoundary.integration.test.ts` (7),
 `rpmPeriod.test.ts` (15 — DST boundaries, half-hour zones, round-trips).
 
-## Still open
+## Wave 5 — the last pilot blocker (2026-08-29)
 
-- **Threshold-editing screen.** API + 8 tests shipped; no UI yet.
-- **Consent annual expiry.** CY2020 requires consent at least annually; PatientConsent has no expiry.
+`/alert-thresholds` (85f671b). The rules API had tests but no screen, so a clinic could not change a
+single threshold without an engineer calling the endpoint — the one thing that actually blocked
+*independent* piloting. The screen shows the bands in force (an empty list previously read as "nothing
+is monitored" rather than "the defaults apply") and makes the missed-reading watch reachable, since
+that cadence lives only on a rule.
+
+**E2E now 5/5.** Added: a clinic setting its first rule and the watch turning on; the server refusing
+an inverted band.
+
+## Still open
+- **Consent annual expiry.** CY2020 requires consent at least annually; `PatientConsent` has no expiry
+  field. Not a pilot blocker — it becomes one at the first annual renewal, i.e. a year after go-live.
+- **Nothing is deployed.** All work is on `feat/receptionist-pilot-program-20260829`. `main`
+  auto-deploys to production; merging is the owner's call.
+- **v5 caveat.** The evidence migration clears every prior signoff. That costs nothing today (no
+  period could reach READY before this work) but stops being free once clinics start attesting.
