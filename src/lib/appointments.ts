@@ -72,14 +72,22 @@ export const appointmentsApi = {
 
 export const schedulingApi = {
   // Real open slots for a provider on a given day (YYYY-MM-DD), backend-computed.
-  slots: (providerId: string, date: string, durationMin?: number) =>
-    apiRequest<ProviderSlotsResponse>(
-      `${schedulingBase}/providers/${providerId}/slots?date=${date}${durationMin ? `&durationMin=${durationMin}` : ''}`,
-    ),
+  // The service is not optional once a clinic has a catalog. resolveSchedulingService
+  // is fail-closed on a configured catalog, so a slots request that names no
+  // service is refused with "Select an active service before checking
+  // availability" — meaning the first service a clinic ever creates broke slot
+  // loading as well as booking, from a screen that had no way to send one.
+  slots: (providerId: string, date: string, opts?: { durationMin?: number; service?: string; serviceCatalogItemId?: string }) => {
+    const params = new URLSearchParams({ date });
+    if (opts?.durationMin) params.set('durationMin', String(opts.durationMin));
+    if (opts?.serviceCatalogItemId) params.set('serviceCatalogItemId', opts.serviceCatalogItemId);
+    else if (opts?.service) params.set('service', opts.service);
+    return apiRequest<ProviderSlotsResponse>(`${schedulingBase}/providers/${providerId}/slots?${params.toString()}`);
+  },
 
   // Conflict-safe booking — sets providerProfileId and is guarded by the DB
   // exclusion constraint. A taken slot returns 409 { error:'slot_unavailable' }.
-  book: (providerId: string, body: { patientId: string; startsAt: string; durationMin?: number; service: string; channel?: string }) =>
+  book: (providerId: string, body: { patientId: string; startsAt: string; durationMin?: number; service: string; serviceCatalogItemId?: string; channel?: string }) =>
     apiRequest<{ id: string }>(`${schedulingBase}/providers/${providerId}/book`, {
       method: 'POST',
       body: JSON.stringify(body),

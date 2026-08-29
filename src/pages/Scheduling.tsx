@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { CalendarDays, Zap, AlertCircle, CheckCircle2, Clock, Users, DollarSign, RefreshCw, CreditCard, LogIn, UserX, CheckCheck, XCircle, CalendarClock } from 'lucide-react';
 import AppointmentPaymentCard from '../components/payments/AppointmentPaymentCard';
 import PaymentRequestsPanel from '../components/payments/PaymentRequestsPanel';
 import ProviderSetupPanel from '../components/scheduling/ProviderSetupPanel';
+import ServiceCatalogPanel from '../components/scheduling/ServiceCatalogPanel';
+import { activeServices, durationLabel, servicesApi, type ServiceCatalogItem } from '../lib/services';
 import InsuranceIntakeCard from '../components/insurance/InsuranceIntakeCard';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
@@ -107,9 +109,24 @@ export default function Scheduling() {
     return `/v1/patients?${params.toString()}`;
   }, [debouncedPatientQuery]);
   const { data: patientRecords, error: patientError } = useApiResource<ApiPatient, ReturnType<typeof mapPatient>>(patientsPath, [], mapPatient);
+  // The service catalog governs booking as soon as it holds one active entry
+  // (resolveSchedulingService is fail-closed on a configured catalog), so this
+  // screen has to know before it offers a free-text box the server will refuse.
+  const [serviceCatalog, setServiceCatalog] = useState<ServiceCatalogItem[]>([]);
+  const reloadServices = useCallback(() => {
+    void servicesApi.list().then(setServiceCatalog).catch(() => setServiceCatalog([]));
+  }, []);
+  useEffect(() => { reloadServices(); }, [reloadServices]);
+  const bookableServices = useMemo(() => activeServices(serviceCatalog), [serviceCatalog]);
+  const catalogGoverns = bookableServices.length > 0;
   const [showBooking, setShowBooking] = useState(false);
   const [paymentApptId, setPaymentApptId] = useState<string | null>(null);
   const [booking, setBooking] = useState(() => emptyBooking(''));
+  // Resolved after the booking state exists, since it reads the chosen name.
+  const chosenService = useMemo(
+    () => bookableServices.find(item => item.name === booking.service) ?? null,
+    [bookableServices, booking.service],
+  );
   const [saving, setSaving] = useState(false);
   const [bookingError, setBookingError] = useState<string | null>(null);
   // Real provider slots for the conflict-safe booking path.
@@ -157,7 +174,10 @@ export default function Scheduling() {
       setSlotsLoading(true);
       setSlotsError(null);
       try {
-        const res = await schedulingApi.slots(booking.providerId, booking.date);
+        const res = await schedulingApi.slots(booking.providerId, booking.date, {
+          serviceCatalogItemId: chosenService?.id,
+          service: chosenService ? undefined : booking.service.trim() || undefined,
+        });
         if (!active) return;
         setSlots(res.slots);
         if (res.slots.length === 0) setSlotsError('No open slots for this provider on this day. Pick another day, or change their working hours in Providers & availability.');
@@ -170,7 +190,9 @@ export default function Scheduling() {
       }
     })();
     return () => { active = false; };
-  }, [showBooking, booking.providerId, booking.date]);
+    // chosenService changes the duration the slot grid is computed for, so a
+    // service change must re-ask rather than show slots sized for the last one.
+  }, [showBooking, booking.providerId, booking.date, booking.service, chosenService]);
 
   useEffect(() => {
     let active = true;
@@ -222,6 +244,7 @@ export default function Scheduling() {
         startsAt: booking.slotStart,
         durationMin,
         service: booking.service.trim(),
+        serviceCatalogItemId: chosenService?.id,
         channel: booking.channel,
       });
       const bookedDate = booking.date;
@@ -240,7 +263,10 @@ export default function Scheduling() {
         // Refresh slots so the taken one drops off.
         if (booking.providerId) {
           try {
-            const res = await schedulingApi.slots(booking.providerId, booking.date);
+            const res = await schedulingApi.slots(booking.providerId, booking.date, {
+              serviceCatalogItemId: chosenService?.id,
+              service: chosenService ? undefined : booking.service.trim() || undefined,
+            });
             setSlots(res.slots);
           } catch { /* keep prior slots */ }
         }
@@ -376,7 +402,16 @@ export default function Scheduling() {
               {debouncedPatientQuery.trim() && patientRecords.length === 0 && (
                 <p className="text-[11px] text-t3">No patient matches that search. Registering a new patient is on the Patients screen.</p>
               )}
-              <input aria-label="Service" value={booking.service} onChange={e => setBooking(b => ({ ...b, service: e.target.value }))} placeholder="Service (e.g. Dermatology Review)" className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+              {catalogGoverns ? (
+                // Only what the server will accept. Typing a service that is not
+                // in the catalog is refused, so it must not be offered.
+                <select aria-label="Service" title="Service" value={booking.service} onChange={e => setBooking(b => ({ ...b, service: e.target.value, slotStart: '', slotEnd: '' }))} className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
+                  <option value="">Select service…</option>
+                  {bookableServices.map(item => <option key={item.id} value={item.name}>{item.name} · {durationLabel(item.defaultDurationMinutes)}</option>)}
+                </select>
+              ) : (
+                <input aria-label="Service" value={booking.service} onChange={e => setBooking(b => ({ ...b, service: e.target.value }))} placeholder="Service (e.g. Dermatology Review)" className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
+              )}
               <div className="grid grid-cols-2 gap-2.5">
                 <select aria-label="Provider" title="Provider" disabled={!booking.patientId} value={booking.providerId} onChange={e => setBooking(b => ({ ...b, providerId: e.target.value, slotStart: '', slotEnd: '' }))} className="px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-xs text-t1 outline-none focus:border-[var(--b3)] disabled:opacity-40">
                   <option value="">{booking.patientId ? 'Select provider…' : 'Pick patient first'}</option>
@@ -424,7 +459,7 @@ export default function Scheduling() {
               )}
             </div>
             <div className="flex gap-2 mt-4">
-              <button type="button" disabled={saving || !booking.providerId || !booking.slotStart} onClick={bookAppointment} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition disabled:opacity-40">{saving ? 'Booking…' : 'Book canonical slot'}</button>
+              <button type="button" disabled={saving || !booking.providerId || !booking.slotStart || !booking.service.trim()} onClick={bookAppointment} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition disabled:opacity-40">{saving ? 'Booking…' : 'Book canonical slot'}</button>
               <button type="button" onClick={closeBooking} className="px-4 py-2 rounded-lg border border-[var(--b1)] text-t2 text-xs font-semibold hover:bg-[var(--s3)] transition">Cancel</button>
             </div>
           </div>
@@ -642,6 +677,9 @@ export default function Scheduling() {
             branches={branchRecords}
             onProvidersChanged={reloadProviders}
           />
+
+          {/* What the clinic offers. Empty here means free-text bookings. */}
+          <ServiceCatalogPanel user={user} onCatalogChanged={reloadServices} />
 
           {/* Deposit payment requests queue */}
           <PaymentRequestsPanel />
