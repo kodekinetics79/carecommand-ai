@@ -17,20 +17,14 @@ import { ApiError } from '../lib/api';
 import { appointmentsApi, schedulingApi, type LifecycleStatus, type ProviderSlot } from '../lib/appointments';
 import { intakeApi, intakeLink } from '../lib/intake';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
+import { clinicDateLabel, clinicDayRangeUtc, clinicTimeToUtc, resolveTimezone, shiftClinicDate, todayInZone } from '../lib/clinicTime';
 import { useSession } from '../hooks/useSession';
 import { checkEligibility, fetchAppointmentVerificationQueue, type AppointmentVerificationQueueRow } from '../lib/revenueProtection';
 
-const isoDate = (offsetDays: number) => {
-  const d = new Date();
-  d.setDate(d.getDate() + offsetDays);
-  return d.toISOString().slice(0, 10);
-};
-const dateOptions = [0, 1, 2].map(offset => ({
-  value: isoDate(offset),
-  label: offset === 0 ? 'Today' : offset === 1 ? 'Tomorrow' : new Date(isoDate(offset)).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric' }),
-}));
-const todayDate = dateOptions[0].value;
-const emptyBooking = { patientId: '', providerId: '', service: '', date: todayDate, channel: 'EMAIL', slotStart: '', slotEnd: '' };
+// Dates are clinic-local and therefore cannot be module constants: the zone is
+// not known until the branches load. Computing them here with toISOString()
+// meant the board opened on tomorrow every evening for any clinic west of UTC.
+const emptyBooking = (today: string) => ({ patientId: '', providerId: '', service: '', date: today, channel: 'EMAIL', slotStart: '', slotEnd: '' });
 
 // Client mirror of the backend lifecycle transition rules (appointments/routes.ts)
 // so we only offer actions the server will accept; a race still surfaces as a 409.
@@ -54,27 +48,52 @@ const statusConfig: Record<string, { label: string; dot: string; bg: string; tex
   waitlist:   { label: 'Waitlist',  dot: 'bg-amber-500',   bg: 'bg-[var(--amber-soft)]',    text: 'text-amber-v' },
 };
 
-interface ApiBranchOption { id: string; name: string }
+interface ApiBranchOption { id: string; name: string; timezone?: string | null }
 
 export default function Scheduling() {
   const navigate = useNavigate();
   const { user } = useSession();
   const isFrontDesk = user?.role === 'FRONT_DESK';
   const [selectedBranch, setSelectedBranch] = useState('all');
-  const [selectedDate, setSelectedDate] = useState(todayDate);
+  const [selectedDate, setSelectedDate] = useState<string | null>(null);
   const [insuranceQueue, setInsuranceQueue] = useState<AppointmentVerificationQueueRow[]>([]);
   const [queueLoading, setQueueLoading] = useState(true);
   const [queueError, setQueueError] = useState<string | null>(null);
   const [queueBusy, setQueueBusy] = useState<string | null>(null);
-  // Server-side day/branch filtering: fetch only the selected UTC day (and branch)
-  // instead of the first 100 rows ordered by id — so a busy day past the first 100
-  // rows is no longer silently dropped. UTC bounds match mapAppointment's date.
+  const { data: branchRecords, error: branchError } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
+
+  // The schedule belongs to the clinic, so every date on this screen is read in
+  // the clinic's zone. With one branch chosen that is its zone; across all
+  // branches the first is the practice's own, and the viewer's zone is the last
+  // resort. Before this the board used the browser: "today" came from
+  // toISOString(), which is UTC, so a Chicago clinic opened on tomorrow every
+  // evening and its post-19:00 appointments fell outside the day it fetched.
+  const clinicTimezone = useMemo(() => {
+    const chosen = selectedBranch === 'all' ? branchRecords[0] : branchRecords.find(b => b.id === selectedBranch);
+    return resolveTimezone(chosen?.timezone ?? branchRecords[0]?.timezone);
+  }, [branchRecords, selectedBranch]);
+
+  const todayDate = useMemo(() => todayInZone(clinicTimezone), [clinicTimezone]);
+  const activeDate = selectedDate ?? todayDate;
+  const dateOptions = useMemo(() => [0, 1, 2].map(offset => {
+    const value = shiftClinicDate(todayDate, offset, clinicTimezone);
+    return {
+      value,
+      label: offset === 0 ? 'Today'
+        : offset === 1 ? 'Tomorrow'
+        : clinicDateLabel(value, clinicTimezone, { weekday: 'short', day: 'numeric' }),
+    };
+  }), [todayDate, clinicTimezone]);
+
+  // Server-side day/branch filtering: fetch only the selected CLINIC day (and
+  // branch) instead of the first 100 rows ordered by id. The window is the
+  // clinic's midnight-to-midnight expressed as UTC instants, which is 23 or 25
+  // hours long on a DST changeover — a fixed 24h span drops or duplicates an hour.
   const appointmentsPath = useMemo(() => {
-    const from = `${selectedDate}T00:00:00.000Z`;
-    const to = `${selectedDate}T23:59:59.999Z`;
+    const { from, to } = clinicDayRangeUtc(activeDate, clinicTimezone);
     const branchParam = selectedBranch === 'all' ? '' : `&branchId=${selectedBranch}`;
-    return `/v1/appointments?limit=100&from=${from}&to=${to}${branchParam}`;
-  }, [selectedDate, selectedBranch]);
+    return `/v1/appointments?limit=100&from=${from.toISOString()}&to=${to.toISOString()}${branchParam}`;
+  }, [activeDate, clinicTimezone, selectedBranch]);
   const { data: appointmentRecords, source, error: appointmentError, reload } = useApiResource<ApiAppointment, ReturnType<typeof mapAppointment>>(appointmentsPath, [], mapAppointment);
   const { data: providerRecords, error: providerError, loading: providersLoading, reload: reloadProviders } = useApiResource<ApiProviderProfile, ReturnType<typeof mapProviderProfile>>('/v1/providers/overview?limit=100', [], mapProviderProfile);
   // The booking picker searches on the SERVER. It used to list the first 100
@@ -88,11 +107,9 @@ export default function Scheduling() {
     return `/v1/patients?${params.toString()}`;
   }, [debouncedPatientQuery]);
   const { data: patientRecords, error: patientError } = useApiResource<ApiPatient, ReturnType<typeof mapPatient>>(patientsPath, [], mapPatient);
-  const { data: branchRecords, error: branchError } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
-
   const [showBooking, setShowBooking] = useState(false);
   const [paymentApptId, setPaymentApptId] = useState<string | null>(null);
-  const [booking, setBooking] = useState(emptyBooking);
+  const [booking, setBooking] = useState(() => emptyBooking(''));
   const [saving, setSaving] = useState(false);
   const [bookingError, setBookingError] = useState<string | null>(null);
   // Real provider slots for the conflict-safe booking path.
@@ -103,7 +120,7 @@ export default function Scheduling() {
   const [rowBusy, setRowBusy] = useState<string | null>(null);
   const [rowNotice, setRowNotice] = useState<{ id: string; kind: 'error' | 'ok'; text: string } | null>(null);
   const [rescheduleFor, setRescheduleFor] = useState<string | null>(null);
-  const [rescheduleForm, setRescheduleForm] = useState({ date: todayDate, time: '10:00' });
+  const [rescheduleForm, setRescheduleForm] = useState<{ date: string | null; time: string }>({ date: null, time: '10:00' });
   const [intakeBusy, setIntakeBusy] = useState<string | null>(null);
 
   // Providers bookable for the chosen patient (same branch — the book route
@@ -177,7 +194,7 @@ export default function Scheduling() {
   }, [selectedBranch]);
 
   function closeBooking() {
-    setBooking(emptyBooking);
+    setBooking(emptyBooking(todayDate));
     // The next booking starts from a clean search, not the last caller's name.
     setPatientQuery('');
     setPinnedPatient(null);
@@ -257,11 +274,14 @@ export default function Scheduling() {
   const cancelAppointment = (id: string) => runRowAction(id, () => appointmentsApi.cancel(id), 'Appointment canceled.');
 
   async function submitReschedule(id: string) {
-    const startsAt = new Date(`${rescheduleForm.date}T${rescheduleForm.time}:00`);
+    // Typed as clinic wall time. Parsing this with `new Date()` read it in the
+    // staff member's own zone, so a reschedule from anywhere but the clinic
+    // wrote a different hour than the one on screen — silently.
+    const startsAt = clinicTimeToUtc(rescheduleForm.date ?? todayDate, rescheduleForm.time, clinicTimezone);
     const endsAt = new Date(startsAt.getTime() + 30 * 60000);
     await runRowAction(id, () => appointmentsApi.reschedule(id, startsAt.toISOString(), endsAt.toISOString()), 'Appointment rescheduled.');
     setRescheduleFor(null);
-    setSelectedDate(rescheduleForm.date);
+    setSelectedDate(rescheduleForm.date ?? todayDate);
   }
 
   // ----- Originate an intake link for an appointment's patient ---------------
@@ -429,10 +449,10 @@ export default function Scheduling() {
       <div className="flex items-center gap-3 flex-wrap">
         <div className="flex items-center gap-1 bg-[var(--s2)] border border-[var(--b1)] p-1 rounded-xl">
           {dateOptions.map(opt => (
-            <button key={opt.value} type="button" onClick={() => setSelectedDate(opt.value)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedDate === opt.value ? 'bg-[var(--indigo)] text-white' : 'text-t3 hover:text-t1'}`}>{opt.label}</button>
+            <button key={opt.value} type="button" onClick={() => setSelectedDate(opt.value)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${activeDate === opt.value ? 'bg-[var(--indigo)] text-white' : 'text-t3 hover:text-t1'}`}>{opt.label}</button>
           ))}
           {/* Pick any day server-side (not just Today/Tomorrow/+2). */}
-          <input type="date" aria-label="Pick a date" value={selectedDate} onChange={e => setSelectedDate(e.target.value || todayDate)} className={`px-2 py-1.5 rounded-lg text-xs font-semibold bg-transparent outline-none ${dateOptions.some(o => o.value === selectedDate) ? 'text-t3' : 'bg-[var(--indigo)] text-white'}`} />
+          <input type="date" aria-label="Pick a date" value={activeDate} onChange={e => setSelectedDate(e.target.value || todayDate)} className={`px-2 py-1.5 rounded-lg text-xs font-semibold bg-transparent outline-none ${dateOptions.some(o => o.value === activeDate) ? 'text-t3' : 'bg-[var(--indigo)] text-white'}`} />
         </div>
         <div className="flex items-center gap-1 bg-[var(--s2)] border border-[var(--b1)] p-1 rounded-xl">
           <button type="button" onClick={() => setSelectedBranch('all')} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedBranch === 'all' ? 'bg-[var(--s3)] text-t1' : 'text-t3 hover:text-t1'}`}>All branches</button>
@@ -517,7 +537,7 @@ export default function Scheduling() {
             )}
           </BentoCard>
 
-          <BentoCard title="Appointment timeline" subtitle={selectedDate === todayDate ? "Today's schedule" : new Date(`${selectedDate}T12:00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })} headerRight={
+          <BentoCard title="Appointment timeline" subtitle={activeDate === todayDate ? "Today's schedule" : clinicDateLabel(activeDate, clinicTimezone, { month: 'short', day: 'numeric', year: 'numeric' })} headerRight={
             <span className="text-xs font-semibold text-t3">{todayAppts.length} appointments · {formatCurrency(totalValue)}</span>
           }>
             <div className="space-y-2">
@@ -589,7 +609,7 @@ export default function Scheduling() {
                             )}
                             {rescheduleFor === appt.id && (
                               <div className="mt-2 flex items-center gap-1.5 flex-wrap">
-                                <input type="date" aria-label="New date" value={rescheduleForm.date} onChange={e => setRescheduleForm(f => ({ ...f, date: e.target.value }))} className="px-2 py-1 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-[11px] text-t1 outline-none focus:border-[var(--b3)]" />
+                                <input type="date" aria-label="New date" value={rescheduleForm.date ?? todayDate} onChange={e => setRescheduleForm(f => ({ ...f, date: e.target.value }))} className="px-2 py-1 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-[11px] text-t1 outline-none focus:border-[var(--b3)]" />
                                 <input type="time" aria-label="New time" value={rescheduleForm.time} onChange={e => setRescheduleForm(f => ({ ...f, time: e.target.value }))} className="px-2 py-1 rounded-lg border border-[var(--b1)] bg-[var(--s2)] text-[11px] text-t1 outline-none focus:border-[var(--b3)]" />
                                 <button type="button" disabled={busy} onClick={() => void submitReschedule(appt.id)} className="px-2.5 py-1 rounded-lg bg-[var(--indigo)] text-white text-[11px] font-semibold hover:opacity-90 disabled:opacity-40">{busy ? 'Saving…' : 'Confirm'}</button>
                               </div>
