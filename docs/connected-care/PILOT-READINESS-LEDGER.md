@@ -147,3 +147,33 @@ an inverted band.
   auto-deploys to production; merging is the owner's call.
 - **v5 caveat.** The evidence migration clears every prior signoff. That costs nothing today (no
   period could reach READY before this work) but stops being free once clinics start attesting.
+
+## Deployment decision — CTO, 2026-08-29
+
+**Shipped to a PR and a verified preview. NOT merged to production.**
+
+- PR #12, preview live (HTTP 200):
+  `https://carecommand-ai-git-feat-reception-23509c-kode-kinetics-projects.vercel.app`
+- `security` check: pass. Vercel build: pass. `npm run check`: clean.
+- Connected Care: 152 server tests + 5 E2E, all green.
+
+### Why not production
+1. **The pipeline was red and nobody could see why.** `main` had failed its last 5 CI runs — including
+   the two merges that shipped anyway — dying at `npm run db:seed` after 1m. Fixed in this PR: the step
+   described a `prisma/seed.ts` that no longer exists and had been repointed at the guarded synthetic
+   demo seeder, which CI can never satisfy and should never run. Plan reference data now ships in
+   migration `20260828120000_subscription_catalog_reference_data`, so the step was obsolete as well as
+   broken. CI now runs the full suite (8m17s) instead of dying at 1m.
+2. **Four real failures remain, none in Connected Care** — `pilotImport` (2) and
+   `platformPlaneIsolation` (2). Both proven pre-existing: `pilotImport` reproduced at `main` in an
+   isolated worktree with none of these commits; `platformPlaneIsolation` was failing typecheck before
+   any of this work began. They sit in the platform/pilot area another session is actively editing, so
+   they are not mine to fix without risking a conflict.
+3. **The v5 migration mutates data** — it clears every prior attestation. Free today (nothing could
+   reach READY before this work), but a data migration should run with a human present.
+4. **The safety detectors were never exercised against live Redis** — it is not running locally, so
+   the missed-reading and device-offline paths are unverified against real infrastructure.
+
+### To promote
+Fix or quarantine the 4 platform/pilot failures, confirm the detectors drain against live Redis on the
+preview, then merge #12 with someone watching the migration.
