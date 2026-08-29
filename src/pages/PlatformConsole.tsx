@@ -9,6 +9,7 @@ import {
 import {
   platformAdmin, setPlatformToken, downloadAuditCsv, TENANT_STATUS_BADGE, SUB_STATUS_BADGE, FEATURE_LABELS,
   type PlatformMe, type TenantSummary, type SystemHealth, type TenantBilling, type AiUsageView, type SecurityView, type IntegrationView,
+  type TenantAccountRecord, type TenantCompany, type TenantRoster,
 } from '../lib/platformAdmin';
 import PlatformPilot from './PlatformPilot';
 
@@ -420,9 +421,11 @@ function AnnouncementsSection({ canManage }: { canManage: boolean }) {
   );
 }
 
-type DrawerTab = 'overview' | 'subscription' | 'entitlements' | 'usage' | 'billing' | 'ai' | 'security' | 'audit' | 'danger';
+type DrawerTab = 'overview' | 'company' | 'subscription' | 'entitlements' | 'usage' | 'billing' | 'ai' | 'security' | 'audit' | 'danger';
 function TenantDrawer({ tenant, canManage, onClose }: { tenant: TenantSummary; canManage: boolean; onClose: () => void }) {
   const [tab, setTab] = useState<DrawerTab>('overview');
+  const [account, setAccount] = useState<TenantAccountRecord | null>(null);
+  const [accountError, setAccountError] = useState<string | null>(null);
   const [detail, setDetail] = useState<TenantSummary | null>(tenant);
   const [plans, setPlans] = useState<Array<{ key: string; name: string }>>([]);
   const [audit, setAudit] = useState<Array<{ id: string; action: string; targetType: string; tenantId: string | null; createdAt: string }>>([]);
@@ -430,17 +433,37 @@ function TenantDrawer({ tenant, canManage, onClose }: { tenant: TenantSummary; c
   const [error, setError] = useState<string | null>(null);
   const tid = tenant.tenant!.id;
 
-  const reload = useCallback(async () => { setDetail(await platformAdmin.tenant(tid)); }, [tid]);
+  // The account record fails independently of the rest of the drawer: it reads
+  // through SECURITY DEFINER windows that can refuse (inactive platform actor),
+  // and that must surface as an error in one tab, not blank the whole panel.
+  const reloadAccount = useCallback(async () => {
+    try { setAccount(await platformAdmin.company(tid)); setAccountError(null); }
+    catch (e) { setAccount(null); setAccountError(e instanceof Error ? e.message : 'Could not load the account record'); }
+  }, [tid]);
+
+  const reload = useCallback(async () => { setDetail(await platformAdmin.tenant(tid)); await reloadAccount(); }, [tid, reloadAccount]);
   useEffect(() => { let a = true; void (async () => {
-    const [d, p, au] = await Promise.all([platformAdmin.tenant(tid).catch(() => tenant), platformAdmin.plans().catch(() => []), platformAdmin.audit(200).catch(() => [])]);
-    if (!a) return; setDetail(d); setPlans(p); setAudit(au.filter(x => x.tenantId === tid));
+    const [d, p, au, acct] = await Promise.all([
+      platformAdmin.tenant(tid).catch(() => tenant),
+      platformAdmin.plans().catch(() => []),
+      platformAdmin.audit(200).catch(() => []),
+      // Settled rather than caught-to-null: a failure here is a real error the
+      // Company tab must show, not an empty record it would render as "nothing
+      // recorded yet".
+      platformAdmin.company(tid).then(r => ({ ok: true as const, r })).catch((e: unknown) => ({ ok: false as const, e })),
+    ]);
+    if (!a) return;
+    setDetail(d); setPlans(p); setAudit(au.filter(x => x.tenantId === tid));
+    if (acct.ok) { setAccount(acct.r); setAccountError(null); }
+    else { setAccount(null); setAccountError(acct.e instanceof Error ? acct.e.message : 'Could not load the account record'); }
   })(); return () => { a = false; }; }, [tid, tenant]);
 
   async function act(fn: () => Promise<unknown>) { setBusy(true); setError(null); try { await fn(); await reload(); } catch (e) { setError(e instanceof Error ? e.message : 'Action failed'); } finally { setBusy(false); } }
 
   const d = detail ?? tenant;
   const tabs: Array<{ id: DrawerTab; label: string; live: boolean }> = [
-    { id: 'overview', label: 'Overview', live: true }, { id: 'subscription', label: 'Subscription', live: true },
+    { id: 'overview', label: 'Overview', live: true }, { id: 'company', label: 'Company & Account', live: true },
+    { id: 'subscription', label: 'Subscription', live: true },
     { id: 'entitlements', label: 'Feature Entitlements', live: true }, { id: 'usage', label: 'Usage & Limits', live: true },
     { id: 'billing', label: 'Billing', live: true }, { id: 'ai', label: 'AI Controls', live: true },
     { id: 'security', label: 'Security', live: true }, { id: 'audit', label: 'Audit Trail', live: true },
@@ -483,6 +506,16 @@ function TenantDrawer({ tenant, canManage, onClose }: { tenant: TenantSummary; c
               <DCard label="Plan" value={d.subscription?.planKey ?? '—'} />
               <DCard label="Sub status" value={d.subscription?.status ?? '—'} />
             </div>
+          )}
+
+          {tab === 'company' && (
+            <CompanyTab
+              tid={tid}
+              account={account}
+              error={accountError}
+              canManage={canManage}
+              onSaved={reloadAccount}
+            />
           )}
 
           {tab === 'subscription' && (
@@ -533,6 +566,267 @@ function TenantDrawer({ tenant, canManage, onClose }: { tenant: TenantSummary; c
         </div>
       </div>
     </div>
+  );
+}
+
+// Company record + the account facts the platform plane is allowed to see.
+// Deliberately NOT here by default: the tenant's staff list. app_platform holds
+// no grants on "User"/"Branch"; this reads three narrow SECURITY DEFINER windows
+// exposing the account owner, aggregate role counts and branches. The roster is
+// break-glass only -- see RosterSection.
+const COMPANY_GROUPS: Array<{ heading: string; fields: Array<{ k: keyof TenantCompany; label: string; long?: boolean }> }> = [
+  { heading: 'Company', fields: [
+    { k: 'legalName', label: 'Registered legal name' }, { k: 'companyNumber', label: 'Company / registration no.' },
+    { k: 'website', label: 'Website' }, { k: 'mainPhone', label: 'Main phone' },
+  ] },
+  { heading: 'Registered address', fields: [
+    { k: 'addressLine1', label: 'Address line 1' }, { k: 'addressLine2', label: 'Address line 2' },
+    { k: 'city', label: 'City' }, { k: 'region', label: 'Region / state' },
+    { k: 'postalCode', label: 'Postal code' }, { k: 'country', label: 'Country' },
+  ] },
+  { heading: 'Primary contact', fields: [
+    { k: 'primaryContactName', label: 'Name' }, { k: 'primaryContactEmail', label: 'Email' },
+    { k: 'primaryContactPhone', label: 'Phone' },
+  ] },
+  { heading: 'Billing contact', fields: [
+    { k: 'billingContactName', label: 'Name' }, { k: 'billingContactEmail', label: 'Email' },
+  ] },
+  { heading: 'Account notes', fields: [{ k: 'accountNotes', label: 'Notes', long: true }] },
+];
+
+function CompanyTab({ tid, account, error, canManage, onSaved }: {
+  tid: string; account: TenantAccountRecord | null; error: string | null;
+  canManage: boolean; onSaved: () => Promise<void>;
+}) {
+  const [edit, setEdit] = useState(false);
+  const [draft, setDraft] = useState<Partial<TenantCompany>>({});
+  const [reason, setReason] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  if (error) return <div className="rounded-lg bg-red-soft border border-[rgba(220,38,38,0.18)] px-3 py-2 text-xs text-red-v">{error}</div>;
+  if (!account) return <p className="text-xs text-t3">Loading account record…</p>;
+
+  const c = account.company;
+  const allFields = COMPANY_GROUPS.flatMap(g => g.fields);
+  const recorded = allFields.filter(f => c[f.k]).length;
+
+  async function save() {
+    setSaving(true); setSaveError(null);
+    try { await platformAdmin.updateCompany(tid, { ...draft, reason }); await onSaved(); setEdit(false); setDraft({}); setReason(''); }
+    catch (e) { setSaveError(e instanceof Error ? e.message : 'Save failed'); }
+    finally { setSaving(false); }
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Account owner: the one identity the platform plane may see by default. */}
+      <section className="space-y-1.5">
+        <h4 className="text-[11px] font-semibold text-t3 uppercase tracking-wide">Account owner</h4>
+        {account.accountOwner ? (
+          <div className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 space-y-0.5">
+            <p className="text-sm font-semibold text-t1">{account.accountOwner.displayName}</p>
+            <p className="text-xs text-t2">{account.accountOwner.email}</p>
+            <p className="text-[11px] text-t3">
+              {account.accountOwner.active ? 'Active' : 'Inactive'} · MFA {account.accountOwner.mfaEnabled ? 'on' : 'off'} ·{' '}
+              {account.accountOwner.lastLoginAt
+                ? `last signed in ${new Date(account.accountOwner.lastLoginAt).toLocaleDateString()}`
+                : 'never signed in'}
+            </p>
+          </div>
+        ) : (
+          <p className="text-xs text-t3">No owner login recorded for this tenant.</p>
+        )}
+      </section>
+
+      {/* Seats by role: aggregate counts, never identities. */}
+      <section className="space-y-1.5">
+        <h4 className="text-[11px] font-semibold text-t3 uppercase tracking-wide">Seats by role</h4>
+        {account.roleBreakdown.length ? (
+          <div className="flex flex-wrap gap-1.5">
+            {account.roleBreakdown.map(r => (
+              <span key={r.role} className="rounded-md border border-[var(--b1)] bg-[var(--s2)] px-2 py-1 text-[11px] text-t2">
+                <span className="font-semibold text-t1">{r.active}</span> {r.role.replace(/_/g, ' ').toLowerCase()}
+                {r.inactive > 0 && <span className="text-t3"> (+{r.inactive} inactive)</span>}
+              </span>
+            ))}
+          </div>
+        ) : <p className="text-xs text-t3">No users yet.</p>}
+      </section>
+
+      <RosterSection tid={tid} canManage={canManage} />
+
+      <section className="space-y-1.5">
+        <h4 className="text-[11px] font-semibold text-t3 uppercase tracking-wide">Branches ({account.branches.length})</h4>
+        {account.branches.length ? (
+          <div className="space-y-1">
+            {account.branches.map(b => (
+              <div key={b.id} className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-1.5 flex items-baseline justify-between gap-2">
+                <span className="text-xs font-semibold text-t1 truncate">{b.name}{!b.active && <span className="ml-1 text-[10px] text-t3">(inactive)</span>}</span>
+                <span className="text-[11px] text-t3 truncate">{b.location} · {b.timezone}</span>
+              </div>
+            ))}
+          </div>
+        ) : <p className="text-xs text-t3">No branches yet.</p>}
+      </section>
+
+      <section className="space-y-2">
+        <div className="flex items-center justify-between">
+          <h4 className="text-[11px] font-semibold text-t3 uppercase tracking-wide">Company record</h4>
+          {canManage && !edit && (
+            <button type="button" onClick={() => { setDraft({ ...c }); setEdit(true); }} className="text-[11px] font-semibold text-indigo hover:underline">Edit</button>
+          )}
+        </div>
+
+        {recorded === 0 && !edit && (
+          <p className="text-xs text-t3">No company details recorded yet{canManage ? ' — use Edit to add them.' : '.'}</p>
+        )}
+
+        {!edit && recorded > 0 && COMPANY_GROUPS.map(g => {
+          const present = g.fields.filter(f => c[f.k]);
+          if (!present.length) return null;
+          return (
+            <div key={g.heading} className="space-y-1">
+              <p className="text-[10px] text-t3 uppercase tracking-wide">{g.heading}</p>
+              {present.map(f => (
+                <div key={f.k} className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-1.5">
+                  <p className="text-[10px] text-t3">{f.label}</p>
+                  <p className="text-xs text-t1 whitespace-pre-wrap break-words">{c[f.k]}</p>
+                </div>
+              ))}
+            </div>
+          );
+        })}
+
+        {!edit && recorded > 0 && recorded < allFields.length && (
+          <p className="text-[10px] text-t3">{allFields.length - recorded} of {allFields.length} fields not recorded.</p>
+        )}
+
+        {edit && (
+          <div className="space-y-3">
+            {COMPANY_GROUPS.map(g => (
+              <div key={g.heading} className="space-y-1.5">
+                <p className="text-[10px] text-t3 uppercase tracking-wide">{g.heading}</p>
+                {g.fields.map(f => (
+                  <label key={f.k} className="block space-y-0.5">
+                    <span className="text-[10px] text-t3">{f.label}</span>
+                    {f.long ? (
+                      <textarea rows={3} className={fieldCls} value={draft[f.k] ?? ''} onChange={e => setDraft(d => ({ ...d, [f.k]: e.target.value }))} />
+                    ) : (
+                      <input className={fieldCls} value={draft[f.k] ?? ''} onChange={e => setDraft(d => ({ ...d, [f.k]: e.target.value }))} />
+                    )}
+                  </label>
+                ))}
+              </div>
+            ))}
+            <label className="block space-y-0.5">
+              <span className="text-[10px] text-t3">Reason for this change (recorded in the audit trail)</span>
+              <input className={fieldCls} value={reason} onChange={e => setReason(e.target.value)} placeholder="e.g. updated billing contact after onboarding call" />
+            </label>
+            {saveError && <div className="rounded-lg bg-red-soft border border-[rgba(220,38,38,0.18)] px-3 py-2 text-xs text-red-v">{saveError}</div>}
+            <div className="flex gap-2">
+              <button type="button" disabled={saving || reason.trim().length < 3} onClick={() => void save()} className="btn-primary text-xs px-3 py-1.5 disabled:opacity-50">
+                {saving ? 'Saving…' : 'Save changes'}
+              </button>
+              <button type="button" disabled={saving} onClick={() => { setEdit(false); setDraft({}); setReason(''); setSaveError(null); }} className="text-xs px-3 py-1.5 text-t2 hover:text-t1">Cancel</button>
+            </div>
+            <p className="text-[10px] text-t3">A reason of at least 3 characters is required. Only the field names you change are written to the audit log, never their values.</p>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+// Staff roster under break-glass. Closed by default: an operator opens a
+// support session with a written reason, the session expires on its own, and
+// both the session and every roster view are audited. The server (and the
+// database function beneath it) enforce this -- the UI only reflects it.
+function RosterSection({ tid, canManage }: { tid: string; canManage: boolean }) {
+  const [roster, setRoster] = useState<TenantRoster | null>(null);
+  const [needsSession, setNeedsSession] = useState(false);
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [opened, setOpened] = useState(false);
+
+  async function load() {
+    setBusy(true); setError(null);
+    try { setRoster(await platformAdmin.roster(tid)); setNeedsSession(false); }
+    catch (e) {
+      const msg = e instanceof Error ? e.message : 'Could not load the staff list';
+      // A 403 here is the expected closed state, not a fault.
+      if (/support[_ ]session/i.test(msg)) { setNeedsSession(true); setRoster(null); setError(null); }
+      else setError(msg);
+    } finally { setBusy(false); setOpened(true); }
+  }
+
+  async function openSessionAndLoad() {
+    setBusy(true); setError(null);
+    try { await platformAdmin.startSupport(tid, reason, 60); setReason(''); await load(); }
+    catch (e) { setError(e instanceof Error ? e.message : 'Could not open a support session'); setBusy(false); }
+  }
+
+  return (
+    <section className="space-y-1.5">
+      <h4 className="text-[11px] font-semibold text-t3 uppercase tracking-wide">Staff list</h4>
+
+      {!opened && (
+        <div className="space-y-1">
+          <button type="button" disabled={busy} onClick={() => void load()} className="text-[11px] font-semibold text-indigo hover:underline disabled:opacity-50">
+            {busy ? 'Checking…' : 'Show staff list'}
+          </button>
+          <p className="text-[10px] text-t3">Individual staff records stay inside the clinic’s workspace. Viewing them needs an open support session, and the reason is recorded.</p>
+        </div>
+      )}
+
+      {error && <div className="rounded-lg bg-red-soft border border-[rgba(220,38,38,0.18)] px-3 py-2 text-xs text-red-v">{error}</div>}
+
+      {needsSession && (
+        <div className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2.5 space-y-2">
+          <p className="text-xs text-t2">No support session is open for this tenant, so its staff list stays closed.</p>
+          {canManage ? (
+            <>
+              <label className="block space-y-0.5">
+                <span className="text-[10px] text-t3">Reason for access (recorded, expires after 60 minutes)</span>
+                <input className={fieldCls} value={reason} onChange={e => setReason(e.target.value)} placeholder="e.g. investigating a locked admin account" />
+              </label>
+              <button type="button" disabled={busy || reason.trim().length < 3} onClick={() => void openSessionAndLoad()} className="btn-primary text-xs px-3 py-1.5 disabled:opacity-50">
+                {busy ? 'Opening…' : 'Open support session & show staff'}
+              </button>
+            </>
+          ) : (
+            <p className="text-[10px] text-t3">Your role cannot open a support session.</p>
+          )}
+        </div>
+      )}
+
+      {roster && (
+        <div className="space-y-1.5">
+          <div className="rounded-lg bg-amber-soft border border-[rgba(217,119,6,0.18)] px-3 py-1.5">
+            <p className="text-[11px] text-amber-v">
+              Support session open until {new Date(roster.supportSession.expiresAt).toLocaleTimeString()} · “{roster.supportSession.reason}”
+            </p>
+          </div>
+          {roster.users.map(u => (
+            <div key={u.id} className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-1.5">
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="text-xs font-semibold text-t1 truncate">{u.displayName}</span>
+                <span className="text-[10px] text-t3 shrink-0">{u.role.replace(/_/g, ' ').toLowerCase()}</span>
+              </div>
+              <p className="text-[11px] text-t2 truncate">{u.email}</p>
+              <p className="text-[10px] text-t3">
+                {u.active ? 'Active' : 'Inactive'} · MFA {u.mfaEnabled ? 'on' : 'off'}
+                {u.branchName ? ` · ${u.branchName}` : ''}
+                {u.lockedUntil && new Date(u.lockedUntil) > new Date() ? ' · locked' : ''}
+                {u.lastLoginAt ? ` · last in ${new Date(u.lastLoginAt).toLocaleDateString()}` : ' · never signed in'}
+              </p>
+            </div>
+          ))}
+          {!roster.users.length && <p className="text-xs text-t3">This tenant has no staff records.</p>}
+        </div>
+      )}
+    </section>
   );
 }
 
