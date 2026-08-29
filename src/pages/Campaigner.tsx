@@ -192,10 +192,19 @@ export default function Campaigner() {
         <BentoCard
           title="Campaign Library"
           subtitle="Most recent first"
-          // The counts are part of the claim, so the tabs only exist once the
-          // records they count have arrived.
-          headerRight={filterTabs ? <ModuleTabs tabs={filterTabs} activeTab={statusFilter} onChange={setStatusFilter} ariaLabel="Campaign status" /> : undefined}
         >
+          {/* The filters sit under the header, not in headerRight. BentoCard
+              marks headerRight shrink-0, so in this 360px column the three tabs
+              took their full natural width and collapsed the title to nothing —
+              the subtitle rendered as "Mo/Re/Firs". Below the header they get
+              the full column and scroll if the labels outgrow it.
+              The counts are part of the claim, so the tabs only exist once the
+              records they count have arrived. */}
+          {filterTabs && (
+            <div className="mb-3 overflow-x-auto">
+              <ModuleTabs tabs={filterTabs} activeTab={statusFilter} onChange={setStatusFilter} ariaLabel="Campaign status" />
+            </div>
+          )}
           <ResourceSection
             label="Campaign library"
             state={campaigns.state}
