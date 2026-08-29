@@ -236,6 +236,116 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
     return { items, total: matching, limit: q.limit, truncated: matching > items.length };
   });
 
+  // ── Monitoring rules (thresholds, cadence, routing) ────────────────────────
+  //
+  // Until now MonitoringRule had NO write path anywhere in the product: no
+  // route, no screen, no seeder. Only the test suite ever created one. Two
+  // consequences followed from that, and both are bigger than they look.
+  //
+  // First, every tenant ran on the hardcoded DEFAULT_THRESHOLDS bands. A clinic
+  // could not widen a band for a patient on a protocol that makes the default
+  // wrong, so the product either cried wolf or stayed silent, and the clinic had
+  // no recourse either way.
+  //
+  // Second — and worse — `missedAfterHours` lives only on this model. The
+  // missed-reading detector skips any patient whose resolved cadence is null, so
+  // with no rules in existence it checked nothing, created nothing, and the
+  // "Missed Readings" figure was structurally zero forever. A monitoring product
+  // silently not looking for missed readings is a safety problem, not a gap.
+
+  const ruleInput = z.object({
+    scope: z.enum(['organization', 'branch', 'patient', 'device_type']).default('organization'),
+    branchId: uuid.nullish(),
+    patientId: uuid.nullish(),
+    deviceType: z.string().trim().max(60).nullish(),
+    readingType: z.enum(READING_TYPES),
+    minValue: z.number().nullish(),
+    maxValue: z.number().nullish(),
+    criticalMin: z.number().nullish(),
+    criticalMax: z.number().nullish(),
+    missedAfterHours: z.number().int().min(1).max(24 * 30).nullish(),
+    assignedToUserId: uuid.nullish(),
+    priority: z.number().int().min(0).max(1000).default(0),
+    active: z.boolean().default(true),
+  });
+
+  /** A band must be orderable, or it silently never fires the severity it names. */
+  function assertCoherentBand(input: z.infer<typeof ruleInput>) {
+    const { minValue, maxValue, criticalMin, criticalMax } = input;
+    if (minValue != null && maxValue != null && minValue >= maxValue) {
+      throw app.httpErrors.badRequest('The safe range is inverted: the minimum must be below the maximum.');
+    }
+    if (criticalMin != null && minValue != null && criticalMin > minValue) {
+      throw app.httpErrors.badRequest('The critical low must be at or below the safe minimum, otherwise the safe range sits inside the critical range.');
+    }
+    if (criticalMax != null && maxValue != null && criticalMax < maxValue) {
+      throw app.httpErrors.badRequest('The critical high must be at or above the safe maximum, otherwise the safe range sits inside the critical range.');
+    }
+    if (input.scope === 'patient' && !input.patientId) throw app.httpErrors.badRequest('A patient-scoped rule needs a patient.');
+    if (input.scope === 'branch' && !input.branchId) throw app.httpErrors.badRequest('A branch-scoped rule needs a branch.');
+    if (input.scope === 'device_type' && !input.deviceType) throw app.httpErrors.badRequest('A device-type rule needs a device type.');
+  }
+
+  app.get('/rules', async request => {
+    const tenantId = request.auth.tenantId;
+    const rows = await db.monitoringRule.findMany({
+      where: { tenantId, ...branchScope(request) },
+      orderBy: [{ readingType: 'asc' }, { priority: 'desc' }, { createdAt: 'asc' }],
+      take: 200,
+    });
+    await audit(request, { action: 'monitoring.rule.list_read', resource: 'monitoringRule', metadata: { count: rows.length } });
+    return {
+      rules: rows,
+      // The bands in force when no rule matches. Sent so the screen can show a
+      // clinic what it is actually running on instead of an empty list that
+      // reads as "nothing is being monitored".
+      defaults: DEFAULT_THRESHOLDS,
+      readingTypes: READING_TYPES,
+    };
+  });
+
+  app.post('/rules', { preHandler: writeRoles }, async (request, reply) => {
+    const input = ruleInput.parse(request.body);
+    assertCoherentBand(input);
+    const tenantId = request.auth.tenantId;
+    if (input.branchId) assertBranchAccess(request, input.branchId);
+    if (input.patientId) {
+      const patient = await db.patient.findFirst({ where: { id: input.patientId, tenantId, deletedAt: null }, select: { branchId: true } });
+      if (!patient) throw app.httpErrors.notFound('Patient not found');
+      assertBranchAccess(request, patient.branchId);
+    }
+    const row = await db.monitoringRule.create({ data: { ...input, tenantId } });
+    await audit(request, { action: 'monitoring.rule.created', resource: 'monitoringRule', resourceId: row.id, metadata: { readingType: row.readingType, scope: row.scope } });
+    return reply.code(201).send(row);
+  });
+
+  app.patch('/rules/:id', { preHandler: writeRoles }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const input = ruleInput.partial().parse(request.body);
+    const tenantId = request.auth.tenantId;
+    const existing = await db.monitoringRule.findFirst({ where: { id, tenantId } });
+    if (!existing) throw app.httpErrors.notFound('Rule not found');
+    if (existing.branchId) assertBranchAccess(request, existing.branchId);
+    const merged = { ...existing, ...input } as z.infer<typeof ruleInput>;
+    assertCoherentBand(merged);
+    const row = await db.monitoringRule.update({ where: { id: existing.id }, data: input });
+    await audit(request, { action: 'monitoring.rule.updated', resource: 'monitoringRule', resourceId: id, metadata: { readingType: row.readingType, active: row.active } });
+    return row;
+  });
+
+  app.delete('/rules/:id', { preHandler: writeRoles }, async (request, reply) => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const tenantId = request.auth.tenantId;
+    const existing = await db.monitoringRule.findFirst({ where: { id, tenantId } });
+    if (!existing) throw app.httpErrors.notFound('Rule not found');
+    if (existing.branchId) assertBranchAccess(request, existing.branchId);
+    // Deactivate rather than delete: a rule is the reason an alert did or did
+    // not fire, so removing the row destroys the explanation for past alerts.
+    await db.monitoringRule.update({ where: { id: existing.id }, data: { active: false } });
+    await audit(request, { action: 'monitoring.rule.deactivated', resource: 'monitoringRule', resourceId: id, metadata: { readingType: existing.readingType } });
+    return reply.code(204).send();
+  });
+
   // ── Alert actions (acknowledge / assign / resolve) ─────────────────────────
   async function loadAlert(request: { auth: { tenantId: string } }, id: string) {
     const alert = await db.readingAlert.findFirst({ where: { id, tenantId: request.auth.tenantId } });
