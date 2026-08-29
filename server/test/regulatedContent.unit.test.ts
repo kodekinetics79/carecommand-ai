@@ -1,8 +1,20 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 function source(path: string): string {
   return readFileSync(path, 'utf8');
+}
+
+// The Studio surface is the page shell plus its panel components under
+// src/components/receptionist; contract pins apply to the whole surface.
+function receptionistStudioSource(): string {
+  const dir = 'src/components/receptionist';
+  const panels = readdirSync(dir, { recursive: true, encoding: 'utf8' })
+    .filter(name => name.endsWith('.ts') || name.endsWith('.tsx'))
+    .sort()
+    .map(name => readFileSync(join(dir, name), 'utf8'));
+  return [readFileSync('src/pages/ReceptionistStudio.tsx', 'utf8'), ...panels].join('\n');
 }
 
 describe('regulated product content guardrails', () => {
@@ -38,7 +50,7 @@ describe('regulated product content guardrails', () => {
   });
 
   it('uses reviewable in-app controls for receptionist configuration and high-impact actions', () => {
-    const studio = source('src/pages/ReceptionistStudio.tsx');
+    const studio = receptionistStudioSource();
     const confirmation = source('src/components/workflow/ConfirmationModal.tsx');
     const form = source('src/components/workflow/FormDialog.tsx');
 
