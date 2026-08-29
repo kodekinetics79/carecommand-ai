@@ -1,16 +1,22 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
-import { Clock, Phone, AlertCircle, Sparkles, Zap, ArrowRight } from 'lucide-react';
+import { Clock, Phone, AlertCircle, Sparkles, ArrowRight, Plus, UserPlus, CheckCircle2, PlayCircle } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
 import { apiRequest } from '../lib/api';
 import { mapStaffProfile, mapStaffTask, type ApiStaffProfile, type ApiStaffTask } from '../lib/apiAdapters';
+import { hasPermission } from '../lib/access';
+import { useSession } from '../hooks/useSession';
 import type { StaffMember } from '../types';
 
 type StaffView = StaffMember & { branch?: string };
 type TaskView = ReturnType<typeof mapStaffTask>;
+interface Assignee { id: string; displayName: string; role: string }
+
+/** The page asks for this many tasks. Counts below are labelled as covering only these. */
+const TASK_PAGE_SIZE = 100;
 
 const statusStyles: Record<TaskView['status'], { label: string; badge: string; border: string }> = {
   open: { label: 'Open', badge: 'badge badge-blue', border: 'border-l-blue-500' },
@@ -20,136 +26,290 @@ const statusStyles: Record<TaskView['status'], { label: string; badge: string; b
 };
 
 const priorityStyles = {
+  critical: { badge: 'badge badge-red', border: 'border-l-red-500' },
   high: { badge: 'badge badge-red', border: 'border-l-red-500' },
   medium: { badge: 'badge badge-amber', border: 'border-l-amber-500' },
+  normal: { badge: 'badge badge-amber', border: 'border-l-amber-500' },
   low: { badge: 'badge badge-blue', border: 'border-l-[var(--b2)]' },
 };
+
+type QueueFilter = 'live' | 'mine' | 'unassigned' | 'all';
+const QUEUE_FILTERS: Array<{ id: QueueFilter; label: string }> = [
+  { id: 'live', label: 'Open & in progress' },
+  { id: 'mine', label: 'Mine' },
+  { id: 'unassigned', label: 'Unassigned' },
+  { id: 'all', label: 'All' },
+];
 
 function extractRows<T>(payload: T[] | { data: T[] }) {
   return Array.isArray(payload) ? payload : payload.data;
 }
 
+const errorText = (error: unknown, fallback: string) => error instanceof Error ? error.message : fallback;
+
 export default function StaffWorkflow() {
   const navigate = useNavigate();
+  const { user } = useSession();
+  const canAssignOthers = hasPermission(user, 'staff:write');
+  const canWorkTasks = hasPermission(user, 'staff:task-status');
+
   const [staffRecords, setStaffRecords] = useState<StaffView[]>([]);
   const [taskRecords, setTaskRecords] = useState<TaskView[]>([]);
-  const [source, setSource] = useState<'live' | 'loading'>('loading');
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [assignees, setAssignees] = useState<Assignee[]>([]);
+  // Each source reports its own outcome. One failing panel must not blank the
+  // others, and must never look like an empty result.
+  const [tasksState, setTasksState] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [staffState, setStaffState] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [tasksError, setTasksError] = useState<string | null>(null);
+  const [staffError, setStaffError] = useState<string | null>(null);
+  const [rowError, setRowError] = useState<string | null>(null);
+  const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
+  const [filter, setFilter] = useState<QueueFilter>('live');
+  const [composerOpen, setComposerOpen] = useState(false);
+
+  const loadTasks = useCallback(async () => {
+    try {
+      const response = await apiRequest<ApiStaffTask[] | { data: ApiStaffTask[] }>(`/v1/tasks?limit=${TASK_PAGE_SIZE}`);
+      setTaskRecords(extractRows(response).map(row => mapStaffTask(row)));
+      setTasksState('ready');
+      setTasksError(null);
+    } catch (error) {
+      setTasksState('error');
+      setTasksError(errorText(error, 'Unable to load the task queue'));
+    }
+  }, []);
+
+  useEffect(() => {
+    void (async () => { await loadTasks(); })();
+  }, [loadTasks]);
 
   useEffect(() => {
     let active = true;
-    Promise.all([
-      apiRequest<ApiStaffProfile[] | { data: ApiStaffProfile[] }>('/v1/staff/overview?limit=100'),
-      apiRequest<ApiStaffTask[] | { data: ApiStaffTask[] }>('/v1/tasks?limit=100'),
-    ]).then(([staffResponse, taskResponse]) => {
-      if (!active) return;
-      const staffRows = extractRows(staffResponse).map(row => mapStaffProfile(row));
-      const tasks = extractRows(taskResponse).map(row => mapStaffTask(row));
-      setStaffRecords(staffRows);
-      setTaskRecords(tasks);
-      setSource('live');
-    }).catch(error => {
-      if (active) setLoadError(error instanceof Error ? error.message : 'Unable to load staff workflow');
-    });
-
+    void (async () => {
+      try {
+        const response = await apiRequest<ApiStaffProfile[] | { data: ApiStaffProfile[] }>('/v1/staff/overview?limit=100');
+        if (!active) return;
+        setStaffRecords(extractRows(response).map(row => mapStaffProfile(row)));
+        setStaffState('ready');
+      } catch (error) {
+        if (!active) return;
+        setStaffState('error');
+        setStaffError(errorText(error, 'Unable to load staff performance records'));
+      }
+    })();
     return () => { active = false; };
   }, []);
 
-  const totals = useMemo(() => {
-    const avgResponse = staffRecords.length > 0 ? (staffRecords.reduce((sum, member) => sum + member.responseTime, 0) / staffRecords.length).toFixed(1) : '0.0';
-    const avgConversion = staffRecords.length > 0 ? Math.round(staffRecords.reduce((sum, member) => sum + member.bookingConversionRate, 0) / staffRecords.length) : 0;
-    const totalMissed = staffRecords.reduce((sum, member) => sum + member.missedCalls, 0);
-    const overdueCount = taskRecords.filter(task => task.due === 'Overdue').length;
-    const completedCount = taskRecords.filter(task => task.status === 'completed').length;
-    return { avgResponse, avgConversion, totalMissed, overdueCount, completedCount };
-  }, [staffRecords, taskRecords]);
+  useEffect(() => {
+    if (!canAssignOthers) return;
+    let active = true;
+    void (async () => {
+      try {
+        const rows = await apiRequest<Assignee[]>('/v1/staff/assignees');
+        if (active) setAssignees(rows);
+      } catch {
+        // Assignment to others simply stays unavailable; the roster is not
+        // required to see, take, or complete work.
+        if (active) setAssignees([]);
+      }
+    })();
+    return () => { active = false; };
+  }, [canAssignOthers]);
 
-  async function markTaskComplete(taskId: string) {
-    setTaskRecords(current => current.map(task => task.id === taskId ? { ...task, status: 'completed' } : task));
+  const tasksReady = tasksState === 'ready';
+  const staffReady = staffState === 'ready' && staffRecords.length > 0;
+  const queueTruncated = tasksReady && taskRecords.length >= TASK_PAGE_SIZE;
+
+  // Counts describe the loaded rows only, and are labelled that way.
+  const counts = useMemo(() => ({
+    open: taskRecords.filter(t => t.status === 'open').length,
+    inProgress: taskRecords.filter(t => t.status === 'in-progress').length,
+    overdue: taskRecords.filter(t => t.overdue).length,
+    unassigned: taskRecords.filter(t => !t.assignedToId && (t.status === 'open' || t.status === 'in-progress')).length,
+  }), [taskRecords]);
+
+  const staffTotals = useMemo(() => {
+    if (staffRecords.length === 0) return null;
+    return {
+      avgResponse: (staffRecords.reduce((sum, m) => sum + m.responseTime, 0) / staffRecords.length).toFixed(1),
+      avgConversion: Math.round(staffRecords.reduce((sum, m) => sum + m.bookingConversionRate, 0) / staffRecords.length),
+      totalMissed: staffRecords.reduce((sum, m) => sum + m.missedCalls, 0),
+    };
+  }, [staffRecords]);
+
+  const visibleTasks = useMemo(() => {
+    const live = (t: TaskView) => t.status === 'open' || t.status === 'in-progress';
+    const rows = taskRecords.filter(t => {
+      if (filter === 'live') return live(t);
+      if (filter === 'mine') return live(t) && t.assignedToId === user?.id;
+      if (filter === 'unassigned') return live(t) && !t.assignedToId;
+      return true;
+    });
+    // Overdue first, then earliest due, then undated.
+    return [...rows].sort((a, b) => {
+      if (a.overdue !== b.overdue) return a.overdue ? -1 : 1;
+      if (a.dueAt && b.dueAt) return a.dueAt.getTime() - b.dueAt.getTime();
+      if (a.dueAt) return -1;
+      if (b.dueAt) return 1;
+      return 0;
+    });
+  }, [taskRecords, filter, user?.id]);
+
+  /** Every row mutation goes through the server and then re-reads. No optimistic status. */
+  async function mutateTask(taskId: string, path: string, body: unknown, failure: string) {
+    setBusyTaskId(taskId);
+    setRowError(null);
     try {
-      await apiRequest(`/v1/staff/tasks/${taskId}/status`, {
-        method: 'PATCH',
-        body: JSON.stringify({ status: 'COMPLETED' }),
-      });
-    } catch {
-      setTaskRecords(current => current.map(task => task.id === taskId ? { ...task, status: 'open' } : task));
+      const updated = await apiRequest<ApiStaffTask>(path, { method: 'PATCH', body: JSON.stringify(body) });
+      setTaskRecords(current => current.map(t => t.id === taskId ? mapStaffTask(updated) : t));
+    } catch (error) {
+      setRowError(errorText(error, failure));
+      // The row is left exactly as the server last described it.
+      await loadTasks();
+    } finally {
+      setBusyTaskId(null);
     }
   }
 
-  async function markTaskInProgress(taskId: string) {
-    setTaskRecords(current => current.map(task => task.id === taskId ? { ...task, status: 'in-progress' } : task));
-    try {
-      await apiRequest(`/v1/staff/tasks/${taskId}/status`, {
-        method: 'PATCH',
-        body: JSON.stringify({ status: 'IN_PROGRESS' }),
-      });
-    } catch {
-      setTaskRecords(current => current.map(task => task.id === taskId ? { ...task, status: 'open' } : task));
-    }
-  }
+  const setStatus = (taskId: string, status: 'IN_PROGRESS' | 'COMPLETED') =>
+    mutateTask(taskId, `/v1/staff/tasks/${taskId}/status`, { status }, 'Unable to update this task');
 
-  const underperformers = staffRecords.filter(member => member.bookingConversionRate < 55 || member.responseTime > 6);
-  const responseThresholdExceptions = staffRecords.filter(member => member.responseTime > 6);
-  const staffMetricsReady = source === 'live' && !loadError;
+  const setAssignment = (taskId: string, assignedToId: string | null) =>
+    mutateTask(taskId, `/v1/staff/tasks/${taskId}/assignment`, { assignedToId }, 'Unable to change who owns this task');
+
+  const underperformers = staffRecords.filter(m => m.bookingConversionRate < 55 || m.responseTime > 6);
+  const responseThresholdExceptions = staffRecords.filter(m => m.responseTime > 6);
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
-        title="Staff Workflow"
-        subtitle="Task board, response SLA tracking, booking conversion, and coaching recommendations."
-        badge={loadError ? 'Data unavailable' : `${totals.overdueCount} overdue · ${source === 'live' ? 'Stored task records' : 'Loading'}`}
-        badgeColor="red"
-        actions={
-          <button type="button" onClick={() => navigate('/autopilot')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
-            <Zap className="w-4 h-4" /> Assign tasks
+        title="Staff Tasks"
+        subtitle="The shared work queue. Every row here is a stored task: take it, hand it to a colleague, or close it."
+        badge={tasksState === 'loading' ? 'Loading' : tasksState === 'error' ? 'Queue unavailable' : `${counts.open + counts.inProgress} live · ${counts.overdue} overdue`}
+        badgeColor={tasksState === 'error' ? 'red' : counts.overdue > 0 ? 'red' : 'blue'}
+        actions={canAssignOthers ? (
+          <button type="button" onClick={() => setComposerOpen(open => !open)} aria-expanded={composerOpen}
+            className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
+            <Plus className="w-4 h-4" /> New task
           </button>
-        }
+        ) : undefined}
       />
 
-      {loadError && (
-        <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          Staff workflow data could not be loaded: {loadError}
+      {tasksState === 'error' && (
+        <div role="alert" className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          The task queue could not be loaded, so this page is not showing your clinic's work. Do not read it as an empty queue. {tasksError}
         </div>
+      )}
+      {rowError && (
+        <div role="alert" className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{rowError}</div>
+      )}
+
+      {composerOpen && canAssignOthers && (
+        <NewTaskForm
+          assignees={assignees}
+          onCancel={() => setComposerOpen(false)}
+          onCreated={async () => { setComposerOpen(false); await loadTasks(); }}
+        />
       )}
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Avg Response Time" value={staffMetricsReady ? `${totals.avgResponse} min` : '—'} subtitle={staffMetricsReady ? 'Across loaded staff records' : 'Unavailable'} icon={<Clock className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Booking Conversion" value={staffMetricsReady ? `${totals.avgConversion}%` : '—'} subtitle={staffMetricsReady ? 'Across loaded staff records' : 'Unavailable'} icon={<Clock className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Missed Calls" value={staffMetricsReady ? totals.totalMissed : '—'} subtitle={staffMetricsReady ? 'This month' : 'Unavailable'} icon={<Phone className="w-4 h-4" />} accent="red" />
-        <StatCard title="Completed Tasks" value={staffMetricsReady ? totals.completedCount : '—'} subtitle={staffMetricsReady ? 'Loaded task records' : 'Unavailable'} icon={<AlertCircle className="w-4 h-4" />} accent="amber" />
+        <StatCard title="Open" value={tasksReady ? counts.open : '—'} subtitle={tasksReady ? 'Loaded task records' : 'Unavailable'} icon={<AlertCircle className="w-4 h-4" />} accent="blue" />
+        <StatCard title="In Progress" value={tasksReady ? counts.inProgress : '—'} subtitle={tasksReady ? 'Loaded task records' : 'Unavailable'} icon={<PlayCircle className="w-4 h-4" />} accent="amber" />
+        <StatCard title="Overdue" value={tasksReady ? counts.overdue : '—'} subtitle={tasksReady ? 'Past due and still live' : 'Unavailable'} icon={<Clock className="w-4 h-4" />} accent="red" />
+        <StatCard title="Unassigned" value={tasksReady ? counts.unassigned : '—'} subtitle={tasksReady ? 'Live work with no owner' : 'Unavailable'} icon={<UserPlus className="w-4 h-4" />} accent="violet" />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
         <div className="space-y-4">
-          <BentoCard title="Task Board" subtitle="Open tasks · All branches">
+          <BentoCard
+            title="Task Queue"
+            subtitle={queueTruncated ? `Newest ${TASK_PAGE_SIZE} tasks — counts cover these only` : 'Tasks stored for your clinic'}
+            headerRight={
+              <div className="flex flex-wrap gap-1">
+                {QUEUE_FILTERS.map(f => (
+                  <button key={f.id} type="button" onClick={() => setFilter(f.id)} aria-pressed={filter === f.id}
+                    className={`rounded-lg px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition ${filter === f.id ? 'bg-[var(--indigo)] text-white' : 'text-t3 hover:bg-[var(--s3)]'}`}>
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+            }
+          >
             <div className="space-y-2.5">
-              {taskRecords.length === 0 ? (
-                <p className="text-sm text-t3 py-4 text-center">No task records were returned for this clinic.</p>
-              ) : taskRecords.map(task => {
+              {tasksState === 'loading' ? (
+                <p role="status" aria-live="polite" aria-busy="true" className="text-sm text-t3 py-4 text-center">Loading the task queue…</p>
+              ) : tasksState === 'error' ? (
+                <p className="text-sm text-t3 py-4 text-center">The queue is unavailable. Retry before assuming there is no work.</p>
+              ) : visibleTasks.length === 0 ? (
+                <p className="text-sm text-t3 py-4 text-center">
+                  {taskRecords.length === 0
+                    ? 'No tasks are stored for this clinic yet. Hand-offs from the Opportunity Center, AI Receptionist escalations, and insurance reviews land here.'
+                    : `No task matches the “${QUEUE_FILTERS.find(f => f.id === filter)?.label}” filter. ${taskRecords.length} task${taskRecords.length === 1 ? '' : 's'} loaded in total.`}
+                </p>
+              ) : visibleTasks.map(task => {
                 const priorityStyle = priorityStyles[task.priority as keyof typeof priorityStyles] ?? priorityStyles.low;
                 const statusStyle = statusStyles[task.status] ?? statusStyles.open;
-                const isOverdue = task.due === 'Overdue';
+                const terminal = task.status === 'completed' || task.status === 'canceled';
+                const busy = busyTaskId === task.id;
+                const mine = task.assignedToId === user?.id;
                 return (
-                  <div key={task.id} className={`flex items-start gap-3 p-3.5 rounded-xl border border-l-2 transition-all ${priorityStyle.border} ${isOverdue && task.status !== 'completed' ? 'border-[var(--b1)] bg-[var(--red-soft)]' : 'border-[var(--b1)]'}`}>
-                    <input
-                      type="checkbox"
-                      checked={task.status === 'completed'}
-                      onChange={() => void markTaskComplete(task.id)}
-                      aria-label={`Mark task complete: ${task.title}`}
-                      className="mt-0.5 w-4 h-4 rounded border-[var(--b2)] accent-[var(--indigo)]"
-                    />
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-semibold text-t1">{task.title}</p>
-                      <div className="flex items-center gap-2 mt-1 flex-wrap">
-                        <span className={priorityStyle.badge}>{task.priority}</span>
-                        <span className={statusStyle.badge}>{statusStyle.label}</span>
-                        <span className={`text-[10px] font-semibold ${isOverdue && task.status !== 'completed' ? 'text-red-v' : 'text-t3'}`}>{task.due}</span>
-                        <span className="text-[10px] text-t3">· {task.branch} · {task.assignee}</span>
+                  <div key={task.id} className={`p-3.5 rounded-xl border border-l-2 transition-all ${priorityStyle.border} ${task.overdue ? 'border-[var(--b1)] bg-[var(--red-soft)]' : 'border-[var(--b1)]'}`}>
+                    <div className="flex items-start gap-3">
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-semibold text-t1">{task.title}</p>
+                        <div className="flex items-center gap-2 mt-1 flex-wrap">
+                          <span className={priorityStyle.badge}>{task.priority}</span>
+                          <span className={statusStyle.badge}>{statusStyle.label}</span>
+                          <span className={`text-[10px] font-semibold ${task.overdue ? 'text-red-v' : 'text-t3'}`}>{task.overdue ? `Overdue · ${task.due}` : task.due}</span>
+                          <span className="text-[10px] text-t3">· {task.branch} · {task.assignee ?? 'Unassigned'}</span>
+                          {task.origin && <span className="text-[10px] text-t3">· from {task.origin}</span>}
+                        </div>
                       </div>
+                      {terminal && <CheckCircle2 className="w-4 h-4 text-emerald-v shrink-0 mt-0.5" aria-hidden="true" />}
                     </div>
-                    <button type="button" onClick={() => void markTaskInProgress(task.id)} className="text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2 py-1 rounded-lg hover:bg-[var(--s3)] transition-colors shrink-0">
-                      Act
-                    </button>
+
+                    {!terminal && canWorkTasks && (
+                      <div className="flex flex-wrap items-center gap-2 mt-2.5">
+                        {task.status === 'open' && (
+                          <button type="button" disabled={busy} onClick={() => void setStatus(task.id, 'IN_PROGRESS')}
+                            className="inline-flex items-center gap-1 rounded-lg bg-[var(--indigo-soft)] px-2.5 py-1 text-[10px] font-semibold text-indigo hover:bg-[var(--s3)] transition disabled:opacity-50">
+                            <PlayCircle className="w-3 h-3" /> Start
+                          </button>
+                        )}
+                        <button type="button" disabled={busy} onClick={() => void setStatus(task.id, 'COMPLETED')}
+                          className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[10px] font-semibold text-t2 hover:bg-[var(--s2)] transition disabled:opacity-50">
+                          <CheckCircle2 className="w-3 h-3" /> Complete
+                        </button>
+                        {mine ? (
+                          <button type="button" disabled={busy} onClick={() => void setAssignment(task.id, null)}
+                            className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[10px] font-semibold text-t2 hover:bg-[var(--s2)] transition disabled:opacity-50">
+                            Give back
+                          </button>
+                        ) : (
+                          <button type="button" disabled={busy} onClick={() => void setAssignment(task.id, user?.id ?? null)}
+                            className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[10px] font-semibold text-t2 hover:bg-[var(--s2)] transition disabled:opacity-50">
+                            <UserPlus className="w-3 h-3" /> {task.assignedToId ? 'Take over' : 'Take it'}
+                          </button>
+                        )}
+                        {canAssignOthers && assignees.length > 0 && (
+                          <label className="inline-flex items-center gap-1 text-[10px] text-t3">
+                            <span className="sr-only">Assign “{task.title}” to</span>
+                            <select
+                              value={task.assignedToId ?? ''}
+                              disabled={busy}
+                              onChange={e => void setAssignment(task.id, e.target.value || null)}
+                              className="rounded-lg border border-[var(--b1)] bg-transparent px-2 py-1 text-[10px] font-semibold text-t2 outline-none disabled:opacity-50"
+                            >
+                              <option value="">Unassigned</option>
+                              {assignees.map(a => <option key={a.id} value={a.id}>{a.displayName}</option>)}
+                            </select>
+                          </label>
+                        )}
+                      </div>
+                    )}
+                    {!terminal && !canWorkTasks && (
+                      <p className="mt-2 text-[10px] text-t3">Your role can read this queue but not change a task.</p>
+                    )}
                   </div>
                 );
               })}
@@ -196,57 +356,61 @@ export default function StaffWorkflow() {
                   })}
                 </tbody>
               </table>
-              {staffRecords.length === 0 && <p className="text-sm text-t3 text-center py-4">No staff profiles were returned.</p>}
+              {staffState === 'loading' && <p role="status" aria-live="polite" aria-busy="true" className="text-sm text-t3 text-center py-4">Loading staff records…</p>}
+              {staffState === 'error' && <p className="text-sm text-t3 text-center py-4">Staff performance records are unavailable. {staffError}</p>}
+              {staffState === 'ready' && staffRecords.length === 0 && (
+                <p className="text-sm text-t3 text-center py-4">No staff profiles are recorded for this clinic, so no response time or conversion figure can be shown.</p>
+              )}
             </div>
           </BentoCard>
         </div>
 
         <div className="space-y-4">
-          <BentoCard title="Coaching Recommendations" subtitle="For underperforming staff" headerRight={<Sparkles className="w-4 h-4 text-violet-500" />}>
-            <div className="space-y-3">
-              {underperformers.map(member => (
-                <div key={member.id} className="p-3.5 rounded-xl border border-[var(--b1)] bg-[var(--amber-soft)]">
-                  <div className="flex items-center justify-between gap-2 mb-2">
-                    <p className="text-xs font-bold text-t1">{member.name}</p>
-                    <span className="badge badge-amber">{member.bookingConversionRate}% conv.</span>
-                  </div>
-                  <div className="space-y-1 mb-3">
-                    <div className="flex justify-between text-[10px] text-t3">
-                      <span>Booking conversion</span><span className="font-semibold">{member.bookingConversionRate}%</span>
-                    </div>
-                    <ProgressBar value={member.bookingConversionRate} size="xs" />
-                    <div className="flex justify-between text-[10px] text-t3">
-                      <span>Response time</span><span className="font-semibold">{member.responseTime} min</span>
-                    </div>
-                    <ProgressBar value={Math.max(0, 100 - (member.responseTime * 10))} size="xs" />
-                  </div>
-                  <p className="text-[11px] text-t2 mb-2">
-                    Coaching prompt: confirm the patient's identity, review the documented service context, and offer only an available time slot.
-                  </p>
-                  <button type="button" onClick={() => navigate('/autopilot')} className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo hover:opacity-80">
-                    <Sparkles className="w-3 h-3" /> View coaching script <ArrowRight className="w-3 h-3" />
-                  </button>
-                </div>
-              ))}
+          <BentoCard title="Staff Response Metrics" subtitle="From recorded staff profiles">
+            <div className="grid grid-cols-3 gap-2">
+              <MetricTile label="Avg response" value={staffReady && staffTotals ? `${staffTotals.avgResponse} min` : '—'} />
+              <MetricTile label="Conversion" value={staffReady && staffTotals ? `${staffTotals.avgConversion}%` : '—'} />
+              <MetricTile label="Missed calls" value={staffReady && staffTotals ? String(staffTotals.totalMissed) : '—'} />
             </div>
+            <p className="mt-2 text-[10.5px] text-t3 leading-relaxed">
+              {staffReady
+                ? `Averaged across ${staffRecords.length} recorded staff profile${staffRecords.length === 1 ? '' : 's'}.`
+                : staffState === 'error'
+                  ? 'Staff records could not be loaded. These are not measurements of zero.'
+                  : 'No staff profiles are recorded for this clinic, so there is nothing to average. These are not measurements of zero.'}
+            </p>
           </BentoCard>
 
-          <BentoCard title="Workload Balance" subtitle="Tasks pending per staff">
-            <div className="space-y-3">
-              {[...staffRecords].slice(0, 6).map(member => (
-                <div key={member.id}>
-                  <div className="flex items-center justify-between gap-2 mb-1">
-                    <p className="text-xs font-semibold text-t1">{member.name.split(' ')[0]}</p>
-                    <div className="flex items-center gap-2">
-                      <span className="text-[10px] text-t3">{member.tasksCompleted} done</span>
-                      <span className={`text-[10px] font-bold ${member.tasksPending > 10 ? 'text-red-v' : 'text-t2'}`}>{member.tasksPending} pending</span>
+          {underperformers.length > 0 && (
+            <BentoCard title="Coaching Recommendations" subtitle="For underperforming staff" headerRight={<Sparkles className="w-4 h-4 text-violet-500" />}>
+              <div className="space-y-3">
+                {underperformers.map(member => (
+                  <div key={member.id} className="p-3.5 rounded-xl border border-[var(--b1)] bg-[var(--amber-soft)]">
+                    <div className="flex items-center justify-between gap-2 mb-2">
+                      <p className="text-xs font-bold text-t1">{member.name}</p>
+                      <span className="badge badge-amber">{member.bookingConversionRate}% conv.</span>
                     </div>
+                    <div className="space-y-1 mb-3">
+                      <div className="flex justify-between text-[10px] text-t3">
+                        <span>Booking conversion</span><span className="font-semibold">{member.bookingConversionRate}%</span>
+                      </div>
+                      <ProgressBar value={member.bookingConversionRate} size="xs" />
+                      <div className="flex justify-between text-[10px] text-t3">
+                        <span>Response time</span><span className="font-semibold">{member.responseTime} min</span>
+                      </div>
+                      <ProgressBar value={Math.max(0, 100 - (member.responseTime * 10))} size="xs" />
+                    </div>
+                    <p className="text-[11px] text-t2 mb-2">
+                      Coaching prompt: confirm the patient's identity, review the documented service context, and offer only an available time slot.
+                    </p>
+                    <button type="button" onClick={() => navigate('/autopilot')} className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo hover:opacity-80">
+                      <Sparkles className="w-3 h-3" /> Open Autopilot <ArrowRight className="w-3 h-3" />
+                    </button>
                   </div>
-                  <ProgressBar value={member.tasksCompleted} max={member.tasksCompleted + member.tasksPending} color={member.tasksPending > 10 ? 'red' : member.tasksPending > 5 ? 'amber' : 'emerald'} size="xs" />
-                </div>
-              ))}
-            </div>
-          </BentoCard>
+                ))}
+              </div>
+            </BentoCard>
+          )}
 
           <div className="rounded-2xl border border-[var(--b1)] bg-[var(--red-soft)] p-4">
             <div className="flex items-start gap-3">
@@ -254,10 +418,16 @@ export default function StaffWorkflow() {
               <div>
                 <p className="text-sm font-bold text-red-v">Response Threshold Review</p>
                 <p className="text-xs text-t2 mt-0.5 leading-relaxed">
-                  {responseThresholdExceptions.length > 0 ? `${responseThresholdExceptions.slice(0, 2).map(member => member.name).join(' and ')} exceed this page's 6-minute response-time review threshold in the loaded records. Review staffing and routing with the branch manager.` : staffMetricsReady ? "No loaded staff record exceeds this page's 6-minute response-time review threshold." : 'Response-time records are unavailable.'}
+                  {responseThresholdExceptions.length > 0
+                    ? `${responseThresholdExceptions.slice(0, 2).map(m => m.name).join(' and ')} exceed this page's 6-minute response-time review threshold in the loaded records. Review staffing and routing with the branch manager.`
+                    : staffReady
+                      ? "No loaded staff record exceeds this page's 6-minute response-time review threshold."
+                      : 'Response-time records are unavailable, so no staff member can be assessed against the threshold.'}
                 </p>
+                {/* This button navigates. It does not switch routing on, so it no
+                    longer says it does. */}
                 <button type="button" onClick={() => navigate('/ai-receptionist')} className="mt-2 inline-flex items-center gap-1 text-xs font-semibold badge badge-red px-3 py-1.5 rounded-lg hover:opacity-80 transition-colors">
-                  <Zap className="w-3 h-3" /> Enable overflow routing
+                  <Phone className="w-3 h-3" /> Open AI Receptionist
                 </button>
               </div>
             </div>
@@ -265,5 +435,90 @@ export default function StaffWorkflow() {
         </div>
       </div>
     </div>
+  );
+}
+
+function MetricTile({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-2.5 py-2">
+      <p className="text-sm font-bold text-t1 tabular-nums leading-none">{value}</p>
+      <p className="text-[10px] text-t3 mt-1">{label}</p>
+    </div>
+  );
+}
+
+/** Real task creation: POST /v1/tasks. Requires staff:write, which the server re-checks. */
+function NewTaskForm({ assignees, onCancel, onCreated }: {
+  assignees: Assignee[]; onCancel: () => void; onCreated: () => Promise<void>;
+}) {
+  const [title, setTitle] = useState('');
+  const [priority, setPriority] = useState('medium');
+  const [assignedToId, setAssignedToId] = useState('');
+  const [dueAt, setDueAt] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    if (title.trim().length < 2) { setError('Give the task a title of at least 2 characters.'); return; }
+    setSaving(true);
+    setError(null);
+    try {
+      await apiRequest('/v1/tasks', {
+        method: 'POST',
+        body: JSON.stringify({
+          title: title.trim(),
+          priority,
+          ...(assignedToId ? { assignedToId } : {}),
+          ...(dueAt ? { dueAt: new Date(dueAt).toISOString() } : {}),
+        }),
+      });
+      await onCreated();
+    } catch (e) {
+      setError(errorText(e, 'The task was not created.'));
+      setSaving(false);
+    }
+  }
+
+  return (
+    <form onSubmit={submit} className="rounded-2xl border border-[var(--b1)] bg-[var(--s1)] p-4 space-y-3">
+      <div className="grid gap-3 sm:grid-cols-[2fr_1fr_1fr_1fr]">
+        <label className="block">
+          <span className="text-[10px] font-bold uppercase tracking-wide text-t3">Task</span>
+          <input value={title} onChange={e => setTitle(e.target.value)} maxLength={240} placeholder="Call back the Tuesday no-shows"
+            className="mt-1 w-full rounded-lg border border-[var(--b1)] bg-white px-3 py-2 text-sm text-t1 outline-none focus:border-indigo" />
+        </label>
+        <label className="block">
+          <span className="text-[10px] font-bold uppercase tracking-wide text-t3">Priority</span>
+          <select value={priority} onChange={e => setPriority(e.target.value)}
+            className="mt-1 w-full rounded-lg border border-[var(--b1)] bg-white px-3 py-2 text-sm text-t1 outline-none">
+            <option value="high">high</option>
+            <option value="medium">medium</option>
+            <option value="low">low</option>
+          </select>
+        </label>
+        <label className="block">
+          <span className="text-[10px] font-bold uppercase tracking-wide text-t3">Assign to</span>
+          <select value={assignedToId} onChange={e => setAssignedToId(e.target.value)}
+            className="mt-1 w-full rounded-lg border border-[var(--b1)] bg-white px-3 py-2 text-sm text-t1 outline-none">
+            <option value="">Leave unassigned</option>
+            {assignees.map(a => <option key={a.id} value={a.id}>{a.displayName}</option>)}
+          </select>
+        </label>
+        <label className="block">
+          <span className="text-[10px] font-bold uppercase tracking-wide text-t3">Due</span>
+          <input type="datetime-local" value={dueAt} onChange={e => setDueAt(e.target.value)}
+            className="mt-1 w-full rounded-lg border border-[var(--b1)] bg-white px-3 py-2 text-sm text-t1 outline-none" />
+        </label>
+      </div>
+      {error && <p role="alert" className="text-[11px] font-semibold text-red-v">{error}</p>}
+      <div className="flex items-center gap-2">
+        <button type="submit" disabled={saving}
+          className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--indigo)] px-4 py-2 text-xs font-semibold text-white hover:opacity-90 transition disabled:opacity-60">
+          <Plus className="w-3.5 h-3.5" /> {saving ? 'Creating…' : 'Create task'}
+        </button>
+        <button type="button" onClick={onCancel} className="rounded-xl border border-[var(--b1)] px-4 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s2)] transition">Cancel</button>
+      </div>
+    </form>
   );
 }

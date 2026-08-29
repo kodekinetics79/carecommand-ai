@@ -2,6 +2,7 @@ import { db } from './db';
 import { env } from './../config/env';
 import { runWithTenantContext } from './tenantContext';
 import { emitBusinessEvent, upsertSignal, createRecommendation } from './intelligence';
+import { ensureStaffTask } from './staffTasks';
 import type { Prisma } from '../generated/prisma/client';
 
 // ===========================================================================
@@ -63,6 +64,21 @@ export interface DenialRiskAssessment {
   allowedActions: string[];
   deepLinkTarget: string;
 }
+
+/**
+ * What the denial-prevention run actually wrote. The "Flag for billing review"
+ * control used to report "task and alert created" unconditionally, including on
+ * runs where the risk was NONE and nothing was written at all. Callers report
+ * these fields instead of assuming.
+ */
+export interface DenialPreventionReview {
+  staffTaskId: string | null;
+  staffTaskCreated: boolean;
+  alertCreated: boolean;
+  reason: 'task_created' | 'task_already_open' | 'task_write_failed' | 'review_not_required' | 'no_risk_detected' | 'no_branch_on_appointment';
+}
+
+export type DenialPreventionRun = DenialRiskAssessment & { review: DenialPreventionReview };
 
 const REASON_ACTION: Record<string, string> = {
   insurance_missing: 'Request updated insurance from the patient',
@@ -158,9 +174,13 @@ async function writeAudit(tenantId: string, actorUserId: string | null, action: 
 // Run denial prevention for an appointment: assess + (when material) create a
 // StaffTask, RevenueProtectionAlert, BusinessEvent, OperationalSignal, and a
 // rule-based AIRecommendation. Idempotent via the per-entity signal upsert.
-export async function runDenialPreventionForAppointment(tenantId: string, appointmentId: string, opts: { actorUserId?: string | null; branchId?: string } = {}): Promise<DenialRiskAssessment> {
+export async function runDenialPreventionForAppointment(tenantId: string, appointmentId: string, opts: { actorUserId?: string | null; branchId?: string } = {}): Promise<DenialPreventionRun> {
   const assessment = await computeDenialRisk({ tenantId, appointmentId });
-  if (assessment.denialRiskLevel === 'NONE') return assessment;
+  // Nothing is created for a NONE risk. Say so, rather than letting the caller
+  // report a task and an alert that were never written.
+  if (assessment.denialRiskLevel === 'NONE') {
+    return { ...assessment, review: { staffTaskId: null, staffTaskCreated: false, alertCreated: false, reason: 'no_risk_detected' } };
+  }
 
   const branchId = opts.branchId ?? (await db.appointment.findFirst({ where: { id: appointmentId, tenantId }, select: { branchId: true } }))?.branchId;
 
@@ -180,24 +200,49 @@ export async function runDenialPreventionForAppointment(tenantId: string, appoin
   }
 
   // Only escalate to a task/alert when staff action is warranted.
+  const review: DenialPreventionReview = { staffTaskId: null, staffTaskCreated: false, alertCreated: false, reason: 'review_not_required' };
   if (assessment.staffReviewRequired || assessment.denialRiskLevel === 'HIGH') {
     if (branchId) {
-      await db.staffTask.create({ data: { tenantId, branchId, title: 'Resolve insurance denial risk before visit', priority: assessment.denialRiskLevel === 'HIGH' ? 'high' : 'normal', status: 'OPEN', metadata: { source: 'denial_prevention', appointmentId, reasons: assessment.reasons } } }).catch(() => {});
-      await runWithTenantContext(tenantId, tx => tx.revenueProtectionAlert.create({
-        data: {
-          tenantId, branchId, appointmentId, patientId: assessment.patientId ?? undefined,
-          sourceType: 'insurance_denial_risk', severity, title: 'Pre-visit insurance denial risk',
-          description: `Denial risk ${assessment.denialRiskLevel}: ${assessment.reasons.join(', ')}.`,
-          estimatedValue: assessment.estimatedPatientResponsibility ?? 0, status: 'open',
-          recommendedAction: assessment.recommendedActions[0] ?? 'Verify insurance before the visit.',
-          actionLink: `appointment/${appointmentId}`,
-        },
-      })).catch(() => {});
+      // Idempotent per appointment: re-running the check on the same appointment
+      // reuses the open review task instead of stacking duplicates on the queue.
+      const handoff = await runWithTenantContext(tenantId, tx => ensureStaffTask(tx, {
+        tenantId, branchId,
+        title: 'Resolve insurance denial risk before visit',
+        priority: assessment.denialRiskLevel === 'HIGH' ? 'high' : 'normal',
+        origin: { workflow: 'insurance_denial_prevention', entityType: 'appointment', entityId: appointmentId },
+        context: { reasons: assessment.reasons, denialRiskLevel: assessment.denialRiskLevel },
+      })).catch(() => null);
+      review.staffTaskId = handoff?.task.id ?? null;
+      review.staffTaskCreated = handoff?.created ?? false;
+      review.reason = handoff ? (handoff.created ? 'task_created' : 'task_already_open') : 'task_write_failed';
+
+      const alerted = await runWithTenantContext(tenantId, async tx => {
+        const open = await tx.revenueProtectionAlert.findFirst({
+          where: { tenantId, appointmentId, sourceType: 'insurance_denial_risk', status: 'open' },
+          select: { id: true },
+        });
+        if (open) return false;
+        await tx.revenueProtectionAlert.create({
+          data: {
+            tenantId, branchId, appointmentId, patientId: assessment.patientId ?? undefined,
+            sourceType: 'insurance_denial_risk', severity, title: 'Pre-visit insurance denial risk',
+            description: `Denial risk ${assessment.denialRiskLevel}: ${assessment.reasons.join(', ')}.`,
+            estimatedValue: assessment.estimatedPatientResponsibility ?? 0, status: 'open',
+            recommendedAction: assessment.recommendedActions[0] ?? 'Verify insurance before the visit.',
+            actionLink: `appointment/${appointmentId}`,
+          },
+        });
+        return true;
+      }).catch(() => false);
+      review.alertCreated = alerted;
+    } else {
+      // No branch means the task would be filed where no branch queue can see it.
+      review.reason = 'no_branch_on_appointment';
     }
-    await writeAudit(tenantId, opts.actorUserId ?? null, 'insurance.denialRisk.created', appointmentId, { denialRiskLevel: assessment.denialRiskLevel, reasons: assessment.reasons });
+    await writeAudit(tenantId, opts.actorUserId ?? null, 'insurance.denialRisk.created', appointmentId, { denialRiskLevel: assessment.denialRiskLevel, reasons: assessment.reasons, staffTaskId: review.staffTaskId, staffTaskCreated: review.staffTaskCreated });
   }
 
-  return assessment;
+  return { ...assessment, review };
 }
 
 export { ELIGIBILITY_EXPIRY_DAYS };

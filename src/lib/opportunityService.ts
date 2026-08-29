@@ -73,13 +73,25 @@ function mapLeak(l: Record<string, unknown>): RevenueLeak {
   };
 }
 
-// Specific workflow CTAs → concrete status transitions (server audits each PATCH).
+// Specific workflow CTAs → concrete server actions (each is audited server-side).
 export type WorkflowVerb = 'approve_campaign' | 'assign_callback' | 'send_front_desk';
-const VERB_STATUS: Record<WorkflowVerb, { status: string; approvalRequired?: boolean }> = {
-  approve_campaign: { status: 'approved', approvalRequired: false },
-  assign_callback: { status: 'running', approvalRequired: false },
-  send_front_desk: { status: 'assigned', approvalRequired: false },
-};
+
+/**
+ * Hand-off verbs. These two tell the user the work has gone to the front desk,
+ * so they must create a real StaffTask — a status string alone assigned nobody.
+ * POST /v1/opportunities/:id/handoff writes the task and the status in one
+ * transaction and is idempotent, so a second click reuses the open task.
+ */
+const HANDOFF_VERBS = ['assign_callback', 'send_front_desk'] as const;
+const isHandoffVerb = (verb: WorkflowVerb): verb is (typeof HANDOFF_VERBS)[number] =>
+  (HANDOFF_VERBS as readonly string[]).includes(verb);
+
+export interface WorkflowResult {
+  opportunity: Opportunity;
+  /** What the server reports it actually did. Null when the verb writes no task. */
+  message: string | null;
+  taskCreated: boolean | null;
+}
 
 export const opportunityService = {
   // [LIVE]
@@ -92,11 +104,17 @@ export const opportunityService = {
     const rows = await apiRequest<Array<Record<string, unknown>>>('/v1/opportunities?limit=30');
     return rows.map(mapOpportunity).sort((a, b) => b.expectedRevenue - a.expectedRevenue);
   },
-  // [LIVE] PATCH /v1/opportunities/:id (status change → audited server-side)
-  async runWorkflow(id: string, verb: WorkflowVerb): Promise<Opportunity> {
-    const t = VERB_STATUS[verb];
-    const row = await apiRequest<Record<string, unknown>>(`/v1/opportunities/${id}`, { method: 'PATCH', body: JSON.stringify({ status: t.status, ownerApprovalRequired: t.approvalRequired ?? false }) });
-    return mapOpportunity(row);
+  // [LIVE] Hand-offs POST /v1/opportunities/:id/handoff (task + status, one
+  // transaction); approval is a plain PATCH. Both audited server-side.
+  async runWorkflow(id: string, verb: WorkflowVerb): Promise<WorkflowResult> {
+    if (isHandoffVerb(verb)) {
+      const res = await apiRequest<{ opportunity: Record<string, unknown>; taskCreated: boolean; message: string }>(
+        `/v1/opportunities/${id}/handoff`, { method: 'POST', body: JSON.stringify({ verb }) },
+      );
+      return { opportunity: mapOpportunity(res.opportunity), message: res.message, taskCreated: res.taskCreated };
+    }
+    const row = await apiRequest<Record<string, unknown>>(`/v1/opportunities/${id}`, { method: 'PATCH', body: JSON.stringify({ status: 'approved', ownerApprovalRequired: false }) });
+    return { opportunity: mapOpportunity(row), message: null, taskCreated: null };
   },
   // [LIVE] dismiss/snooze map to status; reason is sent for the audit metadata.
   async setStatus(id: string, status: string): Promise<Opportunity> {

@@ -25,6 +25,14 @@ export interface DenialRiskAssessment {
   deepLinkTarget: string;
 }
 
+/** What a denial-prevention run actually wrote — never assumed by the caller. */
+export interface DenialPreventionReview {
+  staffTaskId: string | null;
+  staffTaskCreated: boolean;
+  alertCreated: boolean;
+  reason: 'task_created' | 'task_already_open' | 'task_write_failed' | 'review_not_required' | 'no_risk_detected' | 'no_branch_on_appointment';
+}
+
 export interface EligibilityProviderStatus {
   provider: string;
   configured: boolean;
@@ -65,7 +73,7 @@ export const insuranceApi = {
   providerStatus: () => apiRequest<EligibilityProviderStatus>(`${base}/provider-status`),
   getIntake: (appointmentId: string) => apiRequest<DenialRiskAssessment>(`${base}/intake/${appointmentId}`),
   runDenialPrevention: (appointmentId: string) =>
-    apiRequest<DenialRiskAssessment & { requiresHumanReview: boolean }>(`${base}/denial-prevention/${appointmentId}`, { method: 'POST' }),
+    apiRequest<DenialRiskAssessment & { requiresHumanReview: boolean; review?: DenialPreventionReview }>(`${base}/denial-prevention/${appointmentId}`, { method: 'POST' }),
   runEligibilityCheck: (body: { appointmentId?: string; patientId?: string; branchId?: string; payerId?: string; serviceType?: string }, idempotencyKey?: string) => {
     const send = (key: string) => apiRequest<{ status?: string; setupRequired?: boolean; provider?: string; coverageStatus?: string; verificationId?: string }>(`/v1/revenue-protection/eligibility/check`, {
       method: 'POST', headers: eligibilityRequestHeaders(key), body: JSON.stringify(body),

@@ -11,9 +11,9 @@ function ctasFor(o: Opportunity): Cta[] {
   const out: Cta[] = [];
   if (o.approval === 'pending_approval') out.push({ id: 'approve', label: 'Approve Campaign', icon: CheckCircle2, tone: 'indigo', verb: 'approve_campaign', confirm: { title: 'Approve campaign?', message: `This approves "${o.title}" for execution and removes the approval hold.` } });
   if (o.category === 'inactive-patients' || o.category === 'reputation') out.push({ id: 'recovery', label: 'Build Recovery Campaign', icon: MessageSquare, tone: 'indigo', route: '/campaigner', confirm: { title: 'Open Campaigner?', message: 'Build and approve a consent-checked recovery campaign before any message is sent.' } });
-  if (o.category === 'front-desk') out.push({ id: 'callback', label: 'Assign Callback Queue', icon: PhoneCall, tone: 'indigo', verb: 'assign_callback', confirm: { title: 'Assign callback queue?', message: 'Uncontacted callers will be routed to the front-desk callback queue.' } });
+  if (o.category === 'front-desk') out.push({ id: 'callback', label: 'Assign Callback Queue', icon: PhoneCall, tone: 'indigo', verb: 'assign_callback', confirm: { title: 'Assign callback queue?', message: 'This creates a callback task on the branch Staff Tasks queue, due in 4 hours. Nobody is named on it until someone takes it or a manager assigns it.' } });
   if (o.category === 'no-show' || o.category === 'scheduling') out.push({ id: 'fill', label: 'Build Schedule Fill Campaign', icon: CalendarPlus, tone: 'indigo', route: '/campaigner', confirm: { title: 'Open Campaigner?', message: 'Build and approve a schedule-fill campaign before any outreach occurs.' } });
-  out.push({ id: 'frontdesk', label: 'Send to Front Desk', icon: Send, tone: 'amber', verb: 'send_front_desk', confirm: { title: 'Send to front desk?', message: 'This assigns the action to the branch front-desk team.' } });
+  out.push({ id: 'frontdesk', label: 'Send to Front Desk', icon: Send, tone: 'amber', verb: 'send_front_desk', confirm: { title: 'Send to front desk?', message: 'This creates a task on the branch Staff Tasks queue, due in 24 hours. Nobody is named on it until someone takes it or a manager assigns it.' } });
   return out;
 }
 
@@ -22,6 +22,9 @@ export default function OpportunityActionDrawer({ opportunity, onClose, onChange
 }) {
   const [confirm, setConfirm] = useState<Cta | null>(null);
   const [reasonAction, setReasonAction] = useState<{ kind: 'dismiss' | 'snooze' } | null>(null);
+  // What the server reported it actually wrote, shown verbatim rather than a
+  // success message this component invents.
+  const [outcome, setOutcome] = useState<string | null>(null);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !confirm && !reasonAction) onClose(); };
@@ -48,6 +51,11 @@ export default function OpportunityActionDrawer({ opportunity, onClose, onChange
         </div>
 
         <footer className="p-5 border-t border-[var(--b1)] bg-[var(--s1)] space-y-2">
+          {outcome && (
+            <p role="status" aria-live="polite" className="rounded-xl border border-[var(--b1)] bg-[var(--indigo-soft)] px-3 py-2 text-[11px] font-semibold text-indigo">
+              {outcome} <a href="/staff" className="underline">Open Staff Tasks</a>
+            </p>
+          )}
           {ctas.map(c => {
             const Icon = c.icon;
             const cls = c.tone === 'amber' ? 'border border-[rgba(217,119,6,0.3)] text-amber-v hover:bg-amber-soft' : 'bg-[var(--indigo)] text-white hover:opacity-90';
@@ -73,7 +81,11 @@ export default function OpportunityActionDrawer({ opportunity, onClose, onChange
           onClose={() => setConfirm(null)}
           onConfirm={async () => {
             if (confirm.route) { onNavigate(confirm.route); return; }
-            if (confirm.verb) { const updated = await opportunityService.runWorkflow(opportunity.id, confirm.verb); onChanged(updated); }
+            if (confirm.verb) {
+              const result = await opportunityService.runWorkflow(opportunity.id, confirm.verb);
+              setOutcome(result.message);
+              onChanged(result.opportunity);
+            }
           }}
         />
       )}

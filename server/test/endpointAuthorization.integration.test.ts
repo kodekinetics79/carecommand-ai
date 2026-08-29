@@ -101,6 +101,9 @@ const guardedRoutes: GuardedRoute[] = [
   { method: 'POST', url: '/v1/integrations/retell/test', permission: 'integrations:manage' },
   { method: 'GET', url: '/v1/tasks', permission: 'staff:read' },
   { method: 'POST', url: '/v1/tasks', permission: 'staff:write', payload: {} },
+  { method: 'GET', url: '/v1/staff/assignees', permission: 'staff:write' },
+  { method: 'PATCH', url: `/v1/staff/tasks/${fixedId}/assignment`, permission: 'staff:task-status', payload: { assignedToId: null } },
+  { method: 'POST', url: `/v1/opportunities/${fixedId}/handoff`, permission: 'revenue:write', payload: { verb: 'send_front_desk' } },
   { method: 'GET', url: '/v1/revenue-snapshots', permission: 'revenue:read' },
   { method: 'GET', url: '/v1/conversations', permission: 'crm:read' },
   { method: 'POST', url: `/v1/conversations/${fixedId}/reply`, permission: 'crm:write', payload: { message: 'Escalate', status: 'escalated' } },
@@ -164,6 +167,12 @@ describe('cross-module endpoint authorization', () => {
     [{ method: 'PATCH', url: `/v1/partner-reports/${fixedId}/review`, payload: { status: 'doctor-reviewed' }, permission: 'partner-report:review' }, ['OWNER', 'ADMIN', 'PROVIDER'], ['MANAGER', 'BILLING', 'FRONT_DESK', 'ANALYST', 'COMPLIANCE_OFFICER', 'AUDITOR']],
     [{ method: 'PATCH', url: `/v1/integrations/${fixedId}`, payload: { status: 'DISCONNECTED' }, permission: 'integrations:manage' }, ['OWNER', 'ADMIN', 'MANAGER'], ['BILLING', 'PROVIDER', 'FRONT_DESK', 'ANALYST', 'COMPLIANCE_OFFICER', 'AUDITOR']],
     [{ method: 'POST', url: '/v1/tasks', payload: {}, permission: 'staff:write' }, ['OWNER', 'ADMIN', 'MANAGER'], ['BILLING', 'PROVIDER', 'FRONT_DESK', 'ANALYST', 'COMPLIANCE_OFFICER', 'AUDITOR']],
+    // Only a role that may hand work to another person gets the roster.
+    [{ method: 'GET', url: '/v1/staff/assignees', permission: 'staff:write' }, ['OWNER', 'ADMIN', 'MANAGER'], ['BILLING', 'PROVIDER', 'FRONT_DESK', 'ANALYST', 'COMPLIANCE_OFFICER', 'AUDITOR']],
+    // FRONT_DESK reaches the assignment route (it may take a task itself); the
+    // route then refuses assigning to somebody else. See the ownership test below.
+    [{ method: 'PATCH', url: `/v1/staff/tasks/${fixedId}/assignment`, payload: { assignedToId: null }, permission: 'staff:task-status' }, ['OWNER', 'ADMIN', 'MANAGER', 'FRONT_DESK'], ['BILLING', 'PROVIDER', 'ANALYST', 'COMPLIANCE_OFFICER', 'AUDITOR']],
+    [{ method: 'POST', url: `/v1/opportunities/${fixedId}/handoff`, payload: { verb: 'send_front_desk' }, permission: 'revenue:write' }, ['OWNER', 'ADMIN', 'MANAGER', 'BILLING'], ['PROVIDER', 'FRONT_DESK', 'ANALYST', 'COMPLIANCE_OFFICER', 'AUDITOR']],
   ] as Array<[GuardedRoute, Role[], Role[]]>)('preserves the intentional before→after mutation matrix for $0.permission', async (route, allowed, denied) => {
     const tenant = await makeTenant();
     for (const role of allowed) expect((await inject(tenant, role, route)).statusCode, role).not.toBe(403);

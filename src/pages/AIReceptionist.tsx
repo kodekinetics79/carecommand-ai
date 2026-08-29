@@ -152,7 +152,9 @@ export default function AIReceptionist() {
       });
       const deliveryStatus = result.deliveryStatus.toLowerCase();
       setSendNotice(status === 'escalated'
-        ? 'Internal escalation recorded. No patient message was submitted.'
+        // The server reports whether the hand-off task was written or reused.
+        // Use its wording rather than asserting an escalation reached anyone.
+        ? result.message
         : deliveryStatus === 'submission_result_unknown'
           ? 'Submission result unknown. Retry is blocked until provider evidence is reconciled.'
         : deliveryStatus === 'delivered'

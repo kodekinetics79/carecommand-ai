@@ -10,6 +10,7 @@ import { requireFeature } from '../../lib/entitlements';
 import { sendMessage, type SendResult } from '../../lib/commsProvider';
 import { isSuppressed, isValidE164, isValidEmail, maskDestination, toE164, type CommChannel } from '../../lib/campaigns';
 import { getRequestPermissions, requirePermission } from '../../lib/permissions';
+import { ensureStaffTask } from '../../lib/staffTasks';
 
 const channel = z.enum(['WHATSAPP', 'SMS', 'EMAIL', 'PUSH', 'CALL', 'VIDEO']);
 const uuid = z.string().uuid();
@@ -545,6 +546,57 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     return row;
   });
 
+  // Opportunity hand-offs. "Send to Front Desk" and "Assign Callback Queue" both
+  // told the user the work had been handed to the front-desk team, while only
+  // moving the opportunity's own status string — nobody was ever given the job.
+  // Each verb now lands a real StaffTask in the same transaction as the status
+  // change, so the claim and the record cannot diverge.
+  const HANDOFF: Record<'send_front_desk' | 'assign_callback', { status: string; title: (t: string) => string; priority: string; dueInHours: number }> = {
+    send_front_desk: { status: 'assigned', title: t => `Front desk: ${t}`, priority: 'high', dueInHours: 24 },
+    assign_callback: { status: 'running', title: t => `Callback queue: ${t}`, priority: 'high', dueInHours: 4 },
+  };
+  app.post('/opportunities/:id/handoff', { preHandler: revenueWrite }, async (request, reply) => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const { verb } = z.object({ verb: z.enum(['send_front_desk', 'assign_callback']) }).parse(request.body);
+    const spec = HANDOFF[verb];
+    const existing = await db.opportunity.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+    if (!existing) throw app.httpErrors.notFound('Opportunity not found');
+    assertBranchAccess(request, existing.branchId);
+
+    const result = await runWithTenantContext(request.auth.tenantId, async tx => {
+      const handoff = await ensureStaffTask(tx, {
+        tenantId: request.auth.tenantId,
+        branchId: existing.branchId,
+        title: spec.title(existing.title).slice(0, 240),
+        priority: spec.priority,
+        dueAt: new Date(Date.now() + spec.dueInHours * 3_600_000),
+        origin: { workflow: 'opportunity_handoff', entityType: 'opportunity', entityId: existing.id, verb },
+        context: { opportunityCategory: existing.category, recommendedAction: existing.recommendedAction },
+      });
+      const opportunity = await tx.opportunity.update({
+        where: { id: existing.id },
+        data: { status: spec.status, ownerApprovalRequired: false },
+        include: { branch: { select: { name: true } }, ownerUser: { select: { displayName: true } }, patient: { select: { firstName: true, lastName: true } } },
+      });
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+        action: 'opportunity.handoff', resource: 'opportunity', resourceId: existing.id,
+        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
+        metadata: { verb, status: spec.status, taskId: handoff.task.id, taskCreated: handoff.created },
+      } });
+      return { opportunity, handoff };
+    });
+
+    return reply.send({
+      opportunity: result.opportunity,
+      task: result.handoff.task,
+      taskCreated: result.handoff.created,
+      message: result.handoff.created
+        ? 'Task created in Staff Tasks for the branch front desk.'
+        : 'An open task for this opportunity already exists in Staff Tasks; it was not duplicated.',
+    });
+  });
+
   app.get('/leads', { preHandler: crmRead }, async request => {
     const { limit } = listLimit.parse(request.query);
     return db.lead.findMany({ where: { tenantId: request.auth.tenantId }, take: limit, orderBy: { createdAt: 'desc' } });
@@ -852,8 +904,15 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     }).parse(request.body);
     if (input.branchId) await requireTenantBranch(request, input.branchId);
     if (input.assignedToId) await requireTenantAssignee(request, input.assignedToId);
-    const row = await db.staffTask.create({ data: { tenantId: request.auth.tenantId, ...input } });
-    await audit(request, { action: 'task.created', resource: 'staffTask', resourceId: row.id });
+    // GET /tasks scopes a branch-restricted caller to their own branch, so a task
+    // created without one would be invisible to the queue that just created it.
+    // Default to the creator's branch rather than filing work nobody can see.
+    const branchId = input.branchId ?? request.auth.branchId ?? undefined;
+    const row = await db.staffTask.create({
+      data: { tenantId: request.auth.tenantId, ...input, branchId },
+      include: { branch: { select: { name: true } }, assignedTo: { select: { displayName: true } } },
+    });
+    await audit(request, { action: 'task.created', resource: 'staffTask', resourceId: row.id, metadata: { assigned: Boolean(row.assignedToId), branchScoped: Boolean(branchId) } });
     return reply.code(201).send(row);
   });
 
@@ -977,13 +1036,39 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     // Escalation is an internal hand-off to a human — never an outbound patient
     // message, so it must not send and must not inflate AI-recovery metrics.
     if (body.status === 'escalated') {
-      const escalated = await db.conversation.update({
-        where: { id: row.id },
-        data: { status: 'escalated' },
-        include: replyResponseInclude,
+      // "Escalated to a human" previously only rewrote the conversation's own
+      // status string; no human was ever told. The hand-off now lands a real
+      // StaffTask in the same transaction, so the message below is true.
+      const escalation = await runWithTenantContext(request.auth.tenantId, async tx => {
+        const handoff = await ensureStaffTask(tx, {
+          tenantId: request.auth.tenantId,
+          branchId: row.branchId,
+          title: `Escalated ${row.channel.toLowerCase()} conversation needs a human reply`,
+          priority: 'high',
+          dueAt: new Date(Date.now() + 4 * 3_600_000),
+          origin: { workflow: 'conversation_escalation', entityType: 'conversation', entityId: row.id },
+          context: { channel: row.channel, patientId: row.patientId },
+        });
+        const conversation = await tx.conversation.update({
+          where: { id: row.id },
+          data: { status: 'escalated' },
+          include: replyResponseInclude,
+        });
+        await tx.auditEvent.create({ data: {
+          tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+          action: 'conversation.escalated', resource: 'conversation', resourceId: row.id,
+          requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
+          metadata: { taskId: handoff.task.id, taskCreated: handoff.created },
+        } });
+        return { conversation, handoff };
       });
-      await audit(request, { action: 'conversation.escalated', resource: 'conversation', resourceId: row.id });
-      return reply.send({ conversation: escalated, delivered: false, deliveryStatus: 'escalated', providerMode: null, message: 'Escalated to a human. No patient message was sent.' });
+      return reply.send({
+        conversation: escalation.conversation, delivered: false, deliveryStatus: 'escalated', providerMode: null,
+        task: escalation.handoff.task, taskCreated: escalation.handoff.created,
+        message: escalation.handoff.created
+          ? 'Escalated to a human: a task was created in Staff Tasks. No patient message was sent.'
+          : 'Escalated to a human: an open task for this conversation already exists in Staff Tasks. No patient message was sent.',
+      });
     }
 
     if (!body.clientAttemptKey) {
