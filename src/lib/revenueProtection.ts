@@ -365,8 +365,20 @@ export async function updateAlertStatus(id: string, input: { status: string; cre
   });
 }
 
-export async function fetchAppointmentVerificationQueue(branchId?: string) {
-  const suffix = branchId ? `?branchId=${branchId}` : '';
+export async function fetchAppointmentVerificationQueue(
+  branchId?: string,
+  window?: { from: Date; to: Date },
+) {
+  const params = new URLSearchParams();
+  if (branchId) params.set('branchId', branchId);
+  // The clinic day the desk is working. Sent as instants because only the
+  // client knows the clinic's timezone; without it the server falls back to
+  // "today onward" with a day of slack rather than guessing a zone.
+  if (window) {
+    params.set('from', window.from.toISOString());
+    params.set('to', window.to.toISOString());
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : '';
   return apiRequest<{ appointments: AppointmentVerificationQueueRow[] }>(`/v1/revenue-protection/appointment-queue${suffix}`);
 }
 

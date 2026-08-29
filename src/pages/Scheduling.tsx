@@ -200,7 +200,10 @@ export default function Scheduling() {
       setQueueLoading(true);
       setQueueError(null);
       try {
-        const response = await fetchAppointmentVerificationQueue(selectedBranch === 'all' ? undefined : selectedBranch);
+        const response = await fetchAppointmentVerificationQueue(
+          selectedBranch === 'all' ? undefined : selectedBranch,
+          clinicDayRangeUtc(activeDate, clinicTimezone),
+        );
         if (!active) return;
         setInsuranceQueue(response.appointments);
       } catch (err) {
@@ -213,7 +216,7 @@ export default function Scheduling() {
     return () => {
       active = false;
     };
-  }, [selectedBranch]);
+  }, [selectedBranch, activeDate, clinicTimezone]);
 
   function closeBooking() {
     setBooking(emptyBooking(todayDate));
