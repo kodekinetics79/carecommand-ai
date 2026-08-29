@@ -128,6 +128,8 @@ export const ROUTES = {
 
   // /v1/monitoring/* — module preHandler requireRoles(OWNER, ADMIN, MANAGER, PROVIDER)
   '/monitoring': { label: 'Remote Monitoring', roles: CLINICAL_LEADERSHIP },
+  // POST/PATCH/DELETE /v1/monitoring/rules — requireRoles(OWNER, ADMIN, MANAGER)
+  '/alert-thresholds': { label: 'Alert Thresholds', roles: CLINICAL_LEADERSHIP },
   // GET /v1/devices/overview — entitlement only (device_integration).
   '/devices': { label: 'Device Integration' },
   // /v1/connected-care/* — module preHandler requireRoles(OWNER, ADMIN, MANAGER, PROVIDER)

@@ -3,7 +3,7 @@ import { useLocation, Link, useNavigate } from 'react-router';
 import {
   LayoutDashboard, Radar, Users2, Megaphone, TrendingUp,
   CalendarDays, ClipboardList, Puzzle, Settings,
-  Star, Orbit, Target, UserCircle2, ShieldCheck, Sparkles, BadgeCheck, Bot, FileText, CreditCard, Lock, Cpu, Activity, Plug,
+  Star, Orbit, Target, UserCircle2, ShieldCheck, Sparkles, BadgeCheck, Bot, FileText, CreditCard, Lock, Cpu, Activity, Plug, SlidersHorizontal,
   ChevronsLeft, ChevronsRight, ChevronDown, Search, X,
 } from 'lucide-react';
 import { useSession } from '../../hooks/useSession';
@@ -33,6 +33,7 @@ const NAV_FEATURE: Record<string, string> = {
   '/enrollments': 'device_integration',
   '/sync-logs': 'device_integration',
   '/rpm-readiness': 'device_integration',
+  '/alert-thresholds': 'device_integration',
 };
 
 interface NavItem {
@@ -102,6 +103,7 @@ const nav: NavSection[] = [
     label: 'Connected Care',
     items: [
       { label: 'Remote Monitoring', path: '/monitoring', icon: Activity },
+      { label: 'Alert Thresholds', path: '/alert-thresholds', icon: SlidersHorizontal },
       { label: 'Device Integration', path: '/devices', icon: Cpu },
       { label: 'Device Enrollments', path: '/enrollments', icon: UserCircle2 },
       { label: 'RPM Billing Readiness', path: '/rpm-readiness', icon: CreditCard },

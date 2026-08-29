@@ -47,6 +47,7 @@ const IntegrationSetup = lazy(() => import('../pages/IntegrationSetup'));
 const InsuranceEligibility = lazy(() => import('../pages/InsuranceEligibility'));
 const PatientEnrollments = lazy(() => import('../pages/PatientEnrollments'));
 const DeviceSyncLogs = lazy(() => import('../pages/DeviceSyncLogs'));
+const MonitoringThresholds = lazy(() => import('../pages/MonitoringThresholds'));
 const RpmBillingReadiness = lazy(() => import('../pages/RpmBillingReadiness'));
 const Subscription = lazy(() => import('../pages/Subscription'));
 const Platform = lazy(() => import('../pages/Platform'));
@@ -199,6 +200,7 @@ export default function App() {
           <Route path="/insurance-eligibility" element={<InsuranceEligibility />} />
           <Route path="/enrollments" element={<PatientEnrollments />} />
           <Route path="/sync-logs" element={<DeviceSyncLogs />} />
+          <Route path="/alert-thresholds" element={<MonitoringThresholds />} />
           <Route path="/rpm-readiness" element={<RpmBillingReadiness />} />
           <Route path="/subscription" element={<Subscription />} />
           {/* Operator-only console — gated by a platform token, not a tenant role; not in the sidebar. */}

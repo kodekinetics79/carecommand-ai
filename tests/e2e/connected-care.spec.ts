@@ -220,4 +220,54 @@ test.describe('Connected Care — the clinic journey', () => {
       await db.tenant.delete({ where: { id: data.tenantId } }).catch(() => {});
     }
   });
+  test('lets a clinic set its own alert thresholds, including the missed-reading watch', async ({ page }, testInfo) => {
+    const data = await seedCareData(`thresholds-${testInfo.project.name}`);
+    try {
+      await loginStaff(page, data);
+      await page.goto('/alert-thresholds');
+      await assertAccessibilityContract(page, 'alert thresholds');
+
+      // A clinic with no rules of its own is running entirely on the built-in
+      // bands — and, more importantly, nothing is watching for a patient who
+      // stops reporting, because the cadence lives only on a rule.
+      await expect(page.getByText(/No rules of your own yet/i)).toBeVisible();
+      await expect(page.getByText(/nothing is watching for missed readings/i)).toBeVisible();
+      // The defaults in force are shown rather than left implicit.
+      await expect(page.getByRole('cell', { name: 'Glucose' })).toBeVisible();
+
+      await page.getByRole('button', { name: /Add your first rule/i }).click();
+      await page.getByLabel('Reading type').selectOption('glucose');
+      await page.getByLabel('Safe low').fill('80');
+      await page.getByLabel('Safe high').fill('200');
+      await page.getByLabel('Missed after hours').fill('24');
+      await page.getByRole('button', { name: /Save rule/i }).click();
+
+      // The rule is in force, and the patient is now actually being watched.
+      const row = page.getByRole('row', { name: /Glucose/ }).first();
+      await expect(row).toBeVisible();
+      await expect(page.getByText('24h')).toBeVisible();
+      await expect(page.getByText(/not watched/i)).toHaveCount(0);
+    } finally {
+      await db.tenant.delete({ where: { id: data.tenantId } }).catch(() => {});
+    }
+  });
+
+  test('refuses a threshold band that could never fire what it names', async ({ page }, testInfo) => {
+    const data = await seedCareData(`badband-${testInfo.project.name}`);
+    try {
+      await loginStaff(page, data);
+      await page.goto('/alert-thresholds');
+      await page.getByRole('button', { name: /Add a rule/i }).click();
+      // Inverted: a safe range whose low is above its high can never be
+      // satisfied, so the rule would fail silently rather than loudly.
+      await page.getByLabel('Safe low').fill('200');
+      await page.getByLabel('Safe high').fill('100');
+      await page.getByRole('button', { name: /Save rule/i }).click();
+
+      await expect(page.getByRole('alert')).toContainText(/inverted/i);
+      await expect(page.getByText(/No rules of your own yet/i)).toBeVisible();
+    } finally {
+      await db.tenant.delete({ where: { id: data.tenantId } }).catch(() => {});
+    }
+  });
 });
