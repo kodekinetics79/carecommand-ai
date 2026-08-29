@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect } from '@playwright/test';
 import { signIn, clickNavDestination } from './roleAccess';
 import {
   createGrowthTenant, seedInactiveAudience, fixtureDb as db,
@@ -35,6 +35,9 @@ const CAMPAIGN_NAME = 'E2E Winback Journey';
 test.describe('growth campaign money path', () => {
   let tenant: GrowthTenant;
 
+  // Playwright resolves fixtures by parsing this destructuring pattern; the
+  // empty pattern is its required spelling of 'no fixtures, only testInfo'.
+  // eslint-disable-next-line no-empty-pattern
   test.beforeEach(async ({}, testInfo) => {
     tenant = await createGrowthTenant(`campaign-${testInfo.project.name}`, ['OWNER']);
     await seedInactiveAudience(tenant);

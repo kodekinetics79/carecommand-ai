@@ -70,6 +70,9 @@ async function expectNoKpiFigures(page: Page) {
 test.describe('growth surfaces render only honest states', () => {
   let tenant: GrowthTenant;
 
+  // Playwright resolves fixtures by parsing this destructuring pattern; the
+  // empty pattern is its required spelling of 'no fixtures, only testInfo'.
+  // eslint-disable-next-line no-empty-pattern
   test.beforeAll(async ({}, testInfo) => {
     // Deliberately a tenant with NO growth data: phase 3 asserts that a truly
     // empty workspace produces guidance, not blanks — and phases 1 and 2 never

@@ -23,6 +23,9 @@ const RETIRED_PATHS = ['/campaigner', '/reactivation'];
 test.describe('growth navigation and retired campaign paths', () => {
   let tenant: GrowthTenant;
 
+  // Playwright resolves fixtures by parsing this destructuring pattern; the
+  // empty pattern is its required spelling of 'no fixtures, only testInfo'.
+  // eslint-disable-next-line no-empty-pattern
   test.beforeAll(async ({}, testInfo) => {
     tenant = await createGrowthTenant(`nav-${testInfo.project.name}`, ['OWNER', 'PROVIDER']);
   });

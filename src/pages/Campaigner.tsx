@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import {
   AlertCircle, AlertTriangle, Ban, CalendarCheck, CheckCircle2, Filter, HelpCircle, Loader2, Megaphone, Pause,
@@ -102,9 +102,11 @@ export default function Campaigner() {
   // answer the server gave, the pane makes no freshness claim, and every KPI
   // figure on the page stays gated on the live resource state exactly as
   // before. When the reload resolves, selection re-derives from fresh data.
-  const lastReceivedRecords = useRef<Campaign[] | null>(null);
-  if (campaignRecords) lastReceivedRecords.current = campaignRecords;
-  const paneRecords = campaignRecords ?? lastReceivedRecords.current;
+  // React's sanctioned previous-value pattern: state adjusted during render,
+  // never a ref read in render (the react-compiler lint rule rejects that).
+  const [lastReceivedRecords, setLastReceivedRecords] = useState<Campaign[] | null>(null);
+  if (campaignRecords && campaignRecords !== lastReceivedRecords) setLastReceivedRecords(campaignRecords);
+  const paneRecords = campaignRecords ?? lastReceivedRecords;
   const selected = paneRecords
     ? paneRecords.find(row => row.id === chosenId) ?? paneRecords[0] ?? null
     : null;
