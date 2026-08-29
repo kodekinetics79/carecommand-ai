@@ -45,7 +45,9 @@ describe('independent content QA challenge', () => {
     expect(portal).toContain('Open payment page');
     expect(portal).not.toContain('Secure payment link not ready');
     expect(autopilot).toContain('Configured execution level');
-    expect(autopilot).toContain('does not prove unattended execution');
+    // Reworded, same invariant: the configured level is a setting, never
+    // evidence of unattended execution.
+    expect(autopilot).toContain('not evidence that anything has run unattended');
     expect(autopilot).not.toContain('Configured autonomy level');
   });
 
@@ -70,8 +72,16 @@ describe('independent content QA challenge', () => {
     expect(commandDeck).not.toContain('Launch Campaign');
     expect(dashboard).toContain('associated-value fields; causation not established');
     expect(campaigns).toContain('Create campaign draft');
-    expect(campaigns).toContain('Recorded associated value');
-    expect(campaigns).not.toContain('Attributed value');
+    // This pin has legitimately INVERTED. It banned "attributed" when no
+    // attribution machinery existed, so "associated" was the honest hedge.
+    // Attribution is now a real evidence chain — delivery → booking → payment,
+    // rolled up by a database trigger no caller can override — so the panel may
+    // and should say "Attributed revenue", and the guarded invariant moves to
+    // the null-vs-value honesty: an absent payment renders its absence, never
+    // a fabricated figure.
+    expect(campaigns).toContain('Attributed revenue');
+    expect(campaigns).toContain('No attributed payment yet');
+    expect(campaigns).not.toContain('Recorded associated value');
     expect(revenue).toContain('Values do not establish causal attribution.');
     expect(revenue).toContain('not an attribution or reconciliation report');
     expect(revenue).toContain('Open opportunities');
