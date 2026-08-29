@@ -2,6 +2,7 @@ import { db } from '../db';
 import type { Prisma } from '../../generated/prisma/client';
 import { forEachActiveJobTenant } from '../jobTenantResolver';
 import { severityRank } from '../monitoring';
+import { MONITORING_ALERT_SOURCE } from './alertInbox';
 import {
   invalidateRpmProviderSignoff,
   lockRpmEvidenceForDevice,
@@ -62,6 +63,7 @@ async function queueStaffNotification(
       recipientUserId: recipient?.id ?? null,
       recipientLabel: recipient?.displayName ?? 'unassigned clinical safety queue',
       channel: 'in_app',
+      source: MONITORING_ALERT_SOURCE,
       status: 'queued',
       attempts: 0,
       consentChecked: true,

@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import type { Prisma } from '../../generated/prisma/client';
+import { DEFAULT_RPM_TIME_ZONE, resolveRequestedMonth, zonedDateKey } from './rpmPeriod';
 
-export const RPM_EVIDENCE_VERSION = 'rpm-readiness-evidence-v4';
+export const RPM_EVIDENCE_VERSION = 'rpm-readiness-evidence-v5';
 export const RPM_SIGNOFF_ATTESTATION_REVISION = 'rpm-provider-attestation-v1';
 
 /**
@@ -27,12 +28,16 @@ export function isLiveInteractiveModality(modality: string | null | undefined): 
 }
 
 export interface RpmPeriod {
-  /** Inclusive immutable UTC calendar-month billing boundary. */
+  /** Inclusive boundary: local midnight on the 1st, as an absolute instant. */
   start: Date;
-  /** Exclusive immutable UTC calendar-month billing boundary. */
+  /** Exclusive boundary: local midnight on the 1st of the next month. */
   end: Date;
-  /** Current evidence cutoff within the fixed billing period. */
+  /** Evidence cutoff within the period — now, or the period end if it closed. */
   asOf: Date;
+  /** The zone the month and its days are reckoned in. */
+  timeZone: string;
+  /** True once the period has ended, so it can be billed rather than watched. */
+  closed: boolean;
 }
 
 export interface RpmEvidenceSnapshot {
@@ -52,12 +57,23 @@ export interface RpmEvidenceSnapshot {
   deviceExceptions: Array<{ reason: string; count: number }>;
 }
 
-export function rpmPeriodBounds(now = new Date()): RpmPeriod {
-  const requestedAsOf = new Date(now);
-  const start = new Date(Date.UTC(requestedAsOf.getUTCFullYear(), requestedAsOf.getUTCMonth(), 1));
-  const end = new Date(Date.UTC(requestedAsOf.getUTCFullYear(), requestedAsOf.getUTCMonth() + 1, 1));
-  const asOf = new Date(Math.min(requestedAsOf.getTime(), end.getTime() - 1));
-  return { start, end, asOf };
+/**
+ * The billing period, reckoned in the clinic's own zone.
+ *
+ * `periodStart` addresses a month that has already closed — billing happens
+ * after a period ends, and every call site used to compute the CURRENT month,
+ * so on the 1st a clinic could no longer see, let alone attest, the month it
+ * was about to bill. Any instant inside the intended month is accepted and
+ * normalised, so a caller cannot address half a month.
+ */
+export function rpmPeriodBounds(
+  now = new Date(),
+  timeZone: string = DEFAULT_RPM_TIME_ZONE,
+  periodStart?: Date,
+): RpmPeriod {
+  const { start, end } = resolveRequestedMonth(periodStart, now, timeZone);
+  const asOf = new Date(Math.min(now.getTime(), end.getTime() - 1));
+  return { start, end, asOf, timeZone, closed: now.getTime() >= end.getTime() };
 }
 
 export async function lockRpmEvidence(
@@ -196,7 +212,10 @@ export async function buildRpmEvidenceSnapshot(
   const deviceExceptions = [...exceptionCounts.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([reason, count]) => ({ reason, count }));
-  const readingDays = new Set(qualifyingReadings.map(reading => reading.capturedAt.toISOString().slice(0, 10))).size;
+  // Bucket by the LOCAL calendar date. UTC bucketing split one local day that
+  // straddled UTC midnight into two device-days, so eight local days of
+  // transmission could satisfy a sixteen-day CMS threshold.
+  const readingDays = new Set(qualifyingReadings.map(reading => zonedDateKey(reading.capturedAt, period.timeZone))).size;
   // Review totals are derived exclusively from append-only audit evidence.
   // Mutable RPMBillingReadiness totals are only a display cache and can never
   // satisfy the provider-signoff gate. Minutes are recalculated from the
@@ -254,7 +273,8 @@ export async function buildRpmEvidenceSnapshot(
     version: RPM_EVIDENCE_VERSION,
     tenantId,
     patientId,
-    periodSemantics: 'utc-calendar-month',
+    periodSemantics: 'local-calendar-month',
+    periodTimeZone: period.timeZone,
     periodStart: period.start,
     periodEndExclusive: period.end,
     evidenceAsOf,
