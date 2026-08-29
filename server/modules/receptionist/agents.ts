@@ -4,7 +4,7 @@ import { db } from '../../lib/db';
 import { env } from '../../config/env';
 import { runWithTenantContext } from '../../lib/tenantContext';
 import { evaluateRetellAgentReadiness, isValidRetellVersionTag, probeRetellAgent, RETELL_AGENT_VERIFICATION_TTL_MS, type RetellAgentSnapshot } from '../../lib/retell';
-import { Prisma } from '../../generated/prisma/client';
+import { Prisma, type ReceptionistAgent } from '../../generated/prisma/client';
 import { uuid, idParam, writeRoles, isReceptionistDestinationConflict, lockReceptionistConfiguration, auditReceptionistMutation } from './shared';
 
 const providerAgentIdInput = z.string().trim().regex(/^[A-Za-z0-9_-]{1,128}$/).optional().nullable();
@@ -49,6 +49,27 @@ function providerIntakeEvidenceFailure(snapshot: RetellAgentSnapshot): string | 
   }
   if (snapshot.toolCallStrictMode !== true) return 'provider_intake_contract_not_strict';
   return null;
+}
+
+/** Thrown inside the verification transaction so the update rolls back and the route answers 409 with the current row. */
+class VerifyConflict extends Error {
+  constructor(readonly code: string, message: string, readonly agent: ReceptionistAgent) {
+    super(message);
+    this.name = 'VerifyConflict';
+  }
+}
+
+function providerUnavailableMessage(code: string): string {
+  if (code === 'provider_response_engine_unavailable') {
+    return 'Retell answered, but its response engine could not be read, so the deployment could not be verified. No verified state was changed; try again in a moment.';
+  }
+  if (code === 'unauthorized') {
+    return 'Retell rejected the server API key, so the deployment could not be verified. Check RETELL_API_KEY on the server.';
+  }
+  if (code === 'not_configured' || code === 'setup_required') {
+    return 'Retell is not configured on the server, so the deployment could not be verified. Set RETELL_API_KEY on the server.';
+  }
+  return `Retell could not be reached (${code.replaceAll('_', ' ')}), so the deployment could not be verified. No verified state was changed; try again in a moment.`;
 }
 
 export const agentRoutes: FastifyPluginAsync = async app => {
@@ -168,7 +189,13 @@ export const agentRoutes: FastifyPluginAsync = async app => {
     const { id } = idParam.parse(request.params);
     const before = await db.receptionistAgent.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!before) throw app.httpErrors.notFound('Agent not found');
-    if (!before.providerAgentId) throw app.httpErrors.conflict('Link a Retell agent before verification.');
+    // Every non-2xx this route produces carries `{ code, message, agent }` so
+    // Studio can show the real cause next to the durable attempt state. The
+    // agent row is also spread at the top level for callers that read the
+    // row straight off the body.
+    const verifyFailure = (status: number, code: string, message: string, agent: ReceptionistAgent) =>
+      reply.code(status).send({ ...agent, code, message, agent });
+    if (!before.providerAgentId) return verifyFailure(409, 'provider_agent_unlinked', 'Link a Retell agent before verification.', before);
 
     const attemptedAt = new Date();
     const probe = await probeRetellAgent(before.providerAgentId, before.providerVersionTag);
@@ -187,7 +214,7 @@ export const agentRoutes: FastifyPluginAsync = async app => {
         if (current.providerConfigRevision !== before.providerConfigRevision
           || current.providerAgentId !== before.providerAgentId
           || current.providerVersionTag !== before.providerVersionTag) {
-          throw app.httpErrors.conflict('Agent configuration changed while provider verification was in progress. Retry verification.');
+          throw new VerifyConflict('provider_verification_stale', 'Agent configuration changed while provider verification was in progress. Retry verification.', current);
         }
 
         const success = probe.ok && !readinessFailure && !intakeEvidenceFailure;
@@ -269,18 +296,16 @@ export const agentRoutes: FastifyPluginAsync = async app => {
         return { row, driftBlocked: false };
       });
       if (updated.driftBlocked) {
-        return reply.code(409).send({
-          ...updated.row,
-          code: 'provider_deployment_drift',
-          message: 'Provider deployment drift detected. Pause active and runnable campaigns before approving the new immutable version.',
-        });
+        return verifyFailure(409, 'provider_deployment_drift', 'Provider deployment drift detected. Pause active and runnable campaigns before approving the new immutable version.', updated.row);
       }
       if ((!probe.ok && !permanentProbeFailure) || intakeEvidenceFailure === 'provider_response_engine_unavailable') {
-        return reply.code(503).send(updated.row);
+        const code = safeError ?? 'provider_unavailable';
+        return verifyFailure(503, code, providerUnavailableMessage(code), updated.row);
       }
       return reply.code(200).send(updated.row);
     } catch (error) {
-      if (isReceptionistDestinationConflict(error)) throw app.httpErrors.conflict('This active provider deployment is already assigned to another agent.');
+      if (error instanceof VerifyConflict) return verifyFailure(409, error.code, error.message, error.agent);
+      if (isReceptionistDestinationConflict(error)) return verifyFailure(409, 'provider_destination_conflict', 'This active provider deployment is already assigned to another agent.', before);
       throw error;
     }
   });

@@ -778,27 +778,48 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
   });
 
   // ----- Outbound campaigns ----------------------------------------------
-  const campaignCreate = z.object({
+  // The Studio form binds every optional field to a text input, so "unset"
+  // arrives as '' as often as null. Treat '' as null for optional ids and
+  // strings instead of answering 400 "Invalid UUID" for a field the user
+  // never touched.
+  const emptyToNull = <T extends z.ZodTypeAny>(schema: T) => z.preprocess(value => (value === '' ? null : value), schema);
+  const optionalUuid = emptyToNull(uuid.optional().nullable());
+  const optionalText = (max: number, min = 0) => emptyToNull((min > 0 ? z.string().trim().min(min) : z.string()).max(max).optional().nullable());
+  const optionalQuietHour = emptyToNull(z.string().trim().regex(STRICT_HH_MM).optional().nullable());
+  const optionalEnum = <T extends readonly [string, ...string[]]>(values: T) => emptyToNull(z.enum(values).optional().nullable());
+  const REQUIRED_FIELDS_DEFAULT: Array<(typeof REQUIRED_FIELD_KEYS)[number]> = ['firstName', 'lastName', 'phone'];
+  const bookingModeEnum = z.enum(['APPOINTMENT_REQUEST_ONLY', 'DIRECT_BOOKING_IF_SLOT_AVAILABLE']);
+  const maxRetryAttemptsInput = z.number().int().min(0).max(10);
+  // No `.default()` anywhere on the base: Zod 4's `.partial()` keeps defaults,
+  // so a one-field PATCH built from a defaulted schema would silently re-apply
+  // `requiredFields`/`bookingMode`/`maxRetryAttempts` and trip the authority
+  // immutability check on a RUNNING campaign (A6-F01).
+  const campaignBase = z.object({
     clinicId: uuid,
-    agentId: uuid.optional().nullable(),
-    receptionistCampaignId: uuid.optional().nullable(),
+    agentId: optionalUuid,
+    receptionistCampaignId: optionalUuid,
     name: z.string().trim().min(2).max(160),
     script: z.string().trim().min(2).max(4000),
-    purpose: z.enum(OUTBOUND_PURPOSES).optional().nullable(),
-    legalBasis: z.enum(OUTBOUND_LEGAL_BASES).optional().nullable(),
-    policyVersion: z.string().trim().min(3).max(80).optional().nullable(),
-    requiredFields: z.array(z.enum(REQUIRED_FIELD_KEYS)).default(['firstName', 'lastName', 'phone']),
+    purpose: optionalEnum(OUTBOUND_PURPOSES),
+    legalBasis: optionalEnum(OUTBOUND_LEGAL_BASES),
+    policyVersion: optionalText(80, 3),
+    requiredFields: z.array(z.enum(REQUIRED_FIELD_KEYS)),
     customQuestions: z.any().optional(),
-    consentText: z.string().max(2000).optional().nullable(),
-    humanHandoffInstruction: z.string().max(1000).optional().nullable(),
-    bookingMode: z.enum(['APPOINTMENT_REQUEST_ONLY', 'DIRECT_BOOKING_IF_SLOT_AVAILABLE']).default('APPOINTMENT_REQUEST_ONLY'),
-    defaultBranchId: uuid.optional().nullable(),
-    defaultService: z.string().max(160).optional().nullable(),
-    quietHoursStart: z.string().trim().regex(STRICT_HH_MM).optional().nullable(),
-    quietHoursEnd: z.string().trim().regex(STRICT_HH_MM).optional().nullable(),
-    maxRetryAttempts: z.number().int().min(0).max(10).default(1),
+    consentText: optionalText(2000),
+    humanHandoffInstruction: optionalText(1000),
+    bookingMode: bookingModeEnum,
+    defaultBranchId: optionalUuid,
+    defaultService: optionalText(160),
+    quietHoursStart: optionalQuietHour,
+    quietHoursEnd: optionalQuietHour,
+    maxRetryAttempts: maxRetryAttemptsInput,
   });
-  const campaignUpdate = campaignCreate.partial().omit({ clinicId: true }).extend({
+  const campaignCreate = campaignBase.extend({
+    requiredFields: z.array(z.enum(REQUIRED_FIELD_KEYS)).default(REQUIRED_FIELDS_DEFAULT),
+    bookingMode: bookingModeEnum.default('APPOINTMENT_REQUEST_ONLY'),
+    maxRetryAttempts: maxRetryAttemptsInput.default(1),
+  });
+  const campaignUpdate = campaignBase.omit({ clinicId: true }).partial().extend({
     status: z.enum(['DRAFT', 'SCHEDULED', 'RUNNING', 'PAUSED', 'COMPLETED', 'FAILED']).optional(),
   });
 

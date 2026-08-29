@@ -197,6 +197,7 @@ async function createCampaign(
     policyVersion?: string;
     quietHoursStart?: string | null;
     quietHoursEnd?: string | null;
+    requiredFields?: string[];
   } = {},
 ) {
   const defaultQuietHours = quietWindowOutsideNow();
@@ -209,7 +210,7 @@ async function createCampaign(
       agentId: tenant.agentId,
       name: options.name ?? `Outbound ${randomUUID().slice(0, 8)}`,
       script: 'Call the patient about care coordination.',
-      requiredFields: ['firstName', 'lastName', 'phone'],
+      requiredFields: options.requiredFields ?? ['firstName', 'lastName', 'phone'],
       bookingMode: options.bookingMode ?? 'APPOINTMENT_REQUEST_ONLY',
       receptionistCampaignId: options.receptionistCampaignId,
       defaultBranchId: options.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE' ? tenant.branchId : undefined,
@@ -1647,6 +1648,85 @@ describe('AI receptionist outbound authority and target integrity', () => {
     });
     expect(mutated.statusCode).toBe(409);
     expect(mutated.json()).toMatchObject({ message: expect.stringContaining('outbound_authority_immutable') });
+  });
+
+  it('pauses a RUNNING direct-booking campaign with custom requiredFields through a one-field PATCH without re-applying create defaults', async () => {
+    const tenant = await makeTenant();
+    const authority = await createDirectAuthority(tenant);
+    const requiredFields = ['firstName', 'lastName', 'phone', 'email'];
+    const campaignId = await createCampaign(tenant, {
+      bookingMode: 'DIRECT_BOOKING_IF_SLOT_AVAILABLE',
+      receptionistCampaignId: authority.id,
+      requiredFields,
+      maxRetryAttempts: 3,
+      status: 'RUNNING',
+    });
+    const before = await db.receptionistOutboundCampaign.findUniqueOrThrow({ where: { id: campaignId } });
+    expect(before).toMatchObject({ status: 'RUNNING', bookingMode: 'DIRECT_BOOKING_IF_SLOT_AVAILABLE', requiredFields, maxRetryAttempts: 3 });
+    expect(before.authorityApprovedAt).not.toBeNull();
+
+    // Zod 4 `.partial()` keeps `.default()`: a PATCH schema derived from the
+    // create schema used to fill requiredFields / bookingMode / maxRetryAttempts
+    // back in, read that as an authority change, and answer 409
+    // outbound_authority_immutable to a plain pause (A6-F01).
+    const paused = await app.inject({
+      method: 'PATCH',
+      url: `/v1/receptionist/outbound-campaigns/${campaignId}`,
+      headers: auth(tenant),
+      payload: { status: 'PAUSED' },
+    });
+    expect(paused.statusCode).toBe(200);
+    expect(paused.json()).toMatchObject({
+      status: 'PAUSED',
+      bookingMode: 'DIRECT_BOOKING_IF_SLOT_AVAILABLE',
+      requiredFields,
+      maxRetryAttempts: 3,
+      receptionistCampaignId: authority.id,
+      authorityFingerprint: before.authorityFingerprint,
+    });
+    expect(new Date(paused.json().authorityApprovedAt).toISOString()).toBe(before.authorityApprovedAt!.toISOString());
+  });
+
+  it('accepts empty strings for optional ids and policy fields as unset on create (M48)', async () => {
+    const tenant = await makeTenant();
+    const created = await app.inject({
+      method: 'POST',
+      url: '/v1/receptionist/outbound-campaigns',
+      headers: auth(tenant),
+      payload: {
+        clinicId: tenant.clinicId,
+        agentId: '',
+        receptionistCampaignId: '',
+        name: 'Request-only draft',
+        script: 'Call the patient about care coordination.',
+        purpose: '',
+        legalBasis: '',
+        policyVersion: '',
+        defaultBranchId: '',
+        defaultService: '',
+        consentText: '',
+        humanHandoffInstruction: '',
+        quietHoursStart: '',
+        quietHoursEnd: '',
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    expect(created.json()).toMatchObject({
+      status: 'DRAFT', bookingMode: 'APPOINTMENT_REQUEST_ONLY', requiredFields: ['firstName', 'lastName', 'phone'], maxRetryAttempts: 1,
+      agentId: null, receptionistCampaignId: null, purpose: null, legalBasis: null, policyVersion: null,
+      defaultBranchId: null, defaultService: null, quietHoursStart: null, quietHoursEnd: null,
+    });
+
+    // A real validation failure still names its field.
+    const invalid = await app.inject({
+      method: 'POST',
+      url: '/v1/receptionist/outbound-campaigns',
+      headers: auth(tenant),
+      payload: { clinicId: tenant.clinicId, name: 'x', script: 'Call the patient.', policyVersion: 'ab' },
+    });
+    expect(invalid.statusCode).toBe(400);
+    expect(invalid.json().message).toMatch(/^name: /);
+    expect(Object.keys(invalid.json().details.fieldErrors).sort()).toEqual(['name', 'policyVersion']);
   });
 
   it('freezes attested direct-booking authority after approval', async () => {

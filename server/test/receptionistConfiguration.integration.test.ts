@@ -622,6 +622,12 @@ describe('AI receptionist trusted configuration', () => {
       const unavailable = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agent.id}/verify-provider`, headers: auth(t, 'OWNER') });
       expect(unavailable.statusCode).toBe(503);
       expect(unavailable.json()).toMatchObject({ providerStatus: 'VERIFIED', providerVersion: 4, providerLastAttemptStatus: 'FAILED', providerLastErrorCode: 'provider_unavailable' });
+      // Every non-2xx from this route names its cause: `{ code, message, agent }` (C1 / M20).
+      expect(unavailable.json()).toMatchObject({
+        code: 'provider_unavailable',
+        message: expect.stringMatching(/could not be reached|could not be verified/),
+        agent: { id: agent.id, providerStatus: 'VERIFIED', providerLastErrorCode: 'provider_unavailable' },
+      });
 
       vi.stubGlobal('fetch', vi.fn(async url => new Response(
         String(url).includes('/get-retell-llm/')
@@ -674,6 +680,7 @@ describe('AI receptionist trusted configuration', () => {
       release();
       const stale = await verifyRequest;
       expect(stale.statusCode).toBe(409);
+      expect(stale.json()).toMatchObject({ code: 'provider_verification_stale', message: expect.stringContaining('changed while provider verification'), agent: { id: agent.id, providerAgentId: 'agent_relinked' } });
       expect(await db.receptionistAgent.findUniqueOrThrow({ where: { id: agent.id } })).toMatchObject({
         providerAgentId: 'agent_relinked', providerStatus: 'UNVERIFIED', providerVersion: null, providerConfigRevision: 2,
       });
@@ -751,6 +758,63 @@ describe('AI receptionist trusted configuration', () => {
     });
     expect(unattestedStudio.statusCode).toBe(409);
     expect(unattestedStudio.json().message).toContain('intake_schema_unattested');
+  });
+
+  it('surfaces every configuration error with its real cause: field-named 400s, structured verify failures, 409 on an unbuildable prompt', async () => {
+    const t = await tenant();
+
+    // Zod 400: the message names the first failing field and the map is keyed by full path.
+    const badPhone = await createClinic(t, { phone: '555-0100', humanFallbackNumber: '(415) 555-0100 ext 4' });
+    expect(badPhone.statusCode).toBe(400);
+    expect(badPhone.json()).toMatchObject({
+      error: 'VALIDATION_ERROR',
+      message: 'phone: Phone must include country code in E.164 format',
+      details: {
+        fieldErrors: {
+          phone: ['Phone must include country code in E.164 format'],
+          humanFallbackNumber: ['Phone must include country code in E.164 format'],
+        },
+        formErrors: [],
+      },
+    });
+    const nested = await createClinic(t, { workingHours: { monday: { open: true, start: '9am', end: '17:00' } } });
+    expect(nested.statusCode).toBe(400);
+    expect(nested.json().message).toMatch(/^workingHours\.monday/);
+    expect(Object.keys(nested.json().details.fieldErrors)[0]).toMatch(/^workingHours\.monday/);
+
+    // verify-provider without a linked agent: 409 with { code, message, agent }.
+    const clinicId = (await createClinic(t, { name: 'Error surfacing clinic' })).json().id as string;
+    const unlinked = await app.inject({
+      method: 'POST', url: '/v1/receptionist/agents', headers: auth(t, 'OWNER'),
+      payload: { clinicId, name: 'Unlinked receptionist' },
+    });
+    expect(unlinked.statusCode).toBe(201);
+    const unlinkedVerify = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${unlinked.json().id}/verify-provider`, headers: auth(t, 'OWNER') });
+    expect(unlinkedVerify.statusCode).toBe(409);
+    expect(unlinkedVerify.json()).toMatchObject({
+      code: 'provider_agent_unlinked',
+      message: 'Link a Retell agent before verification.',
+      agent: { id: unlinked.json().id, providerStatus: 'UNVERIFIED' },
+    });
+
+    // GET /campaigns/:id/prompt on an inconsistent configuration is a 409 the operator can act on, not a 500 (M71).
+    const campaign = await app.inject({
+      method: 'POST', url: '/v1/receptionist/campaigns', headers: auth(t, 'OWNER'),
+      payload: {
+        clinicId, name: 'Unresolvable locations', status: 'DRAFT', offerTitle: 'Appointment',
+        offerDescription: 'Schedule care', offerScript: 'Schedule now', appointmentType: 'Consultation',
+      },
+    });
+    expect(campaign.statusCode).toBe(201);
+    await db.receptionistCampaign.update({ where: { id: campaign.json().id }, data: { eligibleLocationIds: [randomUUID()] } });
+    for (const url of [`/v1/receptionist/campaigns/${campaign.json().id}/prompt`, `/v1/receptionist/campaigns/${campaign.json().id}/retell-config`]) {
+      const response = await app.inject({ method: 'GET', url, headers: auth(t, 'OWNER') });
+      expect(response.statusCode).toBe(409);
+      expect(response.json()).toMatchObject({
+        error: 'invalid_receptionist_configuration',
+        message: expect.stringContaining('eligible location mapping unresolved'),
+      });
+    }
   });
 
   it('rolls provider verification state back when its mandatory audit insert fails', async () => {

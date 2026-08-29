@@ -75,7 +75,11 @@ async function rawApiRequest<T>(path: string, init?: RequestInit, retryOnRefresh
     let message = humanApiMessage(response.status);
     let code: string | undefined;
     const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+    // errors.ts sends the code as `error`; a route that answers with its own
+    // structured body (the verify-provider route's `{ code, message, agent }`)
+    // sends it as `code`. Accept both so callers can branch either way.
     if (typeof body?.error === 'string') code = body.error;
+    else if (typeof body?.code === 'string') code = body.code;
     // An access denial is a fact about this account, not a fault to report. The
     // API answers with the permission key it enforced ("…required permission
     // (billing:read)…") or Fastify's bare "Forbidden"; neither is language for a

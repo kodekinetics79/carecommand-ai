@@ -1,6 +1,30 @@
+/**
+ * Human label for an enum-ish value.
+ *
+ *   SCREAMING_SNAKE  -> "Sentence case"   (PENDING_REVIEW -> "Pending review")
+ *   snake_case       -> "Sentence case"   (transport_ambiguous -> "Transport ambiguous")
+ *   camelCase        -> "Sentence case"   (directBooking -> "Direct booking")
+ *   Mixed-case text  -> left as written   ("Warm and professional", "Retell LLM")
+ *
+ * The old implementation lower-cased everything, which mangled values that
+ * were already human text or carried acronyms (M71).
+ */
 export function formatEnumLabel(value: string): string {
-  const words = value.trim().replaceAll('_', ' ').toLowerCase();
-  return words ? words[0].toUpperCase() + words.slice(1) : 'Unknown';
+  const trimmed = value.trim();
+  if (!trimmed) return 'Unknown';
+  const isScreaming = /^[A-Z0-9]+(?:[_\- ][A-Z0-9]+)*$/.test(trimmed);
+  const isSnake = /^[a-z0-9]+(?:_[a-z0-9]+)+$/.test(trimmed) || /^[a-z0-9]+$/.test(trimmed);
+  const isCamel = /^[a-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+$/.test(trimmed);
+  let words: string;
+  if (isScreaming || isSnake) {
+    words = trimmed.replaceAll('_', ' ').toLowerCase();
+  } else if (isCamel) {
+    words = trimmed.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase();
+  } else {
+    // Already mixed case: only normalise separators, never re-case letters.
+    words = trimmed.replaceAll('_', ' ');
+  }
+  return words[0].toUpperCase() + words.slice(1);
 }
 
 export function maskedPhone(value: string | null | undefined): string {

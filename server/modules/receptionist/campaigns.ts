@@ -343,24 +343,53 @@ export const campaignRoutes: FastifyPluginAsync = async app => {
   });
 };
 
+const CONFIGURATION_ERROR_PREFIX = 'invalid_receptionist_configuration';
+
+/**
+ * A prompt that cannot be generated because the campaign's own configuration
+ * is inconsistent (an eligible location no longer maps to a branch, for
+ * example) is a state conflict the operator can fix, not a server fault.
+ * Surface it as 409 with the reason instead of a masked 500 (M71).
+ */
+function isConfigurationError(error: unknown): error is Error {
+  return error instanceof Error && error.message.startsWith(CONFIGURATION_ERROR_PREFIX);
+}
+
+function configurationConflict(app: Parameters<FastifyPluginAsync>[0], error: Error) {
+  const reason = error.message.slice(CONFIGURATION_ERROR_PREFIX.length + 1) || 'unknown';
+  const conflict = app.httpErrors.conflict(`Receptionist configuration is invalid: ${reason.replaceAll('_', ' ')}. Fix the campaign's locations and agent before generating the prompt.`);
+  (conflict as Error & { code?: string }).code = CONFIGURATION_ERROR_PREFIX;
+  return conflict;
+}
+
 export const campaignExportRoutes: FastifyPluginAsync = async app => {
   // ===== Prompt generation + RetellAI export ==============================
   app.get('/campaigns/:id/prompt', { preHandler: writeRoles }, async request => {
     const { id } = idParam.parse(request.params);
     const campaign = await loadCampaign(request.auth.tenantId, id);
     if (!campaign) throw app.httpErrors.notFound('Campaign not found');
-    const config = toPromptConfig(campaign as unknown as CampaignWithRelations);
-    return {
-      systemPrompt: generateSystemPrompt(config),
-      samples: generateSamples(config),
-    };
+    try {
+      const config = toPromptConfig(campaign as unknown as CampaignWithRelations);
+      return {
+        systemPrompt: generateSystemPrompt(config),
+        samples: generateSamples(config),
+      };
+    } catch (error) {
+      if (isConfigurationError(error)) throw configurationConflict(app, error);
+      throw error;
+    }
   });
 
   app.get('/campaigns/:id/retell-config', { preHandler: writeRoles }, async request => {
     const { id } = idParam.parse(request.params);
     const campaign = await loadCampaign(request.auth.tenantId, id);
     if (!campaign) throw app.httpErrors.notFound('Campaign not found');
-    const config = toPromptConfig(campaign as unknown as CampaignWithRelations);
-    return buildRetellConfig(config, { webhookBaseUrl: env.PUBLIC_API_URL });
+    try {
+      const config = toPromptConfig(campaign as unknown as CampaignWithRelations);
+      return buildRetellConfig(config, { webhookBaseUrl: env.PUBLIC_API_URL });
+    } catch (error) {
+      if (isConfigurationError(error)) throw configurationConflict(app, error);
+      throw error;
+    }
   });
 };
