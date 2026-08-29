@@ -1,14 +1,17 @@
 import { useState } from 'react';
 import { useLocation, useNavigate } from 'react-router';
-import { Sparkles, Zap, ArrowRight, Target, Users, TrendingUp, CheckCircle2, Play, PauseCircle, AlertTriangle } from 'lucide-react';
+import { Sparkles, Zap, ArrowRight, Target, Users, TrendingUp, CheckCircle2, Play, PauseCircle, AlertTriangle, Megaphone, Filter } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ModuleTabs from '../components/ui/ModuleTabs';
 import ProgressBar from '../components/ui/ProgressBar';
+import ResourceSection from '../components/ui/ResourceSection';
+import EmptyStatePremium from '../components/ui/EmptyStatePremium';
 import { formatCurrency } from '../utils/formatters';
-import { useApiResource } from '../hooks/useApiResource';
-import { mapCampaign, type ApiCampaign } from '../lib/apiAdapters';
+import { useResource } from '../hooks/useResource';
+import { receivedData } from '../lib/resourceState';
+import { fetchList, mapCampaign, type ApiCampaign } from '../lib/apiAdapters';
 import { apiRequest } from '../lib/api';
 
 const statusConfig: Record<string, { label: string; color: string; bg: string }> = {
@@ -40,6 +43,13 @@ const channelTabs = [
   { id: 'push', label: 'Push' },
 ];
 
+type CampaignRow = ReturnType<typeof mapCampaign>;
+
+// Module-scope loader: useResource keys a request by the identity of its
+// source, so this must not be re-created on every render.
+const loadCampaigns = async (signal: AbortSignal): Promise<CampaignRow[]> =>
+  (await fetchList<ApiCampaign>('/v1/campaigns?limit=100', signal)).map(mapCampaign);
+
 export default function Campaigner() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -47,15 +57,18 @@ export default function Campaigner() {
   const [selectedGoal, setSelectedGoal] = useState<string | null>(campaignContext ? 'winback' : null);
   const [previewChannel, setPreviewChannel] = useState('whatsapp');
   const [campaignFilter, setCampaignFilter] = useState('all');
-  const { data: campaignRecords, source, error, reload } = useApiResource<ApiCampaign, ReturnType<typeof mapCampaign>>('/v1/campaigns?limit=100', [], mapCampaign);
+  const campaigns = useResource<CampaignRow[]>(loadCampaigns);
   const [pendingId, setPendingId] = useState<string | null>(null);
-  const loadError = error;
+
+  // Only ever non-null once a response arrived. Nothing below may print a
+  // figure, a rate or a count from anything else.
+  const campaignRecords = receivedData(campaigns.state);
 
   async function pauseCampaign(id: string) {
     setPendingId(id);
     try {
       await apiRequest(`/v1/campaigns/${id}`, { method: 'PATCH', body: JSON.stringify({ status: 'PAUSED' }) });
-      reload();
+      campaigns.reload();
     } finally {
       setPendingId(null);
     }
@@ -64,48 +77,67 @@ export default function Campaigner() {
   function openApprovedCampaignWorkflow() {
     navigate('/reactivation', { state: selectedGoal ? { goal: selectedGoal } : undefined });
   }
-  const campaignFilterTabs = [
+
+  const campaignFilterTabs = campaignRecords && [
     { id: 'all', label: 'All', count: campaignRecords.length },
     { id: 'active', label: 'Active', count: campaignRecords.filter(c => c.status === 'active').length },
     { id: 'draft', label: 'Draft', count: campaignRecords.filter(c => c.status === 'draft').length },
     { id: 'completed', label: 'Completed', count: campaignRecords.filter(c => c.status === 'completed').length },
   ];
-  const totalRevenue = campaignRecords.reduce((sum, campaign) => sum + campaign.revenue, 0);
-  const totalBooked = campaignRecords.reduce((sum, campaign) => sum + campaign.booked, 0);
-  const totalSent = campaignRecords.reduce((sum, campaign) => sum + campaign.sent, 0);
-  const recordedConversionRate = totalSent > 0 ? Math.round((totalBooked / totalSent) * 1000) / 10 : null;
-  const activeCount = campaignRecords.filter(campaign => campaign.status === 'active').length;
-
-  const filteredCampaigns = campaignFilter === 'all' ? campaignRecords : campaignRecords.filter(c => c.status === campaignFilter);
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Campaign Planner & Portfolio"
         subtitle="Review stored campaign metrics and prepare content; approved audience and dispatch actions live in the Reactivation Engine."
-        badge={loadError ? 'Data unavailable' : `${activeCount} Active · ${source === 'live' ? 'Stored campaign records' : 'Loading'}`}
-        badgeColor={loadError ? 'red' : 'emerald'}
+        // The badge is a claim about the portfolio, so it waits for the response
+        // rather than counting an empty in-flight list as "0 Active".
+        badge={
+          campaigns.state.status === 'loading' ? 'Loading campaigns'
+            : campaigns.state.status === 'error' ? 'Data unavailable'
+              : `${campaignRecords?.filter(c => c.status === 'active').length ?? 0} active · stored campaign records`
+        }
+        badgeColor={campaigns.state.status === 'error' ? 'red' : campaigns.state.status === 'loading' ? 'blue' : 'emerald'}
         actions={
           <div className="flex gap-2">
             <button type="button" onClick={() => { setSelectedGoal('winback'); window.scrollTo({ top: 320, behavior: 'smooth' }); }} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
-              <Sparkles className="w-4 h-4" /> Open Campaign Wizard
+              <Sparkles className="w-4 h-4" /> Choose a campaign goal
             </button>
           </div>
         }
       />
 
-      {loadError && (
-        <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          Campaign records could not be loaded from the clinic service: {loadError}
-        </div>
-      )}
-
-      {/* KPIs */}
+      {/* KPIs. The tiles are aggregates of the whole portfolio, so they live
+          behind one resolved state: a workspace with no campaigns really does
+          have $0 attributed, but a request that has not answered does not. */}
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Attributed Revenue" value={loadError ? 'Unavailable' : formatCurrency(totalRevenue)} subtitle={loadError ? 'Campaign records did not load' : 'Stored campaign attribution'} icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Recorded Bookings" value={loadError ? 'Unavailable' : totalBooked} subtitle={loadError ? 'Campaign records did not load' : 'Stored campaign outcomes'} icon={<CheckCircle2 className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Active Campaigns" value={loadError ? 'Unavailable' : activeCount} subtitle={loadError ? 'Campaign records did not load' : 'Currently running'} icon={<Play className="w-4 h-4" />} accent="violet" />
-        <StatCard title="Booking / Accepted" value={loadError ? 'Unavailable' : recordedConversionRate === null ? '—' : `${recordedConversionRate}%`} subtitle={loadError ? 'Campaign records did not load' : 'Bookings per provider-accepted request'} icon={<Target className="w-4 h-4" />} accent="cyan" />
+        <ResourceSection
+          label="Campaign totals"
+          state={campaigns.state}
+          onRetry={campaigns.reload}
+          className="col-span-2 sm:col-span-4"
+          compact
+          loading={<>{[0, 1, 2, 3].map(i => <div key={i} className="skeleton-line h-24 rounded-2xl" />)}</>}
+          // A campaign-free workspace is a real zero, so the tiles render it.
+          isEmpty={() => false}
+        >
+          {rows => {
+            const totalRevenue = rows.reduce((sum, campaign) => sum + campaign.revenue, 0);
+            const totalBooked = rows.reduce((sum, campaign) => sum + campaign.booked, 0);
+            const totalSent = rows.reduce((sum, campaign) => sum + campaign.sent, 0);
+            const recordedConversionRate = totalSent > 0 ? Math.round((totalBooked / totalSent) * 1000) / 10 : null;
+            return (
+              <>
+                <StatCard title="Attributed Revenue" value={formatCurrency(totalRevenue)} subtitle="Stored campaign attribution" icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
+                <StatCard title="Recorded Bookings" value={totalBooked} subtitle="Stored campaign outcomes" icon={<CheckCircle2 className="w-4 h-4" />} accent="blue" />
+                <StatCard title="Active Campaigns" value={rows.filter(campaign => campaign.status === 'active').length} subtitle="Currently running" icon={<Play className="w-4 h-4" />} accent="violet" />
+                {/* A rate over zero accepted requests is undefined, not 0% —
+                    and the subtitle says which of the two this is. */}
+                <StatCard title="Booking / Accepted" value={recordedConversionRate === null ? '—' : `${recordedConversionRate}%`} subtitle={recordedConversionRate === null ? 'No provider-accepted requests recorded' : 'Bookings per provider-accepted request'} icon={<Target className="w-4 h-4" />} accent="cyan" />
+              </>
+            );
+          }}
+        </ResourceSection>
       </div>
 
       {/* Goal Selector */}
@@ -158,9 +190,37 @@ export default function Campaigner() {
         <div className="space-y-4">
           <BentoCard
             title="Campaign Library"
-            subtitle="All campaigns"
-            headerRight={<ModuleTabs tabs={campaignFilterTabs} activeTab={campaignFilter} onChange={setCampaignFilter} />}
+            subtitle="Stored campaign records, most recent first"
+            // The counts are part of the claim, so the tabs only exist once the
+            // records they count have arrived.
+            headerRight={campaignFilterTabs ? <ModuleTabs tabs={campaignFilterTabs} activeTab={campaignFilter} onChange={setCampaignFilter} ariaLabel="Campaign status" /> : undefined}
           >
+            <ResourceSection
+              label="Campaign library"
+              state={campaigns.state}
+              onRetry={campaigns.reload}
+              lines={3}
+              rowClassName="h-40 rounded-2xl"
+              empty={{
+                icon: <Megaphone className="w-5 h-5" />,
+                title: 'No campaigns recorded yet',
+                description: 'The campaign feed loaded successfully and this workspace has no campaign records. Pick a goal above to start a draft — creating one does not authorize an audience or contact anyone.',
+                cta: { label: 'Choose a campaign goal', onClick: () => { setSelectedGoal('winback'); window.scrollTo({ top: 320, behavior: 'smooth' }); } },
+              }}
+            >
+              {rows => {
+                const filteredCampaigns = campaignFilter === 'all' ? rows : rows.filter(c => c.status === campaignFilter);
+                if (filteredCampaigns.length === 0) {
+                  return (
+                    <EmptyStatePremium
+                      icon={<Filter className="w-5 h-5" />}
+                      title={`No ${campaignFilter} campaigns`}
+                      description={`This workspace has ${rows.length} campaign${rows.length === 1 ? '' : 's'} recorded, and none of them are ${campaignFilter}. Clear the filter to see the rest of the library.`}
+                      cta={{ label: 'Show all campaigns', onClick: () => setCampaignFilter('all') }}
+                    />
+                  );
+                }
+                return (
             <div className="space-y-3">
               {filteredCampaigns.map((c) => {
                 const sc = statusConfig[c.status] ?? statusConfig['draft'];
@@ -237,6 +297,9 @@ export default function Campaigner() {
                 );
               })}
             </div>
+                );
+              }}
+            </ResourceSection>
           </BentoCard>
         </div>
 

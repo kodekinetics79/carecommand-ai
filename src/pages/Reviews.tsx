@@ -1,12 +1,14 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { useNavigate } from 'react-router';
-import { Star, CheckCircle2, Sparkles, ArrowRight, TrendingUp, MessageSquare, ShieldCheck, BellRing } from 'lucide-react';
+import { Star, CheckCircle2, Sparkles, ArrowRight, TrendingUp, MessageSquare, ShieldCheck, BellRing, Inbox } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
-import { useApiResource } from '../hooks/useApiResource';
-import { mapProviderProfile, mapReview, type ApiProviderProfile, type ApiReview } from '../lib/apiAdapters';
+import ResourceSection from '../components/ui/ResourceSection';
+import { useResource } from '../hooks/useResource';
+import { LOADING_STATE, receivedData, type ResourceState } from '../lib/resourceState';
+import { fetchList, mapProviderProfile, mapReview, type ApiProviderProfile, type ApiReview, type ReviewRow } from '../lib/apiAdapters';
 import { apiRequest } from '../lib/api';
 
 interface ApiReputationCase {
@@ -51,69 +53,107 @@ interface ReputationResponse {
   reviewRequests: ApiReviewRequest[];
 }
 
+interface BranchOption { id: string; name: string }
+
+/** The slice this screen actually asks for; every count below is of this slice. */
+const REVIEW_PAGE_SIZE = 100;
+
+// Module-scope loaders: useResource keys a request by the identity of its
+// source, so these must not be re-created on every render.
+const loadReviews = async (signal: AbortSignal): Promise<ReviewRow[]> =>
+  (await fetchList<ApiReview>(`/v1/reviews?limit=${REVIEW_PAGE_SIZE}`, signal)).map(mapReview);
+const loadBranches = (signal: AbortSignal) => fetchList<BranchOption>('/v1/branches?limit=100', signal);
+const loadProviders = async (signal: AbortSignal) =>
+  (await fetchList<ApiProviderProfile>('/v1/providers/overview?limit=100', signal)).map(mapProviderProfile);
+
+/**
+ * Two feeds, one claim.
+ *
+ * A panel that reads from two requests can only speak once both have answered:
+ * pairing a loaded list with a missing one would silently narrow the claim
+ * ("0 reviews at this clinic" when the reviews never arrived). This composes the
+ * shared contract rather than replacing it — the result is an ordinary
+ * ResourceState and goes straight into ResourceSection. Worth lifting into
+ * lib/resourceState.ts the next time that file is open.
+ */
+function combineResourceStates<A, B, R>(
+  a: ResourceState<A>,
+  b: ResourceState<B>,
+  merge: (a: A, b: B) => R,
+): ResourceState<R> {
+  if (a.status === 'error') return a;
+  if (b.status === 'error') return b;
+  if (a.status === 'loading' || b.status === 'loading') return LOADING_STATE;
+  return { status: 'ready', data: merge(a.data, b.data), receivedAt: Math.max(a.receivedAt, b.receivedAt) };
+}
+
+function platformLabel(platform: string) {
+  return platform.trim() || 'Platform not recorded';
+}
+
 export default function Reviews() {
   const navigate = useNavigate();
-  const { data: reviewRecords, source, error: reviewError, reload } = useApiResource<ApiReview, ReturnType<typeof mapReview>>('/v1/reviews?limit=100', [], mapReview);
-  const { data: branchOptions, error: branchError } = useApiResource<{ id: string; name: string }, { id: string; name: string }>('/v1/branches?limit=100', [], row => row);
-  const { data: providerRecords, error: providerError } = useApiResource<ApiProviderProfile, ReturnType<typeof mapProviderProfile>>('/v1/providers/overview?limit=100', [], mapProviderProfile);
-  const [respondingId, setRespondingId] = useState<string | null>(null);
-  const [responseNotice, setResponseNotice] = useState<{ id: string; kind: 'ok' | 'error'; text: string } | null>(null);
+  const reviews = useResource<ReviewRow[]>(loadReviews);
+  const branches = useResource<BranchOption[]>(loadBranches);
+  const providers = useResource<ReturnType<typeof mapProviderProfile>[]>(loadProviders);
+  const reputation = useResource<ReputationResponse>('/v1/reputation?limit=10');
 
-  async function respondToReview(id: string, draft?: string) {
+  const [respondingId, setRespondingId] = useState<string | null>(null);
+  const [editorId, setEditorId] = useState<string | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  // Page-level rather than per-row: recording a response reloads the feed, so a
+  // notice living inside the row would be unmounted before it could be read.
+  const [responseNotice, setResponseNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
+
+  const receivedReputation = receivedData(reputation.state);
+
+  /**
+   * Records the response the member of staff wrote. There is deliberately no
+   * default text: the previous build shipped one canned compliment and filed it
+   * verbatim against every review including one-star ones.
+   */
+  async function respondToReview(id: string) {
+    const response = (drafts[id] ?? '').trim();
+    if (!response) return;
     setRespondingId(id);
     setResponseNotice(null);
     try {
       await apiRequest(`/v1/reviews/${id}/respond`, {
         method: 'PATCH',
-        body: JSON.stringify({ response: draft?.trim() || 'Thank you so much for taking the time to share your feedback — we truly appreciate it.' }),
+        body: JSON.stringify({ response }),
       });
-      reload();
-      setResponseNotice({ id, kind: 'ok', text: 'Response recorded in CareCommand. External delivery is not confirmed here.' });
+      setEditorId(null);
+      setDrafts(current => {
+        const next = { ...current };
+        delete next[id];
+        return next;
+      });
+      reviews.reload();
+      setResponseNotice({ kind: 'ok', text: 'Response recorded in CareCommand. External delivery is not confirmed here.' });
     } catch (error) {
-      setResponseNotice({ id, kind: 'error', text: error instanceof Error ? error.message : 'Unable to record response' });
+      setResponseNotice({ kind: 'error', text: error instanceof Error ? error.message : 'Unable to record response' });
     } finally {
       setRespondingId(null);
     }
   }
-  const [reputation, setReputation] = useState<ReputationResponse>({
-    summary: { unresolvedCases: 0, avgBadReviewRisk: 0, avgNpsScore: 0, pendingReviewRequests: 0 },
-    cases: [],
-    reviewRequests: [],
-  });
-  const [reputationSource, setReputationSource] = useState<'loaded' | 'loading'>('loading');
-  const [reputationError, setReputationError] = useState<string | null>(null);
-  const avgRating = reviewRecords.length > 0 ? (reviewRecords.reduce((sum, review) => sum + review.rating, 0) / reviewRecords.length).toFixed(1) : '0.0';
-  const positiveCount = reviewRecords.filter(review => review.sentiment === 'positive').length;
-  const sentimentPct = reviewRecords.length > 0 ? Math.round((positiveCount / reviewRecords.length) * 100) : 0;
-  const ratingDist = [5, 4, 3, 2, 1].map(rating => ({ star: rating, count: reviewRecords.filter(review => review.rating === rating).length }));
-
-  useEffect(() => {
-    let active = true;
-    apiRequest<ReputationResponse>('/v1/reputation?limit=10')
-      .then(row => {
-        if (!active) return;
-        setReputation(row);
-        setReputationSource('loaded');
-        setReputationError(null);
-      })
-      .catch(error => {
-        if (!active) return;
-        setReputationError(error instanceof Error ? error.message : 'Unable to load reputation data');
-      });
-    return () => { active = false; };
-  }, []);
-
-  const loadError = reviewError || branchError || providerError || reputationError;
-  const reviewMetricsReady = source === 'live' && !reviewError;
-  const reputationMetricsReady = reputationSource === 'loaded' && !reputationError;
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="Reviews & Referrals"
         subtitle="Review feedback, record responses, and open campaign setup for reputation and referral work."
-        badge={loadError ? 'Data unavailable' : source !== 'live' || reputationSource === 'loading' ? 'Loading reviews' : `${reputation.summary.unresolvedCases} need review`}
-        badgeColor={loadError ? 'red' : source !== 'live' || reputationSource === 'loading' ? 'blue' : reputation.summary.unresolvedCases > 0 ? 'amber' : 'emerald'}
+        // "N need review" is a safety claim about open cases, so it waits for
+        // the reputation response instead of counting an unanswered request.
+        badge={
+          reputation.state.status === 'loading' ? 'Loading reputation'
+            : reputation.state.status === 'error' ? 'Data unavailable'
+              : `${receivedReputation?.summary.unresolvedCases ?? 0} need review`
+        }
+        badgeColor={
+          reputation.state.status === 'error' ? 'red'
+            : reputation.state.status === 'loading' ? 'blue'
+              : (receivedReputation?.summary.unresolvedCases ?? 0) > 0 ? 'amber' : 'emerald'
+        }
         actions={
           <button type="button" onClick={() => navigate('/campaigner')} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
             <Sparkles className="w-4 h-4" /> Review campaign setup
@@ -121,169 +161,391 @@ export default function Reviews() {
         }
       />
 
-      {loadError && (
-        <div role="alert" className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          Review data is unavailable. {loadError}
+      {responseNotice && (
+        <div
+          role={responseNotice.kind === 'error' ? 'alert' : 'status'}
+          className={`rounded-2xl border border-[var(--b1)] px-4 py-3 text-sm ${responseNotice.kind === 'error' ? 'bg-[var(--red-soft)] text-red-v' : 'bg-[var(--emerald-soft)] text-emerald-v'}`}
+        >
+          {responseNotice.text}
         </div>
       )}
 
-      <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Average rating" value={reviewMetricsReady ? avgRating : '—'} subtitle={reviewMetricsReady ? 'Loaded reviews' : 'Unavailable'} icon={<Star className="w-4 h-4" />} accent="amber" />
-        <StatCard title="Reviews loaded" value={reviewMetricsReady ? reviewRecords.length : '—'} subtitle={reviewMetricsReady ? 'Current result set' : 'Unavailable'} icon={<MessageSquare className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Positive sentiment" value={reviewMetricsReady ? `${sentimentPct}%` : '—'} subtitle={reviewMetricsReady ? 'Loaded reviews' : 'Unavailable'} icon={<TrendingUp className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Review-risk score" value={reputationMetricsReady ? `${reputation.summary.avgBadReviewRisk}%` : '—'} subtitle={reputationMetricsReady ? 'Stored reputation cases · planning metric' : 'Unavailable'} icon={<ShieldCheck className="w-4 h-4" />} accent="red" />
-        <StatCard title="Pending requests" value={reputationMetricsReady ? reputation.summary.pendingReviewRequests : '—'} subtitle={reputationMetricsReady ? 'Recorded request status' : 'Unavailable'} icon={<BellRing className="w-4 h-4" />} accent="violet" />
+      <div className="grid gap-3 grid-cols-2 lg:grid-cols-5">
+        <ResourceSection
+          label="Review figures"
+          state={reviews.state}
+          onRetry={reviews.reload}
+          className="col-span-2 lg:col-span-3"
+          compact
+          loading={<>{[0, 1, 2].map(i => <div key={i} className="skeleton-line h-24 rounded-2xl" />)}</>}
+          // A workspace with no reviews is a real answer; the tiles say so.
+          isEmpty={() => false}
+        >
+          {rows => {
+            // Only rows that actually carry a number contribute to the average,
+            // and the subtitle names that denominator.
+            const rated = rows.filter((review): review is ReviewRow & { rating: number } => review.rating != null);
+            const avgRating = rated.length > 0
+              ? (rated.reduce((sum, review) => sum + review.rating, 0) / rated.length).toFixed(1)
+              : null;
+            // Sentiment is a free-text column; an unrecognised value is not
+            // "neutral", it is unclassified, and it is excluded from the split
+            // instead of being counted against "positive".
+            const classified = rows.filter(review => review.sentiment != null);
+            const positiveCount = rows.filter(review => review.sentiment === 'positive').length;
+            const sentimentPct = classified.length > 0 ? Math.round((positiveCount / classified.length) * 100) : null;
+            return (
+              <>
+                <StatCard
+                  title="Average rating"
+                  value={avgRating ?? 'No ratings recorded'}
+                  subtitle={rated.length > 0 ? `Across ${rated.length} rated review${rated.length === 1 ? '' : 's'}` : 'No loaded review carries a rating'}
+                  icon={<Star className="w-4 h-4" />}
+                  accent="amber"
+                />
+                <StatCard
+                  title="Reviews loaded"
+                  value={rows.length}
+                  subtitle={`Most recent ${REVIEW_PAGE_SIZE}`}
+                  icon={<MessageSquare className="w-4 h-4" />}
+                  accent="blue"
+                />
+                <StatCard
+                  title="Positive sentiment"
+                  value={sentimentPct === null ? 'Not classified' : `${sentimentPct}%`}
+                  subtitle={classified.length > 0 ? `Of ${classified.length} classified review${classified.length === 1 ? '' : 's'}` : 'No loaded review carries a known sentiment'}
+                  icon={<TrendingUp className="w-4 h-4" />}
+                  accent="emerald"
+                />
+              </>
+            );
+          }}
+        </ResourceSection>
+
+        <ResourceSection
+          label="Reputation figures"
+          state={reputation.state}
+          onRetry={reputation.reload}
+          className="col-span-2"
+          compact
+          loading={<>{[0, 1].map(i => <div key={i} className="skeleton-line h-24 rounded-2xl" />)}</>}
+        >
+          {data => (
+            <>
+              <StatCard title="Review-risk score" value={`${data.summary.avgBadReviewRisk}%`} subtitle="Stored reputation cases · planning metric" icon={<ShieldCheck className="w-4 h-4" />} accent="red" />
+              <StatCard title="Pending requests" value={data.summary.pendingReviewRequests} subtitle="Recorded request status" icon={<BellRing className="w-4 h-4" />} accent="violet" />
+            </>
+          )}
+        </ResourceSection>
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
         <div className="space-y-4">
-          <BentoCard title="Review feed" subtitle="Latest loaded reviews across platforms">
-            <div className="space-y-3">
-              {reviewRecords.map((r) => (
-                <div key={r.id} className={`p-4 rounded-2xl border transition-all hover:bg-[var(--s3)] ${
-                  r.sentiment === 'negative' ? 'border-[var(--b2)] bg-[var(--red-soft)]' :
-                  r.sentiment === 'positive' ? 'border-[var(--b1)]' : 'border-[var(--b1)]'
-                }`}>
-                  <div className="flex items-start justify-between gap-3 mb-2">
-                    <div className="flex items-center gap-2">
-                      <div className="w-8 h-8 rounded-full bg-[var(--s3)] flex items-center justify-center text-t2 text-[10px] font-bold shrink-0" aria-hidden="true">
-                        {r.patientName === 'Reviewer name unavailable' ? '—' : r.patientName.split(' ').map(n => n[0]).join('')}
-                      </div>
-                      <div>
-                        <p className="text-sm font-bold text-t1">{r.patientName}</p>
-                        <div className="flex items-center gap-1">
-                          {[...Array(5)].map((_, i) => (
-                            <Star key={i} className={`w-3 h-3 ${i < r.rating ? 'fill-amber-400 text-amber-400' : 'text-t3 fill-[var(--s3)]'}`} />
-                          ))}
-                          <span className="text-[10px] text-t3 ml-1">{r.date}</span>
+          <BentoCard title="Review feed" subtitle={`Most recent ${REVIEW_PAGE_SIZE} stored reviews`}>
+            <ResourceSection
+              label="Review feed"
+              state={reviews.state}
+              onRetry={reviews.reload}
+              lines={3}
+              rowClassName="h-32 rounded-2xl"
+              empty={{
+                icon: <Inbox className="w-5 h-5" />,
+                title: 'No reviews recorded yet',
+                description: 'The review feed loaded successfully and this workspace has no stored reviews. Set up a governed request campaign to start collecting them.',
+                cta: { label: 'Review campaign setup', onClick: () => navigate('/campaigner') },
+              }}
+            >
+              {rows => (
+                <div className="space-y-3">
+                  {rows.map((r) => {
+                    const draft = drafts[r.id] ?? '';
+                    const prefilled = !r.responded && !!r.storedResponse;
+                    const rating = r.rating;
+                    return (
+                    <div key={r.id} className={`p-4 rounded-2xl border transition-all hover:bg-[var(--s3)] ${
+                      r.sentiment === 'negative' ? 'border-[var(--b2)] bg-[var(--red-soft)]' : 'border-[var(--b1)]'
+                    }`}>
+                      <div className="flex items-start justify-between gap-3 mb-2">
+                        <div className="flex items-center gap-2">
+                          <div className="w-8 h-8 rounded-full bg-[var(--s3)] flex items-center justify-center text-t3 shrink-0" aria-hidden="true">
+                            <MessageSquare className="w-3.5 h-3.5" />
+                          </div>
+                          <div>
+                            {/* The reviews endpoint returns no author, so the
+                                row says so rather than showing a placeholder
+                                styled like a real name. */}
+                            <p className="text-xs font-semibold text-t3">Reviewer not identified in the review record</p>
+                            <div className="flex items-center gap-1">
+                              {rating == null
+                                ? <span className="text-[10px] font-semibold text-t3">Rating not recorded</span>
+                                : [...Array(5)].map((_, i) => (
+                                  <Star key={i} className={`w-3 h-3 ${i < rating ? 'fill-amber-400 text-amber-400' : 'text-t3 fill-[var(--s3)]'}`} />
+                                ))}
+                              <span className="text-[10px] text-t3 ml-1">{r.date}</span>
+                            </div>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          {/* The stored platform string, uncoerced: a Yelp row
+                              reads "yelp", not "internal". */}
+                          <span className="badge badge-blue capitalize">{platformLabel(r.platform)}</span>
+                          <span className={`badge ${r.sentiment === 'positive' ? 'badge-emerald' : r.sentiment === 'negative' ? 'badge-red' : 'badge-blue'}`}>
+                            {r.sentiment ?? 'sentiment not classified'}
+                          </span>
                         </div>
                       </div>
+                      <p className="text-xs text-t2 leading-relaxed mb-3">"{r.text}"</p>
+                      {r.responded && r.storedResponse && (
+                        <div className="p-2.5 rounded-xl bg-[var(--s3)] border border-[var(--b1)] mb-2">
+                          <p className="text-[10px] font-bold text-t3 mb-1">Response recorded</p>
+                          <p className="text-xs text-t2">{r.storedResponse}</p>
+                        </div>
+                      )}
+
+                      {r.responded ? (
+                        <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-v"><CheckCircle2 className="w-3 h-3" /> Responded</span>
+                      ) : editorId === r.id ? (
+                        <div className="space-y-2">
+                          <label htmlFor={`review-response-${r.id}`} className="block text-[10px] font-bold uppercase tracking-widest text-t3">
+                            Your response
+                          </label>
+                          <textarea
+                            id={`review-response-${r.id}`}
+                            value={draft}
+                            rows={4}
+                            onChange={event => setDrafts(current => ({ ...current, [r.id]: event.target.value }))}
+                            placeholder="Write the reply this clinic should stand behind for this review."
+                            className="w-full resize-y rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs leading-relaxed text-t1 outline-none focus:border-[var(--b2)]"
+                          />
+                          <p className="text-[10px] text-t3">
+                            {prefilled
+                              ? 'Prefilled from the draft stored on this review. Read it against this rating before recording it.'
+                              : 'Recorded against the review in CareCommand. Nothing is published to the source platform from here.'}
+                          </p>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              disabled={!draft.trim() || respondingId === r.id}
+                              onClick={() => void respondToReview(r.id)}
+                              className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:opacity-90 disabled:opacity-40"
+                            >
+                              <CheckCircle2 className="w-3 h-3" /> {respondingId === r.id ? 'Recording…' : 'Record response'}
+                            </button>
+                            <button type="button" onClick={() => setEditorId(null)} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-t3 hover:bg-[var(--s3)]">
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditorId(r.id);
+                            setDrafts(current => ({ ...current, [r.id]: current[r.id] ?? r.storedResponse ?? '' }));
+                          }}
+                          className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo-soft)] px-3 py-1.5 text-xs font-semibold text-indigo transition-colors hover:opacity-80"
+                        >
+                          <MessageSquare className="w-3 h-3" /> {r.storedResponse ? 'Review stored draft and respond' : 'Write a response'}
+                        </button>
+                      )}
                     </div>
-                    <div className="flex items-center gap-2 shrink-0">
-                      <span className={`badge ${r.platform === 'google' ? 'badge-blue' : 'badge-blue'}`}>{r.platform}</span>
-                      <span className={`badge ${r.sentiment === 'positive' ? 'badge-emerald' : r.sentiment === 'negative' ? 'badge-red' : 'badge-blue'}`}>{r.sentiment}</span>
-                    </div>
-                  </div>
-                  <p className="text-xs text-t2 leading-relaxed mb-3">"{r.text}"</p>
-                  {r.responded && r.aiDraftResponse && (
-                    <div className="p-2.5 rounded-xl bg-[var(--s3)] border border-[var(--b1)] mb-2">
-                      <p className="text-[10px] font-bold text-t3 mb-1">Response recorded</p>
-                      <p className="text-xs text-t2">{r.aiDraftResponse}</p>
-                    </div>
-                  )}
-                  <div className="flex items-center gap-2">
-                    {r.responded
-                      ? <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-v"><CheckCircle2 className="w-3 h-3" /> Responded</span>
-                      : <button type="button" disabled={respondingId === r.id} onClick={() => void respondToReview(r.id, r.aiDraftResponse)} className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo bg-[var(--indigo-soft)] px-3 py-1.5 rounded-lg hover:opacity-80 transition-colors disabled:opacity-40"><Sparkles className="w-3 h-3" /> {respondingId === r.id ? 'Recording…' : r.aiDraftResponse ? 'Record drafted response' : 'Record standard response'}</button>
-                    }
-                  </div>
-                  {responseNotice?.id === r.id && <p role={responseNotice.kind === 'error' ? 'alert' : 'status'} className={`mt-2 text-[11px] ${responseNotice.kind === 'error' ? 'text-red-v' : 'text-emerald-v'}`}>{responseNotice.text}</p>}
+                    );
+                  })}
                 </div>
-              ))}
-            </div>
+              )}
+            </ResourceSection>
           </BentoCard>
         </div>
 
         <div className="space-y-4">
-          <BentoCard title="Reputation follow-up" subtitle="Unresolved cases and recorded recovery guidance" headerRight={
-          <span className={`badge ${reputationSource === 'loaded' ? 'badge-blue' : 'badge-blue'}`}>{reputationSource === 'loaded' ? 'Data loaded' : 'Loading'}</span>
-          }>
-            <div className="space-y-3">
-              {reputation.cases.map((item) => (
-                <div key={item.id} className={`rounded-xl border border-[var(--b1)] p-3 ${item.staffComplaintDetected ? 'bg-[var(--red-soft)]' : 'bg-[var(--s2)]'}`}>
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <p className="text-sm font-bold text-t1">{item.branch.name}</p>
-                      <p className="text-[10px] text-t3 mt-0.5">{item.complaintCategory} · {item.workflowStatus}</p>
+          <BentoCard title="Reputation follow-up" subtitle="Unresolved cases and recorded recovery guidance">
+            <ResourceSection
+              label="Reputation cases"
+              state={reputation.state}
+              onRetry={reputation.reload}
+              lines={2}
+              rowClassName="h-24 rounded-xl"
+              isEmpty={data => data.cases.length === 0}
+              empty={{
+                icon: <ShieldCheck className="w-5 h-5" />,
+                title: 'No open reputation cases',
+                description: 'The reputation feed loaded successfully and this clinic has no recorded unresolved cases.',
+              }}
+            >
+              {data => (
+                <div className="space-y-3">
+                  {data.cases.map((item) => (
+                    <div key={item.id} className={`rounded-xl border border-[var(--b1)] p-3 ${item.staffComplaintDetected ? 'bg-[var(--red-soft)]' : 'bg-[var(--s2)]'}`}>
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="text-sm font-bold text-t1">{item.branch.name}</p>
+                          <p className="text-[10px] text-t3 mt-0.5">{item.complaintCategory} · {item.workflowStatus}</p>
+                        </div>
+                        <span className="badge badge-red">{item.badReviewRisk}% risk</span>
+                      </div>
+                      <p className="text-xs text-t2 mt-2 leading-relaxed">{item.unresolvedComplaint}</p>
+                      <p className="text-[11px] text-t3 mt-2">Trend: {item.publicTrend} · NPS {item.npsScore}{item.staffComplaintDetected ? ' · staff issue detected' : ''}</p>
+                      <p className="text-[11px] text-indigo mt-2 font-semibold">{item.recoveryWorkflow}</p>
+                      <div className="mt-2 p-2.5 rounded-lg bg-[var(--s3)] border border-[var(--b1)]">
+                        <p className="text-[10px] font-bold text-t3 mb-1">Suggested message · review before use</p>
+                        <p className="text-xs text-t2">{item.suggestedReply}</p>
+                      </div>
                     </div>
-                    <span className="badge badge-red">{item.badReviewRisk}% risk</span>
-                  </div>
-                  <p className="text-xs text-t2 mt-2 leading-relaxed">{item.unresolvedComplaint}</p>
-                  <p className="text-[11px] text-t3 mt-2">Trend: {item.publicTrend} · NPS {item.npsScore}{item.staffComplaintDetected ? ' · staff issue detected' : ''}</p>
-                  <p className="text-[11px] text-indigo mt-2 font-semibold">{item.recoveryWorkflow}</p>
-                  <div className="mt-2 p-2.5 rounded-lg bg-[var(--s3)] border border-[var(--b1)]">
-                    <p className="text-[10px] font-bold text-t3 mb-1">Suggested message · review before use</p>
-                    <p className="text-xs text-t2">{item.suggestedReply}</p>
-                  </div>
+                  ))}
                 </div>
-              ))}
-              {reputation.cases.length === 0 && (
-                <p className="text-xs text-t3">{reputationMetricsReady ? 'No reputation cases are recorded for this clinic.' : 'Reputation cases are unavailable.'}</p>
               )}
-            </div>
+            </ResourceSection>
           </BentoCard>
 
           <BentoCard title="Review requests" subtitle="Recorded request and response status">
-            <div className="space-y-2.5">
-              {reputation.reviewRequests.map((request) => (
-                <div key={request.id} className="flex items-start justify-between gap-3 p-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)]">
-                  <div className="min-w-0">
-                    <p className="text-xs font-semibold text-t1">{request.requestType}</p>
-                    <p className="text-[10px] text-t3 mt-0.5">{request.branch.name} · {request.channel.toLowerCase()} · {request.status}</p>
-                    <p className="text-[11px] text-t2 mt-2">{request.message}</p>
-                  </div>
-                  <div className="text-right shrink-0">
-                    <p className="text-xs font-bold text-t1">{request.ratingReceived ? `${request.ratingReceived}★` : '—'}</p>
-                    <p className="text-[10px] text-t3">{request.respondedAt ? 'Responded' : 'Waiting'}</p>
-                  </div>
+            <ResourceSection
+              label="Review requests"
+              state={reputation.state}
+              onRetry={reputation.reload}
+              lines={2}
+              rowClassName="h-16 rounded-xl"
+              isEmpty={data => data.reviewRequests.length === 0}
+              empty={{
+                icon: <BellRing className="w-5 h-5" />,
+                title: 'No review requests recorded',
+                description: 'The reputation feed loaded successfully and no review requests have been recorded for this clinic yet.',
+                cta: { label: 'Review campaign setup', onClick: () => navigate('/campaigner') },
+              }}
+            >
+              {data => (
+                <div className="space-y-2.5">
+                  {data.reviewRequests.map((request) => (
+                    <div key={request.id} className="flex items-start justify-between gap-3 p-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)]">
+                      <div className="min-w-0">
+                        <p className="text-xs font-semibold text-t1">{request.requestType}</p>
+                        <p className="text-[10px] text-t3 mt-0.5">{request.branch.name} · {request.channel.toLowerCase()} · {request.status}</p>
+                        <p className="text-[11px] text-t2 mt-2">{request.message}</p>
+                      </div>
+                      <div className="text-right shrink-0">
+                        <p className="text-xs font-bold text-t1">{request.ratingReceived ? `${request.ratingReceived}★` : 'No rating'}</p>
+                        <p className="text-[10px] text-t3">{request.respondedAt ? 'Responded' : 'Waiting'}</p>
+                      </div>
+                    </div>
+                  ))}
                 </div>
-              ))}
-              {reputation.reviewRequests.length === 0 && (
-                <p className="text-xs text-t3">No review requests are recorded yet.</p>
               )}
-            </div>
+            </ResourceSection>
           </BentoCard>
 
-          <BentoCard title="Rating Distribution" subtitle="All reviews combined">
-            <div className="space-y-2.5">
-              {ratingDist.map(({ star, count }) => (
-                <div key={star} className="flex items-center gap-2">
-                  <div className="flex items-center gap-0.5 w-16 shrink-0">
-                    {[...Array(star)].map((_, i) => <Star key={i} className="w-2.5 h-2.5 fill-amber-400 text-amber-400" />)}
-                  </div>
-                  <div className="flex-1"><ProgressBar value={count} max={reviewRecords.length} color={star >= 4 ? 'emerald' : star === 3 ? 'amber' : 'red'} /></div>
-                  <span className="text-xs font-bold text-t2 w-4 text-right shrink-0">{count}</span>
-                </div>
-              ))}
-            </div>
-          </BentoCard>
-
-          <BentoCard title="Branch Reputation" subtitle="Avg rating by location">
-            <div className="space-y-2.5">
-              {branchOptions.map((b) => {
-                const br = reviewRecords.filter(r => r.branchId === b.id);
-                const avg = br.length > 0 ? (br.reduce((s, r) => s + r.rating, 0) / br.length).toFixed(1) : 'N/A';
-                const score = parseFloat(avg);
+          <BentoCard title="Rating Distribution" subtitle={`Across the loaded review set · most recent ${REVIEW_PAGE_SIZE}`}>
+            <ResourceSection
+              label="Rating distribution"
+              state={reviews.state}
+              onRetry={reviews.reload}
+              lines={5}
+              rowClassName="h-4 rounded-full"
+              empty={{
+                icon: <Star className="w-5 h-5" />,
+                title: 'No reviews to distribute',
+                description: 'The review feed loaded successfully and this workspace has no stored reviews yet.',
+              }}
+            >
+              {rows => {
+                const rated = rows.filter(review => review.rating != null);
+                const unrated = rows.length - rated.length;
+                const ratingDist = [5, 4, 3, 2, 1].map(rating => ({ star: rating, count: rated.filter(review => review.rating === rating).length }));
                 return (
-                  <div key={b.id} className="flex items-center justify-between gap-3 p-3 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors">
-                    <div>
-                      <p className="text-xs font-bold text-t1">{b.name.split(' ')[0]}</p>
-                      <p className="text-[10px] text-t3">{br.length} reviews</p>
-                    </div>
-                    <div className="flex items-center gap-1.5">
-                      <Star className="w-3.5 h-3.5 fill-amber-400 text-amber-400" />
-                      <span className={`text-sm font-bold ${score >= 4.5 ? 'text-emerald-v' : score >= 4 ? 'text-amber-v' : 'text-red-v'}`}>{avg}</span>
-                    </div>
+                  <div className="space-y-2.5">
+                    {ratingDist.map(({ star, count }) => (
+                      <div key={star} className="flex items-center gap-2">
+                        <div className="flex items-center gap-0.5 w-16 shrink-0">
+                          {[...Array(star)].map((_, i) => <Star key={i} className="w-2.5 h-2.5 fill-amber-400 text-amber-400" />)}
+                        </div>
+                        <div className="flex-1"><ProgressBar value={count} max={rated.length} color={star >= 4 ? 'emerald' : star === 3 ? 'amber' : 'red'} /></div>
+                        <span className="text-xs font-bold text-t2 w-4 text-right shrink-0">{count}</span>
+                      </div>
+                    ))}
+                    {unrated > 0 && (
+                      <p className="text-[10px] text-t3">{unrated} loaded review{unrated === 1 ? ' carries' : 's carry'} no rating and {unrated === 1 ? 'is' : 'are'} not counted above.</p>
+                    )}
                   </div>
                 );
-              })}
-            </div>
+              }}
+            </ResourceSection>
           </BentoCard>
 
-          <BentoCard title="Top Provider Ratings" subtitle="By review score">
-            <div className="space-y-2.5">
-              {[...providerRecords].sort((a, b) => b.rating - a.rating).slice(0, 5).map((doc) => (
-                <div key={doc.id} className="flex items-center justify-between gap-3">
-                  <p className="text-xs font-semibold text-t1 truncate">{doc.name}</p>
-                  <div className="flex items-center gap-1.5 shrink-0">
-                    <Star className="w-3 h-3 fill-amber-400 text-amber-400" />
-                    <span className="text-xs font-bold text-t1">{doc.rating}</span>
-                    <span className="text-[10px] text-t3">({doc.reviewCount})</span>
-                  </div>
+          <BentoCard title="Branch Reputation" subtitle="Average of loaded reviews, by clinic">
+            {/* Two feeds: the clinic list and the reviews being averaged. Both
+                have to answer before a per-clinic average means anything. */}
+            <ResourceSection
+              label="Clinic ratings"
+              state={combineResourceStates(branches.state, reviews.state, (branchRows, reviewRows) => ({ branchRows, reviewRows }))}
+              onRetry={() => { branches.reload(); reviews.reload(); }}
+              lines={3}
+              rowClassName="h-14 rounded-xl"
+              isEmpty={data => data.branchRows.length === 0}
+              empty={{
+                title: 'No clinics recorded',
+                description: 'The clinic list loaded successfully and this workspace has no clinic records.',
+              }}
+            >
+              {({ branchRows, reviewRows }) => (
+                <div className="space-y-2.5">
+                  {branchRows.map((b) => {
+                    const rated = reviewRows.filter((r): r is ReviewRow & { rating: number } => r.branchId === b.id && r.rating != null);
+                    const avg = rated.length > 0 ? rated.reduce((s, r) => s + r.rating, 0) / rated.length : null;
+                    return (
+                      <div key={b.id} className="flex items-center justify-between gap-3 p-3 rounded-xl border border-[var(--b1)] hover:bg-[var(--s3)] transition-colors">
+                        <div>
+                          <p className="text-xs font-bold text-t1">{b.name.split(' ')[0]}</p>
+                          <p className="text-[10px] text-t3">{rated.length} rated review{rated.length === 1 ? '' : 's'}</p>
+                        </div>
+                        {avg === null ? (
+                          <span className="text-[10px] font-semibold text-t3 shrink-0">No rated reviews</span>
+                        ) : (
+                          <div className="flex items-center gap-1.5">
+                            <Star className="w-3.5 h-3.5 fill-amber-400 text-amber-400" />
+                            <span className={`text-sm font-bold ${avg >= 4.5 ? 'text-emerald-v' : avg >= 4 ? 'text-amber-v' : 'text-red-v'}`}>{avg.toFixed(1)}</span>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
-              ))}
-              {providerRecords.length === 0 && <p className="text-xs text-t3">No provider ratings are available.</p>}
-            </div>
+              )}
+            </ResourceSection>
+          </BentoCard>
+
+          <BentoCard title="Top Provider Ratings" subtitle="Providers with at least one recorded review">
+            <ResourceSection
+              label="Provider ratings"
+              state={providers.state}
+              onRetry={providers.reload}
+              lines={3}
+              rowClassName="h-6 rounded-lg"
+              // ProviderProfile.rating defaults to 0, so a provider with no
+              // reviews would otherwise be published as a 0.0-star clinician.
+              isEmpty={rows => rows.filter(doc => doc.reviewCount > 0 && Number.isFinite(doc.rating)).length === 0}
+              empty={{
+                icon: <Star className="w-5 h-5" />,
+                title: 'No provider has a recorded rating',
+                description: 'The provider feed loaded successfully and no provider has a review recorded against them yet.',
+              }}
+            >
+              {rows => (
+                <div className="space-y-2.5">
+                  {rows
+                    .filter(doc => doc.reviewCount > 0 && Number.isFinite(doc.rating))
+                    .sort((a, b) => b.rating - a.rating)
+                    .slice(0, 5)
+                    .map((doc) => (
+                      <div key={doc.id} className="flex items-center justify-between gap-3">
+                        <p className="text-xs font-semibold text-t1 truncate">{doc.name}</p>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <Star className="w-3 h-3 fill-amber-400 text-amber-400" />
+                          <span className="text-xs font-bold text-t1">{doc.rating.toFixed(1)}</span>
+                          <span className="text-[10px] text-t3">({doc.reviewCount})</span>
+                        </div>
+                      </div>
+                    ))}
+                </div>
+              )}
+            </ResourceSection>
           </BentoCard>
 
           <div className="rounded-2xl bg-[var(--s2)] border border-[var(--b1)] p-4">

@@ -549,15 +549,41 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     const { limit } = listLimit.parse(request.query);
     return db.lead.findMany({ where: { tenantId: request.auth.tenantId }, take: limit, orderBy: { createdAt: 'desc' } });
   });
+  // The "mark lost" modal blocks the operator until they type a justification and
+  // promises it is "captured for lost-reason intelligence" and "recorded in the
+  // audit trail". It is therefore persisted on the lead, written into the audit
+  // metadata, and recorded as a LeadActivity row. `Lead.stage` is overwritten in
+  // place, so without that row a stage change leaves no trace at all and "why
+  // are we losing leads?" has no answer.
+  const LOST_STAGE = 'lost';
+  const lostReasonInput = z.string().trim().min(3).max(500);
+
   app.post('/leads', { preHandler: crmWrite }, async (request, reply) => {
     const input = z.object({
       patientId: uuid.optional(), name: z.string().min(2).max(160), phone: z.string().max(40).optional(),
       email: z.string().email().optional(), channel, service: z.string().min(2).max(160),
       stage: z.string().min(2).max(40), source: z.string().min(2).max(120), estimatedValue: z.coerce.number().min(0).default(0),
+      lostReason: lostReasonInput.optional(),
     }).parse(request.body);
+    if (input.stage === LOST_STAGE && !input.lostReason) {
+      throw app.httpErrors.badRequest('A lost reason is required when a lead is created in the lost stage.');
+    }
     if (input.patientId) await requireTenantPatient(request, input.patientId);
-    const row = await db.lead.create({ data: { tenantId: request.auth.tenantId, ...input } });
-    await audit(request, { action: 'lead.created', resource: 'lead', resourceId: row.id });
+    const row = await db.$transaction(async tx => {
+      const lead = await tx.lead.create({ data: { tenantId: request.auth.tenantId, ...input } });
+      await tx.leadActivity.create({
+        data: {
+          tenantId: request.auth.tenantId, leadId: lead.id, activityType: 'stage_change',
+          fromStage: null, toStage: lead.stage, reason: input.lostReason ?? null,
+          actorUserId: request.auth.userId,
+        },
+      });
+      return lead;
+    });
+    await audit(request, {
+      action: 'lead.created', resource: 'lead', resourceId: row.id,
+      metadata: { stage: row.stage, ...(input.lostReason ? { lostReason: input.lostReason } : {}) },
+    });
     return reply.code(201).send(row);
   });
   app.patch('/leads/:id', { preHandler: crmWrite }, async request => {
@@ -565,11 +591,32 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     const input = z.object({
       stage: z.string().min(2).max(40).optional(),
       estimatedValue: z.coerce.number().min(0).optional(),
+      lostReason: lostReasonInput.optional(),
     }).parse(request.body);
     const existing = await db.lead.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!existing) throw app.httpErrors.notFound('Lead not found');
-    const row = await db.lead.update({ where: { id }, data: input });
-    await audit(request, { action: 'lead.updated', resource: 'lead', resourceId: id, metadata: input });
+    const stageChanged = input.stage !== undefined && input.stage !== existing.stage;
+    if (input.stage === LOST_STAGE && !input.lostReason && !existing.lostReason) {
+      throw app.httpErrors.badRequest('A lost reason is required to mark a lead as lost.');
+    }
+    const row = await db.$transaction(async tx => {
+      const updated = await tx.lead.update({ where: { id }, data: input });
+      if (stageChanged) {
+        await tx.leadActivity.create({
+          data: {
+            tenantId: request.auth.tenantId, leadId: id, activityType: 'stage_change',
+            fromStage: existing.stage, toStage: updated.stage,
+            reason: input.lostReason ?? updated.lostReason ?? null,
+            actorUserId: request.auth.userId,
+          },
+        });
+      }
+      return updated;
+    });
+    await audit(request, {
+      action: 'lead.updated', resource: 'lead', resourceId: id,
+      metadata: { ...input, ...(stageChanged ? { fromStage: existing.stage, toStage: row.stage } : {}) },
+    });
     return row;
   });
 

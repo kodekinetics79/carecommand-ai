@@ -1,0 +1,268 @@
+import { readFileSync } from 'node:fs';
+import { describe, expect, it } from 'vitest';
+import {
+  GROWTH_CHANNEL_COST_DEFAULTS,
+  GROWTH_POLICY_DEFAULTS,
+  GROWTH_SEGMENT_DEFAULTS,
+  MONEY_AFFECTING_POLICY_FIELDS,
+  PENDING_CONFIG_CALL_SITES,
+  THRESHOLD_RESOLUTIONS,
+} from '../modules/growth/defaults';
+import { RLS_TABLE_ADAPTERS } from '../lib/rlsTableAdapters';
+
+// ===========================================================================
+// The configuration spine is only worth landing if the seeded values are
+// PROVABLY today's values. Three artifacts carry the same numbers — the Prisma
+// column defaults, the `-- @growth-seed` blocks in the migration, and
+// server/modules/growth/defaults.ts — and the Growth module's source is the
+// fourth. This suite fails the build the moment any of them disagree, which is
+// the only way "this increment changes no observable number" can be a claim
+// rather than a hope.
+// ===========================================================================
+
+const root = new URL('../../', import.meta.url).pathname;
+const read = (relative: string) => readFileSync(`${root}${relative}`, 'utf8');
+
+const schema = read('prisma/schema.prisma');
+const migration = read('prisma/migrations/20260828140000_growth_config_spine/migration.sql');
+const crmService = read('src/lib/crmService.ts');
+const patientRoutes = read('server/modules/patients/routes.ts');
+
+const NEW_TENANT_MODELS = ['LeadActivity', 'GrowthPolicy', 'GrowthSegmentDefinition', 'GrowthChannelCost'] as const;
+
+function modelBody(name: string): string {
+  const match = schema.match(new RegExp(`^model\\s+${name}\\s*\\{([\\s\\S]*?)^\\}`, 'm'));
+  expect(match, `model ${name} is missing from prisma/schema.prisma`).toBeTruthy();
+  return match![1];
+}
+
+/** `@default(...)` for one column of a model, as written in the schema. */
+function schemaDefault(model: string, field: string): string {
+  const line = modelBody(model).split('\n').find(l => new RegExp(`^\\s*${field}\\s`).test(l));
+  expect(line, `${model}.${field} is missing from prisma/schema.prisma`).toBeTruthy();
+  const match = line!.match(/@default\(([^)]*)\)/);
+  expect(match, `${model}.${field} has no @default`).toBeTruthy();
+  return match![1];
+}
+
+/** The single `-- @growth-seed <marker>` statement, without its trailing blocks. */
+function seedBlock(marker: string): string {
+  const start = migration.indexOf(`-- @growth-seed ${marker}`);
+  expect(start, `migration has no "-- @growth-seed ${marker}" block`).toBeGreaterThan(-1);
+  const end = migration.indexOf(';', start);
+  return migration.slice(start, end);
+}
+
+/** The line in crmService.ts's `defs` array that declares one segment. */
+function segmentSourceLine(key: string): string {
+  const line = crmService.split('\n').find(l => l.includes(`id: '${key}'`));
+  expect(line, `src/lib/crmService.ts no longer declares the '${key}' segment`).toBeTruthy();
+  return line!;
+}
+
+describe('growth config spine — schema, migration and defaults.ts agree', () => {
+  it('gives every GrowthPolicy field the same default in the schema and in defaults.ts', () => {
+    for (const [field, value] of Object.entries(GROWTH_POLICY_DEFAULTS)) {
+      expect(Number(schemaDefault('GrowthPolicy', field)), `GrowthPolicy.${field} @default`).toBe(value);
+    }
+  });
+
+  it('seeds every existing tenant the policy values defaults.ts declares', () => {
+    const block = seedBlock('policy');
+    // The INSERT column list and the SELECT value list must line up position for
+    // position. `id`/`tenantId` are supplied by gen_random_uuid()/t.id and the
+    // timestamps by now(), so both lists are read with those stripped.
+    const positional = ['id', 'tenantId', 'createdAt', 'updatedAt'];
+    const columnList = block.slice(block.indexOf('('), block.indexOf('SELECT gen_random_uuid'));
+    const columns = [...columnList.matchAll(/"(\w+)"/g)].map(m => m[1])
+      .filter(c => !positional.includes(c));
+    const values = block.slice(block.indexOf('SELECT gen_random_uuid(), t.id,'))
+      .replace('SELECT gen_random_uuid(), t.id,', '')
+      .split('FROM "Tenant"')[0]
+      .split(',').map(v => v.trim()).filter(v => v.length > 0 && v !== 'now()');
+
+    expect(columns.length, 'seed column list and value list are different lengths').toBe(values.length);
+    const seeded = new Map(columns.map((column, index) => [column, values[index]]));
+    for (const [field, value] of Object.entries(GROWTH_POLICY_DEFAULTS)) {
+      expect(Number(seeded.get(field)), `seeded GrowthPolicy.${field}`).toBe(value);
+    }
+    expect([...columns].sort(), 'the seed writes a column set defaults.ts does not own')
+      .toEqual(Object.keys(GROWTH_POLICY_DEFAULTS).sort());
+  });
+
+  it('seeds the six segment definitions and four channel costs verbatim', () => {
+    const segments = seedBlock('segments');
+    for (const definition of GROWTH_SEGMENT_DEFAULTS) {
+      const row = segments.split('\n').find(l => l.includes(`('${definition.key}',`));
+      expect(row, `segment seed row for ${definition.key}`).toBeTruthy();
+      expect(row).toContain(`'${definition.label}'`);
+      expect(row).toContain(`'${definition.description}'`);
+      expect(row).toContain(`'${definition.suggestedChannel}'`);
+      expect(row).toContain(`'${definition.plannedOffer}'`);
+      expect(row).toContain(`, ${definition.assumedBookingRatePct},`);
+      expect(row).toContain(`, ${definition.includeNeverVisited},`);
+    }
+
+    const costs = seedBlock('channel-costs');
+    for (const cost of GROWTH_CHANNEL_COST_DEFAULTS) {
+      expect(costs).toContain(`('${cost.channel}', ${cost.unitCostMinor}, '${cost.currency}')`);
+    }
+  });
+});
+
+describe('growth config spine — the seed reproduces today\'s constants', () => {
+  it('keeps the hot-lead score and the recoverable-value assumption as crmService.ts uses them', () => {
+    expect(crmService).toContain(`l.score >= ${GROWTH_POLICY_DEFAULTS.hotLeadScore}`);
+    // 0.30 is stored with four decimals; the source writes it as 0.3.
+    expect(crmService).toContain(`p.lifetimeValue * ${GROWTH_POLICY_DEFAULTS.recoverableLtvFraction}`);
+  });
+
+  it('reproduces each of the six smart segments in crmService.ts, filter for filter', () => {
+    expect(GROWTH_SEGMENT_DEFAULTS).toHaveLength(6);
+    for (const definition of GROWTH_SEGMENT_DEFAULTS) {
+      const line = segmentSourceLine(definition.key);
+      expect(line, `${definition.key} label`).toContain(`label: '${definition.label}'`);
+      expect(line, `${definition.key} description`).toContain(`description: '${definition.description}'`);
+      expect(line, `${definition.key} channel`).toContain(`channel: '${definition.suggestedChannel}'`);
+      expect(line, `${definition.key} offer`).toContain(`offer: '${definition.plannedOffer}'`);
+      expect(line, `${definition.key} booking rate`).toContain(`rate: ${definition.assumedBookingRatePct}`);
+
+      if (definition.minInactiveDays !== null && definition.maxInactiveDays !== null) {
+        // The window is [min, max): min inclusive, max exclusive.
+        expect(line, `${definition.key} window`).toContain(`d >= ${definition.minInactiveDays} && d < ${definition.maxInactiveDays}`);
+      } else if (definition.minInactiveDays !== null) {
+        expect(line, `${definition.key} open-ended window`).toContain(`daysSince(p.lastVisit) >= ${definition.minInactiveDays}`);
+      }
+      if (definition.minLifetimeValue !== null) {
+        expect(line, `${definition.key} LTV floor`).toContain(`p.lifetimeValue >= ${definition.minLifetimeValue}`);
+      }
+      if (definition.minChurnRisk !== null) {
+        expect(line, `${definition.key} churn floor`).toContain(`p.churnRisk >= ${definition.minChurnRisk}`);
+      }
+      if (definition.requiredTag !== null) {
+        expect(line, `${definition.key} tag`).toContain(`includes('${definition.requiredTag}')`);
+      }
+    }
+  });
+
+  it('reproduces the per-channel planning cost in minor units instead of bare integers', () => {
+    // Today: `ps.length * (channel === 'Email' ? 0 : channel === 'Voice' ? 3 : 1)`,
+    // rendered through formatCurrency with no currency awareness at all.
+    expect(crmService).toContain("d.channel === 'Email' ? 0 : d.channel === 'Voice' ? 3 : 1");
+    const byChannel = new Map(GROWTH_CHANNEL_COST_DEFAULTS.map(c => [c.channel, c]));
+    expect(byChannel.get('Email')?.unitCostMinor).toBe(0);
+    expect(byChannel.get('Voice')?.unitCostMinor).toBe(3 * 100);
+    expect(byChannel.get('SMS')?.unitCostMinor).toBe(1 * 100);
+    expect(byChannel.get('WhatsApp')?.unitCostMinor).toBe(1 * 100);
+    for (const cost of GROWTH_CHANNEL_COST_DEFAULTS) {
+      expect(cost.currency, 'a stored cost is meaningless without its currency').toMatch(/^[A-Z]{3}$/);
+    }
+    // Every channel a seeded segment suggests must have a seeded cost, or the
+    // planning number silently becomes zero.
+    for (const definition of GROWTH_SEGMENT_DEFAULTS) {
+      expect(byChannel.has(definition.suggestedChannel), `no seeded cost for ${definition.suggestedChannel}`).toBe(true);
+    }
+  });
+
+  it('carries the reputation and competitor severity thresholds the radar screens use', () => {
+    // Reviews.tsx and ClinicRadar.tsx belong to another team's concurrent
+    // increment, so the comparison is deliberately variable-name agnostic: it
+    // pins the NUMBER and the OPERATOR, which are what this configuration
+    // replaces, and not whatever the local identifier is called this week.
+    const reviews = read('src/pages/Reviews.tsx');
+    const radar = read('src/pages/ClinicRadar.tsx');
+    const has = (source: string, pattern: RegExp, label: string) =>
+      expect(pattern.test(source), `${label} is no longer expressed as ${pattern}`).toBe(true);
+
+    has(reviews, />=\s*4\.5\b/, 'reviewRatingGood');
+    has(reviews, />=\s*4\b/, 'reviewRatingFair');
+    has(radar, />=\s*80\b/, 'reputationRiskHigh');
+    has(radar, />=\s*55\b/, 'reputationRiskMedium');
+    has(radar, /<=\s*4\.2\b/, 'competitorRatingHighSeverityMax');
+    has(radar, /<=\s*4\.5\b/, 'competitorRatingMediumSeverityMax');
+    has(radar, />\s*350\b/, 'competitorReviewVolumeHigh');
+
+    expect(GROWTH_POLICY_DEFAULTS.reviewRatingGood).toBe(4.5);
+    expect(GROWTH_POLICY_DEFAULTS.reviewRatingFair).toBe(4.0);
+    expect(GROWTH_POLICY_DEFAULTS.reputationRiskHigh).toBe(80);
+    expect(GROWTH_POLICY_DEFAULTS.reputationRiskMedium).toBe(55);
+    expect(GROWTH_POLICY_DEFAULTS.competitorRatingHighSeverityMax).toBe(4.2);
+    expect(GROWTH_POLICY_DEFAULTS.competitorRatingMediumSeverityMax).toBe(4.5);
+    expect(GROWTH_POLICY_DEFAULTS.competitorReviewVolumeHigh).toBe(350);
+  });
+});
+
+describe('growth config spine — the churn-risk / LTV threshold conflict is resolved, not papered over', () => {
+  it('records both sides of each conflict and the value that won', () => {
+    const churn = THRESHOLD_RESOLUTIONS.find(r => r.concept === 'churnRiskHigh');
+    const ltv = THRESHOLD_RESOLUTIONS.find(r => r.concept === 'highValuePatientLtv');
+    expect(churn?.chosen).toBe(50);
+    expect(churn?.comparison).toBe('>=');
+    expect(ltv?.chosen).toBe(4000);
+    expect(ltv?.comparison).toBe('>=');
+    for (const resolution of THRESHOLD_RESOLUTIONS) {
+      expect(resolution.reasoning.length, `${resolution.concept} needs a stated reason`).toBeGreaterThan(80);
+    }
+  });
+
+  it('makes one value per concept the single source of truth', () => {
+    expect(GROWTH_POLICY_DEFAULTS.churnRiskHigh).toBe(50);
+    expect(GROWTH_POLICY_DEFAULTS.highValuePatientLtv).toBe(4000);
+    // The frontend side of both conflicts still reads exactly these numbers.
+    expect(crmService).toContain(`p.churnRisk >= ${GROWTH_POLICY_DEFAULTS.churnRiskHigh}`);
+    expect(crmService).toContain(`p.lifetimeValue >= ${GROWTH_POLICY_DEFAULTS.highValuePatientLtv}`);
+  });
+
+  it('still shows the server disagreeing, and names it as the call site left to rewire', () => {
+    // This is the defect the config exists to end. It is deliberately NOT fixed
+    // here (patients/routes.ts belongs to another increment); it is recorded so
+    // it cannot be forgotten. When that call site starts reading GrowthPolicy,
+    // these two assertions are what tells you to delete them.
+    expect(patientRoutes).toContain('churnRisk: { gte: 60 }');
+    expect(patientRoutes).toContain('lifetimeValue: { gt: 4000 }');
+    expect(PENDING_CONFIG_CALL_SITES.some(site => site.includes('patients/routes.ts'))).toBe(true);
+  });
+});
+
+describe('growth config spine — tenancy is inherited, not assumed', () => {
+  it('gives every new table a tenantId UUID and a real Tenant relation', () => {
+    for (const model of NEW_TENANT_MODELS) {
+      const body = modelBody(model);
+      // AutomationRule (schema.prisma) has a tenantId with no Tenant relation and
+      // no FK. That is the mistake this assertion exists to prevent repeating.
+      expect(body, `${model} needs "tenantId String @db.Uuid"`).toMatch(/^\s*tenantId\s+String\s+[^\n]*@db\.Uuid/m);
+      expect(body, `${model} needs a real Tenant relation`).toMatch(/tenant\s+Tenant\s+@relation\(fields: \[tenantId\], references: \[id\], onDelete: Cascade/);
+    }
+  });
+
+  it('is picked up by the RLS table adapter schema parse', () => {
+    const covered = new Set(RLS_TABLE_ADAPTERS.map(a => a.table));
+    for (const model of NEW_TENANT_MODELS) {
+      expect(covered.has(model), `${model} is not enrolled in the RLS adapter catalog`).toBe(true);
+    }
+  });
+
+  it('declares its own RLS policies, because the isolation loop already ran', () => {
+    // 20260730120000_complete_rls_isolation applied its dynamic policy loop once.
+    // A table created afterwards inherits nothing and must say so itself.
+    for (const model of NEW_TENANT_MODELS) {
+      expect(migration).toContain(`ALTER TABLE "${model}" ENABLE ROW LEVEL SECURITY;`);
+      expect(migration).toContain(`ALTER TABLE "${model}" FORCE ROW LEVEL SECURITY;`);
+      for (const command of ['SELECT', 'INSERT', 'UPDATE', 'DELETE']) {
+        expect(migration, `${model} is missing a ${command} policy`).toMatch(
+          new RegExp(`CREATE POLICY \\w+ ON "${model}" FOR ${command} TO app_rls`),
+        );
+      }
+      expect(migration).toContain(`REVOKE ALL ON TABLE "${model}" FROM app_rls;`);
+      expect(migration).toContain(`GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE "${model}" TO app_rls;`);
+      expect(migration).toContain(`ALTER TABLE "${model}" ADD CONSTRAINT "${model}_tenant`);
+    }
+  });
+
+  it('names money-affecting policy fields explicitly so the API can gate them', () => {
+    expect([...MONEY_AFFECTING_POLICY_FIELDS].sort()).toEqual(['highValuePatientLtv', 'recoverableLtvFraction']);
+    for (const field of MONEY_AFFECTING_POLICY_FIELDS) {
+      expect(Object.keys(GROWTH_POLICY_DEFAULTS)).toContain(field);
+    }
+  });
+});

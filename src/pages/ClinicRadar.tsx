@@ -1,12 +1,16 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
-import { AlertCircle, BarChart3, Radar, Sparkles, TrendingUp, Zap, ArrowRight } from 'lucide-react';
+import { AlertCircle, BarChart3, Filter, Radar, Sparkles, Store, TrendingUp, Zap, ArrowRight } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import RiskBadge from '../components/ui/RiskBadge';
 import BentoCard from '../components/ui/BentoCard';
+import ModuleTabs from '../components/ui/ModuleTabs';
+import ResourceSection from '../components/ui/ResourceSection';
+import EmptyStatePremium from '../components/ui/EmptyStatePremium';
 import type { AlertCategory, AlertSeverity } from '../types';
-import { apiRequest } from '../lib/api';
-import { useApiResource } from '../hooks/useApiResource';
+import { fetchList } from '../lib/apiAdapters';
+import { LOADING_STATE, receivedData, type ResourceState } from '../lib/resourceState';
+import { useResource } from '../hooks/useResource';
 
 interface ApiBranchOption { id: string; name: string }
 
@@ -55,9 +59,12 @@ interface ReputationResponse {
   reviewRequests: Array<{ id: string }>;
 }
 
+/** The only two categories this screen can actually produce. */
+type RadarCategory = Extract<AlertCategory, 'reputation' | 'operations'>;
+
 type SignalRow = {
   id: string;
-  category: AlertCategory;
+  category: RadarCategory;
   severity: AlertSeverity;
   title: string;
   description: string;
@@ -67,25 +74,24 @@ type SignalRow = {
   createdAt: string;
 };
 
-const categories: { id: AlertCategory | 'all'; label: string }[] = [
+/**
+ * ClinicRadar builds signals from exactly two feeds: reputation cases and the
+ * competitor radar. The filter row used to advertise Revenue, Retention, Staff
+ * and Inventory as well — four buttons that could never match a row, because
+ * nothing on this page ever emits those categories. Only the reachable ones are
+ * offered.
+ */
+const categories: { id: RadarCategory | 'all'; label: string }[] = [
   { id: 'all', label: 'All Signals' },
-  { id: 'revenue', label: 'Revenue' },
-  { id: 'retention', label: 'Retention' },
-  { id: 'operations', label: 'Operations' },
   { id: 'reputation', label: 'Reputation' },
-  { id: 'staff', label: 'Staff' },
-  { id: 'inventory', label: 'Inventory' },
+  { id: 'operations', label: 'Operations' },
 ];
 
 const severityOrder: Record<AlertSeverity, number> = { high: 0, medium: 1, low: 2 };
 
-const categoryColor: Record<AlertCategory, { bg: string; text: string; dot: string }> = {
-  revenue:    { bg: 'bg-[var(--emerald-soft)]', text: 'text-emerald-v', dot: 'bg-emerald-500' },
-  retention:  { bg: 'bg-[var(--blue-soft)]',    text: 'text-blue-v',    dot: 'bg-blue-500' },
-  operations: { bg: 'bg-[var(--violet-soft)]',  text: 'text-violet-v',  dot: 'bg-violet-500' },
-  reputation: { bg: 'bg-[var(--amber-soft)]',   text: 'text-amber-v',   dot: 'bg-amber-500' },
-  staff:      { bg: 'bg-[var(--blue-soft)]',    text: 'text-cyan-v',    dot: 'bg-cyan-500' },
-  inventory:  { bg: 'bg-[var(--amber-soft)]',   text: 'text-amber-v',   dot: 'bg-orange-500' },
+const categoryColor: Record<RadarCategory, { bg: string; text: string; dot: string }> = {
+  operations: { bg: 'bg-[var(--violet-soft)]', text: 'text-violet-v', dot: 'bg-violet-500' },
+  reputation: { bg: 'bg-[var(--amber-soft)]',  text: 'text-amber-v',  dot: 'bg-amber-500' },
 };
 
 const severityConfig: Record<AlertSeverity, { border: string; glow: string }> = {
@@ -100,123 +106,146 @@ function severityFromRisk(value: number): AlertSeverity {
   return 'low';
 }
 
+/**
+ * Competitor.googleRating is `@default(0)`, so an unpopulated competitor row
+ * arrives as "0". Reading that as a rating inverted the whole scale: a record
+ * nobody had filled in scored below every threshold and self-reported as "High
+ * Priority · Signals needing action now". An absent rating is not a bad rating,
+ * so it is treated as absent and only the review volume can still raise the row.
+ */
+function competitorRating(raw: string): number | null {
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function competitorSeverity(rating: number | null, reviewVolume: number): AlertSeverity {
+  const highVolume = reviewVolume > 350;
+  if (rating === null) return highVolume ? 'high' : 'low';
+  if (rating <= 4.2 || highVolume) return 'high';
+  if (rating <= 4.5) return 'medium';
+  return 'low';
+}
+
+// Module-scope loaders: useResource keys a request by the identity of its
+// source, so these must not be re-created on every render.
+const loadBranches = (signal: AbortSignal) => fetchList<ApiBranchOption>('/v1/branches?limit=100', signal);
+const loadCompetitors = (signal: AbortSignal) => fetchList<ApiCompetitorRadar>('/v1/competitors/radar?limit=10', signal);
+
+/**
+ * Two feeds, one claim. See the note on the twin helper in Reviews.tsx: a count
+ * that spans both requests may only be shown once both have answered, otherwise
+ * "4 signals loaded" quietly means "4 that we managed to load". Composes the
+ * shared contract; worth lifting into lib/resourceState.ts when that file is
+ * next open.
+ */
+function combineResourceStates<A, B, R>(
+  a: ResourceState<A>,
+  b: ResourceState<B>,
+  merge: (a: A, b: B) => R,
+): ResourceState<R> {
+  if (a.status === 'error') return a;
+  if (b.status === 'error') return b;
+  if (a.status === 'loading' || b.status === 'loading') return LOADING_STATE;
+  return { status: 'ready', data: merge(a.data, b.data), receivedAt: Math.max(a.receivedAt, b.receivedAt) };
+}
+
 export default function ClinicRadar() {
   const navigate = useNavigate();
-  const { data: branchOptions } = useApiResource<ApiBranchOption, ApiBranchOption>('/v1/branches?limit=100', [], row => row);
-  const [reputation, setReputation] = useState<ReputationResponse | null>(null);
-  const [reputationError, setReputationError] = useState<string | null>(null);
-  const [activeCategory, setActiveCategory] = useState<AlertCategory | 'all'>('all');
-  const [activeTab, setActiveTab] = useState<'opportunity' | 'risk'>('opportunity');
+  // Three independent requests rather than one Promise.all: a user who can read
+  // reputation but not the competitor radar (or the reverse) now sees the half
+  // they are entitled to, with a named failure and a retry beside the half they
+  // are not, instead of the whole screen collapsing to a single error.
+  const branches = useResource<ApiBranchOption[]>(loadBranches);
+  const reputation = useResource<ReputationResponse>('/v1/reputation?limit=10');
+  const competitors = useResource<ApiCompetitorRadar[]>(loadCompetitors);
+
+  const [activeCategory, setActiveCategory] = useState<RadarCategory | 'all'>('all');
+  const [activeTab, setActiveTab] = useState<'all' | 'risk'>('all');
   const [selectedBranchId, setSelectedBranchId] = useState<'all' | string>('all');
-  const [competitors, setCompetitors] = useState<ApiCompetitorRadar[]>([]);
-  const [competitorSource, setCompetitorSource] = useState<'loaded' | 'loading'>('loading');
-  const [competitorError, setCompetitorError] = useState<string | null>(null);
 
-  useEffect(() => {
-    let active = true;
-    Promise.all([
-      apiRequest<ReputationResponse>('/v1/reputation?limit=10'),
-      apiRequest<ApiCompetitorRadar[]>('/v1/competitors/radar?limit=10'),
-    ])
-      .then(([reputationRows, competitorRows]) => {
-        if (!active) return;
-        setReputation(reputationRows);
-        setReputationError(null);
-        setCompetitors(competitorRows);
-        setCompetitorSource('loaded');
-        setCompetitorError(null);
-      })
-      .catch(error => {
-        if (!active) return;
-        const text = error instanceof Error ? error.message : 'Unable to load clinic radar';
-        setReputationError(text);
-        setCompetitorError(text);
-      });
-    return () => {
-      active = false;
+  // Memoised so the empty-list fallback keeps one identity: it is a dependency
+  // of the filter memo below, and a fresh [] on every render would re-run it.
+  const branchOptions = useMemo(() => receivedData(branches.state) ?? [], [branches.state]);
+  const receivedReputation = receivedData(reputation.state);
+  const receivedCompetitors = receivedData(competitors.state);
+
+  const reputationSignals = useMemo<SignalRow[]>(() => (receivedReputation?.cases ?? []).map(caseRow => ({
+    id: caseRow.id,
+    category: 'reputation' as const,
+    severity: severityFromRisk(caseRow.badReviewRisk),
+    title: `${caseRow.branch.name}: ${caseRow.workflowStatus}`,
+    description: caseRow.unresolvedComplaint,
+    action: caseRow.recoveryWorkflow,
+    branchId: caseRow.branchId,
+    branchName: caseRow.branch.name,
+    createdAt: caseRow.createdAt,
+  })), [receivedReputation]);
+
+  const competitorSignals = useMemo<SignalRow[]>(() => (receivedCompetitors ?? []).map(competitor => {
+    const rating = competitorRating(competitor.googleRating);
+    const themes = competitor.complaintThemes.join(' · ');
+    return {
+      id: competitor.id,
+      category: 'operations' as const,
+      severity: competitorSeverity(rating, competitor.reviewVolume),
+      title: `${competitor.name} near ${competitor.branch.name}`,
+      // States what the record holds. The old copy asserted that every
+      // competitor row "is creating a market opening", including rows with no
+      // rating on file.
+      description: `${competitor.reviewVolume} reviews recorded, ${rating === null ? 'no rating on file' : `${rating.toFixed(1)} rating`}${themes ? `. Recorded complaint themes: ${themes}` : '.'}`,
+      action: competitor.marketOpeningRecommendation,
+      branchName: competitor.branch.name,
+      createdAt: competitor.createdAt,
     };
-  }, []);
+  }), [receivedCompetitors]);
 
-  const signals = useMemo<SignalRow[]>(() => {
-    const reputationSignals = (reputation?.cases ?? []).map(caseRow => ({
-      id: caseRow.id,
-      category: 'reputation' as const,
-      severity: severityFromRisk(caseRow.badReviewRisk),
-      title: `${caseRow.branch.name}: ${caseRow.workflowStatus}`,
-      description: caseRow.unresolvedComplaint,
-      action: caseRow.recoveryWorkflow,
-      branchId: caseRow.branchId,
-      branchName: caseRow.branch.name,
-      createdAt: caseRow.createdAt,
-    }));
-
-    const competitorSignals = competitors.map(competitor => {
-      const score = competitor.googleRating ? Number(competitor.googleRating) : 0;
-      const severity: AlertSeverity = score <= 4.2 || competitor.reviewVolume > 350 ? 'high' : score <= 4.5 ? 'medium' : 'low';
-      return {
-        id: competitor.id,
-        category: 'operations' as const,
-        severity,
-        title: `${competitor.name} near ${competitor.branch.name}`,
-        description: `${competitor.reviewVolume} reviews, ${competitor.googleRating} rating, and ${competitor.complaintThemes.join(' · ')} are creating a market opening.`,
-        action: competitor.marketOpeningRecommendation,
-        branchName: competitor.branch.name,
-        createdAt: competitor.createdAt,
-      };
-    });
-
-    return [...reputationSignals, ...competitorSignals];
-  }, [competitors, reputation]);
+  const signals = useMemo(() => [...reputationSignals, ...competitorSignals], [competitorSignals, reputationSignals]);
 
   const filtered = useMemo(() => {
     let list = activeCategory === 'all' ? signals : signals.filter(a => a.category === activeCategory);
     if (activeTab === 'risk') list = list.filter(a => a.severity === 'high' || a.severity === 'medium');
     if (selectedBranchId !== 'all') {
-      const selectedBranchName = branchOptions.find(branch => branch.id === selectedBranchId)?.name;
-      list = list.filter(a => a.branchId === selectedBranchId || (selectedBranchName && a.branchName === selectedBranchName));
+      const branchName = branchOptions.find(branch => branch.id === selectedBranchId)?.name;
+      list = list.filter(a => a.branchId === selectedBranchId || (branchName && a.branchName === branchName));
     }
     return [...list].sort((a, b) => severityOrder[a.severity] - severityOrder[b.severity]);
   }, [activeCategory, activeTab, selectedBranchId, branchOptions, signals]);
 
   const selectedBranchName = selectedBranchId === 'all' ? 'All clinics' : branchOptions.find(branch => branch.id === selectedBranchId)?.name ?? 'All clinics';
-  const visibleCompetitors = selectedBranchId === 'all'
-    ? competitors
-    : competitors.filter(competitor => competitor.branch.name === selectedBranchName);
-  const highCount = signals.filter(signal => signal.severity === 'high').length;
-  const medCount = signals.filter(signal => signal.severity === 'medium').length;
-  const loadError = reputationError || competitorError;
+
+  // The signal board itself is useful with one feed down, so it renders what
+  // arrived and names what did not. The counts above it are not: a total drawn
+  // from half the feeds is not a total, so it waits for both.
+  const signalTotals = combineResourceStates(reputation.state, competitors.state, () => ({
+    total: signals.length,
+    high: signals.filter(signal => signal.severity === 'high').length,
+    medium: signals.filter(signal => signal.severity === 'medium').length,
+  }));
+  const boardState = combineResourceStates(reputation.state, competitors.state, () => filtered);
+  const anyFeedFailed = reputation.state.status === 'error' || competitors.state.status === 'error';
+
+  const reloadSignals = () => { reputation.reload(); competitors.reload(); };
+
+  const signalTabs = [
+    { id: 'all', label: 'All signals' },
+    { id: 'risk', label: 'Needs action' },
+  ];
 
   return (
     <div className="space-y-6 pb-8">
       <PageHeader
         title="ClinicRadar"
         subtitle="Review stored reputation and competitor records as operational signals before deciding what to do next."
-        badge={loadError ? 'Data unavailable' : competitorSource === 'loading' ? 'Loading signals' : `${signals.length} signals loaded`}
-        badgeColor={loadError ? 'red' : highCount > 0 ? 'amber' : 'blue'}
+        badge={
+          signalTotals.status === 'loading' ? 'Loading signals'
+            : signalTotals.status === 'error' ? 'Data unavailable'
+              : `${signals.length} signal${signals.length === 1 ? '' : 's'} loaded`
+        }
+        badgeColor={signalTotals.status === 'error' ? 'red' : signalTotals.status === 'loading' ? 'blue' : signals.some(s => s.severity === 'high') ? 'amber' : 'blue'}
         actions={
           <button
             type="button"
-            onClick={() => {
-              setCompetitorSource('loading');
-              setCompetitorError(null);
-              setReputationError(null);
-              setReputation(null);
-              setCompetitors([]);
-              void Promise.all([
-                apiRequest<ReputationResponse>('/v1/reputation?limit=10'),
-                apiRequest<ApiCompetitorRadar[]>('/v1/competitors/radar?limit=10'),
-              ])
-                .then(([reputationRows, competitorRows]) => {
-                  setReputation(reputationRows);
-                  setCompetitors(competitorRows);
-                  setCompetitorSource('loaded');
-                })
-                .catch(error => {
-                  const text = error instanceof Error ? error.message : 'Unable to load clinic radar';
-                  setReputationError(text);
-                  setCompetitorError(text);
-                });
-            }}
+            onClick={reloadSignals}
             className="inline-flex items-center gap-2 rounded-xl bg-[var(--s3)] px-4 py-2 text-sm font-semibold text-t1 hover:bg-[var(--s3)] border border-[var(--b1)] transition"
           >
             <Radar className="w-4 h-4" /> Refresh signals
@@ -224,35 +253,56 @@ export default function ClinicRadar() {
         }
       />
 
-      {loadError && (
-        <div role="alert" className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          ClinicRadar data is unavailable. {loadError}
-        </div>
-      )}
-
       {/* Summary KPI strip */}
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <div className="bg-[var(--s2)] rounded-2xl border border-[var(--b1)] p-4">
-          <p className="text-[10px] font-bold uppercase tracking-widest text-t3 mb-2">Signals loaded</p>
-          <p className="text-2xl font-bold text-t1 tabular-nums">{signals.length}</p>
-          <p className="text-xs text-t3 mt-0.5">Current result set</p>
-        </div>
-        <div className="bg-[var(--red-soft)] rounded-2xl border border-[var(--b1)] p-4">
-          <p className="text-[10px] font-bold uppercase tracking-widest text-red-v mb-2">High Priority</p>
-          <p className="text-2xl font-bold text-red-v tabular-nums">{highCount}</p>
-          <p className="text-xs text-red-v/70 mt-0.5">Signals needing action now</p>
-        </div>
-        <div className="bg-[var(--amber-soft)] rounded-2xl border border-[var(--b1)] p-4">
-          <p className="text-[10px] font-bold uppercase tracking-widest text-amber-v mb-2">Medium Priority</p>
-          <p className="text-2xl font-bold text-amber-v tabular-nums">{medCount}</p>
-          <p className="text-xs text-amber-v/70 mt-0.5">Monitor and schedule</p>
-        </div>
-        <div className="bg-[var(--violet-soft)] rounded-2xl border border-[var(--b1)] p-4">
+        <ResourceSection
+          label="Signal counts"
+          state={signalTotals}
+          onRetry={reloadSignals}
+          className="col-span-2 sm:col-span-3"
+          compact
+          loading={<>{[0, 1, 2].map(i => <div key={i} className="skeleton-line h-28 rounded-2xl" />)}</>}
+          isEmpty={() => false}
+        >
+          {totals => (
+            <>
+              <div className="bg-[var(--s2)] rounded-2xl border border-[var(--b1)] p-4">
+                <p className="text-[10px] font-bold uppercase tracking-widest text-t3 mb-2">Signals loaded</p>
+                <p className="text-2xl font-bold text-t1 tabular-nums">{totals.total}</p>
+                <p className="text-xs text-t3 mt-0.5">Current result set</p>
+              </div>
+              <div className="bg-[var(--red-soft)] rounded-2xl border border-[var(--b1)] p-4">
+                <p className="text-[10px] font-bold uppercase tracking-widest text-red-v mb-2">High Priority</p>
+                <p className="text-2xl font-bold text-red-v tabular-nums">{totals.high}</p>
+                <p className="text-xs text-red-v/70 mt-0.5">Signals needing action now</p>
+              </div>
+              <div className="bg-[var(--amber-soft)] rounded-2xl border border-[var(--b1)] p-4">
+                <p className="text-[10px] font-bold uppercase tracking-widest text-amber-v mb-2">Medium Priority</p>
+                <p className="text-2xl font-bold text-amber-v tabular-nums">{totals.medium}</p>
+                <p className="text-xs text-amber-v/70 mt-0.5">Monitor and schedule</p>
+              </div>
+            </>
+          )}
+        </ResourceSection>
+
+        {/* "0 open cases" is a safety claim, so it comes only from a response
+            that actually said zero — never from a refresh in flight. */}
+        <ResourceSection
+          label="Open reputation cases"
+          state={reputation.state}
+          onRetry={reputation.reload}
+          compact
+          loading={<div className="skeleton-line h-28 rounded-2xl" />}
+        >
+          {data => (
+            <div className="bg-[var(--violet-soft)] rounded-2xl border border-[var(--b1)] p-4">
               <p className="text-[10px] font-bold uppercase tracking-widest text-violet-v mb-2">Open reputation cases</p>
-              <p className="text-2xl font-bold text-violet-v tabular-nums">{reputation?.summary.unresolvedCases ?? 0}</p>
+              <p className="text-2xl font-bold text-violet-v tabular-nums">{data.summary.unresolvedCases}</p>
               <p className="text-xs text-violet-v/70 mt-0.5">Recorded as unresolved</p>
             </div>
-          </div>
+          )}
+        </ResourceSection>
+      </div>
 
       <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-3">
         <p className="text-xs font-semibold text-t2">Clinic</p>
@@ -291,157 +341,242 @@ export default function ClinicRadar() {
                   </button>
                 ))}
               </div>
-              <div className="flex items-center gap-1 bg-[var(--s3)] p-1 rounded-xl shrink-0">
-                <button
-                  type="button"
-                  onClick={() => setActiveTab('opportunity')}
-                  className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${activeTab === 'opportunity' ? 'bg-[var(--s2)] text-t1' : 'text-t3'}`}
-                >
-                  Opportunities
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveTab('risk')}
-                  className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${activeTab === 'risk' ? 'bg-[var(--s2)] text-t1' : 'text-t3'}`}
-                >
-                  Risks
-                </button>
+              {/* Was "Opportunities | Risks", where "Opportunities" applied no
+                  filter at all. The pair is what it does: everything, or the
+                  high and medium rows. */}
+              <div className="shrink-0">
+                <ModuleTabs tabs={signalTabs} activeTab={activeTab} onChange={id => setActiveTab(id as 'all' | 'risk')} ariaLabel="Signal severity" />
               </div>
             </div>
 
-            <div className="space-y-3">
-              {filtered.length === 0 && <p className="py-8 text-center text-sm text-t3">No signals match the selected clinic and filters.</p>}
-              {filtered.map((alert) => {
-                const cat = categoryColor[alert.category];
-                const sev = severityConfig[alert.severity];
+            {anyFeedFailed && reputation.state.status !== competitors.state.status && (
+              <p role="status" className="mb-3 rounded-xl border border-[var(--b1)] bg-[var(--amber-soft)] px-3 py-2 text-[11px] text-amber-v">
+                {reputation.state.status === 'error' ? 'Reputation cases' : 'Competitor records'} did not load, so this board shows only the {reputation.state.status === 'error' ? 'competitor' : 'reputation'} signals. It is not a complete picture.
+              </p>
+            )}
+
+            <ResourceSection
+              label="Signals"
+              state={boardState}
+              onRetry={reloadSignals}
+              lines={3}
+              rowClassName="h-28 rounded-2xl"
+              // The board owns its own two empty claims below, which have to
+              // tell "nothing recorded" apart from "nothing matches".
+              isEmpty={() => false}
+            >
+              {rows => {
+                if (rows.length === 0) {
+                  const filtersActive = activeCategory !== 'all' || activeTab !== 'all' || selectedBranchId !== 'all';
+                  return filtersActive ? (
+                    <EmptyStatePremium
+                      icon={<Filter className="w-5 h-5" />}
+                      title="No signals match these filters"
+                      description={`${signals.length} signal${signals.length === 1 ? ' is' : 's are'} loaded, and none of them match the current clinic, category and severity selection.`}
+                      cta={{ label: 'Clear filters', onClick: () => { setActiveCategory('all'); setActiveTab('all'); setSelectedBranchId('all'); } }}
+                    />
+                  ) : (
+                    <EmptyStatePremium
+                      icon={<Radar className="w-5 h-5" />}
+                      title="No signals recorded"
+                      description="Both feeds loaded successfully and this workspace has no reputation cases or competitor records to raise. Nothing here needs action right now."
+                      cta={{ label: 'Refresh signals', onClick: reloadSignals }}
+                    />
+                  );
+                }
                 return (
-                  <div key={alert.id} className={`rounded-2xl border border-[var(--b1)] border-l-2 p-4 hover:bg-[var(--s3)] transition-all ${sev.border} ${sev.glow}`}>
-                    <div className="flex items-start gap-3">
-                      <div className={`w-8 h-8 rounded-xl flex items-center justify-center shrink-0 ${cat.bg}`}>
-                        <span className={`w-2.5 h-2.5 rounded-full ${cat.dot}`} />
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-start justify-between gap-3 mb-1">
-                          <p className="text-sm font-bold text-t1 leading-tight">{alert.title}</p>
-                          <RiskBadge level={alert.severity} size="sm" />
-                        </div>
+                  <div className="space-y-3">
+                    {rows.map((alert) => {
+                      const cat = categoryColor[alert.category];
+                      const sev = severityConfig[alert.severity];
+                      return (
+                        <div key={alert.id} className={`rounded-2xl border border-[var(--b1)] border-l-2 p-4 hover:bg-[var(--s3)] transition-all ${sev.border} ${sev.glow}`}>
+                          <div className="flex items-start gap-3">
+                            <div className={`w-8 h-8 rounded-xl flex items-center justify-center shrink-0 ${cat.bg}`}>
+                              <span className={`w-2.5 h-2.5 rounded-full ${cat.dot}`} />
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-start justify-between gap-3 mb-1">
+                                <p className="text-sm font-bold text-t1 leading-tight">{alert.title}</p>
+                                <RiskBadge level={alert.severity} size="sm" />
+                              </div>
 
-                        <div className="flex items-center gap-2 mb-2">
-                          <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-full ${cat.bg} ${cat.text}`}>
-                            {alert.category}
-                          </span>
-                          {alert.branchId && (
-                            <span className="text-[10px] text-t3">·</span>
-                          )}
-                        </div>
+                              <div className="flex items-center gap-2 mb-2">
+                                <span className={`text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-full ${cat.bg} ${cat.text}`}>
+                                  {alert.category}
+                                </span>
+                                {alert.branchName && (
+                                  <span className="text-[10px] text-t3">{alert.branchName}</span>
+                                )}
+                              </div>
 
-                        <p className="text-xs text-t3 leading-relaxed mb-3">{alert.description}</p>
+                              <p className="text-xs text-t3 leading-relaxed mb-3">{alert.description}</p>
 
-                        <div className="flex items-center justify-end gap-3">
-                          <div className="flex items-center gap-2">
-                          <button type="button" onClick={() => navigate(
-                            alert.category === 'reputation' ? '/reviews' :
-                            alert.category === 'staff' ? '/staff' :
-                            alert.category === 'inventory' ? '/inventory' :
-                            '/campaigner',
-                            alert.category === 'revenue' || alert.category === 'retention'
-                              ? { state: { title: alert.title, branchName: alert.branchId ? branchOptions.find(branch => branch.id === alert.branchId)?.name : undefined, recommendedAction: alert.action } }
-                              : undefined,
-                          )} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition-colors">
-                              <Zap className="w-3 h-3" /> Review action
-                            </button>
+                              <div className="flex items-center justify-end gap-3">
+                                <div className="flex items-center gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => navigate(alert.category === 'reputation' ? '/reviews' : '/campaigner')}
+                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 transition-colors"
+                                  >
+                                    <Zap className="w-3 h-3" /> Review action
+                                  </button>
+                                </div>
+                              </div>
+
+                              <div className="mt-3 p-2.5 rounded-xl bg-[var(--s3)] border border-[var(--b1)]">
+                                <p className="text-[11px] font-semibold text-t2">
+                                  <span className="text-t3 mr-1">Recommended:</span>
+                                  {alert.action}
+                                </p>
+                              </div>
+                            </div>
                           </div>
                         </div>
-
-                        <div className="mt-3 p-2.5 rounded-xl bg-[var(--s3)] border border-[var(--b1)]">
-                          <p className="text-[11px] font-semibold text-t2">
-                            <span className="text-t3 mr-1">Recommended:</span>
-                            {alert.action}
-                          </p>
-                        </div>
-                      </div>
-                    </div>
+                      );
+                    })}
                   </div>
                 );
-              })}
-            </div>
+              }}
+            </ResourceSection>
           </div>
         </div>
 
         {/* Right sidebar */}
         <div className="space-y-4">
-          {/* Branch heatmap */}
-          <BentoCard title="Nearby Competitors" subtitle="Local openings, ratings, and complaint themes" headerRight={
-            <span className="badge badge-blue">{competitorSource === 'loaded' ? 'Data loaded' : 'Loading'}</span>
-          }>
-            <div className="space-y-3">
-              {visibleCompetitors.length === 0 && (
-                <p className="text-xs text-t3">No competitor records are available for the selected clinic.</p>
-              )}
-              {visibleCompetitors.map((competitor) => (
-                <div key={competitor.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <p className="text-sm font-bold text-t1">{competitor.name}</p>
-                      <p className="text-[10px] text-t3 mt-0.5">{competitor.branch.name} · {competitor.distanceKm} km away</p>
-                    </div>
-                    <div className="text-right shrink-0">
-                      <p className="text-sm font-bold text-t1">{Number(competitor.googleRating).toFixed(1)}</p>
-                      <p className="text-[10px] text-t3">{competitor.reviewVolume} reviews</p>
-                    </div>
+          <BentoCard title="Nearby Competitors" subtitle="Local openings, ratings, and complaint themes">
+            <ResourceSection
+              label="Competitor records"
+              state={competitors.state}
+              onRetry={competitors.reload}
+              lines={2}
+              rowClassName="h-32 rounded-xl"
+              empty={{
+                icon: <Store className="w-5 h-5" />,
+                title: 'No competitor records',
+                description: 'The competitor radar loaded successfully and this workspace has no competitor records on file.',
+              }}
+            >
+              {rows => {
+                const visible = selectedBranchId === 'all' ? rows : rows.filter(competitor => competitor.branch.name === selectedBranchName);
+                if (visible.length === 0) {
+                  return (
+                    <EmptyStatePremium
+                      icon={<Filter className="w-5 h-5" />}
+                      title="No competitors for this clinic"
+                      description={`${rows.length} competitor record${rows.length === 1 ? ' is' : 's are'} loaded, and none of them are recorded against ${selectedBranchName}.`}
+                      cta={{ label: 'Show all clinics', onClick: () => setSelectedBranchId('all') }}
+                    />
+                  );
+                }
+                return (
+                  <div className="space-y-3">
+                    {visible.map((competitor) => {
+                      const rating = competitorRating(competitor.googleRating);
+                      return (
+                        <div key={competitor.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <p className="text-sm font-bold text-t1">{competitor.name}</p>
+                              <p className="text-[10px] text-t3 mt-0.5">{competitor.branch.name} · {competitor.distanceKm} km away</p>
+                            </div>
+                            <div className="text-right shrink-0">
+                              {/* An unset googleRating is "0" in the database,
+                                  and Number('').toFixed(1) was rendering NaN. */}
+                              {rating === null
+                                ? <p className="text-[10px] font-semibold text-t3">No rating on file</p>
+                                : <p className="text-sm font-bold text-t1">{rating.toFixed(1)}</p>}
+                              <p className="text-[10px] text-t3">{competitor.reviewVolume} reviews</p>
+                            </div>
+                          </div>
+                          <div className="mt-2 flex flex-wrap gap-1.5">
+                            {competitor.activeOffers.slice(0, 2).map(offer => (
+                              <span key={offer} className="badge badge-blue">{offer}</span>
+                            ))}
+                          </div>
+                          <p className="text-xs text-t2 mt-2">{competitor.weaknessSummary}</p>
+                          <p className="text-[11px] text-amber-v mt-2">{competitor.opportunityAlert}</p>
+                          {competitor.complaintThemes.length > 0 && (
+                            <p className="text-[11px] text-t3 mt-1">Weak themes: {competitor.complaintThemes.join(' · ')}</p>
+                          )}
+                          <p className="text-[11px] text-indigo mt-2 font-semibold">{competitor.marketOpeningRecommendation}</p>
+                        </div>
+                      );
+                    })}
                   </div>
-                  <div className="mt-2 flex flex-wrap gap-1.5">
-                    {competitor.activeOffers.slice(0, 2).map(offer => (
-                      <span key={offer} className="badge badge-blue">{offer}</span>
-                    ))}
-                  </div>
-                  <p className="text-xs text-t2 mt-2">{competitor.weaknessSummary}</p>
-                  <p className="text-[11px] text-amber-v mt-2">{competitor.opportunityAlert}</p>
-                  <p className="text-[11px] text-t3 mt-1">Weak themes: {competitor.complaintThemes.join(' · ')}</p>
-                  <p className="text-[11px] text-indigo mt-2 font-semibold">{competitor.marketOpeningRecommendation}</p>
-                </div>
-              ))}
-            </div>
+                );
+              }}
+            </ResourceSection>
           </BentoCard>
 
           <BentoCard title="Signals by branch" subtitle="Count of loaded records that need review" headerRight={<BarChart3 className="w-4 h-4 text-t3" />}>
-            <div className="space-y-3">
-              {branchOptions.map((branch) => {
-                const signalCount = signals.filter(signal => signal.branchId === branch.id || signal.branchName === branch.name).length;
-                return (
-                <div key={branch.id}>
-                  <div className="flex items-center justify-between gap-2 mb-1.5">
-                    <p className="text-xs font-semibold text-t2 truncate">{branch.name}</p>
-                    <span className={`badge ${signalCount > 0 ? 'badge-amber' : 'badge-blue'}`}>{signalCount} signal{signalCount === 1 ? '' : 's'}</span>
-                  </div>
-                  <p className="text-[11px] text-t3">{signalCount > 0 ? 'Review source records before taking action.' : 'No current signals in this result set.'}</p>
+            <ResourceSection
+              label="Signals by branch"
+              state={combineResourceStates(branches.state, signalTotals, (branchRows) => branchRows)}
+              onRetry={() => { branches.reload(); reloadSignals(); }}
+              lines={3}
+              rowClassName="h-12 rounded-xl"
+              empty={{
+                title: 'No clinics recorded',
+                description: 'The clinic list loaded successfully and this workspace has no clinic records.',
+              }}
+            >
+              {rows => (
+                <div className="space-y-3">
+                  {rows.map((branch) => {
+                    const signalCount = signals.filter(signal => signal.branchId === branch.id || signal.branchName === branch.name).length;
+                    return (
+                      <div key={branch.id}>
+                        <div className="flex items-center justify-between gap-2 mb-1.5">
+                          <p className="text-xs font-semibold text-t2 truncate">{branch.name}</p>
+                          <span className={`badge ${signalCount > 0 ? 'badge-amber' : 'badge-blue'}`}>{signalCount} signal{signalCount === 1 ? '' : 's'}</span>
+                        </div>
+                        <p className="text-[11px] text-t3">{signalCount > 0 ? 'Review source records before taking action.' : 'No current signals in this result set.'}</p>
+                      </div>
+                    );
+                  })}
                 </div>
-              );})}
-            </div>
+              )}
+            </ResourceSection>
           </BentoCard>
 
           {/* Signal timeline */}
           <BentoCard title="Signal Timeline" subtitle="Recent detections">
-            <div className="space-y-3">
-              {signals.slice(0, 6).map((alert, i) => (
-                <div key={alert.id} className="flex items-start gap-3">
-                  <div className="flex flex-col items-center gap-1">
-                    <div className={`w-2 h-2 rounded-full mt-1 shrink-0 ${
-                      alert.severity === 'high' ? 'bg-red-500' :
-                      alert.severity === 'medium' ? 'bg-amber-500' : 'bg-[var(--b2)]'
-                    }`} />
-                    {i < 5 && <div className="w-px h-6 bg-[var(--b1)]" />}
-                  </div>
-                  <div className="flex-1 min-w-0 pb-1">
-                    <p className="text-xs font-semibold text-t1 leading-tight">{alert.title.split(':')[0]}</p>
-                    <p className="text-[10px] text-t3 mt-0.5">
-                      {new Date(alert.createdAt).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} ·{' '}
-                      {new Date(alert.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}
-                    </p>
-                  </div>
+            <ResourceSection
+              label="Signal timeline"
+              state={combineResourceStates(reputation.state, competitors.state, () => signals)}
+              onRetry={reloadSignals}
+              lines={3}
+              rowClassName="h-10 rounded-xl"
+              empty={{
+                icon: <Radar className="w-5 h-5" />,
+                title: 'No detections recorded',
+                description: 'Both feeds loaded successfully and neither has a record to place on the timeline.',
+              }}
+            >
+              {rows => (
+                <div className="space-y-3">
+                  {rows.slice(0, 6).map((alert, i) => (
+                    <div key={alert.id} className="flex items-start gap-3">
+                      <div className="flex flex-col items-center gap-1">
+                        <div className={`w-2 h-2 rounded-full mt-1 shrink-0 ${
+                          alert.severity === 'high' ? 'bg-red-500' :
+                          alert.severity === 'medium' ? 'bg-amber-500' : 'bg-[var(--b2)]'
+                        }`} />
+                        {i < Math.min(rows.length, 6) - 1 && <div className="w-px h-6 bg-[var(--b1)]" />}
+                      </div>
+                      <div className="flex-1 min-w-0 pb-1">
+                        <p className="text-xs font-semibold text-t1 leading-tight">{alert.title.split(':')[0]}</p>
+                        <p className="text-[10px] text-t3 mt-0.5">
+                          {new Date(alert.createdAt).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} ·{' '}
+                          {new Date(alert.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}
+                        </p>
+                      </div>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
+              )}
+            </ResourceSection>
           </BentoCard>
 
           {/* Decision checklist */}

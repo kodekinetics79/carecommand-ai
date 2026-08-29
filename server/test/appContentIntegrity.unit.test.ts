@@ -28,7 +28,11 @@ describe('general app content integrity', () => {
     const page = source('src/pages/Reviews.tsx');
 
     expect(page).toContain('External delivery is not confirmed here.');
-    expect(page).toContain('Record drafted response');
+    // The canned-compliment button became a real composer: staff must type the
+    // response, so the label changed. What must NOT change is that recording a
+    // response never claims the platform published it.
+    expect(page).toContain('Record response');
+    expect(page).not.toContain('Thank you so much for taking the time to share your feedback');
     expect(page).not.toContain('Send AI Response');
     expect(page).not.toContain('Response sent');
     expect(page).not.toContain('18 referrals');
@@ -41,12 +45,24 @@ describe('general app content integrity', () => {
     const labs = source('src/pages/Labs.tsx');
     const providers = source('src/pages/DoctorWorkspace.tsx');
 
-    expect(adapters).toContain("patientName: 'Reviewer name unavailable'");
+    // GET /v1/reviews loads no author relation, so ReviewRow carries no author
+    // field at all rather than stamping one invented name on every row. The
+    // remaining gaps stay visible as null instead of being coerced into a
+    // plausible value (NaN rating, 'internal' platform, 'neutral' sentiment).
+    expect(adapters).not.toContain("'Reviewer name unavailable'");
+    expect(adapters).toContain('rating: Number.isFinite(rating) ? rating : null');
+    expect(adapters).toContain('platform,');
     expect(adapters).toContain("patientName: row.patient ? `${row.patient.firstName} ${row.patient.lastName}` : 'Patient not linked'");
     expect(adapters).not.toContain('Live DB Customer');
     expect(adapters).not.toContain("doctorName: row.providerRef ?? 'Assigned provider'");
-    expect(reviews).toContain("reviewMetricsReady ? avgRating : '—'");
-    expect(reviews).toContain("reputationMetricsReady ? reputation.summary.pendingReviewRequests : '—'");
+    // The per-value readiness ternaries became a structural gate: the figures
+    // live inside ResourceSection render props, which only run in the ready
+    // state, so a loading or failed fetch cannot reach a number at all.
+    expect(reviews).toContain('state={reviews.state}');
+    expect(reviews).toContain('state={reputation.state}');
+    expect(reviews).toContain("avgRating ?? 'No ratings recorded'");
+    // An unrecognised sentiment is unclassified, never counted as positive.
+    expect(reviews).toContain("sentimentPct === null ? 'Not classified'");
     expect(labs).toContain("value={metricsReady ? openCount : '—'}");
     expect(providers).toContain("value={metricsReady ? providerRecords.length : '—'}");
   });

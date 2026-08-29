@@ -9,7 +9,7 @@ if (!process.env.RLS_DISPOSABLE_DB) {
   describe('RLS behavioral evidence execution guard', () => {
     it('requires the explicit disposable-database lifecycle', () => {
       expect(process.env.RLS_DISPOSABLE_DB).toBeUndefined();
-      expect(RLS_TABLE_ADAPTERS).toHaveLength(124);
+      expect(RLS_TABLE_ADAPTERS).toHaveLength(128);
     });
   });
 } else {
@@ -24,9 +24,9 @@ if (!process.env.RLS_DISPOSABLE_DB) {
   });
 
   describe('RLS behavioral adapter inventory', () => {
-    it('contains exactly one adapter for all 124 deployed protected tables', () => {
-      expect(RLS_TABLE_ADAPTERS).toHaveLength(124);
-      expect(new Set(RLS_TABLE_ADAPTERS.map(adapter => adapter.table)).size).toBe(124);
+    it('contains exactly one adapter for all 128 deployed protected tables', () => {
+      expect(RLS_TABLE_ADAPTERS).toHaveLength(128);
+      expect(new Set(RLS_TABLE_ADAPTERS.map(adapter => adapter.table)).size).toBe(128);
     });
   });
 

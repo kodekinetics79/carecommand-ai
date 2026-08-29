@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { env } from '../../config/env';
 import { audit } from '../../lib/audit';
-import { requireRoles } from '../../plugins/roles';
+import { requirePermission } from '../../lib/permissions';
 import { requireFeature, isFeatureEnabled } from '../../lib/entitlements';
 import { emitBusinessEvent, upsertSignal, createRecommendation, type WorkflowEventType } from '../../lib/intelligence';
 import type { Campaign } from '../../generated/prisma/client';
@@ -31,9 +31,26 @@ import { applyCampaignDeliveryWebhook } from '../../lib/campaignDeliveryWebhook'
 // ===========================================================================
 
 const uuid = z.string().uuid();
+
+// --- Guards ---------------------------------------------------------------
+// Entitlement (`requireFeature`) answers "does this tenant's plan include the
+// product?" — it is NOT an authorization gate. Authorization is the permission
+// layer, which is the only guard that honours a tenant's RoleDefinition
+// override; `requireRoles` ignores overrides, so a tenant that revoked
+// `campaign:manage` from a role still got write access here. Every route below
+// therefore carries an explicit `[permission, entitlement]` preHandler pair, in
+// that order, so an unauthorized caller is refused before any entitlement or
+// resource state is disclosed. This mirrors server/modules/operations/routes.ts.
 const campaignFeature = requireFeature('campaign_automation');
-const writeRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'FRONT_DESK');
-const launchRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'BILLING');
+// Communication consent is patient data, not campaign automation: it belongs to
+// the Patient CRM entitlement that every plan tier includes.
+const patientCrmFeature = requireFeature('patient_crm');
+const campaignRead = requirePermission('campaign:read');
+const campaignManage = requirePermission('campaign:manage');
+// Audience previews, consent, and suppression records expose patient identity
+// and contact evidence, so they take the SAME grant as GET /v1/leads.
+const crmRead = requirePermission('crm:read');
+const crmWrite = requirePermission('crm:write');
 const channelEnum = z.enum(['sms', 'email', 'voice', 'whatsapp']);
 const voicePurpose = z.enum(['CARE_COORDINATION', 'APPOINTMENT_REMINDER', 'PATIENT_REACTIVATION']);
 const voiceCaptureMethod = z.enum(['verbal_recorded', 'written', 'staff_attestation', 'import_verified']);
@@ -84,18 +101,22 @@ function campaignActions(c: Campaign): string[] {
 }
 
 export const crmRoutes: FastifyPluginAsync = async app => {
-  app.addHook('preHandler', campaignFeature);
+  // NOTE: there is deliberately NO module-wide preHandler. A single
+  // `app.addHook('preHandler', campaignFeature)` installed only the entitlement
+  // check, which left every GET below reachable by ANY authenticated role in an
+  // entitled tenant, and coupled the patient-data consent read to the campaign
+  // entitlement. Guards are declared per route so each data class is explicit.
 
   // ----- Communications provider readiness (truthful; no secret values) ---
-  app.get('/provider-status', async () => providerReadiness());
+  app.get('/provider-status', { preHandler: [campaignRead, campaignFeature] }, async () => providerReadiness());
 
   // ----- Campaigns CRUD ---------------------------------------------------
-  app.get('/campaigns', async request => {
+  app.get('/campaigns', { preHandler: [campaignRead, campaignFeature] }, async request => {
     const rows = await db.campaign.findMany({ where: { tenantId: request.auth.tenantId, campaignType: { not: null }, archivedAt: null }, orderBy: { createdAt: 'desc' }, take: 100 });
     return rows.map(mapCampaign);
   });
 
-  app.get('/campaigns/:id', async request => {
+  app.get('/campaigns/:id', { preHandler: [campaignRead, campaignFeature] }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!c) throw app.httpErrors.notFound('Campaign not found');
@@ -103,7 +124,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     return { ...mapCampaign(c), deliveryCounts: Object.fromEntries(deliveries.map(d => [d.status, d._count])) };
   });
 
-  app.post('/campaigns', { preHandler: writeRoles }, async (request, reply) => {
+  app.post('/campaigns', { preHandler: [campaignManage, campaignFeature] }, async (request, reply) => {
     const input = z.object({
       name: z.string().trim().min(2).max(160),
       campaignType: z.enum(CAMPAIGN_TYPES),
@@ -126,7 +147,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     return reply.code(201).send(mapCampaign(row));
   });
 
-  app.patch('/campaigns/:id', { preHandler: writeRoles }, async request => {
+  app.patch('/campaigns/:id', { preHandler: [campaignManage, campaignFeature] }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const input = z.object({ name: z.string().trim().min(2).max(160).optional(), messageSubject: z.string().max(200).optional(), messageTemplate: z.string().max(2000).optional(), channel: channelEnum.optional(), scheduledAt: z.coerce.date().optional() }).parse(request.body);
     const existing = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
@@ -138,7 +159,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
   });
 
   // ----- Rule-based draft generation (requires approval before launch) ----
-  app.post('/campaigns/:id/draft', { preHandler: writeRoles }, async request => {
+  app.post('/campaigns/:id/draft', { preHandler: [campaignManage, campaignFeature] }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!c) throw app.httpErrors.notFound('Campaign not found');
@@ -162,17 +183,20 @@ export const crmRoutes: FastifyPluginAsync = async app => {
   });
 
   // ----- Audience preview (deterministic, consent-gated) ------------------
-  app.get('/audiences/:type/preview', async (request, reply) => {
+  // The preview returns real patient names, a reason string, and a masked
+  // destination, so it is a patient-data read: same grant as GET /v1/leads, and
+  // scoped to the caller's branch like every other patient-facing surface.
+  app.get('/audiences/:type/preview', { preHandler: [crmRead, campaignFeature] }, async (request, reply) => {
     const { type } = z.object({ type: z.enum(AUDIENCE_TYPES) }).parse(request.params);
     const query = z.object({ channel: channelEnum.default('sms') }).parse(request.query);
     if (!(await isFeatureEnabled(request.auth.tenantId, AUDIENCE_FEATURE[type]))) {
       return reply.code(403).send({ error: 'feature_locked', feature: AUDIENCE_FEATURE[type], message: `Audience source ${type} requires ${AUDIENCE_FEATURE[type]}.` });
     }
-    return previewAudience(request.auth.tenantId, type, query.channel);
+    return previewAudience(request.auth.tenantId, type, query.channel, { branchId: request.auth.branchId });
   });
 
   // ----- Approve ----------------------------------------------------------
-  app.post('/campaigns/:id/approve', { preHandler: launchRoles }, async request => {
+  app.post('/campaigns/:id/approve', { preHandler: [campaignManage, campaignFeature] }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const authorization = z.object({
       previewFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
@@ -218,7 +242,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
   // The fingerprint binds the exact recipient eligibility snapshot, message
   // revision, channel, provider identity, and provider mode without returning
   // recipient identifiers or destinations to the browser.
-  app.get('/campaigns/:id/launch-preview', { preHandler: launchRoles }, async request => {
+  app.get('/campaigns/:id/launch-preview', { preHandler: [campaignManage, campaignFeature] }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId, archivedAt: null } });
     if (!c) throw app.httpErrors.notFound('Campaign not found');
@@ -227,7 +251,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
   });
 
   // ----- Launch (build audience → idempotent deliveries) ------------------
-  app.post('/campaigns/:id/launch', { preHandler: launchRoles }, async (request, reply) => {
+  app.post('/campaigns/:id/launch', { preHandler: [campaignManage, campaignFeature] }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const body = z.object({
       force: z.boolean().default(false),
@@ -302,7 +326,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     });
   });
 
-  app.post('/campaigns/:id/pause', { preHandler: launchRoles }, async request => {
+  app.post('/campaigns/:id/pause', { preHandler: [campaignManage, campaignFeature] }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!c) throw app.httpErrors.notFound('Campaign not found');
@@ -311,7 +335,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     return mapCampaign(row);
   });
 
-  app.post('/campaigns/:id/cancel', { preHandler: launchRoles }, async request => {
+  app.post('/campaigns/:id/cancel', { preHandler: [campaignManage, campaignFeature] }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!c) throw app.httpErrors.notFound('Campaign not found');
@@ -321,7 +345,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
   });
 
   // ----- Archive (preserve campaign + delivery evidence) ------------------
-  app.delete('/campaigns/:id', { preHandler: launchRoles }, async (request, reply) => {
+  app.delete('/campaigns/:id', { preHandler: [campaignManage, campaignFeature] }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const c = await db.campaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!c) throw app.httpErrors.notFound('Campaign not found');
@@ -363,7 +387,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     return null;
   }
 
-  app.post('/leads/:id/send', { preHandler: writeRoles }, async (request, reply) => {
+  app.post('/leads/:id/send', { preHandler: [crmWrite, campaignFeature] }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const body = z.object({ cta: z.enum(LEAD_SEND_CTAS), channel: z.enum(['sms', 'email', 'whatsapp']).optional() }).parse(request.body);
     const lead = await db.lead.findFirst({ where: { id, tenantId: request.auth.tenantId } });
@@ -428,15 +452,15 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     return { id: r.id, templateKey: r.templateKey, name: r.name, triggerType: r.triggerType, actionType: r.actionType, config: r.config ?? {}, enabled: r.enabled, lastRunAt: r.lastRunAt?.toISOString() ?? null, lastMatchCount: r.lastMatchCount, runCount: r.runCount };
   }
 
-  app.get('/automation-rules/catalog', async () => RULE_CATALOG);
+  app.get('/automation-rules/catalog', { preHandler: [campaignRead, campaignFeature] }, async () => RULE_CATALOG);
 
-  app.get('/automation-rules', async request => {
+  app.get('/automation-rules', { preHandler: [campaignRead, campaignFeature] }, async request => {
     const rows = await db.automationRule.findMany({ where: { tenantId: request.auth.tenantId }, orderBy: { createdAt: 'asc' } });
     // Live match-count so the UI shows how many records each rule currently hits.
     return Promise.all(rows.map(async r => ({ ...ruleView(r), matchesNow: (await evaluateRule(request.auth.tenantId, r)).matched })));
   });
 
-  app.post('/automation-rules', { preHandler: writeRoles }, async (request, reply) => {
+  app.post('/automation-rules', { preHandler: [campaignManage, campaignFeature] }, async (request, reply) => {
     const body = z.object({ templateKey: z.string().min(2).max(60), enabled: z.boolean().default(false), config: z.record(z.string(), z.number()).optional() }).parse(request.body);
     const tpl = RULE_CATALOG.find(t => t.key === body.templateKey);
     if (!tpl) throw app.httpErrors.badRequest('Unknown rule template');
@@ -445,7 +469,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     return reply.code(201).send(ruleView(row));
   });
 
-  app.patch('/automation-rules/:id', { preHandler: writeRoles }, async request => {
+  app.patch('/automation-rules/:id', { preHandler: [campaignManage, campaignFeature] }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const body = z.object({ enabled: z.boolean().optional(), name: z.string().min(2).max(120).optional(), config: z.record(z.string(), z.number()).optional() }).parse(request.body);
     const existing = await db.automationRule.findFirst({ where: { id, tenantId: request.auth.tenantId } });
@@ -455,7 +479,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     return ruleView(row);
   });
 
-  app.delete('/automation-rules/:id', { preHandler: writeRoles }, async (request, reply) => {
+  app.delete('/automation-rules/:id', { preHandler: [campaignManage, campaignFeature] }, async (request, reply) => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const existing = await db.automationRule.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!existing) throw app.httpErrors.notFound('Rule not found');
@@ -466,7 +490,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
 
   // Evaluate + execute a rule once. Task-creating actions run for real;
   // module-owned actions return a governed preview. Audited.
-  app.post('/automation-rules/:id/run', { preHandler: writeRoles }, async request => {
+  app.post('/automation-rules/:id/run', { preHandler: [campaignManage, campaignFeature] }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const rule = await db.automationRule.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!rule) throw app.httpErrors.notFound('Rule not found');
@@ -477,7 +501,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
   });
 
   // ----- Delivery log (mobile-ready) --------------------------------------
-  app.get('/campaigns/:id/deliveries', async request => {
+  app.get('/campaigns/:id/deliveries', { preHandler: [campaignRead, campaignFeature] }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const rows = await db.campaignDelivery.findMany({ where: { tenantId: request.auth.tenantId, campaignId: id }, orderBy: { createdAt: 'desc' }, take: 500 });
     return rows.map(d => ({ deliveryId: d.id, campaignId: d.campaignId, patientId: d.patientId, leadId: d.leadId, channel: d.channel, destinationMasked: d.destinationMasked, status: d.status, provider: d.provider, providerMessageId: d.providerMessageId, failureReason: d.failureReason, sentAt: d.sentAt?.toISOString() ?? null, providerAcceptedAt: d.providerAcceptedAt?.toISOString() ?? null, deliveredAt: d.deliveredAt?.toISOString() ?? null, statusUpdatedAt: d.statusUpdatedAt.toISOString(), deepLinkTarget: `campaign/${id}` }));
@@ -485,8 +509,12 @@ export const crmRoutes: FastifyPluginAsync = async app => {
 
   // ----- Opportunity scan: connect real audiences → signals + recs --------
   // Rule-based; every recommendation requires human approval before action.
-  app.post('/opportunities/scan', { preHandler: writeRoles }, async request => {
+  app.post('/opportunities/scan', { preHandler: [campaignManage, campaignFeature] }, async request => {
     const tenantId = request.auth.tenantId;
+    // A branch-restricted operator scans their own branch only; the recorded
+    // scope travels with the recommendation so the count is never read as
+    // tenant-wide.
+    const branchId = request.auth.branchId;
     const defs: Array<{ audience: AudienceType; feature: string; signalType: string; recType: string; title: string; event?: WorkflowEventType }> = [
       { audience: 'inactive_patients', feature: 'patient_crm', signalType: 'inactive_patient_opportunity', recType: 'reactivate_inactive_patient', title: 'Reactivate inactive patient', event: 'patient.reactivation.recommended' },
       { audience: 'no_show_recovery', feature: 'patient_crm', signalType: 'no_show_recovery_needed', recType: 'send_no_show_recovery', title: 'Send no-show recovery message', event: 'no_show.recovery.recommended' },
@@ -499,10 +527,10 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     const scanned: Array<{ audience: string; count: number }> = [];
     for (const d of defs) {
       if (!(await isFeatureEnabled(tenantId, d.feature))) continue;
-      const candidates = await buildAudience(tenantId, d.audience);
+      const candidates = await buildAudience(tenantId, d.audience, { branchId });
       if (candidates.length === 0) continue;
       const signal = await upsertSignal(tenantId, { signalType: d.signalType, entityType: 'campaignOpportunity', entityId: d.audience, severity: 'low', score: Math.min(100, candidates.length), reason: `${candidates.length} ${d.audience} candidates` });
-      await createRecommendation(tenantId, { signalId: signal.id, title: d.title, recommendationType: d.recType, reason: `${candidates.length} contacts match the ${d.audience} audience.`, expectedImpact: 'Recover/retain patient revenue', confidence: 55, allowedActionType: 'create_campaign', sourceData: { audience: d.audience, count: candidates.length } });
+      await createRecommendation(tenantId, { signalId: signal.id, title: d.title, recommendationType: d.recType, reason: `${candidates.length} contacts match the ${d.audience} audience.`, expectedImpact: 'Recover/retain patient revenue', confidence: 55, allowedActionType: 'create_campaign', sourceData: { audience: d.audience, count: candidates.length, branchScope: branchId ?? 'tenant' } });
       if (d.event) await emitBusinessEvent(tenantId, { eventType: d.event, entityType: 'campaignOpportunity', entityId: d.audience, sourceModule: 'crm', payload: { count: candidates.length } }).catch(() => {});
       scanned.push({ audience: d.audience, count: candidates.length });
     }
@@ -512,13 +540,13 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     // gaps only — a recommendation, never automated booking.
     if (await isFeatureEnabled(tenantId, 'patient_crm')) {
       const [pendingRequests, openSlots] = await Promise.all([
-        db.appointmentRequest.count({ where: { tenantId, status: { in: ['PENDING_REVIEW', 'MISSING_INFO'] } } }),
-        countOpenSlots(tenantId, 7), // real open slots from existing appointment gaps
+        db.appointmentRequest.count({ where: { tenantId, ...(branchId ? { branchId } : {}), status: { in: ['PENDING_REVIEW', 'MISSING_INFO'] } } }),
+        countOpenSlots(tenantId, 7, { branchId }), // real open slots from existing appointment gaps
       ]);
       if (pendingRequests > 0 && openSlots > 0) {
         const matchable = Math.min(pendingRequests, openSlots);
         const signal = await upsertSignal(tenantId, { signalType: 'empty_slot_fill_opportunity', entityType: 'campaignOpportunity', entityId: 'empty_slots', severity: 'low', score: Math.min(100, matchable), reason: `${openSlots} open slots / ${pendingRequests} pending requests over the next 7 days` });
-        await createRecommendation(tenantId, { signalId: signal.id, title: 'Fill open appointment slot', recommendationType: 'fill_open_slot', reason: `${openSlots} open slots over the next 7 days; ${pendingRequests} pending requests could fill them (review-only — no auto-booking).`, expectedImpact: 'Increase schedule utilization', confidence: 50, allowedActionType: 'create_campaign', sourceData: { pendingRequests, openSlots } });
+        await createRecommendation(tenantId, { signalId: signal.id, title: 'Fill open appointment slot', recommendationType: 'fill_open_slot', reason: `${openSlots} open slots over the next 7 days; ${pendingRequests} pending requests could fill them (review-only — no auto-booking).`, expectedImpact: 'Increase schedule utilization', confidence: 50, allowedActionType: 'create_campaign', sourceData: { pendingRequests, openSlots, branchScope: branchId ?? 'tenant' } });
         await emitBusinessEvent(tenantId, { eventType: 'empty_slot.fill.recommended', entityType: 'campaignOpportunity', entityId: 'empty_slots', sourceModule: 'crm', payload: { pendingRequests, openSlots } }).catch(() => {});
         scanned.push({ audience: 'empty_slot_fill_opportunity', count: matchable });
       }
@@ -528,7 +556,12 @@ export const crmRoutes: FastifyPluginAsync = async app => {
   });
 
   // ----- Communication consent + suppression ------------------------------
-  app.get('/consent', async request => {
+  // Consent evidence is patient data, so it takes `crm:read` (the same grant as
+  // GET /v1/leads) and the Patient CRM entitlement it actually serves — NOT
+  // campaign_automation. The CRM page requests this alongside /v1/leads and
+  // /v1/patients, so gating it on a campaign add-on made a tenant without that
+  // add-on fail the whole request set and blank a page it is entitled to.
+  app.get('/consent', { preHandler: [crmRead, patientCrmFeature] }, async request => {
     const q = z.object({ patientId: uuid.optional() }).parse(request.query);
     const [legacyRows, patientEvents] = await Promise.all([
       db.communicationConsent.findMany({ where: { tenantId: request.auth.tenantId, ...(q.patientId ? { patientId: q.patientId } : {}) }, orderBy: { updatedAt: 'desc' }, take: 200 }),
@@ -562,7 +595,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     ].slice(0, 200);
   });
 
-  app.post('/consent', { preHandler: writeRoles }, async (request, reply) => {
+  app.post('/consent', { preHandler: [crmWrite, campaignFeature] }, async (request, reply) => {
     const input = z.object({
       patientId: uuid.optional(), leadId: uuid.optional(), channel: channelEnum,
       status: z.enum(['opted_in', 'opted_out', 'unknown']), source: z.string().trim().max(80).default('staff'),
@@ -699,13 +732,21 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     return reply.code(201).send(result);
   });
 
-  app.get('/suppressions', async request => {
+  app.get('/suppressions', { preHandler: [crmRead, campaignFeature] }, async request => {
     return db.campaignSuppression.findMany({ where: { tenantId: request.auth.tenantId, active: true }, orderBy: { createdAt: 'desc' }, take: 200 });
   });
 
-  app.post('/suppressions', { preHandler: writeRoles }, async (request, reply) => {
+  app.post('/suppressions', { preHandler: [crmWrite, campaignFeature] }, async (request, reply) => {
     const input = z.object({ patientId: uuid.optional(), leadId: uuid.optional(), channel: channelEnum, reason: z.string().min(2).max(240) }).parse(request.body);
     if (!input.patientId && !input.leadId) throw app.httpErrors.badRequest('patientId or leadId required');
+    // CampaignSuppression.patientId carries a bare Patient FK and leadId carries
+    // no FK at all, so the identity must be proven to belong to this tenant here
+    // — exactly as POST /consent does. Without it an unknown id crashed on the
+    // FK and another tenant's id was accepted as a reference.
+    const identityExists = input.patientId
+      ? await db.patient.count({ where: { id: input.patientId, tenantId: request.auth.tenantId, deletedAt: null } })
+      : await db.lead.count({ where: { id: input.leadId!, tenantId: request.auth.tenantId } });
+    if (identityExists !== 1) throw app.httpErrors.badRequest('Suppression identity must belong to the authenticated tenant');
     const row = await db.campaignSuppression.create({ data: { tenantId: request.auth.tenantId, patientId: input.patientId, leadId: input.leadId, channel: input.channel, reason: input.reason, active: true } });
     await audit(request, { action: 'suppression.created', resource: 'campaignSuppression', resourceId: row.id, metadata: { channel: input.channel } });
     return reply.code(201).send(row);

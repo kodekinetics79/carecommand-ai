@@ -28,6 +28,16 @@ export type AudienceType = typeof AUDIENCE_TYPES[number];
 // Audiences that are intentionally STAFF-facing (never patient-blaming outreach).
 export const STAFF_FACING_AUDIENCES = new Set(['prior_auth_followup']);
 
+// Canonical Lead.stage vocabulary. `Lead.stage` is a free `String` column, so
+// the ONLY place the vocabulary can be enforced is the API boundary. Declared
+// here (next to the other Growth vocabularies) so every boundary that accepts
+// or filters a stage uses `z.enum(LEAD_STAGES)` instead of a free string, and
+// so it cannot drift from the client contract in src/lib/crmService.ts.
+export const LEAD_STAGES = [
+  'new-inquiry', 'contacted', 'booked', 'visited', 'follow-up', 'retained', 'lost',
+] as const;
+export type LeadStage = typeof LEAD_STAGES[number];
+
 export type CommChannel = 'sms' | 'email' | 'voice' | 'whatsapp';
 const INACTIVE_DAYS_DEFAULT = 180;
 
@@ -316,8 +326,25 @@ export async function isSuppressed(tenantId: string, target: { patientId?: strin
 // --- Audience candidates ---------------------------------------------------
 export interface AudienceCandidate { patientId: string | null; leadId: string | null; name: string; email: string | null; phone: string | null; reason: string }
 
-export async function buildAudience(tenantId: string, audienceType: AudienceType, opts: { inactiveDays?: number } = {}): Promise<AudienceCandidate[]> {
+/** Audience generation options. */
+export interface AudienceOptions {
+  /** Inactivity window (days) for the `inactive_patients` audience. */
+  inactiveDays?: number;
+  /**
+   * Branch isolation. Audience sources previously filtered on tenantId ONLY, so
+   * a branch-restricted operator could preview and target patients belonging to
+   * branches they cannot otherwise see. Callers pass `request.auth.branchId`;
+   * null/undefined means the caller is tenant-wide. Semantics deliberately match
+   * `branchScope()` in server/lib/scope.ts: an exact branchId match, so rows
+   * with no branch assigned (e.g. an unrouted AppointmentRequest) fail CLOSED
+   * for a scoped caller rather than leaking into their audience.
+   */
+  branchId?: string | null;
+}
+
+export async function buildAudience(tenantId: string, audienceType: AudienceType, opts: AudienceOptions = {}): Promise<AudienceCandidate[]> {
   const now = Date.now();
+  const branchFilter = opts.branchId ? { branchId: opts.branchId } : {};
   // Audience sources read RLS-enrolled PHI tables (Patient, Appointment,
   // PaymentRequest, DepositRequirement, EligibilityVerification). Run inside a
   // tenant transaction so app.current_tenant_id is set on the SAME connection —
@@ -328,27 +355,27 @@ export async function buildAudience(tenantId: string, audienceType: AudienceType
       case 'inactive_patients': {
         const cutoff = new Date(now - (opts.inactiveDays ?? INACTIVE_DAYS_DEFAULT) * 86400000);
         const rows = await tx.patient.findMany({
-          where: { tenantId, deletedAt: null, lifecycleStage: { not: 'LOST' }, OR: [{ lastVisitAt: { lt: cutoff } }, { lastVisitAt: null, createdAt: { lt: cutoff } }] },
+          where: { tenantId, ...branchFilter, deletedAt: null, lifecycleStage: { not: 'LOST' }, OR: [{ lastVisitAt: { lt: cutoff } }, { lastVisitAt: null, createdAt: { lt: cutoff } }] },
           select: { id: true, firstName: true, lastName: true, email: true, phone: true }, take: 500,
         });
         return rows.map(p => ({ patientId: p.id, leadId: null, name: `${p.firstName} ${p.lastName}`, email: p.email, phone: p.phone, reason: 'No recent visit' }));
       }
       case 'no_show_recovery': {
-        const appts = await tx.appointment.findMany({ where: { tenantId, status: 'NO_SHOW', deletedAt: null }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { startsAt: 'desc' }, take: 500 });
+        const appts = await tx.appointment.findMany({ where: { tenantId, ...branchFilter, status: 'NO_SHOW', deletedAt: null }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { startsAt: 'desc' }, take: 500 });
         const seen = new Set<string>();
         const out: AudienceCandidate[] = [];
         for (const a of appts) { if (seen.has(a.patientId)) continue; seen.add(a.patientId); out.push({ patientId: a.patientId, leadId: null, name: `${a.patient.firstName} ${a.patient.lastName}`, email: a.patient.email, phone: a.patient.phone, reason: 'Missed appointment' }); }
         return out;
       }
       case 'unpaid_deposit_followup': {
-        const reqs = await tx.depositRequirement.findMany({ where: { tenantId, status: { in: ['required', 'requested', 'link_sent'] }, patientId: { not: null } }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, take: 500 });
+        const reqs = await tx.depositRequirement.findMany({ where: { tenantId, ...branchFilter, status: { in: ['required', 'requested', 'link_sent'] }, patientId: { not: null } }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, take: 500 });
         const seen = new Set<string>();
         const out: AudienceCandidate[] = [];
         for (const r of reqs) { if (!r.patientId || seen.has(r.patientId)) continue; seen.add(r.patientId); out.push({ patientId: r.patientId, leadId: null, name: r.patient ? `${r.patient.firstName} ${r.patient.lastName}` : 'Patient', email: r.patient?.email ?? null, phone: r.patient?.phone ?? null, reason: 'Unpaid deposit' }); }
         return out;
       }
       case 'failed_payment_recovery': {
-        const prs = await tx.paymentRequest.findMany({ where: { tenantId, status: { in: ['failed', 'expired'] }, patientId: { not: null } }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { createdAt: 'desc' }, take: 500 });
+        const prs = await tx.paymentRequest.findMany({ where: { tenantId, ...branchFilter, status: { in: ['failed', 'expired'] }, patientId: { not: null } }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { createdAt: 'desc' }, take: 500 });
         const seen = new Set<string>();
         const out: AudienceCandidate[] = [];
         for (const r of prs) { if (!r.patientId || seen.has(r.patientId)) continue; seen.add(r.patientId); out.push({ patientId: r.patientId, leadId: null, name: r.patient ? `${r.patient.firstName} ${r.patient.lastName}` : 'Patient', email: r.patient?.email ?? null, phone: r.patient?.phone ?? null, reason: 'Failed/expired payment' }); }
@@ -356,18 +383,18 @@ export async function buildAudience(tenantId: string, audienceType: AudienceType
       }
       case 'insurance_update_request': {
         // Patient-facing "please update your insurance" — uses ineligible checks.
-        const vers = await tx.eligibilityVerification.findMany({ where: { tenantId, coverageActive: false }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { checkedAt: 'desc' }, take: 500 });
+        const vers = await tx.eligibilityVerification.findMany({ where: { tenantId, ...branchFilter, coverageActive: false }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { checkedAt: 'desc' }, take: 500 });
         const seen = new Set<string>();
         const out: AudienceCandidate[] = [];
         for (const v of vers) { if (seen.has(v.patientId)) continue; seen.add(v.patientId); out.push({ patientId: v.patientId, leadId: null, name: `${v.patient.firstName} ${v.patient.lastName}`, email: v.patient.email, phone: v.patient.phone, reason: 'Insurance needs update' }); }
         return out;
       }
       case 'appointment_request_followup': {
-        const reqs = await tx.appointmentRequest.findMany({ where: { tenantId, status: { in: ['PENDING_REVIEW', 'MISSING_INFO'] } }, select: { id: true, patientId: true, leadId: true, collectedName: true, collectedPhone: true, collectedEmail: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, take: 500 });
+        const reqs = await tx.appointmentRequest.findMany({ where: { tenantId, ...branchFilter, status: { in: ['PENDING_REVIEW', 'MISSING_INFO'] } }, select: { id: true, patientId: true, leadId: true, collectedName: true, collectedPhone: true, collectedEmail: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, take: 500 });
         return reqs.map(r => ({ patientId: r.patientId, leadId: r.leadId, name: r.patient ? `${r.patient.firstName} ${r.patient.lastName}` : (r.collectedName ?? 'Lead'), email: r.patient?.email ?? r.collectedEmail, phone: r.patient?.phone ?? r.collectedPhone, reason: 'Pending appointment request' }));
       }
       case 'review_request': {
-        const appts = await tx.appointment.findMany({ where: { tenantId, status: 'COMPLETED', deletedAt: null }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { startsAt: 'desc' }, take: 500 });
+        const appts = await tx.appointment.findMany({ where: { tenantId, ...branchFilter, status: 'COMPLETED', deletedAt: null }, select: { patientId: true, patient: { select: { firstName: true, lastName: true, email: true, phone: true } } }, orderBy: { startsAt: 'desc' }, take: 500 });
         const seen = new Set<string>();
         const out: AudienceCandidate[] = [];
         for (const a of appts) { if (seen.has(a.patientId)) continue; seen.add(a.patientId); out.push({ patientId: a.patientId, leadId: null, name: `${a.patient.firstName} ${a.patient.lastName}`, email: a.patient.email, phone: a.patient.phone, reason: 'Completed visit' }); }
@@ -382,8 +409,10 @@ export async function buildAudience(tenantId: string, audienceType: AudienceType
 // Preview: deterministic counts after consent/suppression + contact gating.
 export interface AudiencePreview { audienceType: AudienceType; channel: CommChannel; total: number; eligible: number; suppressed: number; missingContact: number; sample: Array<{ name: string; reason: string; destinationMasked: string | null }> }
 
-export async function previewAudience(tenantId: string, audienceType: AudienceType, channel: CommChannel): Promise<AudiencePreview> {
-  const candidates = await buildAudience(tenantId, audienceType);
+export async function previewAudience(tenantId: string, audienceType: AudienceType, channel: CommChannel, opts: AudienceOptions = {}): Promise<AudiencePreview> {
+  // The sample returns REAL patient names + a reason string, so the branch scope
+  // of the caller must reach the audience query itself — not just the response.
+  const candidates = await buildAudience(tenantId, audienceType, opts);
   let eligible = 0, suppressed = 0, missingContact = 0;
   const sample: AudiencePreview['sample'] = [];
   const field = channelField(channel);
@@ -406,12 +435,14 @@ const SLOT_MINUTES = 30;
 const DAY_START_HOUR = 9;
 const DAY_END_HOUR = 17;
 
-export async function countOpenSlots(tenantId: string, days = 7): Promise<number> {
+export async function countOpenSlots(tenantId: string, days = 7, opts: { branchId?: string | null } = {}): Promise<number> {
   const now = new Date();
   const horizon = new Date(now.getTime() + days * 86400000);
+  // A branch-restricted caller must not learn the capacity of other branches.
+  const branchFilter = opts.branchId ? { branchId: opts.branchId } : {};
   const [branches, appts] = await Promise.all([
-    db.branch.findMany({ where: { tenantId, active: true }, select: { id: true } }),
-    db.appointment.findMany({ where: { tenantId, deletedAt: null, startsAt: { gte: now, lt: horizon }, status: { notIn: ['CANCELED', 'NO_SHOW', 'COMPLETED'] } }, select: { branchId: true, startsAt: true, endsAt: true } }),
+    db.branch.findMany({ where: { tenantId, active: true, ...(opts.branchId ? { id: opts.branchId } : {}) }, select: { id: true } }),
+    db.appointment.findMany({ where: { tenantId, ...branchFilter, deletedAt: null, startsAt: { gte: now, lt: horizon }, status: { notIn: ['CANCELED', 'NO_SHOW', 'COMPLETED'] } }, select: { branchId: true, startsAt: true, endsAt: true } }),
   ]);
   const busyByBranch = new Map<string, Array<{ start: number; end: number }>>();
   for (const a of appts) {

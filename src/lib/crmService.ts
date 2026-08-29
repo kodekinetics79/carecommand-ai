@@ -152,9 +152,16 @@ export const crmService = {
     });
   },
 
-  // [LIVE] PATCH /v1/leads/:id (stage transition — audited server-side)
-  async setStage(id: string, stage: Stage): Promise<void> {
-    await apiRequest(`/v1/leads/${id}`, { method: 'PATCH', body: JSON.stringify({ stage }) });
+  // [LIVE] PATCH /v1/leads/:id (stage transition — audited server-side).
+  // `lostReason` is required by the server when a lead moves to `lost`; it is
+  // persisted on the lead, recorded in the audit trail, and written to the
+  // lead's activity history, which is what the confirmation modal promises.
+  async setStage(id: string, stage: Stage, lostReason?: string): Promise<void> {
+    const reason = lostReason?.trim();
+    await apiRequest(`/v1/leads/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(reason ? { stage, lostReason: reason } : { stage }),
+    });
   },
 
   // Derived metrics. inactiveRecoverable is an explicitly unvalidated 30% planning assumption.

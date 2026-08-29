@@ -1,0 +1,282 @@
+import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
+import { z } from 'zod';
+import { db } from '../../lib/db';
+import { audit } from '../../lib/audit';
+import { getRequestPermissions, requirePermission } from '../../lib/permissions';
+import { MONEY_AFFECTING_POLICY_FIELDS } from './defaults';
+import {
+  getEffectiveGrowthPolicy,
+  listEffectiveChannelCosts,
+  listEffectiveSegmentDefinitions,
+  materializeChannelCostDefaults,
+  materializeSegmentDefaults,
+} from './service';
+
+// ===========================================================================
+// Growth configuration API — the tenant-editable home for the Growth module's
+// business rules.
+//
+// Authorization uses the action-permission layer, never a raw role list, so a
+// tenant that re-cuts its roles through RoleDefinition re-cuts this surface too:
+//   * read                 → settings:read   (OWNER/ADMIN/MANAGER/BILLING/PROVIDER/ANALYST)
+//   * operational tuning   → settings:write  (OWNER/ADMIN/MANAGER)
+//   * money-affecting      → settings:write AND admin:manage (OWNER/ADMIN)
+//
+// "Money-affecting" is not a vibe: it is highValuePatientLtv and
+// recoverableLtvFraction (they move the recoverable-value headline and the
+// high-value patient list) plus every channel cost (it moves planned spend). A
+// MANAGER may tune an inactivity window; only an owner or admin may restate what
+// a patient is worth.
+//
+// Nothing reads this configuration yet — the Growth module's call sites are
+// rewired in a later increment. Landing the spine changes no observable number.
+// ===========================================================================
+
+const configRead = requirePermission('settings:read');
+const configWrite = requirePermission('settings:write');
+
+const MONEY_PERMISSION = 'admin:manage' as const;
+
+/**
+ * Second gate for money-affecting writes. Returns true when the reply has
+ * already been sent (403), matching the shape requirePermission() produces so
+ * clients see one error contract.
+ */
+async function deniedForMoneyFields(request: FastifyRequest, reply: FastifyReply, fields: string[]): Promise<boolean> {
+  if (fields.length === 0) return false;
+  const granted = await getRequestPermissions(request);
+  if (granted.has(MONEY_PERMISSION)) return false;
+  await reply.code(403).send({
+    error: 'insufficient_permission',
+    permission: MONEY_PERMISSION,
+    fields,
+    message: `Changing ${fields.join(', ')} affects reported patient value and planned spend, so it requires the ${MONEY_PERMISSION} permission.`,
+  });
+  return true;
+}
+
+const score = z.number().int().min(0).max(100);
+const positiveDays = z.number().int().min(1).max(3650);
+const rating = z.number().min(0).max(5);
+
+const policyPatchSchema = z.object({
+  hotLeadScore: score.optional(),
+  scoreBandHigh: score.optional(),
+  scoreBandMid: score.optional(),
+  goingColdDays: positiveDays.optional(),
+  churnRiskHigh: score.optional(),
+  highValuePatientLtv: z.number().min(0).max(10_000_000).optional(),
+  recoverableLtvFraction: z.number().min(0).max(1).optional(),
+  inactiveAudienceDays: positiveDays.optional(),
+  maxAudienceSize: z.number().int().min(1).max(1_000_000).optional(),
+  slotFillHorizonDays: positiveDays.optional(),
+  reviewRatingGood: rating.optional(),
+  reviewRatingFair: rating.optional(),
+  reputationRiskHigh: score.optional(),
+  reputationRiskMedium: score.optional(),
+  competitorRatingHighSeverityMax: rating.optional(),
+  competitorRatingMediumSeverityMax: rating.optional(),
+  competitorReviewVolumeHigh: z.number().int().min(0).max(1_000_000).optional(),
+  leadSendCooldownHours: z.number().int().min(0).max(8760).optional(),
+}).strict();
+
+const segmentKey = z.string().min(2).max(60).regex(/^[a-z0-9][a-z0-9-]*$/, 'key must be lowercase kebab-case');
+
+const label = z.string().min(2).max(120);
+const description = z.string().min(2).max(400);
+const inactiveFloor = z.number().int().min(0).max(3650).nullable();
+const inactiveCeiling = z.number().int().min(1).max(3650).nullable();
+const lifetimeValue = z.number().min(0).max(10_000_000).nullable();
+const tag = z.string().min(1).max(60).nullable();
+const channelName = z.string().min(2).max(40);
+const offer = z.string().min(2).max(200);
+const bookingRatePct = z.number().int().min(0).max(100);
+const sortOrder = z.number().int().min(0).max(1000);
+
+const segmentCreateSchema = z.object({
+  key: segmentKey,
+  label,
+  description,
+  minInactiveDays: inactiveFloor.default(null),
+  maxInactiveDays: inactiveCeiling.default(null),
+  includeNeverVisited: z.boolean().default(false),
+  minLifetimeValue: lifetimeValue.default(null),
+  minChurnRisk: score.nullable().default(null),
+  requiredTag: tag.default(null),
+  suggestedChannel: channelName,
+  plannedOffer: offer,
+  assumedBookingRatePct: bookingRatePct.default(0),
+  active: z.boolean().default(true),
+  sortOrder: sortOrder.default(0),
+}).strict();
+
+// Written out rather than derived with `.partial()`: in Zod 4 `.partial()` keeps
+// each field's `.default(...)`, so a PATCH of one field would have silently
+// rewritten every other one back to its default — nulling a segment's window and
+// resetting its sort order. Same family of footgun as z.coerce.boolean().
+const segmentPatchSchema = z.object({
+  label: label.optional(),
+  description: description.optional(),
+  minInactiveDays: inactiveFloor.optional(),
+  maxInactiveDays: inactiveCeiling.optional(),
+  includeNeverVisited: z.boolean().optional(),
+  minLifetimeValue: lifetimeValue.optional(),
+  minChurnRisk: score.nullable().optional(),
+  requiredTag: tag.optional(),
+  suggestedChannel: channelName.optional(),
+  plannedOffer: offer.optional(),
+  assumedBookingRatePct: bookingRatePct.optional(),
+  active: z.boolean().optional(),
+  sortOrder: sortOrder.optional(),
+}).strict().refine(
+  body => Object.keys(body).length > 0,
+  { message: 'At least one field must be supplied' },
+);
+
+const channelCostSchema = z.object({
+  unitCostMinor: z.number().int().min(0).max(100_000_000),
+  currency: z.string().regex(/^[A-Z]{3}$/, 'currency must be an ISO-4217 alphabetic code'),
+});
+
+/** A window whose lower bound is not below its exclusive upper bound is empty. */
+function invalidWindow(min: number | null | undefined, max: number | null | undefined): boolean {
+  return typeof min === 'number' && typeof max === 'number' && max <= min;
+}
+
+export const growthRoutes: FastifyPluginAsync = async app => {
+  // ----- Policy ------------------------------------------------------------
+
+  app.get('/policy', { preHandler: configRead }, async request => getEffectiveGrowthPolicy(request.auth.tenantId));
+
+  app.patch('/policy', { preHandler: configWrite }, async (request, reply) => {
+    const input = policyPatchSchema.parse(request.body);
+    if (Object.keys(input).length === 0) throw app.httpErrors.badRequest('At least one field must be supplied');
+
+    const touchedMoneyFields = MONEY_AFFECTING_POLICY_FIELDS.filter(field => input[field] !== undefined);
+    if (await deniedForMoneyFields(request, reply, [...touchedMoneyFields])) return reply;
+
+    const current = await getEffectiveGrowthPolicy(request.auth.tenantId);
+    const merged = { ...current, ...input };
+    if (merged.scoreBandMid >= merged.scoreBandHigh) {
+      throw app.httpErrors.badRequest('scoreBandMid must be below scoreBandHigh');
+    }
+    if (merged.reviewRatingFair > merged.reviewRatingGood) {
+      throw app.httpErrors.badRequest('reviewRatingFair must not exceed reviewRatingGood');
+    }
+    if (merged.reputationRiskMedium >= merged.reputationRiskHigh) {
+      throw app.httpErrors.badRequest('reputationRiskMedium must be below reputationRiskHigh');
+    }
+
+    await db.growthPolicy.upsert({
+      where: { tenantId: request.auth.tenantId },
+      update: input,
+      create: { tenantId: request.auth.tenantId, ...input },
+    });
+    await audit(request, {
+      action: 'growth.policy.updated',
+      resource: 'growthPolicy',
+      resourceId: request.auth.tenantId,
+      metadata: { fields: Object.keys(input), changes: input, moneyAffecting: [...touchedMoneyFields] },
+    });
+    return getEffectiveGrowthPolicy(request.auth.tenantId);
+  });
+
+  // ----- Segment definitions ----------------------------------------------
+
+  app.get('/segments', { preHandler: configRead }, async request => ({
+    segments: await listEffectiveSegmentDefinitions(request.auth.tenantId),
+  }));
+
+  app.post('/segments', { preHandler: configWrite }, async (request, reply) => {
+    const input = segmentCreateSchema.parse(request.body);
+    if (invalidWindow(input.minInactiveDays, input.maxInactiveDays)) {
+      throw app.httpErrors.badRequest('maxInactiveDays must be greater than minInactiveDays');
+    }
+    await materializeSegmentDefaults(request.auth.tenantId);
+    const existing = await db.growthSegmentDefinition.findFirst({
+      where: { tenantId: request.auth.tenantId, key: input.key },
+      select: { id: true },
+    });
+    if (existing) throw app.httpErrors.conflict(`A segment definition with key "${input.key}" already exists`);
+
+    const row = await db.growthSegmentDefinition.create({ data: { tenantId: request.auth.tenantId, ...input } });
+    await audit(request, {
+      action: 'growth.segment.created', resource: 'growthSegmentDefinition', resourceId: row.id,
+      metadata: { key: input.key, fields: Object.keys(input) },
+    });
+    return reply.code(201).send(row);
+  });
+
+  app.patch('/segments/:key', { preHandler: configWrite }, async request => {
+    const { key } = z.object({ key: segmentKey }).parse(request.params);
+    const input = segmentPatchSchema.parse(request.body);
+    await materializeSegmentDefaults(request.auth.tenantId);
+
+    const existing = await db.growthSegmentDefinition.findFirst({ where: { tenantId: request.auth.tenantId, key } });
+    if (!existing) throw app.httpErrors.notFound('Segment definition not found');
+
+    const merged = { ...existing, ...input };
+    if (invalidWindow(merged.minInactiveDays, merged.maxInactiveDays)) {
+      throw app.httpErrors.badRequest('maxInactiveDays must be greater than minInactiveDays');
+    }
+
+    const row = await db.growthSegmentDefinition.update({ where: { id: existing.id }, data: input });
+    await audit(request, {
+      action: 'growth.segment.updated', resource: 'growthSegmentDefinition', resourceId: row.id,
+      metadata: { key, fields: Object.keys(input), changes: input },
+    });
+    return row;
+  });
+
+  app.delete('/segments/:key', { preHandler: configWrite }, async request => {
+    const { key } = z.object({ key: segmentKey }).parse(request.params);
+    await materializeSegmentDefaults(request.auth.tenantId);
+    const existing = await db.growthSegmentDefinition.findFirst({ where: { tenantId: request.auth.tenantId, key } });
+    if (!existing) throw app.httpErrors.notFound('Segment definition not found');
+    await db.growthSegmentDefinition.delete({ where: { id: existing.id } });
+    await audit(request, {
+      action: 'growth.segment.deleted', resource: 'growthSegmentDefinition', resourceId: existing.id,
+      metadata: { key },
+    });
+    return { deleted: true, key };
+  });
+
+  // ----- Channel costs -----------------------------------------------------
+  // Every field here is money, so writes always need the money permission.
+
+  app.get('/channel-costs', { preHandler: configRead }, async request => ({
+    channelCosts: await listEffectiveChannelCosts(request.auth.tenantId),
+  }));
+
+  app.put('/channel-costs/:channel', { preHandler: configWrite }, async (request, reply) => {
+    const { channel } = z.object({ channel: z.string().min(2).max(40) }).parse(request.params);
+    const input = channelCostSchema.parse(request.body);
+    if (await deniedForMoneyFields(request, reply, ['unitCostMinor', 'currency'])) return reply;
+
+    await materializeChannelCostDefaults(request.auth.tenantId);
+    const row = await db.growthChannelCost.upsert({
+      where: { tenantId_channel: { tenantId: request.auth.tenantId, channel } },
+      update: input,
+      create: { tenantId: request.auth.tenantId, channel, ...input },
+    });
+    await audit(request, {
+      action: 'growth.channelCost.updated', resource: 'growthChannelCost', resourceId: row.id,
+      metadata: { channel, unitCostMinor: input.unitCostMinor, currency: input.currency },
+    });
+    return row;
+  });
+
+  app.delete('/channel-costs/:channel', { preHandler: configWrite }, async (request, reply) => {
+    const { channel } = z.object({ channel: z.string().min(2).max(40) }).parse(request.params);
+    if (await deniedForMoneyFields(request, reply, ['unitCostMinor'])) return reply;
+    await materializeChannelCostDefaults(request.auth.tenantId);
+    const existing = await db.growthChannelCost.findFirst({ where: { tenantId: request.auth.tenantId, channel } });
+    if (!existing) throw app.httpErrors.notFound('Channel cost not found');
+    await db.growthChannelCost.delete({ where: { id: existing.id } });
+    await audit(request, {
+      action: 'growth.channelCost.deleted', resource: 'growthChannelCost', resourceId: existing.id,
+      metadata: { channel },
+    });
+    return { deleted: true, channel };
+  });
+};

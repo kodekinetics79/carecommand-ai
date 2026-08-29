@@ -223,7 +223,7 @@ export default function CRM() {
       {reasonModal && (
         <ConfirmationModal title="Mark lead as lost?" message={`Record why "${reasonModal.name}" was lost. This is captured for lost-reason intelligence.`} confirmLabel="Mark lost" tone="red" requireReason
           onClose={() => setReasonModal(null)}
-          onConfirm={async () => { await crmService.setStage(reasonModal.id, 'lost'); await reload(); }}
+          onConfirm={async (reason) => { await crmService.setStage(reasonModal.id, 'lost', reason); await reload(); }}
         />
       )}
       {commsModal && (
