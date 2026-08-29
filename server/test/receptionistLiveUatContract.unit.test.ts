@@ -1,10 +1,22 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+
+// The Studio surface is the page shell plus its panel components under
+// src/components/receptionist; contract pins apply to the whole surface.
+function receptionistStudioSource(): string {
+  const dir = 'src/components/receptionist';
+  const panels = readdirSync(dir, { recursive: true, encoding: 'utf8' })
+    .filter(name => name.endsWith('.ts') || name.endsWith('.tsx'))
+    .sort()
+    .map(name => readFileSync(join(dir, name), 'utf8'));
+  return [readFileSync('src/pages/ReceptionistStudio.tsx', 'utf8'), ...panels].join('\n');
+}
 
 const outboundSource = readFileSync('server/modules/receptionist/outbound.ts', 'utf8');
 const liveUatSource = readFileSync('server/lib/receptionist/liveCallUat.ts', 'utf8');
 const retellSource = readFileSync('server/lib/retell.ts', 'utf8');
-const studioSource = readFileSync('src/pages/ReceptionistStudio.tsx', 'utf8');
+const studioSource = receptionistStudioSource();
 const apiSource = readFileSync('src/lib/receptionist.ts', 'utf8');
 const playwrightSource = readFileSync('playwright.config.ts', 'utf8');
 const liveE2eSource = readFileSync('tests/e2e/receptionist-live-uat.spec.ts', 'utf8');
