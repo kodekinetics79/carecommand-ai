@@ -9,14 +9,56 @@ import { lockDncDestinationFence } from '../../lib/receptionist/dncFence';
 import { uuid, idParam, writeRoles, bookingReviewRoles, callArtifactRead, ownerAdminRoles, optionalE164Phone } from './shared';
 import { cursorPage } from '../../lib/pagination';
 import { maskDestination } from '../../lib/campaigns';
-import { requirePermission } from '../../lib/permissions';
+import { hasPermission, requirePermission } from '../../lib/permissions';
 import { bookCanonicalAppointment } from '../../lib/booking';
 import { appointmentNoteSelect } from '../../lib/appointmentNotes';
 import { getSchedulingPolicy, isDoubleBookConflictError, resolveSchedulingService, clinicLocalMinuteToUtc } from '../../lib/scheduling';
-import { parseReceptionistTask, RECEPTIONIST_TASK_WORKFLOW } from '../../lib/receptionist/frontDeskTask';
+import {
+  parseReceptionistTask, RECEPTIONIST_TASK_WORKFLOW,
+  type ReceptionistTaskKind,
+} from '../../lib/receptionist/frontDeskTask';
+import { assertBranchAccess } from '../../lib/scope';
 
 const LIVE_TASK_STATUS = ['OPEN', 'IN_PROGRESS'] as const;
 const PENDING_REQUEST_STATUS = ['PENDING_REVIEW', 'MISSING_INFO'] as const;
+
+// D12: a cancelled appointment must not block re-booking the caller forever.
+// Only a live appointment proves the call already produced one.
+const LIVE_APPOINTMENT_STATUS = ['CONFIRMED', 'RISKY', 'ARRIVED', 'COMPLETED', 'WAITLIST'] as const;
+
+// ===========================================================================
+// D1 (P0, patient safety) — what a booking is entitled to close.
+//
+// Booking an appointment used to COMPLETE every live receptionist task on the
+// call: `updateMany` filtered `workflow` and had NO `kind` filter. So a caller
+// who mentioned chest pain and also asked for a slot had the EMERGENCY cleared
+// off the queue by an unrelated booking click — `acknowledgedAt` still null, the
+// critical OperationalSignal still open, and no way back, because a terminal
+// task cannot be reopened.
+//
+// A booking closes exactly the work the booking did:
+//   - `booking_review`  — the review this route just performed;
+//   - `message` / `missed_call` — only when the task points at THIS request.
+// It never closes `emergency`, `human_handoff` or `identity_locked`: those are
+// promises a human has to keep, and nothing but a human may keep them.
+// ===========================================================================
+const BOOKING_CLOSES_ALWAYS: readonly ReceptionistTaskKind[] = ['booking_review'];
+const BOOKING_CLOSES_WHEN_LINKED: readonly ReceptionistTaskKind[] = ['message', 'missed_call'];
+/** Never closed by a booking, at any time, for any reason. */
+export const BOOKING_NEVER_CLOSES: readonly ReceptionistTaskKind[] = [
+  'emergency', 'human_handoff', 'identity_locked',
+  'call_denied', 'ai_declined', 'tool_failure', 'deployment_attention',
+];
+
+/** True when booking `appointmentRequestId` genuinely closes this task. */
+export function bookingClosesTask(
+  meta: { kind: ReceptionistTaskKind; appointmentRequestId: string | null },
+  appointmentRequestId: string,
+): boolean {
+  if (BOOKING_NEVER_CLOSES.includes(meta.kind)) return false;
+  if (BOOKING_CLOSES_ALWAYS.includes(meta.kind)) return true;
+  return BOOKING_CLOSES_WHEN_LINKED.includes(meta.kind) && meta.appointmentRequestId === appointmentRequestId;
+}
 
 const csvEnum = <T extends string>(values: readonly T[]) => z.string()
   .transform(value => value.split(',').map(part => part.trim()).filter(Boolean))
@@ -120,6 +162,12 @@ export const activityRoutes: FastifyPluginAsync = async app => {
     };
   });
 
+  // D11: this screen handed patient phone and email — plus the caller's
+  // unmasked number — to AUDITOR and COMPLIANCE_OFFICER, two roles whose grants
+  // deliberately exclude `patient:read`. The sibling surface (`projectTaskRow`)
+  // gates the patient block correctly; this one gated on call-artifact access
+  // alone. Contact detail now needs `patient:read` as well, and revealing it is
+  // an audited disclosure rather than an ordinary read.
   app.get('/appointment-requests/:id', { preHandler: callArtifactRead }, async request => {
     const { id } = idParam.parse(request.params);
     const row = await db.appointmentRequest.findFirst({
@@ -138,8 +186,29 @@ export const activityRoutes: FastifyPluginAsync = async app => {
       },
     });
     if (!row) throw app.httpErrors.notFound('Appointment request not found');
-    await audit(request, { action: 'receptionist.appointmentRequest.read', resource: 'appointmentRequest', resourceId: row.id });
-    return row;
+    const canReadPatient = await hasPermission(request, 'patient:read');
+    const projected = {
+      ...row,
+      patient: row.patient
+        ? canReadPatient
+          ? row.patient
+          : { id: row.patient.id, firstName: row.patient.firstName, lastName: row.patient.lastName }
+        : null,
+      collectedPhone: canReadPatient ? row.collectedPhone : undefined,
+      collectedPhoneMasked: maskDestination(row.collectedPhone),
+      callLog: row.callLog
+        ? {
+          ...row.callLog,
+          callerPhone: canReadPatient ? row.callLog.callerPhone : undefined,
+          callerPhoneMasked: maskDestination(row.callLog.callerPhone),
+        }
+        : null,
+    };
+    await audit(request, {
+      action: 'receptionist.appointmentRequest.read', resource: 'appointmentRequest', resourceId: row.id,
+      metadata: { contactDisclosed: canReadPatient },
+    });
+    return projected;
   });
 
   // Rejecting is a decision a person owns, so the reason is required — the
@@ -218,15 +287,30 @@ export const activityRoutes: FastifyPluginAsync = async app => {
           select: { id: true, branchId: true },
         });
         if (!provider) return { kind: 'provider_invalid' as const };
+        // D2: RLS is tenant-level only. Without this a FRONT_DESK user pinned to
+        // branch B books a branch-A provider and writes an Appointment — and a
+        // new Patient row — into a branch they may not read. Before any create.
+        assertBranchAccess(request, provider.branchId);
 
         let patientId = input.patientId ?? null;
         let patientCreated = false;
+        let crossBranchPatient = false;
         if (patientId) {
+          // D12: a returning patient registered at branch A who calls branch B
+          // must be bookable as themselves. Validate on tenant + branch ACCESS,
+          // not branch equality — forcing `createPatient` here forks the record
+          // and splits their clinical history. The caller is told it happened.
           const patient = await tx.patient.findFirst({
-            where: { id: patientId, tenantId: request.auth.tenantId, branchId: provider.branchId, deletedAt: null },
-            select: { id: true },
+            where: { id: patientId, tenantId: request.auth.tenantId, deletedAt: null },
+            select: { id: true, branchId: true },
           });
           if (!patient) return { kind: 'patient_invalid' as const };
+          if (patient.branchId !== provider.branchId) {
+            if (request.auth.branchId && request.auth.branchId !== patient.branchId) {
+              return { kind: 'patient_invalid' as const };
+            }
+            crossBranchPatient = true;
+          }
         } else {
           const created = await tx.patient.create({
             data: {
@@ -250,13 +334,34 @@ export const activityRoutes: FastifyPluginAsync = async app => {
         // queue points at. Refuse, and send staff to `reconcile`, which is the
         // route for binding a request to an appointment that already exists.
         // (C3's booking sequence is what will allow several per call.)
-        const alreadyBooked = existing.callLogId
+        // D12: a CANCELED or soft-deleted appointment is not a booking the call
+        // produced. Before this the probe matched ANY appointment stamped with
+        // the call, so "booked, patient cancelled, rebook them" dead-ended on a
+        // permanent 409 with no route forward.
+        //
+        // `Appointment(tenantId, receptionistCallLogId)` is unique, so the dead
+        // appointment must actually give the call link up before a live one can
+        // take it. Releasing it is a real write, so it is audited: the call it
+        // came from stays recoverable from the audit trail and from the
+        // AppointmentRequest that still points at the call.
+        const onThisCall = existing.callLogId
           ? await tx.appointment.findFirst({
             where: { tenantId: request.auth.tenantId, receptionistCallLogId: existing.callLogId },
-            select: { id: true },
+            select: { id: true, status: true, deletedAt: true },
           })
           : null;
-        if (alreadyBooked) return { kind: 'call_already_booked' as const, appointmentId: alreadyBooked.id };
+        const terminalAppointment = onThisCall
+          && (onThisCall.deletedAt !== null || !(LIVE_APPOINTMENT_STATUS as readonly string[]).includes(onThisCall.status));
+        if (onThisCall && !terminalAppointment) {
+          return { kind: 'call_already_booked' as const, appointmentId: onThisCall.id };
+        }
+        const releasedAppointmentId = terminalAppointment ? onThisCall!.id : null;
+        if (releasedAppointmentId) {
+          await tx.appointment.update({
+            where: { id: releasedAppointmentId },
+            data: { receptionistCallLogId: null },
+          });
+        }
 
         const booked = await bookCanonicalAppointment(tx, {
           tenantId: request.auth.tenantId, branchId: provider.branchId, patientId: patient.id,
@@ -285,18 +390,47 @@ export const activityRoutes: FastifyPluginAsync = async app => {
             data: { outcome: 'BOOKED' },
           });
         }
-        // The queue row this request came from is now genuinely done.
+        // D1: close only the queue rows this booking genuinely closed. An
+        // unacknowledged emergency from the same call stays OPEN.
         let tasksClosed = 0;
+        let tasksLeftOpen = 0;
         if (existing.callLogId) {
-          const closed = await tx.staffTask.updateMany({
+          const live = await tx.staffTask.findMany({
             where: {
               tenantId: request.auth.tenantId, callLogId: existing.callLogId,
               status: { in: [...LIVE_TASK_STATUS] },
               metadata: { path: ['workflow'], equals: RECEPTIONIST_TASK_WORKFLOW },
             },
-            data: { status: 'COMPLETED', completedAt: new Date(), outcomeCode: 'booked' },
+            select: { id: true, metadata: true },
           });
-          tasksClosed = closed.count;
+          const closable: string[] = [];
+          for (const row of live) {
+            const meta = parseReceptionistTask(row);
+            if (meta && bookingClosesTask(meta, existing.id)) closable.push(row.id);
+            else tasksLeftOpen += 1;
+          }
+          if (closable.length) {
+            const closedAt = new Date();
+            const closed = await tx.staffTask.updateMany({
+              where: { id: { in: closable }, tenantId: request.auth.tenantId },
+              data: {
+                status: 'COMPLETED', completedAt: closedAt, outcomeCode: 'booked',
+                // A row closed by this click WAS seen by this person. Leaving
+                // acknowledgedAt null let a completed task keep claiming that
+                // nobody had ever looked at it.
+                acknowledgedAt: closedAt, acknowledgedById: request.auth.userId,
+              },
+            });
+            tasksClosed = closed.count;
+            // A closed task must not leave an open signal pointing at it.
+            await tx.operationalSignal.updateMany({
+              where: {
+                tenantId: request.auth.tenantId, entityType: 'staffTask',
+                entityId: { in: closable }, status: 'open',
+              },
+              data: { status: 'resolved' },
+            });
+          }
         }
         await tx.auditEvent.create({ data: {
           tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
@@ -304,19 +438,25 @@ export const activityRoutes: FastifyPluginAsync = async app => {
           requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
           metadata: {
             appointmentId: booked.appointment.id, identityProof: 'staff_selected', differences,
-            patientCreated, tasksClosed, requestDifferencesAcknowledged: true,
+            patientCreated, crossBranchPatient, tasksClosed, tasksLeftOpen,
+            releasedAppointmentId, requestDifferencesAcknowledged: true,
           },
         } });
         await tx.businessEvent.create({ data: {
           tenantId: request.auth.tenantId, eventType: 'receptionist.appointmentRequest.booked',
           entityType: 'appointmentRequest', entityId: existing.id, sourceModule: 'receptionist',
-          payload: { appointmentId: booked.appointment.id, differences, patientCreated },
+          payload: { appointmentId: booked.appointment.id, differences, patientCreated, tasksLeftOpen },
         } });
         return {
           kind: 'booked' as const,
           appointment: booked.appointment,
           confirmationsQueued: booked.queued,
           differences,
+          tasksClosed,
+          // Surfaced so the desk can see that the emergency from this call is
+          // still theirs to acknowledge, rather than assuming booking closed it.
+          tasksLeftOpen,
+          crossBranchPatient,
         };
       }) as never;
     } catch (error) {
@@ -330,7 +470,11 @@ export const activityRoutes: FastifyPluginAsync = async app => {
       | { kind: 'not_found' } | { kind: 'resolved' } | { kind: 'provider_invalid' } | { kind: 'patient_invalid' }
       | { kind: 'call_already_booked'; appointmentId: string }
       | { kind: 'conflict'; reason: string }
-      | { kind: 'booked'; appointment: { id: string; service: string; startsAt: Date }; confirmationsQueued: string[]; differences: string[] };
+      | {
+        kind: 'booked'; appointment: { id: string; service: string; startsAt: Date };
+        confirmationsQueued: string[]; differences: string[];
+        tasksClosed: number; tasksLeftOpen: number; crossBranchPatient: boolean;
+      };
     if (result.kind === 'not_found') throw app.httpErrors.notFound('Appointment request not found');
     if (result.kind === 'resolved') throw app.httpErrors.conflict('This request has already been resolved.');
     if (result.kind === 'provider_invalid') throw app.httpErrors.badRequest('Select an active provider in this tenant');
@@ -348,6 +492,9 @@ export const activityRoutes: FastifyPluginAsync = async app => {
       appointment: result.appointment,
       confirmationsQueued: result.confirmationsQueued,
       differences: result.differences,
+      tasksClosed: result.tasksClosed,
+      tasksLeftOpen: result.tasksLeftOpen,
+      crossBranchPatient: result.crossBranchPatient,
     });
   });
 
@@ -1113,7 +1260,6 @@ export const activityRoutes: FastifyPluginAsync = async app => {
       ? null
       : answeredCallbacks.filter(task => task.acknowledgedAt!.getTime() <= task.dueAt!.getTime()).length / callbackTasks.length;
 
-    const totalCalls = grouped.reduce((sum, row) => sum + row._count._all, 0);
     const bookedTotal = grouped.filter(row => row.outcome === 'BOOKED').reduce((sum, row) => sum + row._count._all, 0);
     const counts = {
       inbound: inboundTotal,
@@ -1146,15 +1292,13 @@ export const activityRoutes: FastifyPluginAsync = async app => {
         aht: 'Average call seconds, excluding in-progress and zero-second calls.',
         callbacksWithinSla: 'Message and handoff tasks acknowledged on or before their due time, over those created in the period.',
       },
-      // Legacy scalars kept for one cycle so the current Studio header keeps working.
-      clinics,
-      activeCampaigns,
-      totalCalls,
-      booked: bookedTotal,
-      bookingRate: totalCalls ? Math.round((bookedTotal / totalCalls) * 100) : 0,
-      appointmentRequests: pendingRequests,
-      optOuts: optedOut,
-      avgDurationSeconds: aht ?? 0,
+      // D6: the pre-C4 scalars are GONE. They divided BOOKED by every call in
+      // both directions — including the zero-second NO_ANSWER rows the live
+      // audit found — and collapsed null to 0, so a clinic that had answered
+      // nothing read "0% booking rate" and "0m 0s" instead of "no data yet".
+      // That is the "7 calls handled / 14% booking rate" the contract froze as
+      // not-capability. `counts`, `rates`, `aht` and `definitions` above are the
+      // honest replacements; a rate with no denominator is null, never 0.
     };
   });
 };

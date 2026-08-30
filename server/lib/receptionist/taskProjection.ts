@@ -51,6 +51,14 @@ export interface ReceptionistTaskView {
   denialReason: string | null;
   appointmentRequestId: string | null;
   appointmentId: string | null;
+  // D9 — a `deployment_attention` task carries what lapsed and the words that
+  // fix it, so the Service status lane can render an action and a Fix button
+  // instead of a title nobody can act on.
+  agentId: string | null;
+  code: string | null;
+  remediationTitle: string | null;
+  remediationAction: string | null;
+  fixHref: string | null;
   staffNotes: ReceptionistTaskMetadata['staffNotes'];
 }
 
@@ -58,6 +66,13 @@ export interface RestrictedTaskView {
   kind: ReceptionistTaskKind;
   restricted: true;
   requiresAcknowledgement: true;
+  /**
+   * D9 — the deployment task names no caller and carries no PHI, so a reader
+   * without call-artifact access still sees why the line stopped answering.
+   * Every other kind collapses to the kind alone, as before.
+   */
+  remediationAction?: string | null;
+  fixHref?: string | null;
 }
 
 export interface TaskProjectionOptions {
@@ -89,6 +104,11 @@ export function receptionistView(meta: ReceptionistTaskMetadata): ReceptionistTa
     denialReason: meta.denialReason,
     appointmentRequestId: meta.appointmentRequestId,
     appointmentId: meta.appointmentId,
+    agentId: meta.agentId,
+    code: meta.code,
+    remediationTitle: meta.remediationTitle,
+    remediationAction: meta.remediationAction,
+    fixHref: meta.fixHref,
     staffNotes: meta.staffNotes,
   };
 }
@@ -98,7 +118,12 @@ export function projectTaskRow(row: TaskRowWithRelations, options: TaskProjectio
   const restricted = Boolean(meta) && !options.canReadArtifacts;
   const receptionist: ReceptionistTaskView | RestrictedTaskView | null = meta
     ? restricted
-      ? { kind: meta.kind, restricted: true, requiresAcknowledgement: true }
+      ? {
+        kind: meta.kind, restricted: true, requiresAcknowledgement: true,
+        ...(meta.kind === 'deployment_attention'
+          ? { remediationAction: meta.remediationAction, fixHref: meta.fixHref }
+          : {}),
+      }
       : receptionistView(meta)
     : null;
   const patient = options.canReadPatient && row.patient
@@ -111,7 +136,12 @@ export function projectTaskRow(row: TaskRowWithRelations, options: TaskProjectio
   const metadata = !meta
     ? row.metadata
     : restricted
-      ? { workflow: 'receptionist_safety', kind: meta.kind, requiresAcknowledgement: true, restricted: true }
+      ? {
+        workflow: 'receptionist_safety', kind: meta.kind, requiresAcknowledgement: true, restricted: true,
+        ...(meta.kind === 'deployment_attention'
+          ? { remediationAction: meta.remediationAction, fixHref: meta.fixHref }
+          : {}),
+      }
       : {
         ...(row.metadata as Record<string, unknown>),
         callbackPhone: maskPhone(meta.callbackPhone),
