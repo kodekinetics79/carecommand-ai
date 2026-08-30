@@ -51,6 +51,8 @@ const STRICT_HH_MM = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 const CLIENT_LAUNCH_ATTEMPT_SCOPE = 'receptionist.outbound-client-attempt';
 const LIVE_UAT_TARGET_SOURCE_PREFIX = 'live_voice_uat:';
 export const MAX_TENANT_ACTIVE_CALLS = 3;
+import { recordUsageEvent, periodUsageTotal, voiceCallDedupeKey, USAGE_METRICS } from '../../lib/usageMetering';
+
 export const DEFAULT_VOICE_MINUTES_LIMIT = 500;
 
 type ProviderBoundaryTestStage = 'before_suppression_fence' | 'suppression_fence_acquired' | 'provider_intent_committed' | 'before_provider_binding_lock' | 'provider_binding_committed' | 'before_call_stopping_evaluation';
@@ -1669,7 +1671,10 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
             await finishClientAttempt('blocked:concurrency_limit_reached');
             return { blocked: 'concurrency_limit_reached' as const };
           }
-          const usedMinutes = Math.max(voiceUsage.used, aiUsage.receptionistMinutes);
+          // Included minutes are per billing period; the lifetime counters above
+          // are display-only. Enforcing on them meant a clinic's allowance ran
+          // out once and never came back.
+          const usedMinutes = await periodUsageTotal(tx, request.auth.tenantId, USAGE_METRICS.voiceMinute);
           // Each in-progress call reserves at least one billable minute. This
           // prevents parallel launches from consuming the final minute twice.
           if (!aiUsage.overageAllowed && voiceUsage.limitValue !== null && usedMinutes + activeCalls >= voiceUsage.limitValue) {
@@ -2728,6 +2733,18 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         const finalMinutes = Math.ceil(updated.durationSeconds / 60);
         const delta = Math.max(0, finalMinutes - priorMinutes);
         if (delta > 0) {
+          // Billable record first, in the same transaction as the call row.
+          await recordUsageEvent(tx, {
+            tenantId: request.auth.tenantId,
+            metric: USAGE_METRICS.voiceMinute,
+            quantity: delta,
+            occurredAt: updated.endedAt ?? new Date(),
+            sourceModule: 'receptionist',
+            sourceType: 'receptionistCallLog',
+            sourceId: updated.id,
+            dedupeKey: voiceCallDedupeKey(localCall.retellCallId ?? updated.id, finalMinutes),
+          });
+          // Lifetime totals, kept for the operator's "since day one" view only.
           await tx.tenantAiUsage.upsert({
             where: { tenantId: request.auth.tenantId },
             update: { receptionistMinutes: { increment: delta } },

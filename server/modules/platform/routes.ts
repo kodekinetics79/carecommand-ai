@@ -11,6 +11,7 @@ import { env } from '../../config/env';
 import { encryptSecret, decryptSecret } from '../../lib/security';
 import { runWithPlatformDatabaseRequest } from '../../lib/platformContextStore';
 import { validateIanaTimezone } from '../../lib/scheduling';
+import { periodUsageByMetric, usagePeriodKey, USAGE_LIMIT_KEY_BY_METRIC } from '../../lib/usageMetering';
 
 const timezoneInput = z.string().trim().min(1).max(80).refine(value => {
   try { validateIanaTimezone(value); return true; } catch { return false; }
@@ -732,7 +733,24 @@ export const platformRoutes: FastifyPluginAsync = async app => {
   app.get('/tenants/:tenantId/usage-limits', async request => {
     const { tenantId } = z.object({ tenantId: uuid }).parse(request.params);
     const rows = await ensureUsageLimits(tenantId);
-    return rows.map(r => ({ key: r.key, used: r.used, limit: r.limitValue }));
+    // `used` on the row is a lifetime total. The limit is per billing period,
+    // so report what the gates actually enforce against: this period's metered
+    // usage. Keys with no meter behind them say so rather than showing a zero
+    // an operator would read as "nothing used".
+    const metered = await periodUsageByMetric(db, tenantId);
+    const usedByLimitKey = new Map(
+      Object.entries(metered).map(([metric, total]) => [USAGE_LIMIT_KEY_BY_METRIC[metric as keyof typeof USAGE_LIMIT_KEY_BY_METRIC] ?? metric, total]),
+    );
+    return {
+      periodKey: usagePeriodKey(new Date()),
+      rows: rows.map(r => ({
+        key: r.key,
+        used: usedByLimitKey.get(r.key) ?? 0,
+        limit: r.limitValue,
+        metered: usedByLimitKey.has(r.key),
+        lifetimeUsed: r.used,
+      })),
+    };
   });
   app.patch('/tenants/:tenantId/usage-limits/:key', { preHandler: tenantManage }, async request => {
     const { tenantId, key } = z.object({ tenantId: uuid, key: z.enum(USAGE_KEYS) }).parse(request.params);

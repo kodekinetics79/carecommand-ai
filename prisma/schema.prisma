@@ -246,6 +246,7 @@ model Tenant {
   campaignSubmissionClaims            CampaignSubmissionClaim[]
   campaignLiveDispatchActivations     CampaignLiveDispatchActivation[]
   campaignAttributions                CampaignAttribution[]
+  usageEvents            UsageEvent[]
 }
 
 model User {
@@ -3431,6 +3432,49 @@ model TenantBilling {
   updatedAt       DateTime  @updatedAt
 
   @@index([paymentStatus])
+}
+
+/**
+ * Append-only usage ledger. One row per metered event, keyed to a billing
+ * period.
+ *
+ * Before this table, voice minutes were counted in two LIFETIME counters
+ * (TenantUsageLimit.used and TenantAiUsage.receptionistMinutes) that were only
+ * ever incremented - no period, no reset, no job. Both call-admission gates
+ * refuse a call once used >= limitValue, so a clinic on 500 included minutes
+ * stopped answering its patients' calls forever, part-way through its second
+ * month, with a 402 and no warning. A quota that never resets is not a quota.
+ *
+ * `dedupeKey` is the safety story: provider webhooks redeliver as a matter of
+ * course, so the unique index - not application care - is what stops a
+ * redelivered terminal event billing the same minute twice.
+ */
+model UsageEvent {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+
+  metric   String // voice_minute | sms_send | email_send | ai_token
+  quantity Int // whole units of `metric`; minutes are already rounded up at source
+
+  // occurredAt is provider truth (when the call ended), NOT ingest time, so a
+  // late redelivery still lands in the period the work happened in.
+  occurredAt DateTime
+  periodKey  String // 'YYYY-MM' derived from occurredAt in UTC
+
+  sourceModule String // receptionist | campaigns | ai_gateway
+  sourceType   String // receptionistCallLog | campaignDelivery | aIUsageLog
+  sourceId     String? @db.Uuid
+  dedupeKey    String
+
+  // Platform-only. What the event cost US, never shown to a tenant.
+  providerCostUsd Decimal? @db.Decimal(12, 6)
+
+  createdAt DateTime @default(now())
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, dedupeKey])
+  @@index([tenantId, periodKey, metric])
+  @@index([tenantId, metric, occurredAt])
 }
 
 model TenantUsageLimit {

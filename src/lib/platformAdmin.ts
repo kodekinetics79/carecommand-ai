@@ -222,7 +222,7 @@ export const platformAdmin = {
     pf<TenantBilling>(`/v1/platform/tenants/${id}/billing`, { method: 'PATCH', body: JSON.stringify(body) }),
   extendTrial: (id: string, days: number, reason: string) => pf<{ trialEndsAt: string }>(`/v1/platform/tenants/${id}/billing/extend-trial`, { method: 'POST', body: JSON.stringify({ days, reason }) }),
 
-  getUsageLimits: (id: string) => pf<Array<{ key: string; used: number; limit: number | null }>>(`/v1/platform/tenants/${id}/usage-limits`),
+  getUsageLimits: (id: string) => pf<{ periodKey: string; rows: UsageLimitRow[] }>(`/v1/platform/tenants/${id}/usage-limits`),
   setUsageLimit: (id: string, key: string, limit: number | null) => pf<{ key: string; used: number; limit: number | null }>(`/v1/platform/tenants/${id}/usage-limits/${key}`, { method: 'PATCH', body: JSON.stringify({ limit }) }),
 
   getAiUsage: (id: string) => pf<AiUsageView>(`/v1/platform/tenants/${id}/ai-usage`),
@@ -288,6 +288,9 @@ export const platformAdmin = {
   addService: (label: string, fields: Array<{ label: string; secret: boolean; required: boolean; value?: string }>) => pf<IntegrationView>(`/v1/platform/integrations`, { method: 'POST', body: JSON.stringify({ label, fields }) }),
   addIntegrationField: (key: string, body: { label: string; secret: boolean; required: boolean }) => pf<IntegrationView>(`/v1/platform/integrations/${key}/fields`, { method: 'PATCH', body: JSON.stringify(body) }),
 };
+
+/** `used` is THIS billing period. `metered` is false where nothing counts the key yet. */
+export interface UsageLimitRow { key: string; used: number; limit: number | null; metered: boolean; lifetimeUsed: number }
 
 export interface PlatformSettings {
   platformName: string; supportEmail: string | null;

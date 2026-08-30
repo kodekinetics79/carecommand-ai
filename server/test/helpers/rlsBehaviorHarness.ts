@@ -83,6 +83,8 @@ function syntheticScalar(column: Column, suffix: string): unknown {
   if (name.includes('phone')) return syntheticE164Phone(`${column.table}:${column.name}:${suffix}`);
   if (name.includes('timezone')) return 'UTC';
   if (name.includes('currency')) return 'USD';
+  // Billing period keys are CHECK-constrained to 'YYYY-MM' (UsageEvent).
+  if (name.includes('periodkey')) return '2026-01';
   if (name.includes('locale') || name.includes('language')) return 'en';
   if (name.includes('hash')) return createHash('sha256').update(`${column.table}:${column.name}:${suffix}`).digest('hex');
   if (name.includes('url')) return `https://example.test/${suffix}`;

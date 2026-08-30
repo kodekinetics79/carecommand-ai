@@ -18,6 +18,7 @@ vi.mock('../workers/queues', () => ({
 const { buildApp } = await import('../app');
 const { env } = await import('../config/env');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
+const { recordUsageEvent, USAGE_METRICS } = await import('../lib/usageMetering');
 const { fingerprintJson } = await import('../modules/receptionist/intakeContract');
 const { isWithinQuietHours, quietHoursConfigurationReason, setProviderBoundaryTestHookForTests } = await import('../modules/receptionist/outbound');
 const { isDestinationOptedOut } = await import('../lib/campaigns');
@@ -2156,10 +2157,22 @@ describe('AI receptionist outbound regression safety controls', () => {
       where: { tenantId: tenant.id, outcome: 'IN_PROGRESS' },
       data: { outcome: 'FAILED', endedAt: new Date() },
     });
+    // Exhaust the allowance the way the product now measures it: usage is
+    // metered per billing period in UsageEvent, not accumulated forever in
+    // TenantUsageLimit.used. The limit row still carries the POLICY (1 minute).
     await db.tenantUsageLimit.upsert({
       where: { tenantId_key: { tenantId: tenant.id, key: 'voice_minutes' } },
       update: { used: 1, limitValue: 1 },
       create: { tenantId: tenant.id, key: 'voice_minutes', used: 1, limitValue: 1 },
+    });
+    await recordUsageEvent(db, {
+      tenantId: tenant.id,
+      metric: USAGE_METRICS.voiceMinute,
+      quantity: 1,
+      occurredAt: new Date(),
+      sourceModule: 'receptionist',
+      sourceType: 'receptionistCallLog',
+      dedupeKey: `test-exhaust-${tenant.id}`,
     });
     const minutesExhausted = await app.inject({
       method: 'POST',

@@ -10,7 +10,7 @@ import {
   platformAdmin, setPlatformToken, downloadAuditCsv, TENANT_STATUS_BADGE, SUB_STATUS_BADGE, FEATURE_LABELS,
   type PlatformMe, type TenantSummary, type SystemHealth, type TenantBilling, type AiUsageView, type SecurityView, type IntegrationView,
   type TenantAccountRecord, type TenantCompany, type TenantRoster,
-  type PlatformSettings, type PlatformSettingPreset,
+  type PlatformSettings, type PlatformSettingPreset, type UsageLimitRow,
 } from '../lib/platformAdmin';
 import PlatformPilot from './PlatformPilot';
 
@@ -890,11 +890,12 @@ function Toggle({ on, onToggle, label }: { on: boolean; onToggle: () => void; la
 }
 
 function UsageTab({ tid, canManage }: { tid: string; canManage: boolean }) {
-  const [rows, setRows] = useState<Array<{ key: string; used: number; limit: number | null }> | null>(null);
+  const [rows, setRows] = useState<UsageLimitRow[] | null>(null);
+  const [periodKey, setPeriodKey] = useState<string>('');
   const [edits, setEdits] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
-  const load = useCallback(async () => setRows(await platformAdmin.getUsageLimits(tid)), [tid]);
-  useEffect(() => { let a = true; void (async () => { const r = await platformAdmin.getUsageLimits(tid); if (a) setRows(r); })(); return () => { a = false; }; }, [tid]);
+  const load = useCallback(async () => { const r = await platformAdmin.getUsageLimits(tid); setRows(r.rows); setPeriodKey(r.periodKey); }, [tid]);
+  useEffect(() => { let a = true; void (async () => { const r = await platformAdmin.getUsageLimits(tid); if (a) { setRows(r.rows); setPeriodKey(r.periodKey); } })(); return () => { a = false; }; }, [tid]);
   async function save(key: string) {
     setBusy(key);
     const raw = edits[key]; const limit = raw === '' ? null : Number(raw);
@@ -904,15 +905,22 @@ function UsageTab({ tid, canManage }: { tid: string; canManage: boolean }) {
   if (!rows) return <div className="py-6 text-center"><Loader2 className="inline w-5 h-5 animate-spin text-indigo" /></div>;
   return (
     <div className="space-y-2">
+      <p className="text-[11px] text-t3">
+        Usage shown for the current billing period{periodKey ? ` (${periodKey})` : ''}. Limits reset each period.
+      </p>
       {rows.map(r => {
-        const pct = r.limit ? Math.min(100, Math.round((r.used / r.limit) * 100)) : 0;
+        // An unmetered key has no honest bar to draw: a permanent 0% reads as
+        // "plenty of headroom" when the truth is "nothing counts this".
+        const pct = r.metered && r.limit ? Math.min(100, Math.round((r.used / r.limit) * 100)) : 0;
         return (
           <div key={r.key} className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2.5">
             <div className="flex items-center justify-between">
               <span className="text-[12px] font-semibold text-t1">{labels[r.key] ?? r.key}</span>
-              <span className="text-[11px] text-t3">{r.used}{r.limit != null ? ` / ${r.limit}` : ' / ∞'}</span>
+              <span className="text-[11px] text-t3">
+                {r.metered ? <>{r.used}{r.limit != null ? ` / ${r.limit}` : ' / ∞'}</> : <span title="No meter records this key yet">not measured{r.limit != null ? ` · limit ${r.limit}` : ''}</span>}
+              </span>
             </div>
-            <div className="prog-track md mt-1.5"><div className={`prog-fill ${pct >= 90 ? 'pf-red' : pct >= 70 ? 'pf-amber' : 'pf-indigo'}`} style={{ width: `${pct}%` }} /></div>
+            {r.metered && <div className="prog-track md mt-1.5"><div className={`prog-fill ${pct >= 90 ? 'pf-red' : pct >= 70 ? 'pf-amber' : 'pf-indigo'}`} style={{ width: `${pct}%` }} /></div>}
             {canManage && (
               <div className="mt-2 flex items-center gap-2">
                 <input value={edits[r.key] ?? (r.limit ?? '')} onChange={e => setEdits(s => ({ ...s, [r.key]: e.target.value.replace(/[^0-9]/g, '') }))} placeholder="∞" className="w-24 rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-2 py-1 text-xs" />

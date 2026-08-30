@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { env } from '../../config/env';
 import { targetStatusAfterOutcome, MAX_TENANT_ACTIVE_CALLS, DEFAULT_VOICE_MINUTES_LIMIT } from './outbound';
+import { recordUsageEvent, periodUsageTotal, voiceCallDedupeKey, USAGE_METRICS } from '../../lib/usageMetering';
 import { handleAgentTool, requestHumanHandoff, type TrustedBookingContext } from '../../lib/receptionist/liveTools';
 import { ingestCallArtifacts } from '../../lib/receptionist/privacyLifecycle';
 import { enterTenantContext, runWithTenantContext } from '../../lib/tenantContext';
@@ -338,7 +339,11 @@ async function admitInboundReceptionist(tenantId: string, providerCallId: string
       where: { tenantId, outcome: 'IN_PROGRESS', endedAt: null, retellCallId: { not: providerCallId } },
     });
     if (activeCalls >= MAX_TENANT_ACTIVE_CALLS) return { allowed: false as const, reason: 'concurrency_limit_reached' };
-    const usedMinutes = Math.max(voiceUsage.used, aiUsage.receptionistMinutes);
+    // Included minutes are per billing period. TenantUsageLimit.used and
+    // TenantAiUsage.receptionistMinutes are LIFETIME counters that nothing ever
+    // resets, so enforcing on them meant a clinic stopped answering its
+    // patients' calls permanently once it had used its allowance once.
+    const usedMinutes = await periodUsageTotal(tx, tenantId, USAGE_METRICS.voiceMinute);
     if (!aiUsage.overageAllowed && voiceUsage.limitValue !== null && usedMinutes + activeCalls >= voiceUsage.limitValue) {
       return { allowed: false as const, reason: 'voice_minutes_limit_reached' };
     }
@@ -617,6 +622,22 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         const finalMinutes = Math.ceil(row.durationSeconds / 60);
         const delta = Math.max(0, finalMinutes - priorMinutes);
         if (delta > 0) {
+          // The billable record, in the same transaction as the call row it
+          // describes. Keyed to the cumulative minute total, so a redelivered
+          // terminal event is a no-op and a call later corrected upward bills
+          // only the increment.
+          await recordUsageEvent(tx, {
+            tenantId,
+            metric: USAGE_METRICS.voiceMinute,
+            quantity: delta,
+            occurredAt: row.endedAt ?? new Date(),
+            sourceModule: 'receptionist',
+            sourceType: 'receptionistCallLog',
+            sourceId: row.id,
+            dedupeKey: voiceCallDedupeKey(providerCallId, finalMinutes),
+          });
+          // Lifetime totals are kept for the operator's "since day one" view.
+          // They are no longer what the quota is enforced against.
           await tx.tenantAiUsage.upsert({
             where: { tenantId },
             update: { receptionistMinutes: { increment: delta } },
@@ -625,7 +646,7 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
           await tx.tenantUsageLimit.upsert({
             where: { tenantId_key: { tenantId, key: 'voice_minutes' } },
             update: { used: { increment: delta } },
-            create: { tenantId, key: 'voice_minutes', limitValue: 500, used: delta },
+            create: { tenantId, key: 'voice_minutes', limitValue: DEFAULT_VOICE_MINUTES_LIMIT, used: delta },
           });
         }
       }
