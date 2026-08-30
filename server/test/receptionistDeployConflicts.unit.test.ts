@@ -78,7 +78,7 @@ describe('unique-constraint classification', () => {
     // that does not exist for them.
     expect(PROVIDER_DEPLOYMENT_CONFLICT_MESSAGE).toMatch(/another CareCommand configuration/i);
     expect(PROVIDER_DEPLOYMENT_CONFLICT_MESSAGE).toMatch(/outside this tenant/i);
-    expect(PROVIDER_DEPLOYMENT_CONFLICT_MESSAGE).toMatch(/deploy from studio|unlink/i);
+    expect(PROVIDER_DEPLOYMENT_CONFLICT_MESSAGE).toMatch(/publish to the line/i);
     expect(INBOUND_DESTINATION_CONFLICT_MESSAGE).toMatch(/one number answers for one clinic/i);
   });
 });

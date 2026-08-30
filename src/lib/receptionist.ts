@@ -134,7 +134,7 @@ export interface PromptResult {
   };
 }
 
-export interface RetellConfig {
+export interface VoiceLineConfiguration {
   systemPrompt: string;
   voiceId: string;
   language: string;
@@ -149,7 +149,7 @@ export interface CallLog {
   id: string;
   clinicId: string;
   campaignId: string | null;
-  retellCallId: string | null;
+  providerCallRef: string | null;
   callerName: string | null;
   callerPhone: string | null;
   direction: string;
@@ -264,7 +264,7 @@ export const OUTBOUND_REQUIRED_FIELDS: Array<{ key: OutboundRequiredField; label
   { key: 'preferredDateTime', label: 'Preferred date/time' },
 ];
 
-export interface RetellStatus {
+export interface VoiceLineStatus {
   configured: boolean;
   mock: boolean;
   missing: string[];
@@ -742,15 +742,12 @@ export const FIELD_CATALOG: Array<{ type: FieldType; label: string; question: st
   { type: 'CUSTOM_YES_NO', label: 'Custom yes/no field', question: 'Can you confirm yes or no?', group: 'Custom' },
 ];
 
-export const VOICE_OPTIONS = [
-  { id: '11labs-Adrian', label: 'Adrian (male, warm)' },
-  { id: '11labs-Anna', label: 'Anna (female, friendly)' },
-  { id: '11labs-Bella', label: 'Bella (female, calm)' },
-  { id: '11labs-Brian', label: 'Brian (male, professional)' },
-  { id: '11labs-Marissa', label: 'Marissa (female, upbeat)' },
-  { id: 'openai-Alloy', label: 'Alloy (neutral)' },
-  { id: 'openai-Nova', label: 'Nova (female, bright)' },
-];
+// VOICE_OPTIONS was deleted here. It was a hardcoded fallback list of seven
+// SUPPLIER-prefixed voice ids compiled into the
+// browser bundle, and nothing had imported it since the Studio moved to the
+// server-served catalogue — so it named two suppliers in shipped JavaScript
+// while doing no work at all. Voices come from `GET /voices`, which now
+// projects out the synthesising house as well.
 
 export const TONE_OPTIONS = [
   'Warm and professional',
@@ -809,7 +806,7 @@ export const receptionistApi = {
   reorderIntakeFields: (campaignId: string, orderedIds: string[]) => apiRequest<IntakeField[]>(`${base}/intake-fields/reorder`, { method: 'POST', body: JSON.stringify({ campaignId, orderedIds }) }),
 
   getPrompt: (campaignId: string) => apiRequest<PromptResult>(`${base}/campaigns/${campaignId}/prompt`),
-  getRetellConfig: (campaignId: string) => apiRequest<RetellConfig>(`${base}/campaigns/${campaignId}/retell-config`),
+  getVoiceLineConfiguration: (campaignId: string) => apiRequest<VoiceLineConfiguration>(`${base}/campaigns/${campaignId}/voice-line-configuration`),
 
   listCallLogs: (clinicId: string) => apiRequest<CallLog[]>(`${base}/call-logs?clinicId=${clinicId}`),
   getCallLog: (id: string) => apiRequest<CallLog>(`${base}/call-logs/${id}`),
@@ -829,7 +826,7 @@ export const receptionistApi = {
   }),
 
   // --- Outbound calling ----------------------------------------------------
-  retellStatus: () => apiRequest<RetellStatus>(`${base}/retell-status`),
+  voiceLineStatus: () => apiRequest<VoiceLineStatus>(`${base}/voice-line-status`),
   listOutboundCampaigns: (clinicId?: string) => apiRequest<OutboundCampaign[]>(`${base}/outbound-campaigns${clinicId ? `?clinicId=${clinicId}` : ''}`),
   getOutboundCampaign: (id: string) => apiRequest<OutboundCampaign>(`${base}/outbound-campaigns/${id}`),
   createOutboundCampaign: (body: OutboundCampaignInput) => apiRequest<OutboundCampaign>(`${base}/outbound-campaigns`, { method: 'POST', body: JSON.stringify(body) }),

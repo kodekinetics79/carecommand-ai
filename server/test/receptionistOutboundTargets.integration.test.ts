@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { signRetell } from './helpers/retellSignature';
+import { maskProviderId } from '../lib/receptionist/liveCallUat';
 
 vi.mock('../workers/queues', () => ({
   redisConnection: {},
@@ -345,7 +346,7 @@ describe('AI receptionist persistent reconciliation evidence', () => {
     const first = await read();
     expect(first.statusCode).toBe(200);
     expect(first.json()).toEqual([expect.objectContaining({
-      localCallLogId: call.id, providerCallId: call.retellCallId, targetId: target.id,
+      localCallLogId: call.id, providerCallId: maskProviderId(call.retellCallId), targetId: target.id,
       triggerSources: ['RECONCILIATION_REQUIRED', 'RECONCILIATION_SIGNAL', 'RECONCILIATION_TASK'],
       signalIds: [signal.id], signalStatuses: ['open'],
       reviewTaskIds: [task.id], reviewTaskStatuses: ['OPEN'],
@@ -412,7 +413,7 @@ describe('AI receptionist persistent reconciliation evidence', () => {
     });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual([expect.objectContaining({
-      localCallLogId: oldCall.id, providerCallId: oldCall.retellCallId,
+      localCallLogId: oldCall.id, providerCallId: maskProviderId(oldCall.retellCallId),
       triggerSources: ['RECONCILIATION_REQUIRED'],
     })]);
   });

@@ -133,7 +133,7 @@ function IntakeFieldRow({ field, isFirst, isLast, moveDisabled, onMoveUp, onMove
   const set = <K extends keyof IntakeField>(key: K, value: IntakeField[K]) => setDraft(prev => ({ ...prev, [key]: value }));
   // Preferred-location choices come from the campaign's active mapped
   // locations. A second hand-maintained option list can drift from scheduling
-  // and previously made Retell export fail at runtime.
+  // and previously made the voice line configuration fail at runtime.
   const hasOptions = field.fieldType === 'CUSTOM_DROPDOWN';
 
   async function save() {

@@ -136,9 +136,17 @@ describe('deploying a campaign to Retell', () => {
       // round trips plus a probe do not fit in one serverless invocation.
       expect(deployed.json().verification).toEqual({ status: 'pending' });
       expect(deployed.json().deployment).toMatchObject({ status: 'PUBLISHED', mock: true, numberBound: true });
-      // Provider ids are masked at the boundary like every other provider id.
-      expect(deployed.json().deployment.providerAgentIdMasked).toMatch(/…/);
-      expect(JSON.stringify(deployed.json())).not.toContain('mock_deploy_key');
+      // Masking the provider id was not enough, so the tenant projection no
+      // longer carries it at all — nor the published version, the LLM version,
+      // the deployment tag or the four fingerprints. One opaque reference
+      // stands for all of them, and it is derived from CareCommand's own row
+      // id rather than from anything the supplier issued.
+      expect(deployed.json().deployment.configurationReference).toMatch(/^LINE-[A-Z0-9]{6}$/);
+      const body = JSON.stringify(deployed.json());
+      expect(body).not.toContain('mock_deploy_key');
+      for (const withheld of ['providerAgentIdMasked', 'providerAgentVersion', 'providerLlmVersion', 'providerVersionTag', 'promptHash', 'toolFingerprint', 'intakeFingerprint', 'configFingerprint']) {
+        expect(deployed.json().deployment, `${withheld} must not reach a tenant`).not.toHaveProperty(withheld);
+      }
 
       const row = await db.receptionistAgentDeployment.findFirstOrThrow({ where: { campaignId: campaign.id } });
       expect(row.promptHash.startsWith('mock:')).toBe(true);
@@ -361,7 +369,7 @@ describe('deploying a campaign to Retell', () => {
       expect(deploymentCurrent).toMatchObject({ status: 'fail', code: 'deployment_current' });
       // B7: `deploy` was never a Studio tab id. The go-live screen is `retell`
       // (Package E relabels it "Go live"; the id stays).
-      expect(deploymentCurrent.fixHref).toContain('tab=retell');
+      expect(deploymentCurrent.fixHref).toContain('tab=deploy');
     } finally {
       env.RETELL_API_KEY = originalRetell.apiKey;
       env.RETELL_FROM_NUMBER = originalRetell.fromNumber;

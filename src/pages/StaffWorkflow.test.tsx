@@ -43,7 +43,7 @@ const RECEPTIONIST_TASK = {
     messageCount: 1, reasonCategory: 'billing', callbackWindow: null,
     transferStatus: 'attempted', transferUpdatedAt: '2026-08-29T17:31:00.000Z',
     toolName: null, denialReason: null, appointmentRequestId: null, appointmentId: null,
-    staffNotes: [], source: 'retell_live_call', requiresAcknowledgement: true,
+    staffNotes: [], source: 'webhook_call_ended', requiresAcknowledgement: true,
   },
 };
 

@@ -27,7 +27,7 @@ function preview(overrides: Partial<PreviewResponse> = {}): PreviewResponse {
     ],
     disclosure: { baseline: 'This call is handled by an AI assistant and is recorded.', additional: '', composed: 'This call is handled by an AI assistant and is recorded.' },
     placeholders: [],
-    agent: { name: 'Riley', voice: '11labs-Anna', language: 'en-US', placeholder: false },
+    agent: { name: 'Riley', voice: 'voice-anna', language: 'en-US', placeholder: false },
     systemPrompt: '# Role\nYou are Riley, the receptionist for Brightsmile Dental.',
     ...overrides,
   };
@@ -66,7 +66,7 @@ describe('PreviewPanel — what the receptionist will actually say', () => {
 
   it('banners a placeholder agent and lists what would block a deploy', async () => {
     respond = () => Promise.resolve(preview({
-      agent: { name: 'Riley', voice: '11labs-Adrian', language: 'en-US', placeholder: true },
+      agent: { name: 'Riley', voice: 'voice-adrian', language: 'en-US', placeholder: true },
       placeholders: [{ field: 'offerTitle', value: 'New offer', reason: 'known_default' }],
     }));
     render(<PreviewPanel campaignId="camp-1" />);

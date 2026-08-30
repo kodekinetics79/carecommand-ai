@@ -72,6 +72,9 @@ describe('receptionist catalog', () => {
   });
 
   it('marks only the dropdown field type as having options', () => {
-    expect(SUPPORTED_AGENT_LANGUAGES.every(item => item.provider === 'retell')).toBe(true);
+    // The tag is generic on purpose: the catalog is served to the browser and
+    // which house speaks a language is not the clinic's business (see
+    // server/test/receptionistVendorNeutrality.lint.test.ts).
+    expect(SUPPORTED_AGENT_LANGUAGES.every(item => item.provider === 'voice_service')).toBe(true);
   });
 });

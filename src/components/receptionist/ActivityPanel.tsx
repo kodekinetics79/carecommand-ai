@@ -431,7 +431,7 @@ export function ActivityPanel({ clinicId, initialCallId = null, timezone }: {
           )}
           {callsState === 'ready' && calls.length === 0 && (
             <p className="py-4 text-center text-xs text-t3">
-              {filtersActive ? 'No call matches these filters.' : 'No calls logged yet. Calls appear here via the RetellAI webhook.'}
+              {filtersActive ? 'No call matches these filters.' : 'No calls logged yet. Calls appear here as soon as the voice line reports them.'}
             </p>
           )}
           {calls.map(call => (

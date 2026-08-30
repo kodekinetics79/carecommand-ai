@@ -123,7 +123,7 @@ describe('what staff are told when renewal fails', () => {
     expect(tasks[0]).toMatchObject({ title: 'AI receptionist deployment needs attention', priority: 'HIGH', status: 'OPEN' });
     // The task carries the fix, not just the failure.
     expect(tasks[0].metadata).toMatchObject({ workflow: 'receptionist_deployment', agentId: fixture.agentId, code: 'prompt_drift' });
-    expect(String((tasks[0].metadata as { action: string }).action)).toMatch(/Redeploy from Studio/i);
+    expect(String((tasks[0].metadata as { action: string }).action)).toMatch(/Publish to the line again/i);
     // It lands on the branch that answers for this clinic.
     expect(tasks[0].branchId).toBe(fixture.branchId);
 

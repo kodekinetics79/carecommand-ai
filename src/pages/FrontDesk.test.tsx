@@ -52,7 +52,7 @@ function task(overrides: Record<string, unknown> = {}) {
       hasRequestedPhone: false, messages: [{ text: 'Please call me back about a crown.', recordedAt: '2026-08-29T17:30:00.000Z' }],
       messageCount: 1, reasonCategory: 'billing', callbackWindow: null, transferStatus: 'not_attempted',
       transferUpdatedAt: null, toolName: null, denialReason: null, appointmentRequestId: null, appointmentId: null,
-      staffNotes: [], source: 'retell_live_call', requiresAcknowledgement: true, remediation: null, clinicId: CLINIC.id,
+      staffNotes: [], source: 'webhook_call_ended', requiresAcknowledgement: true, remediation: null, clinicId: CLINIC.id,
     },
     ...overrides,
   };
@@ -78,7 +78,7 @@ const DEPLOYMENT_TASK = {
     workflow: 'receptionist_deployment', agentId: 'agent-1', clinicId: CLINIC.id, code: 'number_bound',
     title: 'The phone number is not bound to this agent',
     action: 'Re-deploy the campaign so the number points at the published agent.',
-    fixHref: '/receptionist-studio?tab=retell&clinic=clinic-1',
+    fixHref: '/receptionist-studio?tab=deploy&clinic=clinic-1',
   },
 };
 
@@ -88,7 +88,7 @@ const REQUEST = {
   collectedName: 'Priya Shah', collectedPhoneMasked: '***-***-9090', collectedEmail: null,
   status: 'PENDING_REVIEW', source: 'voice', missingFields: [], outcomeReason: null,
   bookedAppointmentId: null, bookedAppointment: null,
-  callLog: { id: 'call-2', retellCallId: 'call_x', callerName: 'Priya Shah', direction: 'inbound', startedAt: '2026-08-29T17:00:00.000Z', clinicId: CLINIC.id, patientId: null },
+  callLog: { id: 'call-2', providerCallRef: 'call_x', callerName: 'Priya Shah', direction: 'inbound', startedAt: '2026-08-29T17:00:00.000Z', clinicId: CLINIC.id, patientId: null },
   patient: null, createdAt: '2026-08-29T17:01:00.000Z',
 };
 
@@ -339,7 +339,7 @@ describe('FrontDesk service status', () => {
     expect(await within(lane).findByText(/Your AI receptionist needs attention/)).toBeInTheDocument();
     expect(within(lane).getByText('The phone number is not bound to this agent')).toBeInTheDocument();
     expect(within(lane).getByText('Re-deploy the campaign so the number points at the published agent.')).toBeInTheDocument();
-    expect(within(lane).getByRole('link', { name: 'Fix this' })).toHaveAttribute('href', '/receptionist-studio?tab=retell&clinic=clinic-1');
+    expect(within(lane).getByRole('link', { name: 'Fix this' })).toHaveAttribute('href', '/receptionist-studio?tab=deploy&clinic=clinic-1');
     // …and it is not mixed into the caller lanes.
     expect(within(screen.getByRole('region', { name: 'Callbacks due' })).queryByText(/deployment needs attention/)).not.toBeInTheDocument();
   });

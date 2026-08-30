@@ -16,7 +16,7 @@ describe('formatEnumLabel', () => {
 
   it('leaves mixed-case human text and acronyms as written (M71)', () => {
     expect(formatEnumLabel('Warm and professional')).toBe('Warm and professional');
-    expect(formatEnumLabel('Retell LLM')).toBe('Retell LLM');
+    expect(formatEnumLabel('Voice line LLM')).toBe('Voice line LLM');
     expect(formatEnumLabel('SMS confirmation')).toBe('SMS confirmation');
     expect(formatEnumLabel('en-US')).toBe('En-US');
   });

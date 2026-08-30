@@ -1327,7 +1327,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       if (!terminal || !targetReleased || (unboundUncertainIntent && !reconciliationResolved)) {
         return {
           cleared: false as const, proof: unboundUncertainIntent ? 'unbound_provider_intent' as const : 'call_not_terminal' as const,
-          callLogId: call.id, providerCallId: call.retellCallId,
+          callLogId: call.id, providerCallId: maskProviderId(call.retellCallId),
         };
       }
       await tx.idempotencyKey.update({ where: { id: attempt.id }, data: { resultId: `reconciled:${call.id}` } });
@@ -1338,7 +1338,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
         metadata: { clientAttemptToken: token, outcome: call.outcome, targetReleased },
       } });
-      return { cleared: true as const, proof: 'durable_terminal_reconciliation' as const, callLogId: call.id, providerCallId: call.retellCallId };
+      return { cleared: true as const, proof: 'durable_terminal_reconciliation' as const, callLogId: call.id, providerCallId: maskProviderId(call.retellCallId) };
     });
   });
 
@@ -2824,10 +2824,14 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       resourceId: id,
       metadata: { count: rows.length, recordingsDisclosed: canReadRecordings },
     });
-    return rows.map(row => ({
+    return rows.map(({ retellCallId, ...row }) => ({
       ...row,
       callerPhone: maskPhone(row.callerPhone),
-      retellCallId: maskProviderId(row.retellCallId),
+      // The value was already masked; the KEY was not. A field called
+      // `retellCallId` names the supplier in every response body, every
+      // network tab and every error report a clinic forwards to us, whatever
+      // the value beside it has been reduced to.
+      providerCallRef: maskProviderId(retellCallId),
       recordingAvailable: Boolean(row.recordingUrl),
       recordingUrl: canReadRecordings ? row.recordingUrl : null,
     }));

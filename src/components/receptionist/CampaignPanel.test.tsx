@@ -11,7 +11,7 @@ vi.mock('../../lib/api', async () => {
 
 import { ApiError } from '../../lib/api';
 import type { Campaign, Clinic } from '../../lib/receptionist';
-import type { AgentRow, ConfirmationChannels, ReadinessResponse, RetellStatusResponse } from '../../lib/receptionistDeployment';
+import type { AgentRow, ConfirmationChannels, ReadinessResponse, VoiceLineStatusResponse } from '../../lib/receptionistDeployment';
 import { CampaignPanel } from './CampaignPanel';
 
 /**
@@ -39,9 +39,9 @@ function campaign(overrides: Partial<Campaign> = {}): Campaign {
 
 function agent(overrides: Partial<AgentRow> = {}): AgentRow {
   return {
-    id: 'agent-1', clinicId: 'clinic-1', name: 'Riley', voice: '11labs-Anna', tone: 'Warm and professional', language: 'en-US',
+    id: 'agent-1', clinicId: 'clinic-1', name: 'Riley', voice: 'voice-anna', tone: 'Warm and professional', language: 'en-US',
     persona: null, greetingOverride: null, active: true, providerAgentId: 'agent_7f21', providerVersionTag: 'prod',
-    providerVersion: 4, providerStatus: 'VERIFIED', providerPublished: true, providerVoiceId: '11labs-Anna', providerLanguage: 'en-US',
+    providerVersion: 4, providerStatus: 'VERIFIED', providerPublished: true, providerVoiceId: 'voice-anna', providerLanguage: 'en-US',
     providerVerifiedAt: '2026-08-29T17:00:00.000Z', providerVerificationExpiresAt: '2026-08-30T17:00:00.000Z',
     providerLastAttemptAt: '2026-08-29T17:00:00.000Z', providerLastAttemptStatus: 'SUCCEEDED', providerLastErrorCode: null,
     ...overrides,
@@ -55,7 +55,7 @@ const readiness: ReadinessResponse = {
   evaluatedAt: '2026-08-29T18:00:00.000Z',
 };
 
-const providerStatus: RetellStatusResponse = {
+const providerStatus: VoiceLineStatusResponse = {
   providerConfigured: true, providerMode: 'live', agentReady: true,
   agentScope: { clinicId: 'clinic-1', campaignId: 'camp-1', agentId: 'agent-1', agentName: 'Riley' },
   verification: { status: 'VERIFIED', expiresAt: null, expiresInMs: 19 * 60 * 60 * 1000, autoRenew: { enabled: true, lastSystemAttemptAt: new Date().toISOString() } },
@@ -81,7 +81,7 @@ function routes(stubs: Stubs = {}) {
     if (path.startsWith('/v1/receptionist/agents?')) return (stubs.agents ?? (() => Promise.resolve([])))();
     if (path.endsWith('/readiness')) return (stubs.readiness ?? (() => Promise.resolve(readiness)))();
     if (path.endsWith('/confirmation-channels')) return (stubs.channels ?? (() => Promise.resolve(channels)))();
-    if (path.startsWith('/v1/receptionist/retell-status')) return Promise.resolve(providerStatus);
+    if (path.startsWith('/v1/receptionist/voice-line-status')) return Promise.resolve(providerStatus);
     if (path === '/v1/receptionist/catalog') return Promise.resolve({ voices: [], languages: [], tones: [], campaignTypes: [], providerMode: 'live' });
     if (path === '/v1/receptionist/campaigns/camp-1' && init?.method === 'PATCH') {
       return (stubs.patch ?? (() => Promise.resolve(campaign())))(JSON.parse(String(init.body)) as Record<string, unknown>);

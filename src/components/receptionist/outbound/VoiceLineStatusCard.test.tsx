@@ -2,9 +2,9 @@ import { render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { describe, expect, it } from 'vitest';
 
-import type { RetellStatus } from '../../../lib/receptionist';
-import type { RetellStatusResponse } from '../../../lib/receptionistDeployment';
-import { RetellStatusCard } from './RetellStatusCard';
+import type { VoiceLineStatus } from '../../../lib/receptionist';
+import type { VoiceLineStatusResponse } from '../../../lib/receptionistDeployment';
+import { VoiceLineStatusCard } from './VoiceLineStatusCard';
 
 /**
  * The production card said "set the missing environment variables" for every
@@ -13,7 +13,7 @@ import { RetellStatusCard } from './RetellStatusCard';
  * honest verification expiry, and an attended-UAT block that exists only when
  * the server sent one (demo profile).
  */
-function status(overrides: Partial<RetellStatusResponse> = {}): RetellStatusResponse {
+function status(overrides: Partial<VoiceLineStatusResponse> = {}): VoiceLineStatusResponse {
   return {
     providerConfigured: true,
     providerMode: 'live',
@@ -27,24 +27,24 @@ function status(overrides: Partial<RetellStatusResponse> = {}): RetellStatusResp
   };
 }
 
-function renderCard(value: RetellStatusResponse | RetellStatus | null) {
-  return render(<MemoryRouter><RetellStatusCard status={value} /></MemoryRouter>);
+function renderCard(value: VoiceLineStatusResponse | VoiceLineStatus | null) {
+  return render(<MemoryRouter><VoiceLineStatusCard status={value} /></MemoryRouter>);
 }
 
-describe('RetellStatusCard — the server says what is wrong and where to fix it', () => {
+describe('VoiceLineStatusCard — the server says what is wrong and where to fix it', () => {
   it('renders each server blocker with its own words and a fix link', () => {
     renderCard(status({
       agentReady: false,
       blockers: [
-        { code: 'agent_unverified', severity: 'blocking', title: 'Agent deployment is not verified', action: 'Verify the linked Retell agent before activating.', fixHref: '/receptionist-studio?tab=campaign&agent=agent-1', scope: 'agent' },
-        { code: 'retell_from_number_missing', severity: 'blocking', title: 'Outbound caller number is not set', action: 'Ask your CareCommand administrator to set RETELL_FROM_NUMBER.', fixHref: null, scope: 'server' },
+        { code: 'agent_unverified', severity: 'blocking', title: 'The voice line has not passed a line check', action: 'Run the line check before activating.', fixHref: '/receptionist-studio?tab=campaign&agent=agent-1', scope: 'agent' },
+        { code: 'voice_service_number_missing', severity: 'blocking', title: 'Outbound caller number is not set', action: 'Ask your CareCommand administrator to set this on the API and worker environments, then reload.', fixHref: null, scope: 'server' },
       ],
     }));
 
-    expect(screen.getByText('Agent deployment is not verified')).toBeInTheDocument();
-    expect(screen.getByText('Verify the linked Retell agent before activating.')).toBeInTheDocument();
+    expect(screen.getByText('The voice line has not passed a line check')).toBeInTheDocument();
+    expect(screen.getByText('Run the line check before activating.')).toBeInTheDocument();
     expect(screen.getByText('Outbound caller number is not set')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'Fix Agent deployment is not verified' })).toHaveAttribute('href', '/receptionist-studio?tab=campaign&agent=agent-1');
+    expect(screen.getByRole('link', { name: 'Fix The voice line has not passed a line check' })).toHaveAttribute('href', '/receptionist-studio?tab=campaign&agent=agent-1');
     // A blocker with no fix link offers no link at all rather than a dead one.
     expect(screen.queryByRole('link', { name: 'Fix Outbound caller number is not set' })).not.toBeInTheDocument();
     expect(screen.getByText(/2 blocking items/)).toBeInTheDocument();
@@ -90,8 +90,8 @@ describe('RetellStatusCard — the server says what is wrong and where to fix it
   });
 
   it('still renders the pre-C5 status body so the outbound panel keeps working', () => {
-    const legacy: RetellStatus = {
-      configured: false, mock: true, missing: ['RETELL_FROM_NUMBER', 'AGENT_DEPLOYMENT'], readyAgents: 0, adhocTestCallsAllowed: true,
+    const legacy: VoiceLineStatus = {
+      configured: false, mock: true, missing: ['voice_service_number_missing', 'AGENT_DEPLOYMENT'], readyAgents: 0, adhocTestCallsAllowed: true,
       liveTest: {
         enabled: false, active: false, executionId: null, allowedDestinationMasked: null, expiresAt: null, timezone: 'UTC',
         windowStart: '09:00', windowEnd: '17:00', maxCalls: 0, maxCallMinutes: 0, maxTotalMinutes: 0, maxProviderCostUsd: 0,
@@ -99,8 +99,8 @@ describe('RetellStatusCard — the server says what is wrong and where to fix it
         minutesUsed: 0, minutesRemaining: 0, activeCalls: 0, admissionReason: null,
       },
       checklist: [
-        { key: 'RETELL_API_KEY', label: 'Retell API key', set: true },
-        { key: 'RETELL_FROM_NUMBER', label: 'Outbound caller number', set: false },
+        { key: 'voice_service_key_missing', label: 'Voice service credential', set: true },
+        { key: 'voice_service_number_missing', label: 'Outbound caller number', set: false },
         { key: 'AGENT_DEPLOYMENT', label: 'Published agent deployment', set: false },
         { key: 'LIVE_TEST_CALLS_AUTHORIZED', label: 'Attended live-test authorization', set: false },
       ],

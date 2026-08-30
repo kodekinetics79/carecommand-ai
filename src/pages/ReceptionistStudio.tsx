@@ -5,7 +5,7 @@ import { receptionistApi as api, type Campaign } from '../lib/receptionist';
 import { blockerLabel, receptionistClinicApi, type ClinicRow } from '../lib/receptionistClinic';
 import {
   deploymentApi, formatCount, formatRate, formatSeconds, resolveStudioTab, serviceStatus,
-  type GoLivePrerequisite, type OverviewKpis, type ReadinessResponse, type RetellStatusResponse, type StudioTab,
+  type GoLivePrerequisite, type OverviewKpis, type ReadinessResponse, type VoiceLineStatusResponse, type StudioTab,
 } from '../lib/receptionistDeployment';
 import { useResource } from '../hooks/useResource';
 import { describeFailure, receivedData } from '../lib/resourceState';
@@ -22,7 +22,7 @@ import { LocalePackPanel } from '../components/receptionist/LocalePackPanel';
 import { CampaignPanel } from '../components/receptionist/CampaignPanel';
 import { IntakeBuilder } from '../components/receptionist/IntakeBuilder';
 import { PreviewPanel } from '../components/receptionist/PreviewPanel';
-import { RetellPanel } from '../components/receptionist/RetellPanel';
+import { GoLivePanel } from '../components/receptionist/GoLivePanel';
 import { ActivityPanel } from '../components/receptionist/ActivityPanel';
 import { GoLiveCard, ServiceStatusStrip } from '../components/receptionist/GoLiveCard';
 import { OutboundPanel } from '../components/receptionist/outbound/OutboundPanel';
@@ -30,10 +30,11 @@ import { OutboundPanel } from '../components/receptionist/outbound/OutboundPanel
 /**
  * Two doors, not three: the Front Desk is where staff work a live queue, and
  * this Studio is where the receptionist is configured and taken live. The tab
- * formerly called "RetellAI Export" is now **Go live** — deploy, verify and
- * the manual console fallback — because that is what an owner comes here to
- * do, and because it is the tab id the server's remediation catalogue has
- * been pointing at all along (`fixTab: 'deploy'`, 25 entries).
+ * that once carried the voice supplier's name in its label is **Go live** —
+ * publish, line check — because that is what an owner comes here to do, and
+ * because it is the tab id the server's remediation catalogue has been
+ * pointing at all along (`fixTab: 'deploy'`, 25 entries). The supplier's
+ * console procedure that used to sit under it is now support-only.
  *
  * The id list and the alias map live in `lib/receptionistDeployment.ts`, with
  * the readiness keys: they are a contract with the server, not page trivia.
@@ -169,9 +170,9 @@ export default function ReceptionistStudio() {
   const readinessResource = useResource<ReadinessResponse | null>(loadReadiness);
   const railReadiness = receivedData(readinessResource.state) ?? null;
   const loadRailStatus = useCallback(
-    (signal: AbortSignal) => (activeCampaignId ? deploymentApi.retellStatus({ campaignId: activeCampaignId }, signal) : Promise.resolve(null)),
+    (signal: AbortSignal) => (activeCampaignId ? deploymentApi.voiceLineStatus({ campaignId: activeCampaignId }, signal) : Promise.resolve(null)),
     [activeCampaignId]);
-  const railStatusResource = useResource<RetellStatusResponse | null>(loadRailStatus);
+  const railStatusResource = useResource<VoiceLineStatusResponse | null>(loadRailStatus);
   const railStatus = receivedData(railStatusResource.state) ?? null;
   const reloadRail = readinessResource.reload;
 
@@ -224,7 +225,7 @@ export default function ReceptionistStudio() {
     <div className="space-y-6 pb-10">
       <PageHeader
         title="Receptionist Studio"
-        subtitle="Configure the clinic's AI receptionist, deploy it to the phone line, and prove it can answer a real call."
+        subtitle="Configure the clinic's AI receptionist, publish it to the voice line, and prove it can answer a real call."
         badge={`${clinics.length} clinic${clinics.length === 1 ? '' : 's'}`}
         badgeColor="violet"
         actions={
@@ -474,7 +475,7 @@ export default function ReceptionistStudio() {
             {tab === 'deploy' && (
               activeCampaign
                 ? (
-                  <RetellPanel
+                  <GoLivePanel
                     key={activeCampaign.id}
                     campaignId={activeCampaign.id}
                     campaignStatus={activeCampaign.status}

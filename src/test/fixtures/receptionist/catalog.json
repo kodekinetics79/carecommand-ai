@@ -17,8 +17,8 @@
     { "code": "IE", "name": "Ireland", "callingCode": "353", "defaultEmergencyNumber": "112", "defaultLanguages": ["en-GB"], "currency": "EUR" }
   ],
   "languages": [
-    { "id": "en-US", "label": "English (US)", "provider": "retell" },
-    { "id": "en-GB", "label": "English (UK)", "provider": "retell" }
+    { "id": "en-US", "label": "English (US)", "provider": "voice_service" },
+    { "id": "en-GB", "label": "English (UK)", "provider": "voice_service" }
   ],
   "tones": ["Warm and professional", "Calm and reassuring"],
   "campaignTypes": ["Reactivation", "New patient", "Recall / Recare"],

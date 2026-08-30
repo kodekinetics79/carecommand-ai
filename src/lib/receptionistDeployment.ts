@@ -2,7 +2,8 @@ import { useCallback } from 'react';
 import { ApiError, apiRequest } from './api';
 import { useResource } from '../hooks/useResource';
 import { describeFailure, receivedData, resourceFailure, type ResourceFailure } from './resourceState';
-import type { Agent, Campaign, RetellConfig, RetellStatus } from './receptionist';
+import type { Agent, Campaign, VoiceLineConfiguration, VoiceLineStatus } from './receptionist';
+import { voiceOptionLabel } from './receptionistVocabulary';
 
 /**
  * C5 — deployment & activation client.
@@ -11,7 +12,7 @@ import type { Agent, Campaign, RetellConfig, RetellStatus } from './receptionist
  * this one file, typed against the contracts frozen in the C5 design as
  * amended by the engineering review:
  *
- *   GET  /v1/receptionist/retell-status?clinicId=&campaignId=   → RetellStatusResponse
+ *   GET  /v1/receptionist/voice-line-status?clinicId=&campaignId=   → VoiceLineStatusResponse
  *   POST /v1/receptionist/campaigns/:id/deploy                   → DeployResponse
  *        (200 { deployment: PUBLISHED, verification: { status: 'pending' } };
  *         the client then calls verify-provider and polls deployments/latest)
@@ -22,7 +23,7 @@ import type { Agent, Campaign, RetellConfig, RetellStatus } from './receptionist
  *   GET  /v1/receptionist/campaigns/:id/preview                  → PreviewResponse
  *   GET  /v1/receptionist/confirmation-channels                  → ConfirmationChannels
  *   POST /v1/receptionist/agents/:id/adopt-provider-values       → Agent
- *   GET  /v1/receptionist/campaigns/:id/retell-config            → RetellConfigExport
+ *   GET  /v1/receptionist/campaigns/:id/voice-line-configuration            → VoiceLineConfigurationExport
  *   GET  /v1/receptionist/catalog                                → catalog (voices/languages/tones/campaignTypes/providerMode)
  *
  * The catalog read is a stop-gap: C2 owns `src/lib/receptionistCatalog.ts`.
@@ -59,9 +60,9 @@ export interface VerificationView {
 }
 
 /** The attended live-UAT block. Only present when DEPLOYMENT_PROFILE === 'demo'. */
-export type AttendedUat = RetellStatus['liveTest'];
+export type AttendedUat = VoiceLineStatus['liveTest'];
 
-export interface RetellStatusResponse {
+export interface VoiceLineStatusResponse {
   providerConfigured: boolean;
   providerMode: ProviderMode;
   agentReady: boolean;
@@ -72,32 +73,41 @@ export interface RetellStatusResponse {
   adhocTestCallsAllowed: boolean;
 }
 
-/** Either shape the `/retell-status` route may answer with while the outbound components migrate. */
-export type RetellStatusLike = RetellStatus | RetellStatusResponse;
+/** Either shape the `/voice-line-status` route may answer with while the outbound components migrate. */
+export type VoiceLineStatusLike = VoiceLineStatus | VoiceLineStatusResponse;
 
-export function isRetellStatusResponse(value: RetellStatusLike): value is RetellStatusResponse {
-  return 'blockers' in value && Array.isArray((value as RetellStatusResponse).blockers);
+export function isVoiceLineStatusResponse(value: VoiceLineStatusLike): value is VoiceLineStatusResponse {
+  return 'blockers' in value && Array.isArray((value as VoiceLineStatusResponse).blockers);
 }
 
-const LEGACY_ENV_KEYS = new Set(['RETELL_API_KEY', 'RETELL_FROM_NUMBER']);
+/**
+ * The pre-C5 body keyed its checklist by the SERVER ENVIRONMENT VARIABLE NAME,
+ * which meant the browser carried our supplier's variable names in order to
+ * compare against them. The predicate below asks the same question — "is this
+ * a credential only CareCommand can set?" — by shape rather than by naming the
+ * supplier.
+ */
+function isServerCredentialKey(key: string): boolean {
+  return /_API_KEY$|_FROM_NUMBER$/.test(key) || key.startsWith('voice_service_');
+}
 
 /**
- * Maps the pre-C5 `/retell-status` body (configured / missing / checklist /
- * liveTest) onto the new shape so one card renders both. Legacy blockers carry
- * only the checklist label; the server copy arrives once the route is rewritten.
+ * Maps the pre-C5 status body (configured / missing / checklist / liveTest)
+ * onto the new shape so one card renders both. Legacy blockers carry only the
+ * checklist label; the server copy arrives once the route is rewritten.
  */
-export function normalizeRetellStatus(input: RetellStatusLike): RetellStatusResponse {
-  if (isRetellStatusResponse(input)) return input;
-  const missingEnv = input.missing.filter(key => LEGACY_ENV_KEYS.has(key));
+export function normalizeVoiceLineStatus(input: VoiceLineStatusLike): VoiceLineStatusResponse {
+  if (isVoiceLineStatusResponse(input)) return input;
+  const missingEnv = input.missing.filter(isServerCredentialKey);
   const blockers: Blocker[] = input.checklist
     .filter(item => !item.set && item.key !== 'LIVE_TEST_CALLS_AUTHORIZED')
     .map(item => ({
       code: item.key.toLowerCase(),
       severity: 'blocking',
       title: item.label,
-      action: LEGACY_ENV_KEYS.has(item.key) ? 'Ask your CareCommand administrator to set this on the server.' : 'Link and verify a published agent in the Agent tab.',
+      action: isServerCredentialKey(item.key) ? 'Ask your CareCommand administrator to set this on the server.' : 'Publish to the line from the Go live tab.',
       fixHref: null,
-      scope: LEGACY_ENV_KEYS.has(item.key) ? 'server' : 'agent',
+      scope: isServerCredentialKey(item.key) ? 'server' : 'agent',
     }));
   return {
     providerConfigured: missingEnv.length === 0,
@@ -128,7 +138,7 @@ export function formatExpiresIn(ms: number | null): string {
 export interface VerificationLine { text: string; tone: 'ok' | 'warn' | 'error' | 'muted' }
 
 /**
- * The one sentence AgentEditor and RetellStatusCard both print for a verified
+ * The one sentence AgentEditor and VoiceLineStatusCard both print for a verified
  * agent: expiry plus whether the re-verification worker is actually renewing.
  */
 export function verificationLine(verification: VerificationView, now: number = Date.now()): VerificationLine {
@@ -166,15 +176,14 @@ export interface Deployment {
   id: string;
   status: DeploymentStatus;
   mock: boolean;
-  /** Masked by the server (`agen…1234`); the full id stays on the agent row. */
-  providerAgentIdMasked: string | null;
-  providerAgentVersion: number | null;
-  providerLlmVersion: number | null;
-  providerVersionTag?: string;
-  promptHash: string;
-  toolFingerprint: string;
-  intakeFingerprint: string;
-  configFingerprint?: string;
+  /**
+   * The one opaque handle that replaced the provider's masked agent id, its
+   * published version, its response-engine version, the deployment tag and
+   * four fingerprint hashes. Support asks for this string; nothing else on
+   * this row identifies a supplier. Optional only because a pre-rename server
+   * may omit it.
+   */
+  configurationReference?: string | null;
   voiceId: string;
   language: string;
   steps: DeploymentStep[];
@@ -242,10 +251,16 @@ export interface ToolsDiff { added: string[]; removed: string[]; changed: string
 export interface DeploymentDiff {
   deployment: {
     id: string; status: DeploymentStatus; verifiedAt: string | null;
-    providerAgentVersion: number | null; promptHash: string; toolFingerprint: string; voiceId: string; language: string;
+    configurationReference?: string | null; voiceId: string; language: string;
     mock?: boolean; publishedAt?: string | null; providerErrorCode?: string | null;
   } | null;
-  draft: { promptHash: string; toolFingerprint: string; intakeFingerprint: string; voiceId: string; language: string; webhookUrl: string; toolNames?: string[] };
+  /**
+   * The chips, not the evidence behind them. `changed` is what an operator
+   * acts on; the prompt/tool/intake fingerprints and the callback URL that
+   * used to ride along here are the supplier's coordinates and now stay on
+   * the server.
+   */
+  draft: { voiceId: string; language: string; toolNames?: string[] };
   changed: DeploymentChange[];
   /**
    * The route sends `changed` and `placeholders`, not a tools diff. It is
@@ -280,7 +295,7 @@ export type DeployPanelState =
   | 'deploy-failed' | 'verification-failed' | 'drift-blocked';
 
 /** Pure derivation of the DeployPanel state from what the server holds (local in-flight / error states override it). */
-export function deriveDeployState(input: { status: RetellStatusResponse | null; diff: DeploymentDiff | null }): DeployPanelState {
+export function deriveDeployState(input: { status: VoiceLineStatusResponse | null; diff: DeploymentDiff | null }): DeployPanelState {
   const agentId = input.status?.agentScope.agentId ?? null;
   const unlinked = input.status?.blockers.some(b => b.code === 'agent_unlinked') ?? false;
   if (input.status && (!agentId || unlinked)) return 'no-agent';
@@ -296,7 +311,7 @@ export function deriveDeployState(input: { status: RetellStatusResponse | null; 
 
 export interface DeployChecklistItem { step: number; key: string; label: string; value: string; copyable: boolean }
 
-export interface RetellConfigExport extends RetellConfig {
+export interface VoiceLineConfigurationExport extends VoiceLineConfiguration {
   /** Live custom-function tools; present on the server type, optional here until the route is confirmed. */
   tools?: Array<Record<string, unknown>>;
   deployChecklist?: DeployChecklistItem[];
@@ -312,14 +327,14 @@ function toolName(tool: Record<string, unknown>): string {
  * with the current export route extension; until then it is derived from the
  * same config so the BYO path is never blank.
  */
-export function deployChecklistOf(config: RetellConfigExport): DeployChecklistItem[] {
+export function deployChecklistOf(config: VoiceLineConfigurationExport): DeployChecklistItem[] {
   if (config.deployChecklist && config.deployChecklist.length) return config.deployChecklist;
   const tools = config.tools ?? [];
   const rows: Array<Omit<DeployChecklistItem, 'step'>> = [
     { key: 'agent_language', label: 'Agent language', value: config.language, copyable: true },
     { key: 'agent_voice', label: 'Agent voice', value: config.voiceId, copyable: true },
     { key: 'begin_message', label: 'Begin message', value: config.beginMessage, copyable: true },
-    { key: 'response_engine', label: 'Response engine', value: 'retell-llm · general_prompt = system prompt (copy from Preview)', copyable: false },
+    { key: 'response_engine', label: 'Response engine', value: 'provider LLM · general_prompt = system prompt (copy from Preview)', copyable: false },
     { key: 'tool_call_strict_mode', label: 'Tool call strict mode', value: 'true', copyable: false },
     { key: 'tools', label: 'Custom tools', value: tools.length ? `${tools.length}: ${tools.map(toolName).join(', ')}` : 'none exported', copyable: false },
     { key: 'webhook_url', label: 'Webhook URL', value: config.webhookUrl, copyable: true },
@@ -345,15 +360,17 @@ export function deployChecklistOf(config: RetellConfigExport): DeployChecklistIt
  *
  * The page moved rather than the catalogue: the deploy tab is now `deploy`
  * ("Go live"), which is what the operator is doing there and what the server
- * has always called it. `retell` — the id it shipped with — and `agent` are
- * kept as aliases so no printed link and no server entry breaks either way.
+ * has always called it. The supplier-named id it shipped with, and `agent`,
+ * are kept as inbound aliases below so no link printed before the rename
+ * breaks — but nothing generates them any more: `remediation.ts` now writes
+ * `deploy`, so the tab id stops appearing in the tenant's address bar.
  */
 export const STUDIO_TAB_IDS = ['clinic', 'knowledge', 'campaign', 'intake', 'preview', 'deploy', 'outbound', 'activity'] as const;
 
 export type StudioTab = (typeof STUDIO_TAB_IDS)[number];
 
 const STUDIO_TAB_ALIASES: Record<string, StudioTab> = {
-  retell: 'deploy',
+  retell: 'deploy', // vendor-neutral-exempt: an INBOUND alias for links already printed; nothing generates it.
   'go-live': 'deploy',
   golive: 'deploy',
   agent: 'campaign',
@@ -477,7 +494,7 @@ function stepFromCheck(readiness: ReadinessResponse | null, key: ReadinessKey, s
  */
 export function goLiveSteps(readiness: ReadinessResponse | null, campaignStatus: Campaign['status']): GoLiveStep[] {
   return [
-    stepFromCheck(readiness, 'deployment_current', 'deploy', 'Deploy the agent to Retell', 'Deploy from the Go live tab.'),
+    stepFromCheck(readiness, 'deployment_current', 'deploy', 'Publish to the line', 'Publish from the Go live tab.'),
     stepFromCheck(readiness, 'agent_verified', 'verify', 'Verify the deployment', 'Verify after deploying; verification expires and auto-renews.'),
     stepFromCheck(readiness, 'number_bound', 'forward', 'Forward the public number to the DID', 'Bind the clinic number to the deployed agent and forward the public line to it.'),
     stepFromCheck(readiness, 'test_call_completed', 'test_call', 'Place a test call', 'Call the line from a staff number; the call log must show it.'),
@@ -727,7 +744,12 @@ export function agentRowOf(error: unknown): AgentRow | null {
 // --- Catalog (stop-gap until C2's src/lib/receptionistCatalog.ts lands) ---------
 
 export interface CatalogOption { id: string; label: string }
-export interface CatalogVoice { voiceId: string; name: string; provider: string; gender: string | null; accent: string | null; previewUrl: string | null }
+/**
+ * `provider` is gone. The server used to send the house that synthesised each
+ * voice and the select printed it, so the dropdown where an owner names their
+ * receptionist named two suppliers. Nothing picks a voice on that field.
+ */
+export interface CatalogVoice { voiceId: string; name: string; gender: string | null; accent: string | null; previewUrl: string | null }
 
 export interface CatalogView {
   voices: CatalogVoice[];
@@ -760,7 +782,7 @@ function asVoice(item: unknown): CatalogVoice | null {
   if (!voiceId) return null;
   const name = [row.name, row.voice_name, row.label].find((v): v is string => typeof v === 'string' && v.trim().length > 0) ?? voiceId;
   const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v : null);
-  return { voiceId, name, provider: str(row.provider) ?? 'unknown', gender: str(row.gender), accent: str(row.accent), previewUrl: str(row.previewUrl ?? row.preview_audio_url) };
+  return { voiceId, name, gender: str(row.gender), accent: str(row.accent), previewUrl: str(row.previewUrl ?? row.preview_audio_url) };
 }
 
 function asList(value: unknown): unknown[] {
@@ -807,27 +829,30 @@ export function mergeVoicesSection(view: CatalogView, raw: unknown): CatalogView
     voicesUnavailable: voices.length || view.voices.length
       ? null
       : error
-        ? `The voice catalogue could not be read from the provider (${error}).`
+        ? `The voice catalogue could not be read from the voice service (${error}).`
         : providerMode === 'unconfigured'
-          ? 'The voice provider is not configured on this server, so no voices can be listed.'
-          : 'The provider returned no voices.',
+          ? 'The voice service is not connected on this server, so no voices can be listed.'
+          : 'The voice service returned no voices.',
   };
 }
 
-export function voiceLabel(voice: CatalogVoice): string {
-  const traits = [voice.gender, voice.accent].filter(Boolean).join(', ');
-  return traits ? `${voice.name} (${traits}) · ${voice.provider}` : `${voice.name} · ${voice.provider}`;
-}
+export const voiceLabel = voiceOptionLabel;
 
 /**
  * Select options for a catalog list with the stored value merged in, so a
  * value outside the catalogue (a legacy voice, a provider-adopted language)
  * still renders and is never silently replaced by the first option.
+ *
+ * `fallbackLabel` exists because the label used to be the raw stored id. For a
+ * language that is harmless ("de-DE"); for a voice the id is
+ * supplier-prefixed, so the one option a clinic could not miss — the one their
+ * receptionist currently speaks with — printed a supplier's name as its
+ * visible text. Callers that know the value is a voice pass the neutral label.
  */
-export function withCurrentOption(options: CatalogOption[], current: string): CatalogOption[] {
+export function withCurrentOption(options: CatalogOption[], current: string, fallbackLabel?: string): CatalogOption[] {
   const value = current.trim();
   if (!value || options.some(option => option.id === value)) return options;
-  return [{ id: value, label: `${value} (not in catalog)` }, ...options];
+  return [{ id: value, label: fallbackLabel ?? `${value} (not in catalog)` }, ...options];
 }
 
 const CATALOG_PATH = `${base}/catalog`;
@@ -977,8 +1002,8 @@ function query(params: Record<string, string | undefined>): string {
 }
 
 export const deploymentApi = {
-  retellStatus: (scope: { clinicId?: string; campaignId?: string } = {}, signal?: AbortSignal) =>
-    apiRequest<RetellStatusLike>(`${base}/retell-status${query(scope)}`, { signal }).then(normalizeRetellStatus),
+  voiceLineStatus: (scope: { clinicId?: string; campaignId?: string } = {}, signal?: AbortSignal) =>
+    apiRequest<VoiceLineStatusLike>(`${base}/voice-line-status${query(scope)}`, { signal }).then(normalizeVoiceLineStatus),
   deploy: (campaignId: string) => apiRequest<unknown>(`${base}/campaigns/${campaignId}/deploy`, { method: 'POST', body: JSON.stringify({}) })
     .then(raw => {
       const body = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
@@ -998,7 +1023,7 @@ export const deploymentApi = {
   preview: (campaignId: string, signal?: AbortSignal) => apiRequest<PreviewResponse>(`${base}/campaigns/${campaignId}/preview`, { signal }),
   confirmationChannels: (signal?: AbortSignal) => apiRequest<ConfirmationChannels>(`${base}/confirmation-channels`, { signal }),
   adoptProviderValues: (agentId: string) => apiRequest<AgentRow>(`${base}/agents/${agentId}/adopt-provider-values`, { method: 'POST', body: JSON.stringify({}) }),
-  retellConfig: (campaignId: string, signal?: AbortSignal) => apiRequest<RetellConfigExport>(`${base}/campaigns/${campaignId}/retell-config`, { signal }),
+  voiceLineConfiguration: (campaignId: string, signal?: AbortSignal) => apiRequest<VoiceLineConfigurationExport>(`${base}/campaigns/${campaignId}/voice-line-configuration`, { signal }),
   catalog: loadCatalogWithVoices,
   /** The kpi-v2 block. Legacy scalars in the same body are deliberately ignored. */
   overview: (signal?: AbortSignal) => apiRequest<unknown>(`${base}/overview`, { signal }).then(normalizeOverviewKpis),

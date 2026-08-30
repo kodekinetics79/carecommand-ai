@@ -704,13 +704,13 @@ function CampaignDetail({ campaign, onChanged, onDeleted }: { campaign: Campaign
         )}
         {launch?.setupRequired && (
           <div className="flex items-center gap-2 rounded-lg border border-red-v/40 bg-red-v/5 px-2.5 py-1.5 text-[11px] text-red-v">
-            <AlertCircle className="w-3.5 h-3.5" /> {launch.provider.channel} provider not configured ({launch.provider.missing.join(', ')}). Nothing was submitted to a provider.
+            <AlertCircle className="w-3.5 h-3.5" /> The {launch.provider.channel} service is not configured ({launch.provider.missingConfigCount} setting{launch.provider.missingConfigCount === 1 ? '' : 's'} missing — ask your CareCommand administrator). Nothing was submitted.
           </div>
         )}
         {confirmation && (
           <ConfirmationModal
             title={confirmation.kind === 'approve' ? 'Authorize this exact campaign preview?' : 'Dispatch this exact campaign preview?'}
-            message={`${confirmation.preview.confirmationStatement} Eligible: ${confirmation.preview.audience.eligible}; consent record required: ${confirmation.preview.audience.authorityRequired}; live safety control pending: ${confirmation.preview.audience.atomicBoundaryBlocked}; suppressed: ${confirmation.preview.audience.suppressed}; missing contact: ${confirmation.preview.audience.missingContact}; channel: ${displayLabel(confirmation.preview.channel)}; provider: ${confirmation.preview.provider}; provider mode: ${displayLabel(confirmation.preview.providerMode)}${confirmation.preview.scheduledAt ? `; scheduled: ${new Date(confirmation.preview.scheduledAt).toLocaleString()}` : ''}.`}
+            message={`${confirmation.preview.confirmationStatement} Eligible: ${confirmation.preview.audience.eligible}; consent record required: ${confirmation.preview.audience.authorityRequired}; live safety control pending: ${confirmation.preview.audience.atomicBoundaryBlocked}; suppressed: ${confirmation.preview.audience.suppressed}; missing contact: ${confirmation.preview.audience.missingContact}; channel: ${displayLabel(confirmation.preview.channel)}; provider mode: ${displayLabel(confirmation.preview.providerMode)}${confirmation.preview.scheduledAt ? `; scheduled: ${new Date(confirmation.preview.scheduledAt).toLocaleString()}` : ''}.`}
             confirmLabel={confirmation.kind === 'approve' ? 'Authorize exact preview' : 'Dispatch exact preview'}
             tone="amber"
             onConfirm={confirmExactPreview}

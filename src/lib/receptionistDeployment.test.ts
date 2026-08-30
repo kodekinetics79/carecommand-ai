@@ -191,9 +191,9 @@ describe('the voice catalogue (E9)', () => {
 
     const merged = mergeVoicesSection(catalog, {
       providerMode: 'mock', source: 'provider', error: null,
-      voices: [{ voiceId: '11labs-Anna', name: 'Anna', provider: 'elevenlabs', gender: 'female', accent: 'American', previewUrl: null }],
+      voices: [{ voiceId: 'voice-anna', name: 'Anna', gender: 'female', accent: 'American', previewUrl: null }],
     });
-    expect(merged.voices.map(voice => voice.voiceId)).toEqual(['11labs-Anna']);
+    expect(merged.voices.map(voice => voice.voiceId)).toEqual(['voice-anna']);
     expect(merged.providerMode).toBe('mock');
     expect(merged.voicesUnavailable).toBeNull();
   });
@@ -203,7 +203,7 @@ describe('the voice catalogue (E9)', () => {
     expect(merged.voicesUnavailable).toContain('provider_unavailable');
 
     const unconfigured = mergeVoicesSection(normalizeCatalog({}), { providerMode: 'unconfigured', voices: [], source: 'unavailable', error: null });
-    expect(unconfigured.voicesUnavailable).toContain('not configured');
+    expect(unconfigured.voicesUnavailable).toContain('not connected');
   });
 });
 

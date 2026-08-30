@@ -110,7 +110,7 @@ describe('ReceptionistTaskCard — deployment attention (E11)', () => {
       workflow: 'receptionist_deployment', agentId: 'agent-1', clinicId: 'c1', code: 'number_bound',
       title: 'The phone number is not bound to this agent',
       action: 'Re-deploy the campaign so the number points at the published agent.',
-      fixHref: '/receptionist-studio?tab=retell',
+      fixHref: '/receptionist-studio?tab=deploy',
     },
   });
 
@@ -118,7 +118,7 @@ describe('ReceptionistTaskCard — deployment attention (E11)', () => {
     render(<ReceptionistTaskCard task={deploymentTask()} timezone="America/Los_Angeles" can={CAN} onChanged={() => {}} />);
     expect(screen.getByText('The phone number is not bound to this agent')).toBeInTheDocument();
     expect(screen.getByText('Re-deploy the campaign so the number points at the published agent.')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'Fix this' })).toHaveAttribute('href', '/receptionist-studio?tab=retell');
+    expect(screen.getByRole('link', { name: 'Fix this' })).toHaveAttribute('href', '/receptionist-studio?tab=deploy');
     expect(screen.getByText('Code: number_bound')).toBeInTheDocument();
   });
 

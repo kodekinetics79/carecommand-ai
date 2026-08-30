@@ -71,7 +71,7 @@ const AUDIENCE_PREVIEW = {
 
 const LAUNCH_PREVIEW: CampaignLaunchPreview = {
   campaignId: 'campaign-2', fingerprint: 'a'.repeat(64), templateRevision: 'rev-3',
-  providerMode: 'configured_pending_provider', provider: 'twilio', channel: 'sms', scheduledAt: null,
+  providerMode: 'configured_pending_provider', channel: 'sms', scheduledAt: null,
   audience: { total: 240, eligible: 180, suppressed: 44, missingContact: 16, authorityRequired: 12, atomicBoundaryBlocked: 0 },
   liveDispatchActivated: false,
   activationNotice: 'Live campaign dispatch is not activated for SMS in this workspace.',

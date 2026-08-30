@@ -44,12 +44,12 @@ const READINESS = {
   campaignId: 'camp-1', status: 'DRAFT', ready: false, providerMode: 'live',
   checks: [
     { key: 'deployment_current', label: 'The deployed prompt matches this campaign', status: 'pass', code: null, title: '', detail: 'Version 4 is deployed.', fixHref: null },
-    { key: 'agent_verified', label: 'The agent is verified with Retell', status: 'pass', code: null, title: '', detail: 'Verified.', fixHref: null },
+    { key: 'agent_verified', label: 'The voice line passed its line check', status: 'pass', code: null, title: '', detail: 'Verified.', fixHref: null },
     { key: 'agent_linked', label: 'An agent is assigned', status: 'pass', code: null, title: '', detail: 'Riley.', fixHref: null },
     {
       key: 'number_bound', label: 'The phone number answers with this agent', status: 'fail', code: 'number_bound',
       title: 'The number is not bound to this deployment',
-      detail: 'The Retell number is not bound to this deployment, so a caller would not reach this agent. Deploy again.',
+      detail: 'The phone number does not point at this version, so a caller would not reach this receptionist. Publish to the line again.',
       fixHref: '/receptionist-studio?clinic=clinic-1&campaign=camp-1&tab=deploy',
     },
   ],
@@ -57,7 +57,7 @@ const READINESS = {
   evaluatedAt: '2026-08-30T09:00:00.000Z',
 };
 
-const RETELL_STATUS = {
+const VOICE_LINE_STATUS = {
   providerConfigured: true, providerMode: 'live', agentReady: true,
   agentScope: { clinicId: 'clinic-1', campaignId: 'camp-1', agentId: 'agent-1', agentName: 'Riley' },
   verification: { status: 'VERIFIED', expiresAt: null, expiresInMs: 19 * 60 * 60 * 1000, autoRenew: { enabled: true, lastSystemAttemptAt: new Date().toISOString() } },
@@ -85,17 +85,17 @@ const CATALOG = {
   fieldTypes: [],
   timezones: { groups: [{ region: 'Americas', zones: ['America/Los_Angeles'] }], recommended: ['America/Los_Angeles'] },
   countries: [{ code: 'US', name: 'United States', callingCode: '+1', defaultEmergencyNumber: '911', defaultLanguages: ['en-US'], currency: 'USD' }],
-  languages: [{ id: 'en-US', label: 'English (US)', provider: 'retell' }],
+  languages: [{ id: 'en-US', label: 'English (US)', provider: 'voice_service' }],
   tones: ['Warm and professional'],
   campaignTypes: ['Reactivation'],
   localePacks: [{ language: 'en-US', country: 'US', status: 'APPROVED', packId: 'pack-1', hasPlatformDefault: true, platformDefaultVersion: 2 }],
   limits: { maxIntakeFields: 20, faqMax: 20, payersMax: 40, closureMaxDays: 30, knowledgeTextMax: 4000, closureReasonMax: 240, accessNotesMax: 1000 },
 };
 
-const RETELL_CONFIG = {
-  systemPrompt: '# Role\nYou are Riley.', voiceId: '11labs-Anna', language: 'en-US',
+const VOICE_LINE_CONFIG = {
+  systemPrompt: '# Role\nYou are Riley.', voiceId: 'voice-anna', language: 'en-US',
   beginMessage: 'Hi, this is Riley.', dynamicVariables: { is_open_now: 'true' },
-  webhookUrl: 'https://api.example.com/v1/receptionist/webhooks/retell',
+  webhookUrl: 'https://api.example.com/v1/receptionist/webhooks/voice',
   bookingFunction: { name: 'book_appointment' },
   callOutcomeFields: [{ name: 'outcome', type: 'enum', description: 'Call outcome' }],
   tools: [],
@@ -112,11 +112,11 @@ function respond(path: string): Promise<unknown> {
   if (path.startsWith('/v1/receptionist/campaigns?clinicId=clinic-1')) return Promise.resolve([campaign(), campaign({ id: 'camp-2', name: 'Recall wave', agentId: 'agent-2' })]);
   if (path.startsWith('/v1/receptionist/campaigns?clinicId=clinic-2')) return Promise.resolve([campaign({ id: 'camp-9', clinicId: 'clinic-2', name: 'Northside recall' })]);
   if (path.includes('/readiness')) return Promise.resolve(READINESS);
-  if (path.startsWith('/v1/receptionist/retell-status')) return Promise.resolve(RETELL_STATUS);
+  if (path.startsWith('/v1/receptionist/voice-line-status')) return Promise.resolve(VOICE_LINE_STATUS);
   if (path === '/v1/receptionist/catalog') return Promise.resolve(CATALOG);
   if (path.startsWith('/v1/receptionist/agents')) return Promise.resolve([]);
   if (path.startsWith('/v1/receptionist/scheduling-branches')) return Promise.resolve([]);
-  if (path.includes('/retell-config')) return Promise.resolve(RETELL_CONFIG);
+  if (path.includes('/voice-line-configuration')) return Promise.resolve(VOICE_LINE_CONFIG);
   if (path.includes('/deployment-diff')) return Promise.resolve({ deployment: null, draft: {}, changed: [], placeholders: [] });
   if (path.includes('/deployments/latest')) return Promise.resolve({ deployment: null });
   // Panels below the rail fetch their own resources; the assertions here are
@@ -140,8 +140,8 @@ describe('resolveStudioTab — every fixTab the server writes lands somewhere re
     expect(resolveStudioTab('agent')).toBe('campaign');
   });
 
-  it('keeps the pre-rename `retell` id working', () => {
-    expect(resolveStudioTab('retell')).toBe('deploy');
+  it('keeps the pre-rename supplier-named id working', () => {
+    expect(resolveStudioTab('retell')).toBe('deploy'); // vendor-neutral-exempt: proves the inbound alias for links printed before the rename still lands.
   });
 
   it('accepts every non-null `fixTab` in server/lib/receptionist/remediation.ts', () => {
@@ -242,6 +242,12 @@ describe('ReceptionistStudio', () => {
 
     await screen.findByRole('tablist');
     expect(screen.getByRole('tab', { name: /Go live/ })).toBeInTheDocument();
-    expect(screen.queryByRole('tab', { name: /RetellAI Export/ })).not.toBeInTheDocument();
+    // Asserting the absence of one specific old label only ever caught that
+    // label. Pinning the whole list catches the NEXT supplier name too, and it
+    // is the tab strip a clinic owner reads top to bottom.
+    expect(screen.getAllByRole('tab').map(tab => tab.textContent?.trim())).toEqual([
+      'Clinic Profile', 'Knowledge', 'Agent & Campaign', 'Intake Builder',
+      'Preview', 'Go live', 'Outbound Calls', 'Activity',
+    ]);
   });
 });

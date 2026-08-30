@@ -509,7 +509,7 @@ describe('AI receptionist trusted configuration', () => {
       // what is true and what to do about it.
       expect(duplicateActivation.json().message).toContain('another CareCommand configuration');
       expect(duplicateActivation.json().message).toContain('outside this tenant');
-      expect(duplicateActivation.json().message).toMatch(/deploy from studio|unlink/i);
+      expect(duplicateActivation.json().message).toMatch(/publish to the line/i);
 
       const crossTenantCampaign = await app.inject({
         method: 'POST', url: '/v1/receptionist/campaigns', headers: auth(owner, 'OWNER'),

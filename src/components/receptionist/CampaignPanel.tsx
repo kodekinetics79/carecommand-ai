@@ -4,7 +4,7 @@ import { Field, TextInput, TextArea, Select, Toggle } from '../ui/Field';
 import { receptionistApi as api, CAMPAIGN_TYPES, type Clinic, type Campaign, type Agent } from '../../lib/receptionist';
 import {
   channelUsable, deploymentApi, useReceptionistCatalog, withCurrentOption,
-  type AgentRow, type ChannelStatus, type ConfirmationChannels, type ReadinessResponse, type RetellStatusResponse,
+  type AgentRow, type ChannelStatus, type ConfirmationChannels, type ReadinessResponse, type VoiceLineStatusResponse,
 } from '../../lib/receptionistDeployment';
 import { ApiError } from '../../lib/api';
 import { describeFailure, receivedData, type ResourceFailure } from '../../lib/resourceState';
@@ -95,8 +95,8 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
   const loadChannels = useCallback((signal: AbortSignal) => deploymentApi.confirmationChannels(signal), []);
   const channelsResource = useResource<ConfirmationChannels>(loadChannels);
   const channels = receivedData(channelsResource.state);
-  const loadStatus = useCallback((signal: AbortSignal) => deploymentApi.retellStatus({ campaignId: campaign.id }, signal), [campaign.id]);
-  const statusResource = useResource<RetellStatusResponse>(loadStatus);
+  const loadStatus = useCallback((signal: AbortSignal) => deploymentApi.voiceLineStatus({ campaignId: campaign.id }, signal), [campaign.id]);
+  const statusResource = useResource<VoiceLineStatusResponse>(loadStatus);
   const providerStatus = receivedData(statusResource.state);
 
   const loadAgents = useCallback(async () => {

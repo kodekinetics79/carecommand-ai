@@ -56,7 +56,6 @@ describe('campaign scheduled dispatch authority', () => {
     fingerprint: 'a'.repeat(64),
     templateRevision: 'b'.repeat(64),
     providerMode: 'mock_dev',
-    provider: 'twilio',
     channel: 'sms',
     scheduledAt: null,
     audience: { total: 3, eligible: 1, suppressed: 1, missingContact: 1, authorityRequired: 0, atomicBoundaryBlocked: 0 },

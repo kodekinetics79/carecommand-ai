@@ -10,6 +10,7 @@ import { isBusy, savedAtOf, useMutationState } from '../../hooks/useMutationStat
 import ConfirmationModal from '../workflow/ConfirmationModal';
 import { ConfirmedButton, SaveBar } from './shared';
 import { MutationNotice } from './MutationNotice';
+import { CONFIGURATION_REFERENCE, STORED_VOICE_NOT_IN_CATALOGUE, VOICE } from '../../lib/receptionistVocabulary';
 import { FixLink } from './ReadinessChecklist';
 
 /** The fields this editor owns. Provider snapshot fields are read from the prop, never from the draft. */
@@ -153,7 +154,7 @@ export function AgentEditor({
   const failedAgent = verifyFailure ? agentRowOf(verifyFailure.failure) : null;
   void failedAgent;
 
-  const voiceOptions = withCurrentOption((catalog?.voices ?? []).map(voice => ({ id: voice.voiceId, label: voiceLabel(voice) })), draft.voice);
+  const voiceOptions = withCurrentOption((catalog?.voices ?? []).map(voice => ({ id: voice.voiceId, label: voiceLabel(voice) })), draft.voice, STORED_VOICE_NOT_IN_CATALOGUE);
   const languageOptions = withCurrentOption(catalog?.languages ?? [], draft.language);
   const toneOptions = withCurrentOption(catalog?.tones ?? [], draft.tone);
   const catalogHint = catalog ? undefined : 'Catalog not loaded — only the stored value is offered.';
@@ -162,14 +163,14 @@ export function AgentEditor({
   const voiceHint = catalogHint
     ?? (catalog && catalog.voices.length === 0
       ? `${catalog.voicesUnavailable ?? 'The voice catalogue is empty.'} Only the stored voice is offered.`
-      : 'Deployed to Retell with the campaign.');
+      : 'Published to the line when you publish the campaign.');
 
   // Why Verify is disabled, in words. A greyed button with no explanation is
   // the failure this replaces; the cooldown has its own countdown line below.
   const verifyBlockReason = dirty
-    ? 'Save these changes before verifying the provider deployment.'
+    ? `Save these changes before running the ${VOICE.checkLower}.`
     : !agent.providerAgentId
-      ? 'Enter and save a Retell agent ID before verification.'
+      ? `Publish to the line, or save a ${CONFIGURATION_REFERENCE.toLowerCase()}, before a ${VOICE.checkLower}.`
       : null;
 
   return (
@@ -186,7 +187,7 @@ export function AgentEditor({
             {toneOptions.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
           </Select>
         </Field>
-        <Field label="Language" hint={catalogHint ?? 'Deployed to Retell with the campaign.'}>
+        <Field label="Language" hint={catalogHint ?? 'Published to the line when you publish the campaign.'}>
           <Select aria-label="Language" value={draft.language} onChange={e => set('language', e.target.value)}>
             {languageOptions.map(l => <option key={l.id} value={l.id}>{l.label}</option>)}
           </Select>
@@ -198,8 +199,8 @@ export function AgentEditor({
       <div className="space-y-3 rounded-xl border border-[var(--b1)] bg-[var(--s3)] p-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
-            <p className="text-xs font-bold text-t1">Retell deployment</p>
-            <p className="text-[11px] text-t3">Deploy from the RetellAI Export tab, or link an agent you published yourself. CareCommand verifies either before it answers a call.</p>
+            <p className="text-xs font-bold text-t1">{VOICE.Line}</p>
+            <p className="text-[11px] text-t3">{VOICE.publish} from the Go live tab. CareCommand runs a {VOICE.checkLower} against the live line before it answers a call.</p>
           </div>
           <div className="flex items-center gap-2">
             {providerMode === 'mock' && <span className="badge badge-violet">mock mode</span>}
@@ -207,10 +208,9 @@ export function AgentEditor({
           </div>
         </div>
         <div className="grid gap-3 md:grid-cols-2">
-          <Field label="Retell agent ID"><TextInput aria-label="Retell agent ID" value={draft.providerAgentId ?? ''} onChange={e => set('providerAgentId', e.target.value || null)} placeholder="agent_…" /></Field>
-          <Field label="Deployment tag" hint="Linked agents must carry this tag; deployed agents are pinned by version instead."><TextInput aria-label="Deployment tag" value={draft.providerVersionTag} onChange={e => set('providerVersionTag', e.target.value)} /></Field>
+          <Field label={CONFIGURATION_REFERENCE} hint="Issued when you publish. Quote it to CareCommand support."><TextInput aria-label={CONFIGURATION_REFERENCE} value={draft.providerAgentId ?? ''} onChange={e => set('providerAgentId', e.target.value || null)} placeholder="issued on publish" /></Field>
         </div>
-        {!agent.providerAgentId && <p className="text-[11px] text-t3" role="status">No Retell agent linked yet.</p>}
+        {!agent.providerAgentId && <p className="text-[11px] text-t3" role="status">Nothing is published to the {VOICE.line} yet.</p>}
         {agent.providerVersion !== null && <p className="text-[11px] text-t2">Pinned version {agent.providerVersion} · {agent.providerVoiceId ?? 'voice unavailable'} · {agent.providerLanguage ?? 'language unavailable'}</p>}
         {line
           ? <p className={`text-[11px] font-semibold ${TONE_TEXT[line.tone]}`}>{line.text}</p>
@@ -287,11 +287,11 @@ export function AgentEditor({
               type="button"
               disabled={busy || Boolean(verifyBlockReason) || cooldownSeconds > 0}
               onClick={verify}
-              title={cooldownSeconds > 0 ? `Retry in ${cooldownSeconds}s` : verifyBlockReason ?? 'Ask the provider for the published agent and compare it to this configuration.'}
+              title={cooldownSeconds > 0 ? `Retry in ${cooldownSeconds}s` : verifyBlockReason ?? 'Read the live line back and compare it to this configuration.'}
               className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t1 disabled:opacity-40"
             >
               {isBusy(verifyState.state) ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" />}
-              {cooldownSeconds > 0 ? `Retry in ${cooldownSeconds}s` : 'Verify provider deployment'}
+              {cooldownSeconds > 0 ? `Retry in ${cooldownSeconds}s` : VOICE.runCheck}
             </button>
           </div>
         </div>
@@ -302,15 +302,15 @@ export function AgentEditor({
       <MutationNotice state={saveState.state} showSaved={false} onRetry={dirty ? save : undefined} />
       {saveBlockedBy.length > 0 && (
         <p role="alert" className="text-xs text-amber-v">
-          Pause {saveBlockedBy.length === 1 ? 'this campaign' : 'these campaigns'} before changing the provider binding: {saveBlockedBy.map(row => row.name).join(', ')}.
+          Pause {saveBlockedBy.length === 1 ? 'this campaign' : 'these campaigns'} before changing the {VOICE.line}: {saveBlockedBy.map(row => row.name).join(', ')}.
         </p>
       )}
       <SaveBar dirty={dirty} busy={busy} onSave={save} savedAt={savedAtOf(saveState.state)} />
 
       {confirmBinding && (
         <ConfirmationModal
-          title="Change the linked Retell agent?"
-          message="Changing the agent ID or tag resets provider verification. Campaigns that use this agent cannot answer or place calls until the new binding is verified; active campaigns must be paused first."
+          title={`Change this ${VOICE.line}?`}
+          message={`Changing the ${CONFIGURATION_REFERENCE.toLowerCase()} resets the ${VOICE.checkLower}. Campaigns that use this receptionist cannot answer or place calls until the new line passes a check; active campaigns must be paused first.`}
           confirmLabel="Change binding"
           tone="amber"
           onConfirm={commitSave}

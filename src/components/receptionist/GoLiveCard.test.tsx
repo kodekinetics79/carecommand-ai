@@ -51,7 +51,7 @@ describe('GoLiveCard — the ordered path to answering a real call', () => {
   it('marks each step from its readiness row and keeps unevaluated ones pending', () => {
     render(<MemoryRouter><GoLiveCard campaignStatus="DRAFT" readiness={readiness([
       ...deployedAndVerified,
-      { key: 'number_bound', label: 'The phone number answers with this agent', status: 'fail', code: 'number_bound', title: 'The number is not bound to this deployment', detail: 'The Retell number does not point at this agent version.', fixHref: '/receptionist-studio?clinic=c1&campaign=camp-1&tab=deploy' },
+      { key: 'number_bound', label: 'The phone number answers with this agent', status: 'fail', code: 'number_bound', title: 'The number is not bound to this deployment', detail: 'The phone number does not point at this receptionist version.', fixHref: '/receptionist-studio?clinic=c1&campaign=camp-1&tab=deploy' },
     ])} /></MemoryRouter>);
 
     const list = screen.getByRole('list', { name: 'Go live steps' });
@@ -62,7 +62,7 @@ describe('GoLiveCard — the ordered path to answering a real call', () => {
     // The server never evaluated the test call, so the card does not claim it happened.
     expect(byStep('test_call')).toHaveAttribute('data-status', 'pending');
     const forward = byStep('forward')!;
-    expect(within(forward).getByText('The Retell number does not point at this agent version.')).toBeInTheDocument();
+    expect(within(forward).getByText('The phone number does not point at this receptionist version.')).toBeInTheDocument();
     expect(within(forward).getByText('The number is not bound to this deployment')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Fix Forward the public number to the DID' })).toBeInTheDocument();
     expect(screen.getByText('2/5 steps')).toBeInTheDocument();

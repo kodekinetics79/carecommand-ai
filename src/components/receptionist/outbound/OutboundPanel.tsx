@@ -1,23 +1,23 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Plus, Loader2 } from 'lucide-react';
 import { useSession } from '../../../hooks/useSession';
-import { receptionistApi as api, type Clinic, type Campaign, type RetellStatus, type OutboundCampaign, type BookingRequest, type ConfirmationDelivery, type OutboundControlStatus, type OutboundStopResult } from '../../../lib/receptionist';
+import { receptionistApi as api, type Clinic, type Campaign, type VoiceLineStatus, type OutboundCampaign, type BookingRequest, type ConfirmationDelivery, type OutboundControlStatus, type OutboundStopResult } from '../../../lib/receptionist';
 import { formatEnumLabel } from '../helpers';
 import { OutboundStopCard } from './OutboundStopCard';
-import { RetellStatusCard } from './RetellStatusCard';
+import { VoiceLineStatusCard } from './VoiceLineStatusCard';
 import { CampaignBuilder } from './CampaignBuilder';
 import { CampaignDetail } from './CampaignDetail';
 import { BookingRequestQueue } from './BookingRequestQueue';
 import { ConfirmationDeliveryQueue } from './ConfirmationDeliveryQueue';
 
 // ===========================================================================
-// Outbound calling panel: Retell setup status, campaign builder, target list,
+// Outbound calling panel: voice line status, campaign builder, target list,
 // test-call launcher, call logs, and the appointment-request review queue.
 // ===========================================================================
 
 export function OutboundPanel({ clinic }: { clinic: Clinic }) {
   const { user } = useSession();
-  const [status, setStatus] = useState<RetellStatus | null>(null);
+  const [status, setStatus] = useState<VoiceLineStatus | null>(null);
   const [control, setControl] = useState<OutboundControlStatus | null>(null);
   const [stopResult, setStopResult] = useState<OutboundStopResult | null>(null);
   const [stopError, setStopError] = useState<string | null>(null);
@@ -33,14 +33,14 @@ export function OutboundPanel({ clinic }: { clinic: Clinic }) {
 
   const reload = useCallback(async () => {
     const results = await Promise.allSettled([
-      api.retellStatus(),
+      api.voiceLineStatus(),
       api.listOutboundCampaigns(clinic.id),
       api.listBookingRequests(),
       api.listCampaigns(clinic.id),
       api.listConfirmationDeliveries(),
       api.outboundControl(),
     ]);
-    const labels = ['Retell status', 'outbound campaigns', 'appointment requests', 'booking authorities', 'confirmation delivery evidence', 'emergency-stop status'];
+    const labels = ['voice line status', 'outbound campaigns', 'appointment requests', 'booking authorities', 'confirmation delivery evidence', 'emergency-stop status'];
     setLoadErrors(results.flatMap((result, index) => result.status === 'rejected' ? [`${labels[index]} could not be loaded.`] : []));
     const [st, camps, reqs, authorities, confirmationRows, controlResult] = results;
     if (st.status === 'fulfilled') setStatus(st.value);
@@ -83,7 +83,7 @@ export function OutboundPanel({ clinic }: { clinic: Clinic }) {
 
   return (
     <div className="space-y-5">
-      <RetellStatusCard status={status} />
+      <VoiceLineStatusCard status={status} />
       <OutboundStopCard control={control} result={stopResult} canStop={canStop} stopping={stopping} error={stopError} onStop={stopOutbound} onRetry={reload} />
       {loadErrors.length > 0 && (
         <div role="alert" className="cc-card border-l-4 border-l-red-v p-4">

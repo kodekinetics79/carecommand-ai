@@ -114,7 +114,7 @@ describe('CampaignActions — activation is gated, and a refusal is shown', () =
       reasons: [
         // `number_bound` is the key the server emits; the fixture used to say
         // `phone_number_bound`, which nothing on the server has ever sent.
-        { key: 'number_bound', label: 'The phone number answers with this agent', status: 'fail', code: 'number_bound', title: 'The number is not bound to this deployment', detail: 'The Retell number does not point at this agent version.', fixHref: '/receptionist-studio?tab=deploy' },
+        { key: 'number_bound', label: 'The phone number answers with this agent', status: 'fail', code: 'number_bound', title: 'The number is not bound to this deployment', detail: 'The phone number does not point at this receptionist version.', fixHref: '/receptionist-studio?tab=deploy' },
       ],
     }));
     render(<MemoryRouter><CampaignActions
@@ -128,7 +128,7 @@ describe('CampaignActions — activation is gated, and a refusal is shown', () =
     const alerts = await screen.findAllByRole('alert');
     expect(alerts.some(node => node.textContent?.includes('Campaign configuration is not deployable: campaign_not_ready.'))).toBe(true);
     expect(screen.getByText('The phone number answers with this agent')).toBeInTheDocument();
-    expect(screen.getByText('The Retell number does not point at this agent version.')).toBeInTheDocument();
+    expect(screen.getByText('The phone number does not point at this receptionist version.')).toBeInTheDocument();
     // E7's sibling: the remediation title travels with the row and is shown.
     expect(screen.getByText('The number is not bound to this deployment')).toBeInTheDocument();
   });

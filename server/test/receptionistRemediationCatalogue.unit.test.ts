@@ -29,7 +29,10 @@ import { CLINIC_ACTIVATION_BLOCKERS } from '../lib/receptionist/activationReadin
  * has to be edited in lockstep is what makes a mismatch fail a test rather than
  * ship. Package F's client↔server contract test asserts the other direction.
  */
-const STUDIO_TABS = ['clinic', 'knowledge', 'campaign', 'intake', 'preview', 'retell', 'outbound', 'activity'];
+// `deploy`, not the supplier's name. A fix link is a URL the tenant's
+// browser shows and may paste into a support email, so the tab id was one
+// more place the voice supplier was named — see receptionistVendorNeutrality.
+const STUDIO_TABS = ['clinic', 'knowledge', 'campaign', 'intake', 'preview', 'deploy', 'outbound', 'activity'];
 
 function tabOf(fixHref: string | null): string | null {
   if (!fixHref || fixHref.startsWith('/scheduling')) return null;
@@ -53,7 +56,7 @@ describe('remediation fix links land on a tab that exists (B7)', () => {
   it('sends the go-live failures to the deploy screen and the agent failures to the campaign screen', () => {
     // The five the register named: these were the ones pointing at nothing.
     for (const code of ['number_bound', 'deployment_current', 'agent_verified', 'prompt_drift', 'verification_failed']) {
-      expect(tabOf(remediationFor(code, { campaignId: 'k1' }).fixHref), code).toBe('retell');
+      expect(tabOf(remediationFor(code, { campaignId: 'k1' }).fixHref), code).toBe('deploy');
     }
     for (const code of ['agent_linked', 'agent_inactive', 'engine_not_owned', 'agent_scope_mismatch']) {
       expect(tabOf(remediationFor(code, { campaignId: 'k1' }).fixHref), code).toBe('campaign');
@@ -65,7 +68,7 @@ describe('remediation fix links land on a tab that exists (B7)', () => {
 
   it('carries the clinic and campaign ids the caller supplies', () => {
     expect(remediationFor('number_bound', { clinicId: 'c1', campaignId: 'k1' }).fixHref)
-      .toBe('/receptionist-studio?clinic=c1&campaign=k1&tab=retell');
+      .toBe('/receptionist-studio?clinic=c1&campaign=k1&tab=deploy');
   });
 });
 
