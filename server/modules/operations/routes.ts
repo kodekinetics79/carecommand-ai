@@ -10,7 +10,11 @@ import { requireFeature } from '../../lib/entitlements';
 import { sendMessage, type SendResult } from '../../lib/commsProvider';
 import { isSuppressed, isValidE164, isValidEmail, maskDestination, toE164, type CommChannel } from '../../lib/campaigns';
 import { getRequestPermissions, requirePermission } from '../../lib/permissions';
+import type { Prisma } from '../../generated/prisma/client';
 import { ensureStaffTask } from '../../lib/staffTasks';
+import { cursorPage } from '../../lib/pagination';
+import { parseReceptionistTask, RECEPTIONIST_TASK_KINDS, RECEPTIONIST_TASK_WORKFLOW } from '../../lib/receptionist/frontDeskTask';
+import { projectTaskRow, taskListInclude } from '../../lib/receptionist/taskProjection';
 
 const channel = z.enum(['WHATSAPP', 'SMS', 'EMAIL', 'PUSH', 'CALL', 'VIDEO']);
 const uuid = z.string().uuid();
@@ -945,37 +949,127 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     });
   });
 
+  // ===== Front desk queue ==================================================
+  // Branch visibility (M14): a branch-scoped caller sees their branch AND the
+  // unscoped rows, because `createSafetyTask` files a task with branchId null
+  // whenever the branch is ambiguous — dropping those would hide exactly the
+  // work nobody has claimed. Masking lives in lib/receptionist/taskProjection.
+  const csvEnum = <T extends string>(values: readonly T[]) => z.string()
+    .transform(value => value.split(',').map(part => part.trim()).filter(Boolean))
+    .pipe(z.array(z.enum(values as unknown as [T, ...T[]])).min(1));
+
+  const taskListQuery = z.object({
+    cursor: uuid.optional(),
+    limit: z.coerce.number().int().min(1).max(100).default(50),
+    status: csvEnum(['OPEN', 'IN_PROGRESS', 'COMPLETED', 'CANCELED'] as const).optional(),
+    workflow: z.string().max(60).optional(),
+    kind: csvEnum(RECEPTIONIST_TASK_KINDS).optional(),
+    assignee: z.union([z.literal('me'), z.literal('unassigned'), uuid]).optional(),
+    branchId: uuid.optional(),
+    callLogId: uuid.optional(),
+    patientId: uuid.optional(),
+    dueBefore: z.coerce.date().optional(),
+    acknowledged: z.enum(['true', 'false']).optional(),
+    overdue: z.enum(['true']).optional(),
+  });
+
+  function taskVisibility(request: FastifyRequest, branchId?: string): Prisma.StaffTaskWhereInput {
+    const scope = request.auth.branchId ?? branchId;
+    return scope ? { OR: [{ branchId: scope }, { branchId: null }] } : {};
+  }
+
+  function taskFilters(request: FastifyRequest, query: z.infer<typeof taskListQuery>, now: Date): Prisma.StaffTaskWhereInput {
+    const kindFilter = query.kind
+      ? { OR: query.kind.map(kind => ({ metadata: { path: ['kind'], equals: kind } })) }
+      : null;
+    return {
+      tenantId: request.auth.tenantId,
+      ...taskVisibility(request, query.branchId),
+      status: { in: query.status ?? ['OPEN', 'IN_PROGRESS'] },
+      ...(query.callLogId ? { callLogId: query.callLogId } : {}),
+      ...(query.patientId ? { patientId: query.patientId } : {}),
+      ...(query.assignee === 'me' ? { assignedToId: request.auth.userId }
+        : query.assignee === 'unassigned' ? { assignedToId: null }
+          : query.assignee ? { assignedToId: query.assignee } : {}),
+      ...(query.acknowledged === 'true' ? { acknowledgedAt: { not: null } }
+        : query.acknowledged === 'false' ? { acknowledgedAt: null } : {}),
+      ...(query.overdue === 'true' ? { dueAt: { lt: now } } : query.dueBefore ? { dueAt: { lte: query.dueBefore } } : {}),
+      AND: [
+        ...(query.workflow ? [{ metadata: { path: ['workflow'], equals: query.workflow } }] : []),
+        ...(kindFilter ? [kindFilter] : []),
+      ],
+    };
+  }
+
   app.get('/tasks', { preHandler: staffTaskRead }, async request => {
-    const query = listLimit.extend({ branchId: uuid.optional() }).parse(request.query);
-    const branchId = scopedBranch(request, query.branchId);
+    const query = taskListQuery.parse(request.query);
+    const now = new Date();
     const rows = await db.staffTask.findMany({
-      where: { tenantId: request.auth.tenantId, branchId },
-      take: query.limit,
-      orderBy: { createdAt: 'desc' },
-      include: {
-        branch: { select: { name: true } },
-        assignedTo: { select: { displayName: true } },
-      },
+      where: taskFilters(request, query, now),
+      // Soonest-due first; a task with no due date sorts last rather than first.
+      orderBy: [{ dueAt: { sort: 'asc', nulls: 'last' } }, { createdAt: 'desc' }, { id: 'asc' }],
+      cursor: query.cursor ? { id: query.cursor } : undefined,
+      skip: query.cursor ? 1 : 0,
+      take: query.limit + 1,
+      include: taskListInclude,
     });
     const permissions = await getRequestPermissions(request);
-    const canReadReceptionistArtifacts = permissions.has('receptionist:call-artifacts:read');
-    await audit(request, { action: 'task.list', resource: 'staffTask', metadata: { count: rows.length, branchScoped: Boolean(branchId) } });
-    return rows.map(row => {
-      const metadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
-        ? row.metadata as Record<string, unknown>
-        : null;
-      if (canReadReceptionistArtifacts || metadata?.workflow !== 'receptionist_safety') return row;
-      return {
-        ...row,
-        metadata: {
-          workflow: 'receptionist_safety',
-          kind: metadata.kind ?? 'restricted',
-          requiresAcknowledgement: metadata.requiresAcknowledgement === true,
-          restricted: true,
-        },
-      };
-    });
+    const options = {
+      canReadArtifacts: permissions.has('receptionist:call-artifacts:read'),
+      canReadPatient: permissions.has('patient:read'),
+    };
+    const page = cursorPage(rows, query.limit);
+    await audit(request, { action: 'task.list', resource: 'staffTask', metadata: {
+      count: page.data.length, branchScoped: Boolean(request.auth.branchId ?? query.branchId), receptionistDisclosed: options.canReadArtifacts,
+    } });
+    return { ...page, data: page.data.map(row => projectTaskRow(row, options)) };
   });
+
+  // Counts for the sidebar badge, the critical banner and the queue header.
+  // Titles only — no caller content, so it is safe for every staff:read holder.
+  app.get('/tasks/summary', { preHandler: staffTaskRead }, async request => {
+    const query = z.object({ branchId: uuid.optional() }).parse(request.query);
+    const now = new Date();
+    const live = {
+      tenantId: request.auth.tenantId,
+      ...taskVisibility(request, query.branchId),
+      status: { in: ['OPEN', 'IN_PROGRESS'] as const },
+    } satisfies Prisma.StaffTaskWhereInput;
+    const receptionist = { metadata: { path: ['workflow'], equals: RECEPTIONIST_TASK_WORKFLOW } };
+
+    const [byKind, overdue, mine, dueWithin30m, criticalRows] = await Promise.all([
+      db.staffTask.findMany({ where: { ...live, AND: [receptionist] }, select: { metadata: true } }),
+      db.staffTask.count({ where: { ...live, dueAt: { lt: now } } }),
+      db.staffTask.count({ where: { ...live, assignedToId: request.auth.userId } }),
+      db.staffTask.count({ where: { ...live, dueAt: { gte: now, lte: new Date(now.getTime() + 30 * 60_000) } } }),
+      db.staffTask.findMany({
+        where: { ...live, acknowledgedAt: null, priority: 'critical' },
+        orderBy: [{ createdAt: 'asc' }],
+        take: 5,
+        select: { id: true, title: true, createdAt: true, callLog: { select: { clinic: { select: { name: true } } } } },
+      }),
+    ]);
+    const openByKind = Object.fromEntries(RECEPTIONIST_TASK_KINDS.map(kind => [kind, 0])) as Record<typeof RECEPTIONIST_TASK_KINDS[number], number>;
+    let openNeedsAction = 0;
+    for (const row of byKind) {
+      const meta = parseReceptionistTask(row);
+      if (!meta) continue;
+      openByKind[meta.kind] += 1;
+      openNeedsAction += 1;
+    }
+    return {
+      openByKind,
+      openNeedsAction,
+      overdue,
+      mine,
+      dueWithin30m,
+      unacknowledgedCritical: criticalRows.map(row => ({
+        id: row.id, title: row.title, createdAt: row.createdAt, clinicName: row.callLog?.clinic?.name ?? null,
+      })),
+      generatedAt: now.toISOString(),
+    };
+  });
+
   app.post('/tasks', { preHandler: staffTaskWrite }, async (request, reply) => {
     const input = z.object({
       branchId: uuid.optional(), assignedToId: uuid.optional(), title: z.string().min(2).max(240),
