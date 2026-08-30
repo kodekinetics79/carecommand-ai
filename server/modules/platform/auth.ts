@@ -2,7 +2,7 @@ import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { platformDb } from '../../lib/platformDb';
 import { env } from '../../config/env';
-import { verifyPassword, encryptSecret, decryptSecret } from '../../lib/security';
+import { verifyPassword, encryptSecret, decryptSecret, generatePasswordHash, validatePassword } from '../../lib/security';
 import { generateTotpSecret, verifyTotp, totpAuthUri } from '../../lib/totp';
 import { signPlatformToken, signPlatformMfaToken, requirePlatformAccess, platformAuditEvent, runPlatformAuditedMutation, attachPlatformActorContext, platformSessionWasLoggedOut, platformSessionIdHash, createPlatformAuditEvent, type PlatformMfaPurpose } from '../../lib/platformAuth';
 import { runWithPlatformDatabaseRequest } from '../../lib/platformContextStore';
@@ -12,6 +12,16 @@ import { runWithPlatformDatabaseRequest } from '../../lib/platformContextStore';
 // same password-hash, TOTP, lockout, and audit patterns. Generic error messages
 // never reveal whether an email exists.
 // ===========================================================================
+
+/**
+ * Whether the platform's OWN staff must use MFA. Defaults to required: these
+ * accounts reach every tenant's commercial record. The owner can turn it off in
+ * Platform Settings, and that decision is audited like any other.
+ */
+async function operatorMfaRequired(): Promise<boolean> {
+  const cfg = await platformDb.platformConfig.findUnique({ where: { id: 'singleton' }, select: { requireOperatorMfa: true } });
+  return cfg?.requireOperatorMfa ?? true;
+}
 
 const INVALID = 'Invalid email or password.';
 const INVALID_RESPONSE = { error: 'invalid_credentials', message: INVALID } as const;
@@ -71,14 +81,25 @@ export const platformAuthRoutes: FastifyPluginAsync = async app => {
     }
     // Password verification alone never creates a privileged platform session.
     // Unenrolled operators receive only a short-lived MFA-enrollment token.
+    const mfaRequired = await operatorMfaRequired();
     await platformAuditEvent(request, 'platform.login.password_verified', { type: 'platformUser', id: user.id }, {
       mfa: false,
-      mfaRequired: true,
-      enrollmentRequired: !user.mfaEnabled,
+      mfaRequired,
+      enrollmentRequired: mfaRequired && !user.mfaEnabled,
     });
-    return reply.send(user.mfaEnabled
-      ? { mfaRequired: true, mfaToken: signPlatformMfaToken(app, user.id, 'challenge') }
-      : { mfaSetupRequired: true, mfaToken: signPlatformMfaToken(app, user.id, 'enrollment') });
+    // An enrolled operator always completes their second factor, even if policy
+    // no longer demands one: turning the policy off must not silently weaken
+    // an account that chose to be stronger than it.
+    if (user.mfaEnabled) return reply.send({ mfaRequired: true, mfaToken: signPlatformMfaToken(app, user.id, 'challenge') });
+    if (mfaRequired) return reply.send({ mfaSetupRequired: true, mfaToken: signPlatformMfaToken(app, user.id, 'enrollment') });
+
+    const authenticated = await runPlatformAuditedMutation(request, {
+      action: 'platform.login.succeeded', target: { type: 'platformUser', id: user.id }, metadata: { mfa: false, mfaRequired: false },
+    }, tx => tx.platformUser.update({
+      where: { id: user.id },
+      data: { failedLoginCount: 0, lockedUntil: null, lastLoginAt: new Date() },
+    }));
+    return reply.send({ token: signPlatformToken(app, authenticated), user: publicUser(authenticated) });
   });
 
   // Resolves either a full platform session or a platform-mfa login token.
@@ -140,10 +161,103 @@ export const platformAuthRoutes: FastifyPluginAsync = async app => {
   });
 
   app.get('/me', { preHandler: requirePlatformAccess() }, async request => {
-    if (request.platformUser!.legacy) return { id: 'legacy-token', email: null, name: 'Legacy operator token', role: 'PLATFORM_OWNER', legacy: true, mfaEnabled: false };
+    const mfaRequired = await operatorMfaRequired();
+    if (request.platformUser!.legacy) return { id: 'legacy-token', email: null, name: 'Legacy operator token', role: 'PLATFORM_OWNER', legacy: true, mfaEnabled: false, mfaRequired };
     const user = await platformDb.platformUser.findUnique({ where: { id: request.platformUser!.id } });
     if (!user) throw app.httpErrors.unauthorized('Platform session not found.');
-    return { ...publicUser(user), legacy: false };
+    // The console needs to know whether MFA is the operator's choice here.
+    return { ...publicUser(user), legacy: false, mfaRequired };
+  });
+
+  /**
+   * Change your own password.
+   *
+   * There was no way to do this from the console at all: rotating an operator
+   * credential meant a database write. Requires the current password (so a
+   * borrowed session cannot take the account over), enforces the same policy as
+   * everywhere else, and revokes every OTHER session - the caller gets a fresh
+   * token so they are not signed out of the tab they are working in.
+   */
+  app.post('/password', { preHandler: requirePlatformAccess(), config: { rateLimit: PLATFORM_AUTH_RATE_LIMIT } }, async (request, reply) => {
+    if (request.platformUser!.legacy) throw app.httpErrors.forbidden('The legacy operator token has no password to change.');
+    const body = z.object({
+      currentPassword: z.string().min(1).max(200),
+      newPassword: z.string().min(1).max(200),
+    }).parse(request.body);
+
+    const user = await platformDb.platformUser.findUnique({ where: { id: request.platformUser!.id } });
+    if (!user) throw app.httpErrors.unauthorized('Platform session not found.');
+
+    if (!(await verifyPassword(body.currentPassword, user.passwordHash))) {
+      await platformAuditEvent(request, 'platform.password.change_failed', { type: 'platformUser', id: user.id }, { reason: 'bad_current_password' });
+      return reply.code(400).send({ error: 'invalid_current_password', message: 'That is not your current password.' });
+    }
+    if (body.currentPassword === body.newPassword) {
+      return reply.code(400).send({ error: 'password_unchanged', message: 'The new password must be different from the current one.' });
+    }
+    const policy = validatePassword(body.newPassword);
+    if (!policy.ok) return reply.code(400).send({ error: 'weak_password', message: policy.message ?? 'That password does not meet the policy.' });
+
+    const passwordHash = await generatePasswordHash(body.newPassword);
+    const now = new Date();
+    const updated = await runPlatformAuditedMutation(request, {
+      // Never the password, never a hash - only that it changed and when.
+      action: 'platform.password.changed', target: { type: 'platformUser', id: user.id }, metadata: { self: true },
+    }, tx => tx.platformUser.update({
+      where: { id: user.id },
+      // Incrementing the epoch is what actually invalidates the other sessions;
+      // sessionsRevokedAt is the human-readable record of when.
+      data: {
+        passwordHash, passwordChangedAt: now, sessionsRevokedAt: now,
+        sessionEpoch: { increment: 1 }, failedLoginCount: 0, lockedUntil: null,
+      },
+    }));
+
+    return reply.send({
+      changed: true,
+      otherSessionsRevoked: true,
+      token: signPlatformToken(app, updated),
+      user: publicUser(updated),
+    });
+  });
+
+  /**
+   * Turn your own MFA off.
+   *
+   * Refused while the platform requires operator MFA, so this is the owner's
+   * decision in Platform Settings rather than each operator's. Proving both
+   * factors first means a stolen session cannot remove the factor protecting
+   * the account.
+   */
+  app.post('/mfa/disable', { preHandler: requirePlatformAccess(), config: { rateLimit: PLATFORM_AUTH_RATE_LIMIT } }, async (request, reply) => {
+    if (request.platformUser!.legacy) throw app.httpErrors.forbidden('The legacy operator token has no MFA to disable.');
+    const body = z.object({ password: z.string().min(1).max(200), code: z.string().trim().min(6).max(10) }).parse(request.body);
+
+    if (await operatorMfaRequired()) {
+      return reply.code(403).send({
+        error: 'operator_mfa_required',
+        message: 'This platform requires MFA for operators. Turn that off in Platform Settings first - it applies to every operator, not just you.',
+      });
+    }
+
+    const user = await platformDb.platformUser.findUnique({ where: { id: request.platformUser!.id } });
+    if (!user) throw app.httpErrors.unauthorized('Platform session not found.');
+    if (!user.mfaEnabled || !user.mfaSecretEnc) return reply.send({ mfaEnabled: false, alreadyDisabled: true });
+
+    if (!(await verifyPassword(body.password, user.passwordHash))) {
+      await platformAuditEvent(request, 'platform.mfa.disable_failed', { type: 'platformUser', id: user.id }, { reason: 'bad_password' });
+      return reply.code(400).send({ error: 'invalid_password', message: 'That is not your current password.' });
+    }
+    const secret = decryptSecret(user.mfaSecretEnc);
+    if (!secret || !verifyTotp(secret, body.code)) {
+      await platformAuditEvent(request, 'platform.mfa.disable_failed', { type: 'platformUser', id: user.id }, { reason: 'bad_code' });
+      return reply.code(400).send({ error: 'invalid_code', message: 'That code did not match. Try the current one from your authenticator.' });
+    }
+
+    const updated = await runPlatformAuditedMutation(request, {
+      action: 'platform.mfa.disabled', target: { type: 'platformUser', id: user.id }, metadata: { self: true },
+    }, tx => tx.platformUser.update({ where: { id: user.id }, data: { mfaEnabled: false, mfaSecretEnc: null } }));
+    return reply.send({ mfaEnabled: false, user: publicUser(updated) });
   });
 
   app.post('/logout', { preHandler: requirePlatformAccess() }, async request => {

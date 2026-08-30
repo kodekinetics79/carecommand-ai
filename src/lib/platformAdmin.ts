@@ -24,7 +24,7 @@ async function pf<T>(path: string, init?: RequestInit & { auth?: boolean }): Pro
   return body as T;
 }
 
-export interface PlatformMe { id: string; email: string | null; name: string; role: string; legacy: boolean; mfaEnabled: boolean }
+export interface PlatformMe { id: string; email: string | null; name: string; role: string; legacy: boolean; mfaEnabled: boolean; mfaRequired?: boolean }
 export interface TenantSummary {
   tenant: { id: string; name: string; slug: string; status: string; createdAt: string; lastActivityAt: string } | null;
   subscription: { planKey: string; planName: string; status: string; trialEndsAt: string | null; addons: string[] } | null;
@@ -247,6 +247,12 @@ export const platformAdmin = {
   createAnnouncement: (body: { title: string; body: string; severity?: string; audience?: string }) => pf<unknown>(`/v1/platform/announcements`, { method: 'POST', body: JSON.stringify(body) }),
   toggleAnnouncement: (id: string, active: boolean) => pf<unknown>(`/v1/platform/announcements/${id}`, { method: 'PATCH', body: JSON.stringify({ active }) }),
 
+  changeOwnPassword: (currentPassword: string, newPassword: string) =>
+    pf<{ changed: boolean; otherSessionsRevoked: boolean; token: string; user: PlatformMe }>(`/v1/platform/auth/password`, {
+      method: 'POST', body: JSON.stringify({ currentPassword, newPassword }),
+    }),
+  disableOwnMfa: (password: string, code: string) =>
+    pf<{ mfaEnabled: boolean }>(`/v1/platform/auth/mfa/disable`, { method: 'POST', body: JSON.stringify({ password, code }) }),
   getSettings: () => pf<PlatformSettings>(`/v1/platform/settings`),
   settingPresets: () => pf<{ presets: PlatformSettingPreset[] }>(`/v1/platform/settings/presets`),
   updateSettings: (body: Partial<Omit<PlatformSettings, 'updatedAt'>>) => pf<PlatformSettings>(`/v1/platform/settings`, { method: 'PATCH', body: JSON.stringify(body) }),
@@ -297,6 +303,8 @@ export interface PlatformSettings {
   defaultTrialDays: number; defaultPlanKey: string;
   defaultTimezone: string; defaultCountry: string; defaultBranchName: string; defaultVoiceMinutes: number;
   requireMfaFloor: boolean; sessionTimeoutMaxMinutes: number;
+  /** Whether YOUR OWN operators must use MFA on the Control Tower. */
+  requireOperatorMfa: boolean;
   presetKey: string; updatedAt: string;
 }
 export interface PlatformSettingPreset {

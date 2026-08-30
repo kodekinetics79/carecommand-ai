@@ -19,7 +19,7 @@ type Overview = { tenants: number; activeTenants: number; suspendedTenants: numb
 type SectionId =
   | 'overview' | 'tenants' | 'pilot' | 'requests' | 'plans' | 'entitlements' | 'billing' | 'ai_usage'
   | 'device_usage' | 'operators' | 'security' | 'integrations' | 'health' | 'audit'
-  | 'announcements' | 'settings';
+  | 'announcements' | 'settings' | 'account';
 
 interface SectionDef { id: SectionId; label: string; icon: React.ElementType; group: string; live: boolean; premium?: boolean }
 const SECTIONS: SectionDef[] = [
@@ -39,6 +39,7 @@ const SECTIONS: SectionDef[] = [
   { id: 'audit', label: 'Audit Logs', icon: ScrollText, group: 'Platform', live: true },
   { id: 'announcements', label: 'Announcements', icon: Megaphone, group: 'Platform', live: true },
   { id: 'settings', label: 'Platform Settings', icon: Settings, group: 'Platform', live: true },
+  { id: 'account', label: 'My Account', icon: UserCog, group: 'Platform', live: true },
 ];
 
 export default function PlatformConsole() {
@@ -147,6 +148,7 @@ export default function PlatformConsole() {
           {section === 'integrations' && <IntegrationsSection canManage={canManage} />}
           {section === 'announcements' && <AnnouncementsSection canManage={canManage} />}
           {section === 'settings' && <PlatformSettingsSection canManage={canManage} />}
+          {section === 'account' && <MyAccountSection me={me} onReauthenticated={setMe} />}
         </div>
       </div>
 
@@ -1083,6 +1085,120 @@ function DangerRow({ label, desc, action, tone = 'red', onConfirm, busy }: { lab
   );
 }
 
+/**
+ * The operator's own account.
+ *
+ * Changing your own password had no path in the console at all - rotating an
+ * operator credential meant a database write - and MFA was unconditional, so an
+ * operator could neither turn it off nor see whose decision it was.
+ */
+function MyAccountSection({ me, onReauthenticated }: { me: PlatformMe | null; onReauthenticated: (me: PlatformMe) => void }) {
+  const [current, setCurrent] = useState('');
+  const [next, setNext] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [busy, setBusy] = useState<'password' | 'mfa' | null>(null);
+  const [msg, setMsg] = useState<{ tone: 'ok' | 'bad'; text: string } | null>(null);
+
+  const [mfaPassword, setMfaPassword] = useState('');
+  const [mfaCode, setMfaCode] = useState('');
+  const [mfaMsg, setMfaMsg] = useState<{ tone: 'ok' | 'bad'; text: string } | null>(null);
+
+  const field = 'w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2 text-sm text-t1 outline-none focus:border-[var(--indigo)]';
+  const mismatch = confirm.length > 0 && next !== confirm;
+  const canSubmitPassword = current.length > 0 && next.length >= 8 && !mismatch && next !== current;
+
+  async function changePassword() {
+    setBusy('password'); setMsg(null);
+    try {
+      const result = await platformAdmin.changeOwnPassword(current, next);
+      // The server issues a fresh token because the change signs out every
+      // other session; without adopting it we would sign ourselves out too.
+      setPlatformToken(result.token);
+      onReauthenticated(result.user);
+      setCurrent(''); setNext(''); setConfirm('');
+      setMsg({ tone: 'ok', text: 'Password changed. Every other session has been signed out.' });
+    } catch (e) {
+      setMsg({ tone: 'bad', text: e instanceof Error ? e.message : 'Password change failed' });
+    } finally { setBusy(null); }
+  }
+
+  async function disableMfa() {
+    setBusy('mfa'); setMfaMsg(null);
+    try {
+      await platformAdmin.disableOwnMfa(mfaPassword, mfaCode.trim());
+      setMfaPassword(''); setMfaCode('');
+      const refreshed = await platformAdmin.me();
+      onReauthenticated(refreshed);
+      setMfaMsg({ tone: 'ok', text: 'MFA is off for your account. You will sign in with your password alone.' });
+    } catch (e) {
+      setMfaMsg({ tone: 'bad', text: e instanceof Error ? e.message : 'Could not turn MFA off' });
+    } finally { setBusy(null); }
+  }
+
+  if (!me) return <div className="py-10 text-center"><Loader2 className="inline w-5 h-5 animate-spin text-indigo" /></div>;
+  if (me.legacy) {
+    return (
+      <Panel title="My account" subtitle="Signed in with the legacy operator token">
+        <p className="text-sm text-t2">The legacy operator token is not an account: it has no password and no second factor. Sign in as a platform operator to manage credentials.</p>
+      </Panel>
+    );
+  }
+
+  return (
+    <div className="space-y-5">
+      <Panel title="My account" subtitle={`${me.name} · ${me.email ?? 'no email on file'} · ${me.role.replace('PLATFORM_', '')}`}>
+        <div className="grid sm:grid-cols-2 gap-4 max-w-2xl">
+          <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Current password</span>
+            <input className={field} type="password" autoComplete="current-password" value={current} onChange={e => setCurrent(e.target.value)} /></label>
+          <div />
+          <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">New password</span>
+            <input className={field} type="password" autoComplete="new-password" value={next} onChange={e => setNext(e.target.value)} />
+            <span className="text-[10px] text-t3">At least 8 characters. The server policy is the authority and may require more.</span></label>
+          <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Confirm new password</span>
+            <input className={field} type="password" autoComplete="new-password" value={confirm} onChange={e => setConfirm(e.target.value)} />
+            {mismatch && <span className="text-[10px] text-red-v">Those two do not match.</span>}</label>
+        </div>
+        <div className="mt-4 flex items-center gap-3">
+          <button type="button" disabled={busy !== null || !canSubmitPassword} onClick={() => void changePassword()} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50">
+            {busy === 'password' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Lock className="w-4 h-4" />} Change password
+          </button>
+          {msg && <span className={`text-[12px] ${msg.tone === 'ok' ? 'text-emerald-v' : 'text-red-v'}`} role="status">{msg.text}</span>}
+        </div>
+        <p className="mt-2 text-[11px] text-t3">Changing your password signs out every other session, on every device.</p>
+      </Panel>
+
+      <Panel title="Two-factor authentication" subtitle={me.mfaEnabled ? 'Enabled on your account' : 'Not enabled on your account'}>
+        {me.mfaRequired ? (
+          <p className="text-sm text-t2">
+            This platform requires MFA for every operator, so it cannot be turned off here.
+            An owner can change that in <span className="font-semibold text-t1">Platform Settings</span> — it applies to all operators, not just you.
+          </p>
+        ) : !me.mfaEnabled ? (
+          <p className="text-sm text-t2">MFA is off for your account and this platform does not require it. Sign out and back in to enrol.</p>
+        ) : (
+          <>
+            <p className="text-sm text-t2 mb-3">
+              Turning MFA off means your password alone reaches every tenant&apos;s commercial record. Prove both factors to confirm.
+            </p>
+            <div className="grid sm:grid-cols-2 gap-4 max-w-2xl">
+              <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Password</span>
+                <input className={field} type="password" autoComplete="current-password" value={mfaPassword} onChange={e => setMfaPassword(e.target.value)} /></label>
+              <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Current 6-digit code</span>
+                <input className={field} inputMode="numeric" value={mfaCode} onChange={e => setMfaCode(e.target.value.replace(/[^0-9]/g, '').slice(0, 8))} /></label>
+            </div>
+            <div className="mt-4 flex items-center gap-3">
+              <button type="button" disabled={busy !== null || mfaPassword.length === 0 || mfaCode.trim().length < 6} onClick={() => void disableMfa()} className="inline-flex items-center gap-1.5 rounded-lg border border-[rgba(220,38,38,0.25)] px-4 py-2 text-sm font-semibold text-red-v hover:bg-red-soft disabled:opacity-50">
+                {busy === 'mfa' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Ban className="w-4 h-4" />} Turn MFA off
+              </button>
+              {mfaMsg && <span className={`text-[12px] ${mfaMsg.tone === 'ok' ? 'text-emerald-v' : 'text-red-v'}`} role="status">{mfaMsg.text}</span>}
+            </div>
+          </>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
 function PlatformSettingsSection({ canManage }: { canManage: boolean }) {
   const [cfg, setCfg] = useState<PlatformSettings | null>(null);
   const [presets, setPresets] = useState<PlatformSettingPreset[]>([]);
@@ -1125,6 +1241,7 @@ function PlatformSettingsSection({ canManage }: { canManage: boolean }) {
         defaultTimezone: cfg.defaultTimezone.trim(), defaultCountry: cfg.defaultCountry.trim().toUpperCase(),
         defaultBranchName: cfg.defaultBranchName.trim(), defaultVoiceMinutes: cfg.defaultVoiceMinutes,
         requireMfaFloor: cfg.requireMfaFloor, sessionTimeoutMaxMinutes: cfg.sessionTimeoutMaxMinutes,
+        requireOperatorMfa: cfg.requireOperatorMfa,
         presetKey: cfg.presetKey,
       });
       setCfg(saved); // show what the server stored, not what we sent
@@ -1185,6 +1302,22 @@ function PlatformSettingsSection({ canManage }: { canManage: boolean }) {
             </label>
             <label className="block space-y-1"><span className="text-[11px] font-semibold text-t3">Maximum session length (minutes)</span>
               <input disabled={!canManage} className={field} inputMode="numeric" value={String(cfg.sessionTimeoutMaxMinutes)} onChange={e => patch({ sessionTimeoutMaxMinutes: Number(e.target.value.replace(/[^0-9]/g, '') || 0), presetKey: 'custom' })} /></label>
+          </div>
+        </div>
+
+        <div>
+          <p className="text-[11px] font-bold uppercase tracking-wide text-t3 mb-2">Your own operators</p>
+          <div className="grid gap-2">
+            <label className="flex items-start gap-2 text-sm text-t2">
+              <input type="checkbox" className="mt-1" disabled={!canManage} checked={cfg.requireOperatorMfa} onChange={e => patch({ requireOperatorMfa: e.target.checked })} />
+              <span>
+                Require MFA for every Control Tower operator
+                <span className="block text-[11px] text-t3">
+                  These accounts reach every tenant&apos;s commercial record. Turning this off lets an operator sign in with a password alone, and lets each
+                  operator remove their own second factor from My Account. Operators who have already enrolled keep being asked for their code.
+                </span>
+              </span>
+            </label>
           </div>
         </div>
 

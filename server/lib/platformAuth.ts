@@ -30,12 +30,17 @@ interface PlatformJwt {
   role: PlatformRole;
   type: 'platform';
   sessionId: string;
+  /** The account's session epoch when this token was minted. */
+  epoch?: number;
 }
 
 export type PlatformMfaPurpose = 'challenge' | 'enrollment';
 
-export function signPlatformToken(app: FastifyInstance, user: { id: string; role: string }, expiresIn = '15m'): string {
-  return app.jwt.sign({ platformUserId: user.id, role: user.role, type: 'platform', sessionId: randomUUID() } as PlatformJwt, { expiresIn });
+export function signPlatformToken(app: FastifyInstance, user: { id: string; role: string; sessionEpoch?: number }, expiresIn = '15m'): string {
+  return app.jwt.sign(
+    { platformUserId: user.id, role: user.role, type: 'platform', sessionId: randomUUID(), epoch: user.sessionEpoch ?? 0 } as PlatformJwt,
+    { expiresIn },
+  );
 }
 
 export function signPlatformMfaToken(app: FastifyInstance, userId: string, purpose: PlatformMfaPurpose): string {
@@ -115,13 +120,18 @@ export function requirePlatformAccess(...allowedRoles: PlatformRole[]) {
         const [pu, loggedOut] = await Promise.all([
           platformDb.platformUser.findFirst({
             where: { id: payload.platformUserId, status: 'active' },
-            select: { id: true, role: true, email: true },
+            select: { id: true, role: true, email: true, sessionEpoch: true },
           }),
           typeof payload.sessionId === 'string' && payload.sessionId.length > 0
             ? platformSessionWasLoggedOut(payload.platformUserId, payload.sessionId)
             : Promise.resolve(true),
         ]);
-        if (pu && !loggedOut) {
+        // A password change increments the account's session epoch, so every
+        // token minted before it stops verifying immediately - a credential that
+        // was shared or stolen cannot outlive its rotation. Tokens predating
+        // this field carry no epoch and are treated as epoch 0.
+        const revoked = !!pu && (payload.epoch ?? 0) !== pu.sessionEpoch;
+        if (pu && !loggedOut && !revoked) {
           actor = { id: pu.id, role: pu.role as PlatformRole, legacy: false, email: pu.email };
         }
       }

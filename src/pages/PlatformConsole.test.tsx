@@ -40,7 +40,7 @@ const SETTINGS = {
   defaultTrialDays: 14, defaultPlanKey: 'growth',
   defaultTimezone: 'Europe/London', defaultCountry: 'GB',
   defaultBranchName: 'Reception', defaultVoiceMinutes: 300,
-  requireMfaFloor: true, sessionTimeoutMaxMinutes: 240,
+  requireMfaFloor: true, sessionTimeoutMaxMinutes: 240, requireOperatorMfa: true,
   presetKey: 'uk_pilot', updatedAt: '2026-08-29T10:00:00.000Z',
 };
 
@@ -137,7 +137,19 @@ describe('Control Tower — platform settings', () => {
     await waitFor(() => expect((screen.getByLabelText('Default plan') as HTMLSelectElement).value).toBe('growth'));
     expect((screen.getByDisplayValue('Europe/London') as HTMLInputElement).value).toBe('Europe/London');
     expect((screen.getByDisplayValue('300') as HTMLInputElement).value).toBe('300');
-    expect((screen.getByRole('checkbox', { name: /Require MFA/i }) as HTMLInputElement).checked).toBe(true);
+    // Two MFA controls exist and they mean different things: one is the floor a
+    // new CLINIC starts on, the other governs our own staff.
+    expect((screen.getByRole('checkbox', { name: /Require MFA from day one/i }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole('checkbox', { name: /Require MFA for every Control Tower operator/i }) as HTMLInputElement).checked).toBe(true);
+  });
+
+  it('states what turning operator MFA off actually costs, rather than offering a bare toggle', async () => {
+    renderConsole();
+    await openSection('settings');
+    const operatorMfa = await screen.findByRole('checkbox', { name: /Require MFA for every Control Tower operator/i });
+    expect(operatorMfa).toBeTruthy();
+    expect(screen.getByText(/reach every tenant/i)).toBeTruthy();
+    expect(screen.getByText(/already enrolled keep being asked/i)).toBeTruthy();
   });
 
   it('re-renders from what the server stored, not from what it sent', async () => {

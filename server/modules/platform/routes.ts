@@ -91,6 +91,7 @@ function settingsView(c: Awaited<ReturnType<typeof ensureConfig>>) {
     defaultTimezone: c.defaultTimezone, defaultCountry: c.defaultCountry,
     defaultBranchName: c.defaultBranchName, defaultVoiceMinutes: c.defaultVoiceMinutes,
     requireMfaFloor: c.requireMfaFloor, sessionTimeoutMaxMinutes: c.sessionTimeoutMaxMinutes,
+    requireOperatorMfa: c.requireOperatorMfa,
     presetKey: c.presetKey, updatedAt: c.updatedAt.toISOString(),
   };
 }
@@ -947,6 +948,7 @@ export const platformRoutes: FastifyPluginAsync = async app => {
       defaultVoiceMinutes: z.number().int().min(0).max(1_000_000).optional(),
       requireMfaFloor: z.boolean().optional(),
       sessionTimeoutMaxMinutes: z.number().int().min(5).max(1440).optional(),
+      requireOperatorMfa: z.boolean().optional(),
       presetKey: z.string().trim().max(40).optional(),
     }).parse(request.body);
     if (body.defaultPlanKey && !(await db.subscriptionPlan.findUnique({ where: { key: body.defaultPlanKey } }))) throw app.httpErrors.badRequest('Unknown plan');

@@ -3389,6 +3389,13 @@ model PlatformUser {
   failedLoginCount  Int       @default(0)
   lockedUntil       DateTime?
   passwordChangedAt DateTime  @default(now())
+  // When sessions were last revoked, for the operator to read.
+  sessionsRevokedAt DateTime?
+  // The mechanism. A token carries the epoch it was minted under; changing the
+  // password increments this, so every existing token stops verifying at once.
+  // A counter rather than a timestamp because JWT `iat` has one-second
+  // resolution, and "same second as the change" must not mean "still valid".
+  sessionEpoch      Int       @default(0)
   lastLoginAt       DateTime?
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
@@ -3652,6 +3659,11 @@ model PlatformConfig {
   // new tenant's TenantSecurityPolicy from these; tenants may only tighten.
   requireMfaFloor          Boolean @default(false)
   sessionTimeoutMaxMinutes Int     @default(480)
+
+  // Whether YOUR OWN staff must use MFA on the Control Tower. Defaults to true
+  // because these accounts can reach every tenant's commercial record; the
+  // owner can turn it off, and the console says plainly what that costs.
+  requireOperatorMfa Boolean @default(true)
 
   presetKey   String   @default("custom")
   updatedAt   DateTime @updatedAt
