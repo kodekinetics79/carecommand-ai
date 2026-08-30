@@ -3,6 +3,8 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { buildPilotChecklist, createPilotShareToken } from '../../lib/pilotStatus';
 import { platformAuditEvent, requirePlatformAccess } from '../../lib/platformAuth';
+import { platformDb } from '../../lib/platformDb';
+import { runWithPlatformDatabaseRequest } from '../../lib/platformContextStore';
 import { enterTenantContext, type TenantTxClient } from '../../lib/tenantContext';
 import {
   analyzePilotImport,
@@ -114,6 +116,10 @@ async function providerLookup(tx: TenantTxClient, tenantId: string) {
 }
 
 export const pilotRoutes: FastifyPluginAsync = async app => {
+  // Same scope platformRoutes establishes: platformDb only sets its actor GUCs
+  // inside this store, and without it every platform-plane read here is denied
+  // by RLS and silently returns nothing.
+  app.addHook('onRequest', (_request, _reply, done) => runWithPlatformDatabaseRequest(done));
   app.addHook('preHandler', pilotAdmin);
 
   // Every route below is scoped to /tenants/:tenantId and reads or writes TENANT
@@ -142,6 +148,30 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
     if (!parsed.success) return; // the route's own parse answers with a 400
 
     const actor = request.platformUser;
+
+    // Break-glass, same contract as the staff roster.
+    //
+    // These routes read and write a clinic's Patient, Appointment and
+    // PatientInsurancePolicy rows. The RLS `source = 'platform'` branch admits
+    // ANY active PlatformUser to ANY tenant table, so without this check the
+    // most sensitive platform capability we have was also the only one with no
+    // reason recorded, no expiry and nothing for the clinic to see afterwards -
+    // while the strict `source = 'support'` branch, built for exactly this, sat
+    // unused. Requiring a live session here does not weaken the database
+    // policy; it stops us relying on a route guard as the only control over
+    // vendor access to patient data.
+    const session = await platformDb.supportAccessSession.findFirst({
+      where: { tenantId: parsed.data, endedAt: null, expiresAt: { gt: new Date() } },
+      orderBy: { startedAt: 'desc' },
+      select: { id: true },
+    });
+    if (!session) {
+      return reply.code(403).send({
+        error: 'support_session_required',
+        message: 'Open a support session for this workspace before importing or reading its clinic data. The session records your reason and expires on its own.',
+      });
+    }
+
     enterTenantContext({
       tenantId: parsed.data,
       // Bare id: app_rls_tenant_allowed() requires a UUID that resolves to an
