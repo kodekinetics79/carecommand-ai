@@ -21,7 +21,7 @@ function editableFields(agent: Agent) {
  * the user had just been shown. The draft holds the editable subset; the
  * provider evidence block always reads the latest `agent` prop.
  */
-export function AgentEditor({ agent, onSave, onVerify }: { agent: Agent; onSave: (patch: Partial<Agent>) => Promise<void>; onVerify: () => Promise<void> }) {
+export function AgentEditor({ agent, onSave, onVerify }: { agent: Agent; onSave: (patch: Partial<Agent>) => Promise<Agent>; onVerify: () => Promise<void> }) {
   const [draft, setDraft] = useState<Agent>(agent);
   const saveState = useMutationState();
   const verifyState = useMutationState();
@@ -30,12 +30,19 @@ export function AgentEditor({ agent, onSave, onVerify }: { agent: Agent; onSave:
   const set = <K extends keyof Agent>(key: K, value: Agent[K]) => setDraft(prev => ({ ...prev, [key]: value }));
 
   async function save() {
-    await saveState.run(() => onSave(editableFields(draft)));
+    const updated = await saveState.run(() => onSave(editableFields(draft)));
+    if (updated) setDraft(updated);
   }
 
   async function verify() {
     await verifyState.run(() => onVerify(), { successMessage: 'Provider deployment verified' });
   }
+
+  const verifyBlockReason = dirty
+    ? 'Save these changes before verifying the provider deployment.'
+    : !agent.providerAgentId
+      ? 'Enter and save a Retell agent ID before verification.'
+      : null;
 
   return (
     <div className="space-y-4">
@@ -81,10 +88,11 @@ export function AgentEditor({ agent, onSave, onVerify }: { agent: Agent; onSave:
         <MutationNotice state={verifyState.state} savedLabel="Provider deployment verified" onRetry={verifyState.state.status === 'error' && !dirty && agent.providerAgentId ? verify : undefined} retryLabel="Verify again" />
         <div className="flex flex-wrap items-center justify-between gap-3">
           <Toggle checked={draft.active} onChange={value => set('active', value)} label="Agent active" />
-          <button type="button" disabled={busy || dirty || !agent.providerAgentId} onClick={verify} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t1 disabled:opacity-40">
+          <button type="button" title={verifyBlockReason ?? 'Read and verify the exact published Retell deployment'} disabled={busy || Boolean(verifyBlockReason)} onClick={verify} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t1 disabled:opacity-40">
             {isBusy(verifyState.state) ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />} Verify provider deployment
           </button>
         </div>
+        {verifyBlockReason && <p className="text-[11px] font-semibold text-amber-v">{verifyBlockReason}</p>}
       </div>
       <MutationNotice state={saveState.state} showSaved={false} onRetry={dirty ? save : undefined} />
       <SaveBar dirty={dirty} busy={busy} onSave={save} savedAt={savedAtOf(saveState.state)} />

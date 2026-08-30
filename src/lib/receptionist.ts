@@ -147,6 +147,7 @@ export interface RetellConfig {
 
 export interface CallLog {
   id: string;
+  clinicId: string;
   campaignId: string | null;
   retellCallId: string | null;
   callerName: string | null;

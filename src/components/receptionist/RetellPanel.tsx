@@ -9,7 +9,7 @@ import { LoadFailureNotice } from './MutationNotice';
 
 // ===== RetellAI Panel ======================================================
 
-export function RetellPanel({ campaignId, onConfigure }: { campaignId: string; onConfigure?: () => void }) {
+export function RetellPanel({ campaignId, onConfigure }: { campaignId: string; onConfigure?: (target: 'campaign' | 'intake') => void }) {
   const loadConfig = useCallback(() => api.getRetellConfig(campaignId), [campaignId]);
   const { state, reload } = useResource<RetellConfig>(loadConfig);
   const config = receivedData(state);
@@ -21,8 +21,8 @@ export function RetellPanel({ campaignId, onConfigure }: { campaignId: string; o
       <div className="cc-card p-6">
         <LoadFailureNotice what="The RetellAI export configuration" message={state.failure.message} onRetry={reload} />
         {['invalid_receptionist_configuration', 'invalid_intake_configuration'].includes(state.failure.code ?? '') && onConfigure && (
-          <button type="button" onClick={onConfigure} className="mt-3 rounded-lg border border-amber-v/40 px-3 py-1.5 text-xs font-semibold text-amber-v hover:bg-[var(--s2)]">
-            Open campaign settings
+          <button type="button" onClick={() => onConfigure(state.failure.code === 'invalid_intake_configuration' ? 'intake' : 'campaign')} className="mt-3 rounded-lg border border-amber-v/40 px-3 py-1.5 text-xs font-semibold text-amber-v hover:bg-[var(--s2)]">
+            {state.failure.code === 'invalid_intake_configuration' ? 'Open Intake Builder' : 'Open campaign settings'}
           </button>
         )}
       </div>

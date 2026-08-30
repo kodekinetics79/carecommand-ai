@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ShieldCheck, Loader2 } from 'lucide-react';
 import { Field, TextArea } from '../ui/Field';
 import { receptionistApi as api, type CallLog, type AppointmentRequest, type OptOut } from '../../lib/receptionist';
@@ -14,7 +14,7 @@ type LoadFailures = Partial<Record<ActivityPart, ResourceFailure>>;
 
 // ===== Activity Panel ======================================================
 
-export function ActivityPanel({ clinicId }: { clinicId: string }) {
+export function ActivityPanel({ clinicId, initialCallId = null }: { clinicId: string; initialCallId?: string | null }) {
   const [calls, setCalls] = useState<CallLog[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [loadFailures, setLoadFailures] = useState<LoadFailures>({});
@@ -35,6 +35,7 @@ export function ActivityPanel({ clinicId }: { clinicId: string }) {
   const [revokingId, setRevokingId] = useState<string | null>(null);
   const [revocationReason, setRevocationReason] = useState('');
   const [revocationAcknowledged, setRevocationAcknowledged] = useState(false);
+  const openedInitialCall = useRef<string | null>(null);
   const revocationState = useMutationState();
   const revocationPending = isBusy(revocationState.state);
 
@@ -51,6 +52,30 @@ export function ActivityPanel({ clinicId }: { clinicId: string }) {
     setLoaded(true);
   }, [clinicId]);
 
+  const hydrateReview = useCallback((call: CallLog) => {
+    setNoteSummary(call.operationalNotes?.summary ?? '');
+    setStaffCorrection(call.operationalNotes?.correction ?? '');
+    setCallerIntent(call.operationalNotes?.callerIntent ?? '');
+    setActionsTaken(call.operationalNotes?.actionsTaken.join('\n') ?? '');
+    setFollowUpNotes(call.operationalNotes?.followUpNotes ?? '');
+    setUnresolvedActions(call.unresolvedActionItems?.join('\n') ?? '');
+  }, []);
+
+  const resetReview = reviewState.reset;
+  const openCall = useCallback(async (callId: string) => {
+    setCallDetailLoading(true); setCallDetailError(null); resetReview();
+    try {
+      const detail = await api.getCallLog(callId);
+      setSelectedCall(detail);
+      hydrateReview(detail);
+    } catch (error) {
+      setSelectedCall(null);
+      setCallDetailError(error instanceof Error ? error.message : 'Call detail could not be loaded.');
+    } finally {
+      setCallDetailLoading(false);
+    }
+  }, [hydrateReview, resetReview]);
+
   useEffect(() => {
     let active = true;
     void (async () => {
@@ -66,33 +91,16 @@ export function ActivityPanel({ clinicId }: { clinicId: string }) {
     return () => { active = false; };
   }, [clinicId]);
 
+  useEffect(() => {
+    if (!loaded || !initialCallId || openedInitialCall.current === initialCallId) return;
+    openedInitialCall.current = initialCallId;
+    void openCall(initialCallId);
+  }, [initialCallId, loaded, openCall]);
+
   const emptyText = (part: ActivityPart, rows: unknown[], text: string) =>
     loaded && !loadFailures[part] && rows.length === 0 ? <p className="text-xs text-t3 py-4 text-center">{text}</p> : null;
   const partFailure = (part: ActivityPart, what: string) =>
     loadFailures[part] ? <LoadFailureNotice what={what} message={loadFailures[part]!.message} onRetry={() => void load()} /> : null;
-
-  function hydrateReview(call: CallLog) {
-    setNoteSummary(call.operationalNotes?.summary ?? '');
-    setStaffCorrection(call.operationalNotes?.correction ?? '');
-    setCallerIntent(call.operationalNotes?.callerIntent ?? '');
-    setActionsTaken(call.operationalNotes?.actionsTaken.join('\n') ?? '');
-    setFollowUpNotes(call.operationalNotes?.followUpNotes ?? '');
-    setUnresolvedActions(call.unresolvedActionItems?.join('\n') ?? '');
-  }
-
-  async function openCall(callId: string) {
-    setCallDetailLoading(true); setCallDetailError(null); reviewState.reset();
-    try {
-      const detail = await api.getCallLog(callId);
-      setSelectedCall(detail);
-      hydrateReview(detail);
-    } catch (error) {
-      setSelectedCall(null);
-      setCallDetailError(error instanceof Error ? error.message : 'Call detail could not be loaded.');
-    } finally {
-      setCallDetailLoading(false);
-    }
-  }
 
   async function saveReview(operation: 'SAVE_DRAFT' | 'MARK_REVIEWED' | 'SIGN_OFF') {
     if (!selectedCall || selectedCall.reviewStatus === 'SIGNED_OFF') return;

@@ -124,7 +124,7 @@ export default function AIReceptionist() {
   const avgCallSeconds = receptionistCallLogs.length
     ? Math.round(receptionistCallLogs.reduce((sum, call) => sum + call.durationSeconds, 0) / receptionistCallLogs.length)
     : null;
-  const unresolved = conversationRecords.filter(item => item.status !== 'replied').length;
+  const unresolved = conversationRecords.filter(item => item.channel !== 'call' && item.status !== 'replied').length;
 
   async function sendReply(status: 'replied' | 'escalated' = 'replied') {
     if (!selectedConv) return;
@@ -215,7 +215,7 @@ export default function AIReceptionist() {
                 receptionistCallLogs.length === 0
                   ? <p className="px-4 py-6 text-sm text-t3">No canonical receptionist call logs were returned.</p>
                   : receptionistCallLogs.map(call => (
-                    <button key={call.id} type="button" onClick={() => navigate('/receptionist-studio?tab=activity')} className="w-full flex items-start gap-3 px-4 py-3.5 text-left hover:bg-[var(--s3)] transition-colors">
+                    <button key={call.id} type="button" onClick={() => navigate(`/receptionist-studio?tab=activity&clinicId=${encodeURIComponent(call.clinicId)}&callId=${encodeURIComponent(call.id)}`)} className="w-full flex items-start gap-3 px-4 py-3.5 text-left hover:bg-[var(--s3)] transition-colors">
                       <div className="w-8 h-8 rounded-xl border flex items-center justify-center shrink-0 bg-[var(--blue-soft)] border-[var(--b1)]"><Phone className="w-3.5 h-3.5 text-indigo" /></div>
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center justify-between gap-2">
@@ -453,7 +453,7 @@ export default function AIReceptionist() {
             </button>
           </BentoCard>
 
-          <BentoCard title="After-Hours Activity" subtitle="Unavailable until clinic hours and timezone are configured">
+          <BentoCard title="After-Hours Activity" subtitle="Not implemented — requires validated hours, closures and on-call logic">
             <div className="rounded-xl border border-dashed border-[var(--b2)] bg-[var(--s3)] p-4 text-center">
               <Clock className="mx-auto mb-2 h-5 w-5 text-t3" aria-hidden="true" />
               <p className="text-xs font-semibold text-t2">No after-hours metric is calculated.</p>

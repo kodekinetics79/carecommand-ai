@@ -9,7 +9,7 @@ import { LoadFailureNotice, MutationNotice } from './MutationNotice';
 
 // ===== Intake Builder ======================================================
 
-export function IntakeBuilder({ campaign, clinic, onChanged }: { campaign: Campaign; clinic: Clinic; onChanged: () => Promise<unknown> }) {
+export function IntakeBuilder({ campaign, onChanged }: { campaign: Campaign; clinic: Clinic; onChanged: () => Promise<unknown> }) {
   const [fields, setFields] = useState<IntakeField[]>(campaign.intakeFields ?? []);
   const [loaded, setLoaded] = useState(false);
   const [loadFailure, setLoadFailure] = useState<ResourceFailure | null>(null);
@@ -42,8 +42,10 @@ export function IntakeBuilder({ campaign, clinic, onChanged }: { campaign: Campa
   async function addField(type: FieldType) {
     const meta = FIELD_CATALOG.find(f => f.type === type)!;
     await addState.run(async () => {
-      const options = type === 'PREFERRED_LOCATION' ? (clinic.locations ?? []).map(l => l.name) : [];
-      await api.createIntakeField({ campaignId: campaign.id, fieldType: type, label: meta.label, aiQuestion: meta.question, options, sortOrder: fields.length });
+      // Preferred-location choices are compiled from the campaign's mapped
+      // location UUIDs. Sending display-name options creates a second source
+      // of truth and is rejected by the server contract.
+      await api.createIntakeField({ campaignId: campaign.id, fieldType: type, label: meta.label, aiQuestion: meta.question, options: [], sortOrder: fields.length });
       await refresh();
     }, { successMessage: `${meta.label} added` });
   }

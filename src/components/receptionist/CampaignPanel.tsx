@@ -22,6 +22,7 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
   const [newAgentName, setNewAgentName] = useState('');
   const dirty = JSON.stringify(draft) !== JSON.stringify(campaign);
   const locations = clinic.locations ?? [];
+  const staleLocationIds = draft.eligibleLocationIds.filter(id => !locations.some(location => location.id === id));
   const rules = draft.bookingRules ?? {};
   const busy = isBusy(saveState.state) || isBusy(createAgentState.state);
 
@@ -57,9 +58,10 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
   // AgentEditor owns the mutation state for these two: it shows the server's
   // code/message next to the provider evidence block. Both must throw.
   async function saveAgent(patch: Partial<Agent>) {
-    if (!activeAgent) return;
+    if (!activeAgent) throw new Error('Select an agent before saving.');
     const updated = await api.updateAgent(activeAgent.id, patch);
     setAgents(prev => prev.map(a => (a.id === updated.id ? updated : a)));
+    return updated;
   }
 
   async function verifyAgent() {
@@ -176,6 +178,12 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
           <p className="text-[11px] font-bold uppercase tracking-wide text-t3 mb-2">Eligible locations</p>
           <div className="flex flex-wrap gap-2">
             {locations.length === 0 && <p className="text-xs text-t3">Add locations in the Clinic Profile tab first.</p>}
+            {staleLocationIds.map(id => (
+              <button key={id} type="button" onClick={() => toggleLocation(id)} title="Remove this deleted location reference, then save the campaign"
+                className="rounded-xl border border-red-v/40 bg-[var(--red-soft)] px-3 py-1.5 text-xs font-semibold text-red-v">
+                Remove deleted location · {id.slice(0, 8)}
+              </button>
+            ))}
             {locations.map(loc => {
               const on = draft.eligibleLocationIds.includes(loc.id);
               return (

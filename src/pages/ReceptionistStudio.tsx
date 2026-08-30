@@ -40,6 +40,8 @@ export default function ReceptionistStudio() {
   const [activeClinicId, setActiveClinicId] = useState<string>('');
   const [activeCampaignId, setActiveCampaignId] = useState<string>('');
   const requestedTab = searchParams.get('tab');
+  const requestedClinicId = searchParams.get('clinicId');
+  const requestedCallId = searchParams.get('callId');
   const tab: Tab = isTab(requestedTab) ? requestedTab : 'clinic';
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const [loading, setLoading] = useState(true);
@@ -62,9 +64,11 @@ export default function ReceptionistStudio() {
     const [rows, ov] = await Promise.all([api.listClinics(), api.overview().catch(() => null)]);
     setClinics(rows);
     if (ov) setOverview(ov);
-    setActiveClinicId(prev => (prev && rows.some(r => r.id === prev) ? prev : rows[0]?.id ?? ''));
+    setActiveClinicId(prev => requestedClinicId && rows.some(row => row.id === requestedClinicId)
+      ? requestedClinicId
+      : prev && rows.some(r => r.id === prev) ? prev : rows[0]?.id ?? '');
     return rows;
-  }, []);
+  }, [requestedClinicId]);
 
   const loadCampaigns = useCallback(async (clinicId: string) => {
     const rows = await (clinicId ? api.listCampaigns(clinicId) : Promise.resolve<Campaign[]>([]));
@@ -309,14 +313,14 @@ export default function ReceptionistStudio() {
               activeCampaign ? <PreviewPanel key={activeCampaign.id} campaignId={activeCampaign.id} /> : <EmptyState text="Select a campaign to preview the generated agent." />
             )}
             {tab === 'retell' && (
-              activeCampaign ? <RetellPanel key={activeCampaign.id} campaignId={activeCampaign.id} onConfigure={() => selectTab('campaign')} /> : <EmptyState text="Select a campaign to export its RetellAI configuration." />
+              activeCampaign ? <RetellPanel key={activeCampaign.id} campaignId={activeCampaign.id} onConfigure={selectTab} /> : <EmptyState text="Select a campaign to export its RetellAI configuration." />
             )}
             {tab === 'outbound' && (
               activeClinic ? <OutboundPanel key={activeClinic.id} clinic={activeClinic} />
                 : <EmptyState text="Create a clinic profile first to configure outbound calling." />
             )}
             {tab === 'activity' && activeClinic && (
-              <ActivityPanel clinicId={activeClinic.id} />
+              <ActivityPanel clinicId={activeClinic.id} initialCallId={requestedCallId} />
             )}
             </div>
           </div>

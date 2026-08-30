@@ -219,6 +219,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
                   confirmLabel="Approve and start"
                   tone="amber"
                   disabled={campaignActionPending || !campaign.policyVersion}
+                  buttonTitle={!campaign.policyVersion ? 'Configure a policy version before approval.' : 'Approve the recorded authority and start this campaign.'}
                   onConfirm={approveAndRun}
                   className="rounded-lg bg-indigo px-2.5 py-1 text-xs font-semibold text-white disabled:opacity-50"
                 >Approve and start</ConfirmedButton>}
@@ -320,6 +321,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
                 <button
                   type="button"
                   disabled={!l.retellCallId || syncingCallId === l.id}
+                  title={!l.retellCallId ? 'Provider status is unavailable until a Retell call ID has been recorded.' : 'Refresh the latest provider call state.'}
                   onClick={() => void syncProviderCall(l.id)}
                   className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-indigo disabled:opacity-50"
                 >

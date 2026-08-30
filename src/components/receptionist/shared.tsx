@@ -4,19 +4,29 @@ import ConfirmationModal from '../workflow/ConfirmationModal';
 
 export function CopyButton({ value, label = 'Copy' }: { value: string; label?: string }) {
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState(false);
   return (
-    <button
-      type="button"
-      onClick={async () => {
-        await navigator.clipboard.writeText(value);
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
-      }}
-      className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-2.5 py-1 text-[11px] font-semibold text-t2 hover:bg-[var(--s3)]"
-    >
-      {copied ? <Check className="w-3 h-3 text-emerald-v" /> : <Copy className="w-3 h-3" />}
-      {copied ? 'Copied' : label}
-    </button>
+    <span className="inline-flex flex-col items-end gap-1">
+      <button
+        type="button"
+        onClick={async () => {
+          setCopyError(false);
+          try {
+            await navigator.clipboard.writeText(value);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1500);
+          } catch {
+            setCopied(false);
+            setCopyError(true);
+          }
+        }}
+        className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-2.5 py-1 text-[11px] font-semibold text-t2 hover:bg-[var(--s3)]"
+      >
+        {copied ? <Check className="w-3 h-3 text-emerald-v" /> : <Copy className="w-3 h-3" />}
+        {copied ? 'Copied' : label}
+      </button>
+      {copyError && <span role="alert" className="text-[10px] font-semibold text-red-v">Copy blocked—select the value manually.</span>}
+    </span>
   );
 }
 

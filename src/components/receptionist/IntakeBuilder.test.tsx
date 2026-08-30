@@ -30,7 +30,7 @@ const campaign: Campaign = {
   offerTitle: 'Offer', offerDescription: 'Desc', offerScript: 'Script', appointmentType: 'Consultation', bookingRules: null,
   eligibleLocationIds: [], smsConfirmation: false, emailConfirmation: false, intakeFields: FIELDS,
 };
-const clinic = { id: 'clinic-1', name: 'Brightsmile', locations: [] } as unknown as Clinic;
+const clinic = { id: 'clinic-1', name: 'Brightsmile', locations: [{ id: 'location-1', name: 'Downtown Medical Centre' }] } as unknown as Clinic;
 
 type Responder = (path: string, init?: RequestInit) => Promise<unknown>;
 let respond: Responder;
@@ -48,6 +48,26 @@ function rowLabels(): string[] {
 }
 
 describe('IntakeBuilder — reorder rolls back when the server refuses', () => {
+  it('creates preferred location without duplicating mapped locations as forbidden display-name options', async () => {
+    respond = (path, init) => {
+      if (path.startsWith('/v1/receptionist/intake-fields?campaignId=camp-1')) return Promise.resolve(FIELDS);
+      if (path === '/v1/receptionist/intake-fields' && init?.method === 'POST') {
+        expect(JSON.parse(String(init.body))).toMatchObject({
+          campaignId: 'camp-1',
+          fieldType: 'PREFERRED_LOCATION',
+          options: [],
+        });
+        return Promise.resolve({ ...field('preferred', 'Preferred location', 2), fieldType: 'PREFERRED_LOCATION' });
+      }
+      return Promise.reject(new Error(`Unexpected request in test: ${init?.method ?? 'GET'} ${path}`));
+    };
+    render(<IntakeBuilder campaign={campaign} clinic={clinic} onChanged={async () => {}} />);
+
+    await waitFor(() => expect(rowLabels()).toEqual(['First name', 'Last name']));
+    fireEvent.click(screen.getByRole('button', { name: 'Preferred location' }));
+    expect(await screen.findByText('Preferred location added')).toBeInTheDocument();
+  });
+
   it('disables the arrows while the reorder is in flight, then restores the order and shows the cause', async () => {
     let rejectReorder!: (error: unknown) => void;
     respond = (path, init) => {

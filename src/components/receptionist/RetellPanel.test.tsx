@@ -49,14 +49,14 @@ describe('RetellPanel export failures', () => {
     expect(screen.queryByText('Preview/export configuration — not deployed')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Open campaign settings' }));
-    expect(onConfigure).toHaveBeenCalledOnce();
+    expect(onConfigure).toHaveBeenCalledWith('campaign');
 
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
     await waitFor(() => expect(getRetellConfig).toHaveBeenCalledTimes(2));
     expect(await screen.findByText('Preview/export configuration — not deployed')).toBeInTheDocument();
   });
 
-  it('routes a malformed intake contract back to campaign settings', async () => {
+  it('routes a malformed intake contract to the Intake Builder', async () => {
     const onConfigure = vi.fn();
     getRetellConfig.mockRejectedValue(new ApiError(
       409,
@@ -67,7 +67,7 @@ describe('RetellPanel export failures', () => {
     render(<RetellPanel campaignId="campaign-1" onConfigure={onConfigure} />);
 
     expect(await screen.findByRole('alert')).toHaveTextContent('stale intake options');
-    fireEvent.click(screen.getByRole('button', { name: 'Open campaign settings' }));
-    expect(onConfigure).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole('button', { name: 'Open Intake Builder' }));
+    expect(onConfigure).toHaveBeenCalledWith('intake');
   });
 });
