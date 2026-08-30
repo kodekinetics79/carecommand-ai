@@ -105,7 +105,10 @@ describe('independent content QA challenge', () => {
   });
 
   it('qualifies credential-storage wording and follows the pilot US-English standard', () => {
-    const integration = source('src/pages/IntegrationSetup.tsx');
+    // The credential-entry screen was removed from the tenant: a clinic does not
+    // configure suppliers. The qualification it carried is regulated wording, so it
+    // moved with the capability to the platform console rather than being dropped.
+    const integration = source('src/pages/PlatformConsole.tsx');
     const settings = source('src/pages/Settings.tsx');
     const protection = source('src/pages/RevenueProtection.tsx');
     const scheduling = source('src/pages/Scheduling.tsx');
@@ -113,7 +116,7 @@ describe('independent content QA challenge', () => {
     const receptionist = source('src/lib/receptionist.ts');
     const subscriptions = source('src/lib/subscriptions.ts');
 
-    expect(integration).toContain('Deployment owners must separately verify encryption-key custody and access.');
+    expect(integration).toContain('Deployment owners must separately verify encryption-key custody, rotation, and provider configuration.');
     expect(integration).not.toContain('Credentials are encrypted and never returned to the browser.');
     expect(settings).toContain('subtitle="Organization details"');
     expect(settings).not.toContain('subtitle="Organisation details"');

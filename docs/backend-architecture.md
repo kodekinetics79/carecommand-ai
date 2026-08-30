@@ -20,7 +20,8 @@ The backend is an operational platform boundary, not an EHR. It stores clinic op
 | Inventory | `/v1/inventory` | Branch supplies, reorder thresholds, and expiry dates |
 | Partner Reports | `/v1/partner-reports`, `/v1/partner-reports/:id/review` | Operational tracking for external reports and review workflow |
 | Integrations | `/v1/integrations` | Tenant integration connection state |
-| Integrations Status | `/v1/integrations/status`, `/v1/integrations/:provider/test` | Honest provider readiness, mode labels, and safe connection tests |
+| Capabilities | `/v1/capabilities` | What this clinic can do, in our own words — "Card payments: not set up" — naming no supplier and no environment variable |
+| Provider console (platform) | `/v1/platform/tenants/:tenantId/providers`, `.../providers/:provider/test`, `.../insurance-rails/:provider/test-eligibility`, `.../finance-rails/:provider/test-payment-link` | The supplier catalogue, per-vendor readiness, missing-credential names and connection tests. Platform JWT only; reads through the tenant runtime role under an explicit `source: 'platform'` tenant context, so RLS stays the data boundary |
 | Staff Tasks | `/v1/tasks` | Branch workflow assignments and due dates |
 | Staff Overview | `/v1/staff/overview` | Staff performance, SLA, and workload snapshots |
 | Revenue | `/v1/revenue-snapshots` | Periodic branch and network performance snapshots |
@@ -47,6 +48,7 @@ The backend is an operational platform boundary, not an EHR. It stores clinic op
 - The advisory room must stay business-only: revenue, growth, front desk, operations, reputation, and competitor guidance only. Clinical advice stays out of scope even when using LLM providers.
 - Revenue Protection is operational, not clinical: it handles insurance readiness, copay/deposit capture, prior auth tracking, and payment follow-up. Provider credentials are server-side only; mock fallback is used when live sandbox credentials are absent or invalid.
 - Integration readiness is configuration-aware: mock and placeholder providers never claim live status, and connection tests only record safe metadata rather than PHI or card data.
+- Provider readiness is operator-facing, not tenant-facing. A clinic contracted for a working product, not a console of third-party services, so the catalogue, credential fields and Test-connection buttons live behind the platform JWT. What a tenant receives is a capability with a consequence and a next step ("Contact CareCommand support"), rendered on the screen where the capability would be used.
 
 ## Data Operations
 

@@ -14,21 +14,26 @@ export interface RevenueProtectionSummary {
   revenueAtRisk: number;
 }
 
-export interface RevenueProtectionIntegrationStatus {
-  insurance: {
-    provider: string;
-    providerName: string;
-    mode: RevenueProtectionMode;
-    label: string;
-    configured: boolean;
-  };
-  payment: {
-    provider: string;
-    providerName: string;
-    mode: RevenueProtectionMode;
-    label: string;
-    configured: boolean;
-  };
+/**
+ * One capability, one sentence, no supplier named.
+ *
+ * `test_data` is deliberately its own state and never folded into
+ * `available`: a screen that reads "working" while the money is simulated is
+ * the failure the mock-mode label exists to prevent.
+ */
+export type CapabilityState = 'available' | 'test_data' | 'not_set_up';
+
+export interface TenantCapability {
+  key: 'eligibility_checks' | 'card_payments';
+  label: string;
+  state: CapabilityState;
+  detail: string;
+  usable: boolean;
+}
+
+export interface RevenueProtectionCapabilities {
+  eligibility: TenantCapability;
+  cardPayments: TenantCapability;
   payerCount: number;
   recentRuns: number;
   latestRun?: { provider: string; providerMode: RevenueProtectionMode; operation: string; status: string; createdAt: string } | null;
@@ -276,8 +281,8 @@ export async function fetchRevenueProtectionOverview(branchId?: string) {
   return apiRequest<RevenueProtectionOverview>(branchId ? `/v1/revenue-protection/overview?branchId=${branchId}` : '/v1/revenue-protection/overview');
 }
 
-export async function fetchRevenueProtectionIntegrationStatus() {
-  return apiRequest<RevenueProtectionIntegrationStatus>('/v1/revenue-protection/integration-status');
+export async function fetchRevenueProtectionCapabilities() {
+  return apiRequest<RevenueProtectionCapabilities>('/v1/revenue-protection/integration-status');
 }
 
 export async function checkEligibility(input: { patientId?: string; appointmentId?: string; branchId?: string; payerId?: string; serviceType?: string }, idempotencyKey?: string) {

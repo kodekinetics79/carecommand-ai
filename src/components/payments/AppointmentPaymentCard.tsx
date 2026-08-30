@@ -122,7 +122,11 @@ export default function AppointmentPaymentCard({ appointmentId, currency = 'USD'
 
       {view.setupRequired && (
         <div className="flex items-center gap-2 rounded-lg border border-amber-v/40 bg-amber-v/5 px-2.5 py-1.5 text-[11px] text-amber-v">
-          <AlertCircle className="w-3.5 h-3.5" /> Payment provider not configured — set up Stripe to send live links.
+          {/* On the screen where somebody would try to take the payment, in
+              words they can act on. It used to name our card processor and
+              tell a practice manager to go and set it up — they hold no such
+              account and cannot. */}
+          <AlertCircle className="w-3.5 h-3.5" /> Card payments are not set up for this clinic, so no payment link can be sent. Contact CareCommand support to switch it on.
         </div>
       )}
       {notice && <p className="text-[11px] text-t2">{notice}</p>}

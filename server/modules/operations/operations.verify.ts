@@ -111,11 +111,18 @@ async function main() {
   const triageAudit = await ownerDb.auditEvent.findFirst({ where: { tenantId: tA.id, action: 'aiRecommendation.statusChanged', resourceId: recRow.id } });
   check('Recommendation triage updates status + audits', triage.statusCode === 200 && JSON.parse(triage.body).status === 'accepted' && !!triageAudit);
 
-  // --- Integration Hub: truthful Retell status (Part 5) ------------------
-  const integ = JSON.parse((await call('GET', '/v1/integrations/status', aTok)).body);
-  const retell = integ.find((i: any) => i.key === 'retell');
-  check('Integration hub: Retell entry with truthful configured + missingConfigCount (no names, no secrets)',
-    !!retell && typeof retell.configured === 'boolean' && typeof retell.missingConfigCount === 'number' && retell.missingConfigCount >= 0);
+  // --- Capabilities: our words, no supplier, no credential names ---------
+  // This checked the tenant integration hub's provider rows until the supplier
+  // catalogue moved to the platform console. What a tenant receives now is a
+  // capability statement, and the assertion is that it carries no vendor name
+  // and no environment variable.
+  const caps = JSON.parse((await call('GET', '/v1/capabilities', aTok)).body);
+  const capsText = JSON.stringify(caps).toLowerCase();
+  check('Capabilities: eligibility + card payments, each with a state and a next step',
+    Array.isArray(caps) && caps.length === 2
+    && caps.every((c: any) => ['available', 'test_data', 'not_set_up'].includes(c.state) && typeof c.detail === 'string' && c.detail.length > 20));
+  check('Capabilities: name no supplier and no credential variable',
+    !['stedi', 'stripe', 'twilio', 'retell', '_api_key', '_secret_key'].some(token => capsText.includes(token)));
 
   // --- Tenant isolation (Part 7 #13) -------------------------------------
   const bRecs = JSON.parse((await call('GET', '/v1/recommendations', bTok)).body);

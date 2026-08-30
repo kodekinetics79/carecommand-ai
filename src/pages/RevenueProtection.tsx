@@ -25,7 +25,7 @@ import {
   createDepositRule,
   createPaymentLink,
   fetchAppointmentVerificationQueue,
-  fetchRevenueProtectionIntegrationStatus,
+  fetchRevenueProtectionCapabilities,
   fetchRevenueProtectionOverview,
   markEligibilityVerified,
   updateAlertStatus,
@@ -39,7 +39,8 @@ import {
   type PatientInsurancePolicy,
   type PriorAuthorization,
   type RevenueProtectionAlert,
-  type RevenueProtectionIntegrationStatus,
+  type RevenueProtectionCapabilities,
+  type TenantCapability,
   type RevenueProtectionOverview,
   type AppointmentVerificationQueueRow,
 } from '../lib/revenueProtection';
@@ -84,12 +85,35 @@ function riskBadgeClass(status: string) {
   return 'badge badge-emerald';
 }
 
-function modeBanner(status: RevenueProtectionIntegrationStatus | null) {
-  if (!status) return 'Mock Mode';
-  const insuranceLabel = status.insurance.label;
-  const paymentLabel = status.payment.label;
-  if (insuranceLabel === paymentLabel) return insuranceLabel;
-  return `${insuranceLabel} · ${paymentLabel}`;
+// Our words, not a supplier's. This strip used to print the clearinghouse and
+// the card processor by name with their operating modes, or "Mock Mode" when
+// either was unset — three strings a practice manager cannot act on, naming two
+// companies they hold no account with. A capability with a consequence replaces
+// all of it.
+const CAPABILITY_WORD: Record<TenantCapability['state'], string> = {
+  available: 'Working',
+  test_data: 'Test data',
+  not_set_up: 'Not set up',
+};
+
+function capabilityLine(capabilities: RevenueProtectionCapabilities | null): string {
+  if (!capabilities) return 'Checking what this clinic can do…';
+  return [capabilities.eligibility, capabilities.cardPayments]
+    .map(capability => `${capability.label}: ${CAPABILITY_WORD[capability.state].toLowerCase()}`)
+    .join(' · ');
+}
+
+/** One capability, stated where the person would try to use it. */
+function CapabilityNotice({ capability }: { capability: TenantCapability }) {
+  const tone = capability.state === 'available'
+    ? 'border-[var(--b1)] bg-[var(--s2)] text-t2'
+    : 'border-[var(--b1)] bg-[var(--amber-soft)] text-[#9A3412]';
+  return (
+    <div className={`rounded-lg border p-3 text-[12px] ${tone}`}>
+      <span className="font-semibold">{capability.label}: {CAPABILITY_WORD[capability.state]}.</span>{' '}
+      {capability.detail}
+    </div>
+  );
 }
 
 function estimateForVerification(overview: RevenueProtectionOverview | null, verification: EligibilityVerification) {
@@ -102,7 +126,7 @@ function estimateForQueueRow(overview: RevenueProtectionOverview | null, row: Ap
 
 function useRevenueProtectionData(selectedClinicId: 'all' | string) {
   const [overview, setOverview] = useState<RevenueProtectionOverview | null>(null);
-  const [integrationStatus, setIntegrationStatus] = useState<RevenueProtectionIntegrationStatus | null>(null);
+  const [capabilities, setCapabilities] = useState<RevenueProtectionCapabilities | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [reloadIndex, setReloadIndex] = useState(0);
@@ -111,12 +135,12 @@ function useRevenueProtectionData(selectedClinicId: 'all' | string) {
     let active = true;
     Promise.all([
       fetchRevenueProtectionOverview(selectedClinicId === 'all' ? undefined : selectedClinicId),
-      fetchRevenueProtectionIntegrationStatus(),
+      fetchRevenueProtectionCapabilities(),
     ])
-      .then(([nextOverview, nextStatus]) => {
+      .then(([nextOverview, nextCapabilities]) => {
         if (!active) return;
         setOverview(nextOverview);
-        setIntegrationStatus(nextStatus);
+        setCapabilities(nextCapabilities);
       })
       .catch(loadError => {
         if (!active) return;
@@ -133,7 +157,7 @@ function useRevenueProtectionData(selectedClinicId: 'all' | string) {
 
   return {
     overview,
-    integrationStatus,
+    capabilities,
     loading,
     error,
     reload: useCallback(() => {
@@ -149,7 +173,7 @@ export default function RevenueProtection() {
   const { data: branchOptions } = useApiResource<ClinicOption, ClinicOption>('/v1/branches?limit=100', [], row => row);
   const [selectedClinicId, setSelectedClinicId] = useState<'all' | string>('all');
   const [section, setSection] = useState<'insurance' | 'payments'>('insurance');
-  const { overview, integrationStatus, loading, error, reload } = useRevenueProtectionData(selectedClinicId);
+  const { overview, capabilities, loading, error, reload } = useRevenueProtectionData(selectedClinicId);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -354,7 +378,7 @@ export default function RevenueProtection() {
     <div className="space-y-3 pb-6">
       {/* Slim toolbar — the topbar breadcrumb carries the page title. */}
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className={`badge ph-badge-${integrationStatus?.insurance.mode === 'mock' && integrationStatus?.payment.mode === 'mock' ? 'amber' : 'emerald'}`}>{integrationStatus ? modeBanner(integrationStatus) : 'Loading'}</span>
+        <span className={`badge ph-badge-${capabilities && (capabilities.eligibility.usable || capabilities.cardPayments.usable) ? 'emerald' : 'amber'}`}>{capabilityLine(capabilities)}</span>
         <div className="flex flex-wrap gap-2">
           <button type="button" onClick={() => navigate('/advisory')} className="inline-flex items-center gap-2 rounded-lg border border-[var(--b1)] bg-white px-3 py-1.5 text-[13px] font-semibold text-t1 hover:bg-[var(--s2)] transition">
             <Sparkles className="w-4 h-4 text-t3" /> Ask Advisors
@@ -372,7 +396,7 @@ export default function RevenueProtection() {
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-4 py-2.5">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 min-w-0">
           <span className="inline-flex items-center gap-1.5 text-[13px] font-semibold text-t1"><ShieldCheck className="w-4 h-4 text-indigo" /> Revenue protection</span>
-          <span className="text-[12px] text-t3">{integrationStatus?.insurance.label ?? 'Mock Mode'} · {integrationStatus?.payment.label ?? 'Mock Mode'} · {openAlerts} open alert{openAlerts === 1 ? '' : 's'}</span>
+          <span className="text-[12px] text-t3">{capabilityLine(capabilities)} · {openAlerts} open alert{openAlerts === 1 ? '' : 's'}</span>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <select value={selectedClinicId} onChange={e => setSelectedClinicId(e.target.value)} aria-label="Clinic scope"
@@ -419,9 +443,9 @@ export default function RevenueProtection() {
                 <p className="mt-1 text-xs text-t3">This table reflects the same saved insurance workflow used in Scheduling and Patient Profile.</p>
               </div>
               <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
-                <p className="text-xs font-bold uppercase tracking-widest text-t3">Mode</p>
-                <p className="mt-2 text-sm font-semibold text-t1">{modeBanner(integrationStatus)}</p>
-                <p className="mt-1 text-xs text-t3">Mock Mode appears whenever Stedi or payment providers are not configured.</p>
+                <p className="text-xs font-bold uppercase tracking-widest text-t3">Eligibility checks</p>
+                <p className="mt-2 text-sm font-semibold text-t1">{capabilities ? CAPABILITY_WORD[capabilities.eligibility.state] : '—'}</p>
+                <p className="mt-1 text-xs text-t3">{capabilities?.eligibility.detail ?? 'We cannot read this right now.'}</p>
               </div>
               <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
                 <p className="text-xs font-bold uppercase tracking-widest text-t3">Open alerts</p>
@@ -523,7 +547,7 @@ export default function RevenueProtection() {
                     </span>
                   ))}
                 </div>
-                <p className="mt-3 text-xs text-t3">Sandbox or mock mode is clearly labelled above.</p>
+                <p className="mt-3 text-xs text-t3">Whether these checks reach the payer or run on test data is stated at the top of this screen.</p>
               </div>
             </div>
 
@@ -711,13 +735,18 @@ export default function RevenueProtection() {
         </div>
 
         <div className={`space-y-3 ${section === 'payments' ? '' : 'hidden'}`}>
-          <BentoCard title="Payment Command Center" subtitle="Create payment requests, review provider or staff-recorded status, and follow up on failures">
+          <BentoCard title="Payment Command Center" subtitle="Create payment requests, review recorded status, and follow up on failures">
+            {/* Said on the screen where somebody would try to take a payment,
+                not buried in a settings tab they will never open. */}
+            {capabilities && !capabilities.cardPayments.usable && (
+              <div className="mb-3"><CapabilityNotice capability={capabilities.cardPayments} /></div>
+            )}
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
-                <p className="text-xs font-bold uppercase tracking-widest text-t3">Integration status</p>
+                <p className="text-xs font-bold uppercase tracking-widest text-t3">Card payments</p>
                 <div className="mt-2 space-y-2 text-sm text-t1">
-                  <p>{integrationStatus?.payment.label ?? 'Mock Mode'}</p>
-                  <p className="text-xs text-t3">Configured: {integrationStatus?.payment.configured ? 'Yes' : 'No'}</p>
+                  <p>{capabilities ? CAPABILITY_WORD[capabilities.cardPayments.state] : '—'}</p>
+                  <p className="text-xs text-t3">{capabilities?.cardPayments.detail ?? 'We cannot read this right now.'}</p>
                 </div>
               </div>
               <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">

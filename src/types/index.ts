@@ -366,8 +366,6 @@ export interface SecurityPosture {
   environmentMode?: string;
   riskLabel?: string;
   readinessScore?: number;
-  paymentRailsStatus?: string;
-  insuranceRailsStatus?: string;
   auditEventCount: number;
   loginEventCount: number;
   integrations: Array<{

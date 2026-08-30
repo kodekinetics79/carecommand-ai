@@ -2,18 +2,23 @@ import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { env } from '../../config/env';
 import { db } from '../../lib/db';
-import { audit } from '../../lib/audit';
 import { generatePasswordHash, validatePassword } from '../../lib/security';
 import { requireRoles } from '../../plugins/roles';
 import { setUserActiveSafely, setUserPasswordSafely, setUserRoleSafely } from '../../lib/adminSafety';
 import { autopilotQueue } from '../../workers/queues';
-import { createPaymentProvider, createInsuranceProvider, type PaymentRequestContext } from '../revenue-protection';
-import { paymentProviderStatus } from '../../lib/deposits';
-import { eligibilityProviderStatus } from '../../lib/insuranceIntelligence';
-import { retellConfigStatus } from '../../lib/retell';
+import {
+  buildIntegrationRows,
+  buildFinanceRails,
+  insuranceRailCapability,
+} from '../../lib/providerRails';
 import { runWithTenantContext } from '../../lib/tenantContext';
 import { Prisma } from '../../generated/prisma/client';
 import { lockClinicAccessMutation } from '../../lib/clinicAccessSafety';
+
+// Re-exported from its new home so the money-integrity suite keeps its import
+// path: the rule ("only a credentialed adapter counts as configured") did not
+// move, only the file it lives in.
+export { insuranceRailCapability };
 
 const ownerAdminRoles = requireRoles('OWNER', 'ADMIN');
 const uuid = z.string().uuid();
@@ -81,51 +86,7 @@ const controlPlaneRoles: Record<string, { scope: string; modules: string[]; risk
   rolePermissionMatrix.map(entry => [entry.role, { scope: entry.scope, modules: entry.modules, risk: entry.risk }]),
 );
 
-const integrationDefinitions = [
-  { key: 'stedi', name: 'Stedi', category: 'Insurance', envVars: ['INSURANCE_PROVIDER', 'STEDI_API_KEY', 'STEDI_BASE_URL', 'STEDI_TEST_MODE'], providerType: 'insurance' },
-  { key: 'availity', name: 'Availity', category: 'Insurance', envVars: ['INSURANCE_PROVIDER'], providerType: 'insurance' },
-  { key: 'pverify', name: 'pVerify', category: 'Insurance', envVars: ['INSURANCE_PROVIDER'], providerType: 'insurance' },
-  { key: 'optum', name: 'Optum / Change Healthcare', category: 'Insurance', envVars: ['INSURANCE_PROVIDER'], providerType: 'insurance' },
-  { key: 'stripe', name: 'Stripe', category: 'Payments', envVars: ['PAYMENT_PROVIDER', 'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET'], providerType: 'payments' },
-  { key: 'square', name: 'Square', category: 'Payments', envVars: ['PAYMENT_PROVIDER', 'SQUARE_ACCESS_TOKEN'], providerType: 'payments' },
-  { key: 'authorize_net', name: 'Authorize.Net', category: 'Payments', envVars: ['PAYMENT_PROVIDER', 'AUTHORIZE_NET_API_LOGIN_ID', 'AUTHORIZE_NET_TRANSACTION_KEY'], providerType: 'payments' },
-  { key: 'clover', name: 'Clover', category: 'Payments', envVars: ['PAYMENT_PROVIDER'], providerType: 'payments' },
-  { key: 'paypal', name: 'PayPal', category: 'Payments', envVars: ['PAYMENT_PROVIDER'], providerType: 'payments' },
-  { key: 'twilio', name: 'Twilio', category: 'Communications', envVars: ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_FROM_NUMBER'], providerType: 'communications' },
-  { key: 'sendgrid', name: 'SendGrid / SMTP', category: 'Communications', envVars: ['SMTP_HOST', 'SMTP_USER', 'SMTP_PASS'], providerType: 'communications' },
-  { key: 'whatsapp_business', name: 'WhatsApp Business', category: 'Communications', envVars: ['WHATSAPP_ACCESS_TOKEN'], providerType: 'communications' },
-  { key: 'google_business_profile', name: 'Google Business Profile', category: 'Reputation / Marketing', envVars: ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET'], providerType: 'marketing' },
-  { key: 'meta', name: 'Meta / Facebook', category: 'Reputation / Marketing', envVars: ['META_APP_ID', 'META_APP_SECRET'], providerType: 'marketing' },
-  // Every other row on this list is a service the CLINIC brings and pays for:
-  // its own Stripe account, its own Twilio number, its own Stedi contract.
-  // Naming those is correct — the clinic has to go and configure them.
-  //
-  // The voice line is the opposite. CareCommand supplies it, CareCommand holds
-  // the credential, and the clinic has no account to log into. Labelling the
-  // card "Retell (AI Voice)" therefore disclosed a supplier relationship the
-  // tenant is not party to and cannot act on, on the tenant's own screen. The
-  // row stays — a clinic must be able to see whether its phone line is
-  // connected — but it is now the clinic's line, not our vendor's name.
-  //
-  // `envVars` never leaves the server (only `missingConfigCount` does), and the
-  // provider identity behind this row is served to Platform Console from
-  // PROVIDER_CATALOG.voice, which still reads "Voice (Retell)".
-  { key: 'voice', name: 'Voice line', category: 'Voice', envVars: ['RETELL_API_KEY', 'RETELL_FROM_NUMBER'], providerType: 'voice' },
-  { key: 'ollama', name: 'Ollama', category: 'AI Providers', envVars: ['AI_PROVIDER', 'OLLAMA_BASE_URL', 'OLLAMA_MODEL'], providerType: 'ai' },
-  { key: 'openai', name: 'OpenAI', category: 'AI Providers', envVars: ['AI_PROVIDER', 'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_MODEL'], providerType: 'ai' },
-  { key: 'claude', name: 'Claude', category: 'AI Providers', envVars: ['AI_PROVIDER', 'CLAUDE_API_KEY', 'CLAUDE_BASE_URL', 'CLAUDE_MODEL'], providerType: 'ai' },
-] as const;
 
-const insuranceProviders = ['stedi', 'availity', 'pverify', 'optum'] as const;
-const paymentProviders = ['stripe', 'square', 'authorize_net', 'clover', 'paypal'] as const;
-
-export function insuranceRailCapability(
-  provider: (typeof insuranceProviders)[number],
-  runtime: { selectedProvider: string; stediApiKey?: string; stediTestMode: boolean },
-): { configured: boolean; mode: 'sandbox' | 'live' | 'mock' } {
-  const configured = provider === 'stedi' && runtime.selectedProvider === 'stedi' && Boolean(runtime.stediApiKey);
-  return { configured, mode: configured ? (runtime.stediTestMode ? 'sandbox' : 'live') : 'mock' };
-}
 
 function safeEmail(metadata: unknown) {
   if (!metadata || typeof metadata !== 'object') return null;
@@ -141,14 +102,6 @@ function sameDayRange(now = new Date()) {
   return { start, end };
 }
 
-function formatMode(mode: string, configured: boolean) {
-  if (!configured && mode === 'live') return 'Live Not Configured';
-  if (!configured && mode === 'sandbox') return 'Sandbox Ready';
-  if (!configured) return 'Mock Mode';
-  if (mode === 'live') return 'Live Active';
-  if (mode === 'sandbox') return 'Sandbox Active';
-  return 'Mock Mode';
-}
 
 async function loadUsers(tenantId: string) {
   const users = await db.user.findMany({
@@ -206,250 +159,6 @@ async function replaceClinicAccess(tx: Prisma.TransactionClient, tenantId: strin
     });
   }
   await tx.user.update({ where: { id: userId }, data: { branchId: orderedBranchIds[0] ?? null } });
-}
-
-async function buildIntegrationRows(tenantId: string) {
-  const [integrationRows, paymentConnections, logs] = await Promise.all([
-    db.integration.findMany({ where: { tenantId } }),
-    db.paymentProviderConnection.findMany({ where: { tenantId } }),
-    db.integrationRunLog.findMany({
-      where: { tenantId },
-      orderBy: { createdAt: 'desc' },
-      take: 100,
-    }),
-  ]);
-
-  return integrationDefinitions.map(definition => {
-    const integrationRow = integrationRows.find(row => row.key === definition.key);
-    const paymentRow = paymentConnections.find(row => row.providerKey === definition.key);
-    const latestLog = logs.find(log => log.provider === definition.key || log.provider === definition.name.toLowerCase());
-    // Operator-only detail. Tenants receive a count, never the variable names.
-    const missingConfigCount = definition.providerType === 'voice'
-      ? retellConfigStatus().missing.length
-      : definition.envVars.filter(name => !process.env[name]).length;
-
-    let mode: 'mock' | 'sandbox' | 'live';
-    let configured: boolean;
-    let health: 'healthy' | 'degraded' | 'disconnected' | 'not_configured';
-    let lastSyncAt: string | null;
-
-    if (definition.key === 'stedi') {
-      configured = env.INSURANCE_PROVIDER === 'stedi' && Boolean(env.STEDI_API_KEY);
-      mode = configured ? (env.STEDI_TEST_MODE ? 'sandbox' : 'live') : 'mock';
-      health = configured ? 'healthy' : 'not_configured';
-      lastSyncAt = latestLog?.createdAt.toISOString() ?? null;
-    } else if (definition.key === 'stripe') {
-      configured = env.PAYMENT_PROVIDER === 'stripe' && Boolean(env.STRIPE_SECRET_KEY);
-      mode = configured ? (env.STRIPE_SECRET_KEY?.startsWith('sk_live_') ? 'live' : 'sandbox') : 'mock';
-      health = configured ? (paymentRow?.status === 'connected' ? 'healthy' : 'degraded') : 'not_configured';
-      lastSyncAt = paymentRow?.lastSyncAt?.toISOString() ?? latestLog?.createdAt.toISOString() ?? null;
-    } else if (definition.providerType === 'insurance') {
-      configured = Boolean(integrationRow?.status === 'CONNECTED');
-      mode = configured ? 'sandbox' : 'mock';
-      health = configured ? 'healthy' : 'not_configured';
-      lastSyncAt = integrationRow?.lastSyncAt?.toISOString() ?? latestLog?.createdAt.toISOString() ?? null;
-    } else if (definition.providerType === 'payments') {
-      configured = Boolean(paymentRow?.status === 'connected');
-      mode = configured ? (paymentRow?.mode === 'live' ? 'live' : 'sandbox') : 'mock';
-      health = configured ? 'healthy' : 'not_configured';
-      lastSyncAt = paymentRow?.lastSyncAt?.toISOString() ?? latestLog?.createdAt.toISOString() ?? null;
-    } else if (definition.providerType === 'voice') {
-      // The AI receptionist's provider. Status must come from the same resolver
-      // the senders use (platform credential vault first, environment second),
-      // or the console would disagree with the calls we actually place.
-      const status = retellConfigStatus();
-      configured = status.configured;
-      mode = !configured ? 'mock' : status.mock ? 'sandbox' : 'live';
-      health = configured ? 'healthy' : 'not_configured';
-      lastSyncAt = latestLog?.createdAt.toISOString() ?? null;
-    } else if (definition.providerType === 'ai') {
-      configured = (env.AI_PROVIDER === definition.key) && Boolean(process.env[`${definition.key.toUpperCase()}_API_KEY`] || process.env.OLLAMA_BASE_URL);
-      mode = configured ? (definition.key === 'ollama' ? 'sandbox' : 'live') : 'mock';
-      health = configured ? 'healthy' : 'not_configured';
-      lastSyncAt = latestLog?.createdAt.toISOString() ?? null;
-    } else {
-      configured = Boolean(integrationRow?.status === 'CONNECTED');
-      mode = configured ? 'live' : 'mock';
-      health = configured ? 'healthy' : 'disconnected';
-      lastSyncAt = integrationRow?.lastSyncAt?.toISOString() ?? null;
-    }
-
-    return {
-      key: definition.key,
-      name: definition.name,
-      category: definition.category,
-      // "Retell (AI Voice) readiness and health" was the second place the
-      // supplier reached this card. The voice row answers the only question a
-      // clinic has about a line it does not administer.
-      description: definition.providerType === 'voice'
-        ? (configured ? 'Connected — your AI receptionist can answer calls' : 'Not connected — calls will not be answered')
-        : `${definition.name} readiness and health`,
-      supportedWorkflows: definition.category === 'Insurance'
-        ? ['Eligibility verification', 'Benefits verification', 'Prior authorization']
-        : definition.category === 'Payments'
-          ? ['Payment link', 'Deposits', 'Copay collection']
-          : definition.category === 'Communications'
-            ? ['Reminders', 'Follow-ups', 'Patient messages']
-            : definition.category === 'Voice'
-              ? ['Inbound answering', 'Appointment booking', 'Message taking']
-            : definition.category === 'AI Providers'
-              ? ['Advisory brief', 'Summaries', 'Workflow suggestions']
-              : ['Monitoring'],
-      mode,
-      modeLabel: formatMode(mode, configured),
-      configured,
-      health,
-      lastSyncAt,
-      missingConfigCount,
-      riskLevel: !configured ? 'high' : health === 'degraded' ? 'medium' : 'low',
-      action: 'Test connection',
-      integrationId: integrationRow?.id ?? null,
-      providerConnectionId: paymentRow?.id ?? null,
-      databaseStatus: integrationRow?.status ?? paymentRow?.status ?? null,
-    };
-  });
-}
-
-async function buildInsuranceRails(tenantId: string) {
-  const [payers, policies, verifications, priorAuths, logs] = await Promise.all([
-    db.insurancePayer.findMany({ where: { tenantId }, orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }], take: 20 }),
-    db.patientInsurancePolicy.findMany({
-      where: { tenantId },
-      orderBy: { updatedAt: 'desc' },
-      take: 50,
-      include: {
-        patient: { select: { id: true, firstName: true, lastName: true } },
-        payer: { select: { id: true, name: true, sourceProvider: true } },
-      },
-    }),
-    db.eligibilityVerification.findMany({
-      where: { tenantId },
-      orderBy: { checkedAt: 'desc' },
-      take: 50,
-      include: {
-        payer: { select: { id: true, name: true, sourceProvider: true } },
-      },
-    }),
-    db.priorAuthorization.findMany({
-      where: { tenantId },
-      orderBy: { updatedAt: 'desc' },
-      take: 50,
-      include: {
-        payer: { select: { id: true, name: true, sourceProvider: true } },
-      },
-    }),
-    db.integrationRunLog.findMany({
-      where: { tenantId, provider: { in: [...insuranceProviders] } },
-      orderBy: { createdAt: 'desc' },
-      take: 50,
-    }),
-  ]);
-
-  return insuranceProviders.map(provider => {
-    // Stedi is the only implemented eligibility adapter. Merely selecting an
-    // unimplemented provider must not present that rail as configured.
-    const { configured, mode } = insuranceRailCapability(provider, {
-      selectedProvider: env.INSURANCE_PROVIDER,
-      stediApiKey: env.STEDI_API_KEY,
-      stediTestMode: env.STEDI_TEST_MODE,
-    });
-    const providerPolicies = policies.filter(policy => policy.payer?.sourceProvider === provider || policy.payer?.name.toLowerCase().includes(provider));
-    const providerVerifications = verifications.filter(verification => verification.payer?.sourceProvider === provider || verification.payerName.toLowerCase().includes(provider));
-    const providerAuths = priorAuths.filter(item => item.payer?.sourceProvider === provider);
-    const providerLogs = logs.filter(item => item.provider === provider);
-
-    return {
-      provider,
-      name: provider === 'optum' ? 'Optum / Change Healthcare' : provider[0].toUpperCase() + provider.slice(1),
-      configured,
-      mode,
-      modeLabel: formatMode(mode, configured),
-      eligibilitySupported: provider === 'stedi',
-      benefitsSupported: provider === 'stedi',
-      // The application tracks manually-entered prior-auth status but does not
-      // submit or query prior authorizations through a payer adapter yet.
-      priorAuthSupported: false,
-      priorAuthTrackingSupported: true,
-      claimStatusSupportedFuture: provider === 'stedi' || provider === 'optum',
-      payerListStatus: payers.some(payer => payer.sourceProvider === provider) ? 'Loaded' : 'Not Loaded',
-      lastEligibilityCheck: providerVerifications[0]?.checkedAt.toISOString() ?? null,
-      lastFailedCheck: providerVerifications.find(item => item.coverageStatus !== 'covered')?.checkedAt.toISOString() ?? null,
-      errorRate: providerVerifications.length > 0 ? Math.round((providerVerifications.filter(item => item.coverageStatus !== 'covered').length / providerVerifications.length) * 100) : 0,
-      workflows: ['Eligibility verification', 'Benefits verification', 'Manual prior authorization tracking', 'Patient responsibility estimation', 'Denial risk alert'],
-      actions: ['Test eligibility check', 'View normalized response', 'View integration logs', 'Open Revenue Protection'],
-      logs: providerLogs.map(log => ({
-        id: log.id,
-        operation: log.operation,
-        status: log.status,
-        createdAt: log.createdAt.toISOString(),
-        providerMode: log.providerMode,
-      })),
-      payerCount: providerPolicies.length,
-      authCount: providerAuths.length,
-    };
-  });
-}
-
-async function buildFinanceRails(tenantId: string) {
-  const [connections, requests, transactions, logs] = await Promise.all([
-    db.paymentProviderConnection.findMany({ where: { tenantId } }),
-    db.paymentRequest.findMany({
-      where: { tenantId },
-      orderBy: { createdAt: 'desc' },
-      take: 50,
-      include: {
-        patient: { select: { id: true, firstName: true, lastName: true } },
-        paymentProviderConnection: { select: { id: true, providerKey: true, displayName: true, mode: true, status: true } },
-      },
-    }),
-    db.paymentTransaction.findMany({
-      where: { tenantId },
-      orderBy: { createdAt: 'desc' },
-      take: 50,
-      include: {
-        paymentProviderConnection: { select: { id: true, providerKey: true, displayName: true, mode: true, status: true } },
-      },
-    }),
-    db.integrationRunLog.findMany({
-      where: { tenantId, provider: { in: [...paymentProviders] } },
-      orderBy: { createdAt: 'desc' },
-      take: 50,
-    }),
-  ]);
-
-  return paymentProviders.map(provider => {
-    const connection = connections.find(row => row.providerKey === provider);
-    const providerRequests = requests.filter(request => request.paymentProviderConnection?.providerKey === provider || request.mode === provider || request.paymentProviderConnectionId != null && connection?.id === request.paymentProviderConnectionId);
-    const providerTransactions = transactions.filter(transaction => transaction.paymentProviderConnection?.providerKey === provider || transaction.mode === provider || transaction.paymentProviderConnectionId != null && connection?.id === transaction.paymentProviderConnectionId);
-    const providerLogs = logs.filter(log => log.provider === provider);
-    const configured = provider === 'stripe' ? Boolean(env.STRIPE_SECRET_KEY) : Boolean(connection?.status === 'connected');
-    const mode = connection?.mode === 'live' ? 'live' : configured ? 'sandbox' : 'mock';
-
-    return {
-      provider,
-      name: provider === 'authorize_net' ? 'Authorize.Net' : provider === 'square' ? 'Square' : provider === 'clover' ? 'Clover' : provider === 'paypal' ? 'PayPal' : 'Stripe',
-      configured,
-      mode,
-      modeLabel: formatMode(mode, configured),
-      paymentLinksSupported: true,
-      depositsSupported: true,
-      copayCollectionSupported: true,
-      refundsFuture: true,
-      webhooksConfigured: provider === 'stripe' ? Boolean(env.STRIPE_WEBHOOK_SECRET) : Boolean(connection?.configuration),
-      lastPaymentRequest: providerRequests[0]?.createdAt.toISOString() ?? null,
-      failedPaymentCount: providerTransactions.filter(transaction => transaction.status !== 'paid' && transaction.status !== 'succeeded').length,
-      health: configured ? 'healthy' : 'not_configured',
-      logs: providerLogs.map(log => ({
-        id: log.id,
-        operation: log.operation,
-        status: log.status,
-        createdAt: log.createdAt.toISOString(),
-        providerMode: log.providerMode,
-      })),
-      providerConnectionId: connection?.id ?? null,
-      actions: ['Test payment link', 'View payment provider logs', 'Open Revenue Protection payment queue'],
-    };
-  });
 }
 
 async function buildSystemHealth(tenantId: string) {
@@ -522,7 +231,6 @@ function buildSecurityPosture(_tenantId: string, integrationRows: Array<{ health
   const mockIntegrations = integrationRows.filter(row => row.mode === 'mock').length;
   const sandboxIntegrations = integrationRows.filter(row => row.mode === 'sandbox').length;
   const liveIntegrations = integrationRows.filter(row => row.mode === 'live').length;
-  const failedIntegrations = integrationRows.filter(row => row.health === 'degraded').length;
   const securityAlerts = [
     env.NODE_ENV === 'production' ? null : {
       severity: 'info',
@@ -544,25 +252,22 @@ function buildSecurityPosture(_tenantId: string, integrationRows: Array<{ health
       title: 'HTTPS required in production',
       message: 'Production must terminate HTTPS for secure refresh cookies.',
     },
+    // Capability, not plumbing. The four alerts that used to sit here named a
+    // clearinghouse, a card processor, an LLM vendor and an environment
+    // variable — none of which a practice manager can act on. The clinic is
+    // still told, on the screen where it matters, that the capability is not
+    // set up and that the next step is us; see `tenantCapabilities` in
+    // server/lib/providerRails.ts. The supplier detail is on the platform
+    // console.
     env.INSURANCE_PROVIDER === 'mock' ? {
       severity: 'medium',
-      title: 'Insurance provider in mock mode',
-      message: 'No live insurance rail is configured.',
+      title: 'Insurance eligibility checks are not set up',
+      message: 'Coverage cannot be confirmed from this workspace. Contact CareCommand support to switch it on.',
     } : null,
     env.PAYMENT_PROVIDER === 'mock' ? {
       severity: 'medium',
-      title: 'Payment provider in mock mode',
-      message: 'No live payment rail is configured.',
-    } : null,
-    env.AI_PROVIDER === 'mock' ? {
-      severity: 'low',
-      title: 'AI provider in mock mode',
-      message: 'Advisory responses are mock-backed until an LLM provider is configured.',
-    } : null,
-    !env.STRIPE_WEBHOOK_SECRET && env.PAYMENT_PROVIDER === 'stripe' ? {
-      severity: 'medium',
-      title: 'Stripe webhook not configured',
-      message: 'Set STRIPE_WEBHOOK_SECRET to validate webhooks safely.',
+      title: 'Card payments are not set up',
+      message: 'No payment link can be sent from this workspace. Contact CareCommand support to switch it on.',
     } : null,
   ].filter(Boolean);
 
@@ -599,14 +304,6 @@ function buildSecurityPosture(_tenantId: string, integrationRows: Array<{ health
     alerts: securityAlerts,
     riskLabel,
     readinessScore,
-    integrationSummary: {
-      active: liveIntegrations,
-      sandbox: sandboxIntegrations,
-      mock: mockIntegrations,
-      failed: failedIntegrations,
-    },
-    paymentRailsStatus: paymentRows.some(row => row.configured) ? 'configured' : 'mock',
-    insuranceRailsStatus: integrationRows.some(row => row.category === 'Insurance' && row.configured) ? 'configured' : 'mock',
   };
 }
 
@@ -629,12 +326,25 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
   const userPasswordResetBody = z.object({ password: z.string().min(8).max(200) });
   const clinicStatusBody = z.object({ active: z.boolean() });
 
+  // The tenant's own governance view: who has access, what was audited, how the
+  // workspace is secured.
+  //
+  // It used to also carry `integrations`, `insuranceRails` and `financeRails` —
+  // three arrays of supplier names, operating modes and per-vendor health — plus
+  // four counters built from them. Those are the clinic's suppliers only in the
+  // sense that we pay them; the clinic cannot open one, cannot fix one, and
+  // should never have been asked to read one. They now answer the platform JWT
+  // at /v1/platform/tenants/:tenantId/providers and nothing else.
+  //
+  // The security posture is still COMPUTED from the rails, because the
+  // production-readiness score genuinely depends on whether a payment and an
+  // eligibility rail exist. It is not EMITTED from them.
   app.get('/overview', { preHandler: ownerAdminRoles }, async request => {
-    const [users, branches, tenant, integrations, securityLogs, insuranceRails, financeRails, auditCount] = await Promise.all([
+    const [users, branches, tenant, integrations, securityLogs, financeRails, auditCount] = await Promise.all([
       loadUsers(request.auth.tenantId),
       db.branch.findMany({ where: { tenantId: request.auth.tenantId }, orderBy: { name: 'asc' }, select: { id: true, name: true, location: true, active: true } }),
       db.tenant.findUnique({ where: { id: request.auth.tenantId }, select: { id: true, name: true, slug: true, createdAt: true, updatedAt: true } }),
-      buildIntegrationRows(request.auth.tenantId),
+      buildIntegrationRows(db, request.auth.tenantId),
       db.auditEvent.findMany({
         where: {
           tenantId: request.auth.tenantId,
@@ -646,8 +356,7 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
         orderBy: { occurredAt: 'desc' },
         take: 25,
       }),
-      buildInsuranceRails(request.auth.tenantId),
-      buildFinanceRails(request.auth.tenantId),
+      buildFinanceRails(db, request.auth.tenantId),
       db.auditEvent.count({ where: { tenantId: request.auth.tenantId } }),
     ]);
     const securityPosture = buildSecurityPosture(request.auth.tenantId, integrations, financeRails, auditCount);
@@ -655,10 +364,6 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
     const activeUsers = users.filter(user => user.active).length;
     const adminUsers = users.filter(user => ['OWNER', 'ADMIN'].includes(user.role)).length;
     const inactiveUsers = users.length - activeUsers;
-    const activeIntegrations = integrations.filter(row => row.configured && row.health === 'healthy').length;
-    const sandboxIntegrations = integrations.filter(row => row.mode === 'sandbox').length;
-    const mockIntegrations = integrations.filter(row => row.mode === 'mock').length;
-    const failedIntegrations = integrations.filter(row => row.health === 'degraded').length;
     const auditEventsToday = await db.auditEvent.count({
       where: {
         tenantId: request.auth.tenantId,
@@ -678,21 +383,12 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
         adminUsers,
         inactiveUsers,
         clinics: branches.length,
-        activeIntegrations,
-        sandboxIntegrations,
-        mockIntegrations,
-        failedIntegrations,
         auditEventsToday,
         securityAlerts,
-        paymentRailsStatus: securityPosture.paymentRailsStatus,
-        insuranceRailsStatus: securityPosture.insuranceRailsStatus,
         productionReadinessScore: securityPosture.readinessScore,
       },
       branches,
       securityPosture,
-      integrations,
-      insuranceRails,
-      financeRails,
       systemHealth: await buildSystemHealth(request.auth.tenantId),
       auditEventsToday: securityLogs.map(event => ({ id: event.id, action: event.action, occurredAt: event.occurredAt.toISOString() })),
     };
@@ -1071,8 +767,8 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
   });
 
   app.get('/security-posture', { preHandler: ownerAdminRoles }, async request => {
-    const integrationRows = await buildIntegrationRows(request.auth.tenantId);
-    const paymentRows = await buildFinanceRails(request.auth.tenantId);
+    const integrationRows = await buildIntegrationRows(db, request.auth.tenantId);
+    const paymentRows = await buildFinanceRails(db, request.auth.tenantId);
     const auditCount = await db.auditEvent.count({ where: { tenantId: request.auth.tenantId } });
     return buildSecurityPosture(request.auth.tenantId, integrationRows, paymentRows, auditCount);
   });
@@ -1167,289 +863,6 @@ export const controlPlaneRoutes: FastifyPluginAsync = async app => {
       } });
     });
     return reply.code(204).send();
-  });
-
-  app.get('/integrations', { preHandler: ownerAdminRoles }, async request => buildIntegrationRows(request.auth.tenantId));
-
-  app.post('/integrations/:provider/test', { preHandler: ownerAdminRoles }, async (request, reply) => {
-    const { provider } = z.object({ provider: z.string().trim().min(2) }).parse(request.params);
-    const integrations = await buildIntegrationRows(request.auth.tenantId);
-    const selected = integrations.find(row => row.key === provider);
-    if (!selected) throw app.httpErrors.notFound('Integration provider not found');
-    const branchId = request.auth.branchId ?? null;
-
-    const commonFields = {
-      providerKey: provider, providerName: selected.name, modeLabel: selected.modeLabel,
-      health: selected.health, supportedWorkflows: selected.supportedWorkflows,
-      missingConfigCount: selected.missingConfigCount, riskLevel: selected.riskLevel,
-    };
-
-    // Not configured → honest not_configured; never claim a successful test.
-    if (!selected.configured) {
-      const note = `${selected.name} is not configured; no live connection test was performed.${selected.missingConfigCount ? ' Setup must be completed by your administrator.' : ''}`;
-      await db.integrationRunLog.create({
-        data: {
-          tenantId: request.auth.tenantId, branchId, provider, providerMode: selected.mode,
-          operation: 'test-connection', status: 'not_configured',
-          requestSummary: { provider }, responseSummary: { status: 'not_configured', note },
-        },
-      });
-      await audit(request, { action: 'controlPlane.integration.tested', resource: 'integration', resourceId: provider, metadata: { status: 'not_configured' } });
-      return reply.send({ ...commonFields, status: 'not_configured', configured: false, verified: false, note, message: note });
-    }
-
-    // Configured + we have a live adapter → make a REAL reachability probe (Stripe).
-    if (provider === 'stripe' && env.STRIPE_SECRET_KEY) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 6000);
-      try {
-        const res = await fetch('https://api.stripe.com/v1/balance', { headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` }, signal: controller.signal });
-        const ok = res.ok;
-        const note = ok ? 'Live Stripe API reachable (GET /v1/balance).' : `Stripe API returned HTTP ${res.status}.`;
-        await db.integrationRunLog.create({
-          data: {
-            tenantId: request.auth.tenantId, branchId, provider, providerMode: selected.mode,
-            operation: 'test-connection', status: ok ? 'success' : 'error',
-            requestSummary: { provider }, responseSummary: { status: ok ? 'success' : 'error', note },
-          },
-        });
-        await audit(request, { action: 'controlPlane.integration.tested', resource: 'integration', resourceId: provider, metadata: { status: ok ? 'success' : 'error' } });
-        return reply.code(ok ? 200 : 502).send({ ...commonFields, status: ok ? 'success' : 'error', configured: true, verified: ok, note, message: note });
-      } catch (error) {
-        const note = `Stripe API unreachable: ${(error as Error).message?.slice(0, 200) ?? 'network error'}.`;
-        await db.integrationRunLog.create({
-          data: {
-            tenantId: request.auth.tenantId, branchId, provider, providerMode: selected.mode,
-            operation: 'test-connection', status: 'error', requestSummary: { provider }, errorMessage: note,
-          },
-        });
-        await audit(request, { action: 'controlPlane.integration.tested', resource: 'integration', resourceId: provider, metadata: { status: 'error' } });
-        return reply.code(502).send({ ...commonFields, status: 'error', configured: true, verified: false, note, message: note });
-      } finally {
-        clearTimeout(timer);
-      }
-    }
-
-    // Configured, but no live connectivity probe is implemented for this provider —
-    // report configuration presence honestly (NOT a verified live connection).
-    const note = `${selected.name} is configured. A live connectivity probe is not implemented for this provider, so configuration presence is reported rather than verified reachability.`;
-    await db.integrationRunLog.create({
-      data: {
-        tenantId: request.auth.tenantId, branchId, provider, providerMode: selected.mode,
-        operation: 'test-connection', status: 'configured',
-        requestSummary: { provider }, responseSummary: { status: 'configured', verified: false, note },
-      },
-    });
-    await audit(request, { action: 'controlPlane.integration.tested', resource: 'integration', resourceId: provider, metadata: { status: 'configured' } });
-    return reply.send({ ...commonFields, status: 'configured', configured: true, verified: false, note, message: note });
-  });
-
-  app.get('/integrations/:provider/runs', { preHandler: ownerAdminRoles }, async request => {
-    const { provider } = z.object({ provider: z.string().trim().min(2) }).parse(request.params);
-    const runs = await db.integrationRunLog.findMany({
-      where: { tenantId: request.auth.tenantId, provider },
-      orderBy: { createdAt: 'desc' },
-      take: 50,
-    });
-    return runs.map(run => ({
-      id: run.id,
-      provider: run.provider,
-      providerMode: run.providerMode,
-      operation: run.operation,
-      status: run.status,
-      requestSummary: run.requestSummary ?? null,
-      responseSummary: run.responseSummary ?? null,
-      errorMessage: run.errorMessage ?? null,
-      createdAt: run.createdAt.toISOString(),
-    }));
-  });
-
-  app.get('/insurance-rails', { preHandler: ownerAdminRoles }, async request => buildInsuranceRails(request.auth.tenantId));
-
-  app.post('/insurance-rails/:provider/test-eligibility', { preHandler: ownerAdminRoles }, async (request, reply) => {
-    const { provider } = z.object({ provider: z.enum(insuranceProviders) }).parse(request.params);
-    const payers = await db.insurancePayer.findMany({ where: { tenantId: request.auth.tenantId, active: true }, orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }], take: 20 });
-    const payer = payers.find(item => item.sourceProvider === provider) ?? payers[0];
-    const patient = await db.patient.findFirst({ where: { tenantId: request.auth.tenantId }, orderBy: { createdAt: 'asc' }, select: { id: true, branchId: true } });
-    const branchId = patient?.branchId ?? request.auth.branchId ?? null;
-
-    // Honesty gate: only a genuinely configured, credentialed eligibility provider
-    // (the one the app actually uses) can make a REAL payer call. Never claim
-    // 'covered' from a synthesized response.
-    const status = eligibilityProviderStatus();
-    const canRunReal = status.provider === provider && status.configured && !status.mock;
-
-    if (!canRunReal) {
-      const simulated = status.provider === provider && status.mock; // mock/demo mode
-      const outcomeStatus = simulated ? 'simulated' : 'not_configured';
-      const note = simulated
-        ? `${provider} is in mock/demo mode — this is a simulated eligibility check, not a real payer (271) response.`
-        : `${provider} is not configured. Configure it (sandbox available) to run a real eligibility check.`;
-      await db.integrationRunLog.create({
-        data: {
-          tenantId: request.auth.tenantId, branchId, provider, providerMode: simulated ? 'mock' : 'unconfigured',
-          operation: 'test-eligibility', status: outcomeStatus,
-          requestSummary: { provider, patientId: patient?.id ?? null, payerId: payer?.id ?? null },
-          responseSummary: { status: outcomeStatus, note },
-        },
-      });
-      await audit(request, { action: 'controlPlane.insurance.tested', resource: 'insuranceRail', resourceId: provider, metadata: { status: outcomeStatus } });
-      return reply.send({
-        provider, providerName: payer?.sourceProvider ?? provider, status: outcomeStatus,
-        configured: false, coverageStatus: null, note, message: note,
-      });
-    }
-
-    // Real provider path: make an actual eligibility call and report the REAL result.
-    const providerImpl = createInsuranceProvider();
-    try {
-      const outcome = await providerImpl.runEligibilityCheck({
-        tenantId: request.auth.tenantId,
-        branchId: branchId ?? '',
-        payer: payer ? { id: payer.id, name: payer.name, tradingPartnerServiceId: payer.tradingPartnerServiceId, sourceProvider: payer.sourceProvider } : undefined,
-      });
-      await db.integrationRunLog.create({
-        data: {
-          tenantId: request.auth.tenantId, branchId, provider, providerMode: outcome.providerMode,
-          operation: 'test-eligibility', status: 'success',
-          requestSummary: { provider, patientId: patient?.id ?? null, payerId: payer?.id ?? null },
-          responseSummary: { coverageStatus: outcome.coverageStatus, coverageActive: outcome.coverageActive, providerMode: outcome.providerMode },
-        },
-      });
-      await audit(request, { action: 'controlPlane.insurance.tested', resource: 'insuranceRail', resourceId: provider, metadata: { status: 'success', coverageStatus: outcome.coverageStatus, mode: outcome.providerMode } });
-      return reply.send({
-        provider, providerName: outcome.providerName, providerMode: outcome.providerMode,
-        modeLabel: formatMode(outcome.providerMode, true), status: 'success', configured: true,
-        coverageStatus: outcome.coverageStatus, coverageActive: outcome.coverageActive,
-        message: 'Live eligibility check completed.',
-      });
-    } catch (error) {
-      await db.integrationRunLog.create({
-        data: {
-          tenantId: request.auth.tenantId, branchId, provider, providerMode: status.provider === 'stedi' ? (env.STEDI_TEST_MODE ? 'sandbox' : 'live') : 'live',
-          operation: 'test-eligibility', status: 'error',
-          requestSummary: { provider, patientId: patient?.id ?? null, payerId: payer?.id ?? null },
-          errorMessage: (error as Error).message?.slice(0, 500) ?? 'Eligibility call failed',
-        },
-      });
-      await audit(request, { action: 'controlPlane.insurance.tested', resource: 'insuranceRail', resourceId: provider, metadata: { status: 'error' } });
-      return reply.code(502).send({ provider, providerName: provider, status: 'error', configured: true, coverageStatus: null, message: 'Live eligibility provider call failed.' });
-    }
-  });
-
-  app.get('/insurance-rails/logs', { preHandler: ownerAdminRoles }, async request => {
-    const logs = await db.integrationRunLog.findMany({
-      where: { tenantId: request.auth.tenantId, provider: { in: [...insuranceProviders] } },
-      orderBy: { createdAt: 'desc' },
-      take: 50,
-    });
-    return logs.map(log => ({
-      id: log.id,
-      provider: log.provider,
-      providerMode: log.providerMode,
-      operation: log.operation,
-      status: log.status,
-      requestSummary: log.requestSummary ?? null,
-      responseSummary: log.responseSummary ?? null,
-      errorMessage: log.errorMessage ?? null,
-      createdAt: log.createdAt.toISOString(),
-    }));
-  });
-
-  app.get('/finance-rails', { preHandler: ownerAdminRoles }, async request => buildFinanceRails(request.auth.tenantId));
-
-  app.post('/finance-rails/:provider/test-payment-link', { preHandler: ownerAdminRoles }, async (request, reply) => {
-    const { provider } = z.object({ provider: z.enum(paymentProviders) }).parse(request.params);
-    const connections = await db.paymentProviderConnection.findMany({ where: { tenantId: request.auth.tenantId } });
-    const connection = connections.find(item => item.providerKey === provider);
-    const patient = await db.patient.findFirst({ where: { tenantId: request.auth.tenantId }, orderBy: { createdAt: 'asc' }, select: { id: true, branchId: true } });
-    const branchId = patient?.branchId ?? request.auth.branchId ?? (await db.branch.findFirst({ where: { tenantId: request.auth.tenantId }, select: { id: true } }))?.id ?? null;
-
-    // Honesty gate: only a genuinely configured, credentialed payment provider
-    // (the one the app actually uses) can make a REAL Stripe call. Never synthesize
-    // a checkout.stripe.com URL and never persist a fabricated payment request.
-    const status = paymentProviderStatus();
-    const canRunReal = status.provider === provider && status.configured && !status.mock;
-
-    if (!canRunReal) {
-      const simulated = status.provider === provider && status.mock; // mock/demo mode
-      const outcomeStatus = simulated ? 'simulated' : 'not_configured';
-      const note = simulated
-        ? `${provider} is in mock/demo mode — no real payment link is created and nothing is persisted.`
-        : `${provider} is not configured. Connect ${provider} (set credentials) to generate a real payment link.`;
-      await db.integrationRunLog.create({
-        data: {
-          tenantId: request.auth.tenantId, branchId, provider, providerMode: simulated ? 'mock' : 'unconfigured',
-          operation: 'test-payment-link', status: outcomeStatus,
-          requestSummary: { provider }, responseSummary: { status: outcomeStatus, note },
-        },
-      });
-      await audit(request, { action: 'controlPlane.finance.tested', resource: 'financeRail', resourceId: provider, metadata: { status: outcomeStatus } });
-      return reply.send({
-        provider, providerName: connection?.displayName ?? provider, status: outcomeStatus,
-        configured: false, paymentUrl: null, note, message: note,
-      });
-    }
-
-    // Real provider path: create an ACTUAL payment link via the live provider and
-    // report the real URL. This is a connectivity test — no PaymentRequest row is
-    // persisted (it is not a collectible patient charge).
-    const providerImpl = createPaymentProvider();
-    try {
-      const outcome = await providerImpl.createPaymentLink({
-        tenantId: request.auth.tenantId,
-        branchId: branchId ?? '',
-        amount: 1,
-        reason: 'CareCommand connectivity test',
-      } as PaymentRequestContext);
-      const ok = Boolean(outcome.paymentUrl);
-      await db.integrationRunLog.create({
-        data: {
-          tenantId: request.auth.tenantId, branchId, provider, providerMode: outcome.providerMode,
-          operation: 'test-payment-link', status: ok ? 'success' : 'error',
-          requestSummary: { provider }, responseSummary: { providerReference: outcome.providerReference, paymentUrl: outcome.paymentUrl ?? null },
-        },
-      });
-      await audit(request, { action: 'controlPlane.finance.tested', resource: 'financeRail', resourceId: provider, metadata: { status: ok ? 'success' : 'error', providerReference: outcome.providerReference } });
-      if (!ok) {
-        return reply.code(502).send({ provider, providerName: outcome.provider, status: 'error', configured: true, paymentUrl: null, message: 'Live payment provider returned no link.' });
-      }
-      return reply.send({
-        provider, providerName: outcome.provider, providerMode: outcome.providerMode,
-        modeLabel: formatMode(outcome.providerMode, true), status: 'success', configured: true,
-        paymentUrl: outcome.paymentUrl, providerReference: outcome.providerReference,
-        message: `Live payment link created via ${outcome.provider}.`,
-      });
-    } catch (error) {
-      await db.integrationRunLog.create({
-        data: {
-          tenantId: request.auth.tenantId, branchId, provider, providerMode: status.mode,
-          operation: 'test-payment-link', status: 'error',
-          requestSummary: { provider }, errorMessage: (error as Error).message?.slice(0, 500) ?? 'Payment link call failed',
-        },
-      });
-      await audit(request, { action: 'controlPlane.finance.tested', resource: 'financeRail', resourceId: provider, metadata: { status: 'error' } });
-      return reply.code(502).send({ provider, providerName: connection?.displayName ?? provider, status: 'error', configured: true, paymentUrl: null, message: 'Live payment provider call failed.' });
-    }
-  });
-
-  app.get('/finance-rails/logs', { preHandler: ownerAdminRoles }, async request => {
-    const logs = await db.integrationRunLog.findMany({
-      where: { tenantId: request.auth.tenantId, provider: { in: [...paymentProviders] } },
-      orderBy: { createdAt: 'desc' },
-      take: 50,
-    });
-    return logs.map(log => ({
-      id: log.id,
-      provider: log.provider,
-      providerMode: log.providerMode,
-      operation: log.operation,
-      status: log.status,
-      requestSummary: log.requestSummary ?? null,
-      responseSummary: log.responseSummary ?? null,
-      errorMessage: log.errorMessage ?? null,
-      createdAt: log.createdAt.toISOString(),
-    }));
   });
 
   app.get('/system-health', { preHandler: ownerAdminRoles }, async request => buildSystemHealth(request.auth.tenantId));

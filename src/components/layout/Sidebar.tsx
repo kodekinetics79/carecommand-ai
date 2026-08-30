@@ -2,8 +2,8 @@ import { useState } from 'react';
 import { useLocation, Link, useNavigate } from 'react-router';
 import {
   LayoutDashboard, Radar, Users2, Megaphone, TrendingUp,
-  CalendarDays, ClipboardList, Puzzle, Settings,
-  Star, Orbit, Target, UserCircle2, ShieldCheck, Sparkles, BadgeCheck, Bot, FileText, CreditCard, Lock, Cpu, Activity, Plug, SlidersHorizontal,
+  CalendarDays, ClipboardList, Settings,
+  Star, Orbit, Target, UserCircle2, ShieldCheck, Sparkles, BadgeCheck, Bot, FileText, CreditCard, Lock, Cpu, Activity, SlidersHorizontal,
   ChevronsLeft, ChevronsRight, ChevronDown, Search, X, PhoneCall,
 } from 'lucide-react';
 import { useSession } from '../../hooks/useSession';
@@ -31,7 +31,6 @@ const NAV_FEATURE: Record<string, string> = {
   '/revenue-protection': 'revenue_protection',
   '/devices': 'device_integration',
   '/monitoring': 'device_integration',
-  '/integration-setup': 'device_integration',
   '/insurance-eligibility': 'insurance_eligibility',
   '/enrollments': 'device_integration',
   '/sync-logs': 'device_integration',
@@ -112,15 +111,21 @@ const nav: NavSection[] = [
       { label: 'Device Enrollments', path: '/enrollments', icon: UserCircle2 },
       { label: 'RPM Billing Readiness', path: '/rpm-readiness', icon: CreditCard },
       { label: 'Provider Sync Logs', path: '/sync-logs', icon: FileText },
-      { label: 'Integration Setup', path: '/integration-setup', icon: Plug },
     ],
   },
+  // "Integrations" and "Integration Setup" used to sit here and under Connected
+  // Care. Both were directories of the services CareCommand buys — 17 provider
+  // cards with Mock Mode badges, Test-connection buttons and API-key fields —
+  // on the screen of a clinic that holds none of those accounts. They moved to
+  // the Platform Console whole. What a clinic sees instead is the capability,
+  // stated where it bites: the eligibility screen says eligibility is not set
+  // up, the payment card says card payments are not set up, and both name
+  // CareCommand support as the next step.
   {
     label: 'Governance',
     items: [
       { label: 'Compliance Readiness', path: '/compliance', icon: FileText },
       { label: 'Control Plane', path: '/control-plane', icon: ShieldCheck },
-      { label: 'Integrations', path: '/integrations', icon: Puzzle },
       { label: 'Subscription', path: '/subscription', icon: CreditCard },
       { label: 'Settings', path: '/settings', icon: Settings },
     ],

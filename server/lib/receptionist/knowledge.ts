@@ -77,7 +77,7 @@ export function validateKnowledge(doc: KnowledgeDocument): { ok: boolean; issues
     if (!item.question.trim()) issues.push({ path: `faq.${index}.question`, message: 'Question is required' });
     if (!item.answer.trim()) issues.push({ path: `faq.${index}.answer`, message: 'Answer is required' });
   });
-  if (doc.urgentCare.onCallNumber && !E164.test(doc.urgentCare.onCallNumber)) issues.push({ path: 'urgentCare.onCallNumber', message: 'On-call number must be E.164' });
+  if (doc.urgentCare.onCallNumber && !E164.test(doc.urgentCare.onCallNumber)) issues.push({ path: 'urgentCare.onCallNumber', message: 'On-call number must include the country code, like +1 212 555 0100' });
   const hasAnyContent = doc.acceptedPayers.length > 0 || doc.paymentPolicy.trim() || doc.newPatientPolicy.trim()
     || doc.urgentCare.whatCountsAsUrgent.trim() || doc.urgentCare.sameDayPolicy.trim() || doc.faq.length > 0;
   if (!hasAnyContent) issues.push({ path: '', message: 'The document is empty; add at least one fact before approving' });

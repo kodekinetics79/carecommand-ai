@@ -97,8 +97,6 @@ const guardedRoutes: GuardedRoute[] = [
   { method: 'PATCH', url: `/v1/partner-reports/${fixedId}/review`, permission: 'partner-report:review', payload: { status: 'doctor-reviewed' } },
   { method: 'GET', url: '/v1/integrations', permission: 'integrations:read' },
   { method: 'PATCH', url: `/v1/integrations/${fixedId}`, permission: 'integrations:manage', payload: { status: 'DISCONNECTED' } },
-  { method: 'GET', url: '/v1/integrations/status', permission: 'integrations:read' },
-  { method: 'POST', url: '/v1/integrations/retell/test', permission: 'integrations:manage' },
   { method: 'GET', url: '/v1/tasks', permission: 'staff:read' },
   { method: 'POST', url: '/v1/tasks', permission: 'staff:write', payload: {} },
   { method: 'GET', url: '/v1/staff/assignees', permission: 'staff:write' },

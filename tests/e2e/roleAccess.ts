@@ -86,10 +86,13 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
   { path: '/enrollments', label: 'Device Enrollments', primaryCall: '/v1/connected-care/enrollments' },
   { path: '/rpm-readiness', label: 'RPM Billing Readiness', primaryCall: '/v1/connected-care/rpm-readiness' },
   { path: '/sync-logs', label: 'Provider Sync Logs', primaryCall: '/v1/connected-care/sync-logs' },
-  { path: '/integration-setup', label: 'Integration Setup', primaryCall: '/v1/devices/providers' },
+  // '/integration-setup' and '/integrations' were certified destinations here
+  // until the supplier catalogue left the tenant app on 2026-08-30. Both were
+  // directories of the services CareCommand buys, with credential fields and a
+  // Test-connection button per vendor; they are Platform Console surfaces now.
+  // Every role's count falls by the entries it used to be offered.
   { path: '/compliance', label: 'Compliance Readiness', primaryCall: '/v1/compliance/dashboard' },
   { path: '/control-plane', label: 'Control Plane', primaryCall: '/v1/control-plane/overview' },
-  { path: '/integrations', label: 'Integrations', primaryCall: '/v1/integrations/status' },
   { path: '/subscription', label: 'Subscription', primaryCall: '/v1/subscriptions/current' },
   // The account page every user reaches from their own avatar. Its landing view
   // is session-derived; the workspace-summary tiles it embeds are admin-scoped.
@@ -117,9 +120,14 @@ export const ROLE_ACCESS: Record<CrawlRole, RoleAccessContract> = {
   // (the queue of work the AI receptionist hands back to a human) and
   // /alert-thresholds (the bands a clinic's own monitoring alerts fire on,
   // which had no write path anywhere in the product before it).
+  // 2026-08-30: 33 -> 31. Two destinations were REMOVED from the product, not
+  // withheld from this role: /integrations (the 17-provider grid) and
+  // /integration-setup (credential entry for the same providers). An OWNER held
+  // integrations:read and the device entitlement, so it was offered both; every
+  // other declaration for this role is unchanged.
   OWNER: {
-    navDestinations: 33,
-    mustOffer: ['/', '/settings', '/patients', '/scheduling', '/insurance', '/staff', '/integrations', '/monitoring', '/compliance', '/control-plane', '/campaigns', '/front-desk', '/alert-thresholds', '/advisory'],
+    navDestinations: 31,
+    mustOffer: ['/', '/settings', '/patients', '/scheduling', '/insurance', '/staff', '/monitoring', '/compliance', '/control-plane', '/campaigns', '/front-desk', '/alert-thresholds', '/advisory'],
     mustNotOffer: [],
   },
   // Patient, billing, staff and CRM reads; no revenue, operations, integrations
@@ -135,10 +143,14 @@ export const ROLE_ACCESS: Record<CrawlRole, RoleAccessContract> = {
   // role is still not offered it. Against that, /advisory left: the brief names
   // patients and their money and its route requires patient:read AND
   // revenue:read, which this role does not hold.
+  // 2026-08-30: 19 -> 18. This role never held integrations:read, so
+  // /integrations was already withheld — but /integration-setup declared no
+  // permission at all (entitlement only), so every signed-in user was offered a
+  // screen with API-key fields on it. That destination no longer exists.
   FRONT_DESK: {
-    navDestinations: 19,
+    navDestinations: 18,
     mustOffer: ['/', '/settings', '/patients', '/scheduling', '/insurance', '/staff', '/crm', '/campaigns', '/front-desk'],
-    mustNotOffer: ['/control-plane', '/compliance', '/integrations', '/monitoring', '/revenue', '/receptionist-studio', '/alert-thresholds', '/advisory'],
+    mustNotOffer: ['/control-plane', '/compliance', '/monitoring', '/revenue', '/receptionist-studio', '/alert-thresholds', '/advisory'],
   },
   // Clinical reads plus the connected-care role list; no CRM, billing, revenue
   // or compliance grant — and therefore no campaign workspace, and no
@@ -150,10 +162,12 @@ export const ROLE_ACCESS: Record<CrawlRole, RoleAccessContract> = {
   // /alert-thresholds gave one back — it is on the monitoring module's role
   // gate, which includes PROVIDER. And /advisory left, for the reason on
   // FRONT_DESK above: no revenue:read.
+  // 2026-08-30: 16 -> 15, for the same reason as FRONT_DESK — the permissionless
+  // /integration-setup entry it was being offered is gone.
   PROVIDER: {
-    navDestinations: 16,
+    navDestinations: 15,
     mustOffer: ['/', '/settings', '/patients', '/scheduling', '/staff', '/monitoring', '/doctor-workspace', '/alert-thresholds'],
-    mustNotOffer: ['/control-plane', '/compliance', '/crm', '/campaigns', '/insurance', '/revenue', '/integrations', '/front-desk', '/advisory'],
+    mustNotOffer: ['/control-plane', '/compliance', '/crm', '/campaigns', '/insurance', '/revenue', '/front-desk', '/advisory'],
   },
   // Compliance and audit reads and nothing operational.
   // 2026-08-30: 9 -> 7. It loses the same free /reactivation entry the PROVIDER
@@ -163,10 +177,12 @@ export const ROLE_ACCESS: Record<CrawlRole, RoleAccessContract> = {
   // which requires staff:read, and an auditor holds no staff grant. A page
   // whose calls load and whose work lanes 403 is the half-open door this suite
   // exists to catch, so the requirement was corrected rather than the count.
+  // 2026-08-30: 7 -> 6. Same single cause: /integration-setup asked for nothing,
+  // so an auditor was offered a credential-entry screen too.
   AUDITOR: {
-    navDestinations: 7,
+    navDestinations: 6,
     mustOffer: ['/', '/settings', '/compliance'],
-    mustNotOffer: ['/control-plane', '/patients', '/scheduling', '/insurance', '/staff', '/integrations', '/monitoring', '/revenue', '/campaigns', '/front-desk', '/alert-thresholds', '/advisory'],
+    mustNotOffer: ['/control-plane', '/patients', '/scheduling', '/insurance', '/staff', '/monitoring', '/revenue', '/campaigns', '/front-desk', '/alert-thresholds', '/advisory'],
   },
 };
 

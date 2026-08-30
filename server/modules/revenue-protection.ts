@@ -13,6 +13,7 @@ import { resolveIngressTenant } from '../lib/tenantIngressResolvers';
 import { recordWorkflowEvent, emitBusinessEvent } from '../lib/intelligence';
 import { eligibilityProviderStatus, runDenialPreventionForAppointment } from '../lib/insuranceIntelligence';
 import { paymentProviderStatus } from '../lib/deposits';
+import { eligibilityCapability, cardPaymentsCapability } from '../lib/providerRails';
 import type { Prisma } from '../generated/prisma/client';
 import {
   EligibilityExecutionConflictError,
@@ -1832,6 +1833,21 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     return result;
   });
 
+  /**
+   * What this clinic can actually do, in our own words.
+   *
+   * This route used to answer with `Stedi Sandbox Active` / `Stripe Live
+   * Active` / `Mock Mode` and the raw provider keys behind them, and the
+   * Revenue Protection screen printed those strings in five places. A practice
+   * manager cannot act on any of it: they hold no account with either company
+   * and cannot switch a mode. What they need is the capability and the
+   * consequence — "Card payments are not set up, so no payment link can be
+   * sent" — plus who to ask. That is what it answers now.
+   *
+   * The three states stay distinct on purpose. `test_data` is NOT collapsed
+   * into `available`: a screen that says "working" while the money is
+   * simulated is the exact failure this codebase keeps a mock-mode label for.
+   */
   app.get('/integration-status', { preHandler: billingRead }, async request => {
     const insuranceProvider = createInsuranceProvider();
     const paymentProvider = createPaymentProvider();
@@ -1847,28 +1863,8 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
     ]);
 
     const result = {
-      insurance: {
-        provider: env.INSURANCE_PROVIDER,
-        providerName: insuranceProvider.displayName,
-        mode: insuranceProvider.mode,
-        label: insuranceConfigured
-          ? (insuranceProvider.providerKey === 'stedi'
-            ? `Stedi ${insuranceProvider.mode === 'live' ? 'Live Active' : 'Sandbox Active'}`
-            : `${insuranceProvider.displayName} Active`)
-          : 'Mock Mode',
-        configured: insuranceConfigured,
-      },
-      payment: {
-        provider: env.PAYMENT_PROVIDER,
-        providerName: paymentProvider.displayName,
-        mode: paymentProvider.mode,
-        label: paymentConfigured
-          ? (paymentProvider.providerKey === 'stripe'
-            ? `Stripe ${paymentProvider.mode === 'live' ? 'Live Active' : 'Test Mode Active'}`
-            : `${paymentProvider.displayName} Active`)
-          : 'Mock Mode',
-        configured: paymentConfigured,
-      },
+      eligibility: eligibilityCapability(insuranceConfigured, insuranceProvider.mode !== 'live'),
+      cardPayments: cardPaymentsCapability(paymentConfigured, paymentProvider.mode !== 'live'),
       payerCount: payerList.length,
       recentRuns: recentRuns.length,
       latestRun: recentRuns[0] ?? null,

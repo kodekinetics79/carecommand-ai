@@ -2,6 +2,7 @@ import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { env } from '../../config/env';
+import { eligibilityCapability, cardPaymentsCapability } from '../../lib/providerRails';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { assertBranchAccess, branchScope } from '../../lib/scope';
@@ -46,190 +47,6 @@ const partnerReportWrite = requirePermission('partner-report:write');
 const partnerReportReview = requirePermission('partner-report:review');
 const staffTaskRead = requirePermission('staff:read');
 const staffTaskWrite = requirePermission('staff:write');
-
-type IntegrationCatalogEntry = {
-  key: string;
-  name: string;
-  category: string;
-  description: string;
-  supportedWorkflows: string[];
-  envVars: string[];
-  providerType: 'integration' | 'insurance' | 'payments' | 'placeholder' | 'ai';
-};
-
-const integrationCatalog: IntegrationCatalogEntry[] = [
-  {
-    key: 'whatsapp-business',
-    name: 'WhatsApp Business',
-    category: 'Communication',
-    description: 'Two-way appointment follow-up and patient outreach.',
-    supportedWorkflows: ['Missed-call recovery', 'Appointment reminders', 'Campaign replies'],
-    envVars: [],
-    providerType: 'integration',
-  },
-  {
-    key: 'stedi',
-    name: 'Stedi',
-    category: 'Insurance',
-    description: 'Eligibility, benefits, and payer verification.',
-    supportedWorkflows: ['Eligibility verification', 'Benefit lookup', 'Prior auth prep'],
-    envVars: ['INSURANCE_PROVIDER', 'STEDI_API_KEY', 'STEDI_BASE_URL', 'STEDI_TEST_MODE'],
-    providerType: 'insurance',
-  },
-  {
-    key: 'availity',
-    name: 'Availity',
-    category: 'Insurance',
-    description: 'Insurance eligibility adapter placeholder.',
-    supportedWorkflows: ['Eligibility verification', 'Payer lookup'],
-    envVars: ['INSURANCE_PROVIDER'],
-    providerType: 'placeholder',
-  },
-  {
-    key: 'pverify',
-    name: 'pVerify',
-    category: 'Insurance',
-    description: 'Insurance eligibility adapter placeholder.',
-    supportedWorkflows: ['Eligibility verification', 'Benefit lookup'],
-    envVars: ['INSURANCE_PROVIDER'],
-    providerType: 'placeholder',
-  },
-  {
-    key: 'optum',
-    name: 'Optum / Change',
-    category: 'Insurance',
-    description: 'Insurance eligibility adapter placeholder.',
-    supportedWorkflows: ['Eligibility verification', 'Prior auth prep'],
-    envVars: ['INSURANCE_PROVIDER'],
-    providerType: 'placeholder',
-  },
-  {
-    key: 'stripe',
-    name: 'Stripe',
-    category: 'Payments',
-    description: 'Payment links and checkout sessions.',
-    supportedWorkflows: ['Payment links', 'Checkout sessions', 'Deposit collection'],
-    envVars: ['PAYMENT_PROVIDER', 'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET'],
-    providerType: 'payments',
-  },
-  {
-    key: 'square',
-    name: 'Square',
-    category: 'Payments',
-    description: 'Payment provider adapter placeholder.',
-    supportedWorkflows: ['Payment links', 'Card-on-file'],
-    envVars: ['PAYMENT_PROVIDER', 'SQUARE_ACCESS_TOKEN'],
-    providerType: 'placeholder',
-  },
-  {
-    key: 'authorize_net',
-    name: 'Authorize.Net',
-    category: 'Payments',
-    description: 'Payment provider adapter placeholder.',
-    supportedWorkflows: ['Payment links', 'Card processing'],
-    envVars: ['PAYMENT_PROVIDER', 'AUTHORIZE_NET_API_LOGIN_ID', 'AUTHORIZE_NET_TRANSACTION_KEY'],
-    providerType: 'placeholder',
-  },
-  {
-    key: 'clover',
-    name: 'Clover',
-    category: 'Payments',
-    description: 'Payment provider adapter placeholder.',
-    supportedWorkflows: ['Point-of-sale sync', 'Payments'],
-    envVars: ['PAYMENT_PROVIDER'],
-    providerType: 'placeholder',
-  },
-  {
-    key: 'paypal',
-    name: 'PayPal',
-    category: 'Payments',
-    description: 'Payment provider adapter placeholder.',
-    supportedWorkflows: ['Online payments', 'Deposit links'],
-    envVars: ['PAYMENT_PROVIDER'],
-    providerType: 'placeholder',
-  },
-  {
-    key: 'twilio_sms',
-    name: 'Twilio SMS',
-    category: 'Communication',
-    description: 'SMS reminder and follow-up adapter placeholder.',
-    supportedWorkflows: ['Appointment reminders', 'Missed-call recovery'],
-    envVars: ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_FROM_NUMBER'],
-    providerType: 'placeholder',
-  },
-  {
-    key: 'sendgrid_smtp',
-    name: 'SendGrid / SMTP',
-    category: 'Communication',
-    description: 'Email delivery adapter placeholder.',
-    supportedWorkflows: ['Review requests', 'Campaign emails'],
-    envVars: ['SMTP_HOST', 'SMTP_USER', 'SMTP_PASS'],
-    providerType: 'placeholder',
-  },
-  {
-    key: 'whatsapp',
-    name: 'WhatsApp',
-    category: 'Communication',
-    description: 'WhatsApp provider readiness.',
-    supportedWorkflows: ['Patient reminders', 'Campaign replies'],
-    envVars: ['WHATSAPP_ACCESS_TOKEN'],
-    providerType: 'placeholder',
-  },
-  {
-    key: 'google_business_profile',
-    name: 'Google Business Profile',
-    category: 'Reputation / Marketing',
-    description: 'Review and profile management placeholder.',
-    supportedWorkflows: ['Review monitoring', 'Reputation alerts'],
-    envVars: ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET'],
-    providerType: 'placeholder',
-  },
-  {
-    key: 'facebook_meta',
-    name: 'Facebook / Meta',
-    category: 'Reputation / Marketing',
-    description: 'Social publishing and marketing placeholder.',
-    supportedWorkflows: ['Campaign publishing', 'Lead capture'],
-    envVars: ['META_APP_ID', 'META_APP_SECRET'],
-    providerType: 'placeholder',
-  },
-  {
-    key: 'ollama',
-    name: 'Ollama',
-    category: 'AI Providers',
-    description: 'Local model adapter for the advisory room.',
-    supportedWorkflows: ['Advisory brief', 'Summaries', 'Workflow suggestions'],
-    envVars: ['AI_PROVIDER', 'OLLAMA_BASE_URL', 'OLLAMA_MODEL'],
-    providerType: 'ai',
-  },
-  {
-    key: 'openai',
-    name: 'OpenAI',
-    category: 'AI Providers',
-    description: 'Hosted LLM adapter for advisory workflows.',
-    supportedWorkflows: ['Advisory brief', 'Drafting', 'Summaries'],
-    envVars: ['AI_PROVIDER', 'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_MODEL'],
-    providerType: 'ai',
-  },
-  {
-    key: 'claude',
-    name: 'Claude',
-    category: 'AI Providers',
-    description: 'Hosted LLM adapter for advisory workflows.',
-    supportedWorkflows: ['Advisory brief', 'Drafting', 'Summaries'],
-    envVars: ['AI_PROVIDER', 'CLAUDE_API_KEY', 'CLAUDE_BASE_URL', 'CLAUDE_MODEL'],
-    providerType: 'ai',
-  },
-  {
-    key: 'retell',
-    name: 'Retell AI Voice',
-    category: 'AI Voice',
-    description: 'Outbound AI receptionist voice calls and webhook handoff.',
-    supportedWorkflows: ['Outbound calling', 'Appointment request capture', 'Call webhook handoff'],
-    envVars: ['RETELL_API_KEY', 'RETELL_FROM_NUMBER'],
-    providerType: 'integration',
-  },
-] as const;
 
 function scopedBranch(request: FastifyRequest, branchId?: string) {
   return request.auth.branchId ?? branchId;
@@ -336,125 +153,6 @@ function deliveryMessage(accepted: boolean, deliveryStatus: string, providerMode
     case 'pending': return 'Pending: provider submission and delivery are not confirmed.';
     default: return 'Not sent: delivery failed. Nothing was delivered to the patient.';
   }
-}
-
-function isEnvSet(name: string) {
-  return typeof process.env[name] === 'string' && process.env[name]!.length > 0;
-}
-
-function integrationModeLabel(mode: 'mock' | 'sandbox' | 'live', configured: boolean) {
-  if (!configured && mode === 'live') return 'Live Not Configured';
-  if (!configured && mode === 'sandbox') return 'Sandbox Ready';
-  if (mode === 'mock') return 'Mock Mode';
-  if (mode === 'live') return 'Live Active';
-  return 'Sandbox Active';
-}
-
-async function buildIntegrationStatuses(tenantId: string) {
-  type IntegrationRow = { id: string; key: string; status: string; lastSyncAt: Date | null };
-  type PaymentConnectionRow = { id: string; providerKey: string; status: string; mode: string; lastSyncAt: Date | null };
-  type IntegrationLogRow = { provider: string; createdAt: Date };
-
-  const [dbIntegrations, paymentConnections, logs] = await Promise.all([
-    db.integration.findMany({ where: { tenantId } }),
-    db.paymentProviderConnection.findMany({ where: { tenantId } }),
-    db.integrationRunLog.findMany({
-      where: { tenantId },
-      orderBy: { createdAt: 'desc' },
-      take: 100,
-    }),
-  ]) as [IntegrationRow[], PaymentConnectionRow[], IntegrationLogRow[]];
-
-  return integrationCatalog.map(entry => {
-    const integrationRow = dbIntegrations.find(row => row.key === entry.key);
-    const paymentRow = paymentConnections.find(row => row.providerKey === entry.key);
-    const latestLog = logs.find((log: IntegrationLogRow) => log.provider === entry.key || log.provider === entry.name.toLowerCase());
-
-    // Operator-only detail. Tenants receive a count, never the variable names.
-    const missingConfigCount = entry.envVars.filter((name: string) => !isEnvSet(name)).length;
-
-    let mode: 'mock' | 'sandbox' | 'live' = 'mock';
-    let configured = false;
-    let health: 'healthy' | 'degraded' | 'disconnected' | 'not_configured' = 'not_configured';
-    let lastSyncAt: string | null = null;
-    let label: string;
-
-    if (entry.key === 'whatsapp-business') {
-      configured = integrationRow?.status === 'CONNECTED';
-      mode = configured ? 'live' : 'mock';
-      health = integrationRow?.status === 'ERROR' ? 'degraded' : configured ? 'healthy' : 'disconnected';
-      lastSyncAt = integrationRow?.lastSyncAt?.toISOString() ?? null;
-    } else if (entry.key === 'stedi') {
-      configured = env.INSURANCE_PROVIDER === 'stedi' && Boolean(env.STEDI_API_KEY);
-      mode = configured ? (env.STEDI_TEST_MODE ? 'sandbox' : 'live') : 'mock';
-      health = configured ? 'healthy' : 'not_configured';
-      lastSyncAt = latestLog?.createdAt.toISOString() ?? null;
-    } else if (entry.key === 'stripe') {
-      const liveConfigured = env.PAYMENT_PROVIDER === 'stripe' && Boolean(env.STRIPE_SECRET_KEY);
-      configured = liveConfigured || Boolean(paymentRow);
-      mode = configured ? ((env.STRIPE_SECRET_KEY?.startsWith('sk_live_') ?? false) ? 'live' : 'sandbox') : 'mock';
-      health = configured ? (paymentRow?.status === 'connected' ? 'healthy' : 'degraded') : 'not_configured';
-      lastSyncAt = paymentRow?.lastSyncAt?.toISOString() ?? latestLog?.createdAt.toISOString() ?? null;
-    } else if (entry.key === 'ollama') {
-      configured = env.AI_PROVIDER === 'ollama' && Boolean(env.OLLAMA_BASE_URL);
-      mode = configured ? 'sandbox' : 'mock';
-      health = configured ? 'healthy' : 'not_configured';
-      lastSyncAt = latestLog?.createdAt.toISOString() ?? null;
-    } else if (entry.key === 'openai') {
-      configured = env.AI_PROVIDER === 'openai' && Boolean(env.OPENAI_API_KEY);
-      mode = configured ? 'live' : 'mock';
-      health = configured ? 'healthy' : 'not_configured';
-      lastSyncAt = latestLog?.createdAt.toISOString() ?? null;
-    } else if (entry.key === 'claude') {
-      configured = env.AI_PROVIDER === 'claude' && Boolean(env.CLAUDE_API_KEY);
-      mode = configured ? 'live' : 'mock';
-      health = configured ? 'healthy' : 'not_configured';
-      lastSyncAt = latestLog?.createdAt.toISOString() ?? null;
-    } else if (entry.key === 'retell') {
-      configured = Boolean(env.RETELL_API_KEY && env.RETELL_FROM_NUMBER);
-      mode = !configured ? 'mock' : env.RETELL_API_KEY!.startsWith('mock') ? 'sandbox' : 'live';
-      health = configured ? 'healthy' : 'not_configured';
-      lastSyncAt = latestLog?.createdAt.toISOString() ?? null;
-    } else if (entry.providerType === 'placeholder') {
-      configured = false;
-      mode = 'mock';
-      health = 'not_configured';
-      lastSyncAt = latestLog?.createdAt.toISOString() ?? null;
-    }
-
-    if (entry.providerType === 'payments' && entry.key !== 'stripe') {
-      const connection = paymentConnections.find((row: PaymentConnectionRow) => row.providerKey === entry.key);
-      configured = Boolean(connection?.status === 'connected');
-      mode = configured ? (connection?.mode === 'live' ? 'live' : 'sandbox') : 'mock';
-      health = configured ? 'healthy' : 'not_configured';
-      lastSyncAt = connection?.lastSyncAt?.toISOString() ?? latestLog?.createdAt.toISOString() ?? null;
-    }
-
-    if (!configured && entry.providerType === 'placeholder') {
-      label = 'Live Not Configured';
-    } else {
-      label = integrationModeLabel(mode, configured);
-    }
-
-    return {
-      key: entry.key,
-      name: entry.name,
-      category: entry.category,
-      description: entry.description,
-      supportedWorkflows: entry.supportedWorkflows,
-      mode,
-      modeLabel: label,
-      configured,
-      health,
-      lastSyncAt,
-      missingConfigCount,
-      riskLevel: !configured ? 'high' : health === 'degraded' ? 'medium' : 'low',
-      action: 'Test connection',
-      integrationId: integrationRow?.id ?? null,
-      providerConnectionId: paymentRow?.id ?? null,
-      databaseStatus: integrationRow?.status ?? paymentRow?.status ?? null,
-    };
-  });
 }
 
 export const operationsRoutes: FastifyPluginAsync = async app => {
@@ -868,6 +566,32 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     return updated;
   });
 
+  /**
+   * What this clinic can do, in our own words — one row per capability, no
+   * supplier named and no environment variable quoted.
+   *
+   * This replaces `GET /integrations/status`, which served a tenant a
+   * seventeen-row supplier catalogue with operating modes, per-vendor health
+   * and a missing-configuration count. The catalogue did not disappear; it
+   * answers a platform JWT now, at /v1/platform/tenants/:tenantId/providers.
+   *
+   * Authenticated only, deliberately. The person who needs to know that card
+   * payments are not set up is the one standing at the desk trying to take
+   * one, and they are rarely an administrator. Nothing here is sensitive: it
+   * states a capability and names us as the next step.
+   */
+  app.get('/capabilities', async () => {
+    const insuranceConfigured = env.INSURANCE_PROVIDER === 'mock' || (env.INSURANCE_PROVIDER === 'stedi' && Boolean(env.STEDI_API_KEY));
+    const paymentConfigured = env.PAYMENT_PROVIDER === 'mock' || (env.PAYMENT_PROVIDER === 'stripe' && Boolean(env.STRIPE_SECRET_KEY));
+    return [
+      eligibilityCapability(insuranceConfigured, env.INSURANCE_PROVIDER !== 'stedi' || env.STEDI_TEST_MODE),
+      cardPaymentsCapability(paymentConfigured, !env.STRIPE_SECRET_KEY?.startsWith('sk_live_')),
+    ];
+  });
+
+  // The tenant's own Integration rows. Kept: these are records the workspace
+  // owns (a connection it recorded), not our supply chain, and no screen
+  // enumerates them as a vendor catalogue any more.
   app.get('/integrations', { preHandler: integrationsRead }, async request => {
     return db.integration.findMany({ where: { tenantId: request.auth.tenantId }, orderBy: { name: 'asc' } });
   });
@@ -884,73 +608,6 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     });
     await audit(request, { action: 'integration.statusChanged', resource: 'integration', resourceId: id, metadata: { status: input.status } });
     return row;
-  });
-
-  app.get('/integrations/status', { preHandler: integrationsRead }, async request => {
-    return buildIntegrationStatuses(request.auth.tenantId);
-  });
-
-  app.post('/integrations/:provider/test', { preHandler: integrationsManage }, async (request, reply) => {
-    const { provider } = z.object({ provider: z.string().trim().min(1).max(80) }).parse(request.params);
-    const statuses = await buildIntegrationStatuses(request.auth.tenantId);
-    const selected = statuses.find(entry => entry.key === provider);
-    if (!selected) throw app.httpErrors.notFound('Integration provider not found');
-
-    await db.integrationRunLog.create({
-      data: {
-        tenantId: request.auth.tenantId,
-        branchId: request.auth.branchId ?? undefined,
-        provider: selected.key,
-        providerMode: selected.mode,
-        operation: 'connection.test',
-        status: selected.configured ? 'success' : 'not_configured',
-        requestSummary: {
-          provider: selected.key,
-          category: selected.category,
-        },
-        responseSummary: {
-          mode: selected.modeLabel,
-          health: selected.health,
-          configured: selected.configured,
-        },
-        errorMessage: selected.configured ? null : 'Provider not configured',
-      },
-    });
-
-    if (selected.integrationId) {
-      await db.integration.update({
-        where: { id: selected.integrationId },
-        data: { lastSyncAt: new Date() },
-      });
-    }
-    if (selected.providerConnectionId) {
-      await db.paymentProviderConnection.update({
-        where: { id: selected.providerConnectionId },
-        data: { lastSyncAt: new Date() },
-      });
-    }
-
-    await audit(request, {
-      action: 'integration.tested',
-      resource: 'integration',
-      resourceId: selected.integrationId ?? selected.providerConnectionId ?? selected.key,
-      metadata: { provider: selected.key, configured: selected.configured, mode: selected.mode },
-    });
-
-    return reply.send({
-      providerKey: selected.key,
-      providerName: selected.name,
-      category: selected.category,
-      mode: selected.mode,
-      modeLabel: selected.modeLabel,
-      configured: selected.configured,
-      health: selected.health,
-      message: selected.configured ? 'Connection test recorded.' : 'Provider is not configured yet.',
-      lastCheckedAt: new Date().toISOString(),
-      supportedWorkflows: selected.supportedWorkflows,
-      missingConfigCount: selected.missingConfigCount,
-      riskLevel: selected.riskLevel,
-    });
   });
 
   // ===== Front desk queue ==================================================

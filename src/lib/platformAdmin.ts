@@ -191,6 +191,61 @@ export interface TenantRoster {
 export const TENANT_STATUS_BADGE: Record<string, string> = { active: 'badge-emerald', suspended: 'badge-red', cancelled: 'badge-red' };
 export const SUB_STATUS_BADGE: Record<string, string> = { ACTIVE: 'badge-emerald', TRIAL: 'badge-violet', PAST_DUE: 'badge-amber', SUSPENDED: 'badge-red', CANCELLED: 'badge-red' };
 
+export interface TenantProviderRow {
+  key: string;
+  name: string;
+  category: string;
+  description: string;
+  supportedWorkflows: string[];
+  mode: 'mock' | 'sandbox' | 'live';
+  modeLabel: string;
+  configured: boolean;
+  health: string;
+  lastSyncAt: string | null;
+  missingConfigCount: number;
+  /** Operator-only: the exact variables that are unset. Never served to a tenant. */
+  missingConfigKeys: string[];
+  riskLevel: string;
+}
+
+export interface TenantInsuranceRail {
+  provider: string;
+  name: string;
+  configured: boolean;
+  modeLabel: string;
+  eligibilitySupported: boolean;
+  benefitsSupported: boolean;
+  priorAuthSupported: boolean;
+  priorAuthTrackingSupported: boolean;
+  payerListStatus: string;
+  errorRate: number;
+  workflows: string[];
+  logs: Array<{ id: string; operation: string; status: string; createdAt: string; providerMode: string }>;
+}
+
+export interface TenantFinanceRail {
+  provider: string;
+  name: string;
+  configured: boolean;
+  modeLabel: string;
+  paymentLinksSupported: boolean;
+  depositsSupported: boolean;
+  copayCollectionSupported: boolean;
+  webhooksConfigured: boolean;
+  failedPaymentCount: number;
+  health: string;
+  logs: Array<{ id: string; operation: string; status: string; createdAt: string; providerMode: string }>;
+}
+
+export interface TenantProviderConsole {
+  tenantId: string;
+  tenantName: string;
+  summary: { active: number; sandbox: number; mock: number; failed: number; total: number };
+  integrations: TenantProviderRow[];
+  insuranceRails: TenantInsuranceRail[];
+  financeRails: TenantFinanceRail[];
+}
+
 export const platformAdmin = {
   login: (email: string, password: string) => pf<{ token?: string; mfaRequired?: boolean; mfaSetupRequired?: boolean; mfaToken?: string; user?: PlatformMe }>(`/v1/platform/auth/login`, { method: 'POST', auth: false, body: JSON.stringify({ email, password }) }),
   mfaSetup: (mfaToken: string) => pf<{ secret: string; otpauthUri: string; enabled: false }>(`/v1/platform/auth/mfa/setup`, { method: 'POST', auth: false, headers: { Authorization: `Bearer ${mfaToken}` }, body: '{}' }),
@@ -261,6 +316,19 @@ export const platformAdmin = {
   endSupport: (sessionId: string) => pf<{ ended: boolean }>(`/v1/platform/support-session/${sessionId}`, { method: 'DELETE' }),
 
   archiveTenant: (id: string, reason: string) => pf<{ status: string }>(`/v1/platform/tenants/${id}/archive`, { method: 'POST', body: JSON.stringify({ reason }) }),
+
+  // The supplier console, per tenant. Every one of these answered a TENANT
+  // JWT under /v1/control-plane until the clinic stopped being shown the
+  // machinery: the provider catalogue, the eligibility rails, the payment
+  // rails and their Test buttons. Same data, same honesty gates, read by the
+  // people who can actually act on it.
+  tenantProviders: (tenantId: string) => pf<TenantProviderConsole>(`/v1/platform/tenants/${tenantId}/providers`),
+  testTenantProvider: (tenantId: string, provider: string) =>
+    pf<{ status: string; message: string; verified?: boolean }>(`/v1/platform/tenants/${tenantId}/providers/${provider}/test`, { method: 'POST', body: '{}' }),
+  testTenantEligibility: (tenantId: string, provider: string) =>
+    pf<{ status: string; message: string }>(`/v1/platform/tenants/${tenantId}/insurance-rails/${provider}/test-eligibility`, { method: 'POST', body: '{}' }),
+  testTenantPaymentLink: (tenantId: string, provider: string) =>
+    pf<{ status: string; message: string }>(`/v1/platform/tenants/${tenantId}/finance-rails/${provider}/test-payment-link`, { method: 'POST', body: '{}' }),
 
   providerHealth: () => pf<{ providers: Array<{ key: string; label: string; status: string; detail: string }>; failedJobs: number }>(`/v1/platform/health/providers`),
   retryJobs: (queue = 'autopilot') => pf<{ queue: string; retried: number }>(`/v1/platform/health/retry-jobs`, { method: 'POST', body: JSON.stringify({ queue }) }),

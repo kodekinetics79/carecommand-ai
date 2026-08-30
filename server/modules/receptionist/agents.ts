@@ -169,7 +169,11 @@ export const agentRoutes: FastifyPluginAsync = async app => {
         case 'not_found':
           throw app.httpErrors.notFound('Agent not found');
         case 'unlinked':
-          return verifyReply(409, 'provider_agent_unlinked', 'Link a Retell agent before verification.', outcome.agent);
+          // The catalogue already holds both halves of this fault: the tenant
+          // reads `action`, and the supplier-named instruction ("link an
+          // existing Retell agent id") stays on `agent_unlinked.platformAction`,
+          // which `remediationFor` destructures out.
+          return verifyReply(409, 'provider_agent_unlinked', remediationFor('agent_unlinked').action, outcome.agent);
         case 'concurrent_change':
           return verifyReply(409, 'provider_verification_stale', 'Agent configuration changed while provider verification was in progress. Retry verification.', outcome.agent);
         case 'cooldown':
@@ -180,7 +184,10 @@ export const agentRoutes: FastifyPluginAsync = async app => {
             agent: null,
           });
         case 'drift_blocked':
-          return verifyReply(409, outcome.code, 'Provider deployment drift detected. Pause active and runnable campaigns before approving the new immutable version.', outcome.agent);
+          // Same reason as `agent_unlinked` above: the catalogue already owns
+          // this fault's tenant copy. The hardcoded sentence it replaces was
+          // pure data model ("provider deployment drift", "immutable version").
+          return verifyReply(409, outcome.code, remediationFor(outcome.code, { agentId: id, clinicId: outcome.agent.clinicId }).action, outcome.agent);
         case 'failed':
           // One catalogue of operator copy (C5's `remediationFor`) rather than
           // a second message table living in this route.

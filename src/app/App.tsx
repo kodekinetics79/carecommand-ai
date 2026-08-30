@@ -41,10 +41,8 @@ const Inventory = lazy(() => import('../pages/Inventory'));
 const Labs = lazy(() => import('../pages/Labs'));
 const Telehealth = lazy(() => import('../pages/Telehealth'));
 const ComplianceCenter = lazy(() => import('../pages/ComplianceCenter'));
-const Integrations = lazy(() => import('../pages/Integrations'));
 const DeviceIntegration = lazy(() => import('../pages/DeviceIntegration'));
 const RemoteMonitoring = lazy(() => import('../pages/RemoteMonitoring'));
-const IntegrationSetup = lazy(() => import('../pages/IntegrationSetup'));
 const InsuranceEligibility = lazy(() => import('../pages/InsuranceEligibility'));
 const PatientEnrollments = lazy(() => import('../pages/PatientEnrollments'));
 const DeviceSyncLogs = lazy(() => import('../pages/DeviceSyncLogs'));
@@ -195,10 +193,14 @@ export default function App() {
           <Route path="/telehealth" element={<Telehealth />} />
           <Route path="/compliance" element={<ComplianceCenter />} />
           <Route path="/compliance/:section" element={<ComplianceCenter />} />
-          <Route path="/integrations" element={<Integrations />} />
+          {/* /integrations and /integration-setup are gone. A clinic contracted
+              for a working product, not a console of the services we buy: the
+              provider catalogue, its credential fields and its Test-connection
+              buttons live in the Platform Console now. Both paths fall through
+              to the catch-all redirect below, so an old bookmark lands on the
+              Command Center rather than a blank screen. */}
           <Route path="/devices" element={<DeviceIntegration />} />
           <Route path="/monitoring" element={<RemoteMonitoring />} />
-          <Route path="/integration-setup" element={<IntegrationSetup />} />
           <Route path="/insurance-eligibility" element={<InsuranceEligibility />} />
           <Route path="/enrollments" element={<PatientEnrollments />} />
           <Route path="/sync-logs" element={<DeviceSyncLogs />} />

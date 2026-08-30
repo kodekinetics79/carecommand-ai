@@ -228,7 +228,10 @@ describe('CRM Command View figures', () => {
     renderPage();
 
     expect(await screen.findByText('No open leads yet')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Review lead sources' })).toBeInTheDocument();
+    // The CTA pointed at /integrations — a directory of the services
+    // CareCommand buys, which was never where a clinic goes to find out why no
+    // lead arrived. It points at the campaign workspace now.
+    expect(screen.getByRole('button', { name: 'Review campaigns' })).toBeInTheDocument();
     // The retired copy asserted a threshold that does not gate this list.
     expect(screen.queryByText(/No open lead scores 55 or above/)).not.toBeInTheDocument();
     expect(screen.queryByText('None of your open leads can be ranked yet')).not.toBeInTheDocument();

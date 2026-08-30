@@ -115,6 +115,12 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
         name: p.name,
         tradingPartnerServiceId: p.tradingPartnerServiceId,
         sourceProvider: p.sourceProvider,
+        // The tenant-safe rendering of the line above. `sourceProvider` is a
+        // clearinghouse key: useful to the eligibility engine, meaningless to a
+        // practice manager, and a supplier name on their screen if printed. The
+        // clinic is recording HOW a payer is verified, not who we buy it from.
+        verificationLabel: p.sourceProvider === 'mock' ? 'Not verified electronically' : 'Verified through CareCommand',
+        electronicVerification: p.sourceProvider !== 'mock',
         active: p.active,
         sortOrder: p.sortOrder,
         policyCount: p._count.policies,
@@ -132,12 +138,21 @@ export const insuranceRoutes: FastifyPluginAsync = async app => {
     return payers;
   });
 
+  // `sourceProvider` stays accepted for API callers that already send a
+  // clearinghouse key. The UI sends `electronicVerification` instead, and the
+  // SERVER resolves which clearinghouse that means — the clinic never has to
+  // know, and cannot pick one we have no adapter for.
   const payerInput = z.object({
     name: z.string().trim().min(2).max(160),
     tradingPartnerServiceId: z.string().trim().max(60).optional(),
-    sourceProvider: z.enum(['stedi', 'mock', 'availity', 'pverify', 'optum']).default('mock'),
+    sourceProvider: z.enum(['stedi', 'mock', 'availity', 'pverify', 'optum']).optional(),
+    electronicVerification: z.boolean().optional(),
     sortOrder: z.number().int().min(0).optional(),
-  });
+  }).transform(input => ({
+    ...input,
+    sourceProvider: input.sourceProvider
+      ?? (input.electronicVerification ? (env.INSURANCE_PROVIDER === 'mock' ? 'stedi' : env.INSURANCE_PROVIDER) : 'mock'),
+  }));
 
   app.post('/payers', { preHandler: adminRoles }, async (request, reply) => {
     const input = payerInput.parse(request.body);

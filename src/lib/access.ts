@@ -168,16 +168,20 @@ export const ROUTES = {
   '/enrollments': { label: 'Device Enrollments', roles: CLINICAL_LEADERSHIP },
   '/rpm-readiness': { label: 'RPM Billing Readiness', roles: CLINICAL_LEADERSHIP },
   '/sync-logs': { label: 'Provider Sync Logs', roles: CLINICAL_LEADERSHIP },
-  // GET /v1/insurance/providers, /v1/devices/providers — entitlement only.
-  '/integration-setup': { label: 'Integration Setup' },
 
   // /v1/compliance/* center — requireRoles(OWNER, ADMIN, COMPLIANCE_OFFICER, AUDITOR)
   '/compliance': { label: 'Compliance Readiness', roles: COMPLIANCE_READ_ROLES },
   // /v1/control-plane/* — requireRoles(OWNER, ADMIN)
   '/control-plane': { label: 'Control Plane', roles: OWNER_ADMIN },
   '/admin': { label: 'Control Plane', roles: OWNER_ADMIN },
-  // GET /v1/integrations/status — requirePermission('integrations:read')
-  '/integrations': { label: 'Integrations', permission: 'integrations:read' },
+  // '/integrations' and '/integration-setup' were declared here until the
+  // supplier catalogue left the tenant app. A clinic is shown capabilities in
+  // our words — "Card payments: not set up" — and never a directory of the
+  // services we buy with a Test-connection button per vendor. The catalogue,
+  // its credential fields and its health checks are Platform Console surfaces
+  // now. `integrations:read` stays in the vocabulary below because
+  // GET /v1/integrations (the workspace's own connection records) still uses
+  // it; no NAV entry gates on it any more.
   // GET /v1/subscriptions/current, /plans, /features — authenticated only.
   '/subscription': { label: 'Subscription' },
   // GET /v1/settings/roles, /notification-templates — authenticated only. Also

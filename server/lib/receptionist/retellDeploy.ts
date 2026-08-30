@@ -26,6 +26,12 @@ import { findPlaceholders, type Placeholder } from './placeholders';
 import { assemblePromptConfig, type PromptAssemblyClient } from './promptAssembly';
 import type { DeployFailureCode } from './remediation';
 import { verifyAgentProvider, type VerifyActor, type VerifyOutcome } from './agentVerification';
+// A provider adapter may name the supplier everywhere EXCEPT in `message`.
+// `fail()`'s `message` is serialised straight onto the tenant's deploy
+// response (`server/modules/receptionist/deployment.ts`), so those sentences
+// are tenant copy authored inside an adapter file — the exact shape the
+// vendor-neutrality ratchet now scans for.
+import { VOICE } from '../../../src/lib/receptionistVocabulary';
 
 /**
  * Failure codes Package A adds on top of the catalogue's `DeployFailureCode`.
@@ -279,7 +285,7 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
       })
       : null;
     if (agent.providerAgentId && !owned) {
-      return { kind: 'error' as const, code: 'engine_not_owned' as ReceptionistDeployFailureCode, message: 'This agent points at a Retell agent CareCommand did not create. Unlink it before deploying, so a deployment does not overwrite an agent it does not own.' };
+      return { kind: 'error' as const, code: 'engine_not_owned' as ReceptionistDeployFailureCode, message: `This campaign points at a ${VOICE.configuration} CareCommand did not create. Clear it before publishing, so publishing does not overwrite a configuration it does not own.` };
     }
 
     // A4 — a redeploy flips the agent to UNVERIFIED, and the runtime gate then
@@ -310,7 +316,7 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
       where: { tenantId: input.tenantId, startedAt: { gt: new Date(now.getTime() - 3_600_000) } },
     });
     if (hourly >= env.RECEPTIONIST_DEPLOY_HOURLY_LIMIT) {
-      return { kind: 'error' as const, code: 'tenant_rate_limited' as DeployFailureCode, message: 'This tenant reached its hourly deployment limit.', retryAfterSeconds: 600 };
+      return { kind: 'error' as const, code: 'tenant_rate_limited' as DeployFailureCode, message: 'This clinic reached its hourly publishing limit.', retryAfterSeconds: 600 };
     }
 
     const promptConfig = await campaignPromptConfig(tx, campaign, input.tenantId);
@@ -469,7 +475,7 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
   }
   if (!llm.ok) {
     stamp('ensure_llm', 'failed', { providerErrorCode: llm.error });
-    return failDeployment(providerFailureCode(llm.error), llm.error, 'Retell did not accept the prompt. Nothing was published.');
+    return failDeployment(providerFailureCode(llm.error), llm.error, `${VOICE.Service} did not accept the prompt. Nothing was published.`);
   }
   created.llmId = llm.value.llmId;
   created.llmVersion = llm.value.version;
@@ -496,7 +502,7 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
     : await createRetellAgent(agentSpec);
   if (!providerAgent.ok) {
     stamp('ensure_agent', 'failed', { providerErrorCode: providerAgent.error });
-    return failDeployment(providerFailureCode(providerAgent.error), providerAgent.error, 'Retell did not accept the agent configuration. Nothing was published.');
+    return failDeployment(providerFailureCode(providerAgent.error), providerAgent.error, `${VOICE.Service} did not accept the ${VOICE.configuration}. Nothing was published.`);
   }
   created.agentId = providerAgent.value.agentId;
   created.agentVersion = providerAgent.value.version;
@@ -510,7 +516,7 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
   const published = await publishRetellAgent(providerAgent.value.agentId, providerAgent.value.version);
   if (!published.ok) {
     stamp('publish', 'failed', { providerErrorCode: published.error });
-    return failDeployment(providerFailureCode(published.error), published.error, 'Retell accepted the agent but did not publish it.');
+    return failDeployment(providerFailureCode(published.error), published.error, `${VOICE.Service} accepted the ${VOICE.configuration} but did not publish it.`);
   }
   stamp('publish', 'ok');
 

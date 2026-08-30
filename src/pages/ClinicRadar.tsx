@@ -680,7 +680,7 @@ export default function ClinicRadar() {
                 'Open the source record and confirm it is still current.',
                 'Confirm authority, consent, and suppression status in the destination workflow before contacting anyone.',
                 'Treat estimated or suggested language as guidance, not a verified outcome.',
-                'Use the Control Plane to review the available audit and integration evidence.',
+                'Use the Control Plane to review the available audit and access evidence.',
               ].map((text, i) => (
                 <div key={i} className="flex items-center gap-2.5">
                   <AlertCircle className="w-3.5 h-3.5 text-amber-v shrink-0" />

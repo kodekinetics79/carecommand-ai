@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { BadgeCheck, ShieldCheck, ShieldX, ShieldAlert, AlertTriangle, Loader2, Search, Settings2, History } from 'lucide-react';
+import { BadgeCheck, ShieldCheck, ShieldX, ShieldAlert, AlertTriangle, Loader2, Search, History } from 'lucide-react';
 import type { ElementType } from 'react';
 import BentoCard from '../components/ui/BentoCard';
 import EmptyStatePremium from '../components/ui/EmptyStatePremium';
@@ -8,7 +8,14 @@ import { crmService, type CrmPatient } from '../lib/crmService';
 import { formatCurrency } from '../utils/formatters';
 import { eligibilityRequestHeaders, runEligibilityAction } from '../lib/eligibilityIdempotency';
 
-interface ProviderRow { key: string; displayName: string; status: string; mode: string }
+// What the clinic is told about eligibility, in our words. The provider strip
+// that used to sit at the top of this screen listed three clearinghouses by
+// name with their per-vendor status, beside a link to a credential-entry
+// screen. A clinic cannot act on any of that; it can act on "not set up,
+// contact support".
+interface EligibilityCapability {
+  key: string; label: string; state: 'available' | 'test_data' | 'not_set_up'; detail: string; usable: boolean;
+}
 interface EligibilityResult {
   verificationId: string; status: string; coverageActive: boolean; planName: string; payerName: string;
   copay: number | null; deductibleRemaining: number | null; coinsurance: number | null; message: string; payerReference: string | null;
@@ -50,6 +57,11 @@ function statusLabel(status: string, decisionSource?: string | null): string {
   if (decisionSource === 'PAYER_RESPONSE') return `Payer reports ${state}`;
   return `Eligibility ${state}`;
 }
+const CAPABILITY_WORD: Record<'available' | 'test_data' | 'not_set_up', string> = {
+  available: 'Working',
+  test_data: 'Test data',
+  not_set_up: 'Not set up',
+};
 function formatBenefit(value: number | null): string { return value === null ? 'Unknown' : formatCurrency(value); }
 function formatCoinsurance(value: number | null): string {
   if (value === null) return 'Unknown';
@@ -69,7 +81,7 @@ const emptyEvidence = () => ({
 });
 
 export default function InsuranceEligibility() {
-  const [providers, setProviders] = useState<ProviderRow[]>([]);
+  const [capability, setCapability] = useState<EligibilityCapability | null>(null);
   const [patients, setPatients] = useState<CrmPatient[]>([]);
   const [history, setHistory] = useState<HistoryRow[]>([]);
   const [loading, setLoading] = useState(true);
@@ -90,11 +102,12 @@ export default function InsuranceEligibility() {
   }, [reconciliationFilter]);
   const load = useCallback(async () => {
     try {
-      const [prov, pats] = await Promise.all([
-        apiRequest<ProviderRow[]>('/v1/insurance/providers'),
+      const [caps, pats] = await Promise.all([
+        apiRequest<EligibilityCapability[]>('/v1/capabilities'),
         crmService.getPatients().catch(() => [] as CrmPatient[]),
       ]);
-      setProviders(prov); setPatients(pats);
+      setCapability(caps.find(row => row.key === 'eligibility_checks') ?? null);
+      setPatients(pats);
       await Promise.all([loadHistory(), loadReconciliations()]);
     } catch (e) { setError(e instanceof Error ? e.message : 'Failed to load'); }
     finally { setLoading(false); }
@@ -102,8 +115,10 @@ export default function InsuranceEligibility() {
   // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { void load(); }, [load]);
 
-  const stedi = providers.find(p => p.key === 'stedi');
-  const canCheck = !!stedi && (stedi.status === 'SANDBOX' || stedi.status === 'ACTIVE');
+  // Unknown is not the same as unavailable: while the capability is still
+  // loading the control stays disabled and says so, rather than rendering as
+  // ready and failing on submit.
+  const canCheck = capability?.usable === true;
   const valid = form.patientId && form.payerName.trim().length >= 2 && form.memberId.trim().length >= 2;
 
   async function check() {
@@ -172,22 +187,25 @@ export default function InsuranceEligibility() {
 
   return (
     <div className="space-y-4 pb-6">
-      {/* Provider status strip */}
-      <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-4 py-2.5">
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-          <span className="inline-flex items-center gap-1.5 text-[13px] font-semibold text-t1"><ShieldCheck className="w-4 h-4 text-indigo" /> Eligibility providers</span>
-          {providers.map(p => (
-            <span key={p.key} className="text-[11.5px] text-t3">{p.displayName}: <span className={`font-semibold ${p.status === 'SANDBOX' || p.status === 'ACTIVE' ? 'text-emerald-v' : 'text-t3'}`}>{p.status.replace('_', ' ').toLowerCase()}</span></span>
-          ))}
-        </div>
-        <a href="/integration-setup" className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-indigo hover:underline"><Settings2 className="w-3.5 h-3.5" /> Integration setup</a>
+      {/* Capability strip — one sentence, no supplier, and the next step is us. */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border border-[var(--b1)] bg-[var(--s1)] px-4 py-2.5">
+        <span className="inline-flex items-center gap-1.5 text-[13px] font-semibold text-t1"><ShieldCheck className="w-4 h-4 text-indigo" /> Eligibility checks</span>
+        <span className="text-[11.5px] text-t3">
+          {loading
+            ? 'Checking whether this clinic can run eligibility checks…'
+            : capability
+              ? <><span className={`font-semibold ${capability.usable ? 'text-emerald-v' : 'text-t3'}`}>{CAPABILITY_WORD[capability.state]}</span> — {capability.detail}</>
+              : 'We could not read whether eligibility checks are available. Nothing has been run.'}
+        </span>
       </div>
 
       <div className="grid gap-3 xl:grid-cols-[1fr_1fr] items-start">
         {/* Check form */}
-        <BentoCard title="Request Eligibility Response" subtitle="270/271 via the configured Stedi mode · a point-in-time response, not a coverage or payment guarantee" headerRight={<BadgeCheck className="w-4 h-4 text-t3" />}>
+        <BentoCard title="Request Eligibility Response" subtitle="Eligibility is a point-in-time response, not a coverage or payment guarantee" headerRight={<BadgeCheck className="w-4 h-4 text-t3" />}>
           {!canCheck && !loading && (
-            <div className="rounded-lg border border-[var(--b1)] bg-[var(--amber-soft)] p-3 text-[12px] text-amber-v mb-3">Stedi is not configured. Enable the sandbox in Integration Setup to run checks.</div>
+            <div className="rounded-lg border border-[var(--b1)] bg-[var(--amber-soft)] p-3 text-[12px] text-[#9A3412] mb-3">
+              {capability?.detail ?? 'We could not read whether eligibility checks are available, so nothing has been run.'}
+            </div>
           )}
           <div className="space-y-2.5">
             <Field label="Patient">
@@ -205,7 +223,11 @@ export default function InsuranceEligibility() {
             <button type="button" disabled={!valid || busy || !canCheck} onClick={check} className="inline-flex items-center gap-2 rounded-lg bg-[var(--indigo)] px-4 py-2 text-[13px] font-semibold text-white hover:opacity-90 disabled:opacity-50">
               {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />} Request eligibility response
             </button>
-            <p className="text-[10.5px] text-t3">Sandbox tip: member IDs ending <code className="font-mono">00</code> → inactive, <code className="font-mono">99</code> → needs review, starting <code className="font-mono">ERR</code> → error.</p>
+            {/* Only shown while the capability really is on test data. Printed
+                unconditionally it read as an instruction for live checks. */}
+            {capability?.state === 'test_data' && (
+              <p className="text-[10.5px] text-t3">Test data: member IDs ending <code className="font-mono">00</code> → inactive, <code className="font-mono">99</code> → needs review, starting <code className="font-mono">ERR</code> → error.</p>
+            )}
           </div>
         </BentoCard>
 
