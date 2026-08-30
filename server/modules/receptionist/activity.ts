@@ -18,6 +18,7 @@ import {
   type ReceptionistTaskKind,
 } from '../../lib/receptionist/frontDeskTask';
 import { assertBranchAccess } from '../../lib/scope';
+import { auditReceptionistMutation } from './shared';
 
 const LIVE_TASK_STATUS = ['OPEN', 'IN_PROGRESS'] as const;
 const PENDING_REQUEST_STATUS = ['PENDING_REVIEW', 'MISSING_INFO'] as const;
@@ -832,7 +833,7 @@ export const activityRoutes: FastifyPluginAsync = async app => {
       take: query.limit + 1,
       include: {
         campaign: { select: { id: true, name: true } },
-        patient: { select: { id: true, firstName: true, lastName: true } },
+        patient: { select: { id: true, firstName: true, lastName: true, humanOnly: true } },
         appointments: { select: { id: true }, take: 1, orderBy: { createdAt: 'desc' } },
         _count: { select: { staffTasks: { where: { status: { in: [...LIVE_TASK_STATUS] } } } } },
       },
@@ -854,6 +855,10 @@ export const activityRoutes: FastifyPluginAsync = async app => {
         callerPhoneMasked: maskDestination(row.callerPhone),
         patientId: row.patientId,
         patient: row.patient,
+        // Human only travels with the caller wherever staff see them. On the
+        // board it is the difference between "call them back" and "call them
+        // back, and never let the AI line try again".
+        humanOnly: row.patient?.humanOnly ?? false,
         direction: row.direction,
         outcome: row.outcome,
         durationSeconds: row.durationSeconds,
@@ -904,7 +909,7 @@ export const activityRoutes: FastifyPluginAsync = async app => {
         campaign: { select: { id: true, name: true } },
         reviewedBy: { select: { id: true, displayName: true } },
         signedOffBy: { select: { id: true, displayName: true } },
-        patient: { select: { id: true, firstName: true, lastName: true } },
+        patient: { select: { id: true, firstName: true, lastName: true, humanOnly: true, humanOnlyReason: true, humanOnlySetAt: true } },
         appointments: {
           select: {
             id: true, service: true, startsAt: true, status: true, notes: true,
@@ -959,6 +964,14 @@ export const activityRoutes: FastifyPluginAsync = async app => {
         sourceCallId: row.retellCallId,
       } : null,
       recordingAvailable: Boolean(usableRecordingUrl),
+      humanOnly: row.patient?.humanOnly ?? false,
+      // Comprehension evidence on the record itself: how many turns the line
+      // could not parse, and whether it gave up and handed the caller over.
+      // Reviewing a call means seeing this, not inferring it from a transcript.
+      comprehension: {
+        unparseableTurns: row.unparseableTurns,
+        bailedOutAt: row.comprehensionBailoutAt,
+      },
       recordingAccess: row.recordingPurgedAt
         ? 'purged'
         : !usableRecordingUrl
@@ -971,6 +984,60 @@ export const activityRoutes: FastifyPluginAsync = async app => {
       // One-cycle alias for clients still reading the old name.
       handoffReferences: handoffs,
     };
+  });
+
+  // ===== Human only =======================================================
+  // One tap from any call: this person must never be answered by the AI line
+  // again. It sits on the CALL because that is where a member of staff is
+  // standing when they learn it — listening to a recording of someone who could
+  // not get through — and it is stored on the PATIENT because it is a fact
+  // about the person, not about the call.
+  //
+  // A reason is required to raise it and to clear it. Not bureaucracy: the flag
+  // will outlive whoever set it, and the next person deserves to know whether
+  // it says "had a stroke, cannot use an automated line" or "was annoyed once".
+  const humanOnlyInput = z.object({
+    humanOnly: z.boolean(),
+    reason: z.string().trim().min(5).max(240),
+  }).strict();
+
+  app.patch('/call-logs/:id/human-only', { preHandler: bookingReviewRoles }, async (request, reply) => {
+    const { id } = idParam.parse(request.params);
+    const input = humanOnlyInput.parse(request.body);
+    return runWithTenantContext(request.auth.tenantId, async tx => {
+      const call = await tx.receptionistCallLog.findFirst({
+        where: { id, tenantId: request.auth.tenantId },
+        select: { id: true, patientId: true, callerPhone: true },
+      });
+      if (!call) throw app.httpErrors.notFound('Call log not found');
+      if (!call.patientId) {
+        // Said plainly rather than silently doing nothing. The flag lives on a
+        // patient record; a call from a number we cannot tie to one has no
+        // person to attach it to yet, and pretending otherwise would leave a
+        // member of staff believing a caller is protected when they are not.
+        return reply.code(409).send({
+          error: 'no_patient_on_call',
+          message: 'This call is not linked to a patient record, so there is nobody to mark. Link the caller to a patient first, then mark them Human only.',
+        });
+      }
+      const now = new Date();
+      const patient = await tx.patient.update({
+        where: { id: call.patientId },
+        data: input.humanOnly
+          ? { humanOnly: true, humanOnlyReason: input.reason, humanOnlySetAt: now, humanOnlySetByUserId: request.auth.userId }
+          : { humanOnly: false, humanOnlyReason: null, humanOnlySetAt: null, humanOnlySetByUserId: null },
+        select: { id: true, humanOnly: true, humanOnlyReason: true, humanOnlySetAt: true },
+      });
+      await auditReceptionistMutation(tx, request, {
+        action: input.humanOnly ? 'receptionistPatient.humanOnly.set' : 'receptionistPatient.humanOnly.cleared',
+        resource: 'patient',
+        resourceId: patient.id,
+        // The reason is staff-authored free text about a patient, so it stays
+        // out of the audit metadata and lives only on the row it describes.
+        metadata: { callLogId: call.id, humanOnly: patient.humanOnly, reasonRecorded: true },
+      });
+      return { patientId: patient.id, humanOnly: patient.humanOnly, humanOnlyReason: patient.humanOnlyReason, humanOnlySetAt: patient.humanOnlySetAt };
+    });
   });
 
   app.patch('/call-logs/:id/operator-review', { preHandler: bookingReviewRoles }, async (request, reply) => {

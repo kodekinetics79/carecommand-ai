@@ -4,7 +4,15 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { env } from '../../config/env';
 import { targetStatusAfterOutcome, DEFAULT_VOICE_MINUTES_LIMIT } from './outbound';
-import { admissionDenialPolicy, MAX_TENANT_ACTIVE_CALLS, type AdmissionDenialPolicy } from '../../lib/receptionist/admissionPolicy';
+import {
+  admissionDenialPolicy,
+  MAX_TENANT_ACTIVE_CALLS,
+  preAnswerRoutingPolicy,
+  REPEAT_CALLER_THRESHOLD,
+  REPEAT_CALLER_WINDOW_HOURS,
+  type AdmissionDenialPolicy,
+} from '../../lib/receptionist/admissionPolicy';
+import { humanOnlyAmong, patientsMatchingCallerPhone } from '../../lib/receptionist/humanOnly';
 import { runtimeDynamicVariableDefaults } from '../../lib/receptionist/runtimeVariables';
 import { buildHoursDynamicVariables, hoursStatus } from '../../lib/receptionist/clinicHours';
 import { loadHoursSource } from '../../lib/receptionist/hoursSource';
@@ -717,26 +725,49 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       // until the DOB ladder says which of them is on the line.
       const callerPhone = canonicalRetellDestination(inbound.from_number);
       let patientKnown = false;
+      // "Human only" is read on the SAME query as the returning-caller name, so
+      // honouring it costs nothing and can never be skipped by a code path that
+      // forgot to look. Two matches on one number (a couple, a family) are both
+      // read: if EITHER of them must never meet an AI line, this call does not
+      // meet one, because we cannot yet tell which of them is speaking.
+      let humanOnly = false;
       if (callerPhone) {
-        const matches = await db.$queryRaw<Array<{ firstName: string }>>`
-          SELECT "firstName"
-          FROM "Patient"
-          WHERE "tenantId" = ${inboundTenantId}::uuid
-            AND "deletedAt" IS NULL
-            AND "phone" IS NOT NULL
-            AND CASE
-              WHEN "phone" LIKE '+%' THEN '+' || regexp_replace("phone", '[^0-9]', '', 'g')
-              WHEN length(regexp_replace("phone", '[^0-9]', '', 'g')) = 10 THEN '+1' || regexp_replace("phone", '[^0-9]', '', 'g')
-              ELSE '+' || regexp_replace("phone", '[^0-9]', '', 'g')
-            END = ${callerPhone}
-          ORDER BY id
-          LIMIT 2
-        `;
+        const matches = await patientsMatchingCallerPhone(db, inboundTenantId, callerPhone);
+        humanOnly = humanOnlyAmong(matches);
         if (matches.length === 1) {
           variables.known_first_name = matches[0].firstName.trim().slice(0, 80);
           patientKnown = true;
         }
       }
+
+      // Three calls from one number in a morning is not a busy patient. It is
+      // the line failing that person and them trying again, and it is the one
+      // pattern the product can see and a practice manager cannot.
+      //
+      // A call that ended in a booking is not one of those, and is excluded: a
+      // family booking three appointments on one number in a morning is the
+      // product WORKING, and routing them to the front desk every time would
+      // spend a receptionist's afternoon punishing a good outcome. BOOKED is a
+      // narrow proxy for "resolved" and deliberately so — a message taken is
+      // not yet resolution, and until the product can say which callbacks were
+      // actually made, counting one as resolved would hide the failure this
+      // detector exists to find.
+      let repeatCallerCount = 0;
+      if (callerPhone && !humanOnly) {
+        repeatCallerCount = await db.receptionistCallLog.count({
+          where: {
+            tenantId: inboundTenantId,
+            clinicId: clinic.id,
+            direction: 'inbound',
+            callerPhone,
+            outcome: { not: 'BOOKED' },
+            createdAt: { gte: new Date(Date.now() - REPEAT_CALLER_WINDOW_HOURS * 3_600_000) },
+          },
+        });
+      }
+      // The row for THIS call does not exist yet, so the caller reaching the
+      // threshold is the one whose prior calls already number threshold - 1.
+      const repeatCaller = repeatCallerCount + 1 >= REPEAT_CALLER_THRESHOLD;
 
       // Admission moves here, off the first tool call. A caller who cannot be
       // admitted is told so in their first turn and routed to a human — rather
@@ -745,7 +776,29 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         clinicId: clinic.id, direction: 'inbound', reserve: false,
       });
       let admissionMessage: string | null = null;
-      if (!admission.allowed) {
+      // Caller-specific routing outranks tenant admission, and BOTH outrank
+      // "admitted". A Human-only caller is routed to a person even when the
+      // line is perfectly healthy — that is the entire point of the flag, and
+      // it is why this branch sits above the admission result rather than
+      // inside its failure path.
+      if (humanOnly || repeatCaller) {
+        const policy = preAnswerRoutingPolicy(humanOnly ? 'human_only' : 'repeat_caller');
+        variables.admission_state = policy.admissionState;
+        admissionMessage = speakOptionalPackMessage(pack?.strings, policy.messageKey, policy.fallbackMessage);
+        if (repeatCaller && !humanOnly) {
+          await recordWorkflowEvent(inboundTenantId, {
+            eventType: 'receptionist.call.repeat_caller',
+            entityType: 'receptionistClinic',
+            entityId: clinic.id,
+            sourceModule: 'receptionist',
+            payload: {
+              clinicId: clinic.id,
+              callsInWindow: repeatCallerCount + 1,
+              windowHours: REPEAT_CALLER_WINDOW_HOURS,
+            },
+          }).catch(() => undefined);
+        }
+      } else if (!admission.allowed) {
         const policy = admissionDenialPolicy(admission.reason);
         variables.admission_state = policy.admissionState;
         admissionMessage = speakOptionalPackMessage(pack?.strings, policy.messageKey, policy.fallbackMessage);
@@ -764,6 +817,11 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
           metadata: {
             clinic_id: clinic.id,
             patient_known: patientKnown,
+            // Both are stated as their own facts rather than being folded into
+            // `admission_state`, so the call record can say which one routed
+            // this caller and nobody has to reverse-engineer it from a string.
+            human_only: humanOnly,
+            repeat_caller: repeatCaller && !humanOnly,
             admission_state: variables.admission_state,
             ...(admissionMessage ? { admission_message: admissionMessage } : {}),
           },

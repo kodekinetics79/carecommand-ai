@@ -403,6 +403,8 @@ export const READINESS_KEYS = [
   'intake_attested',
   'placeholders_absent',
   'disclosure_composed',
+  'closing_disclosure_present',
+  'emergency_path_reachable',
   'confirmation_channels',
   'transfer_target_distinct',
   'test_call_completed',

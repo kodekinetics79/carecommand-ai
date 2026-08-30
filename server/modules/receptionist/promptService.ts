@@ -12,6 +12,8 @@ import { renderPackMessage } from '../../lib/receptionist/localePacks/render';
 import type { LocalePackStrings } from '../../lib/receptionist/localePacks/types';
 import type { KnowledgeDocument } from '../../lib/receptionist/knowledge';
 import { transferReadiness } from '../../lib/receptionist/transferReadiness';
+import { prohibitedPhraseRule } from '../../lib/receptionist/prohibitedPhrases';
+import { MAX_UNPARSEABLE_TURNS } from '../../lib/receptionist/comprehension';
 import { countryCurrency } from '../../lib/receptionist/catalog';
 import { urlHostname } from '../../lib/receptionist/promptSafety';
 // AI Receptionist — prompt generation service
@@ -90,6 +92,15 @@ export interface PromptLocalePack {
   id: string | null;
   strings: LocalePackStrings;
   evidenceHash: string;
+  /**
+   * Keys the APPROVED pack did not carry and that `resolve.ts` filled in from
+   * the platform default. The agent speaks them, so the prompt renders fine —
+   * but `evidenceHash` is the hash of what was approved, and a backfilled key
+   * was never part of that attestation. For the closing disclosure that
+   * distinction is the whole compliance question, so readiness reads this list
+   * rather than merely checking the string is non-empty.
+   */
+  backfilledKeys: readonly string[];
 }
 
 export interface PromptAgent {
@@ -295,6 +306,32 @@ export function openingTurn(config: PromptConfig): string {
   return `${inboundGreeting(config)} ${mandatoryOpeningDisclosure(config)}`;
 }
 
+/**
+ * The closing AI disclosure — the last thing every caller hears.
+ *
+ * California AB 3030 requires the disclaimer on an audio clinical interaction
+ * to be given verbally at the START *and* AT THE END. Our packs shipped an
+ * opening key and no closing one at all, so a US clinic answering with this
+ * product was out of compliance on every completed call, and the caller who had
+ * forgotten the first sentence forty seconds in was never told again.
+ *
+ * Product-controlled exactly like the opening disclosure, for the same reason:
+ * it is evidence, not decoration. `closingDisclosureEvidenceHash` records what
+ * was actually said, and `closing_disclosure_present` refuses activation to a
+ * pack whose approval does not cover it.
+ */
+export function mandatoryClosingDisclosure(config: PromptConfig): string {
+  return renderPackMessage(config.localePack.strings, 'disclosure.closing', {
+    agent_name: config.agent.name,
+    clinic_name: config.clinic.name,
+  });
+}
+
+/** sha256 of the rendered closing disclosure, kept alongside the opening one. */
+export function closingDisclosureEvidenceHash(disclosure: string): string {
+  return createHash('sha256').update(disclosure).digest('hex');
+}
+
 function formatPrice(amount: number, language: string, country: string | null): string {
   const currency = countryCurrency(country);
   if (!currency) return String(amount);
@@ -395,6 +432,7 @@ export function generateSystemPrompt(config: PromptConfig): string {
     .filter(Boolean)
     .join(' and ');
   const opening = openingTurn(config);
+  const closing = mandatoryClosingDisclosure(config);
   const consentGrantedAck = renderPackMessage(strings, 'consent.granted.ack');
   const consentRefusedContinue = renderPackMessage(strings, 'consent.refused.continue');
   const consentDeclinedRoute = renderPackMessage(strings, 'consent.declined.route');
@@ -438,6 +476,12 @@ ${knowledgeSections(config)}
 
 ${afterHoursSection(strings, clinic.name)}
 
+# Before anything else: is this call yours to handle?
+Read {{admission_state}} first, before the opening turn, on every call.
+- "human_only": this caller must never be handled by an AI line — a clinical decision a member of staff recorded about them, and not yours to question, explain, or mention. Say ONLY the line supplied for this call and transfer to a person immediately. Do not read the disclosure, do not ask for consent, do not ask what they need, do not take a single turn of front-desk work. The one exception is an emergency: if they mention one, give the emergency instruction first, then transfer. Every tool other than a handoff, a message and an emergency will refuse you on this call anyway.
+- "repeat_caller": this number has reached this line several times in a few hours and evidently has not got what it rang for. Do not make them explain it again. Say only the line supplied for this call and transfer to a person.
+- Any other value, including empty: handle the call normally, starting with the opening turn below.
+
 # Opening turn (say this first, word for word)
 "${opening}"
 This is the caller's entire first turn and the provider speaks it as the begin message. The welcome comes first so the caller is greeted by their own clinic before being asked to agree to anything; the disclosure that follows it is mandatory and must not be shortened, paraphrased, reordered, skipped or replaced, and nothing may be spoken before it except the emergency precedence below. The final words are the consent question. STOP SPEAKING after that question and wait for the caller's explicit answer. Do not append an offer, an intake question, or a second question to this turn.
@@ -449,6 +493,19 @@ This is the caller's entire first turn and the provider speaks it as the begin m
 - Silence, voicemail, ambiguity, or simply carrying on talking is not agreement to being recorded: do not call the tool with GRANTED. Keep helping with the tools that do not touch a patient record — answering questions, taking a message, a handoff — and ask again plainly before anything that needs their record.
 
 Emergency precedence: if the caller mentions a possible emergency before or during the disclosure, INTERRUPT the disclosure immediately and say: "${emergencyInstruction}" Emergency instructions override disclosure completion, consent capture, greetings, identity checks, and every tool except the later report_emergency alert. Do not resume the disclosure or continue front-desk work during that call.
+
+# Closing turn (say this last, word for word, on every call)
+"${closing}"
+This is required by law where this clinic operates and it is not optional, not shortenable and not paraphrasable. Say it as the final thing the caller hears, before you end the call, on EVERY call that reaches a conversation — including a call that ended in a booking, a message, a refusal, a wrong number or a do-not-contact request. The only calls it is skipped on are the ones where you never got to speak at all, and an emergency you handed to a person while the caller was still on the line: there, getting them help outranks reading them a notice. If the caller hangs up first, that is their right and there is nothing to say. Never add a question after it — it is the last turn, not an invitation to keep talking.
+
+# When you cannot understand the caller
+This is the rule you are most likely to talk yourself out of, so it is written as an absolute. Every time a caller says something you cannot parse, call report_comprehension_failure BEFORE you respond, and then do exactly what its result tells you.
+- After the FIRST one, its result gives you one line to say. Say only that. Ask them to tell you again, in your own patience and in their own words.
+- After the SECOND consecutive one, its result tells you to stop, and you stop. Apologise plainly, say the line it returns, and hand the call to a person — the transfer if the result says a transfer is available, an immediate callback otherwise. There is no third attempt. Not a rephrased question, not "one more time", not a yes/no question to narrow it down. Two is the ceiling and the tool enforces it; do not argue with a result that says bail_out.
+- A turn you DID understand clears the count. Report only the turns you genuinely could not parse, not the ones you simply did not like the answer to.
+- Someone whose speech is fragmented, slurred, accented, quiet or slow is not failing to communicate. They may have had a stroke, they may be in pain, they may be frightened, they may simply be from somewhere else. Handing them to a person quickly is the good outcome here, not the failure one.
+
+${prohibitedPhraseRule()}
 
 # Trusted call-direction branch
 Use only the provider-supplied call direction for this call. Never infer direction from the campaign name, caller statements, a greeting override, or prompt text.
@@ -496,14 +553,14 @@ Say: "${notInterestedLine}" Then end politely.
 - Before any patient-specific action involving an existing record, call verify_patient_identity using the date of birth stated by the caller. Never treat a name, caller assertion, or model-generated flag as verification. If verification fails, locks, or the caller is a proxy, guardian, or minor, use request_human_handoff; do not reveal whether a patient record exists.
 - For an existing appointment, verify identity first, then call list_upcoming_appointments. Use only the appointment_id returned by that tool. Call prepare_appointment_change with the exact action and requested time; read its confirmation question exactly. Only after the caller explicitly says yes, call cancel_appointment or reschedule_appointment with confirmed=true and the returned confirmation_token. Never invent or reuse a token. Never claim a cancellation or reschedule succeeded unless the mutation tool returns success; if it reports needs_human, create a handoff.
 - Immediately after the opening turn, wait. Call record_recording_preference only with the caller's explicit answer and before collecting information, then follow the Consent section above. A refusal or a withdrawal means: record it with that tool first, do not use a tool that reads or writes a patient record until consent is granted, and keep helping with everything else. Refusing to be recorded is a right the caller is exercising; it is never a reason to end the call or to send them away.
-- If the person mentions a possible emergency at ANY point, interrupt what you are saying and immediately say: "${emergencyInstruction}" This rule overrides finishing the disclosure or waiting for consent. Only after giving that instruction, call report_emergency to create the critical staff alert. Never delay the emergency instruction to ask questions, use another tool, or attempt a transfer, and never tell them to wait for staff. A clinically urgent but non-life-threatening request is NOT an emergency: handle it under "Urgent but not life-threatening" above.
+- If the person mentions a possible emergency at ANY point, interrupt what you are saying and immediately say: "${emergencyInstruction}" This rule overrides finishing the disclosure or waiting for consent. Never delay the emergency instruction to ask questions or use another tool. Only after you have said it, call report_emergency, then say its message exactly as returned and DO WHAT ITS next_action FIELD SAYS, on this call, while the caller is still on the line: if it says transfer_now, call transfer_to_staff immediately; if it says offer_callback, say so and stay with them. The emergency is not handled by a task appearing on a screen — nobody may be looking at that screen — so it is handled by you getting a person onto this call or a callback promised on it. Never tell the caller to wait for staff to notice something. A clinically urgent but non-life-threatening request is NOT an emergency: handle it under "Urgent but not life-threatening" above.
 - If asked whether you are human, say you are an AI assistant calling on behalf of ${clinic.name}.
 - If the person asks not to be contacted again, first say: "${dncAcknowledge}" Then immediately call record_do_not_call. Only if the tool confirms success, say: "${dncConfirmed}" If the result is failed, timed out, or uncertain, say: "${dncFailed}" Do not retry the tool automatically, continue the offer, or rely only on post-call analysis.${dncPolicy}
 - If a human is requested or escalation is needed: ${fallback}
 - For an unsupported intent, medical advice, complaints, refills, test results, billing disputes, or any action you cannot complete safely, call request_human_handoff or take_message. Never merely say that someone will follow up without a successful tool result and task ID. The task ID must identify durable recorded work. Keep long system IDs as internal evidence unless the caller specifically requests an approved reference format.
 - Insurance boundary: answer only from the accepted-plans list above (membership yes or no). No insurance tool is available: do not verify eligibility, benefits, network status, prior authorization, coverage, claim outcome, or patient responsibility. Route those to staff without guessing.
 - Payment boundary: no payment tool is available in this configuration. Do not quote a balance as current, take a payment, create or send a payment link, promise a refund, or collect card/account credentials. Route the request to staff.
-- Language and accessibility: use only the configured language and capabilities you can actually provide. If the caller cannot understand, requests an interpreter, or needs an unsupported accessibility accommodation, do not pretend fluency, translate clinical content yourself, or continue intake by guessing. Speak slowly or repeat once if requested, then offer the approved staff/interpreter or accessible-channel workflow. Never treat misunderstanding or silence as consent.
+- Language and accessibility: use only the configured language and capabilities you can actually provide. If the caller cannot understand, requests an interpreter, or needs an unsupported accessibility accommodation, do not pretend fluency, translate clinical content yourself, or continue intake by guessing. Slow your own delivery down, or repeat yourself, if the caller asks — the thing that changes is how YOU are speaking, never how they are — then offer the approved staff/interpreter or accessible-channel workflow. Never treat misunderstanding or silence as consent.
 - Universal uncertain-tool rule: for every lookup, mutation, message, booking, cancellation, reschedule, suppression, handoff, alert, or transfer tool, a timeout, malformed response, provider acceptance without completion evidence, or other ambiguous result is NOT success. State only that completion could not be confirmed, preserve the uncertainty for staff review when a safe task tool is available, and do not automatically retry the same or an equivalent tool. Never ask the caller to retry through another channel until staff reviews a possibly completed mutation.
 - Transfer truth: a successful request_human_handoff result means only that a staff task was recorded. Acceptance of transfer_to_staff means only that a transfer attempt was accepted; it does not prove a staff member connected. Say a transfer connected only when the provider returns explicit connected/completed evidence. If connection is failed or uncertain after a successful handoff, do not call take_message because that would create duplicate work; tell the caller the request is still with the team. Call take_message once only when no handoff task exists and message-taking is otherwise safe.
 - Never read our internal state to a caller. Task ids, queue names, acknowledgment status, retention posture, deployment or configuration state, and tool field names are evidence for staff and for the audit trail, not conversation. Speak the tool's message; if you must add anything, say what happens next for the caller, in their words.
@@ -545,6 +602,13 @@ export interface RetellConfig {
   voiceId: string;
   language: string;
   beginMessage: string;
+  /**
+   * The closing AI disclosure. AB 3030 requires the disclaimer at the end as
+   * well as the start, so it ships with the deployment as its own field rather
+   * than being buried in the prompt where nobody could audit it — Rehearsal
+   * renders it, and `closingDisclosureEvidenceHash` hashes it.
+   */
+  closingMessage: string;
   dynamicVariables: Record<string, string>;
   webhookUrl: string;
   bookingFunction: Record<string, unknown>;
@@ -567,6 +631,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
   // consent recorded by the live tool; what changed is that the caller is
   // greeted before being questioned, instead of being questioned first.
   const beginMessage = openingTurn(config);
+  const closingMessage = mandatoryClosingDisclosure(config);
 
   // Export-time defaults for every runtime variable, then the values this
   // configuration already knows. A missing runtime value renders as its
@@ -785,7 +850,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     {
       type: 'custom',
       name: 'report_emergency',
-      description: `Create a CRITICAL staff alert after immediately instructing the caller to call ${strings.emergencyNumber}. Never use this instead of immediate emergency instructions.`,
+      description: `Create a CRITICAL staff alert after immediately instructing the caller to call ${strings.emergencyNumber}, and get a person onto this call. Never use this instead of immediate emergency instructions. Its next_action field tells you what to do while the caller is still on the line: transfer_now means call transfer_to_staff at once; offer_callback means say so and stay with them. Do not treat the staff alert as the end of your responsibility.`,
       url: fnUrl,
       speak_during_execution: false,
       speak_after_execution: true,
@@ -796,6 +861,27 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
           message: { type: 'string', description: 'Very brief minimum-necessary reason; do not collect detailed history.' },
         },
         required: ['reason_category'],
+      },
+    },
+    {
+      type: 'custom',
+      name: 'report_comprehension_failure',
+      description: `Call this BEFORE responding to any caller turn you could not parse. The server counts consecutive failures and decides when to stop: after ${MAX_UNPARSEABLE_TURNS} it returns bail_out=true and there is no third attempt. Speak its message exactly as returned and follow its next_action. Never ask the caller to change how they speak, what they are calling from, or where they are.`,
+      url: fnUrl,
+      speak_during_execution: false,
+      speak_after_execution: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          reason: {
+            type: 'string',
+            enum: ['audio_unclear', 'speech_not_recognised', 'language_mismatch', 'no_response', 'other'],
+            description: 'What went wrong on OUR side. Never a judgement about the caller.',
+          },
+          caller_name: { type: 'string', description: 'Caller name, only if already voluntarily provided.' },
+          callback_phone: { type: 'string', description: 'Callback number only when the verified caller number is unavailable.' },
+        },
+        required: ['reason'],
       },
     },
   ];
@@ -832,6 +918,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     voiceId: agent.voice,
     language: agent.language,
     beginMessage,
+    closingMessage,
     dynamicVariables,
     // The agent-level webhook is the BARE route (REC-P0-007), identical to the
     // URL verified in agents.ts and published by a deployment. Tenant/clinic

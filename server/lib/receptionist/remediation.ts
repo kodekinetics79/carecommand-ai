@@ -88,6 +88,11 @@ export type ReadinessKey =
   // What the caller hears.
   | 'placeholders_absent'
   | 'disclosure_composed'
+  // Caller safety. Both BLOCK: a clinic whose emergency path is a screen nobody
+  // is watching, or whose approved wording never says goodbye as an AI, should
+  // not be answering patient calls at all.
+  | 'closing_disclosure_present'
+  | 'emergency_path_reachable'
   | 'confirmation_channels'
   | 'transfer_target_distinct'
   | 'test_call_completed'
@@ -98,7 +103,8 @@ export const READINESS_KEYS: readonly ReadinessKey[] = [
   'clinic_country_set', 'clinic_hours_set', 'locale_pack_approved', 'agent_language_supported',
   'agent_linked', 'agent_verified', 'deployment_current', 'number_bound',
   'location_mapped', 'services_bookable', 'provider_availability', 'provider_resolvable', 'intake_attested',
-  'placeholders_absent', 'disclosure_composed', 'confirmation_channels', 'transfer_target_distinct',
+  'placeholders_absent', 'disclosure_composed', 'closing_disclosure_present', 'emergency_path_reachable',
+  'confirmation_channels', 'transfer_target_distinct',
   'test_call_completed', 'data_storage_setting',
 ];
 
@@ -231,6 +237,8 @@ const CATALOGUE = {
   placeholders_absent: { title: 'Placeholder text is still in the configuration', action: 'Replace the pre-filled example values listed below before this agent speaks to a patient.', scope: 'campaign', severity: 'blocking', fixTab: 'campaign', retryable: false },
   placeholders_present: { title: 'Placeholder text is still in the configuration', action: 'Replace the pre-filled example values before deploying. A patient must never hear "New offer".', scope: 'campaign', severity: 'blocking', fixTab: 'campaign', retryable: false },
   disclosure_composed: { title: 'The clinic adds no disclosure wording', action: 'The product’s baseline AI and recording disclosure is used on its own. Add clinic-specific wording if your jurisdiction requires it.', scope: 'clinic', severity: 'warning', fixTab: 'clinic', retryable: false },
+  closing_disclosure_present: { title: 'The approved wording never tells the caller they spoke to an AI at the end', action: 'California AB 3030 requires the AI disclosure at the END of a call as well as the start, and this clinic’s approved wording does not carry one. Approve the current version of the wording pack, which includes it.', scope: 'clinic', severity: 'blocking', fixTab: 'clinic', retryable: false },
+  emergency_path_reachable: { title: 'An emergency would only appear on a screen', action: 'Set a human fallback number that a person answers. Without one the receptionist cannot put an emergency caller through or promise a callback during the call, and the alert waits on the Front Desk board for somebody to look at it.', scope: 'clinic', severity: 'blocking', fixTab: 'clinic', retryable: false },
   confirmation_channels: { title: 'A confirmation channel is enabled but not configured', action: 'Configure the messaging provider, or turn the confirmation off. The agent must not promise a text it cannot send.', scope: 'campaign', severity: 'blocking', fixTab: 'campaign', retryable: false },
   confirmation_channel_unconfigured: { title: 'That confirmation channel is not configured', action: 'Configure the messaging provider before enabling this confirmation, so the agent never promises a message it cannot send.', scope: 'campaign', severity: 'blocking', fixTab: 'campaign', retryable: false },
   transfer_target_distinct: { title: 'The transfer number loops back to the AI line', action: 'Set a human fallback number that differs from the clinic’s AI line, or a transfer would return the caller to the agent.', scope: 'clinic', severity: 'blocking', fixTab: 'clinic', retryable: false },

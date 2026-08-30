@@ -18,6 +18,11 @@ export type WorkflowEventType =
   | 'receptionist.knowledge.approved' | 'receptionist.locale_pack.approved'
   // An ACTIVE campaign that no longer passes its own activation gate (B8).
   | 'receptionist.campaign.readiness_regressed'
+  // Caller safety. Both of these say the same thing in different words — the AI
+  // line is failing a specific human being — so both are events with signals
+  // rather than a new alerting channel nobody would have built.
+  | 'receptionist.call.comprehension_bailout'
+  | 'receptionist.call.repeat_caller'
   | 'deposit.required' | 'deposit.missing' | 'deposit.paid'
   | 'payment.request.created' | 'payment.link.created' | 'payment.succeeded' | 'payment.failed' | 'payment.expired'
   | 'revenue.leakage_detected'
@@ -136,6 +141,46 @@ async function deriveFromEvent(tenantId: string, input: EventInput, eventId: str
       await upsertSignal(tenantId, {
         signalType: 'after_hours_call', entityType: 'receptionistClinic', entityId: clinicId, severity: 'low', score: 20,
         reason: `${count} inbound call${count === 1 ? '' : 's'} arrived outside configured hours in the last 7 days.`, sourceEventId: eventId,
+      });
+      break;
+    }
+    case 'receptionist.call.comprehension_bailout': {
+      // The line could not understand a caller and handed them to a person. The
+      // event is per call; the signal is per clinic and carries a rolling
+      // 30-day count, because ONE of these is a bad minute for one patient and
+      // a rising count is a product that is failing a class of people — the
+      // exact pattern Healthwatch Rotherham logged and nobody's dashboard
+      // showed. Once a human resolves it, it is never reopened.
+      const clinicId = typeof input.payload?.clinicId === 'string' ? input.payload.clinicId : null;
+      if (!clinicId) break;
+      const since = new Date(Date.now() - 30 * 86_400_000);
+      const count = await db.receptionistCallLog.count({
+        where: { tenantId, clinicId, comprehensionBailoutAt: { gte: since } },
+      });
+      await upsertSignal(tenantId, {
+        signalType: 'receptionist_comprehension_bailout', entityType: 'receptionistClinic', entityId: clinicId,
+        severity: 'high', score: 75,
+        reason: `The receptionist could not understand ${count} caller${count === 1 ? '' : 's'} in the last 30 days and handed them to a person. Callers with a speech difference, a strong accent or a poor line are the ones this happens to.`,
+        sourceEventId: eventId,
+      });
+      break;
+    }
+    case 'receptionist.call.repeat_caller': {
+      // Three or more calls from one number in a short window is not a busy
+      // patient; it is the AI failing that person and them trying again. The
+      // signal is per clinic so it aggregates, and the payload keeps the window
+      // so the reason line can never claim more than it measured.
+      const clinicId = typeof input.payload?.clinicId === 'string' ? input.payload.clinicId : null;
+      const calls = typeof input.payload?.callsInWindow === 'number' ? input.payload.callsInWindow : null;
+      const hours = typeof input.payload?.windowHours === 'number' ? input.payload.windowHours : null;
+      if (!clinicId) break;
+      await upsertSignal(tenantId, {
+        signalType: 'receptionist_repeat_caller', entityType: 'receptionistClinic', entityId: clinicId,
+        severity: 'high', score: 70,
+        reason: calls && hours
+          ? `One number reached this line ${calls} times in ${hours} hours without getting what they rang for. They were routed to a person.`
+          : 'One number reached this line repeatedly in a short window without getting what they rang for. They were routed to a person.',
+        sourceEventId: eventId,
       });
       break;
     }

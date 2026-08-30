@@ -203,9 +203,9 @@ describe('deploying a campaign to Retell', () => {
       // re-derivation of it, so this is the published payload under test.
       const row = await db.receptionistAgentDeployment.findFirstOrThrow({ where: { campaignId: campaign.id } });
       const tools = row.toolsJson as Array<Record<string, unknown>>;
-      expect(tools).toHaveLength(13);
+      expect(tools).toHaveLength(14);
       for (const tool of tools) expect(RETELL_GENERAL_TOOL_TYPES).toContain(tool.type);
-      expect(tools.filter(tool => tool.type === 'custom')).toHaveLength(12);
+      expect(tools.filter(tool => tool.type === 'custom')).toHaveLength(13);
       expect(tools.filter(tool => tool.type === 'transfer_call').map(tool => tool.name)).toEqual(['transfer_to_staff']);
       expect(tools.some(tool => tool.type === 'function')).toBe(false);
 
@@ -480,7 +480,8 @@ describe('readiness and activation', () => {
       expect(keys).toEqual(expect.arrayContaining([
         'agent_linked', 'agent_verified', 'deployment_current', 'number_bound', 'location_mapped',
         'services_bookable', 'provider_availability', 'intake_attested', 'placeholders_absent',
-        'disclosure_composed', 'confirmation_channels', 'transfer_target_distinct', 'test_call_completed', 'data_storage_setting',
+        'disclosure_composed', 'closing_disclosure_present', 'emergency_path_reachable',
+        'confirmation_channels', 'transfer_target_distinct', 'test_call_completed', 'data_storage_setting',
       ]));
       expect(readiness.json().ready).toBe(false);
       expect(readiness.json().actions.activate.allowed).toBe(false);

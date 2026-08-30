@@ -131,3 +131,57 @@ export function admissionDenialPolicy(reason: string): AdmissionDenialPolicy {
     fallbackMessage: UNAVAILABLE_FALLBACK,
   };
 }
+
+// ===========================================================================
+// Pre-answer routing — the two reasons a specific CALLER is sent to a person
+// before the receptionist takes a single turn.
+//
+// These are deliberately not admission denials. Admission is about the tenant:
+// whether this workspace may take another call at all. These are about the
+// person on the line, and nothing is wrong with the line when they fire. They
+// share the `AdmissionDenialPolicy` shape because the webhook needs exactly the
+// same four things from both — a spoken line, a disposition, an
+// `admission_state` for the prompt, and a fallback for a clinic with no pack.
+//
+// Neither line ever tells the caller why. A patient marked Human only does not
+// need to be read their own flag back to them, and a patient calling for the
+// third time needs a person, not an explanation.
+// ===========================================================================
+
+export const PRE_ANSWER_ROUTING_REASONS = ['human_only', 'repeat_caller'] as const;
+export type PreAnswerRoutingReason = (typeof PRE_ANSWER_ROUTING_REASONS)[number];
+
+const HUMAN_ONLY_FALLBACK = "Thanks for calling. I'm putting you straight through to someone at the front desk now — please stay on the line.";
+const REPEAT_CALLER_FALLBACK = "Thanks for calling back. Rather than have you go through this again, I'm putting you straight through to someone at the front desk — please stay on the line.";
+
+export function preAnswerRoutingPolicy(reason: PreAnswerRoutingReason): AdmissionDenialPolicy {
+  if (reason === 'human_only') {
+    return {
+      reason,
+      disposition: 'transfer_to_human',
+      messageKey: 'admission.denied.human_only',
+      admissionState: 'human_only',
+      fallbackMessage: HUMAN_ONLY_FALLBACK,
+    };
+  }
+  return {
+    reason,
+    disposition: 'transfer_to_human',
+    messageKey: 'admission.denied.repeat_caller',
+    admissionState: 'repeat_caller',
+    fallbackMessage: REPEAT_CALLER_FALLBACK,
+  };
+}
+
+/**
+ * Three or more calls from one number inside this window is the detector.
+ *
+ * Not a hunch: the Front Desk "What it missed" lane already defines a repeat
+ * caller as the same number reaching the line three times with no resolution,
+ * and this is where that definition lives so the lane and the router cannot
+ * disagree. Six hours is a morning: long enough that a genuine third call is
+ * evidence the line is failing someone, short enough that a patient who rang in
+ * January is not still counted in June.
+ */
+export const REPEAT_CALLER_WINDOW_HOURS = 6;
+export const REPEAT_CALLER_THRESHOLD = 3;

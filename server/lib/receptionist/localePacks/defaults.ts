@@ -30,6 +30,10 @@ const EN_US_V1: PlatformLocalePack = {
     dateStyle: 'weekday-month-day',
     messages: {
       'disclosure.recording': RECORDING_DISCLOSURE_EVIDENCE_TEMPLATE,
+      // AB 3030: the disclaimer is required at the end as well as the start.
+      // It names what the caller was speaking to and how to reach a person,
+      // because the same statute requires that instruction too.
+      'disclosure.closing': 'Before you go — just so you know, you have been speaking with {{agent_name}}, an AI assistant for {{clinic_name}}, and not a member of staff. If you would like to speak with a person about anything from this call, call us back and ask for the front desk. Take care.',
       'dnc.acknowledge': 'I heard your request. I am recording it now.',
       'dnc.confirmed': 'Your do-not-contact request is recorded. I will end the call now.',
       'dnc.failed': 'I could not confirm that the request was recorded. I will end this call and flag it for staff review.',
@@ -62,6 +66,21 @@ const EN_US_V1: PlatformLocalePack = {
       'admission.denied.capacity': "We're taking more calls than usual right now, so rather than keep you waiting I'll put you through to the front desk.",
       'admission.denied.demo': "Thanks for calling. This line is set up for demonstration only and isn't taking patient calls, so I won't take your details here. Please call the practice on its main number.",
       'admission.denied.unavailable': "I'm sorry, the automated line isn't available right now. Let me put you through to the front desk instead.",
+      // Caller safety — routed to a person before the receptionist takes a
+      // turn. Neither line tells the caller why they were routed.
+      'admission.denied.human_only': "Thanks for calling. I'm putting you straight through to someone at the front desk now — please stay on the line.",
+      'admission.denied.repeat_caller': "Thanks for calling back. Rather than have you go through this again, I'm putting you straight through to someone at the front desk — please stay on the line.",
+
+      // Caller safety — the emergency path happens on the call, not on a board
+      // somebody may not be watching.
+      'emergency.transfer.line': "I'm also connecting you to someone at the practice right now. Please stay on the line.",
+      'emergency.callback.line': "I have alerted the practice, and someone will call you straight back on this number. Please don't wait for that call if you need help now.",
+
+      // Caller safety — comprehension. One retry, then a person. Nothing here
+      // asks the caller to change how they speak or what they are calling from.
+      'comprehension.retry': "I'm sorry, that's my fault — I didn't catch that. Could you tell me again?",
+      'comprehension.bail_out.transfer': "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I'm putting you through to a person at the practice now. Please stay on the line.",
+      'comprehension.bail_out.callback': "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've asked someone at the practice to call you straight back on this number, and I've written down that we spoke.",
 
       // C12 — what the caller hears when they ask for a human. The task id and
       // the acknowledgment state stay in the structured result, not here.
@@ -91,6 +110,7 @@ const EN_GB_V1: PlatformLocalePack = {
     dateStyle: 'weekday-day-month',
     messages: {
       'disclosure.recording': "Hi, I'm {{agent_name}}, an AI assistant for {{clinic_name}}. This call may be recorded or monitored for quality and training purposes.{{clinic_disclosure}} Is that okay?",
+      'disclosure.closing': 'Before you go — just so you know, you have been speaking with {{agent_name}}, an AI assistant for {{clinic_name}}, and not a member of the team. If you would like to speak with a person about anything from this call, ring us back and ask for reception. Take care.',
       'dnc.acknowledge': 'I heard your request. I am recording it now.',
       'dnc.confirmed': 'Your do-not-contact request is recorded. I will end the call now.',
       'dnc.failed': 'I could not confirm that the request was recorded. I will end this call and flag it for the team to review.',
@@ -123,6 +143,21 @@ const EN_GB_V1: PlatformLocalePack = {
       'admission.denied.capacity': "We're taking more calls than usual right now, so rather than keep you waiting I'll put you through to reception.",
       'admission.denied.demo': "Thanks for calling. This line is set up for demonstration only and isn't taking patient calls, so I won't take your details here. Please ring the practice on its main number.",
       'admission.denied.unavailable': "I'm sorry, the automated line isn't available right now. Let me put you through to reception instead.",
+      // Caller safety — routed to a person before the receptionist takes a
+      // turn. Neither line tells the caller why they were routed.
+      'admission.denied.human_only': "Thanks for calling. I'm putting you straight through to someone at reception now — please stay on the line.",
+      'admission.denied.repeat_caller': "Thanks for ringing back. Rather than have you go through this again, I'm putting you straight through to someone at reception — please stay on the line.",
+
+      // Caller safety — the emergency path happens on the call, not on a board
+      // somebody may not be watching.
+      'emergency.transfer.line': "I'm also connecting you to someone at the practice right now. Please stay on the line.",
+      'emergency.callback.line': "I have alerted the practice, and someone will ring you straight back on this number. Please don't wait for that call if you need help now.",
+
+      // Caller safety — comprehension. One retry, then a person. Nothing here
+      // asks the caller to change how they speak or what they are calling from.
+      'comprehension.retry': "I'm sorry, that's my fault — I didn't catch that. Could you tell me again?",
+      'comprehension.bail_out.transfer': "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I'm putting you through to a person at the practice now. Please stay on the line.",
+      'comprehension.bail_out.callback': "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've asked someone at the practice to ring you straight back on this number, and I've written down that we spoke.",
 
       // C12 — what the caller hears when they ask for a human. The task id and
       // the acknowledgment state stay in the structured result, not here.
