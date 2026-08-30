@@ -527,10 +527,18 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     human_fallback_number: clinic.humanFallbackNumber ?? '',
   };
 
-  // Live custom-function tools: Retell calls these URLs DURING the call so the
-  // The agent asks the canonical scheduling service for current open slots and
+  // Live custom tools: Retell calls these URLs DURING the call so the
+  // agent asks the canonical scheduling service for current open slots and
   // books only from a successful tool result. Confirmation dispatch and final
   // delivery are separate states and must be reported exactly.
+  //
+  // `type` is Retell's oneOf discriminator on `general_tools[]` and the ONLY
+  // accepted values are end_call, press_digit, custom, transfer_call,
+  // bridge_transfer, cancel_transfer and mcp. A webhook-backed tool is
+  // `custom`; `function` is an OpenAI word Retell rejects with 400
+  // invalid_request, which is exactly how the first live deploy died. The mock
+  // provider now enforces that same enum (server/lib/receptionist/retellMock.ts)
+  // so this can never again be discovered on a real account.
   const fnUrl = expectedRetellToolUrl(clinic.id, options.webhookBaseUrl);
   const intakeContract = compileIntakeContract({
     campaignId: campaign.id,
@@ -546,7 +554,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
   const bookingFunction = buildBookAppointmentTool({ snapshot: intakeContract.snapshot, clinicName: clinic.name });
   const tools: Array<Record<string, unknown>> = [
     {
-      type: 'function',
+      type: 'custom',
       name: 'record_recording_preference',
       description: 'Immediately record the caller\'s explicit response to the approved AI/recording disclosure. Call this before collecting information. On refusal or withdrawal, do not use any other patient-data tool; offer human fallback.',
       url: fnUrl,
@@ -562,7 +570,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
       },
     },
     {
-      type: 'function',
+      type: 'custom',
       name: 'record_do_not_call',
       description: 'After acknowledging the request, persist an ALL-channel do-not-contact suppression for the verified party on this call. Report success only from a confirmed tool result. On failure or uncertainty, do not retry automatically or continue the offer; end and flag staff review.',
       url: fnUrl,
@@ -571,7 +579,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
       parameters: { type: 'object', properties: {}, required: [] },
     },
     {
-      type: 'function',
+      type: 'custom',
       name: 'verify_patient_identity',
       description: 'Verify an existing patient for this call using the provider-observed caller number plus date of birth. Required before any patient-specific action involving an existing record. Never use for a proxy, guardian, or minor; route those cases to staff.',
       url: fnUrl,
@@ -586,7 +594,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
       },
     },
     {
-      type: 'function',
+      type: 'custom',
       name: 'list_upcoming_appointments',
       description: 'After verify_patient_identity succeeds, list the verified caller\'s upcoming appointments that can be changed. Never call before verification and never reveal results to a proxy, guardian, or minor.',
       url: fnUrl,
@@ -595,7 +603,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
       parameters: { type: 'object', properties: {}, required: [] },
     },
     {
-      type: 'function',
+      type: 'custom',
       name: 'prepare_appointment_change',
       description: 'Create a short-lived server-held confirmation for one verified caller-owned cancellation or reschedule. Read the returned confirmation question and wait for an explicit yes before calling the mutation tool.',
       url: fnUrl,
@@ -613,7 +621,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
       },
     },
     {
-      type: 'function',
+      type: 'custom',
       name: 'cancel_appointment',
       description: 'Cancel only after prepare_appointment_change returned a confirmation_token and the verified caller explicitly said yes. Never promise a refund; report the tool result exactly.',
       url: fnUrl,
@@ -631,7 +639,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
       },
     },
     {
-      type: 'function',
+      type: 'custom',
       name: 'reschedule_appointment',
       description: 'Move an appointment only after prepare_appointment_change validates the exact new time and the verified caller explicitly says yes.',
       url: fnUrl,
@@ -650,7 +658,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
       },
     },
     {
-      type: 'function',
+      type: 'custom',
       name: 'check_availability',
       description: `Ask the canonical scheduling service for currently open appointment slots at ${clinic.name} on a date. ALWAYS call this before offering times or booking, and never imply a returned slot is held.`,
       url: fnUrl,
@@ -666,7 +674,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     },
     bookingFunction,
     {
-      type: 'function',
+      type: 'custom',
       name: 'request_human_handoff',
       description: 'Create an acknowledgment-required staff handoff/callback task. ALWAYS call this before attempting transfer_to_staff. Never imply staff has seen it or claim a transfer completed from this tool result.',
       url: fnUrl,
@@ -684,7 +692,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
       },
     },
     {
-      type: 'function',
+      type: 'custom',
       name: 'take_message',
       description: 'Create a staff callback task when no human transfer is configured, a transfer fails, or the request cannot safely be completed.',
       url: fnUrl,
@@ -702,7 +710,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
       },
     },
     {
-      type: 'function',
+      type: 'custom',
       name: 'report_emergency',
       description: `Create a CRITICAL staff alert after immediately instructing the caller to call ${strings.emergencyNumber}. Never use this instead of immediate emergency instructions.`,
       url: fnUrl,

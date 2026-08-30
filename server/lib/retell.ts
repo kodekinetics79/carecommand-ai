@@ -1153,7 +1153,12 @@ export interface RetellAgentSpec {
   maxCallDurationMs?: number;
 }
 
-function llmRequestBody(spec: RetellLlmSpec) {
+/**
+ * The exact body sent to create/update-retell-llm. Exported so a deploy test
+ * can hand the real payload to the mock's schema validator rather than
+ * re-describing it and drifting from what ships.
+ */
+export function llmRequestBody(spec: RetellLlmSpec) {
   return {
     ...(spec.model ? { model: spec.model } : {}),
     general_prompt: spec.generalPrompt,
@@ -1195,29 +1200,36 @@ function parseAgentResponse(value: Record<string, unknown>, expectedId?: string)
 
 export async function createRetellLlm(spec: RetellLlmSpec): Promise<RetellProviderResult<{ llmId: string; version: number }>> {
   if (!retellCredentials().apiKey) return { ok: false, error: 'setup_required', mock: false };
-  if (retellConfigStatus().mock) return mockCreateLlm();
-  const result = await providerRequest('/create-retell-llm', { method: 'POST', body: llmRequestBody(spec) });
+  // The mock is handed the EXACT body the live call would send, and validates
+  // it the way Retell does, so a payload the provider would reject fails
+  // identically in both modes instead of only on somebody's real account.
+  const body = llmRequestBody(spec);
+  if (retellConfigStatus().mock) return mockCreateLlm(body);
+  const result = await providerRequest('/create-retell-llm', { method: 'POST', body });
   return result.ok ? parseLlmResponse(result.value) : result;
 }
 
 export async function updateRetellLlm(llmId: string, spec: RetellLlmSpec, previousVersion = 0): Promise<RetellProviderResult<{ llmId: string; version: number }>> {
   if (!retellCredentials().apiKey) return { ok: false, error: 'setup_required', mock: false };
-  if (retellConfigStatus().mock) return mockUpdateLlm(llmId, previousVersion);
-  const result = await providerRequest(`/update-retell-llm/${encodeURIComponent(llmId)}`, { method: 'PATCH', body: llmRequestBody(spec) });
+  const body = llmRequestBody(spec);
+  if (retellConfigStatus().mock) return mockUpdateLlm(llmId, body, previousVersion);
+  const result = await providerRequest(`/update-retell-llm/${encodeURIComponent(llmId)}`, { method: 'PATCH', body });
   return result.ok ? parseLlmResponse(result.value, llmId) : result;
 }
 
 export async function createRetellAgent(spec: RetellAgentSpec): Promise<RetellProviderResult<{ agentId: string; version: number }>> {
   if (!retellCredentials().apiKey) return { ok: false, error: 'setup_required', mock: false };
-  if (retellConfigStatus().mock) return mockCreateAgent();
-  const result = await providerRequest('/create-agent', { method: 'POST', body: agentRequestBody(spec) });
+  const body = agentRequestBody(spec);
+  if (retellConfigStatus().mock) return mockCreateAgent(body);
+  const result = await providerRequest('/create-agent', { method: 'POST', body });
   return result.ok ? parseAgentResponse(result.value) : result;
 }
 
 export async function updateRetellAgent(agentId: string, spec: RetellAgentSpec, previousVersion = 0): Promise<RetellProviderResult<{ agentId: string; version: number }>> {
   if (!retellCredentials().apiKey) return { ok: false, error: 'setup_required', mock: false };
-  if (retellConfigStatus().mock) return mockUpdateAgent(agentId, previousVersion);
-  const result = await providerRequest(`/update-agent/${encodeURIComponent(agentId)}`, { method: 'PATCH', body: agentRequestBody(spec) });
+  const body = agentRequestBody(spec);
+  if (retellConfigStatus().mock) return mockUpdateAgent(agentId, body, previousVersion);
+  const result = await providerRequest(`/update-agent/${encodeURIComponent(agentId)}`, { method: 'PATCH', body });
   return result.ok ? parseAgentResponse(result.value, agentId) : result;
 }
 

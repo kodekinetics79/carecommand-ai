@@ -18,7 +18,8 @@ const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
 const { readyCampaignFixture, clinicFixtureData } = await import('./helpers/receptionistFixtures');
-const { hashPrompt } = await import('../lib/retell');
+const { hashPrompt, llmRequestBody } = await import('../lib/retell');
+const { RETELL_GENERAL_TOOL_TYPES, retellLlmRequestIssues } = await import('../lib/receptionist/retellMock');
 
 // ===========================================================================
 // Deploying to Retell, end to end.
@@ -145,6 +146,52 @@ describe('deploying a campaign to Retell', () => {
       expect(verified.statusCode).toBe(200);
       expect(verified.json().agent).toMatchObject({ providerStatus: 'VERIFIED', providerVersion: row.providerAgentVersion });
       expect(await db.receptionistAgentDeployment.findUniqueOrThrow({ where: { id: row.id } })).toMatchObject({ status: 'VERIFIED' });
+    } finally {
+      env.RETELL_API_KEY = originalRetell.apiKey;
+      env.RETELL_FROM_NUMBER = originalRetell.fromNumber;
+    }
+  });
+
+  it('publishes an LLM payload Retell would accept, rather than one it answers 400 to', async () => {
+    // The live attended deploy died exactly here. Eleven of the thirteen tools
+    // declared `type: 'function'` — a value that is not in Retell's
+    // general_tools discriminator at all — and ensure_llm came back 400
+    // invalid_request. No test caught it because the mock returned success for
+    // any payload whatsoever. The mock now validates the same request body the
+    // live client sends, so reaching PUBLISHED below IS the assertion that the
+    // tool schema passed; the explicit checks after it say what passed.
+    env.RETELL_API_KEY = 'mock_deploy_key';
+    env.RETELL_FROM_NUMBER = '+15550100000';
+    try {
+      const t = await tenant();
+      const { campaign } = await deployableCampaign(t);
+
+      const deployed = await app.inject({ method: 'POST', url: `/v1/receptionist/campaigns/${campaign.id}/deploy`, headers: auth(t) });
+      expect(deployed.statusCode).toBe(200);
+      expect(deployed.json().deployment).toMatchObject({ status: 'PUBLISHED' });
+
+      // `toolsJson` is the same array that was sent as `general_tools`, not a
+      // re-derivation of it, so this is the published payload under test.
+      const row = await db.receptionistAgentDeployment.findFirstOrThrow({ where: { campaignId: campaign.id } });
+      const tools = row.toolsJson as Array<Record<string, unknown>>;
+      expect(tools).toHaveLength(13);
+      for (const tool of tools) expect(RETELL_GENERAL_TOOL_TYPES).toContain(tool.type);
+      expect(tools.filter(tool => tool.type === 'custom')).toHaveLength(12);
+      expect(tools.filter(tool => tool.type === 'transfer_call').map(tool => tool.name)).toEqual(['transfer_to_staff']);
+      expect(tools.some(tool => tool.type === 'function')).toBe(false);
+
+      // The whole request body, assembled by the very function the live client
+      // posts. Only `begin_message` is supplied here rather than read back: the
+      // deployment stores its hash, not its text, and its content is not what
+      // the provider schema is about.
+      const spec = { generalPrompt: row.promptText, beginMessage: 'The approved opening consent disclosure.', tools };
+      expect(retellLlmRequestIssues(llmRequestBody(spec))).toEqual([]);
+
+      // And the guard bites: put one tool back on the value the real account
+      // rejected, and the validator that just gated this deploy refuses it.
+      const regressed = tools.map(tool => (tool.name === 'book_appointment' ? { ...tool, type: 'function' } : tool));
+      expect(retellLlmRequestIssues(llmRequestBody({ ...spec, tools: regressed })))
+        .toEqual([expect.stringMatching(/^general_tools\/\d+\/type must be equal to one of the allowed values: /)]);
     } finally {
       env.RETELL_API_KEY = originalRetell.apiKey;
       env.RETELL_FROM_NUMBER = originalRetell.fromNumber;
