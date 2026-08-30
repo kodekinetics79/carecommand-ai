@@ -7,6 +7,47 @@ import { runWithTenantContext } from '../../lib/tenantContext';
 import { Prisma } from '../../generated/prisma/client';
 import { lockDncDestinationFence } from '../../lib/receptionist/dncFence';
 import { uuid, idParam, writeRoles, bookingReviewRoles, callArtifactRead, ownerAdminRoles, optionalE164Phone } from './shared';
+import { cursorPage } from '../../lib/pagination';
+import { maskDestination } from '../../lib/campaigns';
+import { requirePermission } from '../../lib/permissions';
+import { bookCanonicalAppointment } from '../../lib/booking';
+import { appointmentNoteSelect } from '../../lib/appointmentNotes';
+import { getSchedulingPolicy, isDoubleBookConflictError, resolveSchedulingService, clinicLocalMinuteToUtc } from '../../lib/scheduling';
+import { parseReceptionistTask, RECEPTIONIST_TASK_WORKFLOW } from '../../lib/receptionist/frontDeskTask';
+
+const LIVE_TASK_STATUS = ['OPEN', 'IN_PROGRESS'] as const;
+const PENDING_REQUEST_STATUS = ['PENDING_REVIEW', 'MISSING_INFO'] as const;
+
+const csvEnum = <T extends string>(values: readonly T[]) => z.string()
+  .transform(value => value.split(',').map(part => part.trim()).filter(Boolean))
+  .pipe(z.array(z.enum(values as unknown as [T, ...T[]])).min(1));
+
+/** The clinic's own calendar day, not the server's. */
+function clinicDayRangeUtc(timezone: string, days: number, now = new Date()): { from: Date; to: Date } {
+  const today = new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
+  const endOfToday = clinicLocalMinuteToUtc(today, 24 * 60, timezone) ?? now;
+  const startDay = new Date(endOfToday.getTime() - days * 24 * 60 * 60_000);
+  const startISO = new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(startDay);
+  const from = clinicLocalMinuteToUtc(startISO, 0, timezone) ?? startDay;
+  return { from, to: endOfToday };
+}
+
+/**
+ * C2 stamps `ReceptionistCallLog.outsideHours` at webhook time. Until that
+ * migration lands the after-hours rate is UNAVAILABLE, never a fake zero.
+ */
+let outsideHoursColumn: boolean | null = null;
+async function hasOutsideHoursColumn(): Promise<boolean> {
+  if (outsideHoursColumn !== null) return outsideHoursColumn;
+  const rows = await db.$queryRaw<Array<{ present: boolean }>>`
+    SELECT EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'ReceptionistCallLog' AND column_name = 'outsideHours'
+    ) AS present
+  `;
+  outsideHoursColumn = rows[0]?.present ?? false;
+  return outsideHoursColumn;
+}
 
 const operationalNotesInput = z.object({
   summary: z.string().trim().max(2_000).optional().nullable(),
@@ -25,6 +66,276 @@ const callReviewInput = z.object({
 }).strict();
 
 export const activityRoutes: FastifyPluginAsync = async app => {
+  // ===== Appointment requests (core AppointmentRequest) ====================
+  // The only request table. Scoped by the source call's clinic — the core model
+  // has no clinic column of its own, only `callLog.clinicId`.
+  const requestListQuery = z.object({
+    clinicId: uuid.optional(),
+    campaignId: uuid.optional(),
+    status: csvEnum(['PENDING_REVIEW', 'BOOKED', 'REJECTED', 'MISSING_INFO', 'DUPLICATE'] as const).optional(),
+    from: z.coerce.date().optional(),
+    to: z.coerce.date().optional(),
+    cursor: uuid.optional(),
+    limit: z.coerce.number().int().min(1).max(100).default(50),
+  });
+
+  app.get('/appointment-requests', { preHandler: callArtifactRead }, async request => {
+    const query = requestListQuery.parse(request.query);
+    const rows = await db.appointmentRequest.findMany({
+      where: {
+        tenantId: request.auth.tenantId,
+        status: { in: query.status ?? [...PENDING_REQUEST_STATUS] },
+        ...(query.clinicId ? { callLog: { clinicId: query.clinicId } } : {}),
+        ...(query.campaignId ? { campaignId: query.campaignId } : {}),
+        ...(query.from || query.to ? { createdAt: { gte: query.from, lte: query.to } } : {}),
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      cursor: query.cursor ? { id: query.cursor } : undefined,
+      skip: query.cursor ? 1 : 0,
+      take: query.limit + 1,
+      include: {
+        callLog: { select: { id: true, retellCallId: true, callerName: true, direction: true, startedAt: true, clinicId: true, patientId: true } },
+        bookedAppointment: {
+          select: {
+            id: true, service: true, startsAt: true,
+            branch: { select: { name: true, timezone: true } },
+            providerProfile: { select: { user: { select: { displayName: true } } } },
+          },
+        },
+        patient: { select: { id: true, firstName: true, lastName: true } },
+      },
+    });
+    const page = cursorPage(rows, query.limit);
+    await audit(request, { action: 'receptionist.appointmentRequest.listRead', resource: 'appointmentRequest', metadata: { count: page.data.length } });
+    return {
+      ...page,
+      // The raw collected payload and the unmasked number stay on the detail route.
+      data: page.data.map(({ rawCollectedFields, collectedPhone, ...row }) => ({
+        ...row,
+        collectedPhoneMasked: maskDestination(collectedPhone),
+      })),
+    };
+  });
+
+  app.get('/appointment-requests/:id', { preHandler: callArtifactRead }, async request => {
+    const { id } = idParam.parse(request.params);
+    const row = await db.appointmentRequest.findFirst({
+      where: { id, tenantId: request.auth.tenantId },
+      include: {
+        callLog: { select: { id: true, retellCallId: true, callerName: true, callerPhone: true, direction: true, startedAt: true, endedAt: true, clinicId: true, outcome: true } },
+        bookedAppointment: {
+          select: {
+            id: true, service: true, startsAt: true, status: true,
+            branch: { select: { name: true, timezone: true } },
+            providerProfile: { select: { user: { select: { displayName: true } } } },
+          },
+        },
+        patient: { select: { id: true, firstName: true, lastName: true, phone: true, email: true } },
+        branch: { select: { id: true, name: true, timezone: true } },
+      },
+    });
+    if (!row) throw app.httpErrors.notFound('Appointment request not found');
+    await audit(request, { action: 'receptionist.appointmentRequest.read', resource: 'appointmentRequest', resourceId: row.id });
+    return row;
+  });
+
+  // Rejecting is a decision a person owns, so the reason is required — the
+  // outbound alias keeps it optional for one cycle for older clients.
+  app.patch('/appointment-requests/:id', { preHandler: bookingReviewRoles }, async request => {
+    const { id } = idParam.parse(request.params);
+    const input = z.object({
+      status: z.literal('REJECTED'),
+      outcomeReason: z.string().trim().min(5).max(1000),
+    }).strict().parse(request.body);
+    return runWithTenantContext(request.auth.tenantId, async tx => {
+      const existing = await tx.appointmentRequest.findFirst({ where: { id, tenantId: request.auth.tenantId }, select: { id: true, status: true } });
+      if (!existing) throw app.httpErrors.notFound('Appointment request not found');
+      if (!(PENDING_REQUEST_STATUS as readonly string[]).includes(existing.status)) {
+        throw app.httpErrors.conflict('This request has already been resolved.');
+      }
+      const updated = await tx.appointmentRequest.update({
+        where: { id: existing.id },
+        data: { status: 'REJECTED', outcomeReason: input.outcomeReason },
+      });
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+        action: 'receptionist.appointmentRequest.rejected', resource: 'appointmentRequest', resourceId: existing.id,
+        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
+        metadata: { fromStatus: existing.status, reasonRecorded: true },
+      } });
+      return updated;
+    });
+  });
+
+  // Book it. One transaction: the canonical scheduler writes the appointment
+  // (lib/booking.ts — the same path the scheduling route uses), the request is
+  // linked, the source call is marked BOOKED and any open task for that call is
+  // closed with outcome `booked`. Nothing here can report success without an
+  // Appointment row.
+  app.post('/appointment-requests/:id/book', { preHandler: [bookingReviewRoles, requirePermission('appointment:write')] }, async (request, reply) => {
+    const { id } = idParam.parse(request.params);
+    const input = z.object({
+      patientId: uuid.optional(),
+      createPatient: z.object({
+        firstName: z.string().trim().min(1).max(80),
+        lastName: z.string().trim().min(1).max(80),
+        phone: optionalE164Phone,
+        email: z.string().trim().email().max(160).optional().nullable(),
+      }).strict().optional(),
+      providerProfileId: uuid,
+      startsAt: z.coerce.date(),
+      serviceCatalogItemId: uuid.optional(),
+      service: z.string().trim().min(1).max(160),
+      channel: z.enum(['WHATSAPP', 'SMS', 'EMAIL', 'PUSH', 'CALL', 'VIDEO']).default('CALL'),
+      acknowledgeRequestDifferences: z.literal(true),
+      outcomeReason: z.string().trim().max(1000).optional(),
+    }).strict().refine(value => Boolean(value.patientId) !== Boolean(value.createPatient), {
+      message: 'Provide either an existing patientId or createPatient, not both',
+    }).parse(request.body);
+
+    const service = await resolveSchedulingService({
+      tenantId: request.auth.tenantId, serviceCatalogItemId: input.serviceCatalogItemId, service: input.service,
+    });
+    if (!service) throw app.httpErrors.badRequest('Select an active service before booking');
+    const policy = await getSchedulingPolicy(request.auth.tenantId);
+
+    let outcome: Awaited<ReturnType<typeof runWithTenantContext>>;
+    try {
+      outcome = await runWithTenantContext(request.auth.tenantId, async tx => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-appointment-request:${request.auth.tenantId}:${id}`})::bigint)`;
+        const existing = await tx.appointmentRequest.findFirst({
+          where: { id, tenantId: request.auth.tenantId },
+          include: { callLog: { select: { id: true, retellCallId: true } } },
+        });
+        if (!existing) return { kind: 'not_found' as const };
+        if (!(PENDING_REQUEST_STATUS as readonly string[]).includes(existing.status)) return { kind: 'resolved' as const };
+
+        const provider = await tx.providerProfile.findFirst({
+          where: { id: input.providerProfileId, tenantId: request.auth.tenantId, active: true },
+          select: { id: true, branchId: true },
+        });
+        if (!provider) return { kind: 'provider_invalid' as const };
+
+        let patientId = input.patientId ?? null;
+        let patientCreated = false;
+        if (patientId) {
+          const patient = await tx.patient.findFirst({
+            where: { id: patientId, tenantId: request.auth.tenantId, branchId: provider.branchId, deletedAt: null },
+            select: { id: true },
+          });
+          if (!patient) return { kind: 'patient_invalid' as const };
+        } else {
+          const created = await tx.patient.create({
+            data: {
+              tenantId: request.auth.tenantId, branchId: provider.branchId,
+              firstName: input.createPatient!.firstName, lastName: input.createPatient!.lastName,
+              phone: input.createPatient!.phone ?? null, email: input.createPatient!.email ?? null,
+            },
+            select: { id: true },
+          });
+          patientId = created.id;
+          patientCreated = true;
+        }
+        const patient = await tx.patient.findUniqueOrThrow({ where: { id: patientId }, select: { id: true, phone: true, email: true } });
+
+        // C4-R06: one appointment per source call. Until C3's booking sequence
+        // lands, a call that already produced an appointment links through the
+        // request only rather than colliding on the unique index.
+        const alreadyStamped = existing.callLogId
+          ? await tx.appointment.findFirst({
+            where: { tenantId: request.auth.tenantId, receptionistCallLogId: existing.callLogId },
+            select: { id: true },
+          })
+          : null;
+        const linkedViaRequestOnly = Boolean(existing.callLogId && alreadyStamped);
+
+        const booked = await bookCanonicalAppointment(tx, {
+          tenantId: request.auth.tenantId, branchId: provider.branchId, patientId: patient.id,
+          providerProfileId: provider.id, service, startsAt: input.startsAt, channel: input.channel,
+          policy, patientContact: { phone: patient.phone, email: patient.email },
+          receptionistCallLogId: linkedViaRequestOnly ? null : existing.callLogId,
+        });
+        if ('conflict' in booked) return { kind: 'conflict' as const, reason: booked.conflict };
+
+        const differences = [
+          existing.requestedService && existing.requestedService.trim().toLocaleLowerCase() !== booked.appointment.service.trim().toLocaleLowerCase() ? 'service' : null,
+          existing.requestedDateTime && existing.requestedDateTime.getTime() !== booked.appointment.startsAt.getTime() ? 'dateTime' : null,
+        ].filter((value): value is string => value !== null);
+
+        await tx.appointmentRequest.update({
+          where: { id: existing.id },
+          data: {
+            status: 'BOOKED', bookedAppointmentId: booked.appointment.id,
+            branchId: provider.branchId, patientId: patient.id,
+            missingFields: [], outcomeReason: input.outcomeReason ?? null,
+          },
+        });
+        if (existing.callLogId) {
+          await tx.receptionistCallLog.updateMany({
+            where: { id: existing.callLogId, tenantId: request.auth.tenantId, outcome: 'IN_PROGRESS' },
+            data: { outcome: 'BOOKED' },
+          });
+        }
+        // The queue row this request came from is now genuinely done.
+        let tasksClosed = 0;
+        if (existing.callLogId) {
+          const closed = await tx.staffTask.updateMany({
+            where: {
+              tenantId: request.auth.tenantId, callLogId: existing.callLogId,
+              status: { in: [...LIVE_TASK_STATUS] },
+              metadata: { path: ['workflow'], equals: RECEPTIONIST_TASK_WORKFLOW },
+            },
+            data: { status: 'COMPLETED', completedAt: new Date(), outcomeCode: 'booked' },
+          });
+          tasksClosed = closed.count;
+        }
+        await tx.auditEvent.create({ data: {
+          tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+          action: 'receptionist.appointmentRequest.bookedFromReview', resource: 'appointmentRequest', resourceId: existing.id,
+          requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
+          metadata: {
+            appointmentId: booked.appointment.id, identityProof: 'staff_selected', differences,
+            patientCreated, linkedViaRequestOnly, tasksClosed, requestDifferencesAcknowledged: true,
+          },
+        } });
+        await tx.businessEvent.create({ data: {
+          tenantId: request.auth.tenantId, eventType: 'receptionist.appointmentRequest.booked',
+          entityType: 'appointmentRequest', entityId: existing.id, sourceModule: 'receptionist',
+          payload: { appointmentId: booked.appointment.id, differences, patientCreated },
+        } });
+        return {
+          kind: 'booked' as const,
+          appointment: booked.appointment,
+          confirmationsQueued: booked.queued,
+          differences,
+          linkedViaRequestOnly,
+        };
+      }) as never;
+    } catch (error) {
+      if (isDoubleBookConflictError(error)) {
+        return reply.code(409).send({ error: 'slot_unavailable', reason: 'already_booked' });
+      }
+      throw error;
+    }
+
+    const result = outcome as unknown as
+      | { kind: 'not_found' } | { kind: 'resolved' } | { kind: 'provider_invalid' } | { kind: 'patient_invalid' }
+      | { kind: 'conflict'; reason: string }
+      | { kind: 'booked'; appointment: { id: string; service: string; startsAt: Date }; confirmationsQueued: string[]; differences: string[]; linkedViaRequestOnly: boolean };
+    if (result.kind === 'not_found') throw app.httpErrors.notFound('Appointment request not found');
+    if (result.kind === 'resolved') throw app.httpErrors.conflict('This request has already been resolved.');
+    if (result.kind === 'provider_invalid') throw app.httpErrors.badRequest('Select an active provider in this tenant');
+    if (result.kind === 'patient_invalid') throw app.httpErrors.badRequest("Patient not found in this provider's clinic");
+    if (result.kind === 'conflict') return reply.code(409).send({ error: 'slot_unavailable', reason: result.reason });
+    return reply.code(201).send({
+      status: 'BOOKED',
+      appointment: result.appointment,
+      confirmationsQueued: result.confirmationsQueued,
+      differences: result.differences,
+      linkedViaRequestOnly: result.linkedViaRequestOnly,
+    });
+  });
+
   // Persistent, minimum-necessary reconciliation state for the Studio. This
   // is rebuilt from durable call/target safety state on every refresh; a
   // transient launch toast is never the only warning that a provider call may
@@ -316,34 +627,111 @@ export const activityRoutes: FastifyPluginAsync = async app => {
     }));
   });
 
-  // ===== Call logs (read) =================================================
+  // ===== Call logs as a work queue ========================================
+  // Filters staff actually triage by, cursor pagination, and a projection that
+  // carries no raw phone and no recording URL — both are detail-route only.
+  const callLogQuery = z.object({
+    clinicId: uuid.optional(),
+    campaignId: uuid.optional(),
+    direction: z.enum(['inbound', 'outbound']).optional(),
+    outcome: csvEnum(['IN_PROGRESS', 'BOOKED', 'NOT_INTERESTED', 'NO_ANSWER', 'VOICEMAIL', 'ESCALATED', 'OPTED_OUT', 'FAILED'] as const).optional(),
+    reviewStatus: csvEnum(['UNREVIEWED', 'DRAFT', 'REVIEWED', 'SIGNED_OFF'] as const).optional(),
+    handoff: z.enum(['open', 'any', 'none']).optional(),
+    consent: csvEnum(['UNDETERMINED', 'GRANTED', 'REFUSED', 'WITHDRAWN'] as const).optional(),
+    from: z.coerce.date().optional(),
+    to: z.coerce.date().optional(),
+    cursor: uuid.optional(),
+    limit: z.coerce.number().int().min(1).max(100).default(50),
+  });
+
+  function callLogWhere(tenantId: string, query: z.infer<typeof callLogQuery>) {
+    return {
+      tenantId,
+      ...(query.clinicId ? { clinicId: query.clinicId } : {}),
+      ...(query.campaignId ? { campaignId: query.campaignId } : {}),
+      ...(query.direction ? { direction: query.direction } : {}),
+      ...(query.outcome ? { outcome: { in: query.outcome } } : {}),
+      ...(query.reviewStatus ? { reviewStatus: { in: query.reviewStatus } } : {}),
+      ...(query.consent ? { recordingConsentStatus: { in: query.consent } } : {}),
+      ...(query.from || query.to ? { createdAt: { gte: query.from, lte: query.to } } : {}),
+      ...(query.handoff === 'open' ? { staffTasks: { some: { status: { in: [...LIVE_TASK_STATUS] } } } }
+        : query.handoff === 'any' ? { staffTasks: { some: {} } }
+          : query.handoff === 'none' ? { staffTasks: { none: {} } } : {}),
+    } satisfies Prisma.ReceptionistCallLogWhereInput;
+  }
+
   app.get('/call-logs', { preHandler: callArtifactRead }, async request => {
-    const query = z.object({
-      clinicId: uuid.optional(),
-      campaignId: uuid.optional(),
-      limit: z.coerce.number().int().min(1).max(200).default(100),
-    }).parse(request.query);
+    const query = callLogQuery.parse(request.query);
     const rows = await db.receptionistCallLog.findMany({
-      where: {
-        tenantId: request.auth.tenantId,
-        ...(query.clinicId ? { clinicId: query.clinicId } : {}),
-        ...(query.campaignId ? { campaignId: query.campaignId } : {}),
+      where: callLogWhere(request.auth.tenantId, query),
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      cursor: query.cursor ? { id: query.cursor } : undefined,
+      skip: query.cursor ? 1 : 0,
+      take: query.limit + 1,
+      include: {
+        campaign: { select: { id: true, name: true } },
+        patient: { select: { id: true, firstName: true, lastName: true } },
+        appointments: { select: { id: true }, take: 1, orderBy: { createdAt: 'desc' } },
+        _count: { select: { staffTasks: { where: { status: { in: [...LIVE_TASK_STATUS] } } } } },
       },
-      orderBy: { createdAt: 'desc' },
-      take: query.limit,
-      include: { campaign: { select: { id: true, name: true } } },
     });
-    const canReadRecordings = await hasReceptionistPermission(request, RECEPTIONIST_PERMISSIONS.RECORDINGS_READ);
+    const page = cursorPage(rows, query.limit);
     await audit(request, {
       action: 'receptionistCallLog.listRead',
       resource: 'receptionistCallLog',
-      metadata: { count: rows.length, recordingsDisclosed: canReadRecordings },
+      metadata: { count: page.data.length, recordingsDisclosed: false },
     });
-    return rows.map(row => ({
-      ...row,
-      recordingAvailable: Boolean(row.recordingUrl),
-      recordingUrl: canReadRecordings ? row.recordingUrl : null,
-    }));
+    return {
+      ...page,
+      data: page.data.map(row => ({
+        id: row.id,
+        clinicId: row.clinicId,
+        campaign: row.campaign,
+        retellCallId: row.retellCallId,
+        callerName: row.callerName,
+        callerPhoneMasked: maskDestination(row.callerPhone),
+        patientId: row.patientId,
+        patient: row.patient,
+        direction: row.direction,
+        outcome: row.outcome,
+        durationSeconds: row.durationSeconds,
+        startedAt: row.startedAt,
+        endedAt: row.endedAt,
+        reviewStatus: row.reviewStatus,
+        recordingConsentStatus: row.recordingConsentStatus,
+        recordingAvailable: Boolean(row.recordingUrl),
+        // A list never carries a recording URL, whatever the caller may read.
+        recordingUrl: null,
+        openHandoffCount: row._count.staffTasks,
+        bookedAppointmentId: row.appointments[0]?.id ?? null,
+        transcriptSummary: row.transcriptSummary,
+        createdAt: row.createdAt,
+      })),
+    };
+  });
+
+  // Counts for the queue header. Same filters, no rows, no PHI.
+  app.get('/call-logs/summary', { preHandler: callArtifactRead }, async request => {
+    const query = callLogQuery.parse(request.query);
+    const where = callLogWhere(request.auth.tenantId, query);
+    const [unreviewed, openHandoffs, inbound, outbound, booked, pendingRequests] = await Promise.all([
+      db.receptionistCallLog.count({ where: { ...where, reviewStatus: 'UNREVIEWED' } }),
+      db.receptionistCallLog.count({ where: { ...where, staffTasks: { some: { status: { in: [...LIVE_TASK_STATUS] } } } } }),
+      db.receptionistCallLog.count({ where: { ...where, direction: 'inbound' } }),
+      db.receptionistCallLog.count({ where: { ...where, direction: 'outbound' } }),
+      db.receptionistCallLog.count({ where: { ...where, outcome: 'BOOKED' } }),
+      db.appointmentRequest.count({
+        where: {
+          tenantId: request.auth.tenantId,
+          status: { in: [...PENDING_REQUEST_STATUS] },
+          ...(query.clinicId ? { callLog: { clinicId: query.clinicId } } : {}),
+        },
+      }),
+    ]);
+    return {
+      unreviewed, openHandoffs, inbound, outbound, booked, pendingRequests,
+      range: { from: query.from ?? null, to: query.to ?? null },
+    };
   });
 
   app.get('/call-logs/:id', { preHandler: callArtifactRead }, async request => {
@@ -354,7 +742,14 @@ export const activityRoutes: FastifyPluginAsync = async app => {
         campaign: { select: { id: true, name: true } },
         reviewedBy: { select: { id: true, displayName: true } },
         signedOffBy: { select: { id: true, displayName: true } },
-        appointments: { select: { id: true, service: true, startsAt: true, status: true }, orderBy: { createdAt: 'desc' } },
+        patient: { select: { id: true, firstName: true, lastName: true } },
+        appointments: {
+          select: {
+            id: true, service: true, startsAt: true, status: true, notes: true,
+            noteEntries: { orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], select: appointmentNoteSelect },
+          },
+          orderBy: { createdAt: 'desc' },
+        },
         appointmentRequests: {
           select: { id: true, requestedService: true, requestedDateTime: true, status: true, bookedAppointmentId: true },
           orderBy: { createdAt: 'desc' },
@@ -364,23 +759,30 @@ export const activityRoutes: FastifyPluginAsync = async app => {
     if (!row) throw app.httpErrors.notFound('Call log not found');
     const canReadRecording = await hasReceptionistPermission(request, RECEPTIONIST_PERMISSIONS.RECORDINGS_READ);
     const canSignOffReview = await hasReceptionistPermission(request, RECEPTIONIST_PERMISSIONS.MANAGE);
+    const canEditReview = await hasReceptionistPermission(request, RECEPTIONIST_PERMISSIONS.BOOKING_REVIEW);
     const usableRecordingUrl = typeof row.recordingUrl === 'string' && /^https:\/\//i.test(row.recordingUrl)
       ? row.recordingUrl
       : null;
-    const handoffReferences = await db.staffTask.findMany({
+    // The FK is authoritative now; the metadata match still finds pre-migration rows.
+    const staffTasks = await db.staffTask.findMany({
       where: {
         tenantId: request.auth.tenantId,
         AND: [
-          { metadata: { path: ['workflow'], equals: 'receptionist_safety' } },
+          { metadata: { path: ['workflow'], equals: RECEPTIONIST_TASK_WORKFLOW } },
           { OR: [
+            { callLogId: row.id },
             { metadata: { path: ['callLogId'], equals: row.id } },
             ...(row.retellCallId ? [{ metadata: { path: ['callId'], equals: row.retellCallId } }] : []),
           ] },
         ],
       },
-      select: { id: true, title: true, status: true, priority: true, dueAt: true, createdAt: true },
+      select: {
+        id: true, title: true, status: true, priority: true, dueAt: true, createdAt: true,
+        acknowledgedAt: true, completedAt: true, outcomeCode: true, metadata: true,
+      },
       orderBy: { createdAt: 'desc' },
     });
+    const handoffs = staffTasks.map(({ metadata, ...task }) => ({ ...task, kind: parseReceptionistTask({ metadata })?.kind ?? null }));
     await audit(request, {
       action: 'receptionistCallLog.read',
       resource: 'receptionistCallLog',
@@ -401,8 +803,11 @@ export const activityRoutes: FastifyPluginAsync = async app => {
           ? 'not_available'
           : canReadRecording ? 'available' : 'restricted',
       recordingUrl: canReadRecording ? usableRecordingUrl : null,
-      reviewCapabilities: { canEdit: true, canSignOff: canSignOffReview },
-      handoffReferences,
+      // canEdit is a real permission answer now, not a hardcoded true.
+      reviewCapabilities: { canEdit: canEditReview, canSignOff: canSignOffReview },
+      staffTasks: handoffs,
+      // One-cycle alias for clients still reading the old name.
+      handoffReferences: handoffs,
     };
   });
 
@@ -596,31 +1001,145 @@ export const activityRoutes: FastifyPluginAsync = async app => {
     return reply.code(204).send();
   });
 
-  // ===== Overview (dashboard metrics) =====================================
-  app.get('/overview', async request => {
+  // ===== Overview KPIs ====================================================
+  // Every rate is defined, versioned and allowed to be null. A rate with no
+  // denominator is UNAVAILABLE, never 0 — a clinic must never read "0% booked"
+  // when the truth is "no answered calls yet".
+  app.get('/overview', { preHandler: callArtifactRead }, async request => {
     const tenantId = request.auth.tenantId;
-    const [clinics, campaigns, callLogs, requests, optOuts] = await Promise.all([
+    const query = z.object({
+      clinicId: uuid.optional(),
+      period: z.enum(['today', '7d', '30d', 'custom']).default('7d'),
+      from: z.coerce.date().optional(),
+      to: z.coerce.date().optional(),
+      direction: z.enum(['inbound', 'outbound']).optional(),
+    }).parse(request.query);
+
+    const clinic = query.clinicId
+      ? await db.receptionistClinic.findFirst({ where: { id: query.clinicId, tenantId }, select: { id: true, timezone: true } })
+      : await db.receptionistClinic.findFirst({ where: { tenantId }, orderBy: { createdAt: 'asc' }, select: { id: true, timezone: true } });
+    if (query.clinicId && !clinic) throw app.httpErrors.notFound('Clinic not found');
+    const timezone = clinic?.timezone ?? 'UTC';
+    const range = query.period === 'custom' && (query.from || query.to)
+      ? { from: query.from ?? new Date(0), to: query.to ?? new Date() }
+      : clinicDayRangeUtc(timezone, query.period === 'today' ? 0 : query.period === '30d' ? 29 : 6);
+
+    const callScope = {
+      tenantId,
+      ...(query.clinicId ? { clinicId: query.clinicId } : {}),
+      ...(query.direction ? { direction: query.direction } : {}),
+      createdAt: { gte: range.from, lte: range.to },
+    } satisfies Prisma.ReceptionistCallLogWhereInput;
+    const inboundScope = { ...callScope, direction: 'inbound' };
+    const UNANSWERED = ['NO_ANSWER', 'FAILED', 'IN_PROGRESS'] as const;
+
+    const [
+      grouped, durations, inboundTotal, answeredInbound, inboundBooked, escalatedOrHandoff,
+      optedOut, pendingRequests, openHandoffs, activeCampaigns, clinics, callbackTasks, outsideHoursSupported,
+    ] = await Promise.all([
+      db.receptionistCallLog.groupBy({ by: ['direction', 'outcome'], where: callScope, _count: { _all: true } }),
+      db.receptionistCallLog.aggregate({
+        where: { ...callScope, outcome: { not: 'IN_PROGRESS' }, durationSeconds: { gt: 0 } },
+        _avg: { durationSeconds: true }, _count: { _all: true },
+      }),
+      db.receptionistCallLog.count({ where: inboundScope }),
+      db.receptionistCallLog.count({ where: { ...inboundScope, outcome: { notIn: [...UNANSWERED] } } }),
+      db.receptionistCallLog.count({ where: { ...inboundScope, outcome: 'BOOKED' } }),
+      db.receptionistCallLog.count({ where: {
+        ...inboundScope,
+        outcome: { notIn: [...UNANSWERED] },
+        OR: [
+          { outcome: 'ESCALATED' },
+          { staffTasks: { some: { AND: [
+            { metadata: { path: ['workflow'], equals: RECEPTIONIST_TASK_WORKFLOW } },
+            { OR: [{ metadata: { path: ['kind'], equals: 'human_handoff' } }, { metadata: { path: ['kind'], equals: 'emergency' } }] },
+          ] } } },
+        ],
+      } }),
+      db.receptionistOptOut.count({ where: { tenantId, revokedAt: null, ...(query.clinicId ? { clinicId: query.clinicId } : {}) } }),
+      db.appointmentRequest.count({ where: {
+        tenantId, status: { in: [...PENDING_REQUEST_STATUS] },
+        ...(query.clinicId ? { callLog: { clinicId: query.clinicId } } : {}),
+      } }),
+      db.receptionistCallLog.count({ where: { ...callScope, staffTasks: { some: { status: { in: [...LIVE_TASK_STATUS] } } } } }),
+      db.receptionistCampaign.count({ where: { tenantId, status: 'ACTIVE', ...(query.clinicId ? { clinicId: query.clinicId } : {}) } }),
       db.receptionistClinic.count({ where: { tenantId } }),
-      db.receptionistCampaign.findMany({ where: { tenantId }, select: { status: true } }),
-      db.receptionistCallLog.findMany({ where: { tenantId }, select: { outcome: true, durationSeconds: true } }),
-      db.appointmentRequest.count({ where: { tenantId, status: { in: ['PENDING_REVIEW', 'MISSING_INFO'] } } }),
-      db.receptionistOptOut.count({ where: { tenantId, revokedAt: null } }),
+      db.staffTask.findMany({
+        where: {
+          tenantId,
+          createdAt: { gte: range.from, lte: range.to },
+          AND: [
+            { metadata: { path: ['workflow'], equals: RECEPTIONIST_TASK_WORKFLOW } },
+            { OR: [{ metadata: { path: ['kind'], equals: 'message' } }, { metadata: { path: ['kind'], equals: 'human_handoff' } }] },
+          ],
+        },
+        select: { acknowledgedAt: true, dueAt: true },
+      }),
+      hasOutsideHoursColumn(),
     ]);
-    const booked = callLogs.filter(call => call.outcome === 'BOOKED').length;
-    const totalCalls = callLogs.length;
-    const avgDuration = totalCalls
-      ? Math.round(callLogs.reduce((sum, call) => sum + call.durationSeconds, 0) / totalCalls)
-      : 0;
+
+    // After-hours needs C2's stamped column; without it the answer is "unknown".
+    let afterHoursPct: number | null = null;
+    let afterHoursBasis = 'unavailable_no_hours';
+    if (outsideHoursSupported && inboundTotal > 0) {
+      const rows = await db.$queryRaw<Array<{ count: bigint }>>`
+        SELECT count(*) AS count FROM "ReceptionistCallLog"
+        WHERE "tenantId" = ${tenantId}::uuid AND "direction" = 'inbound'
+          AND "createdAt" >= ${range.from} AND "createdAt" <= ${range.to}
+          AND "outsideHours" IS TRUE
+          ${query.clinicId ? Prisma.sql`AND "clinicId" = ${query.clinicId}::uuid` : Prisma.empty}
+      `;
+      afterHoursPct = Number(rows[0]?.count ?? 0) / inboundTotal;
+      afterHoursBasis = 'stamped_outside_hours';
+    }
+
+    const answeredCallbacks = callbackTasks.filter(task => task.acknowledgedAt && task.dueAt);
+    const callbacksWithinSlaPct = callbackTasks.length === 0
+      ? null
+      : answeredCallbacks.filter(task => task.acknowledgedAt!.getTime() <= task.dueAt!.getTime()).length / callbackTasks.length;
+
+    const totalCalls = grouped.reduce((sum, row) => sum + row._count._all, 0);
+    const bookedTotal = grouped.filter(row => row.outcome === 'BOOKED').reduce((sum, row) => sum + row._count._all, 0);
+    const counts = {
+      inbound: inboundTotal,
+      outbound: grouped.filter(row => row.direction === 'outbound').reduce((sum, row) => sum + row._count._all, 0),
+      answeredInbound,
+      booked: bookedTotal,
+      escalated: grouped.filter(row => row.outcome === 'ESCALATED').reduce((sum, row) => sum + row._count._all, 0),
+      optedOut, pendingRequests, openHandoffs, activeCampaigns, clinics,
+    };
+    const aht = durations._count._all > 0 && durations._avg.durationSeconds !== null
+      ? Math.round(durations._avg.durationSeconds)
+      : null;
+
     return {
+      period: { from: range.from, to: range.to, timezone, period: query.period },
+      counts,
+      rates: {
+        bookingRate: answeredInbound > 0 ? inboundBooked / answeredInbound : null,
+        containedPct: answeredInbound > 0 ? (answeredInbound - escalatedOrHandoff) / answeredInbound : null,
+        afterHoursPct,
+        callbacksWithinSlaPct,
+      },
+      aht,
+      definitions: {
+        version: 'kpi-v2',
+        answeredInbound: 'Inbound calls whose outcome is not NO_ANSWER, FAILED or IN_PROGRESS.',
+        bookingRate: 'Inbound BOOKED / answered inbound. Null when nothing was answered.',
+        containedPct: 'Answered inbound minus calls that escalated or filed a handoff/emergency task, over answered inbound.',
+        afterHours: afterHoursBasis,
+        aht: 'Average call seconds, excluding in-progress and zero-second calls.',
+        callbacksWithinSla: 'Message and handoff tasks acknowledged on or before their due time, over those created in the period.',
+      },
+      // Legacy scalars kept for one cycle so the current Studio header keeps working.
       clinics,
-      activeCampaigns: campaigns.filter(campaign => campaign.status === 'ACTIVE').length,
-      totalCampaigns: campaigns.length,
+      activeCampaigns,
       totalCalls,
-      booked,
-      bookingRate: totalCalls ? Math.round((booked / totalCalls) * 100) : 0,
-      appointmentRequests: requests,
-      optOuts,
-      avgDurationSeconds: avgDuration,
+      booked: bookedTotal,
+      bookingRate: totalCalls ? Math.round((bookedTotal / totalCalls) * 100) : 0,
+      appointmentRequests: pendingRequests,
+      optOuts: optedOut,
+      avgDurationSeconds: aht ?? 0,
     };
   });
 };

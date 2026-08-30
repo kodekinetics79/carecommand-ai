@@ -107,7 +107,7 @@ describe('AI receptionist call-artifact least privilege', () => {
       headers: auth(tenant.id, tenant.users.FRONT_DESK),
     });
     expect(response.statusCode).toBe(200);
-    const row = (response.json() as Array<Record<string, unknown>>).find(item => item.id === tenant.callId);
+    const row = (response.json().data as Array<Record<string, unknown>>).find(item => item.id === tenant.callId);
     expect(row?.transcriptSummary).toBe('Caller requested a routine appointment.');
     expect(row?.recordingAvailable).toBe(true);
     expect(row?.recordingUrl).toBeNull();

@@ -151,10 +151,14 @@ describe('receptionist inbound-call lifecycle (event webhook)', () => {
     // 4. Retrievable via the authenticated call-logs API (client responses recorded).
     const res = await app.inject({ method: 'GET', url: '/v1/receptionist/call-logs', headers: authFor(t) });
     expect(res.statusCode).toBe(200);
-    const apiLogs = res.json() as Array<{ retellCallId: string; outcome: string; durationSeconds: number }>;
+    // The queue paginates and the list projection carries no raw phone,
+    // recording URL or sentiment — those live on the detail route now.
+    const apiLogs = res.json().data as Array<{ retellCallId: string; outcome: string; durationSeconds: number; callerPhoneMasked: string | null; recordingUrl: null }>;
     const mine = apiLogs.find(l => l.retellCallId === callId);
     expect(mine?.outcome).toBe('ESCALATED');
     expect(mine?.durationSeconds).toBe(125);
+    expect(mine?.recordingUrl).toBeNull();
+    expect(mine).not.toHaveProperty('callerPhone');
   });
 
   it('OPTED_OUT files exactly one opt-out, idempotent across redelivery', async () => {
