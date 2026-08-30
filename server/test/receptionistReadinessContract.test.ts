@@ -195,13 +195,23 @@ type EvidenceKind =
   | 'own_configuration';
 
 const EVIDENCE: Record<string, { evidence: EvidenceKind; why: string }> = {
+  // B6 — the clinic prerequisites `transitionCampaign` used to throw as bare
+  // 409s after readiness had already said "ready". Three of the four read
+  // nothing but our own record of what the practice told us, and are marked as
+  // such: "the clinic has hours" is not the same promise as "the agent will
+  // say something true about them".
+  clinic_country_set: { evidence: 'own_configuration', why: 'B6: `ReceptionistClinic.country`, a field on our own row that our own Clinic Profile form wrote. Nothing outside CareCommand corroborates it.' },
+  clinic_hours_set: { evidence: 'own_configuration', why: 'B6: the weekly hours the practice typed into our clinic and location rows, via `loadHoursSource`. No independent source confirms the door is open when they say.' },
+  locale_pack_approved: { evidence: 'independent_row', why: 'B6: `resolveApprovedLocalePack` requires an APPROVED `ReceptionistLocalePack` row with its evidence hash, and refuses the platform default. Approval is a separate governed act on a separate row; a campaign cannot write itself one.' },
+  agent_language_supported: { evidence: 'own_configuration', why: 'B6: the language we stored on the agent, checked against the languages this product supports. Both halves are ours, and the row says so.' },
   agent_linked: { evidence: 'own_configuration', why: 'Whether this campaign has an agent is our configuration and nothing else.' },
   agent_verified: { evidence: 'provider_read_back', why: 'An attestation with a TTL, written only from what the provider reported.' },
   deployment_current: { evidence: 'own_configuration', why: 'Compares the planned configuration against the deployed hashes — a comparison, not a claim.' },
   number_bound: { evidence: 'provider_read_back', why: 'A2: who answers the number is a fact at Retell. `deployment.numberBound` is a column we wrote.' },
   location_mapped: { evidence: 'own_configuration', why: 'Whether a location is mapped to a branch is our configuration.' },
   services_bookable: { evidence: 'independent_row', why: 'B2: the practice marks a service bookable by voice; a name match is not that decision.' },
-  provider_availability: { evidence: 'independent_row', why: 'B3: availability rows the scheduler reads, and a provider the live tool can actually resolve.' },
+  provider_availability: { evidence: 'independent_row', why: 'B3: the `ProviderAvailability` rows the scheduler reads before it can offer any time.' },
+  provider_resolvable: { evidence: 'independent_row', why: 'B3: the practice’s own `ProviderProfile` roster at the mapped branch, under the same "exactly one active provider" rule `resolveSoleProvider` applies at call time. A row count is not an offerable time.' },
   intake_attested: { evidence: 'provider_read_back', why: 'The published booking tool as the provider reports it, versus these intake fields.' },
   placeholders_absent: { evidence: 'own_configuration', why: 'Placeholder detection over the assembled prompt.' },
   disclosure_composed: { evidence: 'own_configuration', why: 'Whether the clinic added wording to the baseline disclosure.' },
@@ -325,7 +335,7 @@ describe('number_bound — who answers the number is a fact at the provider (A1/
 });
 
 describe('services_bookable — the practice decides what a machine may book (B2)', () => {
-  it.fails('fails when the matching service is not bookable by voice', async () => {
+  it('fails when the matching service is not bookable by voice', async () => {
     const t = await tenant();
     const deployed = await deployedCampaign(t);
     expect((await readiness(t, deployed.campaignId)).status('services_bookable')).toBe('pass');
@@ -347,7 +357,7 @@ describe('services_bookable — the practice decides what a machine may book (B2
 });
 
 describe('provider_availability — a row count is not an offerable time (B3)', () => {
-  it.fails('stops passing on a branch with more than one provider and no selection rule', async () => {
+  it('stops passing on a branch with more than one provider and no selection rule', async () => {
     const t = await tenant();
     // Every real practice is this shape. `resolveSoleProvider` (liveTools.ts)
     // returns null for 2+ active providers, so the agent answers every booking
@@ -356,7 +366,13 @@ describe('provider_availability — a row count is not an offerable time (B3)', 
     const deployed = await deployedCampaign(t, { providers: 2 });
     expect(deployed.providerProfileIds.length).toBe(2);
     const twoDentists = await readiness(t, deployed.campaignId);
-    expect(twoDentists.status('provider_availability'), 'B3: the tool cannot resolve a provider here').not.toBe('pass');
+    // B3 shipped as a SPLIT, not as a change to the counting check: both
+    // clinicians have weekday windows, so counting rows is honestly satisfied
+    // and still says `pass`. The lie was ever calling that "ready", and the new
+    // `provider_resolvable` row is what refuses to. Assert both halves, so
+    // neither can quietly absorb the other's meaning again.
+    expect(twoDentists.status('provider_availability'), 'B3: rows exist, and this check only ever claimed that').toBe('pass');
+    expect(twoDentists.status('provider_resolvable'), 'B3: the tool cannot resolve a provider here').not.toBe('pass');
   }, 180_000);
 
   it('fails when the mapped branch has availability rows but all are inactive', async () => {
@@ -368,7 +384,7 @@ describe('provider_availability — a row count is not an offerable time (B3)', 
 });
 
 describe('test_call_completed — proof a caller reached THIS deployment (B4)', () => {
-  it.fails('is not satisfied by an inbound call recorded before the deployment published', async () => {
+  it('is not satisfied by an inbound call recorded before the deployment published', async () => {
     const t = await tenant();
     const deployed = await deployedCampaign(t);
     await db.receptionistCallLog.delete({ where: { id: deployed.callLogId } });
@@ -386,7 +402,7 @@ describe('test_call_completed — proof a caller reached THIS deployment (B4)', 
     expect(stale.status('test_call_completed'), 'B4: evidence must postdate the deployment').not.toBe('pass');
   }, 120_000);
 
-  it.fails('is not satisfied by a zero-second call that never connected', async () => {
+  it('is not satisfied by a zero-second call that never connected', async () => {
     const t = await tenant();
     const deployed = await deployedCampaign(t);
     await db.receptionistCallLog.delete({ where: { id: deployed.callLogId } });
@@ -401,7 +417,7 @@ describe('test_call_completed — proof a caller reached THIS deployment (B4)', 
     expect(notConnected.status('test_call_completed'), 'B4: a zero-second row proves nothing').not.toBe('pass');
   }, 120_000);
 
-  it.fails('is invalidated by the next deploy, which is what the Go-live card promises', async () => {
+  it('is invalidated by the next deploy, which is what the Go-live card promises', async () => {
     const t = await tenant();
     const deployed = await deployedCampaign(t);
     expect((await readiness(t, deployed.campaignId)).status('test_call_completed')).toBe('pass');
@@ -483,7 +499,25 @@ describe('the checks that are honestly about our own configuration', () => {
     const t = await tenant();
     const deployed = await deployedCampaign(t);
     await db.receptionistCampaign.update({ where: { id: deployed.campaignId }, data: { smsConfirmation: true } });
-    expect((await readiness(t, deployed.campaignId)).status('confirmation_channels')).toBe('fail');
+    // The promise is only broken when no sender exists. This suite inherits the
+    // developer `.env`, where Twilio is mock-configured and a confirmation IS
+    // recorded — so enabling the channel alone proves nothing. Take the sender
+    // away, which is the state a pilot tenant that never wired Twilio is in.
+    const twilio = {
+      TWILIO_ACCOUNT_SID: env.TWILIO_ACCOUNT_SID,
+      TWILIO_AUTH_TOKEN: env.TWILIO_AUTH_TOKEN,
+      TWILIO_FROM_NUMBER: env.TWILIO_FROM_NUMBER,
+    };
+    try {
+      env.TWILIO_ACCOUNT_SID = undefined;
+      env.TWILIO_AUTH_TOKEN = undefined;
+      env.TWILIO_FROM_NUMBER = undefined;
+      const promised = await readiness(t, deployed.campaignId);
+      expect(promised.status('confirmation_channels')).toBe('fail');
+      expect(promised.byKey.get('confirmation_channels')?.detail, 'the row must name the channel that cannot deliver').toContain('sms');
+    } finally {
+      Object.assign(env, twilio);
+    }
   }, 120_000);
 
   it('data_storage_setting never reports pass while no tenant retention policy exists', async () => {

@@ -136,7 +136,7 @@ describe('every remediation fix link lands on a screen that exists (B7)', () => 
 });
 
 describe('every code a route can emit has remediation copy (B6)', () => {
-  it.fails('covers every ClinicActivationBlocker (B6)', () => {
+  it('covers every ClinicActivationBlocker (B6)', () => {
     // `campaigns.ts` throws these AFTER readiness has passed, on the first-run
     // path, which is the worst possible moment to show a bare code.
     const missing = CLINIC_ACTIVATION_BLOCKERS.filter(code => !isKnownRemediationCode(code));
