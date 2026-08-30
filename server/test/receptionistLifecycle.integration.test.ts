@@ -153,8 +153,12 @@ describe('receptionist inbound-call lifecycle (event webhook)', () => {
     expect(res.statusCode).toBe(200);
     // The queue paginates and the list projection carries no raw phone,
     // recording URL or sentiment — those live on the detail route now.
-    const apiLogs = res.json().data as Array<{ retellCallId: string; outcome: string; durationSeconds: number; callerPhoneMasked: string | null; recordingUrl: null }>;
-    const mine = apiLogs.find(l => l.retellCallId === callId);
+    // The provider call id is MASKED on the wire now, and the field is named
+    // for what it is rather than for who supplies it — a list route must not
+    // hand a clinic the supplier's full call identifier.
+    const apiLogs = res.json().data as Array<{ providerCallRef: string; outcome: string; durationSeconds: number; callerPhoneMasked: string | null; recordingUrl: null }>;
+    const mine = apiLogs.find(l => l.providerCallRef === `${callId.slice(0, 4)}\u2026${callId.slice(-4)}`);
+    expect(mine, 'the masked provider call ref should identify the call').toBeDefined();
     expect(mine?.outcome).toBe('ESCALATED');
     expect(mine?.durationSeconds).toBe(125);
     expect(mine?.recordingUrl).toBeNull();

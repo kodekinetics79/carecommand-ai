@@ -4,7 +4,7 @@
  *   SCREAMING_SNAKE  -> "Sentence case"   (PENDING_REVIEW -> "Pending review")
  *   snake_case       -> "Sentence case"   (transport_ambiguous -> "Transport ambiguous")
  *   camelCase        -> "Sentence case"   (directBooking -> "Direct booking")
- *   Mixed-case text  -> left as written   ("Warm and professional", "Retell LLM")
+ *   Mixed-case text  -> left as written   ("Warm and professional", "Voice line")
  *
  * The old implementation lower-cased everything, which mangled values that
  * were already human text or carried acronyms (M71).

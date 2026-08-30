@@ -98,11 +98,35 @@ export const PERMISSIONS = [
   'receptionist:booking-review',
   // Tenant administration: manage users, roles, sessions, security posture.
   'admin:manage',
+  // ---- Platform-only ------------------------------------------------------
+  // The voice line's supplier mechanics: provider agent id and version, the
+  // deployment tag, prompt/tool/intake/config fingerprints, the webhook URL and
+  // the raw provider export. A clinic can act on none of it, and reading it
+  // discloses which supplier answers its phones — so unlike every other grant
+  // below, this one is NOT in any default role, INCLUDING Owner and Admin.
+  // It exists so CareCommand support can be granted it deliberately, per
+  // tenant, through the RoleDefinition override, rather than the capability
+  // being deleted outright.
+  'platform:voice-line-mechanics:read',
 ] as const;
 
 export type Permission = (typeof PERMISSIONS)[number];
 
-const ALL: Permission[] = [...PERMISSIONS];
+/**
+ * Grants that no role gets by default, not even the ones defined as "all".
+ *
+ * `OWNER: ALL` is a spreading default, and it is the right one for tenant
+ * data: an owner may see everything about their own clinic. A supplier's
+ * coordinates are not their clinic's data, so a `platform:*` grant added to
+ * PERMISSIONS must not arrive in the owner's token merely by being added to
+ * the list. Excluding them here makes that structural instead of a convention
+ * the next permission has to remember.
+ */
+export const PLATFORM_ONLY_PERMISSIONS: readonly Permission[] = ['platform:voice-line-mechanics:read'];
+
+const PLATFORM_ONLY = new Set<string>(PLATFORM_ONLY_PERMISSIONS);
+
+const ALL: Permission[] = PERMISSIONS.filter(permission => !PLATFORM_ONLY.has(permission));
 
 /**
  * Default grant matrix. These defaults are calibrated to exactly reproduce the

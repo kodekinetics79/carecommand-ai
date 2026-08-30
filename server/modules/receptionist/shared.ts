@@ -200,7 +200,7 @@ export function isClinicNameConflict(error: unknown): boolean {
  * actually resolves it: publish a fresh version, which deploying does.
  */
 export const PROVIDER_DEPLOYMENT_CONFLICT_MESSAGE =
-  'This published Retell agent version is already in use by another CareCommand configuration, which may be outside this tenant. One live provider version answers for one configuration, because they would otherwise share a webhook and a response engine. Deploy from Studio to publish a version of your own, or unlink this agent.';
+  'This published voice line configuration is already in use by another CareCommand configuration, which may be outside this tenant. One live version answers for one configuration, because they would otherwise share the same callback address and the same response engine. Publish to the line from the Go live tab to publish a version of your own.';
 
 export const INBOUND_DESTINATION_CONFLICT_MESSAGE =
   'This inbound destination is already assigned to an active receptionist clinic. One number answers for one clinic; give this clinic its own line, or deactivate the clinic that holds it.';

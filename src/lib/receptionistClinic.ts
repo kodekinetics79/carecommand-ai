@@ -381,10 +381,10 @@ export interface CatalogLocalePackStatus {
 }
 
 export interface CatalogVoices {
-  source: 'retell' | 'mock' | 'unavailable';
+  source: 'service' | 'mock' | 'unavailable';
   fetchedAt: string | null;
   error: null | 'unauthorized' | 'provider_unavailable' | 'invalid_response';
-  items: Array<{ id: string; name: string; provider: string; gender: string | null; accent: string | null; age: string | null; previewUrl: string | null }>;
+  items: Array<{ id: string; name: string; gender: string | null; accent: string | null; age: string | null; previewUrl: string | null }>;
 }
 
 export interface Catalog {

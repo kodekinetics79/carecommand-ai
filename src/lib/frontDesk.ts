@@ -322,7 +322,7 @@ export interface AppointmentRequestRow {
     branch: { timezone: string; name: string };
     providerProfile: { user: { displayName: string } } | null;
   } | null;
-  callLog: { id: string; retellCallId: string | null; callerName: string | null; direction: string; startedAt: string | null; clinicId: string | null; patientId: string | null } | null;
+  callLog: { id: string; providerCallRef: string | null; callerName: string | null; direction: string; startedAt: string | null; clinicId: string | null; patientId: string | null } | null;
   patient: { firstName: string; lastName: string } | null;
   createdAt: string;
 }

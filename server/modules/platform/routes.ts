@@ -14,6 +14,8 @@ import { validateIanaTimezone } from '../../lib/scheduling';
 import { PROVIDER_CATALOG, PROVIDER_KEYS, providerConfig, invalidateProviderCredentials, refreshProviderCredentials, type ProviderDef as SharedProviderDef } from '../../lib/providerCredentials';
 import { periodUsageByMetric, usagePeriodKey, USAGE_LIMIT_KEY_BY_METRIC } from '../../lib/usageMetering';
 import { TENANT_MODES, TENANT_MODE_DESCRIPTION, modeAllowsLiveCalling } from '../../lib/tenantMode';
+import { platformRemediationCatalogue } from '../../lib/receptionist/remediation';
+import { platformDeploymentProjection } from '../receptionist/deployment';
 
 const timezoneInput = z.string().trim().min(1).max(80).refine(value => {
   try { validateIanaTimezone(value); return true; } catch { return false; }
@@ -986,6 +988,67 @@ export const platformRoutes: FastifyPluginAsync = async app => {
     try { failedJobs = await withTimeout(autopilotQueue.getFailedCount(), 1000); } catch { failedJobs = -1; }
     return { providers, failedJobs };
   });
+  // ===== Voice line: the mechanics the tenant no longer receives ==========
+  //
+  // Everything stripped out of the receptionist's tenant routes lands here.
+  // The point of the split was never to delete the capability — support has to
+  // be able to answer "what is actually published on this clinic's line?" —
+  // only to stop the clinic reading our supply chain to do it. This surface is
+  // behind the platform JWT, which a tenant token cannot mint.
+
+  /**
+   * The failure catalogue with the supplier instruction attached.
+   *
+   * A clinic that hits `tag_dynamic_variables_not_empty` now reads "your voice
+   * line needs attention from CareCommand support" and a reference. This is
+   * where the person they reach looks up what that actually means and what to
+   * do in the provider console.
+   */
+  app.get('/voice-line/remediation', async () => ({
+    provider: PROVIDERS.voice?.label ?? 'Voice',
+    entries: platformRemediationCatalogue(),
+  }));
+
+  /**
+   * One tenant's live voice-line mechanics: provider agent ids, published and
+   * response-engine versions, the deployment tag, the webhook URL, every
+   * fingerprint, and the `configurationReference` the tenant was shown — so a
+   * support engineer can go from a quoted "LINE-4F2C91" to the exact row.
+   */
+  app.get('/tenants/:tenantId/voice-line', async request => {
+    const { tenantId } = z.object({ tenantId: uuid }).parse(request.params);
+    const [agents, deployments] = await Promise.all([
+      db.receptionistAgent.findMany({
+        where: { tenantId },
+        orderBy: { createdAt: 'asc' },
+        select: {
+          id: true, clinicId: true, name: true, active: true, voice: true, language: true,
+          providerAgentId: true, providerVersion: true, providerVersionTag: true, providerStatus: true,
+          providerPublished: true, providerAssignedTags: true, providerVoiceId: true, providerLanguage: true,
+          providerWebhookUrl: true, providerWebhookEvents: true, providerDataStorageSetting: true,
+          providerSignedUrl: true, providerResponseEngineType: true, providerResponseEngineId: true,
+          providerResponseEngineVersion: true, providerBookToolFingerprint: true,
+          providerToolCallStrictMode: true, providerFingerprint: true, providerLastErrorCode: true,
+          providerVerifiedAt: true, providerVerificationExpiresAt: true,
+        },
+      }),
+      db.receptionistAgentDeployment.findMany({
+        where: { tenantId },
+        orderBy: { startedAt: 'desc' },
+        take: 50,
+      }),
+    ]);
+    return {
+      provider: PROVIDERS.voice?.label ?? 'Voice',
+      agents,
+      deployments: deployments.map(row => ({
+        ...platformDeploymentProjection(row),
+        campaignId: row.campaignId,
+        agentId: row.agentId,
+      })),
+    };
+  });
+
   app.post('/health/retry-jobs', { preHandler: tenantManage }, async (request, reply) => {
     const body = z.object({ queue: z.literal('autopilot').default('autopilot') }).parse(request.body ?? {});
     let failed: Awaited<ReturnType<typeof autopilotQueue.getFailed>>;

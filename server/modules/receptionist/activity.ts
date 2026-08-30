@@ -9,6 +9,7 @@ import { lockDncDestinationFence } from '../../lib/receptionist/dncFence';
 import { uuid, idParam, writeRoles, bookingReviewRoles, callArtifactRead, ownerAdminRoles, optionalE164Phone } from './shared';
 import { cursorPage } from '../../lib/pagination';
 import { maskDestination } from '../../lib/campaigns';
+import { maskProviderId } from '../../lib/receptionist/liveCallUat';
 import { hasPermission, requirePermission } from '../../lib/permissions';
 import { bookCanonicalAppointment } from '../../lib/booking';
 import { appointmentNoteSelect } from '../../lib/appointmentNotes';
@@ -136,7 +137,7 @@ export const activityRoutes: FastifyPluginAsync = async app => {
       skip: query.cursor ? 1 : 0,
       take: query.limit + 1,
       include: {
-        callLog: { select: { id: true, retellCallId: true, callerName: true, direction: true, startedAt: true, clinicId: true, patientId: true } },
+        callLog: { select: { id: true, callerName: true, direction: true, startedAt: true, clinicId: true, patientId: true } },
         bookedAppointment: {
           select: {
             id: true, service: true, startsAt: true,
@@ -173,7 +174,7 @@ export const activityRoutes: FastifyPluginAsync = async app => {
     const row = await db.appointmentRequest.findFirst({
       where: { id, tenantId: request.auth.tenantId },
       include: {
-        callLog: { select: { id: true, retellCallId: true, callerName: true, callerPhone: true, direction: true, startedAt: true, endedAt: true, clinicId: true, outcome: true } },
+        callLog: { select: { id: true, callerName: true, callerPhone: true, direction: true, startedAt: true, endedAt: true, clinicId: true, outcome: true } },
         bookedAppointment: {
           select: {
             id: true, service: true, startsAt: true, status: true,
@@ -594,7 +595,10 @@ export const activityRoutes: FastifyPluginAsync = async app => {
       if (durableResolution) return [];
       return [{
         localCallLogId: log.id,
-        providerCallId: log.retellCallId,
+        // Masked: this is the outbound reconciliation queue, which staff read.
+        // The unmasked id is only ever needed by the resync that runs on the
+        // server, and by support through the platform route.
+        providerCallId: maskProviderId(log.retellCallId),
         targetId: log.targetId ?? targetByCall.get(log.id) ?? null,
         triggerSources: [
           ...(targetByCall.has(log.id) ? ['RECONCILIATION_REQUIRED' as const] : []),
@@ -849,7 +853,13 @@ export const activityRoutes: FastifyPluginAsync = async app => {
         id: row.id,
         clinicId: row.clinicId,
         campaign: row.campaign,
-        retellCallId: row.retellCallId,
+        // Was `retellCallId: row.retellCallId` — the supplier's name in the
+        // field and the UNMASKED provider call id in the value, on a list
+        // route. The browser was already masking it for display, which is the
+        // tell: nobody wanted the whole id on screen, it was simply on the
+        // wire anyway. The masked form is all the queue needs — it prints it,
+        // and enables the resync button when it is non-null.
+        providerCallRef: maskProviderId(row.retellCallId),
         callerName: row.callerName,
         callerPhoneMasked: maskDestination(row.callerPhone),
         patientId: row.patientId,
@@ -951,12 +961,17 @@ export const activityRoutes: FastifyPluginAsync = async app => {
       resourceId: row.id,
       metadata: { recordingDisclosed: canReadRecording && Boolean(row.recordingUrl) },
     });
+    const { retellCallId, ...callRow } = row;
     return {
-      ...row,
+      ...callRow,
+      providerCallRef: maskProviderId(retellCallId),
       providerSummary: row.transcriptSummary ? {
         text: row.transcriptSummary,
         source: 'PROVIDER_CALL_ANALYSIS',
-        sourceCallId: row.retellCallId,
+        // Masked like the list. The detail view spread the whole Prisma row,
+        // so the full provider call id shipped twice — once as `retellCallId`
+        // and once here — on the screen a receptionist opens to read a call.
+        sourceCallId: maskProviderId(retellCallId),
       } : null,
       recordingAvailable: Boolean(usableRecordingUrl),
       recordingAccess: row.recordingPurgedAt

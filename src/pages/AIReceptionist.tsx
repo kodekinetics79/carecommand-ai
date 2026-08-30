@@ -278,7 +278,7 @@ export default function AIReceptionist() {
           <BentoCard title={activeChannel === 'call' ? 'Voice Call Review' : 'Conversation Review'} subtitle="Recorded context and server authorization evidence" headerRight={<Sparkles className="w-4 h-4 text-violet-v" />}>
             {activeChannel === 'call' ? (
               <div className="space-y-3">
-                <p className="text-sm text-t2">Voice rows now come from the canonical Retell-backed call log instead of the generic conversation inbox.</p>
+                <p className="text-sm text-t2">Voice rows now come from the canonical voice-line call log instead of the generic conversation inbox.</p>
                 <button type="button" onClick={() => navigate('/receptionist-studio?tab=activity')} className="w-full rounded-xl border border-dashed border-[var(--b2)] px-3 py-2 text-xs font-semibold text-indigo hover:bg-[var(--s3)]">
                   Open call review, recordings and provider evidence
                 </button>

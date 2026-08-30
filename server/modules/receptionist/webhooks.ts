@@ -843,7 +843,7 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     if (query.campaignId) {
       const campaign = await db.receptionistCampaign.findFirst({ where: { id: query.campaignId, tenantId }, select: { clinicId: true } });
       if (!campaign || (trustedClinicId && campaign.clinicId !== trustedClinicId) || (query.clinicId && campaign.clinicId !== query.clinicId)) {
-        await flagRetellIngressReview(tenantId, providerCallId, 'Signed Retell webhook selectors did not match the trusted clinic mapping');
+        await flagRetellIngressReview(tenantId, providerCallId, 'Signed voice-service callback selectors did not match the trusted clinic mapping');
         return reply.code(202).send({ ok: true, ignored: true });
       }
       trustedCampaignId = query.campaignId;
@@ -851,7 +851,7 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     } else if (query.clinicId) {
       const clinic = await db.receptionistClinic.findFirst({ where: { id: query.clinicId, tenantId }, select: { id: true } });
       if (!clinic || (trustedClinicId && clinic.id !== trustedClinicId)) {
-        await flagRetellIngressReview(tenantId, providerCallId, 'Signed Retell webhook clinic selector did not match the trusted clinic mapping');
+        await flagRetellIngressReview(tenantId, providerCallId, 'Signed voice-service callback clinic selector did not match the trusted clinic mapping');
         return reply.code(202).send({ ok: true, ignored: true });
       }
       trustedClinicId = clinic.id;
@@ -1320,14 +1320,14 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     if (body.name !== 'book_appointment' && query.campaignId) {
       const campaign = await db.receptionistCampaign.findFirst({ where: { id: query.campaignId, tenantId }, select: { clinicId: true } });
       if (!campaign || (trustedClinicId && campaign.clinicId !== trustedClinicId) || (query.clinicId && campaign.clinicId !== query.clinicId)) {
-        await flagRetellIngressReview(tenantId, providerCallId, 'Signed Retell tool selectors did not match the trusted clinic mapping');
+        await flagRetellIngressReview(tenantId, providerCallId, 'Signed voice-service tool selectors did not match the trusted clinic mapping');
         return reply.code(202).send({ message: "I'm sorry, I can't access this clinic right now." });
       }
       trustedClinicId = campaign.clinicId;
     } else if (body.name !== 'book_appointment' && query.clinicId) {
       const clinic = await db.receptionistClinic.findFirst({ where: { id: query.clinicId, tenantId }, select: { id: true } });
       if (!clinic || (trustedClinicId && clinic.id !== trustedClinicId)) {
-        await flagRetellIngressReview(tenantId, providerCallId, 'Signed Retell tool clinic selector did not match the trusted clinic mapping');
+        await flagRetellIngressReview(tenantId, providerCallId, 'Signed voice-service tool clinic selector did not match the trusted clinic mapping');
         return reply.code(202).send({ message: "I'm sorry, I can't access this clinic right now." });
       }
       trustedClinicId = clinic.id;
@@ -1505,7 +1505,7 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     const activeSince = activeCall.startedAt ?? activeCall.createdAt;
     const canonicalBookingReplay = body.name === 'book_appointment' && activeCall.outcome === 'BOOKED';
     if (activeCall.endedAt || (!canonicalBookingReplay && activeCall.outcome !== 'IN_PROGRESS') || activeSince.getTime() < Date.now() - RECEPTIONIST_CALL_LEASE_MS) {
-      await flagRetellIngressReview(tenantId, providerCallId, 'Signed Retell tool rejected because the call is ended, terminal, or outside its active lease');
+      await flagRetellIngressReview(tenantId, providerCallId, 'Signed voice-service tool rejected because the call is ended, terminal, or outside its active lease');
       return reply.code(200).send({ allowed: false, needs_human: true, message: 'This call is no longer active. I cannot access or change patient information.' });
     }
 
@@ -1543,7 +1543,7 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         });
       } catch (error) {
         request.log.error({ ...refs, err: error }, 'Retell tool-limit staff handoff could not be persisted');
-        await flagRetellIngressReview(tenantId, providerCallId, 'Verified Retell tool limit reached but staff handoff persistence failed').catch(() => {});
+        await flagRetellIngressReview(tenantId, providerCallId, 'Verified voice-service tool limit reached but staff handoff persistence failed').catch(() => {});
         return reply.code(200).send({
           allowed: false,
           needs_human: true,

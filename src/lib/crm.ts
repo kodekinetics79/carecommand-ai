@@ -203,7 +203,7 @@ export interface LaunchResult {
   status: string;
   setupRequired: boolean;
   summary: { total: number; accepted: number; deliveryUnknown: number; suppressed: number; skipped: number; setupRequired: number; queued: number; failed: number; authorityBlocked: number; atomicBoundaryBlocked: number };
-  provider: { channel: string; configured: boolean; setupRequired: boolean; missing: string[]; mode: string; liveDispatchActivated: boolean };
+  provider: { channel: string; configured: boolean; setupRequired: boolean; missingConfigCount: number; mode: string; liveDispatchActivated: boolean };
   launchFingerprint: string;
 }
 
@@ -212,7 +212,6 @@ export interface CampaignLaunchPreview {
   fingerprint: string;
   templateRevision: string;
   providerMode: string;
-  provider: string;
   channel: CommChannel;
   scheduledAt: string | null;
   audience: { total: number; eligible: number; suppressed: number; missingContact: number; authorityRequired: number; atomicBoundaryBlocked: number };

@@ -10,7 +10,7 @@ vi.mock('../../lib/api', async () => {
 });
 
 import { ApiError } from '../../lib/api';
-import type { Deployment, DeploymentDiff, RetellConfigExport, RetellStatusResponse } from '../../lib/receptionistDeployment';
+import type { Deployment, DeploymentDiff, VoiceLineConfigurationExport, VoiceLineStatusResponse } from '../../lib/receptionistDeployment';
 import { DeployPanel } from './DeployPanel';
 
 /**
@@ -19,7 +19,7 @@ import { DeployPanel } from './DeployPanel';
  * it shows the server's own failure words, and that the manual (BYO) path is
  * always available — an operator must be able to finish in the console.
  */
-function status(overrides: Partial<RetellStatusResponse> = {}): RetellStatusResponse {
+function status(overrides: Partial<VoiceLineStatusResponse> = {}): VoiceLineStatusResponse {
   return {
     providerConfigured: true,
     providerMode: 'live',
@@ -44,9 +44,8 @@ function status(overrides: Partial<RetellStatusResponse> = {}): RetellStatusResp
 function deployment(overrides: Partial<Deployment> = {}): Deployment {
   return {
     id: 'dep-1', status: 'VERIFIED', mock: false,
-    providerAgentIdMasked: 'agen…7f21', providerAgentVersion: 4, providerLlmVersion: 2, providerVersionTag: 'prod',
-    promptHash: 'abc123def456789', toolFingerprint: 'tools-1', intakeFingerprint: 'intake-1', configFingerprint: 'config-1',
-    voiceId: '11labs-Anna', language: 'en-US', steps: [], providerErrorCode: null,
+    configurationReference: 'LINE-00DEP1',
+    voiceId: 'voice-anna', language: 'en-US', steps: [], providerErrorCode: null,
     numberBound: true, boundPhoneNumberMasked: '+1 ••• ••• 0142', deployedBySource: 'USER',
     startedAt: '2026-08-29T17:00:00.000Z', publishedAt: '2026-08-29T17:00:20.000Z', verifiedAt: '2026-08-29T17:00:30.000Z',
     ...overrides,
@@ -66,29 +65,33 @@ function diff(overrides: Partial<DeploymentDiff> = {}): DeploymentDiff {
   return {
     deployment: {
       id: row.id, status: row.status, verifiedAt: row.verifiedAt,
-      providerAgentVersion: row.providerAgentVersion, promptHash: row.promptHash, toolFingerprint: row.toolFingerprint,
+      configurationReference: row.configurationReference,
       voiceId: row.voiceId, language: row.language,
     },
-    draft: { promptHash: row.promptHash, toolFingerprint: row.toolFingerprint, intakeFingerprint: row.intakeFingerprint, voiceId: row.voiceId, language: row.language, webhookUrl: 'https://api.example.com/v1/receptionist/webhooks/retell', toolNames: ['book_appointment', 'take_message'] },
+    draft: { voiceId: row.voiceId, language: row.language, toolNames: ['book_appointment', 'take_message'] },
     changed: [],
     toolsDiff: { added: [], removed: [], changed: [] },
     ...overrides,
   };
 }
 
-function config(): RetellConfigExport {
+function config(): VoiceLineConfigurationExport {
   return {
     systemPrompt: '# Role\nYou are Riley.',
-    voiceId: '11labs-Anna',
+    voiceId: 'voice-anna',
     language: 'en-US',
     beginMessage: 'Hi, this is Riley, an AI assistant for Brightsmile Dental.',
+    // The mechanics below arrive ONLY for a caller holding
+    // `platform:voice-line-mechanics:read`. This fixture keeps them so the
+    // support-only checklist stays under test; the tenant fixture (no
+    // `webhookUrl`) is asserted separately, and the panel renders nothing.
     dynamicVariables: { is_open_now: 'true' },
-    webhookUrl: 'https://api.example.com/v1/receptionist/webhooks/retell',
+    webhookUrl: 'https://api.example.com/v1/receptionist/webhooks/voice',
     bookingFunction: { name: 'book_appointment' },
     callOutcomeFields: [{ name: 'outcome', type: 'enum', description: 'Call outcome' }],
     tools: [
-      { name: 'book_appointment', url: 'https://api.example.com/v1/receptionist/webhooks/retell/fn?clinicId=clinic-1', parameters: { required: ['startsAt'] } },
-      { name: 'take_message', url: 'https://api.example.com/v1/receptionist/webhooks/retell/fn?clinicId=clinic-1' },
+      { name: 'book_appointment', url: 'https://api.example.com/v1/receptionist/webhooks/voice/fn?clinicId=clinic-1', parameters: { required: ['startsAt'] } },
+      { name: 'take_message', url: 'https://api.example.com/v1/receptionist/webhooks/voice/fn?clinicId=clinic-1' },
     ],
   };
 }
@@ -97,7 +100,7 @@ let respond: (path: string, init?: RequestInit) => Promise<unknown>;
 
 function routes(overrides: Partial<Record<'status' | 'diff' | 'latest' | 'deploy' | 'verify', () => Promise<unknown>>> = {}) {
   return (path: string, init?: RequestInit): Promise<unknown> => {
-    if (path.startsWith('/v1/receptionist/retell-status')) return (overrides.status ?? (() => Promise.resolve(status())))();
+    if (path.startsWith('/v1/receptionist/voice-line-status')) return (overrides.status ?? (() => Promise.resolve(status())))();
     if (path.endsWith('/deployment-diff')) return (overrides.diff ?? (() => Promise.resolve(diff())))();
     if (path.endsWith('/deployments/latest')) return (overrides.latest ?? (() => Promise.resolve(latestBody())))();
     if (path.endsWith('/deploy') && init?.method === 'POST') return (overrides.deploy ?? (() => Promise.reject(new Error('deploy not stubbed'))))();
@@ -111,7 +114,7 @@ beforeEach(() => {
   apiRequestMock.mockImplementation((path: string, init?: RequestInit) => respond(path, init));
 });
 
-function renderPanel(cfg: RetellConfigExport | null = config()) {
+function renderPanel(cfg: VoiceLineConfigurationExport | null = config()) {
   return render(<MemoryRouter><DeployPanel campaignId="camp-1" config={cfg} pollIntervalMs={1} pollMaxAttempts={2} /></MemoryRouter>);
 }
 
@@ -134,10 +137,10 @@ describe('DeployPanel', () => {
     respond = routes();
     renderPanel();
 
-    expect(await screen.findByText('Version 4')).toBeInTheDocument();
+    expect(await screen.findByText('LINE-00DEP1')).toBeInTheDocument();
     expect(screen.getByText('VERIFIED')).toBeInTheDocument();
     expect(screen.getByText(/expires in 19h — auto-renews/)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Redeploy/ })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /Publish to the line again/ })).toBeEnabled();
   });
 
   it('shows changed-setting chips and a Deploy changes button when the draft moved on', async () => {
@@ -150,7 +153,7 @@ describe('DeployPanel', () => {
     expect(await screen.findByTestId('deploy-changes')).toBeInTheDocument();
     expect(screen.getByText('Prompt')).toBeInTheDocument();
     expect(screen.getByText('Voice')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Deploy changes/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Publish changes/ })).toBeInTheDocument();
   });
 
   it('warns before redeploying a campaign that is answering calls right now', async () => {
@@ -166,7 +169,7 @@ describe('DeployPanel', () => {
     respond = routes();
     render(<MemoryRouter><DeployPanel campaignId="camp-1" config={config()} campaignStatus="DRAFT" pollIntervalMs={1} pollMaxAttempts={2} /></MemoryRouter>);
 
-    await screen.findByText('Version 4');
+    await screen.findByText('LINE-00DEP1');
     expect(screen.queryByTestId('redeploy-degrade-warning')).not.toBeInTheDocument();
   });
 
@@ -182,13 +185,13 @@ describe('DeployPanel', () => {
         // provider-status read already resolved.
         deploy: async () => {
           await gate;
-          return { deployment: deployment({ status: 'PUBLISHED', verifiedAt: null }), verification: { status: 'pending' }, message: 'Published to Retell.' };
+          return { deployment: deployment({ status: 'PUBLISHED', verifiedAt: null }), verification: { status: 'pending' }, message: 'Published to the line.' };
         },
       })(path, init);
     };
     renderPanel();
 
-    fireEvent.click(await screen.findByRole('button', { name: /Deploy to Retell/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /Publish to the line/ }));
     await waitFor(() => expect(document.querySelector('[data-step="publish"][data-step-state="running"]')).not.toBeNull());
     releaseDeploy!();
 
@@ -206,7 +209,7 @@ describe('DeployPanel', () => {
     });
     renderPanel();
 
-    fireEvent.click(await screen.findByRole('button', { name: /Deploy to Retell/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /Publish to the line/ }));
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('Another deployment started less than a minute ago.');
@@ -225,7 +228,7 @@ describe('DeployPanel', () => {
     });
     renderPanel();
 
-    fireEvent.click(await screen.findByRole('button', { name: /Redeploy/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /Publish to the line again/ }));
 
     expect(await screen.findByText('Another active campaign uses this agent.')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Recall wave' })).toHaveAttribute('href', '/receptionist-studio?tab=campaign&campaign=camp-9');
@@ -242,13 +245,13 @@ describe('DeployPanel', () => {
     });
     renderPanel();
 
-    fireEvent.click(await screen.findByRole('button', { name: /Deploy to Retell/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /Publish to the line/ }));
 
-    expect(await screen.findByText(/Published, but verification failed: The published prompt does not match this configuration./)).toBeInTheDocument();
+    expect(await screen.findByText(/Published, but the line check did not pass: The published prompt does not match this configuration./)).toBeInTheDocument();
     expect(screen.getByText('code: prompt_drift')).toBeInTheDocument();
     // Reading the `{ deployment }` envelope as the row made this line throw.
-    expect(await screen.findByText(/Deployment published · version 4/)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Verify again/ })).toBeInTheDocument();
+    expect(await screen.findByText(/Deployment published · LINE-00DEP1/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Run the line check/ })).toBeInTheDocument();
   });
 
   it('stops polling as soon as the settled row arrives, rather than spending the whole budget', async () => {
@@ -260,7 +263,7 @@ describe('DeployPanel', () => {
     });
     render(<MemoryRouter><DeployPanel campaignId="camp-1" config={config()} pollIntervalMs={1} pollMaxAttempts={8} /></MemoryRouter>);
 
-    fireEvent.click(await screen.findByRole('button', { name: /Deploy to Retell/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /Publish to the line/ }));
     expect(await screen.findByText('Deployed')).toBeInTheDocument();
     // One read: the VERIFIED row settles the poll. Reading the envelope as the
     // row never matched 'VERIFIED', so every deploy burned the whole budget.
@@ -278,8 +281,8 @@ describe('DeployPanel', () => {
     });
     renderPanel();
 
-    expect(await screen.findByText('No agent linked to this campaign.')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Deploy to Retell/ })).toBeDisabled();
+    expect(await screen.findByText('No receptionist is assigned to this campaign.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Publish to the line/ })).toBeDisabled();
   });
 
   it('names a failed provider-status load instead of rendering an empty ready state', async () => {
@@ -287,7 +290,7 @@ describe('DeployPanel', () => {
     renderPanel();
 
     const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent('Provider status could not be loaded.');
+    expect(alert).toHaveTextContent('Voice line status could not be loaded.');
     expect(alert).toHaveTextContent('An unexpected error occurred');
   });
 });

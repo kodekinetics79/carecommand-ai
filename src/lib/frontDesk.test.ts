@@ -119,7 +119,7 @@ describe('deployment-attention tasks — D9, the task the board could not show',
     code: 'number_bound',
     title: 'The phone number is not bound to this agent',
     action: 'Re-deploy the campaign.',
-    fixHref: '/receptionist-studio?tab=retell',
+    fixHref: '/receptionist-studio?tab=deploy',
   };
 
   it('reads the pre-D shape: its own workflow, no kind', () => {

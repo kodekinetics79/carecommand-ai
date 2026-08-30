@@ -16,10 +16,10 @@ import { AgentEditor } from './AgentEditor';
  */
 function agent(overrides: Partial<AgentRow> = {}): AgentRow {
   return {
-    id: 'agent-1', clinicId: 'clinic-1', name: 'Riley', voice: '11labs-Anna', tone: 'Warm and professional',
+    id: 'agent-1', clinicId: 'clinic-1', name: 'Riley', voice: 'voice-anna', tone: 'Warm and professional',
     language: 'en-US', persona: null, greetingOverride: null, active: true,
-    providerAgentId: 'agent_7f21', providerVersionTag: 'prod', providerVersion: 4, providerStatus: 'VERIFIED',
-    providerPublished: true, providerVoiceId: '11labs-Anna', providerLanguage: 'en-US',
+    providerAgentId: 'reference-7f21', providerVersionTag: 'prod', providerVersion: 4, providerStatus: 'VERIFIED',
+    providerPublished: true, providerVoiceId: 'voice-anna', providerLanguage: 'en-US',
     providerVerifiedAt: '2026-08-29T17:00:00.000Z', providerVerificationExpiresAt: '2026-08-30T17:00:00.000Z',
     providerLastAttemptAt: '2026-08-29T17:00:00.000Z', providerLastAttemptStatus: 'SUCCEEDED', providerLastErrorCode: null,
     ...overrides,
@@ -46,8 +46,8 @@ const VOICES_BODY = {
   fetchedAt: '2026-08-30T09:00:00.000Z',
   error: null,
   voices: [
-    { voiceId: '11labs-Anna', name: 'Anna', provider: 'elevenlabs', gender: 'female', accent: 'American', age: 'young', previewUrl: null },
-    { voiceId: '11labs-Marcus', name: 'Marcus', provider: 'elevenlabs', gender: 'male', accent: 'British', age: 'middle', previewUrl: null },
+    { voiceId: 'voice-anna', name: 'Anna', gender: 'female', accent: 'American', age: 'young', previewUrl: null },
+    { voiceId: 'voice-marcus', name: 'Marcus', gender: 'male', accent: 'British', age: 'middle', previewUrl: null },
   ],
 };
 
@@ -67,11 +67,11 @@ function renderEditor(props: Partial<React.ComponentProps<typeof AgentEditor>> =
 }
 
 describe('AgentEditor', () => {
-  it('says plainly when no Retell agent is linked and will not let you verify nothing', () => {
+  it('says plainly when nothing is published to the line and will not let you check nothing', () => {
     renderEditor({ agent: agent({ providerAgentId: null, providerStatus: 'UNVERIFIED', providerVersion: null, providerVerifiedAt: null }) });
 
-    expect(screen.getByText('No Retell agent linked yet.')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Verify provider deployment/ })).toBeDisabled();
+    expect(screen.getByText('Nothing is published to the voice line yet.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Run the line check/ })).toBeDisabled();
   });
 
   it('shows the pinned numeric version rather than a tag claim', () => {
@@ -92,7 +92,7 @@ describe('AgentEditor', () => {
       code: 'agent_invalid:tag_dynamic_variables_not_empty',
       severity: 'blocking',
       title: 'The deployment tag carries default dynamic variables',
-      action: 'Remove default dynamic variables from the tag in Retell; CareCommand supplies all variables per call.',
+      action: 'Your voice line needs attention from CareCommand support.',
       fixHref: null,
       scope: 'agent',
     }];
@@ -101,7 +101,7 @@ describe('AgentEditor', () => {
     const alert = screen.getByRole('alert');
     expect(alert).toHaveTextContent('tag dynamic variables not empty');
     expect(alert).toHaveTextContent('The deployment tag carries default dynamic variables');
-    expect(alert).toHaveTextContent('Remove default dynamic variables from the tag in Retell');
+    expect(alert).toHaveTextContent('Your voice line needs attention from CareCommand support.');
   });
 
   it('keeps a failed verify visible when the parent hands back a refreshed row', async () => {
@@ -124,7 +124,7 @@ describe('AgentEditor', () => {
     }
     render(<Harness />);
 
-    fireEvent.click(screen.getByRole('button', { name: /Verify provider deployment/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Run the line check/ }));
 
     await waitFor(() => expect(screen.getByText('The published agent no longer matches this configuration.')).toBeInTheDocument());
     expect(screen.getByText('code: provider_deployment_drift')).toBeInTheDocument();
@@ -135,14 +135,14 @@ describe('AgentEditor', () => {
     const onSave = vi.fn().mockResolvedValue(undefined);
     renderEditor({ onSave });
 
-    fireEvent.change(screen.getByLabelText('Retell agent ID'), { target: { value: 'agent_9999' } });
+    fireEvent.change(screen.getByLabelText('Configuration reference'), { target: { value: 'reference-9999' } });
     fireEvent.click(screen.getByRole('button', { name: /Save changes/ }));
 
-    expect(await screen.findByRole('dialog')).toHaveTextContent('Change the linked Retell agent?');
+    expect(await screen.findByRole('dialog')).toHaveTextContent('Change this voice line?');
     expect(onSave).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole('button', { name: 'Change binding' }));
-    await waitFor(() => expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ providerAgentId: 'agent_9999' })));
+    await waitFor(() => expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ providerAgentId: 'reference-9999' })));
   });
 
   it('saves an ordinary edit without a confirmation', async () => {
@@ -158,7 +158,7 @@ describe('AgentEditor', () => {
 
   it('flags a provider mismatch and adopts the provider values on request', async () => {
     const onAdoptProviderValues = vi.fn().mockResolvedValue(undefined);
-    renderEditor({ agent: agent({ voice: '11labs-Adrian', providerVoiceId: 'openai-Nova' }), onAdoptProviderValues });
+    renderEditor({ agent: agent({ voice: 'voice-adrian', providerVoiceId: 'openai-Nova' }), onAdoptProviderValues });
 
     expect(screen.getByTestId('provider-mismatch')).toHaveTextContent('Differs from verified provider (openai-Nova)');
     fireEvent.click(screen.getByRole('button', { name: /Adopt provider values/ }));
@@ -169,19 +169,19 @@ describe('AgentEditor', () => {
     const onVerify = vi.fn().mockRejectedValue(new ApiError(429, 'Too many verification attempts.', 'cooldown', { code: 'cooldown', retryAfterSeconds: 42 }));
     renderEditor({ onVerify });
 
-    fireEvent.click(screen.getByRole('button', { name: /Verify provider deployment/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Run the line check/ }));
 
     expect(await screen.findByText(/Provider check cooling down — retry in 4[0-9]s\./)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Retry in 4[0-9]s/ })).toBeDisabled();
   });
 
   it('renders a stored voice that is not in the catalog instead of silently replacing it', () => {
-    renderEditor({ agent: agent({ voice: '11labs-Legacy' }), catalog });
+    renderEditor({ agent: agent({ voice: 'voice-legacy' }), catalog });
 
     const voice = screen.getByLabelText('Voice') as HTMLSelectElement;
-    expect(voice.value).toBe('11labs-Legacy');
-    expect(screen.getByRole('option', { name: '11labs-Legacy (not in catalog)' })).toBeInTheDocument();
-    expect(screen.getByRole('option', { name: 'Anna (female, American) · elevenlabs' })).toBeInTheDocument();
+    expect(voice.value).toBe('voice-legacy');
+    expect(screen.getByRole('option', { name: 'Current voice (no longer offered)' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'Anna (female, American)' })).toBeInTheDocument();
   });
 
   it('will not delete an agent the campaign still links', () => {
@@ -203,41 +203,41 @@ describe('AgentEditor — the voice picker (E9)', () => {
     renderEditor({ catalog });
 
     const picker = screen.getByLabelText('Voice') as HTMLSelectElement;
-    expect([...picker.options].map(option => option.value)).toEqual(['11labs-Anna', '11labs-Marcus']);
-    expect(screen.getByText('Anna (female, American) · elevenlabs')).toBeInTheDocument();
+    expect([...picker.options].map(option => option.value)).toEqual(['voice-anna', 'voice-marcus']);
+    expect(screen.getByText('Anna (female, American)')).toBeInTheDocument();
   });
 
   it('says why the list is empty rather than showing a picker with one silent option', () => {
     const unavailable = mergeVoicesSection(normalizeCatalog(CATALOG_BODY), { providerMode: 'live', voices: [], source: 'unavailable', error: 'provider_unavailable' });
     renderEditor({ catalog: unavailable });
 
-    expect(screen.getByText(/could not be read from the provider \(provider_unavailable\)/)).toBeInTheDocument();
+    expect(screen.getByText(/could not be read from the voice service \(provider_unavailable\)/)).toBeInTheDocument();
     // The stored voice is still offered, marked, so nothing is silently replaced.
-    expect(screen.getByText('11labs-Anna (not in catalog)')).toBeInTheDocument();
+    expect(screen.getByText('Current voice (no longer offered)')).toBeInTheDocument();
   });
 });
 
 describe('AgentEditor — the draft follows the stored row (E10)', () => {
   it('re-seeds the picker after an adopt changes the stored voice, and stops reverting it on the next Save', () => {
     const { rerender } = render(<MemoryRouter><AgentEditor
-      agent={agent({ voice: '11labs-Anna' })}
+      agent={agent({ voice: 'voice-anna' })}
       catalog={catalog}
       onSave={vi.fn().mockResolvedValue(agent())}
       onVerify={vi.fn().mockResolvedValue(undefined)}
     /></MemoryRouter>);
-    expect((screen.getByLabelText('Voice') as HTMLSelectElement).value).toBe('11labs-Anna');
+    expect((screen.getByLabelText('Voice') as HTMLSelectElement).value).toBe('voice-anna');
 
     // What "Adopt provider values" does: the server row comes back with the
     // provider's voice. The editor used to keep showing the old one, so Save
     // silently undid the adoption.
     rerender(<MemoryRouter><AgentEditor
-      agent={agent({ voice: '11labs-Marcus' })}
+      agent={agent({ voice: 'voice-marcus' })}
       catalog={catalog}
       onSave={vi.fn().mockResolvedValue(agent())}
       onVerify={vi.fn().mockResolvedValue(undefined)}
     /></MemoryRouter>);
 
-    expect((screen.getByLabelText('Voice') as HTMLSelectElement).value).toBe('11labs-Marcus');
+    expect((screen.getByLabelText('Voice') as HTMLSelectElement).value).toBe('voice-marcus');
     expect(screen.getByRole('button', { name: /Save changes/ })).toBeDisabled();
   });
 
@@ -259,7 +259,7 @@ describe('AgentEditor — the draft follows the stored row (E10)', () => {
   it('keeps the adopt confirmation visible after the mismatch it fixed has gone', async () => {
     const onAdoptProviderValues = vi.fn().mockResolvedValue(undefined);
     const { rerender } = render(<MemoryRouter><AgentEditor
-      agent={agent({ voice: '11labs-Marcus', providerVoiceId: '11labs-Anna' })}
+      agent={agent({ voice: 'voice-marcus', providerVoiceId: 'voice-anna' })}
       catalog={catalog}
       onSave={vi.fn().mockResolvedValue(agent())} onVerify={vi.fn().mockResolvedValue(undefined)}
       onAdoptProviderValues={onAdoptProviderValues}
@@ -271,7 +271,7 @@ describe('AgentEditor — the draft follows the stored row (E10)', () => {
     // The adopt succeeded, so the mismatch badge is gone — the confirmation
     // used to live inside that block and vanish with it.
     rerender(<MemoryRouter><AgentEditor
-      agent={agent({ voice: '11labs-Anna', providerVoiceId: '11labs-Anna' })}
+      agent={agent({ voice: 'voice-anna', providerVoiceId: 'voice-anna' })}
       catalog={catalog}
       onSave={vi.fn().mockResolvedValue(agent())} onVerify={vi.fn().mockResolvedValue(undefined)}
       onAdoptProviderValues={onAdoptProviderValues}

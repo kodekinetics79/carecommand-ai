@@ -1,7 +1,7 @@
 import { CircleCheck, CircleAlert, AlertCircle, RefreshCw } from 'lucide-react';
 import {
-  normalizeRetellStatus, verificationLine,
-  type Blocker, type RetellStatusLike,
+  normalizeVoiceLineStatus, verificationLine,
+  type Blocker, type VoiceLineStatusLike,
 } from '../../../lib/receptionistDeployment';
 import { FixLink } from '../ReadinessChecklist';
 
@@ -23,15 +23,16 @@ function BlockerRow({ blocker }: { blocker: Blocker }) {
 }
 
 /**
- * Provider readiness for the selected scope. Renders the server's blockers
- * (title, action, fix link) verbatim, the verification expiry with whether
- * auto-renewal is really running, and the attended-UAT block only when the
- * server sent one (demo profile). Accepts the legacy `/retell-status` body
- * too, so the outbound panel keeps working until it moves to the new fields.
+ * Voice-line readiness for the selected scope. Renders the server's blockers
+ * (title, action, fix link) verbatim — which is why this card needed almost no
+ * work here: the copy it prints is the remediation catalogue's, and that is
+ * where the supplier's name was removed. Also prints the line-check expiry with
+ * whether auto-renewal is really running, and the attended-UAT block only when
+ * the server sent one (demo profile).
  */
-export function RetellStatusCard({ status, onRefresh }: { status: RetellStatusLike | null; onRefresh?: () => void }) {
+export function VoiceLineStatusCard({ status, onRefresh }: { status: VoiceLineStatusLike | null; onRefresh?: () => void }) {
   if (!status) return null;
-  const view = normalizeRetellStatus(status);
+  const view = normalizeVoiceLineStatus(status);
   const blocking = view.blockers.filter(blocker => blocker.severity === 'blocking');
   const ok = view.providerConfigured && view.agentReady && blocking.length === 0;
   const line = view.verification.status ? verificationLine(view.verification) : null;
@@ -43,9 +44,9 @@ export function RetellStatusCard({ status, onRefresh }: { status: RetellStatusLi
         {ok ? <CircleCheck className="h-5 w-5 shrink-0 text-emerald-v" aria-hidden="true" /> : <CircleAlert className="h-5 w-5 shrink-0 text-amber-v" aria-hidden="true" />}
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <h3 className="text-sm font-bold text-t1">Provider status {ok ? '— ready' : '— needs attention'}</h3>
+            <h3 className="text-sm font-bold text-t1">Voice line {ok ? '— ready' : '— needs attention'}</h3>
             {view.providerMode === 'mock' && <span className="badge badge-violet">mock mode</span>}
-            {view.providerMode === 'unconfigured' && <span className="badge badge-amber">unconfigured</span>}
+            {view.providerMode === 'unconfigured' && <span className="badge badge-amber">not connected</span>}
             {onRefresh && (
               <button type="button" onClick={onRefresh} className="ml-auto inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2 py-1 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)]">
                 <RefreshCw className="h-3 w-3" aria-hidden="true" /> Refresh
@@ -53,16 +54,16 @@ export function RetellStatusCard({ status, onRefresh }: { status: RetellStatusLi
             )}
           </div>
           <p className="mt-0.5 text-xs text-t3">
-            {view.agentScope.agentName ? `Agent ${view.agentScope.agentName}. ` : ''}
+            {view.agentScope.agentName ? `Receptionist ${view.agentScope.agentName}. ` : ''}
             {ok
-              ? 'Server credentials and the agent deployment passed the status check. Each campaign still needs its own readiness checks before activation.'
+              ? 'The line is connected and the published configuration passed its check. Each campaign still needs its own readiness checks before activation.'
               : blocking.length
                 ? `${blocking.length} blocking item${blocking.length === 1 ? '' : 's'} before calls can be placed or answered.`
                 : 'No blocking items; review the warnings below.'}
           </p>
           {line && <p className={`mt-1 text-xs font-semibold ${TONE_TEXT[line.tone]}`} data-verification={view.verification.status ?? ''}>{line.text}</p>}
           {view.blockers.length > 0 && (
-            <ul className="mt-3 space-y-1.5" aria-label="Provider blockers">
+            <ul className="mt-3 space-y-1.5" aria-label="Voice line blockers">
               {view.blockers.map(blocker => <BlockerRow key={blocker.code} blocker={blocker} />)}
             </ul>
           )}

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { PhoneOff, Activity, Loader2, AlertCircle, PhoneCall, PhoneOutgoing } from 'lucide-react';
 import { Field, TextInput } from '../../ui/Field';
-import { receptionistApi as api, OUTBOUND_RECONCILIATION_WARNING, launchControlsBlocked, mergeReconciliationRefresh, presentLaunchResult, clearTransportAmbiguityToken, readTransportAmbiguityToken, transportAmbiguityStorageKey, writeTransportAmbiguityToken, type CallLog, type RetellStatus, type OutboundCampaign, type CallTarget, type OutboundReconciliationEvidence } from '../../../lib/receptionist';
+import { receptionistApi as api, OUTBOUND_RECONCILIATION_WARNING, launchControlsBlocked, mergeReconciliationRefresh, presentLaunchResult, clearTransportAmbiguityToken, readTransportAmbiguityToken, transportAmbiguityStorageKey, writeTransportAmbiguityToken, type CallLog, type VoiceLineStatus, type OutboundCampaign, type CallTarget, type OutboundReconciliationEvidence } from '../../../lib/receptionist';
 import { describeFailure } from '../../../lib/resourceState';
 import { isBusy, useMutationState } from '../../../hooks/useMutationState';
 import { formatEnumLabel, maskedPhone, maskedProviderId, outcomeBadge } from '../helpers';
@@ -9,7 +9,7 @@ import { ConfirmedButton } from '../shared';
 import { MutationNotice } from '../MutationNotice';
 import { TargetList } from './TargetList';
 
-export function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { campaign: OutboundCampaign; status: RetellStatus | null; outboundStopped: boolean; onChanged: () => void }) {
+export function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { campaign: OutboundCampaign; status: VoiceLineStatus | null; outboundStopped: boolean; onChanged: () => void }) {
   const transportAmbiguityKey = transportAmbiguityStorageKey(campaign.id);
   const [targets, setTargets] = useState<CallTarget[]>([]);
   const [logs, setLogs] = useState<CallLog[]>([]);
@@ -275,7 +275,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
         )}
         {!configured && (
           <div className="flex items-center gap-2 rounded-lg border border-amber-v/40 bg-amber-v/5 px-3 py-2 text-xs text-amber-v">
-            <AlertCircle className="w-4 h-4" /> Retell isn’t configured — launching returns a setup-required notice instead of placing a call.
+            <AlertCircle className="w-4 h-4" /> The voice line isn’t connected — launching returns a setup-required notice instead of placing a call.
           </div>
         )}
         {status?.adhocTestCallsAllowed ? (
@@ -316,12 +316,12 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
                     <span className="text-t2">{l.callerName || maskedPhone(l.callerPhone)}</span>
                     <span className="text-t3">{maskedPhone(l.callerPhone)}</span>
                   </div>
-                  <p className="mt-1 text-[10px] text-t3 font-mono">{maskedProviderId(l.retellCallId)}{providerStatusByCall[l.id] ? ` · ${providerStatusByCall[l.id]}` : ''}</p>
+                  <p className="mt-1 text-[10px] text-t3 font-mono">{maskedProviderId(l.providerCallRef)}{providerStatusByCall[l.id] ? ` · ${providerStatusByCall[l.id]}` : ''}</p>
                 </div>
                 <button
                   type="button"
-                  disabled={!l.retellCallId || syncingCallId === l.id}
-                  title={!l.retellCallId ? 'Provider status is unavailable until a Retell call ID has been recorded.' : 'Refresh the latest provider call state.'}
+                  disabled={!l.providerCallRef || syncingCallId === l.id}
+                  title={!l.providerCallRef ? 'Call status is unavailable until the voice line has reported this call.' : 'Refresh the latest call state from the voice line.'}
                   onClick={() => void syncProviderCall(l.id)}
                   className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-indigo disabled:opacity-50"
                 >

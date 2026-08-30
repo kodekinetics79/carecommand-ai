@@ -263,7 +263,7 @@ describe('B1 — the number binding is proved, never assumed', () => {
     expect(bound.status).not.toBe('warn');
     expect(bound.blocking).toBe(true);
     expect(bound.code).toBe('number_binding_unattested');
-    expect(bound.fixHref).toContain('tab=retell');
+    expect(bound.fixHref).toContain('tab=deploy');
     expect(result.ready).toBe(false);
     expect(result.actions.activate.allowed).toBe(false);
     expect(result.actions.activate.reasons).toContain('number_binding_unattested');

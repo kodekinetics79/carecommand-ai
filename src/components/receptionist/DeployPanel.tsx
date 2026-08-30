@@ -5,7 +5,7 @@ import { receptionistApi, type Campaign } from '../../lib/receptionist';
 import {
   DEPLOYMENT_POLL_INTERVAL_MS, DEPLOYMENT_POLL_MAX_ATTEMPTS, blockedByOf, deployChecklistOf, deploymentApi, deriveDeployState,
   formatExpiresIn, pollLatestDeployment, retryAfterSecondsOf, verificationLine,
-  type BlockedByCampaign, type Deployment, type DeploymentDiff, type DeployPanelState, type RetellConfigExport, type RetellStatusResponse,
+  type BlockedByCampaign, type Deployment, type DeploymentDiff, type DeployPanelState, type VoiceLineConfigurationExport, type VoiceLineStatusResponse,
 } from '../../lib/receptionistDeployment';
 import { useResource } from '../../hooks/useResource';
 import { describeMutationFailure, isBusy, useMutationState, type MutationError } from '../../hooks/useMutationState';
@@ -13,12 +13,13 @@ import { receivedData } from '../../lib/resourceState';
 import { CopyButton } from './shared';
 import { LoadFailureNotice, MutationNotice } from './MutationNotice';
 import { FixLink } from './ReadinessChecklist';
+import { VOICE } from '../../lib/receptionistVocabulary';
 
 type Phase = 'idle' | 'publish' | 'verify' | 'confirm';
 
 const PHASES: Array<{ key: Exclude<Phase, 'idle'>; label: string }> = [
-  { key: 'publish', label: 'Publish the prompt, tools and agent version to Retell' },
-  { key: 'verify', label: 'Verify the published version against this configuration' },
+  { key: 'publish', label: 'Publish the prompt, the booking steps and the receptionist version to the line' },
+  { key: 'verify', label: 'Read the live line back and compare it to this configuration' },
   { key: 'confirm', label: 'Confirm the deployment record settled' },
 ];
 
@@ -27,6 +28,20 @@ const CHANGE_LABEL: Record<string, string> = {
 };
 
 const TONE_TEXT = { ok: 'text-emerald-v', warn: 'text-amber-v', error: 'text-red-v', muted: 'text-t3' } as const;
+
+/**
+ * Did the server send the provider mechanics?
+ *
+ * The tenant response carries voice, language, the opening line and the
+ * call-outcome fields — the clinic's own content. `webhookUrl` and `tools`
+ * arrive only when the caller holds `platform:voice-line-mechanics:read`, so
+ * their presence IS the permission answer. Asking the payload rather than
+ * asking a flag means the console procedure cannot be rendered for someone the
+ * server would not have given the data to.
+ */
+function providerMechanicsPresent(config: VoiceLineConfigurationExport): boolean {
+  return typeof config.webhookUrl === 'string' && config.webhookUrl.length > 0;
+}
 
 function toolSummary(tool: Record<string, unknown>) {
   const name = typeof tool.name === 'string' ? tool.name : 'unnamed tool';
@@ -37,16 +52,21 @@ function toolSummary(tool: Record<string, unknown>) {
 }
 
 /**
- * Deploy-to-Retell. Deploy publishes (the server answers with a PUBLISHED
+ * Publish to the line. Publishing publishes (the server answers with a PUBLISHED
  * row and `verification: { status: 'pending' }`), then this panel calls
- * verify-provider and polls `deployments/latest` until the row settles.
+ * the line check and polls `deployments/latest` until the row settles.
  * Every state is derived from server data plus the in-flight phase; failure
- * copy is the server's `code` / `message`. The manual (BYO) checklist stays
- * available in every state so an operator can always finish in the console.
+ * copy is the server's `code` / `message`.
+ *
+ * The manual setup checklist below is the supplier's console procedure. It is
+ * rendered only when the server actually sent the provider mechanics — which
+ * it does only for a caller holding `platform:voice-line-mechanics:read`. That
+ * is the whole gate: no flag in the browser, no hidden element a clinic can
+ * reveal with devtools. If the fields are absent the block does not exist.
  */
 export function DeployPanel({ campaignId, config, campaignStatus = null, onDeployingChange, pollIntervalMs = DEPLOYMENT_POLL_INTERVAL_MS, pollMaxAttempts = DEPLOYMENT_POLL_MAX_ATTEMPTS }: {
   campaignId: string;
-  config: RetellConfigExport | null;
+  config: VoiceLineConfigurationExport | null;
   /** Known when the panel is hosted by Studio; drives the redeploy degrade warning. */
   campaignStatus?: Campaign['status'] | null;
   /** Raised while a deploy is publishing, so the status strip above can say the line is degraded. */
@@ -54,9 +74,9 @@ export function DeployPanel({ campaignId, config, campaignStatus = null, onDeplo
   pollIntervalMs?: number;
   pollMaxAttempts?: number;
 }) {
-  const loadStatus = useCallback((signal: AbortSignal) => deploymentApi.retellStatus({ campaignId }, signal), [campaignId]);
+  const loadStatus = useCallback((signal: AbortSignal) => deploymentApi.voiceLineStatus({ campaignId }, signal), [campaignId]);
   const loadDiff = useCallback((signal: AbortSignal) => deploymentApi.deploymentDiff(campaignId, signal), [campaignId]);
-  const statusResource = useResource<RetellStatusResponse>(loadStatus);
+  const statusResource = useResource<VoiceLineStatusResponse>(loadStatus);
   const diffResource = useResource<DeploymentDiff>(loadDiff);
   const status = receivedData(statusResource.state);
   const diff = receivedData(diffResource.state);
@@ -170,33 +190,33 @@ export function DeployPanel({ campaignId, config, campaignStatus = null, onDeplo
     <div className="space-y-4">
       <div className="cc-card space-y-3 p-5" data-deploy-state={view}>
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <h3 className="inline-flex items-center gap-2 text-sm font-bold text-t1"><Rocket className="h-4 w-4 text-indigo" aria-hidden="true" /> Deploy to Retell</h3>
+          <h3 className="inline-flex items-center gap-2 text-sm font-bold text-t1"><Rocket className="h-4 w-4 text-indigo" aria-hidden="true" /> Go live</h3>
           <div className="flex items-center gap-2">
             {mock && <span className="badge badge-violet">mock mode</span>}
-            {status?.providerMode === 'unconfigured' && <span className="badge badge-amber">provider unconfigured</span>}
+            {status?.providerMode === 'unconfigured' && <span className="badge badge-amber">not connected</span>}
           </div>
         </div>
 
-        {statusFailed && <LoadFailureNotice what="Provider status" message={statusResource.state.status === 'error' ? statusResource.state.failure.message : ''} onRetry={statusResource.reload} />}
+        {statusFailed && <LoadFailureNotice what="Voice line status" message={statusResource.state.status === 'error' ? statusResource.state.failure.message : ''} onRetry={statusResource.reload} />}
         {diffFailed && <LoadFailureNotice what="The deployment record" message={diffResource.state.status === 'error' ? diffResource.state.failure.message : ''} onRetry={diffResource.reload} />}
-        {!status && !statusFailed && <p role="status" className="text-xs text-t3"><Loader2 className="mr-1 inline h-3.5 w-3.5 animate-spin" aria-hidden="true" /> Checking provider status…</p>}
+        {!status && !statusFailed && <p role="status" className="text-xs text-t3"><Loader2 className="mr-1 inline h-3.5 w-3.5 animate-spin" aria-hidden="true" /> Checking the voice line…</p>}
 
         {view === 'no-agent' && (
           <div role="status" className="rounded-lg border border-[var(--b1)] bg-[var(--s3)] px-3 py-2 text-xs text-t2">
-            <p className="font-semibold text-t1">No agent linked to this campaign.</p>
-            <p className="mt-0.5">Create or link an agent in the <Link to="/receptionist-studio?tab=campaign" className="font-semibold text-indigo hover:underline">Agent &amp; Campaign</Link> tab, then deploy it here.</p>
+            <p className="font-semibold text-t1">No receptionist is assigned to this campaign.</p>
+            <p className="mt-0.5">Create or assign one in the <Link to="/receptionist-studio?tab=campaign" className="font-semibold text-indigo hover:underline">Agent &amp; Campaign</Link> tab, then publish it here.</p>
           </div>
         )}
 
         {view === 'never-deployed' && (
-          <p className="text-xs text-t2">This campaign has never been deployed. Deploy publishes the generated prompt, tools and agent version to Retell and verifies it, or follow the manual checklist below to bring your own agent.</p>
+          <p className="text-xs text-t2">This campaign has never gone live. Publishing sends the generated prompt, the booking steps and the receptionist version to the {VOICE.line}, then runs a {VOICE.checkLower} to confirm the live line is running exactly that.</p>
         )}
 
         {campaignStatus === 'ACTIVE' && !deploying && (
           <p role="note" data-testid="redeploy-degrade-warning" className="flex items-start gap-2 rounded-lg border border-amber-v/40 bg-[var(--s3)] px-3 py-2 text-[11px] text-t1">
             <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-v" aria-hidden="true" />
             <span>
-              <span className="font-semibold">This campaign is answering calls now.</span> Deploying resets provider verification: between publish and verify the agent runs on the safe tools only — a caller can leave a message or be transferred, but cannot book. Verification runs immediately and usually takes seconds; stay on this screen until it finishes.
+              <span className="font-semibold">This campaign is answering calls now.</span> Publishing resets the {VOICE.checkLower}: between publishing and the check the receptionist runs on the safe steps only — a caller can leave a message or be transferred, but cannot book. The check runs immediately and usually takes seconds; stay on this screen until it finishes.
             </span>
           </p>
         )}
@@ -221,8 +241,7 @@ export function DeployPanel({ campaignId, config, campaignStatus = null, onDeplo
           <div className={`rounded-lg border px-3 py-2 ${view === 'deployed-current' ? 'border-emerald-v/40' : 'border-amber-v/40'}`}>
             <div className="flex flex-wrap items-center gap-2">
               <span className={`badge ${deployment.status === 'VERIFIED' ? 'badge-emerald' : deployment.status === 'PUBLISHED' ? 'badge-amber' : 'badge-blue'}`}>{deployment.status}</span>
-              <p className="text-xs font-semibold text-t1">Version {deployment.providerAgentVersion ?? '—'}</p>
-              <p className="font-mono text-[10px] text-t3">prompt {deployment.promptHash.slice(0, 12)}</p>
+              <p className="font-mono text-[10px] text-t3" title="Quote this to CareCommand support">{deployment.configurationReference ?? '—'}</p>
             </div>
             <p className="mt-0.5 text-[11px] text-t3">
               {deployment.verifiedAt ? `Verified ${new Date(deployment.verifiedAt).toLocaleString()}` : deployment.publishedAt ? `Published ${new Date(deployment.publishedAt).toLocaleString()} — not verified yet` : 'Pending'}
@@ -278,9 +297,9 @@ export function DeployPanel({ campaignId, config, campaignStatus = null, onDeplo
         {view === 'verification-failed' && (
           <div className="space-y-1.5">
             <div role="alert" className="rounded-lg border border-red-v/40 bg-[var(--red-soft)] px-3 py-2 text-xs text-red-v">
-              <p className="font-semibold">Published, but verification failed{verifyError?.message ? `: ${verifyError.message}` : '.'}</p>
+              <p className="font-semibold">Published, but the {VOICE.checkLower} did not pass{verifyError?.message ? `: ${verifyError.message}` : '.'}</p>
               {verifyError?.code && <p className="font-mono text-[10px]">code: {verifyError.code}</p>}
-              {latest?.status && <p className="text-red-v/90">Deployment {latest.status.toLowerCase()} · version {latest.providerAgentVersion ?? '—'}</p>}
+              {latest?.status && <p className="text-red-v/90">Deployment {latest.status.toLowerCase()} · {latest.configurationReference ?? '—'}</p>}
             </div>
             {status?.blockers.filter(b => b.scope === 'agent' || b.scope === 'provider').map(blocker => (
               <p key={blocker.code} className="text-[11px] text-t2"><span className="font-semibold text-t1">{blocker.title}</span> — {blocker.action} <FixLink href={blocker.fixHref} label={`Fix ${blocker.title}`} /></p>
@@ -297,25 +316,25 @@ export function DeployPanel({ campaignId, config, campaignStatus = null, onDeplo
             type="button"
             disabled={!canDeploy}
             onClick={deploy}
-            title={view === 'no-agent' ? 'Link an agent first.' : cooldownSeconds > 0 ? `Retry in ${cooldownSeconds}s` : undefined}
+            title={view === 'no-agent' ? 'Assign a receptionist first.' : cooldownSeconds > 0 ? `Retry in ${cooldownSeconds}s` : undefined}
             className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-40"
           >
             {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> : <Rocket className="h-4 w-4" aria-hidden="true" />}
-            {view === 'deployed-stale' ? 'Deploy changes' : view === 'deploy-failed' || view === 'drift-blocked' ? (cooldownSeconds > 0 ? `Retry in ${cooldownSeconds}s` : 'Retry deploy') : view === 'deployed-current' ? 'Redeploy' : 'Deploy to Retell'}
+            {view === 'deployed-stale' ? 'Publish changes' : view === 'deploy-failed' || view === 'drift-blocked' ? (cooldownSeconds > 0 ? `Retry in ${cooldownSeconds}s` : 'Retry') : view === 'deployed-current' ? VOICE.publishAgain : VOICE.publish}
           </button>
           {(view === 'verification-failed' || (deployment && deployment.status === 'PUBLISHED')) && agentId && (
             <button type="button" disabled={busy} onClick={verifyAgain} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t1 disabled:opacity-40">
-              <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" /> Verify again
+              <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" /> {VOICE.runCheck}
             </button>
           )}
           {deployState.state.status === 'saved' && !verifyError && <MutationNotice state={deployState.state} />}
         </div>
       </div>
 
-      {config && (
+      {config && providerMechanicsPresent(config) && (
         <details className="cc-card p-5" data-testid="byo-checklist">
-          <summary className="cursor-pointer text-sm font-bold text-t1"><ListChecks className="mr-1.5 inline h-4 w-4 text-indigo" aria-hidden="true" /> Manual setup — bring your own Retell agent</summary>
-          <p className="mt-2 text-xs text-t3">Configure the agent in the Retell console in this order, then paste its agent ID in the Agent tab and verify. Source: {config.agentSource ?? 'local'} configuration.</p>
+          <summary className="cursor-pointer text-sm font-bold text-t1"><ListChecks className="mr-1.5 inline h-4 w-4 text-indigo" aria-hidden="true" /> Manual setup — CareCommand support only</summary>
+          <p className="mt-2 text-xs text-t3">Configure the agent in the provider console in this order, then paste its agent id in the Agent tab and verify. Source: {config.agentSource ?? 'local'} configuration.</p>
           <ol className="mt-3 space-y-1.5" aria-label="Manual deploy checklist">
             {deployChecklistOf(config).map(item => (
               <li key={item.key} className="flex items-start gap-2 rounded-lg border border-[var(--b1)] bg-[var(--s3)] px-3 py-2" data-checklist-key={item.key}>

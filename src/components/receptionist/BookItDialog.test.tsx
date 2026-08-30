@@ -26,7 +26,7 @@ const REQUEST: AppointmentRequestRow = {
   collectedName: 'Priya Shah', collectedPhoneMasked: '***-***-9090', collectedEmail: null,
   status: 'PENDING_REVIEW', source: 'voice', missingFields: [], outcomeReason: null,
   bookedAppointmentId: null, bookedAppointment: null,
-  callLog: { id: 'call-2', retellCallId: 'c', callerName: 'Priya Shah', direction: 'inbound', startedAt: null, clinicId: 'clinic-1', patientId: null },
+  callLog: { id: 'call-2', providerCallRef: 'c', callerName: 'Priya Shah', direction: 'inbound', startedAt: null, clinicId: 'clinic-1', patientId: null },
   patient: null, createdAt: '2026-08-29T17:01:00.000Z',
 };
 

@@ -38,9 +38,13 @@ export const SUPPORTED_COUNTRIES: readonly CatalogCountry[] = [
 ];
 
 /** Provider capability list; server-validated on agent/clinic writes. */
-export const SUPPORTED_AGENT_LANGUAGES: ReadonlyArray<{ id: string; label: string; provider: 'retell' }> = [
-  { id: 'en-US', label: 'English (US)', provider: 'retell' },
-  { id: 'en-GB', label: 'English (UK)', provider: 'retell' },
+// `provider` tagged each language with the supplier that speaks it and rode
+// out to the browser on every catalog read, where nothing rendered it. The
+// tag is the voice service, generically: which one is not the clinic's
+// business, and it was never the clinic's choice.
+export const SUPPORTED_AGENT_LANGUAGES: ReadonlyArray<{ id: string; label: string; provider: 'voice_service' }> = [
+  { id: 'en-US', label: 'English (US)', provider: 'voice_service' },
+  { id: 'en-GB', label: 'English (UK)', provider: 'voice_service' },
 ];
 
 export const TONES: readonly string[] = ['Warm and professional', 'Calm and reassuring', 'Friendly and upbeat', 'Concise and efficient'];

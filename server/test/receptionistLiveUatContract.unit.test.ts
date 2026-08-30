@@ -72,6 +72,6 @@ describe('live AI receptionist UAT production contract', () => {
 
   it('refreshes candidate authority after a server-held synthetic target is attached and masks provider ids at the API boundary', () => {
     expect(studioSource).toContain('[campaign.id, targetIdentityKey]');
-    expect(outboundSource).toContain('retellCallId: maskProviderId(row.retellCallId)');
+    expect(outboundSource).toContain('providerCallRef: maskProviderId(retellCallId)');
   });
 });

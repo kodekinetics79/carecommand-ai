@@ -15,6 +15,7 @@ import {
   planDeployment,
 } from '../../lib/receptionist/retellDeploy';
 import { voicesCatalogSection } from '../../lib/receptionist/catalogVoices';
+import { configurationReference, VOICE } from '../../../src/lib/receptionistVocabulary';
 import { uuid, idParam, writeRoles, callArtifactRead } from './shared';
 
 // ===========================================================================
@@ -35,22 +36,27 @@ type DeploymentRowShape = {
 
 /**
  * Deployment rows are evidence, not a prompt archive for the browser: the
- * deployed prompt text and tool bodies stay server-side, and provider ids are
- * masked exactly as they are everywhere else at the API boundary.
+ * deployed prompt text and tool bodies stay server-side.
+ *
+ * Masking the provider id was not enough. `agen…7f21`, a published version
+ * number, an LLM version number, a version tag and four fingerprint hashes
+ * were all still on the wire and on the screen, and a clinic owner can act on
+ * none of them — they are our supplier's coordinates, printed at the exact
+ * moment the owner is anxious about their phone line. They collapse to one
+ * `configurationReference`, which is a suffix of CareCommand's own row id and
+ * is the string support asks for.
+ *
+ * The mechanics are not deleted: `platformDeploymentProjection` below returns
+ * every one of them, and it is reachable only from the platform routes and
+ * from a tenant user holding `platform:voice-line-mechanics:read`, which no
+ * default role has.
  */
 function deploymentProjection(row: DeploymentRowShape) {
   return {
     id: row.id,
     status: row.status,
     mock: row.mock,
-    providerAgentIdMasked: maskProviderId(row.providerAgentId),
-    providerAgentVersion: row.providerAgentVersion,
-    providerLlmVersion: row.providerLlmVersion,
-    providerVersionTag: row.providerVersionTag,
-    promptHash: row.promptHash,
-    toolFingerprint: row.toolFingerprint,
-    intakeFingerprint: row.intakeFingerprint,
-    configFingerprint: row.configFingerprint,
+    configurationReference: configurationReference({ deploymentId: row.id }),
     voiceId: row.voiceId,
     language: row.language,
     steps: row.steps,
@@ -61,6 +67,25 @@ function deploymentProjection(row: DeploymentRowShape) {
     startedAt: row.startedAt,
     publishedAt: row.publishedAt,
     verifiedAt: row.verifiedAt,
+  };
+}
+
+/**
+ * The support view of the same row. Everything `deploymentProjection` drops,
+ * plus the reference that ties the two together. Never merged into a tenant
+ * response by default — the caller must have proven the permission first.
+ */
+export function platformDeploymentProjection(row: DeploymentRowShape) {
+  return {
+    ...deploymentProjection(row),
+    providerAgentIdMasked: maskProviderId(row.providerAgentId),
+    providerAgentVersion: row.providerAgentVersion,
+    providerLlmVersion: row.providerLlmVersion,
+    providerVersionTag: row.providerVersionTag,
+    promptHash: row.promptHash,
+    toolFingerprint: row.toolFingerprint,
+    intakeFingerprint: row.intakeFingerprint,
+    configFingerprint: row.configFingerprint,
   };
 }
 
@@ -114,7 +139,7 @@ export const deploymentRoutes: FastifyPluginAsync = async app => {
       return reply.code(200).send({
         deployment: deploymentProjection(outcome.deployment),
         verification: { status: 'pending' as const },
-        message: 'Published to Retell. Verify the agent to confirm the provider is running exactly this configuration.',
+        message: `Published to the line. Run the ${VOICE.checkLower} to confirm the live line is running exactly this configuration.`,
       });
     }
     const remediation = remediationFor(outcome.code, { campaignId: id });
@@ -164,23 +189,23 @@ export const deploymentRoutes: FastifyPluginAsync = async app => {
       throw app.httpErrors.conflict('No locale pack is available for this clinic’s country and language, so the prompt cannot be rendered. Approve a locale pack for the clinic.');
     }
     const plan = planDeployment(promptConfig, { mock: deployment?.mock });
+    // The diff is a set of CHIPS — "Prompt changed", "Voice changed". The
+    // hashes behind them were the evidence, and shipping them let the browser
+    // print `prompt a91f0c3d…` beside a version number in a card whose whole
+    // job is to answer "is my phone line current?". `changed` already answers
+    // that; the fingerprints only ever told a reader which supplier we call.
+    // They stay server-side and reach support through the platform route.
     return {
       deployment: deployment
         ? {
           id: deployment.id, status: deployment.status, verifiedAt: deployment.verifiedAt,
-          providerAgentVersion: deployment.providerAgentVersion, promptHash: deployment.promptHash,
-          toolFingerprint: deployment.toolFingerprint, voiceId: deployment.voiceId, language: deployment.language,
+          configurationReference: configurationReference({ deploymentId: deployment.id }),
+          voiceId: deployment.voiceId, language: deployment.language,
         }
         : null,
       draft: {
-        promptHash: plan.promptHash,
-        beginMessageHash: plan.beginMessageHash,
-        toolFingerprint: plan.toolFingerprint,
-        intakeFingerprint: plan.intakeFingerprint,
-        configFingerprint: plan.configFingerprint,
         voiceId: plan.voiceId,
         language: plan.language,
-        webhookUrl: plan.config.webhookUrl,
         toolNames: plan.config.tools.map(tool => String(tool.name ?? '')).sort(),
       },
       changed: deploymentChanges(plan, deployment),
@@ -188,15 +213,25 @@ export const deploymentRoutes: FastifyPluginAsync = async app => {
     };
   });
 
-  // Provider and agent readiness for one scope, with server-authored blockers.
-  // Replaces the tenant-wide checklist that conflated "are the environment
-  // variables set" with "can any agent actually answer a call".
-  app.get('/retell-status', { preHandler: callArtifactRead }, async request => {
+  // Voice-line and receptionist readiness for one scope, with server-authored
+  // blockers. Replaces the tenant-wide checklist that conflated "are the
+  // environment variables set" with "can any receptionist actually answer a
+  // call".
+  //
+  // The path used to be `/retell-status`. A URL is not private: it is in the
+  // network tab, in a copied cURL, in any error a clinic forwards to us. It
+  // named the supplier on every poll of the Go live screen. `/retell-status`
+  // is kept below as a silent alias so nothing that already calls it breaks.
+  const voiceLineStatus = async (request: Parameters<typeof callArtifactRead>[0]) => {
     const query = z.object({ clinicId: uuid.optional(), campaignId: uuid.optional() }).parse(request.query);
     const status = retellConfigStatus();
     const blockers: Array<{ code: string; severity: 'blocking' | 'warning'; title: string; action: string; fixHref: string | null; scope: string }> = [];
     for (const missing of status.missing) {
-      const code = missing === 'RETELL_API_KEY' ? 'retell_api_key_missing' : 'retell_from_number_missing';
+      // The missing ENV VAR NAME stays here and never leaves the server: which
+      // credential is absent is CareCommand's operational fact, and naming it
+      // told the clinic who we buy from without telling them anything they
+      // could act on. The code they receive is provider-neutral.
+      const code = missing === 'RETELL_API_KEY' ? 'voice_service_key_missing' : 'voice_service_number_missing';
       const remediation = remediationFor(code);
       blockers.push({ code, severity: 'blocking', title: remediation.title, action: remediation.action, fixHref: null, scope: 'server' });
     }
@@ -258,7 +293,12 @@ export const deploymentRoutes: FastifyPluginAsync = async app => {
       attendedUat,
       adhocTestCallsAllowed: status.mock && env.NODE_ENV !== 'production',
     };
-  });
+  };
+
+  app.get('/voice-line-status', { preHandler: callArtifactRead }, voiceLineStatus);
+  // Compatibility alias. Removed once no printed fix link and no cached client
+  // bundle still asks for it; the ratchet stops any NEW caller being written.
+  app.get('/retell-status', { preHandler: callArtifactRead }, voiceLineStatus);
 
   // Whether an enabled confirmation can actually be delivered. The campaign
   // toggle is refused when it cannot: the agent must never promise a text that
@@ -271,5 +311,18 @@ export const deploymentRoutes: FastifyPluginAsync = async app => {
   // Voice catalogue. C2 owns server/lib/receptionist/catalog.ts and the
   // /catalog route; this is C5's section, exported separately so the two merge
   // without either stream editing the other's file.
-  app.get('/voices', { preHandler: callArtifactRead }, async () => voicesCatalogSection());
+  //
+  // `provider` is dropped on the way out. The catalogue upstream tags each
+  // voice with the house that synthesised it, and the Studio's voice select
+  // printed it after a middot — so the dropdown where an owner names their
+  // receptionist also named two of our suppliers, five times over, on a screen
+  // nobody thinks of as an integration screen. Nothing chooses a voice on that
+  // field: gender and accent are what an owner picks on, and they stay.
+  app.get('/voices', { preHandler: callArtifactRead }, async () => {
+    const section = await voicesCatalogSection();
+    return {
+      ...section,
+      voices: section.voices.map(({ voiceId, name, gender, accent, age, previewUrl }) => ({ voiceId, name, gender, accent, age, previewUrl })),
+    };
+  });
 };

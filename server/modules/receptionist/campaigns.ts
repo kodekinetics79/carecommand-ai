@@ -17,6 +17,7 @@ import { uuid, idParam, writeRoles, receptionistRead, callArtifactRead, intakeCo
 import { activationBlockers, evaluateCampaignReadiness, type ReadinessResponse } from '../../lib/receptionist/campaignReadiness';
 import { confirmationChannelStatus } from '../../lib/receptionist/confirmationOutbox';
 import { remediationFor, type RemediationContext } from '../../lib/receptionist/remediation';
+import { hasPermission } from '../../lib/permissions';
 import { generateSampleTranscripts, mandatoryOpeningDisclosure } from './promptService';
 import { findPlaceholders } from '../../lib/receptionist/placeholders';
 
@@ -618,8 +619,45 @@ export const campaignLifecycleRoutes: FastifyPluginAsync = async app => {
   });
 };
 
+/**
+ * The provider payload, split by audience.
+ *
+ * `buildRetellConfig` produces exactly what CareCommand sends to the voice
+ * service: the webhook URL it calls back on, the dynamic-variable table, the
+ * booking function schema, the live tool definitions and their fingerprints.
+ * All of it rendered in the tenant's Go live tab behind a "Copy full JSON"
+ * button — a clinic could read our integration off its own screen, and the one
+ * true note on that panel ("copying this JSON does not change the live agent")
+ * conceded that none of it was actionable either.
+ *
+ * What the tenant keeps is what belongs to the clinic: which voice, which
+ * language, and the sentence the receptionist opens with.
+ */
+function tenantConfigurationView(built: ReturnType<typeof buildRetellConfig>) {
+  return {
+    voiceId: built.voiceId,
+    language: built.language,
+    beginMessage: built.beginMessage,
+    callOutcomeFields: built.callOutcomeFields,
+  };
+}
+
+/** Everything `tenantConfigurationView` withholds. Permission-gated, never default. */
+function providerMechanicsView(built: ReturnType<typeof buildRetellConfig>) {
+  return {
+    systemPrompt: built.systemPrompt,
+    dynamicVariables: built.dynamicVariables,
+    webhookUrl: built.webhookUrl,
+    bookingFunction: built.bookingFunction,
+    tools: built.tools,
+    intakeSchemaRevision: built.intakeSchemaRevision,
+    intakeSchemaFingerprint: built.intakeSchemaFingerprint,
+    intakeToolFingerprint: built.intakeToolFingerprint,
+  };
+}
+
 export const campaignExportRoutes: FastifyPluginAsync = async app => {
-  // ===== Prompt generation + RetellAI export ==============================
+  // ===== Prompt generation + voice line configuration =====================
   app.get('/campaigns/:id/prompt', { preHandler: receptionistRead }, async request => {
     const { id } = idParam.parse(request.params);
     const campaign = await loadCampaign(request.auth.tenantId, id);
@@ -648,19 +686,30 @@ export const campaignExportRoutes: FastifyPluginAsync = async app => {
     }
   });
 
-  app.get('/campaigns/:id/retell-config', { preHandler: receptionistRead }, async request => {
+  const voiceLineConfiguration = async (request: Parameters<typeof receptionistRead>[0]) => {
     const { id } = idParam.parse(request.params);
     const campaign = await loadCampaign(request.auth.tenantId, id);
     if (!campaign) throw app.httpErrors.notFound('Campaign not found');
     try {
       const prepared = await promptConfigForCampaign(campaign as unknown as CampaignWithRelations, request.auth.tenantId);
       if (!prepared.ok) {
-        throw app.httpErrors.conflict('No approved locale pack is available for this clinic language and country. Approve one before exporting the agent configuration.');
+        throw app.httpErrors.conflict('No approved locale pack is available for this clinic language and country. Approve one before publishing to the line.');
       }
       const built = buildRetellConfig(prepared.config, { webhookBaseUrl: env.PUBLIC_API_URL });
+      // Not `hasPermission(...)` inline for tidiness: the mechanics are the
+      // whole reason this split exists, so the check is the widest thing in
+      // the function and impossible to read past.
+      const mayReadMechanics = await hasPermission(request, 'platform:voice-line-mechanics:read');
+      if (!mayReadMechanics) {
+        return {
+          ...tenantConfigurationView(built),
+          localePack: { id: prepared.localePackId, evidenceHash: prepared.evidenceHash },
+        };
+      }
       const hashes = await configurationHashes(request.auth.tenantId, campaign.clinicId);
       return {
-        ...built,
+        ...tenantConfigurationView(built),
+        ...providerMechanicsView(built),
         promptHash: promptHash(built.systemPrompt),
         localePack: { id: prepared.localePackId, evidenceHash: prepared.evidenceHash },
         ...hashes,
@@ -669,5 +718,9 @@ export const campaignExportRoutes: FastifyPluginAsync = async app => {
       if (isConfigurationError(error)) throw configurationConflict(app, error);
       throw error;
     }
-  });
+  };
+
+  app.get('/campaigns/:id/voice-line-configuration', { preHandler: receptionistRead }, voiceLineConfiguration);
+  // Compatibility alias for anything still asking by the old name.
+  app.get('/campaigns/:id/retell-config', { preHandler: receptionistRead }, voiceLineConfiguration);
 };
