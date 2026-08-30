@@ -16,6 +16,8 @@ export type WorkflowEventType =
   | 'receptionist.call.after_hours'
   | 'receptionist.clinic.hours_changed' | 'receptionist.clinic.timezone_changed' | 'receptionist.clinic.phone_changed'
   | 'receptionist.knowledge.approved' | 'receptionist.locale_pack.approved'
+  // An ACTIVE campaign that no longer passes its own activation gate (B8).
+  | 'receptionist.campaign.readiness_regressed'
   | 'deposit.required' | 'deposit.missing' | 'deposit.paid'
   | 'payment.request.created' | 'payment.link.created' | 'payment.succeeded' | 'payment.failed' | 'payment.expired'
   | 'revenue.leakage_detected'
@@ -134,6 +136,23 @@ async function deriveFromEvent(tenantId: string, input: EventInput, eventId: str
       await upsertSignal(tenantId, {
         signalType: 'after_hours_call', entityType: 'receptionistClinic', entityId: clinicId, severity: 'low', score: 20,
         reason: `${count} inbound call${count === 1 ? '' : 's'} arrived outside configured hours in the last 7 days.`, sourceEventId: eventId,
+      });
+      break;
+    }
+    case 'receptionist.campaign.readiness_regressed': {
+      // A live campaign was gated once, on activation, and never re-gated. The
+      // hourly re-check re-runs the same evaluation; a campaign that no longer
+      // passes it is answering calls it can no longer complete, so it becomes a
+      // signal the morning briefing and the Front Desk banner already read.
+      const codes = Array.isArray(input.payload?.blockingCodes) ? input.payload.blockingCodes : [];
+      const listed = codes.filter((code): code is string => typeof code === 'string');
+      await upsertSignal(tenantId, {
+        signalType: 'receptionist_readiness_regressed', entityType: 'receptionistCampaign', entityId: id,
+        severity: 'high', score: 80,
+        reason: listed.length
+          ? `A live receptionist campaign no longer passes its activation checks: ${listed.join(', ')}.`
+          : 'A live receptionist campaign no longer passes its activation checks.',
+        sourceEventId: eventId,
       });
       break;
     }
