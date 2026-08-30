@@ -1934,6 +1934,12 @@ model ReceptionistClinic {
   // active trusted inbound destination (migration-managed; Prisma cannot
   // represent partial unique indexes in this schema).
   phone                String
+  // The provider-owned inbound line THIS clinic answers on — the number a
+  // deployment binds and the number verification re-reads. Backfilled from
+  // `phone`, and globally unique among active clinics (migration-managed), so
+  // one clinic's deploy can never repoint another clinic's line. Null means
+  // "not assigned yet"; deploy claims `phone` and records the claim.
+  inboundNumber        String?
   website              String?
   addressLine          String?
   // ISO-3166-1 alpha-2, uppercase (CHECK in migration). Never inferred: a null
@@ -2236,8 +2242,23 @@ model ReceptionistAgentDeployment {
   toolsJson            Json
   steps                Json?
   providerErrorCode    String?
+  // `numberBound` and `boundPhoneNumber` are what the deploy ASKED the provider
+  // for. Everything below is what the provider ANSWERED when asked again, and
+  // it is the only evidence readiness may pass `number_bound` on: a stored
+  // claim we wrote ourselves is not an attestation.
   numberBound          Boolean                      @default(false)
   boundPhoneNumber     String?
+  // When the provider was last asked who answers `boundPhoneNumber`.
+  numberBindingReadAt  DateTime?
+  // Who the provider says answers it, read back verbatim.
+  numberBindingAgentId String?
+  numberBindingAgentVersion Int?
+  // Non-null ONLY when that read-back named this deployment's own published
+  // agent and version. Stale or null ⇒ `pending`; it may never read `pass`.
+  numberBindingVerifiedAt   DateTime?
+  // Why the read-back could not be completed, or `number_bound_elsewhere` when
+  // it completed and named somebody else.
+  numberBindingErrorCode    String?
   deployedById         String?                      @db.Uuid
   deployedBySource     ReceptionistAttemptSource    @default(USER)
   startedAt            DateTime                     @default(now())
@@ -2253,6 +2274,7 @@ model ReceptionistAgentDeployment {
   @@index([tenantId, agentId, createdAt])
   @@index([tenantId, campaignId, status])
   @@index([providerAgentId, providerAgentVersion])
+  @@index([tenantId, boundPhoneNumber, status])
 }
 
 model ReceptionistIntakeField {
