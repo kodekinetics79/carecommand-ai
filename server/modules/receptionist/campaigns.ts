@@ -341,7 +341,7 @@ function campaignConflictBody(
       body: {
         error: 'conflict',
         code: 'active_provider_deployment_conflict',
-        message: 'This provider deployment already owns an active Studio campaign for the tenant.',
+        message: 'Another active campaign already answers on this voice line. Pause that campaign first.',
         reasons: [],
       },
     };

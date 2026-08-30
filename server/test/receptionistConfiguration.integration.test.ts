@@ -21,6 +21,7 @@ const { env } = await import('../config/env');
 const { compileIntakeContract } = await import('../modules/receptionist/intakeContract');
 const { PLATFORM_LOCALE_PACKS, platformLocalePackHash } = await import('../lib/receptionist/localePacks/defaults');
 const { readyCampaignFixture, proveTestCall } = await import('./helpers/receptionistFixtures');
+const { remediationFor } = await import('../lib/receptionist/remediation');
 
 type Role = 'OWNER' | 'MANAGER' | 'BILLING';
 type TenantFixture = { id: string; users: Record<Role, string>; branchId: string };
@@ -638,13 +639,19 @@ describe('AI receptionist trusted configuration', () => {
       }).snapshot.bookAppointmentToolContract;
       const graphDriftBlocked = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agentId}/verify-provider`, headers: auth(owner, 'OWNER') });
       expect(graphDriftBlocked.statusCode).toBe(409);
-      expect(graphDriftBlocked.json().message).toContain('drift');
+      // Pinned on the CODE, not on the English. "drift" is our word for this
+      // fault, not the operator's, and the tenant copy now comes from the
+      // remediation catalogue — which is the thing that must stay actionable.
+      expect(graphDriftBlocked.json().code).toBe('provider_deployment_drift');
+      expect(graphDriftBlocked.json().message).toBe(remediationFor('provider_deployment_drift').action);
+      expect(graphDriftBlocked.json().message).toContain('Pause the active and runnable campaigns');
       providerBookingTool = attestedProviderBookingTool;
 
       providerPayload.version = 18;
       const driftBlocked = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agentId}/verify-provider`, headers: auth(owner, 'OWNER') });
       expect(driftBlocked.statusCode).toBe(409);
-      expect(driftBlocked.json().message).toContain('drift');
+      // As above: the code is the pin, the copy comes from the catalogue.
+      expect(driftBlocked.json().message).toBe(remediationFor('provider_deployment_drift').action);
       expect(driftBlocked.json().code).toBe('provider_deployment_drift');
       expect(await db.receptionistAgent.findUniqueOrThrow({ where: { id: agentId } })).toMatchObject({
         providerVersion: 17,
@@ -923,9 +930,14 @@ describe('AI receptionist trusted configuration', () => {
     expect(unlinkedVerify.statusCode).toBe(409);
     expect(unlinkedVerify.json()).toMatchObject({
       code: 'provider_agent_unlinked',
-      message: 'Link a Retell agent before verification.',
+      // The supplier's name is gone from the tenant's copy without the
+      // instruction going vague: it names the tab, the act, and what happens
+      // until it is done. The vendor-precise half lives on
+      // `agent_unlinked.platformAction`, which `remediationFor` strips.
+      message: remediationFor('agent_unlinked').action,
       agent: { id: unlinked.json().id, providerStatus: 'UNVERIFIED' },
     });
+    expect(unlinkedVerify.json().message).not.toMatch(/retell/i);
 
     // GET /campaigns/:id/prompt on an inconsistent configuration is a 409 the operator can act on, not a 500 (M71).
     const campaign = await app.inject({
