@@ -30,8 +30,50 @@ export const RECEPTIONIST_TASK_WORKFLOW = 'receptionist_safety' as const;
 export const RECEPTIONIST_TASK_KINDS = [
   'message', 'human_handoff', 'emergency', 'missed_call',
   'call_denied', 'ai_declined', 'tool_failure', 'identity_locked', 'booking_review',
+  // D9 - the one task that says "your receptionist is off the air". Filed by the
+  // re-verification worker through `fileDeploymentAttentionTask`, never by a
+  // caller, so it carries remediation copy instead of a message.
+  'deployment_attention',
 ] as const;
 export type ReceptionistTaskKind = typeof RECEPTIONIST_TASK_KINDS[number];
+
+/**
+ * D8 - the workflows the front desk board owns. `receptionist_safety` is the one
+ * this file writes; the rest are reconciliation tasks other receptionist paths
+ * file and the desk must still see. A critical *insurance* or *ops* task is not
+ * in this set and must never be announced to the front desk as an emergency.
+ */
+export const RECEPTIONIST_TASK_WORKFLOWS = [
+  RECEPTIONIST_TASK_WORKFLOW,
+  'receptionist_outbound_reconciliation',
+  'receptionist_outbound_stop_reconciliation',
+  'receptionist_provider_intent_recovery',
+  'receptionist_provider_poll_reconciliation',
+  'receptionist_provider_deployment_review',
+  // Pre-D9 rows only; new ones arrive as receptionist_safety/deployment_attention.
+  'receptionist_deployment',
+] as const;
+
+/**
+ * D10 - one priority vocabulary. This file has always filed lowercase; the
+ * webhook and outbound reconciliation paths still file 'CRITICAL'/'HIGH', so
+ * every read matches both spellings until those rows are backfilled. New writes
+ * go through `normalizeTaskPriority`.
+ */
+export const TASK_PRIORITIES = ['critical', 'high', 'medium', 'low'] as const;
+export type TaskPriority = typeof TASK_PRIORITIES[number];
+export const taskPrioritySchema = z.enum(TASK_PRIORITIES);
+
+export function normalizeTaskPriority(value: unknown): TaskPriority | null {
+  if (typeof value !== 'string') return null;
+  const lower = value.trim().toLowerCase();
+  return (TASK_PRIORITIES as readonly string[]).includes(lower) ? lower as TaskPriority : null;
+}
+
+/** Every spelling of one priority still present in the table. */
+export function taskPriorityVariants(priority: TaskPriority): string[] {
+  return [priority, priority.toUpperCase()];
+}
 
 export const TASK_OUTCOME_CODES = [
   'reached', 'left_voicemail', 'no_answer', 'wrong_number', 'booked',
@@ -99,19 +141,39 @@ export const receptionistTaskMetadata = z.object({
   denialReason: z.string().max(80).nullable().default(null),
   appointmentRequestId: z.string().uuid().nullable().default(null),
   appointmentId: z.string().uuid().nullable().default(null),
+  // deployment_attention only (D9): what lapsed, and the words that fix it.
+  agentId: z.string().uuid().nullable().default(null),
+  code: z.string().max(80).nullable().default(null),
+  remediationTitle: z.string().max(240).nullable().default(null),
+  remediationAction: z.string().max(1_000).nullable().default(null),
+  fixHref: z.string().max(400).nullable().default(null),
   requiresAcknowledgement: z.literal(true).default(true),
   staffNotes: z.array(staffNoteSchema).max(MAX_STAFF_NOTES).default([]),
 });
 export type ReceptionistTaskMetadata = z.infer<typeof receptionistTaskMetadata>;
 
-/** Typed view of a receptionist task's metadata; null for any other workflow. */
-export function parseReceptionistTask(row: { metadata: unknown }): ReceptionistTaskMetadata | null {
+export interface ReceptionistTaskParse {
+  /** Typed view: the strict parse, or the recovered one when `degraded`. */
+  meta: ReceptionistTaskMetadata;
+  /**
+   * True when the stored blob failed the strict schema. `meta` is then a partial
+   * reconstruction and MUST NOT be written back on its own (D3) - doing so
+   * deletes the caller's recorded message, the previous person's note, the
+   * callback window and the appointment-request link, irreversibly.
+   */
+  degraded: boolean;
+  /** The stored object exactly as the row holds it. */
+  raw: Record<string, unknown>;
+}
+
+/** Typed view + provenance. Null for any other workflow. */
+export function parseReceptionistTaskDetailed(row: { metadata: unknown }): ReceptionistTaskParse | null {
   const raw = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
     ? row.metadata as Record<string, unknown>
     : null;
   if (!raw || raw.workflow !== RECEPTIONIST_TASK_WORKFLOW) return null;
   const parsed = receptionistTaskMetadata.safeParse(raw);
-  if (parsed.success) return parsed.data;
+  if (parsed.success) return { meta: parsed.data, degraded: false, raw };
   // A malformed receptionist row must still surface in the queue rather than
   // vanish; degrade to what is recoverable, never throw on a read.
   const kind = RECEPTIONIST_TASK_KINDS.includes(raw.kind as ReceptionistTaskKind) ? raw.kind as ReceptionistTaskKind : 'message';
@@ -119,15 +181,87 @@ export function parseReceptionistTask(row: { metadata: unknown }): ReceptionistT
   const str = (value: unknown, max: number) => typeof value === 'string' ? value.slice(0, max) : null;
   const phone = (value: unknown) => typeof value === 'string' && E164.test(value) ? value : null;
   return {
-    ...fallback,
-    callId: str(raw.callId, 128),
-    callerName: str(raw.callerName, MAX_NAME),
-    message: str(raw.message, MAX_MESSAGE),
-    callbackPhone: phone(raw.callbackPhone),
-    verifiedPhone: phone(raw.verifiedPhone),
-    requestedCallbackPhone: phone(raw.requestedCallbackPhone),
-    reasonCategory: str(raw.reasonCategory, MAX_SHORT) ?? 'other',
+    meta: {
+      ...fallback,
+      callId: str(raw.callId, 128),
+      callerName: str(raw.callerName, MAX_NAME),
+      message: str(raw.message, MAX_MESSAGE),
+      callbackPhone: phone(raw.callbackPhone),
+      verifiedPhone: phone(raw.verifiedPhone),
+      requestedCallbackPhone: phone(raw.requestedCallbackPhone),
+      reasonCategory: str(raw.reasonCategory, MAX_SHORT) ?? 'other',
+    },
+    degraded: true,
+    raw,
   };
+}
+
+/** Typed view of a receptionist task's metadata; null for any other workflow. */
+export function parseReceptionistTask(row: { metadata: unknown }): ReceptionistTaskMetadata | null {
+  return parseReceptionistTaskDetailed(row)?.meta ?? null;
+}
+
+/**
+ * D3 - the ONLY way a receptionist task's metadata is written back. The changed
+ * fields are merged onto the stored object, so a blob that failed strict parse
+ * keeps every key this schema does not know about. The two identity fields are
+ * repaired on the way through so a degraded row becomes readable again.
+ */
+export function mergeReceptionistTaskMetadata(
+  parse: ReceptionistTaskParse,
+  patch: Partial<ReceptionistTaskMetadata>,
+): Prisma.InputJsonObject {
+  return {
+    ...parse.raw,
+    workflow: RECEPTIONIST_TASK_WORKFLOW,
+    kind: parse.meta.kind,
+    ...patch,
+  } as unknown as Prisma.InputJsonObject;
+}
+
+/**
+ * D4 - a write onto a task this module did NOT file (insurance reconciliation,
+ * an opportunity hand-off, an intake follow-up). Their metadata carries the
+ * origin markers `ensureStaffTask` and the reconciliation paths look tasks up
+ * by; overwriting it with a synthetic receptionist blob makes those lookups miss
+ * and files duplicates later. Only the given keys are added.
+ */
+export function mergeForeignTaskMetadata(
+  metadata: unknown,
+  patch: Record<string, unknown>,
+): Prisma.InputJsonObject {
+  const raw = metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+    ? metadata as Record<string, unknown>
+    : {};
+  return { ...raw, ...patch } as unknown as Prisma.InputJsonObject;
+}
+
+/** Staff notes already stored on any task, receptionist or not. */
+export function readStaffNotes(metadata: unknown): Array<z.infer<typeof staffNoteSchema>> {
+  const raw = metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+    ? (metadata as Record<string, unknown>).staffNotes
+    : null;
+  const parsed = z.array(staffNoteSchema).safeParse(raw);
+  return parsed.success ? parsed.data : [];
+}
+
+/**
+ * D5 - ONE advisory-lock key per task id, in ONE namespace. Before this, the
+ * live tools locked `hashtext('receptionist-safety:...')` while the staff routes
+ * locked `hashtextextended('staff-task:...', 0)` - two disjoint namespaces over
+ * the same JSON column - and `markTransferOutcome` took no lock at all, so a
+ * caller's second message and a staff note interleaved and one was lost.
+ */
+export function staffTaskLockKey(tenantId: string, taskId: string): string {
+  return `staff-task:${tenantId}:${taskId}`;
+}
+
+export async function lockStaffTask(
+  tx: Prisma.TransactionClient,
+  tenantId: string,
+  taskId: string,
+): Promise<void> {
+  await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${staffTaskLockKey(tenantId, taskId)}::text, 0))::text AS locked`;
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +316,13 @@ export interface SafetyTaskContext {
     branchTimezone: string | null;
   };
   selection?: ToolSelection;
+  /**
+   * Overrides the default `tenant:callId:kind` idempotency key. Only the
+   * deployment-attention path uses it, because it is filed by a worker with no
+   * call: its key is `(agent, code)` so a probe failing every hour produces one
+   * thing to act on, not a queue of identical rows (D9).
+   */
+  idempotencyKey?: string;
 }
 
 /** Raw tool args (snake_case, Retell) — every field optional and untrusted. */
@@ -197,6 +338,13 @@ export interface SafetyTaskArgs {
   appointment_request_id?: unknown;
   appointment_id?: unknown;
   source?: unknown;
+  /** deployment_attention only (D9). */
+  agent_id?: unknown;
+  code?: unknown;
+  remediation_title?: unknown;
+  remediation_action?: unknown;
+  fix_href?: unknown;
+  priority?: unknown;
   [key: string]: unknown;
 }
 
@@ -218,7 +366,15 @@ const TASK_TITLES: Record<ReceptionistTaskKind, string> = {
   tool_failure: 'AI receptionist tool failed during a call',
   identity_locked: 'Caller identity verification locked',
   booking_review: 'AI receptionist booking needs review',
+  deployment_attention: 'AI receptionist deployment needs attention',
 };
+
+/**
+ * The deployment task is not caller work and is not tenant-configurable: like
+ * `emergency` it is filed at a fixed urgency, because a clinic must not be able
+ * to quietly downgrade the alert that says the line has stopped answering.
+ */
+const DEPLOYMENT_ATTENTION_DUE_MINUTES = 60;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function optionalUuid(v: unknown): string | null {
@@ -295,6 +451,15 @@ export async function createSafetyTask(
   const toolName = sanitizeTaskText(args.tool_name, 80);
   const denialReason = sanitizeTaskText(args.denial_reason, 80);
   const source: TaskSource = TASK_SOURCES.includes(args.source as TaskSource) ? args.source as TaskSource : 'retell_live_call';
+  const deployment = kind === 'deployment_attention'
+    ? {
+      agentId: optionalUuid(args.agent_id),
+      code: sanitizeTaskText(args.code, 80),
+      remediationTitle: sanitizeTaskText(args.remediation_title, 240),
+      remediationAction: sanitizeTaskText(args.remediation_action, 1_000),
+      fixHref: sanitizeTaskText(args.fix_href, 400),
+    }
+    : { agentId: null, code: null, remediationTitle: null, remediationAction: null, fixHref: null };
   const invocationId = sanitizeTaskText(ctx.providerInvocationId, 180);
   const selection = ctx.selection ?? {};
 
@@ -363,7 +528,11 @@ export async function createSafetyTask(
   const policy = await resolveFrontDeskPolicy(tenantId, clinicId);
   const sla = kind === 'emergency'
     ? { dueMinutes: 0, priority: 'critical' as const }
-    : policy.sla[kind as SlaKind] ?? DEFAULT_FRONT_DESK_POLICY.sla[kind as SlaKind];
+    : kind === 'deployment_attention'
+      // The worker downgrades to 'medium' while a transient probe failure is
+      // still far from the expiry; anything else is the line going quiet.
+      ? { dueMinutes: DEPLOYMENT_ATTENTION_DUE_MINUTES, priority: normalizeTaskPriority(args.priority) ?? 'critical' as const }
+      : policy.sla[kind as SlaKind] ?? DEFAULT_FRONT_DESK_POLICY.sla[kind as SlaKind];
   const now = new Date();
   // Pilot cut: the window is stored as given; dueAt = start (no clipping to opening hours).
   const dueAt = kind === 'emergency'
@@ -375,7 +544,11 @@ export async function createSafetyTask(
   const fallbackDigest = createHash('sha256')
     .update(JSON.stringify({ tenantId, kind, verifiedPhone, requestedCallbackPhone, callerName, message, reasonCategory, bucket: Math.floor(Date.now() / 600_000) }))
     .digest('hex');
-  const idemKey = safeCallId ? `${tenantId}:${safeCallId}:${kind}` : `${tenantId}:fallback:${fallbackDigest}`;
+  const idemKey = ctx.idempotencyKey
+    ?? (safeCallId ? `${tenantId}:${safeCallId}:${kind}` : `${tenantId}:fallback:${fallbackDigest}`);
+  // D5: hashtextextended everywhere. `hashtext` and `hashtextextended` are
+  // different functions over the same string, so the two namespaces never
+  // collided and never serialised each other.
   const lockKey = `receptionist-safety:${idemKey}`;
 
   const auditBase = {
@@ -386,18 +559,24 @@ export async function createSafetyTask(
   };
 
   return db.$transaction(async tx => {
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey})::bigint)`;
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}::text, 0))`;
     const prior = await tx.idempotencyKey.findUnique({
       where: { scope_key: { scope: 'receptionist.live-safety', key: idemKey } },
       select: { id: true, resultId: true },
     });
     if (prior?.resultId) {
+      // D5: take the per-task lock BEFORE reading the row we are about to
+      // read-modify-write, so a staff note landing at the same instant cannot
+      // be overwritten by the message we are appending (and vice versa).
+      await lockStaffTask(tx, tenantId, prior.resultId);
       const existing = await tx.staffTask.findFirst({
         where: { id: prior.resultId, tenantId },
         select: { id: true, status: true, metadata: true },
       });
       if (existing && (LIVE_TASK_STATUSES as readonly string[]).includes(existing.status)) {
-        const current = parseReceptionistTask(existing) ?? receptionistTaskMetadata.parse({ workflow: RECEPTIONIST_TASK_WORKFLOW, kind });
+        const parse = parseReceptionistTaskDetailed(existing)
+          ?? { meta: receptionistTaskMetadata.parse({ workflow: RECEPTIONIST_TASK_WORKFLOW, kind }), degraded: false, raw: {} };
+        const current = parse.meta;
         const alreadyRecorded = Boolean(invocationId) && current.messages.some(entry => entry.invocationId === invocationId);
         const lastText = current.messages.at(-1)?.text ?? current.message;
         const appendMessage = Boolean(message) && !alreadyRecorded && lastText !== message;
@@ -409,15 +588,15 @@ export async function createSafetyTask(
         const messages = appendMessage
           ? [...current.messages, { text: message!, recordedAt: now.toISOString(), invocationId }].slice(-MAX_MESSAGES)
           : current.messages;
-        const next: ReceptionistTaskMetadata = {
-          ...current,
+        // D3: merged onto the stored blob, never written as the degraded view.
+        const next = mergeReceptionistTaskMetadata(parse, {
           messages,
           message: appendMessage ? message : current.message,
           requestedCallbackPhone: newRequestedPhone ?? current.requestedCallbackPhone,
           callbackPhone: newRequestedPhone ?? current.callbackPhone ?? verifiedPhone,
           callerName: newCallerName ?? current.callerName,
-        };
-        await tx.staffTask.update({ where: { id: existing.id }, data: { metadata: next as unknown as Prisma.InputJsonObject } });
+        });
+        await tx.staffTask.update({ where: { id: existing.id }, data: { metadata: next } });
         await tx.auditEvent.create({ data: {
           tenantId, actorUserId: null, action: `receptionist.safety.${kind}.appended`, resource: 'staffTask', resourceId: existing.id,
           userAgent: 'retell-webhook',
@@ -453,6 +632,7 @@ export async function createSafetyTask(
       denialReason,
       appointmentRequestId: optionalUuid(args.appointment_request_id),
       appointmentId: optionalUuid(args.appointment_id),
+      ...deployment,
       requiresAcknowledgement: true,
       staffNotes: [],
     };
@@ -460,7 +640,7 @@ export async function createSafetyTask(
       data: {
         tenantId,
         branchId: branch?.id,
-        title: TASK_TITLES[kind],
+        title: deployment.remediationTitle ?? TASK_TITLES[kind],
         priority: sla.priority,
         dueAt,
         patientId,
@@ -514,7 +694,7 @@ export async function markTransferOutcome(
   tx: Prisma.TransactionClient,
   input: { tenantId: string; callLogId: string; outcome: TransferOutcome; retellCallId?: string | null },
 ): Promise<{ updated: number; completed: number }> {
-  const tasks = await tx.staffTask.findMany({
+  const candidates = await tx.staffTask.findMany({
     where: {
       tenantId: input.tenantId,
       status: { in: [...LIVE_TASK_STATUSES] },
@@ -527,20 +707,35 @@ export async function markTransferOutcome(
         ] },
       ],
     },
-    select: { id: true, metadata: true },
+    // Deterministic order: two concurrent call_ended webhooks for the same call
+    // must take the per-task locks in the same sequence or they deadlock.
+    orderBy: { id: 'asc' },
+    select: { id: true },
   });
   const now = new Date();
   let completed = 0;
-  for (const task of tasks) {
-    const current = parseReceptionistTask(task);
-    if (!current) continue;
-    const next: ReceptionistTaskMetadata = { ...current, transferStatus: input.outcome, transferUpdatedAt: now.toISOString() };
+  const tasks: Array<{ id: string }> = [];
+  for (const candidate of candidates) {
+    // D5: this path used to take no lock at all, so a transfer outcome landing
+    // beside a staff note dropped one of them. Lock, then re-read: the row may
+    // have changed between the scan above and the lock below.
+    await lockStaffTask(tx, input.tenantId, candidate.id);
+    const task = await tx.staffTask.findFirst({
+      where: { id: candidate.id, tenantId: input.tenantId, status: { in: [...LIVE_TASK_STATUSES] } },
+      select: { id: true, metadata: true },
+    });
+    if (!task) continue;
+    const parse = parseReceptionistTaskDetailed(task);
+    if (!parse) continue;
+    tasks.push({ id: task.id });
+    // D3: merged onto the stored blob, so a degraded row keeps its messages.
+    const next = mergeReceptionistTaskMetadata(parse, { transferStatus: input.outcome, transferUpdatedAt: now.toISOString() });
     const closes = input.outcome === 'connected';
     if (closes) completed += 1;
     await tx.staffTask.update({
       where: { id: task.id },
       data: {
-        metadata: next as unknown as Prisma.InputJsonObject,
+        metadata: next,
         ...(closes ? { status: 'COMPLETED', completedAt: now, outcomeCode: 'transferred' } : {}),
       },
     });
@@ -551,6 +746,67 @@ export async function markTransferOutcome(
     } });
   }
   return { updated: tasks.length, completed };
+}
+
+// ---------------------------------------------------------------------------
+// D9 — deployment attention: the task that says the line stopped answering.
+// ---------------------------------------------------------------------------
+
+export interface DeploymentAttentionInput {
+  tenantId: string;
+  /** The receptionist agent whose verification lapsed or drifted. */
+  agentId: string;
+  clinicId: string;
+  /** The readiness/verification failure code the remediation catalogue keys on. */
+  code: string;
+  /** Remediation copy from `remediationFor(code, ctx)` - the words staff act on. */
+  title: string;
+  action: string;
+  fixHref: string | null;
+  /**
+   * 'critical' (default) when the line is off the air; 'medium' while a
+   * transient probe failure is still far from the expiry.
+   */
+  priority?: TaskPriority;
+}
+
+/**
+ * File the deployment-attention task through the ONE contract the board reads.
+ *
+ * Before this, `agentReverification` wrote its own StaffTask with
+ * `workflow: 'receptionist_deployment'` - which `parseReceptionistTask` rejects
+ * - and `priority: 'HIGH'` while the critical banner looks for lowercase
+ * 'critical'. Badge, banner, header count and every lane therefore excluded the
+ * one task that says the receptionist is not answering.
+ *
+ * Idempotency is (agent, code) exactly as before, and live-status scoped like
+ * every other safety task: one open row per failing agent per code, and a NEW
+ * row once someone has closed the last one, so a still-broken agent cannot be
+ * silenced by yesterday's acknowledgment.
+ *
+ * Package A owns `agentReverification.ts`; this is the entry point it calls in
+ * place of its private `raiseAttention`.
+ */
+export async function fileDeploymentAttentionTask(input: DeploymentAttentionInput): Promise<SafetyTaskResult> {
+  return createSafetyTask(
+    {
+      tenantId: input.tenantId,
+      callId: null,
+      idempotencyKey: `${input.tenantId}:agent:${input.agentId}:${input.code}`,
+      selection: { clinicId: input.clinicId },
+    },
+    'deployment_attention',
+    {
+      source: 'system',
+      reason_category: 'deployment',
+      agent_id: input.agentId,
+      code: input.code,
+      remediation_title: input.title,
+      remediation_action: input.action,
+      fix_href: input.fixHref,
+      priority: input.priority ?? 'critical',
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------

@@ -7,11 +7,10 @@ import { getRequestPermissions, requirePermission } from '../../lib/permissions'
 import { runWithTenantContext } from '../../lib/tenantContext';
 import { audit } from '../../lib/audit';
 import {
-  LIVE_TASK_STATUSES, parseReceptionistTask, receptionistTaskMetadata, TASK_OUTCOME_CODES,
-  type ReceptionistTaskMetadata,
+  LIVE_TASK_STATUSES, lockStaffTask, mergeForeignTaskMetadata, mergeReceptionistTaskMetadata,
+  parseReceptionistTask, parseReceptionistTaskDetailed, readStaffNotes, TASK_OUTCOME_CODES,
 } from '../../lib/receptionist/frontDeskTask';
 import { projectTaskRow, taskListInclude, type TaskRowWithRelations } from '../../lib/receptionist/taskProjection';
-import type { Prisma } from '../../generated/prisma/client';
 
 const staffQuery = paginationSchema.extend({
   branchId: z.string().uuid().optional(),
@@ -68,7 +67,7 @@ export const staffRoutes: FastifyPluginAsync = async app => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = taskStatusInput.parse(request.body);
     const result = await runWithTenantContext(request.auth.tenantId, async tx => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`staff-task:${request.auth.tenantId}:${params.id}`}::text, 0))::text AS locked`;
+      await lockStaffTask(tx, request.auth.tenantId, params.id);
       const existing = await tx.staffTask.findFirst({ where: { id: params.id, tenantId: request.auth.tenantId } });
       if (!existing) return { kind: 'not_found' as const };
       if (existing.branchId) assertBranchAccess(request, existing.branchId);
@@ -81,7 +80,8 @@ export const staffRoutes: FastifyPluginAsync = async app => {
         const unchanged = await tx.staffTask.findFirstOrThrow({ where: { id: existing.id, tenantId: request.auth.tenantId }, include: taskInclude });
         return { kind: 'updated' as const, task: unchanged };
       }
-      const receptionist = parseReceptionistTask(existing);
+      const parse = parseReceptionistTaskDetailed(existing);
+      const receptionist = parse?.meta ?? null;
       const terminal = input.status === 'COMPLETED' || input.status === 'CANCELED';
       // Cancelling always needs a reason; completing a receptionist task does
       // too, because "done" with no outcome tells the next person nothing.
@@ -95,8 +95,10 @@ export const staffRoutes: FastifyPluginAsync = async app => {
         });
         if (!appointment) return { kind: 'appointment_invalid' as const };
       }
-      const metadata: ReceptionistTaskMetadata | null = receptionist && input.appointmentId
-        ? { ...receptionist, appointmentId: input.appointmentId }
+      // D3: merge the one changed field onto the stored object. Writing the
+      // parsed view back would delete every key the schema could not recover.
+      const metadata = parse && input.appointmentId
+        ? mergeReceptionistTaskMetadata(parse, { appointmentId: input.appointmentId })
         : null;
       const task = await tx.staffTask.update({
         where: { id: existing.id },
@@ -105,7 +107,7 @@ export const staffRoutes: FastifyPluginAsync = async app => {
           ...(terminal ? { completedAt: new Date() } : {}),
           ...(input.outcomeCode ? { outcomeCode: input.outcomeCode } : {}),
           ...(input.outcomeNote ? { outcomeNote: input.outcomeNote } : {}),
-          ...(metadata ? { metadata: metadata as unknown as Prisma.InputJsonObject } : {}),
+          ...(metadata ? { metadata } : {}),
         },
         include: taskInclude,
       });
@@ -167,9 +169,8 @@ export const staffRoutes: FastifyPluginAsync = async app => {
   // Idempotent, so a double click never rewrites who saw it first.
   app.patch('/tasks/:id/acknowledge', { preHandler: requirePermission('staff:task-status') }, async (request, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
-    const lockKey = `staff-task:${request.auth.tenantId}:${params.id}`;
     const result = await runWithTenantContext(request.auth.tenantId, async tx => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}::text, 0))::text AS locked`;
+      await lockStaffTask(tx, request.auth.tenantId, params.id);
       const existing = await tx.staffTask.findFirst({ where: { id: params.id, tenantId: request.auth.tenantId } });
       if (!existing) return { kind: 'not_found' as const };
       if (existing.branchId) assertBranchAccess(request, existing.branchId);
@@ -217,30 +218,36 @@ export const staffRoutes: FastifyPluginAsync = async app => {
   app.post('/tasks/:id/notes', { preHandler: requirePermission('staff:task-status') }, async (request, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = taskNoteInput.parse(request.body);
-    const lockKey = `staff-task:${request.auth.tenantId}:${params.id}`;
     const result = await runWithTenantContext(request.auth.tenantId, async tx => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}::text, 0))::text AS locked`;
+      await lockStaffTask(tx, request.auth.tenantId, params.id);
       const existing = await tx.staffTask.findFirst({ where: { id: params.id, tenantId: request.auth.tenantId } });
       if (!existing) return { kind: 'not_found' as const };
       if (existing.branchId) assertBranchAccess(request, existing.branchId);
       if (!(LIVE_TASK_STATUSES as readonly string[]).includes(existing.status)) return { kind: 'terminal' as const };
-      const current = parseReceptionistTask(existing)
-        ?? receptionistTaskMetadata.parse({ workflow: 'receptionist_safety', kind: 'message' });
-      if (current.staffNotes.length >= MAX_STAFF_NOTES) return { kind: 'note_limit' as const };
-      const next: ReceptionistTaskMetadata = {
-        ...current,
-        staffNotes: [...current.staffNotes, { text: input.text, at: new Date().toISOString(), byUserId: request.auth.userId }],
-      };
+      // D4: a note on a task this module did not file must NOT rewrite its
+      // metadata as a synthetic receptionist blob. That destroys the origin
+      // markers ensureStaffTask, intake and insurance reconciliation look the
+      // task up by (so a duplicate is filed later), and it makes an insurance
+      // task count as a receptionist `message` in the front desk lanes.
+      // D3: on a receptionist task the note merges onto the stored object, so a
+      // blob that failed strict parse keeps the caller's recorded message.
+      const parse = parseReceptionistTaskDetailed(existing);
+      const staffNotes = parse ? parse.meta.staffNotes : readStaffNotes(existing.metadata);
+      if (staffNotes.length >= MAX_STAFF_NOTES) return { kind: 'note_limit' as const };
+      const appended = [...staffNotes, { text: input.text, at: new Date().toISOString(), byUserId: request.auth.userId }];
+      const next = parse
+        ? mergeReceptionistTaskMetadata(parse, { staffNotes: appended })
+        : mergeForeignTaskMetadata(existing.metadata, { staffNotes: appended });
       const task = await tx.staffTask.update({
         where: { id: existing.id },
-        data: { metadata: next as unknown as Prisma.InputJsonObject },
+        data: { metadata: next },
         include: taskListInclude,
       });
       await tx.auditEvent.create({ data: {
         tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
         action: 'task.note.appended', resource: 'staffTask', resourceId: existing.id,
         requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
-        metadata: { hasNote: true, noteCount: next.staffNotes.length },
+        metadata: { hasNote: true, noteCount: appended.length, receptionist: Boolean(parse) },
       } });
       return { kind: 'updated' as const, task };
     });
@@ -280,7 +287,7 @@ export const staffRoutes: FastifyPluginAsync = async app => {
     const canAssignOthers = permissions.has('staff:write');
 
     const result = await runWithTenantContext(request.auth.tenantId, async tx => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`staff-task:${request.auth.tenantId}:${params.id}`}::text, 0))::text AS locked`;
+      await lockStaffTask(tx, request.auth.tenantId, params.id);
       const existing = await tx.staffTask.findFirst({ where: { id: params.id, tenantId: request.auth.tenantId } });
       if (!existing) return { kind: 'not_found' as const };
       if (existing.branchId) assertBranchAccess(request, existing.branchId);

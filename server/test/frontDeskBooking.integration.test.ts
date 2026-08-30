@@ -95,7 +95,13 @@ async function makeFixture(): Promise<Fixture> {
   const task = await db.staffTask.create({
     data: {
       tenantId, branchId: branch.id, callLogId: callLog.id, title: 'AI receptionist callback requested', priority: 'high',
-      metadata: { workflow: 'receptionist_safety', kind: 'message', requiresAcknowledgement: true },
+      // D1: this is the request's OWN callback task, so booking the request is
+      // genuinely what closes it. A `message` task with no link to this request
+      // is other unfinished business and stays open.
+      metadata: {
+        workflow: 'receptionist_safety', kind: 'message', requiresAcknowledgement: true,
+        appointmentRequestId: requestRow.id,
+      },
     },
   });
   return {
@@ -202,9 +208,13 @@ describe('appointment requests — the review queue', () => {
       status: 'BOOKED', bookedAppointmentId: appointmentId, patientId: f.patientId, branchId: f.branchId,
     });
     expect((await db.receptionistCallLog.findUniqueOrThrow({ where: { id: f.callLogId } })).outcome).toBe('BOOKED');
-    expect(await db.staffTask.findUniqueOrThrow({ where: { id: f.taskId } })).toMatchObject({
-      status: 'COMPLETED', outcomeCode: 'booked',
-    });
+    // D1: closed by a person, so it is also acknowledged — a COMPLETED row must
+    // never keep claiming that nobody ever looked at it.
+    const closedTask = await db.staffTask.findUniqueOrThrow({ where: { id: f.taskId } });
+    expect(closedTask).toMatchObject({ status: 'COMPLETED', outcomeCode: 'booked' });
+    expect(closedTask.acknowledgedAt).not.toBeNull();
+    expect(closedTask.acknowledgedById).toBe(f.frontDesk);
+    expect(res.json()).toMatchObject({ tasksClosed: 1, tasksLeftOpen: 0 });
     expect(await db.auditEvent.count({
       where: { tenantId: f.tenantId, action: 'receptionist.appointmentRequest.bookedFromReview', resourceId: f.requestId },
     })).toBe(1);
