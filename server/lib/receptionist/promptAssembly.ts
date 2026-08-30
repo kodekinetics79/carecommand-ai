@@ -6,6 +6,7 @@ import {
   type PromptIntakeField,
   type PromptService,
 } from '../../modules/receptionist/promptService';
+import { serviceVoiceDuration } from '../scheduling';
 import { hoursSummarySpoken, upcomingClosuresSpoken } from './clinicHours';
 import { loadHoursSource } from './hoursSource';
 import { parseKnowledgeDocument, type KnowledgeDocument } from './knowledge';
@@ -93,7 +94,9 @@ export async function assemblePromptConfig(
     id: item.id,
     name: item.name,
     spokenDescription: item.spokenDescription,
-    voiceDurationMinutes: item.voiceDurationMinutes ?? item.defaultDurationMinutes,
+    // The one duration resolver. What the agent speaks is what the scheduler
+    // reserves; they used to disagree and double-booked the chair.
+    voiceDurationMinutes: serviceVoiceDuration(item),
     priceFrom: item.priceFrom === null || item.priceFrom === undefined ? null : Number(item.priceFrom),
     bookableByVoice: item.bookableByVoice,
   }));

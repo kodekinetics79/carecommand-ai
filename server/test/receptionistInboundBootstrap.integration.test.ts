@@ -19,7 +19,9 @@ const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
 const { disclosureEvidenceHash, renderRecordingDisclosure } = await import('../lib/receptionist/privacyLifecycle');
-const { MAX_TENANT_ACTIVE_CALLS } = await import('../modules/receptionist/outbound');
+// The concurrency ceiling moved to its own policy module (C-voice); the pack
+// helpers below are what C-words asserts the caller actually hears.
+const { MAX_TENANT_ACTIVE_CALLS } = await import('../lib/receptionist/admissionPolicy');
 const { DEGRADED_SAFE_TOOLS } = await import('../lib/receptionist/agentReadiness');
 const { platformLocalePack } = await import('../lib/receptionist/localePacks/defaults');
 const { renderPackMessage } = await import('../lib/receptionist/localePacks/render');

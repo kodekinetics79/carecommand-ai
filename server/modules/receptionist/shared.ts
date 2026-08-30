@@ -60,7 +60,7 @@ export async function compileCampaignIntakeContract(
   tx: Prisma.TransactionClient,
   campaign: { id: string; tenantId: string; clinicId: string; appointmentType: string; eligibleLocationIds: string[]; intakeSchemaRevision: number },
 ) {
-  const [fields, locations] = await Promise.all([
+  const [fields, locations, services] = await Promise.all([
     tx.receptionistIntakeField.findMany({ where: { tenantId: campaign.tenantId, campaignId: campaign.id }, orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] }),
     tx.receptionistLocation.findMany({
       where: {
@@ -73,6 +73,15 @@ export async function compileCampaignIntakeContract(
       orderBy: { id: 'asc' },
       select: { id: true, name: true },
     }),
+    // C9: `service` is an enum over the voice-bookable catalogue. This query
+    // MUST match the one `promptAssembly` feeds the deploy path — the
+    // attestation compares the two compiled tools byte for byte, and a
+    // narrower list here would refuse to activate a campaign we just deployed.
+    tx.serviceCatalogItem.findMany({
+      where: { tenantId: campaign.tenantId, active: true, bookableByVoice: true },
+      orderBy: { name: 'asc' },
+      select: { name: true },
+    }),
   ]);
   return compileIntakeContract({
     campaignId: campaign.id,
@@ -81,6 +90,7 @@ export async function compileCampaignIntakeContract(
     eligibleLocations: locations,
     fields,
     toolUrl: expectedRetellToolUrl(campaign.clinicId),
+    bookableServices: services.map(service => service.name),
   });
 }
 

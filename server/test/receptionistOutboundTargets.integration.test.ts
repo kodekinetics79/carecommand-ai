@@ -22,6 +22,7 @@ const { recordUsageEvent, USAGE_METRICS } = await import('../lib/usageMetering')
 const { fingerprintJson } = await import('../modules/receptionist/intakeContract');
 const { isWithinQuietHours, quietHoursConfigurationReason, setProviderBoundaryTestHookForTests } = await import('../modules/receptionist/outbound');
 const { isDestinationOptedOut } = await import('../lib/campaigns');
+const { MAX_TENANT_ACTIVE_CALLS } = await import('../lib/receptionist/admissionPolicy');
 const { runWithJobTenantContext } = await import('../lib/tenantContext');
 
 type TenantFixture = Awaited<ReturnType<typeof makeTenant>>;
@@ -2130,14 +2131,16 @@ describe('AI receptionist outbound regression safety controls', () => {
     const tenant = await makeTenant();
     const campaignId = await createCampaign(tenant, { status: 'RUNNING' });
     const target = await addPatientTarget(tenant, campaignId, 701);
+    // Fill the tenant's concurrency ceiling exactly, reading the policy value
+    // rather than restating it: C7 raised it off a hardcoded 3.
     await db.receptionistCallLog.createMany({
-      data: [1, 2, 3].map(suffix => ({
+      data: Array.from({ length: MAX_TENANT_ACTIVE_CALLS }, (_, index) => ({
         tenantId: tenant.id,
         clinicId: tenant.clinicId,
         outboundCampaignId: campaignId,
-        callerPhone: phoneFor(tenant.id, 710 + suffix),
+        callerPhone: phoneFor(tenant.id, 711 + index),
         direction: 'outbound',
-        outcome: 'IN_PROGRESS',
+        outcome: 'IN_PROGRESS' as const,
       })),
     });
 

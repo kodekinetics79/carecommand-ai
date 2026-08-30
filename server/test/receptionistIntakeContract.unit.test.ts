@@ -55,7 +55,9 @@ describe('receptionist typed intake contract', () => {
     };
     expect(parameters.additionalProperties).toBe(false);
     expect(parameters.properties).not.toHaveProperty('phone');
-    expect(parameters.properties).toHaveProperty('service', expect.objectContaining({ const: 'Consultation' }));
+    // C9: `service` is an enum over the voice-bookable catalogue, not one
+    // pinned const. A single-service campaign still offers exactly one option.
+    expect(parameters.properties).toHaveProperty('service', expect.objectContaining({ enum: ['Consultation'] }));
     expect(parameters.properties).toHaveProperty('intake_contract_fingerprint', expect.objectContaining({ const: first.snapshot.semanticFingerprint }));
     expect(parameters.properties).toHaveProperty('intake_schema_revision', expect.objectContaining({ const: 7 }));
     expect(parameters.properties).toHaveProperty(`custom_${customId.replaceAll('-', '')}_confirmed`, expect.objectContaining({ const: true }));
@@ -119,9 +121,9 @@ describe('receptionist typed intake contract', () => {
 
     const compiled = compileIntakeContract(base);
     const mutated = structuredClone(compiled.snapshot.bookAppointmentToolContract) as unknown as {
-      parameters: { properties: { service: { const: string } } };
+      parameters: { properties: { service: { enum: string[] } } };
     };
-    mutated.parameters.properties.service.const = '{{per_call_service}}';
+    mutated.parameters.properties.service.enum = ['{{per_call_service}}'];
     expect(bookAppointmentToolFingerprint(mutated)).toBeNull();
   });
 

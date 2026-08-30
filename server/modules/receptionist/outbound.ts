@@ -53,7 +53,7 @@ const OUTBOUND_LEGAL_BASES = ['EXPLICIT_CONSENT', 'TREATMENT_OPERATIONS'] as con
 const STRICT_HH_MM = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 const CLIENT_LAUNCH_ATTEMPT_SCOPE = 'receptionist.outbound-client-attempt';
 const LIVE_UAT_TARGET_SOURCE_PREFIX = 'live_voice_uat:';
-export const MAX_TENANT_ACTIVE_CALLS = 3;
+import { MAX_TENANT_ACTIVE_CALLS } from '../../lib/receptionist/admissionPolicy';
 import { recordUsageEvent, periodUsageTotal, voiceCallDedupeKey, USAGE_METRICS } from '../../lib/usageMetering';
 import { liveCallingBlockReason, TENANT_MODE_DEMO_BLOCK } from '../../lib/tenantMode';
 

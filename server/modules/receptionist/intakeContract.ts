@@ -40,6 +40,15 @@ interface IntakeContractInput {
   eligibleLocations: Array<{ id: string; name: string }>;
   fields: IntakeFieldConfiguration[];
   toolUrl: string;
+  /**
+   * Catalogue services the caller may actually choose, in `bookableByVoice`
+   * order. A campaign used to pin exactly one service as a JSON-Schema `const`,
+   * so a dental line that takes cleanings, emergencies, crowns and whitening
+   * could only ever book the one the campaign named; "I need a filling" ended
+   * in a message. Omitted (or empty) keeps the historical single-service
+   * behaviour by falling back to `appointmentType`.
+   */
+  bookableServices?: string[];
 }
 
 export interface ExecutableBookAppointmentContract {
@@ -56,6 +65,12 @@ export interface IntakeContractSnapshot {
   campaignId: string;
   revision: number;
   appointmentType: string;
+  /**
+   * The exact set the deployed `service` enum offers. Runtime validates the
+   * caller's choice against this list before it reaches the scheduler, so the
+   * spoken menu and the bookable menu can never drift apart.
+   */
+  bookableServices: string[];
   eligibleLocationIds: string[];
   eligibleLocations: Array<{ id: string; name: string }>;
   /**
@@ -257,6 +272,19 @@ export function compileIntakeContract(input: IntakeContractInput): { snapshot: I
   if (new Set(input.eligibleLocations.map(location => location.id)).size !== input.eligibleLocations.length) issues.push('Eligible location identifiers must be unique.');
   if (input.eligibleLocations.some(location => !location.id.trim() || !location.name.trim())) issues.push('Eligible locations require stable identifiers and names.');
   if (containsProviderTemplateSyntax(input.eligibleLocations)) issues.push('Eligible location content may not contain provider dynamic-variable templates.');
+  // The bookable menu. `appointmentType` is always offerable (it is what the
+  // campaign advertises); the catalogue's other voice-bookable services join
+  // it, deduplicated and ordered so the fingerprint is stable across reads.
+  const bookableServices = [...new Set([
+    input.appointmentType.trim(),
+    ...(input.bookableServices ?? []).map(name => name.trim()).filter(Boolean),
+  ])].sort();
+  if (bookableServices.some(name => name.length < 2 || name.length > 120)) {
+    issues.push('Every voice-bookable service name must contain 2 to 120 characters.');
+  }
+  if (containsProviderTemplateSyntax(bookableServices)) {
+    issues.push('Voice-bookable service names may not contain provider dynamic-variable templates.');
+  }
   const locationIds = [...new Set(input.eligibleLocations.map(location => location.id))].sort();
   const eligibleLocations = [...input.eligibleLocations]
     .map(location => ({ id: location.id, name: location.name }))
@@ -283,6 +311,7 @@ export function compileIntakeContract(input: IntakeContractInput): { snapshot: I
     campaignId: input.campaignId,
     revision: input.revision,
     appointmentType: input.appointmentType,
+    bookableServices,
     eligibleLocations,
     fields: semanticFields,
   });
@@ -291,10 +320,14 @@ export function compileIntakeContract(input: IntakeContractInput): { snapshot: I
     last_name: stringProperty('Caller last name.', 80),
     appointment_date: stringProperty('Chosen appointment date (YYYY-MM-DD).', 10, { pattern: '^\\d{4}-\\d{2}-\\d{2}$' }),
     appointment_time: stringProperty('Chosen appointment time (HH:mm, 24-hour).', 5, { pattern: '^(?:[01]\\d|2[0-3]):[0-5]\\d$' }),
+    // `service` is the one value here the CALLER chooses: an enum over the
+    // clinic's voice-bookable catalogue rather than a single pinned const.
+    // Runtime re-validates the choice against `bookableServices` on the
+    // persisted snapshot before it reaches the scheduler.
+    service: { type: 'string', enum: bookableServices, description: 'The service the caller asked for. Choose only from this list.' },
     // These values are applied by Retell's schema rather than selected by the
     // model. Runtime re-derives them from persisted call/campaign authority and
     // treats the supplied constants only as a deployment-drift cross-check.
-    service: { type: 'string', const: input.appointmentType, description: 'Server-configured appointment service.' },
     intake_contract_fingerprint: { type: 'string', const: semanticFingerprint, description: 'Provider-deployed immutable intake contract fingerprint.' },
     intake_schema_revision: { type: 'integer', const: input.revision, description: 'Provider-deployed immutable intake schema revision.' },
     booking_confirmed: {
@@ -346,6 +379,7 @@ export function compileIntakeContract(input: IntakeContractInput): { snapshot: I
     campaignId: input.campaignId,
     revision: input.revision,
     appointmentType: input.appointmentType,
+    bookableServices,
     eligibleLocationIds: locationIds,
     eligibleLocations,
     semanticFingerprint,
@@ -354,6 +388,34 @@ export function compileIntakeContract(input: IntakeContractInput): { snapshot: I
     bookAppointmentToolFingerprint: bookFingerprint,
   };
   return { snapshot, fingerprint: fingerprintJson(snapshot) };
+}
+
+/**
+ * The menu a deployed agent may offer, tolerant of snapshots persisted before
+ * `bookableServices` existed (those campaigns keep their single service).
+ */
+export function bookableServicesOf(
+  snapshot: Pick<IntakeContractSnapshot, 'appointmentType' | 'bookableServices'>,
+): string[] {
+  const configured = Array.isArray(snapshot.bookableServices)
+    ? snapshot.bookableServices.filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
+    : [];
+  return configured.length ? configured : [snapshot.appointmentType];
+}
+
+/**
+ * Resolve a caller-chosen service name back to the exact attested spelling, or
+ * null when it is not on this deployment's menu. Case-insensitive because the
+ * model echoes what it heard; the returned value is always the catalogue's own
+ * casing so the scheduler matches on it.
+ */
+export function resolveBookableService(
+  snapshot: Pick<IntakeContractSnapshot, 'appointmentType' | 'bookableServices'>,
+  requested: unknown,
+): string | null {
+  const wanted = typeof requested === 'string' ? requested.trim().toLocaleLowerCase() : '';
+  if (!wanted) return null;
+  return bookableServicesOf(snapshot).find(name => name.trim().toLocaleLowerCase() === wanted) ?? null;
 }
 
 export function buildBookAppointmentTool(input: {

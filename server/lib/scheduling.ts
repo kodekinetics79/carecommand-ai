@@ -178,14 +178,42 @@ export async function resolveProviderSchedulingContext(
   return { providerProfileId: provider.id, branchId: provider.branchId, timezone: validateIanaTimezone(provider.branch.timezone) };
 }
 
+/**
+ * How long a catalogue service takes, as ONE answer.
+ *
+ * The receptionist prompt spoke `voiceDurationMinutes ?? defaultDurationMinutes`
+ * ("about 60 minutes") while the scheduler blocked `defaultDurationMinutes`
+ * (30) — a double-book discovered in the chair. Whatever a caller is told is
+ * now exactly what the calendar reserves, because both read this.
+ */
+export function serviceVoiceDuration(
+  item: { voiceDurationMinutes?: number | null; defaultDurationMinutes: number },
+): number {
+  const voice = item.voiceDurationMinutes;
+  return typeof voice === 'number' && Number.isInteger(voice) && voice >= 5 && voice <= 480
+    ? voice
+    : item.defaultDurationMinutes;
+}
+
 /** Active catalog configuration is fail-closed; caller duration is ignored. */
 export async function resolveSchedulingService(
-  args: { tenantId: string; serviceCatalogItemId?: string | null; service?: string | null; fallbackDurationMin?: number },
+  args: {
+    tenantId: string;
+    serviceCatalogItemId?: string | null;
+    service?: string | null;
+    fallbackDurationMin?: number;
+    /**
+     * Reserve the duration the voice agent SPEAKS rather than the desk default.
+     * Only the receptionist passes this: the front desk keeps booking the
+     * catalogue default it shows on screen.
+     */
+    useVoiceDuration?: boolean;
+  },
   client: Client = db,
 ): Promise<SchedulingService | null> {
   const catalog = await client.serviceCatalogItem.findMany({
     where: { tenantId: args.tenantId, active: true },
-    select: { id: true, name: true, defaultDurationMinutes: true },
+    select: { id: true, name: true, defaultDurationMinutes: true, voiceDurationMinutes: true },
     orderBy: { createdAt: 'asc' },
   });
   if (catalog.length > 0) {
@@ -195,7 +223,12 @@ export async function resolveSchedulingService(
       : Boolean(normalized) && item.name.trim().toLocaleLowerCase() === normalized);
     if (matches.length !== 1) return null;
     const item = matches[0];
-    return { id: item.id, name: item.name, durationMin: item.defaultDurationMinutes, catalogConfigured: true };
+    return {
+      id: item.id,
+      name: item.name,
+      durationMin: args.useVoiceDuration ? serviceVoiceDuration(item) : item.defaultDurationMinutes,
+      catalogConfigured: true,
+    };
   }
   const name = args.service?.trim() || 'Consultation';
   const durationMin = args.fallbackDurationMin ?? 30;

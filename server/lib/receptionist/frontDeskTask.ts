@@ -356,6 +356,21 @@ export interface SafetyTaskResult {
   appended: boolean;
 }
 
+/**
+ * The staff-facing note on a possible-duplicate booking review.
+ *
+ * It lives here, beside TASK_TITLES, rather than at the call site in
+ * liveTools: nobody speaks this sentence, the front desk reads it off a task.
+ * frontDeskTask owns the StaffTask contract and its copy, which is exactly why
+ * the C10 caller-facing pack lint does not scan this module — and why putting
+ * a staff note in a `message:` literal inside liveTools is the wrong home for
+ * it, not merely a lint failure.
+ */
+export function possibleDuplicatePatientNote(possibleDuplicateOfPatientId: string): string {
+  return `This caller's number already matches patient ${possibleDuplicateOfPatientId}, and identity was not verified on the call. `
+    + 'The booking was made under a new patient record; please confirm whether the records should be merged.';
+}
+
 const TASK_TITLES: Record<ReceptionistTaskKind, string> = {
   human_handoff: 'AI receptionist human handoff requested',
   message: 'AI receptionist callback requested',
