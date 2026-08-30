@@ -5,6 +5,8 @@ import { fixtureDb as db } from './helpers/fixtureDb';
 import { handleAgentTool } from '../lib/receptionist/liveTools';
 import { runWithWebhookTenantContext } from '../lib/tenantContext';
 import { buildRetellConfig, generateSystemPrompt, type PromptConfig } from '../modules/receptionist/promptService';
+import { promptFixture } from './fixtures/receptionistPromptConfigs';
+import { EN_US } from './fixtures/receptionistPackStrings';
 
 const tenantIds: string[] = [];
 
@@ -101,7 +103,7 @@ describe('AI receptionist safety workflows', () => {
     ) as Record<string, unknown>;
 
     expect(result).toMatchObject({ emergency_recorded: true, acknowledgment_pending: true });
-    expect(result.message).toMatch(/call 911 now/i);
+    expect(result.message).toContain(EN_US.emergencyNumber);
     expect(result.message).toMatch(/do not wait/i);
     const signal = await db.operationalSignal.findFirstOrThrow({
       where: { tenantId: tenant.id, signalType: 'receptionist_emergency_mention', entityId: String(result.task_id) },
@@ -189,20 +191,13 @@ describe('AI receptionist safety workflows', () => {
   });
 });
 
+const fixture = promptFixture('us-full');
 const promptConfig: PromptConfig = {
-  clinic: {
-    id: 'clinic-1', name: 'Example Clinic', phone: '+12125550100', timezone: 'America/New_York',
-    defaultLanguage: 'en-US', complianceDisclosure: '', humanFallbackNumber: '+12125550200',
-    doNotContactPolicy: 'Record the opt-out and end the call.',
-  },
-  agent: { name: 'Avery', voice: 'voice-1', tone: 'warm', language: 'en-US' },
-  campaign: {
-    id: 'campaign-1', name: 'Scheduling', campaignType: 'inbound', offerTitle: 'Appointment',
-    offerDescription: 'Schedule an appointment.', offerScript: 'How can I help?', appointmentType: 'Consultation',
-    eligibleLocationIds: ['branch-1'], smsConfirmation: true, emailConfirmation: false,
-  },
+  ...fixture,
+  clinic: { ...fixture.clinic, complianceDisclosure: null, doNotContactPolicy: 'Record the opt-out and end the call.' },
+  campaign: { ...fixture.campaign, eligibleLocationIds: ['branch-1'] },
   locations: [{ id: 'branch-1', name: 'Main', address: '1 Main St' }],
-  intakeFields: [],
+  hours: { clinicSummary: fixture.hours!.clinicSummary, perLocation: [{ id: 'branch-1', summary: fixture.hours!.clinicSummary, closures: [] }] },
 };
 
 describe('Retell safety configuration', () => {
@@ -223,8 +218,8 @@ describe('Retell safety configuration', () => {
     const invalid = { ...promptConfig, clinic: { ...promptConfig.clinic, humanFallbackNumber: 'front desk' } };
     expect(buildRetellConfig(invalid, { webhookBaseUrl: 'https://api.example.test' }).tools.some(tool => tool.name === 'transfer_to_staff')).toBe(false);
     const prompt = generateSystemPrompt(invalid);
-    expect(prompt).toMatch(/immediately tell them to hang up and call 911/i);
-    expect(prompt).toMatch(/Never delay the 911 instruction/i);
+    expect(prompt).toContain(EN_US.emergencyInstruction);
+    expect(prompt).toMatch(/Never delay the emergency instruction/i);
     expect(prompt).toMatch(/Never merely say that someone will follow up without a successful tool result and task ID/i);
     expect(prompt).toMatch(/proxy, guardian, or minor/i);
   });

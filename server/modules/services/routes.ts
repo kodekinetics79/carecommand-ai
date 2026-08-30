@@ -39,19 +39,35 @@ export const serviceCatalogRoutes: FastifyPluginAsync = async app => {
     return rows.map(mapItem);
   });
 
-  const createInput = z.object({
+  // Field shapes without defaults. `.strict()` on both schemas means a
+  // misspelled or unsupported field is a 400, never a silent no-op that
+  // returns 200 and saves nothing.
+  const fields = {
     name: z.string().trim().min(2).max(160),
-    category: z.string().trim().min(2).max(80).default('general'),
-    defaultDurationMinutes: z.coerce.number().int().min(5).max(480).default(30),
+    category: z.string().trim().min(2).max(80),
+    defaultDurationMinutes: z.coerce.number().int().min(5).max(480),
     defaultAppointmentValue: z.coerce.number().min(0).max(1_000_000).optional().nullable(),
     depositRuleId: uuid.optional().nullable(),
-    active: z.boolean().default(true),
+    active: z.boolean(),
     // Voice-receptionist facts; prompt-safe text (no template syntax or override phrasing).
     spokenDescription: optionalPromptText(300),
-    bookableByVoice: z.boolean().optional(),
+    bookableByVoice: z.boolean(),
     voiceDurationMinutes: z.coerce.number().int().min(5).max(480).optional().nullable(),
     priceFrom: z.coerce.number().min(0).max(1_000_000).optional().nullable(),
-  });
+  };
+
+  const createInput = z.object({
+    ...fields,
+    category: fields.category.default('general'),
+    defaultDurationMinutes: fields.defaultDurationMinutes.default(30),
+    active: fields.active.default(true),
+    bookableByVoice: fields.bookableByVoice.default(false),
+  }).strict();
+
+  // NOT createInput.partial(): Zod keeps .default() through .partial(), so a
+  // one-field PATCH would silently reset category, duration and active to
+  // their creation defaults.
+  const updateInput = z.object(fields).partial().strict();
 
   app.post('/', { preHandler: writeRoles }, async (request, reply) => {
     const input = createInput.parse(request.body);
@@ -64,7 +80,7 @@ export const serviceCatalogRoutes: FastifyPluginAsync = async app => {
     const row = await db.serviceCatalogItem.create({
       data: {
         tenantId: request.auth.tenantId, name: input.name, category: input.category, defaultDurationMinutes: input.defaultDurationMinutes, defaultAppointmentValue: input.defaultAppointmentValue ?? undefined, depositRuleId: input.depositRuleId ?? undefined, active: input.active,
-        spokenDescription: input.spokenDescription ?? undefined, bookableByVoice: input.bookableByVoice ?? false,
+        spokenDescription: input.spokenDescription ?? undefined, bookableByVoice: input.bookableByVoice,
         voiceDurationMinutes: input.voiceDurationMinutes ?? undefined, priceFrom: input.priceFrom ?? undefined,
       },
     });
@@ -74,7 +90,7 @@ export const serviceCatalogRoutes: FastifyPluginAsync = async app => {
 
   app.patch('/:id', { preHandler: writeRoles }, async request => {
     const { id } = z.object({ id: uuid }).parse(request.params);
-    const input = createInput.partial().parse(request.body);
+    const input = updateInput.parse(request.body);
     const existing = await db.serviceCatalogItem.findFirst({ where: { id, tenantId: request.auth.tenantId } });
     if (!existing) throw app.httpErrors.notFound('Service not found');
     if (input.depositRuleId) {

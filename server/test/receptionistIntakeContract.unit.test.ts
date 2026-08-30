@@ -5,6 +5,7 @@ import {
   validateIntakeFieldConfiguration,
 } from '../modules/receptionist/intakeContract';
 import { buildRetellConfig, type PromptConfig } from '../modules/receptionist/promptService';
+import { promptFixture } from './fixtures/receptionistPromptConfigs';
 
 const clinicId = '11111111-1111-4111-8111-111111111111';
 const campaignId = '22222222-2222-4222-8222-222222222222';
@@ -119,18 +120,14 @@ describe('receptionist typed intake contract', () => {
   });
 
   it('exports the compatibility alias and tools array from the same executable object', () => {
+    const base = promptFixture('us-full');
     const config: PromptConfig = {
-      clinic: {
-        id: clinicId, name: 'Example Clinic', phone: '+12125550100', timezone: 'America/New_York',
-        defaultLanguage: 'en-US', complianceDisclosure: 'Approved disclosure.', doNotContactPolicy: 'Record opt out.',
-      },
-      agent: { name: 'Avery', voice: 'voice', tone: 'warm', language: 'en-US' },
-      campaign: {
-        id: campaignId, name: 'Pilot', campaignType: 'inbound', offerTitle: 'Care', offerDescription: 'Schedule care',
-        offerScript: 'Would you like to schedule?', appointmentType: 'Consultation', eligibleLocationIds: [clinicId],
-        smsConfirmation: true, emailConfirmation: false, intakeSchemaRevision: 7,
-      },
+      ...base,
+      clinic: { ...base.clinic, id: clinicId, complianceDisclosure: 'Approved disclosure.', doNotContactPolicy: 'Record opt out.' },
+      agent: { ...base.agent, voice: 'voice' },
+      campaign: { ...base.campaign, id: campaignId, name: 'Pilot', offerTitle: 'Care', offerDescription: 'Schedule care', offerScript: 'Would you like to schedule?', eligibleLocationIds: [clinicId], intakeSchemaRevision: 7 },
       locations: [{ id: clinicId, name: 'Main', address: '1 Main Street' }],
+      hours: { clinicSummary: base.hours!.clinicSummary, perLocation: [{ id: clinicId, summary: base.hours!.clinicSummary, closures: [] }] },
       intakeFields: fields(),
     };
     const exported = buildRetellConfig(config, { webhookBaseUrl: 'https://api.example.test' });

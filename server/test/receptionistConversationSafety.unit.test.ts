@@ -8,39 +8,21 @@ import {
   generateSystemPrompt,
   type PromptConfig,
 } from '../modules/receptionist/promptService';
+import { promptFixture } from './fixtures/receptionistPromptConfigs';
+import { EN_US } from './fixtures/receptionistPackStrings';
 
+const fixture = promptFixture('us-full');
 const baseConfig: PromptConfig = {
+  ...fixture,
   clinic: {
-    id: 'clinic-1',
-    name: 'Example Clinic',
-    phone: '+12125550100',
-    timezone: 'America/New_York',
-    defaultLanguage: 'en-US',
+    ...fixture.clinic,
     complianceDisclosure: 'State-specific supplemental notice.',
-    humanFallbackNumber: '+12125550200',
     doNotContactPolicy: 'Record the suppression immediately and end the call.',
   },
-  agent: {
-    name: 'Avery',
-    voice: 'voice-1',
-    tone: 'warm',
-    language: 'en-US',
-    greetingOverride: 'Welcome to our scheduling line.',
-  },
-  campaign: {
-    id: 'campaign-1',
-    name: 'Scheduling',
-    campaignType: 'reactivation',
-    offerTitle: 'Appointment',
-    offerDescription: 'Schedule a visit.',
-    offerScript: 'Would you like to schedule?',
-    appointmentType: 'Consultation',
-    eligibleLocationIds: ['branch-1'],
-    smsConfirmation: true,
-    emailConfirmation: false,
-  },
+  agent: { ...fixture.agent, greetingOverride: 'Welcome to our scheduling line.' },
+  campaign: { ...fixture.campaign, campaignType: 'reactivation', offerDescription: 'Schedule a visit.', offerScript: 'Would you like to schedule?', eligibleLocationIds: ['branch-1'] },
   locations: [{ id: 'branch-1', name: 'Main', address: '1 Main St' }],
-  intakeFields: [],
+  hours: { clinicSummary: fixture.hours!.clinicSummary, perLocation: [{ id: 'branch-1', summary: fixture.hours!.clinicSummary, closures: [] }] },
 };
 
 describe('AI receptionist conversation safety contract', () => {
@@ -83,11 +65,11 @@ describe('AI receptionist conversation safety contract', () => {
     expect(emergency.speak_during_execution).toBe(false);
     expect(emergency.parameters.required).not.toContain('emergency_instruction_spoken');
     const providerProtocolTrace = [
-      { kind: 'spoken', value: 'Hang up and call 911 now, or go to the nearest emergency room.' },
+      { kind: 'spoken', value: EN_US.emergencyInstruction },
       { kind: 'tool', value: 'report_emergency' },
       { kind: 'terminated', value: 'emergency_flow' },
     ];
-    expect(providerProtocolTrace[0]).toMatchObject({ kind: 'spoken', value: expect.stringMatching(/call 911.*nearest emergency room/i) });
+    expect(providerProtocolTrace[0]).toMatchObject({ kind: 'spoken', value: expect.stringContaining(EN_US.emergencyNumber) });
     expect(providerProtocolTrace.findIndex(event => event.kind === 'spoken')).toBeLessThan(providerProtocolTrace.findIndex(event => event.kind === 'tool'));
     expect(providerProtocolTrace.slice(2).some(event => event.value === 'disclosure' || event.value === 'normal_flow')).toBe(false);
   });

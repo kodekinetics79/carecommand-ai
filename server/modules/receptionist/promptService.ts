@@ -1,11 +1,17 @@
 // ===========================================================================
 
-import { renderRecordingDisclosure } from '../../lib/receptionist/privacyLifecycle';
+import { createHash } from 'node:crypto';
 import {
   buildBookAppointmentTool,
   compileIntakeContract,
   intakeFieldKey,
 } from './intakeContract';
+import { renderPackMessage } from '../../lib/receptionist/localePacks/render';
+import type { LocalePackStrings } from '../../lib/receptionist/localePacks/types';
+import type { KnowledgeDocument } from '../../lib/receptionist/knowledge';
+import { transferReadiness } from '../../lib/receptionist/transferReadiness';
+import { countryCurrency } from '../../lib/receptionist/catalog';
+import { urlHostname } from '../../lib/receptionist/promptSafety';
 // AI Receptionist — prompt generation service
 //
 // Pure, dependency-free composition layer. Given a clinic profile, an agent,
@@ -44,12 +50,14 @@ export interface PromptClinic {
   phone: string;
   website?: string | null;
   addressLine?: string | null;
+  /** ISO-3166 alpha-2; null blocks activation and is never inferred. */
+  country: string | null;
   timezone: string;
   defaultLanguage: string;
-  complianceDisclosure: string;
+  /** Supplemental sentence only; the disclosure baseline comes from the pack. */
+  complianceDisclosure?: string | null;
   humanFallbackNumber?: string | null;
-  doNotContactPolicy: string;
-  workingHours?: unknown;
+  doNotContactPolicy?: string | null;
 }
 
 export interface PromptLocation {
@@ -57,6 +65,29 @@ export interface PromptLocation {
   name: string;
   address: string;
   phone?: string | null;
+  accessNotes?: string | null;
+}
+
+/** A bookable/describable service, always from ServiceCatalogItem. */
+export interface PromptService {
+  id: string;
+  name: string;
+  spokenDescription?: string | null;
+  voiceDurationMinutes?: number | null;
+  priceFrom?: number | null;
+  bookableByVoice: boolean;
+}
+
+export interface PromptHours {
+  clinicSummary: string;
+  perLocation: Array<{ id: string; summary: string; closures: string[] }>;
+}
+
+export interface PromptLocalePack {
+  /** Tenant pack id, or null when a platform default is standing in. */
+  id: string | null;
+  strings: LocalePackStrings;
+  evidenceHash: string;
 }
 
 export interface PromptAgent {
@@ -111,6 +142,45 @@ export interface PromptConfig {
   campaign: PromptCampaign;
   locations: PromptLocation[];
   intakeFields: PromptIntakeField[];
+  /** Approved clinic knowledge; null renders an explicit "not configured" line. */
+  knowledge: KnowledgeDocument | null;
+  /** Rendered hours facts; null renders "not configured". */
+  hours: PromptHours | null;
+  /** Active catalog services the agent may describe or book. */
+  services: PromptService[];
+  /** Required: every caller-facing string is rendered from the pack. */
+  localePack: PromptLocalePack;
+}
+
+// ===========================================================================
+// Runtime dynamic variables (contract section 3). ONE list, consumed by
+// buildRetellConfig defaults, the outbound dial path, C3's call_inbound and
+// the prompt-snapshot allowlist test. These are the only `{{...}}` tokens a
+// generated prompt may still contain: Retell substitutes them per call.
+// ===========================================================================
+export const RUNTIME_DYNAMIC_VARIABLES = [
+  { name: 'is_open_now', default: 'unknown' },
+  { name: 'hours_today', default: '' },
+  { name: 'next_opening', default: '' },
+  { name: 'closure_reason', default: '' },
+  { name: 'emergency_number', default: '' },
+  { name: 'known_first_name', default: '' },
+  { name: 'human_fallback_number', default: '' },
+  { name: 'admission_state', default: '' },
+  { name: 'location_name', default: '' },
+  { name: 'location_address', default: '' },
+  { name: 'location_phone', default: '' },
+] as const;
+
+export type RuntimeDynamicVariable = (typeof RUNTIME_DYNAMIC_VARIABLES)[number]['name'];
+
+export function runtimeDynamicVariableDefaults(): Record<string, string> {
+  return Object.fromEntries(RUNTIME_DYNAMIC_VARIABLES.map(item => [item.name, item.default]));
+}
+
+/** sha256 of a generated system prompt; the deploy attestation stores it. */
+export function promptHash(systemPrompt: string): string {
+  return createHash('sha256').update(systemPrompt).digest('hex');
 }
 
 // --- Field metadata --------------------------------------------------------
@@ -194,17 +264,111 @@ function locationList(locations: PromptLocation[], eligibleIds: string[]): Promp
 // workflow still needs jurisdiction-specific legal review and an operational
 // path for recording refusal; the prompt alone is not evidence of consent.
 export function mandatoryOpeningDisclosure(config: PromptConfig): string {
-  return renderRecordingDisclosure({
-    agentName: config.agent.name,
-    clinicName: config.clinic.name,
-    clinicDisclosure: config.clinic.complianceDisclosure,
+  const supplemental = config.clinic.complianceDisclosure?.trim();
+  return renderPackMessage(config.localePack.strings, 'disclosure.recording', {
+    agent_name: config.agent.name,
+    clinic_name: config.clinic.name,
+    // The pack template reproduces renderRecordingDisclosure exactly: the
+    // supplemental sentence is part of the disclosure and carries its own
+    // leading space, so consent evidence hashes stay reproducible.
+    clinic_disclosure: supplemental ? ` ${supplemental}` : '',
   });
+}
+
+function formatPrice(amount: number, language: string, country: string | null): string {
+  const currency = countryCurrency(country);
+  if (!currency) return String(amount);
+  try {
+    return new Intl.NumberFormat(language, { style: 'currency', currency }).format(amount);
+  } catch {
+    return `${amount} ${currency}`;
+  }
+}
+
+function clinicFactsSection(config: PromptConfig): string {
+  const { clinic, hours } = config;
+  const locations = locationList(config.locations, config.campaign.eligibleLocationIds);
+  const hostname = urlHostname(clinic.website);
+  const lines = locations.map((location, index) => {
+    const perLocation = hours?.perLocation.find(item => item.id === location.id);
+    const closures = perLocation?.closures.length ? perLocation.closures.join('; ') : 'none scheduled';
+    return [
+      `  ${index + 1}. ${location.name} - ${location.address}. Phone ${location.phone ?? clinic.phone}.`,
+      `     Hours: ${perLocation?.summary ?? hours?.clinicSummary ?? 'not configured'}`,
+      `     Parking and access: ${location.accessNotes?.trim() || 'no access notes provided; offer to have staff share directions'}`,
+      `     Upcoming closures: ${closures}`,
+    ].join('\n');
+  }).join('\n');
+  return `# Clinic facts (answer these directly; never invent anything beyond them)
+- Name: ${clinic.name}
+- Public phone: ${clinic.phone}
+- Website: ${hostname ?? 'not provided'}
+- Country: ${clinic.country ?? 'not configured'}. Clinic time zone: ${clinic.timezone}.
+- Regular hours: ${hours?.clinicSummary ?? 'not configured'}
+- Locations:
+${lines || `  1. ${clinic.name}${clinic.addressLine ? ` - ${clinic.addressLine}` : ''}. Phone ${clinic.phone}.`}
+- Open right now: use the live value {{is_open_now}} together with {{hours_today}}. If the value is "unknown", say you cannot confirm whether the office is open at this moment and give today's regular hours from above. When {{closure_reason}} is not empty, that is why the office is closed.`;
+}
+
+function servicesSection(config: PromptConfig): string {
+  if (!config.services.length) {
+    return `# Services
+No services are configured for voice. Do not describe or price a service; take a message for staff.`;
+  }
+  const lines = config.services.map(service => {
+    const parts = [service.spokenDescription?.trim() || 'No description configured; do not embellish.'];
+    const minutes = service.voiceDurationMinutes;
+    if (typeof minutes === 'number') parts.push(`Typically about ${minutes} minutes.`);
+    if (typeof service.priceFrom === 'number') parts.push(`Prices start at ${formatPrice(service.priceFrom, config.agent.language, config.clinic.country)}; it is a starting price, not a quote.`);
+    parts.push(service.bookableByVoice ? 'Bookable on this call.' : 'Not bookable on this call: take a message instead.');
+    return `- ${service.name}: ${parts.join(' ')}`;
+  }).join('\n');
+  return `# Services (only these may be described or booked)
+${lines}
+If asked about anything else, say it is not on the list and offer a staff follow-up.`;
+}
+
+function knowledgeSections(config: PromptConfig): string {
+  const knowledge = config.knowledge;
+  if (!knowledge) {
+    return `# Clinic knowledge
+No approved clinic knowledge is configured. For insurance, pricing, and policy questions, take a message; do not guess.`;
+  }
+  const payers = knowledge.acceptedPayers.length
+    ? knowledge.acceptedPayers.map(payer => `${payer.name}${payer.plans?.length ? ` (${payer.plans.join(', ')})` : ''}`).join(', ')
+    : 'none recorded';
+  const faq = knowledge.faq.length
+    ? knowledge.faq.map(item => `- Q: ${item.question}  A: ${item.answer}`).join('\n')
+    : '- (No approved questions yet. Take a message for anything not covered above.)';
+  const urgent = knowledge.urgentCare;
+  const onCall = urgent.onCallNumber ? `If they need the on-call line, give ${urgent.onCallNumber}.` : 'No on-call number is configured: create a handoff for staff instead.';
+  return `# Insurance and payment
+- Accepted plans: ${payers}.
+- You may say whether a named plan is or is not on this accepted list. Never state eligibility, benefits, coverage, network status for a specific person, prior authorization, claim outcome, or what a patient will owe. Route those to staff.
+- Payment policy (read as written): ${knowledge.paymentPolicy || 'not configured; take a message'}
+- New patients: ${knowledge.newPatientPolicy || 'not configured; take a message'}
+
+# Urgent but not life-threatening
+A life-threatening emergency is handled by the emergency rule below and always wins. A clinically urgent request is different: it is not an emergency and must not be sent to the emergency number.
+- What counts as urgent here: ${urgent.whatCountsAsUrgent || 'not configured; treat any clinical urgency as a staff handoff'}
+- Same-day policy: ${urgent.sameDayPolicy || 'not configured; do not promise a same-day appointment'}
+- Offer the soonest available slot from a successful tool result. ${onCall} Never promise a clinician will call back before staff confirm it.
+
+# Frequently asked questions (approved answers; read the answer, do not embellish)
+${faq}`;
+}
+
+function afterHoursSection(strings: LocalePackStrings, clinicName: string): string {
+  const line = renderPackMessage(strings, 'after_hours.line', { clinic_name: clinicName, next_opening: '{{next_opening}}' });
+  return `# After hours
+When {{is_open_now}} is "false": first say: "${line}" You may still check availability and book from a successful tool result. Take a message for anything that needs staff, and never promise a callback before the next opening above. The emergency rule still applies.`;
 }
 
 // --- System prompt ---------------------------------------------------------
 
 export function generateSystemPrompt(config: PromptConfig): string {
   const { clinic, agent, campaign, intakeFields } = config;
+  const strings = config.localePack.strings;
   const locations = locationList(config.locations, campaign.eligibleLocationIds);
   const locationNames = locations.map(location => location.name).join(', ') || clinic.name;
   const confirmationChannels = [campaign.smsConfirmation ? 'SMS' : null, campaign.emailConfirmation ? 'email' : null]
@@ -214,20 +378,29 @@ export function generateSystemPrompt(config: PromptConfig): string {
   const greetingAfterConsent = agent.greetingOverride?.trim()
     ? `After consent is granted, you may say: "${agent.greetingOverride.trim()}"`
     : 'After consent is granted, continue with the trusted call-direction branch below.';
-  const fallback = clinic.humanFallbackNumber
+  // One predicate decides both the spoken branch and whether the provider
+  // transfer tool is registered at all, so the prompt can never promise a
+  // transfer the configuration cannot perform.
+  const transfer = transferReadiness(clinic, { inboundLineNumbers: config.locations.map(location => location.phone) });
+  const fallback = transfer.ready
     ? 'Call request_human_handoff first. Only after it succeeds, call transfer_to_staff. If the transfer fails or is uncertain, do not create a second message task: the successful handoff result already left the callback request in the staff work queue.'
-    : 'Call take_message and explain that staff acknowledgment is still pending; do not promise a callback time.';
+    : `${renderPackMessage(strings, 'human_fallback.line')} Call take_message and explain that staff acknowledgment is still pending; do not promise a callback time.`;
+  const emergencyInstruction = renderPackMessage(strings, 'emergency.instruction', { emergency_number: strings.emergencyNumber });
+  const voicemailScript = renderPackMessage(strings, 'voicemail.script', {
+    agent_name: agent.name, clinic_name: clinic.name, clinic_phone: clinic.phone,
+  });
+  const summaryLine = renderPackMessage(strings, 'summary.line', { fields: summaryFieldList(intakeFields) });
+  const notInterestedLine = renderPackMessage(strings, 'not_interested.line');
+  const dncAcknowledge = renderPackMessage(strings, 'dnc.acknowledge');
+  const dncConfirmed = renderPackMessage(strings, 'dnc.confirmed');
+  const dncFailed = renderPackMessage(strings, 'dnc.failed');
+  const dncPolicy = clinic.doNotContactPolicy?.trim() ? ` Clinic policy: ${clinic.doNotContactPolicy.trim()}` : '';
 
   return `You are ${agent.name}, the AI receptionist for ${clinic.name}.
 
 You are calling or answering on behalf of ${clinic.name}. Use only the configuration provided below for this clinic and campaign. Speak in ${agent.language}. Your tone is ${agent.tone}.${agent.persona ? ` ${agent.persona}` : ''}
 
-# Clinic
-- Name: ${clinic.name}
-- Phone: ${clinic.phone}
-- Website: ${clinic.website ?? 'n/a'}
-- Locations: ${locationNames}
-- Timezone: ${clinic.timezone}
+${clinicFactsSection(config)}
 
 # Campaign: ${campaign.name} (${campaign.campaignType})
 - Offer: ${campaign.offerTitle}
@@ -236,11 +409,17 @@ You are calling or answering on behalf of ${clinic.name}. Use only the configura
 - Eligible locations: ${locationNames}
 - Booking rules: ${describeBookingRules(campaign.bookingRules)}
 
+${servicesSection(config)}
+
+${knowledgeSections(config)}
+
+${afterHoursSection(strings, clinic.name)}
+
 # Required disclosure (say at the very start)
 "${openingDisclosure}"
 Except for the emergency precedence below, this exact disclosure is mandatory and must be spoken before any greeting override, offer, intake question, identity lookup, or booking action. Do not shorten, paraphrase, skip, or replace it. The final words are the consent question. STOP SPEAKING after that question and wait for the caller's explicit answer. Do not append a greeting, offer, or second question to this turn. ${greetingAfterConsent}
 
-Emergency precedence: if the caller mentions a possible emergency before or during the disclosure, INTERRUPT the disclosure immediately and give the emergency instruction below. Emergency instructions override disclosure completion, consent capture, greetings, identity checks, and every tool except the later report_emergency alert. Do not resume the disclosure or continue front-desk work during that call.
+Emergency precedence: if the caller mentions a possible emergency before or during the disclosure, INTERRUPT the disclosure immediately and say: "${emergencyInstruction}" Emergency instructions override disclosure completion, consent capture, greetings, identity checks, and every tool except the later report_emergency alert. Do not resume the disclosure or continue front-desk work during that call.
 
 # Trusted call-direction branch
 Use only the provider-supplied call direction for this call. Never infer direction from the campaign name, caller statements, a greeting override, or prompt text.
@@ -250,7 +429,7 @@ Use only the provider-supplied call direction for this call. Never infer directi
 
 # Wrong party and voicemail
 - Wrong party: apologize briefly, reveal no offer, appointment, care relationship, patient status, or reason for calling, use no patient-data tool, and end. Never ask the person for the intended party's location or contact information.
-- Voicemail or automated answering system: do not speak an offer, appointment detail, patient status, or other sensitive purpose. Leave only: "This is ${agent.name}, an AI assistant calling for ${clinic.name}. Please call ${clinic.phone}. Goodbye." Do not collect information, book, transfer, or mark consent from a voicemail interaction.
+- Voicemail or automated answering system: do not speak an offer, appointment detail, patient status, or other sensitive purpose. Leave only: "${voicemailScript}" Do not collect information, book, transfer, or mark consent from a voicemail interaction.
 
 # Purpose
 1. Greet the caller or lead warmly and professionally.
@@ -271,7 +450,7 @@ ${intakeFieldLines(intakeFields) || '(No intake fields configured — confirm in
 For each field: ask naturally, validate the answer, repeat back phone numbers and email addresses, and never skip a required field. If the caller refuses an optional field, continue. If they refuse a required field, briefly explain it is needed to book.
 
 # Before booking, summarize
-"Perfect. I have ${summaryFieldList(intakeFields)}. Is everything correct?"
+"${summaryLine}"
 
 # After a successful booking tool result
 Say that the appointment is confirmed only when the tool returns booked=true with a canonical appointment ID. The ID is internal evidence; do not read a long system identifier aloud unless the caller specifically requests an approved reference format. Repeat the date, time, location, service, and provider only when each value is present in that successful tool response. Describe a text or email as provider-accepted only when the tool reports accepted; describe it as delivered only when the tool reports delivered. If delivery is queued, failed, suppressed, or unknown, state that accurately and do not promise receipt. Never invent a slot or delivery status. You may remind the caller to follow the clinic's arrival instructions shown in the tool result; do not invent an arrival time or document requirement.
@@ -279,7 +458,7 @@ Say that the appointment is confirmed only when the tool returns booked=true wit
 If no slots are available, offer alternatives only when the same booking-tool result explicitly returns them. Otherwise say that no available times or alternatives were returned, offer the approved staff or message workflow, and do not invent a date, time, location, waitlist, or callback commitment.
 
 # If not interested
-Say: "No problem at all. Would you like us not to contact you again about this offer?" Then end politely.
+Say: "${notInterestedLine}" Then end politely.
 
 # Safety and compliance (always)
 - Do not diagnose, give medical advice, recommend treatment, or discuss test results.
@@ -288,12 +467,12 @@ Say: "No problem at all. Would you like us not to contact you again about this o
 - Before any patient-specific action involving an existing record, call verify_patient_identity using the date of birth stated by the caller. Never treat a name, caller assertion, or model-generated flag as verification. If verification fails, locks, or the caller is a proxy, guardian, or minor, use request_human_handoff; do not reveal whether a patient record exists.
 - For an existing appointment, verify identity first, then call list_upcoming_appointments. Use only the appointment_id returned by that tool. Call prepare_appointment_change with the exact action and requested time; read its confirmation question exactly. Only after the caller explicitly says yes, call cancel_appointment or reschedule_appointment with confirmed=true and the returned confirmation_token. Never invent or reuse a token. Never claim a cancellation or reschedule succeeded unless the mutation tool returns success; if it reports needs_human, create a handoff.
 - Immediately after the opening disclosure, wait. Call record_recording_preference only with the caller's explicit answer and before collecting information. Silence, voicemail, ambiguity, or continuing to speak is not consent. If they refuse or later withdraw, use that tool first, do not use any other patient-data tool, explain that this AI line cannot continue, provide the human fallback option, and end the call.
-- If the person mentions a possible emergency at ANY point, interrupt what you are saying and immediately tell them to hang up and call 911 or go to the nearest emergency room. This rule overrides finishing the disclosure or waiting for consent. Only after giving that instruction, call report_emergency to create the critical staff alert. Never delay the 911 instruction to ask questions, use another tool, or attempt a transfer, and never tell them to wait for staff.
+- If the person mentions a possible emergency at ANY point, interrupt what you are saying and immediately say: "${emergencyInstruction}" This rule overrides finishing the disclosure or waiting for consent. Only after giving that instruction, call report_emergency to create the critical staff alert. Never delay the emergency instruction to ask questions, use another tool, or attempt a transfer, and never tell them to wait for staff. A clinically urgent but non-life-threatening request is NOT an emergency: handle it under "Urgent but not life-threatening" above.
 - If asked whether you are human, say you are an AI assistant calling on behalf of ${clinic.name}.
-- If the person asks not to be contacted again, first say: "I heard your request. I am recording it now." Then immediately call record_do_not_call. Only if the tool confirms success, say: "Your do-not-contact request is recorded. I will end the call now." If the result is failed, timed out, or uncertain, say: "I could not confirm that the request was recorded. I will end this call and flag it for staff review." Do not retry the tool automatically, continue the offer, or rely only on post-call analysis. Clinic policy: ${clinic.doNotContactPolicy}
+- If the person asks not to be contacted again, first say: "${dncAcknowledge}" Then immediately call record_do_not_call. Only if the tool confirms success, say: "${dncConfirmed}" If the result is failed, timed out, or uncertain, say: "${dncFailed}" Do not retry the tool automatically, continue the offer, or rely only on post-call analysis.${dncPolicy}
 - If a human is requested or escalation is needed: ${fallback}
 - For an unsupported intent, medical advice, complaints, refills, test results, billing disputes, or any action you cannot complete safely, call request_human_handoff or take_message. Never merely say that someone will follow up without a successful tool result and task ID. The task ID must identify durable recorded work. Keep long system IDs as internal evidence unless the caller specifically requests an approved reference format.
-- Insurance boundary: you may repeat only a current, exact result returned by an approved insurance tool. No insurance tool is available in this configuration, so do not verify network status, eligibility, benefits, prior authorization, coverage, claim outcome, or patient responsibility. Route the request to staff without guessing.
+- Insurance boundary: answer only from the accepted-plans list above (membership yes or no). No insurance tool is available: do not verify eligibility, benefits, network status, prior authorization, coverage, claim outcome, or patient responsibility. Route those to staff without guessing.
 - Payment boundary: no payment tool is available in this configuration. Do not quote a balance as current, take a payment, create or send a payment link, promise a refund, or collect card/account credentials. Route the request to staff.
 - Language and accessibility: use only the configured language and capabilities you can actually provide. If the caller cannot understand, requests an interpreter, or needs an unsupported accessibility accommodation, do not pretend fluency, translate clinical content yourself, or continue intake by guessing. Speak slowly or repeat once if requested, then offer the approved staff/interpreter or accessible-channel workflow. Never treat misunderstanding or silence as consent.
 - Universal uncertain-tool rule: for every lookup, mutation, message, booking, cancellation, reschedule, suppression, handoff, alert, or transfer tool, a timeout, malformed response, provider acceptance without completion evidence, or other ambiguous result is NOT success. State only that completion could not be confirmed, preserve the uncertainty for staff review when a safe task tool is available, and do not automatically retry the same or an equivalent tool. Never ask the caller to retry through another channel until staff reviews a possibly completed mutation.
@@ -326,6 +505,7 @@ export interface RetellConfig {
 
 export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUrl: string }): RetellConfig {
   const { clinic, agent, campaign } = config;
+  const strings = config.localePack.strings;
   const locations = locationList(config.locations, campaign.eligibleLocationIds);
   const systemPrompt = generateSystemPrompt(config);
   const openingDisclosure = mandatoryOpeningDisclosure(config);
@@ -334,7 +514,11 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
   // been recorded by the live tool.
   const beginMessage = openingDisclosure;
 
+  // Export-time defaults for every runtime variable, then the values this
+  // configuration already knows. A missing runtime value renders as its
+  // documented default instead of a literal {{token}} on the call.
   const dynamicVariables: Record<string, string> = {
+    ...runtimeDynamicVariableDefaults(),
     clinic_name: clinic.name,
     clinic_phone: clinic.phone,
     clinic_website: clinic.website ?? '',
@@ -344,6 +528,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     offer_title: campaign.offerTitle,
     appointment_type: campaign.appointmentType,
     eligible_locations: locations.map(location => location.name).join(', '),
+    emergency_number: strings.emergencyNumber,
     human_fallback_number: clinic.humanFallbackNumber ?? '',
   };
 
@@ -524,7 +709,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     {
       type: 'function',
       name: 'report_emergency',
-      description: 'Create a CRITICAL staff alert after immediately instructing the caller to call 911 or go to the nearest ER. Never use this instead of immediate emergency instructions.',
+      description: `Create a CRITICAL staff alert after immediately instructing the caller to call ${strings.emergencyNumber}. Never use this instead of immediate emergency instructions.`,
       url: fnUrl,
       speak_during_execution: false,
       speak_after_execution: true,
@@ -540,9 +725,10 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
   ];
 
   // Retell's provider-native transfer is executable only when the clinic has a
-  // valid E.164 fallback. The custom handoff tool above creates the durable
-  // callback task first, so a failed cold transfer never loses the request.
-  if (/^\+[1-9]\d{7,14}$/.test(clinic.humanFallbackNumber ?? '')) {
+  // usable fallback: present, E.164, and not the number the agent itself
+  // answers. The custom handoff tool above creates the durable callback task
+  // first, so a failed cold transfer never loses the request.
+  if (transferReadiness(clinic, { inboundLineNumbers: config.locations.map(location => location.phone) }).ready) {
     tools.push({
       type: 'transfer_call',
       name: 'transfer_to_staff',

@@ -4,6 +4,7 @@ import { env } from '../config/env';
 import { evaluateRetellAgentReadiness, probeRetellAgent } from '../lib/retell';
 import { bookAppointmentToolFingerprint, compileIntakeContract } from '../modules/receptionist/intakeContract';
 import { buildRetellConfig, type PromptConfig } from '../modules/receptionist/promptService';
+import { promptFixture } from './fixtures/receptionistPromptConfigs';
 
 const original = { apiKey: env.RETELL_API_KEY, baseUrl: env.RETELL_BASE_URL };
 const webhookUrl = 'https://api.example.test/v1/receptionist/webhooks/retell';
@@ -66,21 +67,14 @@ describe('Retell agent provider contract', () => {
   it('round-trips the first-party export through exact provider attestation without templates', async () => {
     env.RETELL_API_KEY = 'real-key';
     env.RETELL_BASE_URL = 'https://api.retellai.com';
+    const base = promptFixture('us-full');
     const config: PromptConfig = {
-      clinic: {
-        id: 'clinic-1', name: 'Example Clinic', phone: '+12125550100', timezone: 'America/New_York',
-        defaultLanguage: 'en-US', complianceDisclosure: 'Approved disclosure.',
-        doNotContactPolicy: 'Record opt out.',
-      },
-      agent: { name: 'Avery', voice: 'voice_verified', tone: 'warm', language: 'en-US' },
-      campaign: {
-        id: 'campaign-1', name: 'Pilot', campaignType: 'inbound', offerTitle: 'Care',
-        offerDescription: 'Schedule care', offerScript: 'Would you like to schedule?',
-        appointmentType: 'Consultation', eligibleLocationIds: ['location-1'],
-        smsConfirmation: true, emailConfirmation: false, intakeSchemaRevision: 1,
-      },
+      ...base,
+      clinic: { ...base.clinic, complianceDisclosure: 'Approved disclosure.', doNotContactPolicy: 'Record opt out.' },
+      agent: { ...base.agent, voice: 'voice_verified' },
+      campaign: { ...base.campaign, name: 'Pilot', offerTitle: 'Care', offerDescription: 'Schedule care', offerScript: 'Would you like to schedule?', eligibleLocationIds: ['location-1'] },
       locations: [{ id: 'location-1', name: 'Main', address: '1 Main Street' }],
-      intakeFields: [],
+      hours: { clinicSummary: base.hours!.clinicSummary, perLocation: [{ id: 'location-1', summary: base.hours!.clinicSummary, closures: [] }] },
     };
     const exported = buildRetellConfig(config, { webhookBaseUrl: 'https://api.example.test' });
     expect(JSON.stringify(exported)).not.toMatch(/\{\{|\$\{/);

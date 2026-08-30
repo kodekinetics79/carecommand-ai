@@ -80,7 +80,7 @@ async function makeTenant() {
     },
   });
   const clinic = await db.receptionistClinic.create({
-    data: { tenantId: id, name: 'Main clinic', phone: phoneFor(id), timezone: 'America/New_York' },
+    data: { tenantId: id, name: 'Main clinic', phone: phoneFor(id), timezone: 'America/New_York', country: 'US', defaultLanguage: 'en-US' },
   });
   const now = new Date();
   const providerAgentId = `agent_${id.replaceAll('-', '')}`;

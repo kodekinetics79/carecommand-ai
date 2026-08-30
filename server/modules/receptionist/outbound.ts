@@ -5,6 +5,9 @@ import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { env } from '../../config/env';
 import { retellConfigStatus, createPhoneCall, getPhoneCall, stopPhoneCall } from '../../lib/retell';
+import { buildHoursDynamicVariables, hoursStatus } from '../../lib/receptionist/clinicHours';
+import { loadHoursSource } from '../../lib/receptionist/hoursSource';
+import { resolveLocalePackWithFallback, resolvedLocaleFormat } from '../../lib/receptionist/localePacks/resolve';
 import { isDestinationOptedOut, isSuppressed, isValidE164, toE164 } from '../../lib/campaigns';
 import { requireRoles } from '../../plugins/roles';
 import {
@@ -1384,7 +1387,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     const campaign = await db.receptionistOutboundCampaign.findFirst({
       where: { id, tenantId: request.auth.tenantId },
       include: {
-        clinic: { select: { name: true, complianceDisclosure: true, timezone: true } },
+        clinic: { select: { id: true, name: true, complianceDisclosure: true, timezone: true, country: true, defaultLanguage: true } },
         agent: true,
         receptionistCampaign: { select: { id: true, offerScript: true, appointmentType: true } },
       },
@@ -1989,17 +1992,38 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         trackingDegraded,
       });
     }
+    // A campaign with no linked agent has no name to introduce itself with.
+    // Substituting one would put a fabricated identity on a real call, so the
+    // dial is refused instead (readiness already blocks this earlier).
+    if (!campaign.agent?.name) {
+      await releaseReservedAttempt('AGENT_REQUIRED');
+      await audit(request, { action: 'receptionist.call.blocked', resource: 'receptionistOutboundCampaign', resourceId: campaign.id, metadata: { reason: 'agent_required' } });
+      return reply.code(409).send({ status: 'blocked', reason: 'agent_required', callLogId: callLog.id });
+    }
+
+    // Call-time truth for the hours and emergency variables: what the agent
+    // says about "are you open" must be resolved now, not at export time.
+    const dialBundle = await loadHoursSource(db, { tenantId: request.auth.tenantId, clinicId: campaign.clinic.id });
+    const dialPack = await resolveLocalePackWithFallback(db, {
+      tenantId: request.auth.tenantId,
+      language: campaign.agent.language ?? campaign.clinic.defaultLanguage,
+      country: campaign.clinic.country,
+    });
+    const dialLocale = resolvedLocaleFormat(dialPack, campaign.clinic.defaultLanguage);
+    const dialStatus = dialBundle ? hoursStatus(dialBundle.source, new Date(), dialLocale) : null;
+
     const result = await createPhoneCall({
       toNumber: canonicalDialDestination,
       agentId: authorizedCampaign.agent!.providerAgentId!,
       agentVersion: authorizedCampaign.agent!.providerVersion!,
       webhookUrl: `${env.PUBLIC_API_URL}/v1/receptionist/webhooks/retell?clinicId=${campaign.clinicId}&campaignId=${campaign.receptionistCampaignId ?? ''}`,
       dynamicVariables: {
+        ...buildHoursDynamicVariables({ status: dialStatus, strings: dialPack?.strings ?? null }),
         clinic_name: campaign.clinic.name,
-        agent_name: campaign.agent?.name ?? 'Riley',
+        agent_name: campaign.agent.name,
         disclosure: liveTest
           ? liveCallUatDisclosure(campaign.clinic.complianceDisclosure)
-          : campaign.clinic.complianceDisclosure,
+          : campaign.clinic.complianceDisclosure ?? '',
         live_test_disclosure: liveTest ? liveCallUatDisclosure(null) : '',
         consent_text: campaign.consentText ?? '',
         human_handoff: campaign.humanHandoffInstruction ?? '',

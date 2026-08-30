@@ -70,9 +70,10 @@ export async function resolveCallLocalePack(
     },
   });
   if (!call?.clinic) return null;
-  if (call.localePack?.status === 'APPROVED' && isLocalePackStrings(call.localePack.strings)) {
-    const pack = call.localePack;
-    return { id: pack.id, language: pack.language, country: pack.country, version: pack.version, strings: pack.strings, evidenceHash: pack.evidenceHash, source: 'approved' };
+  const stamped = call.localePack;
+  if (stamped?.status === 'APPROVED' && isLocalePackStrings(stamped.strings)) {
+    const strings = stamped.strings;
+    return { id: stamped.id, language: stamped.language, country: stamped.country, version: stamped.version, strings, evidenceHash: stamped.evidenceHash, source: 'approved' };
   }
   const trustedAgent = input.trustedProviderAgentId
     ? await client.receptionistAgent.findFirst({ where: { id: input.trustedProviderAgentId, tenantId: input.tenantId, clinicId: call.clinic.id }, select: { language: true } })

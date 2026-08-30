@@ -35,7 +35,7 @@ async function tenant(phone = randomE164(), entitled = true) {
   tenantIds.push(id);
   await db.tenant.create({ data: { id, name: `Inbound ${id.slice(0, 8)}`, slug: `inbound-${id.slice(0, 8)}` } });
   await db.tenantFeatureEntitlement.create({ data: { tenantId: id, featureKey: 'ai_receptionist', enabled: entitled, source: 'test' } });
-  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Trusted destination', phone, active: true } });
+  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Trusted destination', phone, active: true, country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' } });
   const providerAgentId = `agent_${id.replaceAll('-', '')}`;
   const providerAgentVersion = 3;
   const providerFingerprint = 'a'.repeat(64);

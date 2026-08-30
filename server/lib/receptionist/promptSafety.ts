@@ -28,7 +28,7 @@ export function containsInstructionOverride(value: string): boolean {
 
 /** Zod builder for any prompt-bearing text field. */
 export function promptText(max: number) {
-  return z.string().max(max).transform(sanitizePromptText)
+  return z.string().max(max).transform(value => sanitizePromptText(value))
     .refine(value => !containsProviderTemplateSyntax(value), { message: 'Template syntax ({{ }} or {% %}) is not allowed in clinic text.' })
     .refine(value => !containsInstructionOverride(value), { message: 'This text contains instruction-override phrasing and cannot be used in a voice prompt.' });
 }

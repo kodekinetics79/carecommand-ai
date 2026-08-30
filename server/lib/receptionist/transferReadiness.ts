@@ -12,7 +12,7 @@ export interface TransferReadiness {
 }
 
 export function transferReadiness(
-  clinic: { humanFallbackNumber: string | null | undefined; phone?: string | null },
+  clinic: { humanFallbackNumber?: string | null; phone?: string | null },
   options: { inboundLineNumbers?: Array<string | null | undefined> } = {},
 ): TransferReadiness {
   const fallback = clinic.humanFallbackNumber?.trim() ?? '';

@@ -38,7 +38,7 @@ async function makeTenant() {
     users[role] = user.id;
   }
   const clinic = await db.receptionistClinic.create({
-    data: { tenantId: id, name: 'Least Privilege Clinic', phone: phoneFor(id) },
+    data: { tenantId: id, name: 'Least Privilege Clinic', phone: phoneFor(id), country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' },
   });
   const call = await db.receptionistCallLog.create({
     data: {

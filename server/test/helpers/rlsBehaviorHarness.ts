@@ -655,6 +655,13 @@ export class RlsBehaviorHarness {
       values.set('phase', 'INTENT');
       values.set('status', 'started');
     }
+    // ISO-2 country and the source enum are CHECK-constrained text columns;
+    // the generic synthetic scalar would violate both.
+    if (table === 'ReceptionistLocalePack') {
+      values.set('country', 'US');
+      values.set('language', 'en-US');
+      values.set('source', 'platform_default');
+    }
     if (table === 'ConversationReplyAttempt') {
       values.set('phase', 'INTENT');
       values.set('status', 'authorized');
