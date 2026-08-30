@@ -10,6 +10,13 @@ import { remediationFor, READINESS_KEYS, type ReadinessKey } from './remediation
 import { mandatoryClosingDisclosure, mandatoryOpeningDisclosure } from '../../modules/receptionist/promptService';
 import { transferReadiness } from './transferReadiness';
 import { RETELL_AGENT_VERIFICATION_TTL_MS, retellConfigStatus } from '../retell';
+// The one vocabulary, shared with the browser — the same import
+// `remediation.ts` makes, and for the same reason. Every `label` and `detail`
+// below is authored here and READ in the tenant's browser: `ReadinessChecklist`
+// renders both verbatim from `GET /campaigns/:id/readiness`, which is a tenant
+// route. Writing "Retell" into one of these sentences put our supplier on a
+// clinic's go-live checklist for the whole of this branch's life.
+import { VOICE } from '../../../src/lib/receptionistVocabulary';
 
 // ===========================================================================
 // Campaign readiness.
@@ -105,7 +112,7 @@ const LABELS: Record<ReadinessKey, string> = {
   locale_pack_approved: 'An approved locale pack covers this clinic',
   agent_language_supported: 'The agent speaks a supported language',
   agent_linked: 'An agent is assigned',
-  agent_verified: 'The agent is verified with Retell',
+  agent_verified: `${VOICE.check} passed`,
   deployment_current: 'The deployed prompt matches this campaign',
   number_bound: 'The phone number answers with this agent',
   location_mapped: 'A location is mapped to a scheduling branch',
@@ -200,13 +207,13 @@ function deployedNumberBoundCheck(
   const unbound = (row: ReadinessCheck): NumberBoundResult => ({ check: row, boundNumber: null });
   if (deployment.numberBindingErrorCode === 'number_bound_elsewhere') {
     return unbound(check('number_bound', 'fail',
-      `Retell reports ${deployment.boundPhoneNumber ?? 'this number'} answering with ${deployment.numberBindingAgentId ? 'a different agent' : 'no agent at all'}, not this deployment. A caller would not reach this campaign. Deploy again to bind it back.`,
+      `The ${VOICE.checkLower} found ${deployment.boundPhoneNumber ?? 'this number'} answering with ${deployment.numberBindingAgentId ? `a different ${VOICE.configuration}` : 'nothing at all'}. A caller would not reach this campaign. ${VOICE.publishAgain} to point the number back here.`,
       ctx, 'number_bound_elsewhere'));
   }
   if (attestationIsFresh(deployment.numberBindingVerifiedAt, now) && deployment.boundPhoneNumber) {
     return {
       check: check('number_bound', 'pass',
-        `Retell confirms ${deployment.boundPhoneNumber} answers with version ${deployment.providerAgentVersion}.`, ctx),
+        `The ${VOICE.checkLower} confirms ${deployment.boundPhoneNumber} answers with the ${VOICE.configuration} published from here.`, ctx),
       boundNumber: dialable(deployment.boundPhoneNumber),
     };
   }
@@ -216,12 +223,12 @@ function deployedNumberBoundCheck(
   if (deployment.numberBound && deployment.boundPhoneNumber) {
     return unbound(check('number_bound', 'pending',
       deployment.numberBindingErrorCode
-        ? `CareCommand could not ask Retell who answers ${deployment.boundPhoneNumber} (${deployment.numberBindingErrorCode}), so the binding is unproven. Verify the agent again.`
-        : `The deployment bound ${deployment.boundPhoneNumber}, but nothing has re-read that from Retell yet. Verify the agent to prove it.`,
+        ? `The ${VOICE.checkLower} could not read who answers ${deployment.boundPhoneNumber} (${deployment.numberBindingErrorCode}), so nothing yet proves a caller reaches ${VOICE.receptionist}. ${VOICE.runCheck} again.`
+        : `Publishing pointed ${deployment.boundPhoneNumber} here, but nothing has read the live line back since. ${VOICE.runCheck} to prove it.`,
       ctx, 'number_bound'));
   }
   return unbound(check('number_bound', 'fail',
-    'The Retell number is not bound to this deployment, so a caller would not reach this agent. Deploy again.', ctx, 'number_bound'));
+    `No number is pointed at this ${VOICE.configuration}, so a caller would not reach ${VOICE.receptionist}. ${VOICE.publishAgain}.`, ctx, 'number_bound'));
 }
 
 function byoNumberBoundCheck(
@@ -233,7 +240,7 @@ function byoNumberBoundCheck(
   const unbound = (row: ReadinessCheck): NumberBoundResult => ({ check: row, boundNumber: null });
   if (agent.providerInboundNumberErrorCode === 'number_bound_elsewhere') {
     return unbound(check('number_bound', 'fail',
-      `Retell reports ${clinicLine ?? 'this clinic’s line'} answering with a different agent. A caller would not reach this campaign.`,
+      `The ${VOICE.checkLower} found ${clinicLine ?? 'this clinic’s line'} answering with a different ${VOICE.configuration}. A caller would not reach this campaign.`,
       ctx, 'number_bound_elsewhere'));
   }
   if (attestationIsFresh(agent.providerInboundNumberVerifiedAt, now)
@@ -241,13 +248,13 @@ function byoNumberBoundCheck(
     && agent.providerInboundNumber === clinicLine) {
     return {
       check: check('number_bound', 'pass',
-        `Retell confirms ${agent.providerInboundNumber} answers with this hand-linked agent.`, ctx),
+        `The ${VOICE.checkLower} confirms ${agent.providerInboundNumber} answers with this hand-linked ${VOICE.configuration}.`, ctx),
       boundNumber: dialable(agent.providerInboundNumber),
     };
   }
   if (agent.providerInboundNumberErrorCode) {
     return unbound(check('number_bound', 'pending',
-      `CareCommand could not ask Retell who answers ${clinicLine ?? 'this clinic’s line'} (${agent.providerInboundNumberErrorCode}), so the binding is unproven. Verify the agent again.`,
+      `The ${VOICE.checkLower} could not read who answers ${clinicLine ?? 'this clinic’s line'} (${agent.providerInboundNumberErrorCode}), so nothing yet proves a caller reaches ${VOICE.receptionist}. ${VOICE.runCheck} again.`,
       ctx, 'number_bound'));
   }
   return unbound(check('number_bound', 'fail',
@@ -371,8 +378,8 @@ export async function evaluateCampaignReadiness(
     checks.push(reason
       ? check('agent_verified', 'fail', remediationFor(reason, ctx).action, ctx, reason)
       : check('agent_verified', 'pass', agent.providerVerificationExpiresAt
-        ? `Verified with Retell; the attestation is valid until ${agent.providerVerificationExpiresAt.toISOString()}.`
-        : 'Verified with Retell.', ctx));
+        ? `The ${VOICE.checkLower} passed. It holds until ${agent.providerVerificationExpiresAt.toISOString()}.`
+        : `The ${VOICE.checkLower} passed.`, ctx));
 
     deployment = agent.currentDeploymentId
       ? await tx.receptionistAgentDeployment.findFirst({ where: { id: agent.currentDeploymentId, tenantId: input.tenantId } })
@@ -382,7 +389,7 @@ export async function evaluateCampaignReadiness(
       // cannot prove: the prompt was authored elsewhere.
       checks.push(agent.providerAgentId
         ? check('deployment_current', 'warn', 'This agent was linked manually, so CareCommand cannot prove which prompt it runs. Deploy from Studio to take ownership of it.', ctx, 'deployment_current')
-        : check('deployment_current', 'fail', 'This campaign has never been deployed to Retell.', ctx, 'deployment_current'));
+        : check('deployment_current', 'fail', `Nothing has ever been ${VOICE.published} for this campaign.`, ctx, 'deployment_current'));
       // B1 — contract §16 froze this as BLOCKING. It used to warn for a
       // hand-linked agent, and a warn does not block, so a campaign went ACTIVE
       // with the Retell number's inbound agent still None: patients called the
@@ -490,7 +497,7 @@ export async function evaluateCampaignReadiness(
     && Boolean(campaign.intakeToolFingerprint);
   checks.push(attested
     ? check('intake_attested', 'pass', `Attested at intake revision ${campaign.intakeSchemaRevision}.`, ctx)
-    : check('intake_attested', 'fail', 'The booking tool published to Retell has not been attested against these intake fields. Deploy, then verify.', ctx, 'intake_schema_unattested'));
+    : check('intake_attested', 'fail', `The booking questions ${VOICE.published} have not been checked against these intake fields. ${VOICE.publish}, then run the ${VOICE.checkLower}.`, ctx, 'intake_schema_unattested'));
 
   // ---- What the caller hears ------------------------------------------------
   const placeholders = promptConfig ? planDeployment(promptConfig, { mock: retellConfigStatus().mock }).placeholders : [];
@@ -550,7 +557,7 @@ export async function evaluateCampaignReadiness(
   checks.push(!fallback
     ? check('transfer_target_distinct', 'warn', 'No human fallback number is set, so the agent takes a message instead of transferring.', ctx, 'transfer_target_distinct')
     : !isValidE164(fallback)
-      ? check('transfer_target_distinct', 'fail', 'The human fallback number is not a valid E.164 number, so a transfer could never connect.', ctx, 'transfer_target_distinct')
+      ? check('transfer_target_distinct', 'fail', 'The transfer number is not a number that can be dialled, so a transfer could never connect. Enter it with the country code, like +1 212 555 0100.', ctx, 'transfer_target_distinct')
       : loops
         ? check('transfer_target_distinct', 'fail', 'The human fallback number is the same line the AI answers, so a transfer would loop back to the agent.', ctx, 'transfer_target_distinct')
         : check('transfer_target_distinct', 'pass', 'Transfers reach a number distinct from the AI line.', ctx));
@@ -582,7 +589,7 @@ export async function evaluateCampaignReadiness(
       ? 'No human fallback number is set, so an emergency caller cannot be put through to anyone during the call. The alert would wait on the Front Desk board — in-app only, on a 20-second poll — for somebody to look at it.'
       : emergencyTransfer.reason === 'loops_to_agent'
         ? 'The human fallback number is the line the AI answers, so an emergency transfer would return the caller to the agent.'
-        : 'The human fallback number is not a valid E.164 number, so an emergency transfer could never connect.', ctx, 'emergency_path_reachable'));
+        : 'The transfer number is not a number that can be dialled, so an emergency transfer could never connect. Enter it with the country code, like +1 212 555 0100.', ctx, 'emergency_path_reachable'));
 
   // ---- Proof it works on a real phone --------------------------------------
   // B4 — this used to count ANY inbound row for the clinic in 30 days. Clinics
@@ -637,7 +644,11 @@ export async function evaluateCampaignReadiness(
   // Contract §6: the expected provider storage setting comes from the tenant
   // policy table. Until C3 ships it there is nothing to read, so the setting is
   // fixed at metadata-only and reported read-only rather than pretended about.
-  checks.push(check('data_storage_setting', 'warn', 'No tenant transcript-retention policy exists yet, so the provider stores basic attributes only. This is read-only for the pilot.', ctx));
+  // Read the tenant half out of the catalogue rather than restating it. The
+  // duplicate here said "tenant" and "provider" and named the supplier's own
+  // storage enum; the catalogue entry already carries a neutral `action` and
+  // keeps the exact setting name on `platformAction`.
+  checks.push(check('data_storage_setting', 'warn', remediationFor('data_storage_setting', ctx).action, ctx));
 
   // B5 — one gate. `ready`, `actions.activate.allowed` and `transitionCampaign`
   // all read `activationBlockers`, so the badge, the button and the gate are

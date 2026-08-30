@@ -17,12 +17,29 @@ import campaignReadinessSource from '../../../../server/lib/receptionist/campaig
 // the product does not produce. Use this instead of a hand-written array.
 // ===========================================================================
 
-/** The readiness keys the server labels and returns, read from its source. */
+/**
+ * The readiness keys the server labels and returns, read from its source.
+ *
+ * A label may be written either as a plain string or as a template composed
+ * from the shared vocabulary — `agent_verified` is `` `${VOICE.check} passed` ``
+ * so that the browser and the API cannot drift on what the line check is
+ * called. This parser used to accept single quotes only, which silently
+ * dropped any key whose label was composed rather than typed out, and a
+ * dropped key reads downstream as "the server never evaluated this step".
+ */
 export function serverReadinessKeys(): string[] {
   const block = campaignReadinessSource.match(/const LABELS: Record<ReadinessKey, string> = \{([\s\S]*?)\n\};/);
   if (!block) throw new Error('Could not read the LABELS record from campaignReadiness.ts');
-  const keys = [...block[1].matchAll(/^\s+([a-z_0-9]+):\s*'([^']*)'/gm)].map(match => match[1]);
+  const keys = [...block[1].matchAll(/^\s+([a-z_0-9]+):\s*(?:'[^']*'|`[^`]*`)/gm)].map(match => match[1]);
   if (!keys.length) throw new Error('The LABELS record in campaignReadiness.ts parsed to nothing');
+  // A key the parser cannot read is worse than a parse error: it disappears
+  // from the fixture, and every downstream assertion reads the missing row as
+  // "the server never evaluated this step". Count the entries independently so
+  // an unrecognised label shape fails here, loudly, instead.
+  const entries = block[1].split('\n').filter(line => /^\s+[a-z_0-9]+:/.test(line)).length;
+  if (keys.length !== entries) {
+    throw new Error(`LABELS has ${entries} entries but only ${keys.length} parsed — a label is written in a shape this parser does not read.`);
+  }
   return keys;
 }
 
