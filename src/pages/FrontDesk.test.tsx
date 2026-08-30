@@ -312,7 +312,7 @@ describe('FrontDesk permissions', () => {
     expect(within(callbacks).queryByRole('button', { name: /Call back/ })).not.toBeInTheDocument();
     expect(within(callbacks).queryByRole('button', { name: /Acknowledge/ })).not.toBeInTheDocument();
     expect(within(callbacks).getByText('Your role can read this task but not change it.')).toBeInTheDocument();
-    expect(screen.getByText('Your role can read this request but not book or reject it.')).toBeInTheDocument();
+    expect(await screen.findByText('Your role can read this request but not book or reject it.')).toBeInTheDocument();
   });
 
   it('shows no badge count when the summary could not be loaded', async () => {
