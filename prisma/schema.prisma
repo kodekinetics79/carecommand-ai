@@ -2143,6 +2143,19 @@ model ReceptionistAgent {
   // Prompt hash read back from the verified provider deployment. Compared with
   // the draft plan so a prompt edited in the Retell console reads as drift.
   providerPromptHash            String?
+  // Which inbound line the PROVIDER says this agent answers on, read back
+  // during verification. It exists for the hand-linked (BYO) agent, which has
+  // no deployment row to carry the same evidence: the number question is
+  // answerable for BYO — ask Retell who answers the clinic's line — and it is
+  // answered by a read-back, never by an operator ticking a box.
+  providerInboundNumber         String?
+  // Stamped only when that read-back named THIS agent and the version the
+  // probe reported in the same pass. Ages out on the verification TTL exactly
+  // as `providerVerifiedAt` does.
+  providerInboundNumberVerifiedAt DateTime?
+  // Why the read-back could not be completed, or `number_bound_elsewhere` when
+  // it completed and named somebody else.
+  providerInboundNumberErrorCode  String?
   // The deployment this agent currently runs. Null for a manually linked (BYO)
   // agent, whose prompt CareCommand cannot attest to.
   currentDeploymentId           String?                          @db.Uuid

@@ -17,7 +17,7 @@ vi.mock('../workers/queues', () => ({
 const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
-const { readyCampaignFixture, clinicFixtureData } = await import('./helpers/receptionistFixtures');
+const { readyCampaignFixture, clinicFixtureData, proveTestCall } = await import('./helpers/receptionistFixtures');
 
 // ===========================================================================
 // Deploy integrity — Package A.
@@ -341,9 +341,14 @@ describe('A4 — a live campaign is not degraded without being asked', () => {
     useMockProvider();
     try {
       const t = await tenant();
-      const { agent, campaign } = await deployableCampaign(t);
+      const { agent, campaign, clinic } = await deployableCampaign(t);
       expect((await deploy(t, campaign.id)).statusCode).toBe(200);
       expect((await verify(t, agent.id)).statusCode).toBe(200);
+      // `test_call_completed` is blocking and scoped to this deployment (B4),
+      // so the campaign only reaches ACTIVE once a caller has actually
+      // reached this version of the line.
+      const deployment = await db.receptionistAgentDeployment.findFirstOrThrow({ where: { campaignId: campaign.id, status: 'VERIFIED' } });
+      await proveTestCall({ tenantId: t.id, clinicId: clinic.id, campaignId: campaign.id, deploymentId: deployment.id });
       const activated = await app.inject({ method: 'POST', url: `/v1/receptionist/campaigns/${campaign.id}/activate`, headers: auth(t) });
       expect(activated.statusCode).toBe(200);
 

@@ -136,12 +136,20 @@ export async function verifyAgentProvider(input: VerifyInput): Promise<VerifyOut
     const deployment = agent.currentDeploymentId
       ? await tx.receptionistAgentDeployment.findFirst({ where: { id: agent.currentDeploymentId, tenantId: input.tenantId } })
       : null;
-    return { kind: 'ready' as const, agent, deployment };
+    // The clinic's own line, so a hand-linked agent with no deployment row can
+    // still have the number question ASKED of the provider rather than
+    // answered by an operator ticking a box.
+    const clinic = await tx.receptionistClinic.findFirst({
+      where: { id: agent.clinicId, tenantId: input.tenantId },
+      select: { inboundNumber: true, phone: true },
+    });
+    return { kind: 'ready' as const, agent, deployment, clinic };
   }, input.actor.trustedActor);
 
   if (prepared.kind !== 'ready') return prepared;
   const before = prepared.agent;
   const deployment = prepared.deployment;
+  const clinicInboundNumber = prepared.clinic?.inboundNumber?.trim() || prepared.clinic?.phone?.trim() || null;
 
   // Mock evidence is resolved HERE, inside the tenant context, and handed to
   // the probe. The provider client stays database-free, and the probe cannot
@@ -198,12 +206,22 @@ export async function verifyAgentProvider(input: VerifyInput): Promise<VerifyOut
   const intakeEvidenceFailure = probe.ok ? providerIntakeEvidenceFailure(probe.snapshot) : null;
   const safeError = probe.ok ? readinessFailure ?? intakeEvidenceFailure : probe.error;
 
-  // A2 - ask the provider who answers this deployment's line. Still outside any
-  // transaction, and deliberately independent of the agent probe: an agent can
-  // be perfectly attested while its number points somewhere else entirely, and
-  // that is precisely the state that let patients reach nothing.
-  const numberBinding = deployment
-    ? await readNumberBinding(deployment, mockBinding, attemptedAt)
+  // A2 - ask the provider who answers this line. Still outside any transaction,
+  // and deliberately independent of the agent probe: an agent can be perfectly
+  // attested while its number points somewhere else entirely, and that is
+  // precisely the state that let patients reach nothing.
+  //
+  // One read-back serves both shapes. A deployed agent is checked against the
+  // exact version it published. A hand-linked agent has no published version to
+  // pin, so it is checked against the agent id and the version the probe just
+  // reported in this same pass — still the provider's answer, never ours.
+  const expectedBinding = {
+    boundPhoneNumber: deployment?.boundPhoneNumber ?? clinicInboundNumber,
+    providerAgentId: deployment?.providerAgentId ?? before.providerAgentId,
+    providerAgentVersion: deployment?.providerAgentVersion ?? (probe.ok ? probe.snapshot.version : null),
+  };
+  const numberBinding = expectedBinding.boundPhoneNumber
+    ? await readNumberBinding(expectedBinding, mockBinding, attemptedAt)
     : null;
 
   // ---- Commit, in a short write transaction ---------------------------------
@@ -268,6 +286,17 @@ export async function verifyAgentProvider(input: VerifyInput): Promise<VerifyOut
       providerLastAttemptStatus: success ? 'SUCCEEDED' : 'FAILED',
       providerLastAttemptSource: input.actor.source,
       providerLastErrorCode: safeError,
+      // The same read-back, recorded on the agent as well, because a
+      // hand-linked agent has no deployment row to carry it. The database
+      // refuses a half-attested row, so an unreadable provider clears the
+      // attestation rather than leaving a stale pass standing.
+      ...(numberBinding
+        ? {
+          ...(numberBinding.numberBindingVerifiedAt ? { providerInboundNumber: expectedBinding.boundPhoneNumber } : {}),
+          providerInboundNumberVerifiedAt: numberBinding.numberBindingVerifiedAt,
+          providerInboundNumberErrorCode: numberBinding.numberBindingErrorCode,
+        }
+        : {}),
       ...(success && probe.ok ? providerSnapshotData(probe.snapshot) : {}),
       ...(success ? {
         providerStatus: 'VERIFIED' as const,
@@ -353,10 +382,11 @@ type NumberBindingUpdate = {
  *                operator to fix something that is not broken.
  */
 async function readNumberBinding(
-  deployment: { boundPhoneNumber: string | null; providerAgentId: string | null; providerAgentVersion: number | null },
+  expected: { boundPhoneNumber: string | null; providerAgentId: string | null; providerAgentVersion: number | null },
   mockBinding: MockPhoneNumberBinding | null,
   at: Date,
 ): Promise<NumberBindingUpdate | null> {
+  const deployment = expected;
   if (!deployment.boundPhoneNumber) return null;
   const answer = await getPhoneNumberBinding(deployment.boundPhoneNumber, { mockBinding });
   if (!answer.ok) {

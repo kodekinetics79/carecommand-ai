@@ -441,7 +441,7 @@ describe('deploying a campaign to Retell', () => {
       expect(agentBody.webhook_events).toEqual(['call_started', 'call_ended', 'call_analyzed']);
       expect(agentBody.data_storage_setting).toBe('basic_attributes_only');
       expect(agentBody.opt_in_signed_url).toBe(true);
-      expect(agentBody.response_engine).toEqual({ type: 'retell-llm', llm_id: 'llm_new', version: 0 });
+      expect(agentBody.response_engine).toEqual({ type: 'retell-llm', llm_id: newLlmId, version: 0 });
 
       // Publishing pins an exact numeric version, and the phone number's
       // INBOUND agent is bound to it — otherwise publishing changes nothing

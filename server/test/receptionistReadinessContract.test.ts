@@ -154,7 +154,7 @@ async function deployedCampaign(t: TenantFixture, options: { providers?: number;
   };
 }
 
-type CheckRow = { key: string; status: string; code: string | null; detail: string; fixHref: string | null };
+type CheckRow = { key: string; status: string; code: string | null; detail: string; fixHref: string | null; blocking: boolean };
 
 async function readiness(t: TenantFixture, campaignId: string) {
   const tenantId = t.id;
@@ -195,6 +195,11 @@ type EvidenceKind =
   | 'own_configuration';
 
 const EVIDENCE: Record<string, { evidence: EvidenceKind; why: string }> = {
+  clinic_country_set: { evidence: 'own_configuration', why: 'B6: the clinic country an operator confirmed. Never inferred, and never read from anywhere else.' },
+  clinic_hours_set: { evidence: 'own_configuration', why: 'B6: the opening hours the clinic entered, which the prompt then speaks.' },
+  locale_pack_approved: { evidence: 'independent_row', why: 'B6: an approved pack row, approved by a human other than the person activating.' },
+  agent_language_supported: { evidence: 'own_configuration', why: 'B6: whether the configured language has a pack that can render what the caller hears.' },
+  provider_resolvable: { evidence: 'independent_row', why: 'B3: the same rule `resolveSoleProvider` applies at call time, over provider rows we did not write here.' },
   agent_linked: { evidence: 'own_configuration', why: 'Whether this campaign has an agent is our configuration and nothing else.' },
   agent_verified: { evidence: 'provider_read_back', why: 'An attestation with a TTL, written only from what the provider reported.' },
   deployment_current: { evidence: 'own_configuration', why: 'Compares the planned configuration against the deployed hashes — a comparison, not a claim.' },
@@ -280,44 +285,89 @@ describe('a check that cannot be evaluated', () => {
 // ---------------------------------------------------------------------------
 
 describe('number_bound — who answers the number is a fact at the provider (A1/A2)', () => {
-  it.fails('stops passing when a second clinic\'s deploy takes the line, though our column still says bound', async () => {
+  it('does not let a second clinic\'s deploy take the first clinic\'s line at all', async () => {
     const t = await tenant();
     const first = await deployedCampaign(t);
     expect((await readiness(t, first.campaignId)).status('number_bound')).toBe('pass');
 
-    // Every deploy binds the one global RETELL_FROM_NUMBER. The second clinic
-    // now owns the line; callers to the first reach the second's agent, its
-    // hours and its disclosure. The first clinic's stored `numberBound` column
-    // is still true, because we wrote it and never looked again.
+    // Every deploy used to bind the one global RETELL_FROM_NUMBER, so the
+    // second clinic silently took the first clinic's line — callers to the
+    // first reached the second's agent, its hours and its disclosure — and the
+    // first clinic's stored `numberBound` column stayed true, because we wrote
+    // it and never looked again.
+    //
+    // A1 removes the theft rather than detecting it: each deploy binds its own
+    // clinic's line. The marker this test carried asked for the weaker
+    // property (notice the theft); the stronger one is asserted here, and the
+    // detection half is the two tests below.
     const second = await deployedCampaign(t);
     expect((await readiness(t, second.campaignId)).status('number_bound')).toBe('pass');
 
-    const stolen = await readiness(t, first.campaignId);
-    expect(stolen.status('number_bound'), 'A1/A2: the first clinic no longer owns the line').not.toBe('pass');
+    const untouched = await readiness(t, first.campaignId);
+    expect(untouched.status('number_bound'), 'A1: the first clinic still owns its own line').toBe('pass');
+
+    const [firstRow, secondRow] = await Promise.all([
+      db.receptionistAgentDeployment.findUniqueOrThrow({ where: { id: first.deploymentId } }),
+      db.receptionistAgentDeployment.findUniqueOrThrow({ where: { id: second.deploymentId } }),
+    ]);
+    expect(firstRow.boundPhoneNumber).toBeTruthy();
+    expect(firstRow.boundPhoneNumber, 'A1: two clinics, two lines').not.toBe(secondRow.boundPhoneNumber);
+    // And each pass is the provider's answer about that clinic's own number,
+    // not the column the deploy wrote.
+    expect(firstRow.numberBindingVerifiedAt).not.toBeNull();
+    expect(firstRow.numberBindingAgentId).toBe(firstRow.providerAgentId);
+    expect(secondRow.numberBindingAgentId).toBe(secondRow.providerAgentId);
   }, 180_000);
 
-  it.fails('is pending, not pass, when the provider cannot be read', async () => {
+  it('is pending, not pass, when the provider cannot be read', async () => {
     const t = await tenant();
     const deployed = await deployedCampaign(t);
-    const key = env.RETELL_API_KEY;
-    try {
-      env.RETELL_API_KEY = '';
-      const unreadable = await readiness(t, deployed.campaignId);
-      // The register's rule, stated exactly: unreadable ⇒ pending, never pass.
-      expect(unreadable.status('number_bound'), 'A2: unreadable provider ⇒ pending').toBe('pending');
-    } finally {
-      env.RETELL_API_KEY = key;
-    }
-  }, 120_000);
-
-  it.fails('refuses a hand-forged binding claim with nothing published behind it', async () => {
-    const t = await tenant();
-    const deployed = await deployedCampaign(t);
-    // Erase the published evidence but keep the claim. Nothing at the provider
-    // corresponds to this deployment any more.
+    // The attestation is what the provider said, and it ages out on the same
+    // 24h TTL `agent_verified` uses. Age it past that: nothing has confirmed
+    // the line for a day, and nobody can say who answers it now.
     await db.receptionistAgentDeployment.update({
       where: { id: deployed.deploymentId },
+      data: { numberBindingVerifiedAt: new Date(Date.now() - 25 * 60 * 60 * 1_000) },
+    });
+    const stale = await readiness(t, deployed.campaignId);
+    // The register's rule, stated exactly: unreadable ⇒ pending, never pass.
+    expect(stale.status('number_bound'), 'A2: an unconfirmed binding ⇒ pending').toBe('pending');
+    expect(stale.byKey.get('number_bound')!.blocking, 'A2: pending still blocks').toBe(true);
+
+    // And a provider that answered with an error is the same answer — pending,
+    // never fail. Telling an operator their number is wrong during a Retell
+    // outage sends them to fix something that is not broken.
+    await db.receptionistAgentDeployment.update({
+      where: { id: deployed.deploymentId },
+      data: { numberBindingVerifiedAt: null, numberBindingErrorCode: 'provider_unavailable' },
+    });
+    const unreadable = await readiness(t, deployed.campaignId);
+    expect(unreadable.status('number_bound')).toBe('pending');
+    expect(unreadable.byKey.get('number_bound')!.detail).toMatch(/provider_unavailable/);
+  }, 120_000);
+
+  it('refuses a hand-forged binding claim with nothing published behind it', async () => {
+    const t = await tenant();
+    const deployed = await deployedCampaign(t);
+
+    // Erasing the published evidence while keeping the attestation is not even
+    // representable: the database refuses an attestation that does not name the
+    // version actually published, so the forgery cannot be written at all.
+    await expect(db.receptionistAgentDeployment.update({
+      where: { id: deployed.deploymentId },
       data: { providerAgentVersion: 9_999, boundPhoneNumber: '+15550199999', numberBound: true },
+    })).rejects.toThrow(/number_binding_verified_check/);
+
+    // So the strongest forgery available is the claim on its own: our two
+    // columns set by hand, with nothing from the provider behind them. That is
+    // precisely the shape `number_bound` used to pass on.
+    await db.receptionistAgentDeployment.update({
+      where: { id: deployed.deploymentId },
+      data: {
+        providerAgentVersion: 9_999, boundPhoneNumber: '+15550199999', numberBound: true,
+        numberBindingVerifiedAt: null, numberBindingAgentId: null, numberBindingAgentVersion: null,
+        numberBindingReadAt: null, numberBindingErrorCode: null,
+      },
     });
     const forged = await readiness(t, deployed.campaignId);
     expect(forged.status('number_bound'), 'A2: a column we wrote is not evidence').not.toBe('pass');
@@ -325,7 +375,7 @@ describe('number_bound — who answers the number is a fact at the provider (A1/
 });
 
 describe('services_bookable — the practice decides what a machine may book (B2)', () => {
-  it.fails('fails when the matching service is not bookable by voice', async () => {
+  it('fails when the matching service is not bookable by voice', async () => {
     const t = await tenant();
     const deployed = await deployedCampaign(t);
     expect((await readiness(t, deployed.campaignId)).status('services_bookable')).toBe('pass');
@@ -368,7 +418,7 @@ describe('provider_availability — a row count is not an offerable time (B3)', 
 });
 
 describe('test_call_completed — proof a caller reached THIS deployment (B4)', () => {
-  it.fails('is not satisfied by an inbound call recorded before the deployment published', async () => {
+  it('is not satisfied by an inbound call recorded before the deployment published', async () => {
     const t = await tenant();
     const deployed = await deployedCampaign(t);
     await db.receptionistCallLog.delete({ where: { id: deployed.callLogId } });
@@ -386,7 +436,7 @@ describe('test_call_completed — proof a caller reached THIS deployment (B4)', 
     expect(stale.status('test_call_completed'), 'B4: evidence must postdate the deployment').not.toBe('pass');
   }, 120_000);
 
-  it.fails('is not satisfied by a zero-second call that never connected', async () => {
+  it('is not satisfied by a zero-second call that never connected', async () => {
     const t = await tenant();
     const deployed = await deployedCampaign(t);
     await db.receptionistCallLog.delete({ where: { id: deployed.callLogId } });
@@ -401,7 +451,7 @@ describe('test_call_completed — proof a caller reached THIS deployment (B4)', 
     expect(notConnected.status('test_call_completed'), 'B4: a zero-second row proves nothing').not.toBe('pass');
   }, 120_000);
 
-  it.fails('is invalidated by the next deploy, which is what the Go-live card promises', async () => {
+  it('is invalidated by the next deploy, which is what the Go-live card promises', async () => {
     const t = await tenant();
     const deployed = await deployedCampaign(t);
     expect((await readiness(t, deployed.campaignId)).status('test_call_completed')).toBe('pass');

@@ -137,7 +137,8 @@ export type RemediationCode =
   // had no entry, so the first-run owner got "Something went wrong — report the
   // code" from the catalogue that exists to prevent exactly that.
   | ClinicActivationBlocker
-  | 'number_binding_unattested';
+  | 'number_binding_unattested'
+  | 'number_bound_elsewhere';
 
 const ASK_ADMIN = 'Ask your CareCommand administrator to set this on the API and worker environments, then reload.';
 
@@ -214,6 +215,7 @@ const CATALOGUE = {
   // ---- Readiness ----------------------------------------------------------
   deployment_current: { title: 'The deployed prompt is out of date', action: 'The campaign has changed since it was deployed. Deploy the changes so callers hear the current configuration.', scope: 'campaign', severity: 'blocking', fixTab: 'retell', retryable: false },
   number_bound: { title: 'The phone number does not point at this agent', action: 'Deploy the campaign; deployment binds the Retell number’s inbound agent to the published version.', scope: 'campaign', severity: 'blocking', fixTab: 'retell', retryable: false },
+  number_bound_elsewhere: { title: 'Retell says a different agent answers this number', action: 'The number\u2019s inbound agent was changed outside CareCommand, so a caller reaches something else. Deploy from Studio to bind it back to this campaign\u2019s published version.', scope: 'provider', severity: 'blocking', fixTab: 'retell', retryable: false },
   number_binding_unattested: { title: 'Nothing proves the number answers with this agent', action: 'This agent was linked by hand, so CareCommand has never bound the number and cannot read back what the line points at. Deploy from Studio, which binds the number and records the evidence.', scope: 'campaign', severity: 'blocking', fixTab: 'retell', retryable: false },
   location_mapped: { title: 'No location is mapped to a scheduling branch', action: 'Map at least one active clinic location to a branch so bookings land on a real schedule.', scope: 'clinic', severity: 'blocking', fixTab: 'clinic', retryable: false },
   location_scope_mismatch: { title: 'A selected location is not usable', action: 'Every eligible location must be active, belong to this clinic, and be mapped to a branch.', scope: 'campaign', severity: 'blocking', fixTab: 'clinic', retryable: false },
