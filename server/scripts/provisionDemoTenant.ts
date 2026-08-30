@@ -136,6 +136,9 @@ interface ReadinessRow {
   receptionist_active_campaigns: number;
   receptionist_bound_deployments: number;
   branches_without_bookable_provider: number;
+  campaigns_without_voice_bookable_service: number;
+  clinics_without_matching_locale_pack: number;
+  deployments_without_proven_test_call: number;
 }
 
 /**
@@ -208,7 +211,41 @@ async function verify(ownerUrl: string): Promise<ReadinessRow> {
               SELECT 1 FROM "ProviderAvailability" pa
               JOIN "ProviderProfile" pp ON pp.id = pa."providerProfileId" AND pp.active
               WHERE pa."tenantId" = d.id AND pa."branchId" = b.id AND pa.active
-            ))::int AS branches_without_bookable_provider
+            ))::int AS branches_without_bookable_provider,
+        -- A campaign whose appointment type is not a VOICE-BOOKABLE catalogue
+        -- row deploys a prompt that says "not bookable on this call: take a
+        -- message instead" for the one thing the campaign exists to book.
+        -- Counting bookable services somewhere in the tenant is not the same
+        -- question, and it is the question that was being asked.
+        (SELECT count(*) FROM "ReceptionistCampaign" c
+          WHERE c."tenantId" = d.id AND c.status IN ('ACTIVE', 'PAUSED')
+            AND NOT EXISTS (
+              SELECT 1 FROM "ServiceCatalogItem" s
+              WHERE s."tenantId" = d.id AND s.active AND s."bookableByVoice"
+                AND lower(s.name) = lower(c."appointmentType")
+            ))::int AS campaigns_without_voice_bookable_service,
+        -- An approved pack for the clinic's OWN country and language. Two packs
+        -- existing somewhere does not mean this clinic can render a sentence.
+        (SELECT count(*) FROM "ReceptionistClinic" c
+          WHERE c."tenantId" = d.id AND c.active
+            AND NOT EXISTS (
+              SELECT 1 FROM "ReceptionistLocalePack" p
+              WHERE p."tenantId" = d.id AND p.status = 'APPROVED'
+                AND p.country = c.country AND p.language = c."defaultLanguage"
+            ))::int AS clinics_without_matching_locale_pack,
+        -- Evidence a caller reached THIS deployment: inbound, non-zero, stamped
+        -- with the version that answered, recorded after it published.
+        (SELECT count(*) FROM "ReceptionistAgentDeployment" dep
+          WHERE dep."tenantId" = d.id AND dep.status = 'VERIFIED'
+            AND NOT EXISTS (
+              SELECT 1 FROM "ReceptionistCallLog" cl
+              WHERE cl."tenantId" = d.id
+                AND cl."clinicId" = dep."clinicId"
+                AND cl.direction = 'inbound'
+                AND cl."durationSeconds" > 0
+                AND cl."boundProviderAgentVersion" = dep."providerAgentVersion"
+                AND cl."createdAt" > dep."publishedAt"
+            ))::int AS deployments_without_proven_test_call
       FROM demo d
     `);
     const row = rows[0];
@@ -253,6 +290,18 @@ function assertReady(row: ReadinessRow): string[] {
   if (row.receptionist_bound_deployments < 1) failures.push('no verified deployment is bound to a phone number; publishing an agent changes nothing about who answers');
   if (row.branches_without_bookable_provider > 0) {
     failures.push(`${row.branches_without_bookable_provider} bookable branch(es) have no provider availability; the agent could never offer an appointment time`);
+  }
+  // A demo is only a demo of a receptionist if the clinic is genuinely
+  // bookable. Each of the three below was green on the live tenant while the
+  // thing it stands for was false.
+  if (row.campaigns_without_voice_bookable_service > 0) {
+    failures.push(`${row.campaigns_without_voice_bookable_service} campaign(s) book an appointment type no service is marked bookableByVoice for; the agent would take a message instead of booking`);
+  }
+  if (row.clinics_without_matching_locale_pack > 0) {
+    failures.push(`${row.clinics_without_matching_locale_pack} clinic(s) have no APPROVED locale pack for their own country and language, so nothing the caller would hear can be rendered`);
+  }
+  if (row.deployments_without_proven_test_call > 0) {
+    failures.push(`${row.deployments_without_proven_test_call} verified deployment(s) have no inbound call proving the line reaches them; test_call_completed would be green on historical rows instead`);
   }
   return failures;
 }
