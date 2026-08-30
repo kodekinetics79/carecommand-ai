@@ -66,17 +66,6 @@ function localTime(instant: Date, timezone: string): string {
   return new Intl.DateTimeFormat('en-GB', { timeZone: timezone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(instant);
 }
 
-/** Receptionist adapter over the canonical provider scheduling engine. */
-export async function getOpenSlots(
-  tenantId: string, branchId: string, dateISO: string, durationMin = SLOT_MIN, limit = 8, providerProfileId?: string,
-): Promise<Slot[]> {
-  if (!providerProfileId) return [];
-  const provider = await resolveProviderSchedulingContext(tenantId, providerProfileId, branchId);
-  if (!provider) return [];
-  const slots = await computeProviderSlots({ tenantId, providerProfileId, dateISO, durationMin });
-  return slots.slice(0, limit).map(slot => ({ ...slot, time: localTime(slot.startsAt, provider.timezone) }));
-}
-
 /**
  * The union of open slots across several clinicians, as one merged offer.
  *
