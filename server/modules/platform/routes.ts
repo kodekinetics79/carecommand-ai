@@ -13,6 +13,7 @@ import { runWithPlatformDatabaseRequest } from '../../lib/platformContextStore';
 import { validateIanaTimezone } from '../../lib/scheduling';
 import { PROVIDER_CATALOG, PROVIDER_KEYS, providerConfig, invalidateProviderCredentials, refreshProviderCredentials, type ProviderDef as SharedProviderDef } from '../../lib/providerCredentials';
 import { periodUsageByMetric, usagePeriodKey, USAGE_LIMIT_KEY_BY_METRIC } from '../../lib/usageMetering';
+import { TENANT_MODES, TENANT_MODE_DESCRIPTION, modeAllowsLiveCalling } from '../../lib/tenantMode';
 
 const timezoneInput = z.string().trim().min(1).max(80).refine(value => {
   try { validateIanaTimezone(value); return true; } catch { return false; }
@@ -115,10 +116,17 @@ const COMPANY_FIELDS = [
   'postalCode', 'country', 'mainPhone', 'website', 'primaryContactName',
   'primaryContactEmail', 'primaryContactPhone', 'billingContactName',
   'billingContactEmail', 'accountNotes',
+  // Relationship facts. Dates are carried as ISO strings through this record so
+  // the whole company tab stays one string-in/string-out shape.
+  'contractStartedAt', 'accountManager', 'baaSignedAt',
 ] as const;
 
 const blankToNull = (max: number) =>
   z.string().trim().max(max).transform(v => (v === '' ? null : v)).nullable().optional();
+const dateOrNull = z.string().trim().max(40)
+  .transform(v => (v === '' ? null : v))
+  .refine(v => v === null || !Number.isNaN(Date.parse(v)), { message: 'must be a date (YYYY-MM-DD)' })
+  .nullable().optional();
 const emailOrNull = z.string().trim().max(200)
   .transform(v => (v === '' ? null : v))
   .refine(v => v === null || z.string().email().safeParse(v).success, { message: 'must be a valid email address' })
@@ -134,12 +142,20 @@ const companyUpdateSchema = z.object({
   primaryContactPhone: blankToNull(40),
   billingContactName: blankToNull(200), billingContactEmail: emailOrNull,
   accountNotes: blankToNull(4000),
+  accountManager: blankToNull(200),
+  // Dates arrive as YYYY-MM-DD (or blank to clear). Validated here rather than
+  // trusted, so a typo cannot land as an Invalid Date in a renewal report.
+  contractStartedAt: dateOrNull,
+  baaSignedAt: dateOrNull,
   reason: reasonSchema,
 });
 
 function companyView(tenant: Record<string, unknown>): Record<string, string | null> {
   const out: Record<string, string | null> = {};
-  for (const f of COMPANY_FIELDS) out[f] = (tenant[f] as string | null) ?? null;
+  for (const f of COMPANY_FIELDS) {
+    const value = tenant[f];
+    out[f] = value instanceof Date ? value.toISOString() : ((value as string | null) ?? null);
+  }
   return out;
 }
 
@@ -217,13 +233,13 @@ async function applySubscriptionChange(
 
 async function tenantSummary(tenantId: string) {
   const [tenant, sub, activity, enabledCount] = await Promise.all([
-    db.tenant.findUnique({ where: { id: tenantId }, select: { id: true, name: true, slug: true, status: true, createdAt: true, updatedAt: true } }),
+    db.tenant.findUnique({ where: { id: tenantId }, select: { id: true, name: true, slug: true, status: true, mode: true, createdAt: true, updatedAt: true } }),
     db.tenantSubscription.findUnique({ where: { tenantId }, include: { plan: true, addons: { where: { active: true }, include: { addon: true } } } }),
     tenantActivityCounts(tenantId),
     db.tenantFeatureEntitlement.count({ where: { tenantId, enabled: true } }),
   ]);
   return {
-    tenant: tenant ? { id: tenant.id, name: tenant.name, slug: tenant.slug, status: tenant.status, createdAt: tenant.createdAt.toISOString(), lastActivityAt: tenant.updatedAt.toISOString() } : null,
+    tenant: tenant ? { id: tenant.id, name: tenant.name, slug: tenant.slug, status: tenant.status, mode: tenant.mode, modeDescription: TENANT_MODE_DESCRIPTION[tenant.mode as keyof typeof TENANT_MODE_DESCRIPTION] ?? tenant.mode, liveCallingAllowed: modeAllowsLiveCalling(tenant.mode), createdAt: tenant.createdAt.toISOString(), lastActivityAt: tenant.updatedAt.toISOString() } : null,
     subscription: sub ? { planKey: sub.plan.key, planName: sub.plan.name, status: sub.status, trialEndsAt: sub.trialEndsAt?.toISOString() ?? null, addons: sub.addons.map(a => a.addon.key) } : null,
     activeUsers: activity.activeUsers, branches: activity.branches, enabledFeatures: enabledCount,
     setupStatus: sub ? 'configured' : 'setup_required',
@@ -374,12 +390,23 @@ export const platformRoutes: FastifyPluginAsync = async app => {
 
     // Only fields actually present in the request are written, so a partial
     // edit never blanks a field the operator did not touch.
-    const data: Record<string, string | null> = {};
+    const DATE_FIELDS = new Set(['contractStartedAt', 'baaSignedAt']);
+    const data: Record<string, string | Date | null> = {};
     const changed: string[] = [];
     for (const f of COMPANY_FIELDS) {
       if (!(f in body)) continue;
       const next = (body as Record<string, string | null | undefined>)[f] ?? null;
-      const prev = (existing as unknown as Record<string, string | null>)[f] ?? null;
+      const rawPrev = (existing as unknown as Record<string, unknown>)[f] ?? null;
+      if (DATE_FIELDS.has(f)) {
+        // Compare on the instant, not the string: '2026-01-05' and the stored
+        // ISO form are the same date and must not read as a change.
+        const prevIso = rawPrev instanceof Date ? rawPrev.toISOString() : null;
+        const nextDate = next === null ? null : new Date(next);
+        data[f] = nextDate;
+        if ((nextDate?.toISOString() ?? null) !== prevIso) changed.push(f);
+        continue;
+      }
+      const prev = (rawPrev as string | null) ?? null;
       data[f] = next;
       if (next !== prev) changed.push(f);
     }
@@ -394,6 +421,30 @@ export const platformRoutes: FastifyPluginAsync = async app => {
     }, tx => tx.tenant.update({ where: { id: tenantId }, data }));
 
     return { tenantId, company: companyView(updated as unknown as Record<string, unknown>), changed };
+  });
+
+  /**
+   * Set how a workspace may behave in the real world.
+   *
+   * Separate from the company record on purpose: the company record holds
+   * FACTS an operator types, while this is a switch that changes what the
+   * product will do - a demo workspace is refused at both call-admission gates
+   * (server/lib/tenantMode.ts). It carries a reason for the same reason suspend
+   * does.
+   */
+  app.patch('/tenants/:tenantId/mode', { preHandler: tenantManage }, async (request, reply) => {
+    const { tenantId } = z.object({ tenantId: uuid }).parse(request.params);
+    const body = z.object({ mode: z.enum(TENANT_MODES), reason: reasonSchema }).parse(request.body);
+    const existing = await db.tenant.findUnique({ where: { id: tenantId }, select: { mode: true } });
+    if (!existing) return reply.code(404).send({ error: 'not_found', message: 'Tenant not found' });
+
+    const updated = await runPlatformAuditedMutation(request, {
+      action: 'tenant.mode.changed',
+      target: { type: 'tenant', id: tenantId, tenantId },
+      metadata: { reason: body.reason, from: existing.mode, to: body.mode },
+    }, tx => tx.tenant.update({ where: { id: tenantId }, data: { mode: body.mode } }));
+
+    return { tenantId, mode: updated.mode, liveCallingAllowed: modeAllowsLiveCalling(updated.mode) };
   });
 
   // Break-glass staff roster. Readable only while an unexpired, unended

@@ -55,6 +55,7 @@ const CLIENT_LAUNCH_ATTEMPT_SCOPE = 'receptionist.outbound-client-attempt';
 const LIVE_UAT_TARGET_SOURCE_PREFIX = 'live_voice_uat:';
 export const MAX_TENANT_ACTIVE_CALLS = 3;
 import { recordUsageEvent, periodUsageTotal, voiceCallDedupeKey, USAGE_METRICS } from '../../lib/usageMetering';
+import { liveCallingBlockReason, TENANT_MODE_DEMO_BLOCK } from '../../lib/tenantMode';
 
 export const DEFAULT_VOICE_MINUTES_LIMIT = 500;
 
@@ -1614,6 +1615,13 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
           const activeCalls = await tx.receptionistCallLog.count({
             where: { tenantId: request.auth.tenantId, outcome: 'IN_PROGRESS', endedAt: null },
           });
+          // A demonstration workspace must never dial a real number. Checked
+          // before concurrency and quota so it cannot be reached by waiting.
+          const modeBlock = await liveCallingBlockReason(request.auth.tenantId, tx);
+          if (modeBlock) {
+            await finishClientAttempt(`blocked:${TENANT_MODE_DEMO_BLOCK}`);
+            return { blocked: TENANT_MODE_DEMO_BLOCK as typeof TENANT_MODE_DEMO_BLOCK };
+          }
           const activeCallLimit = liveTest ? 1 : MAX_TENANT_ACTIVE_CALLS;
           if (activeCalls >= activeCallLimit) {
             await finishClientAttempt('blocked:concurrency_limit_reached');

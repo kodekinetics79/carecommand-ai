@@ -5,6 +5,7 @@ import { db } from '../../lib/db';
 import { env } from '../../config/env';
 import { targetStatusAfterOutcome, MAX_TENANT_ACTIVE_CALLS, DEFAULT_VOICE_MINUTES_LIMIT } from './outbound';
 import { recordUsageEvent, periodUsageTotal, voiceCallDedupeKey, USAGE_METRICS } from '../../lib/usageMetering';
+import { liveCallingBlockReason } from '../../lib/tenantMode';
 import { handleAgentTool, requestHumanHandoff, type TrustedBookingContext } from '../../lib/receptionist/liveTools';
 import { ingestCallArtifacts } from '../../lib/receptionist/privacyLifecycle';
 import { enterTenantContext, runWithTenantContext } from '../../lib/tenantContext';
@@ -342,6 +343,10 @@ async function admitInboundReceptionist(tenantId: string, providerCallId: string
       select: { receptionistMinutes: true, overageAllowed: true, killSwitch: true },
     });
     if (aiUsage.killSwitch) return { allowed: false as const, reason: 'kill_switch' };
+    // A demonstration workspace must never answer a real patient. Checked above
+    // every quota so the answer does not depend on how much allowance is left.
+    const modeBlock = await liveCallingBlockReason(tenantId, tx);
+    if (modeBlock) return { allowed: false as const, reason: modeBlock };
     const voiceUsage = await tx.tenantUsageLimit.upsert({
       where: { tenantId_key: { tenantId, key: 'voice_minutes' } },
       update: {},

@@ -124,6 +124,23 @@ model Tenant {
   billingContactName                  String?
   billingContactEmail                 String?
   accountNotes                        String?
+
+  // How this workspace is allowed to behave in the real world.
+  //   demo       - nobody real is on the other end of the phone. Live calling
+  //                is refused outright, so a sales demo cannot dial a patient.
+  //   pilot      - a real clinic, attended operation.
+  //   production - a real clinic, unattended.
+  // Enforced in server/lib/tenantMode.ts at both call-admission gates. A voice
+  // product needs one switch above every dial path, and this is it.
+  mode                                String                               @default("pilot")
+
+  // Relationship facts an operator needs and the console could not show. These
+  // are recorded facts, not runtime switches: their job is to be visible when
+  // someone asks "when does this renew" or "is the BAA signed".
+  contractStartedAt                   DateTime?
+  accountManager                      String?
+  baaSignedAt                         DateTime?
+
   createdAt                           DateTime                             @default(now())
   updatedAt                           DateTime                             @updatedAt
   branches                            Branch[]
