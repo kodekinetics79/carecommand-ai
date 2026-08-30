@@ -25,39 +25,6 @@ const callReviewInput = z.object({
 }).strict();
 
 export const activityRoutes: FastifyPluginAsync = async app => {
-  // ===== Appointment requests (read) ======================================
-  app.get('/appointment-requests', { preHandler: callArtifactRead }, async request => {
-    const query = z.object({
-      clinicId: uuid.optional(),
-      campaignId: uuid.optional(),
-      limit: z.coerce.number().int().min(1).max(200).default(100),
-    }).parse(request.query);
-    return db.receptionistAppointmentRequest.findMany({
-      where: {
-        tenantId: request.auth.tenantId,
-        ...(query.clinicId ? { clinicId: query.clinicId } : {}),
-        ...(query.campaignId ? { campaignId: query.campaignId } : {}),
-      },
-      orderBy: { createdAt: 'desc' },
-      take: query.limit,
-      include: { campaign: { select: { id: true, name: true } } },
-    });
-  });
-
-  app.patch('/appointment-requests/:id', { preHandler: writeRoles }, async request => {
-    const { id } = idParam.parse(request.params);
-    const input = z.object({
-      status: z.enum(['PENDING', 'CONFIRMED', 'CANCELED', 'COMPLETED', 'NO_SLOTS']).optional(),
-      bookedSlot: z.string().trim().max(120).optional().nullable(),
-      notes: z.string().trim().max(1000).optional().nullable(),
-    }).parse(request.body);
-    const existing = await db.receptionistAppointmentRequest.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!existing) throw app.httpErrors.notFound('Appointment request not found');
-    const row = await db.receptionistAppointmentRequest.update({ where: { id }, data: input });
-    await audit(request, { action: 'receptionistAppointmentRequest.updated', resource: 'receptionistAppointmentRequest', resourceId: id });
-    return row;
-  });
-
   // Persistent, minimum-necessary reconciliation state for the Studio. This
   // is rebuilt from durable call/target safety state on every refresh; a
   // transient launch toast is never the only warning that a provider call may
@@ -636,7 +603,7 @@ export const activityRoutes: FastifyPluginAsync = async app => {
       db.receptionistClinic.count({ where: { tenantId } }),
       db.receptionistCampaign.findMany({ where: { tenantId }, select: { status: true } }),
       db.receptionistCallLog.findMany({ where: { tenantId }, select: { outcome: true, durationSeconds: true } }),
-      db.receptionistAppointmentRequest.count({ where: { tenantId } }),
+      db.appointmentRequest.count({ where: { tenantId, status: { in: ['PENDING_REVIEW', 'MISSING_INFO'] } } }),
       db.receptionistOptOut.count({ where: { tenantId, revokedAt: null } }),
     ]);
     const booked = callLogs.filter(call => call.outcome === 'BOOKED').length;

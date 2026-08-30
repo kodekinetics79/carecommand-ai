@@ -69,9 +69,6 @@ async function makeTenant() {
       outcome: 'BOOKED',
     },
   });
-  const appointmentRequest = await db.receptionistAppointmentRequest.create({
-    data: { tenantId: id, clinicId: clinic.id, status: 'PENDING' },
-  });
   return {
     id,
     users,
@@ -79,7 +76,6 @@ async function makeTenant() {
     callId: call.id,
     outboundCampaignId: outboundCampaign.id,
     outboundCallId: outboundCall.id,
-    appointmentRequestId: appointmentRequest.id,
   };
 }
 
@@ -172,9 +168,9 @@ describe('AI receptionist call-artifact least privilege', () => {
 
     const mutation = await app.inject({
       method: 'PATCH',
-      url: `/v1/receptionist/appointment-requests/${tenant.appointmentRequestId}`,
+      url: `/v1/receptionist/clinics/${tenant.clinicId}`,
       headers: auth(tenant.id, tenant.users.ADMIN),
-      payload: { status: 'CONFIRMED' },
+      payload: { name: 'Renamed by a read-only role' },
     });
     expect(mutation.statusCode).toBe(403);
     expect(mutation.json().permission).toBe('receptionist:manage');

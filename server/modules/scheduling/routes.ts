@@ -2,11 +2,11 @@ import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
-import { queueAppointmentConfirmations } from '../../lib/receptionist/confirmationOutbox';
+import { bookCanonicalAppointment, type CanonicalBookingResult } from '../../lib/booking';
 import { requirePermission } from '../../lib/permissions';
 import { assertBranchAccess } from '../../lib/scope';
 import { recordWorkflowEvent } from '../../lib/intelligence';
-import { computeProviderSlots, findSlotConflict, getSchedulingPolicy, isDoubleBookConflictError, resolveSchedulingService } from '../../lib/scheduling';
+import { computeProviderSlots, getSchedulingPolicy, isDoubleBookConflictError, resolveSchedulingService } from '../../lib/scheduling';
 
 // ===========================================================================
 // Provider scheduling — recurring availability, one-off time-off, open-slot
@@ -178,39 +178,20 @@ export const schedulingRoutes: FastifyPluginAsync = async app => {
     const patient = await db.patient.findFirst({ where: { id: body.patientId, tenantId: request.auth.tenantId, branchId: provider.branchId, deletedAt: null }, select: { id: true, phone: true, email: true } });
     if (!patient) throw app.httpErrors.badRequest('Patient not found in this provider\'s clinic');
 
-    const endsAt = new Date(body.startsAt.getTime() + service.durationMin * 60_000);
     const policy = await getSchedulingPolicy(request.auth.tenantId);
 
-    // Conflict check + create in one transaction so the slot can't be double-booked
-    // between check and insert. The DB exclusion constraint is the final guard if a
-    // concurrent booking still races past the in-transaction check.
-    let result: { conflict: Awaited<ReturnType<typeof findSlotConflict>> } | { appointment: Awaited<ReturnType<typeof db.appointment.create>>; queued: Awaited<ReturnType<typeof queueAppointmentConfirmations>> };
+    // Conflict check + create + confirmation queueing in one transaction so the
+    // slot can't be double-booked between check and insert (lib/booking.ts — the
+    // same atomic path the receptionist "book from review" route uses). The DB
+    // exclusion constraint is the final guard if a concurrent booking still
+    // races past the in-transaction check.
+    let result: CanonicalBookingResult;
     try {
-      result = await db.$transaction(async tx => {
-        const conflict = await findSlotConflict({ tenantId: request.auth.tenantId, providerProfileId: providerId, startsAt: body.startsAt, durationMin: service.durationMin }, tx);
-        if (conflict) return { conflict } as const;
-        const appointment = await tx.appointment.create({
-          data: {
-            tenantId: request.auth.tenantId, branchId: provider.branchId, patientId: body.patientId,
-            providerProfileId: providerId, providerRef: providerId, service: service.name, serviceCatalogItemId: service.id, startsAt: body.startsAt, endsAt,
-            status: 'CONFIRMED', channel: body.channel,
-          },
-        });
-        // Queue the confirmation with the booking, so a clinic that has opted
-        // in cannot end up with an appointment and no message arranged. This
-        // only enqueues: consent, quiet hours and the DNC fence are all still
-        // decided at the delivery boundary, exactly as for the voice path.
-        const queued = await queueAppointmentConfirmations(tx, {
-          tenantId: request.auth.tenantId,
-          appointmentId: appointment.id,
-          patientId: patient.id,
-          smsEnabled: policy.confirmBookingsBySms,
-          emailEnabled: policy.confirmBookingsByEmail,
-          phone: patient.phone,
-          email: patient.email,
-        });
-        return { appointment, queued } as const;
-      });
+      result = await db.$transaction(tx => bookCanonicalAppointment(tx, {
+        tenantId: request.auth.tenantId, branchId: provider.branchId, patientId: body.patientId,
+        providerProfileId: providerId, service, startsAt: body.startsAt, channel: body.channel,
+        policy, patientContact: { phone: patient.phone, email: patient.email },
+      }));
     } catch (error) {
       if (isDoubleBookConflictError(error)) return reply.code(409).send({ error: 'slot_unavailable', reason: 'already_booked' });
       throw error;

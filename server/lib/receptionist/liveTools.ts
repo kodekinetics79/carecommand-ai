@@ -1,5 +1,5 @@
 import { db } from '../db';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import type { Prisma } from '../../generated/prisma/client';
 import { toE164, isValidE164 } from '../campaigns';
 import { getOpenSlots, parseSlot, speakTime, SLOT_MIN } from './availability';
@@ -20,6 +20,7 @@ import {
 import { restrictCallToBasicAttributes } from '../retell';
 import { CONFIRMATION_OUTBOX_SOURCE, processAppointmentConfirmations } from './confirmationOutbox';
 import { lockDncDestinationFence } from './dncFence';
+import { createSafetyTask } from './frontDeskTask';
 
 // Real-time tools the AI receptionist invokes DURING a call (Retell custom
 // functions). Each returns a JSON result with a `message` the agent can speak.
@@ -270,113 +271,11 @@ function validateAttestedBookingArgs(snapshot: IntakeContractSnapshot, args: Rec
   return issues.length ? { ok: false, answers, issues: [...new Set(issues)].sort() } : { ok: true, answers: answers! };
 }
 
-type SafetyWorkflow = 'human_handoff' | 'message' | 'emergency';
-
-const SAFETY_TASK: Record<SafetyWorkflow, { title: string; priority: string; dueMinutes: number }> = {
-  human_handoff: { title: 'AI receptionist human handoff requested', priority: 'high', dueMinutes: 15 },
-  message: { title: 'AI receptionist callback requested', priority: 'high', dueMinutes: 30 },
-  emergency: { title: 'URGENT: AI receptionist emergency mention', priority: 'high', dueMinutes: 0 },
-};
-
-// Creates the existing, staff-visible acknowledgment primitive before the
-// agent promises follow-up or attempts a transfer. Caller content stays in the
-// task only; the audit row contains classifications and identifiers, not names,
-// phone numbers, or message text. A stable call id makes Retell retries safe.
-async function createSafetyTask(ctx: ToolContext, workflow: SafetyWorkflow, args: Record<string, unknown>) {
-  const branch = await resolveBranch(ctx.tenantId);
-  const callbackPhone = validPhone(ctx.callerPhone) ?? validPhone(args.callback_phone);
-  const callerName = sanitizeText(args.caller_name, MAX_NAME);
-  const message = sanitizeText(args.message, MAX_MESSAGE);
-  const reasonCategory = sanitizeText(args.reason_category, MAX_SHORT) ?? 'other';
-  const config = SAFETY_TASK[workflow];
-  const safeCallId = sanitizeText(ctx.callId, 128);
-  // Retell normally supplies call_id. For a malformed/replayed callback without
-  // one, hash minimum-necessary inputs into a short time bucket: no caller
-  // content leaks into the key, while immediate provider retries remain safe.
-  const fallbackDigest = createHash('sha256')
-    .update(JSON.stringify({ tenantId: ctx.tenantId, workflow, callbackPhone, callerName, message, reasonCategory, bucket: Math.floor(Date.now() / 600_000) }))
-    .digest('hex');
-  const idemKey = safeCallId ? `${ctx.tenantId}:${safeCallId}:${workflow}` : `${ctx.tenantId}:fallback:${fallbackDigest}`;
-  const lockKey = `receptionist-safety:${idemKey}`;
-
-  const result = await db.$transaction(async tx => {
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey})::bigint)`;
-    const prior = await tx.idempotencyKey.findUnique({
-      where: { scope_key: { scope: 'receptionist.live-safety', key: idemKey } },
-      select: { id: true, resultId: true },
-    });
-    if (prior?.resultId) {
-      const task = await tx.staffTask.findFirst({
-        where: { id: prior.resultId, tenantId: ctx.tenantId },
-        select: { id: true },
-      });
-      if (task) return { taskId: task.id, duplicate: true };
-    }
-    if (prior) await tx.idempotencyKey.delete({ where: { id: prior.id } });
-
-    const task = await tx.staffTask.create({
-      data: {
-        tenantId: ctx.tenantId,
-        branchId: branch?.id,
-        title: config.title,
-        priority: config.priority,
-        dueAt: new Date(Date.now() + config.dueMinutes * 60_000),
-        metadata: {
-          workflow: 'receptionist_safety',
-          kind: workflow,
-          callId: safeCallId,
-          callbackPhone,
-          callerName,
-          message,
-          reasonCategory,
-          requiresAcknowledgement: true,
-          source: 'retell_live_call',
-        },
-      },
-      select: { id: true },
-    });
-    await tx.idempotencyKey.create({
-      data: { tenantId: ctx.tenantId, scope: 'receptionist.live-safety', key: idemKey, resultId: task.id },
-    });
-    await tx.auditEvent.create({
-      data: {
-        tenantId: ctx.tenantId,
-        actorUserId: null,
-        action: `receptionist.safety.${workflow}.created`,
-        resource: 'staffTask',
-        resourceId: task.id,
-        userAgent: 'retell-webhook',
-        // Minimum necessary: caller content is deliberately excluded.
-        metadata: { workflow, branchId: branch?.id ?? null, hasCallbackPhone: Boolean(callbackPhone), callIdPresent: Boolean(safeCallId) },
-      },
-    });
-    if (workflow === 'emergency') {
-      await tx.operationalSignal.create({
-        data: {
-          tenantId: ctx.tenantId,
-          signalType: 'receptionist_emergency_mention',
-          entityType: 'staffTask',
-          entityId: task.id,
-          severity: 'critical',
-          score: 100,
-          reason: 'Emergency language was reported during an AI receptionist call; staff acknowledgment is required.',
-        },
-      });
-    }
-    await tx.businessEvent.create({
-      data: {
-        tenantId: ctx.tenantId,
-        eventType: `receptionist.safety.${workflow}.created`,
-        entityType: 'staffTask',
-        entityId: task.id,
-        sourceModule: 'receptionist',
-        payload: { workflow, acknowledgmentRequired: true },
-      },
-    });
-    return { taskId: task.id, duplicate: false };
-  });
-  return result;
-}
+// The receptionist StaffTask contract lives in frontDeskTask.ts (C4-pre): one
+// metadata schema, one writer. The three live tools below only shape the spoken
+// result; `createSafetyTask` resolves branch/call/patient, appends a second
+// message on the same live call, and files the audit/business events.
+export { createSafetyTask } from './frontDeskTask';
 
 /** Records an acknowledgment-required handoff before Retell attempts transfer. */
 export async function requestHumanHandoff(ctx: ToolContext, args: Record<string, unknown>) {
@@ -385,6 +284,7 @@ export async function requestHumanHandoff(ctx: ToolContext, args: Record<string,
     handoff_recorded: true,
     transfer_completed: false,
     duplicate: task.duplicate,
+    appended: task.appended,
     task_id: task.taskId,
     message: 'I created a request in the front desk queue. Staff have not acknowledged it yet. If a transfer option is available, I can try it next; no transfer has occurred yet, and the callback request remains open.',
   };
@@ -394,11 +294,15 @@ export async function requestHumanHandoff(ctx: ToolContext, args: Record<string,
 export async function takeMessage(ctx: ToolContext, args: Record<string, unknown>) {
   const task = await createSafetyTask(ctx, 'message', args);
   return {
-    message_recorded: true,
+    // True only when a task was created or a message appended on this call.
+    message_recorded: !task.duplicate,
     acknowledgment_pending: true,
     duplicate: task.duplicate,
+    appended: task.appended,
     task_id: task.taskId,
-    message: 'Thank you. I have recorded a callback request for the front desk. A team member still needs to review and acknowledge it.',
+    message: task.appended
+      ? 'Thank you. I added that to your callback request for the front desk. A team member still needs to review and acknowledge it.'
+      : 'Thank you. I have recorded a callback request for the front desk. A team member still needs to review and acknowledge it.',
   };
 }
 
@@ -410,6 +314,7 @@ export async function reportEmergency(ctx: ToolContext, args: Record<string, unk
     protocol_status: 'pending_provider_evidence',
     acknowledgment_pending: true,
     duplicate: task.duplicate,
+    appended: task.appended,
     task_id: task.taskId,
     message: 'If you may be experiencing an emergency, hang up and call 911 now, or go to the nearest emergency room. Do not wait for a callback from this office.',
   };

@@ -9,6 +9,7 @@ import { evaluateDepositForAppointment, getAppointmentPaymentSummaries, handleAp
 import { recordWorkflowEvent } from '../../lib/intelligence';
 import { findSlotConflict, isDoubleBookConflictError, resolveSchedulingService } from '../../lib/scheduling';
 import { runWithTenantContext } from '../../lib/tenantContext';
+import { APPOINTMENT_NOTE_MAX, appendAppointmentNote, appointmentNoteSelect } from '../../lib/appointmentNotes';
 
 const uuid = z.string().uuid();
 
@@ -93,7 +94,11 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
     const { id } = z.object({ id: uuid }).parse(request.params);
     const appointment = await runWithTenantContext(request.auth.tenantId, tx => tx.appointment.findFirst({
       where: { id, tenantId: request.auth.tenantId, deletedAt: null, ...branchScope(request) },
-      include: { patient: { select: { id: true, firstName: true, lastName: true } } },
+      include: {
+        patient: { select: { id: true, firstName: true, lastName: true } },
+        // Append-only note history (C4). The scalar `notes` string is untouched.
+        noteEntries: { orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], select: appointmentNoteSelect },
+      },
     }));
     if (!appointment) throw app.httpErrors.notFound('Appointment not found');
     const summaries = await getAppointmentPaymentSummaries(request.auth.tenantId, [appointment.id]);
@@ -101,6 +106,39 @@ export const appointmentRoutes: FastifyPluginAsync = async app => {
     await audit(request, { action: 'appointment.read', resource: 'appointment', resourceId: appointment.id });
     const patientName = appointment.patient ? `${appointment.patient.firstName} ${appointment.patient.lastName}`.trim() : null;
     return { ...appointment, patientName, payment: summaries.get(appointment.id) ?? null };
+  });
+
+  // ----- Append a note (immutable history; never edits the scalar `notes`) ---
+  app.patch('/:id/notes', { preHandler: canWriteAppointments }, async request => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const body = z.object({ text: z.string().trim().min(1).max(APPOINTMENT_NOTE_MAX) }).strict().parse(request.body);
+    const result = await runWithTenantContext(request.auth.tenantId, async tx => {
+      const appointment = await tx.appointment.findFirst({
+        where: { id, tenantId: request.auth.tenantId, deletedAt: null },
+        select: { id: true, branchId: true },
+      });
+      if (!appointment) return null;
+      assertBranchAccess(request, appointment.branchId);
+      const appended = await appendAppointmentNote(tx, {
+        tenantId: request.auth.tenantId, appointmentId: appointment.id, text: body.text,
+        actorType: 'staff', actorUserId: request.auth.userId,
+      });
+      if (!appended) return null;
+      // Minimum necessary: the audit row records that a note exists, never its text.
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+        action: 'appointment.notes.appended', resource: 'appointment', resourceId: appointment.id,
+        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
+        metadata: { hasNote: true, noteCount: appended.noteCount, actorType: 'staff' },
+      } });
+      const full = await tx.appointment.findUniqueOrThrow({
+        where: { id: appointment.id },
+        include: { noteEntries: { orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], select: appointmentNoteSelect } },
+      });
+      return full;
+    });
+    if (!result) throw app.httpErrors.notFound('Appointment not found');
+    return result;
   });
 
   app.post('/', { preHandler: canWriteAppointments }, async (request, reply) => {

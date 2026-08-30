@@ -154,15 +154,14 @@ export const clinicRoutes: FastifyPluginAsync = async app => {
       await lockReceptionistConfiguration(tx, request.auth.tenantId);
       const existing = await tx.receptionistClinic.findFirst({ where: { id, tenantId: request.auth.tenantId } });
       if (!existing) throw app.httpErrors.notFound('Clinic not found');
-      const [locations, agents, campaigns, outboundCampaigns, calls, requests] = await Promise.all([
+      const [locations, agents, campaigns, outboundCampaigns, calls] = await Promise.all([
         tx.receptionistLocation.count({ where: { tenantId: request.auth.tenantId, clinicId: id } }),
         tx.receptionistAgent.count({ where: { tenantId: request.auth.tenantId, clinicId: id } }),
         tx.receptionistCampaign.count({ where: { tenantId: request.auth.tenantId, clinicId: id } }),
         tx.receptionistOutboundCampaign.count({ where: { tenantId: request.auth.tenantId, clinicId: id } }),
         tx.receptionistCallLog.count({ where: { tenantId: request.auth.tenantId, clinicId: id } }),
-        tx.receptionistAppointmentRequest.count({ where: { tenantId: request.auth.tenantId, clinicId: id } }),
       ]);
-      if (locations || agents || campaigns || outboundCampaigns || calls || requests) {
+      if (locations || agents || campaigns || outboundCampaigns || calls) {
         throw app.httpErrors.conflict('This clinic has receptionist history or dependent configuration. Deactivate it to preserve audit lineage.');
       }
       await tx.receptionistClinic.delete({ where: { id } });
