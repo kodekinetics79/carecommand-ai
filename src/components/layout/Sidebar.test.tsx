@@ -66,6 +66,22 @@ describe('Sidebar Front Desk entry', () => {
     expect(apiRequestMock).not.toHaveBeenCalledWith('/v1/tasks/summary');
   });
 
+  /**
+   * The auditor's shape: it may read call artifacts and recordings, and holds
+   * no staff grant at all. The board is built from both — the calls, and the
+   * task lanes those calls create — and GET /v1/tasks{,/summary} is guarded by
+   * staff:read. Offering the entry produced a page whose calls loaded and whose
+   * every lane answered 403, with a badge polling that same 403 every 20s from
+   * every screen in the app.
+   */
+  it('hides Front Desk from a role that may read call artifacts but holds no staff grant', () => {
+    signedIn(['receptionist:call-artifacts:read', 'receptionist:recordings:read', 'compliance:read', 'audit:read']);
+    apiRequestMock.mockResolvedValue(summary());
+    renderSidebar();
+    expect(screen.queryByRole('link', { name: /Front Desk/ })).not.toBeInTheDocument();
+    expect(apiRequestMock).not.toHaveBeenCalledWith('/v1/tasks/summary');
+  });
+
   it('badges open work in amber', async () => {
     apiRequestMock.mockResolvedValue(summary());
     renderSidebar();

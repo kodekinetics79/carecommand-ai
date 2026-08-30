@@ -50,10 +50,20 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
   { path: '/patients', label: 'Patients', primaryCall: '/v1/patients' },
   { path: '/scheduling', label: 'Scheduling', primaryCall: '/v1/appointments' },
   { path: '/patient-intake', label: 'Patient Intake', primaryCall: '/v1/intake/queue' },
+  // The work the AI receptionist hands back to a human: emergency, callback and
+  // service lanes. GET /v1/tasks is the lane query and the first request the
+  // board makes; /v1/tasks/summary is deliberately NOT the probe here, because
+  // the sidebar badge polls it from every page and a probe another surface also
+  // issues would pass without this one loading.
+  { path: '/front-desk', label: 'Front Desk', primaryCall: '/v1/tasks' },
   { path: '/ai-receptionist', label: 'AI Receptionist', primaryCall: '/v1/conversations' },
   { path: '/receptionist-studio', label: 'Receptionist Studio', primaryCall: '/v1/receptionist/overview' },
   { path: '/staff', label: 'Staff Tasks', primaryCall: '/v1/staff/overview' },
-  { path: '/crm', label: 'CRM', primaryCall: '/v1/leads' },
+  // The CRM workspace opens on its Command View, whose figures come from
+  // GET /v1/growth/metrics. It was /v1/leads until the Growth rebuild moved
+  // scoring and aggregation server-side; the page no longer issues /v1/leads on
+  // load at all, so the old probe waited for a request that never comes.
+  { path: '/crm', label: 'CRM', primaryCall: '/v1/growth/metrics' },
   // /campaigner and /reactivation were one Campaign table behind two doors;
   // they merged into the single /campaigns workspace (both old paths now
   // redirect there — asserted by growth-redirects-and-nav.spec.ts).
@@ -68,6 +78,10 @@ export const NAV_DESTINATIONS: readonly NavDestination[] = [
   { path: '/doctor-workspace', label: 'Provider Performance', primaryCall: '/v1/providers/overview' },
   { path: '/benchmarking', label: 'Multi-Clinic Benchmarking', primaryCall: '/v1/competitors/radar' },
   { path: '/monitoring', label: 'Remote Monitoring', primaryCall: '/v1/monitoring/overview' },
+  // The bands a clinic's own alerts fire on. Reading them is the whole point of
+  // the screen and is on the monitoring module's role gate; writing one is
+  // narrower (OWNER/ADMIN/MANAGER), which is why the probe is the read.
+  { path: '/alert-thresholds', label: 'Alert Thresholds', primaryCall: '/v1/monitoring/rules' },
   { path: '/devices', label: 'Device Integration', primaryCall: '/v1/devices/overview' },
   { path: '/enrollments', label: 'Device Enrollments', primaryCall: '/v1/connected-care/enrollments' },
   { path: '/rpm-readiness', label: 'RPM Billing Readiness', primaryCall: '/v1/connected-care/rpm-readiness' },
@@ -99,32 +113,60 @@ export const ROLE_ACCESS: Record<CrawlRole, RoleAccessContract> = {
   // Every permission in the vocabulary: the whole inventory.
   // 2026-08-29: 32 -> 31 when /campaigner and /reactivation merged into the
   // single /campaigns destination.
+  // 2026-08-30: 31 -> 33. Two destinations were added, not renamed: /front-desk
+  // (the queue of work the AI receptionist hands back to a human) and
+  // /alert-thresholds (the bands a clinic's own monitoring alerts fire on,
+  // which had no write path anywhere in the product before it).
   OWNER: {
-    navDestinations: 31,
-    mustOffer: ['/', '/settings', '/patients', '/scheduling', '/insurance', '/staff', '/integrations', '/monitoring', '/compliance', '/control-plane', '/campaigns'],
+    navDestinations: 33,
+    mustOffer: ['/', '/settings', '/patients', '/scheduling', '/insurance', '/staff', '/integrations', '/monitoring', '/compliance', '/control-plane', '/campaigns', '/front-desk', '/alert-thresholds', '/advisory'],
     mustNotOffer: [],
   },
   // Patient, billing, staff and CRM reads; no revenue, operations, integrations
   // or compliance grant, and not on the connected-care role list. Holds both
   // campaign:read and crm:read, so the merged campaign workspace is offered.
   // 2026-08-29: 20 -> 19 for the same /campaigns merge (two entries became one).
+  // 2026-08-30: still 19, from two changes that cancel. Front Desk is the
+  // role's own board and it holds both grants the board needs:
+  // receptionist:call-artifacts:read for the call evidence and staff:read for
+  // the task lanes. It gained receptionist:read in the same change, which opens
+  // the Studio's READ routes — but the Studio screen still renders its mutation
+  // controls, so navigation keeps gating it on receptionist:manage and this
+  // role is still not offered it. Against that, /advisory left: the brief names
+  // patients and their money and its route requires patient:read AND
+  // revenue:read, which this role does not hold.
   FRONT_DESK: {
     navDestinations: 19,
-    mustOffer: ['/', '/settings', '/patients', '/scheduling', '/insurance', '/staff', '/crm', '/campaigns'],
-    mustNotOffer: ['/control-plane', '/compliance', '/integrations', '/monitoring', '/revenue', '/receptionist-studio'],
+    mustOffer: ['/', '/settings', '/patients', '/scheduling', '/insurance', '/staff', '/crm', '/campaigns', '/front-desk'],
+    mustNotOffer: ['/control-plane', '/compliance', '/integrations', '/monitoring', '/revenue', '/receptionist-studio', '/alert-thresholds', '/advisory'],
   },
   // Clinical reads plus the connected-care role list; no CRM, billing, revenue
-  // or compliance grant — and therefore no campaign workspace.
+  // or compliance grant — and therefore no campaign workspace, and no
+  // receptionist grant of any kind, so no Front Desk board.
+  // 2026-08-30: 17 -> 16, three movements. The /campaigns merge on 2026-08-29
+  // took a destination away from this role that the note above did not record:
+  // /reactivation required NO permission until then, so every role was offered
+  // it, and the merged workspace requires campaign:read + crm:read.
+  // /alert-thresholds gave one back — it is on the monitoring module's role
+  // gate, which includes PROVIDER. And /advisory left, for the reason on
+  // FRONT_DESK above: no revenue:read.
   PROVIDER: {
-    navDestinations: 17,
-    mustOffer: ['/', '/settings', '/patients', '/scheduling', '/staff', '/monitoring', '/doctor-workspace'],
-    mustNotOffer: ['/control-plane', '/compliance', '/crm', '/campaigns', '/insurance', '/revenue', '/integrations'],
+    navDestinations: 16,
+    mustOffer: ['/', '/settings', '/patients', '/scheduling', '/staff', '/monitoring', '/doctor-workspace', '/alert-thresholds'],
+    mustNotOffer: ['/control-plane', '/compliance', '/crm', '/campaigns', '/insurance', '/revenue', '/integrations', '/front-desk', '/advisory'],
   },
   // Compliance and audit reads and nothing operational.
+  // 2026-08-30: 9 -> 7. It loses the same free /reactivation entry the PROVIDER
+  // note above describes, and /advisory, which it never had the grants for.
+  // It is NOT offered /front-desk despite holding
+  // receptionist:call-artifacts:read: the board's task lanes are GET /v1/tasks,
+  // which requires staff:read, and an auditor holds no staff grant. A page
+  // whose calls load and whose work lanes 403 is the half-open door this suite
+  // exists to catch, so the requirement was corrected rather than the count.
   AUDITOR: {
-    navDestinations: 9,
+    navDestinations: 7,
     mustOffer: ['/', '/settings', '/compliance'],
-    mustNotOffer: ['/control-plane', '/patients', '/scheduling', '/insurance', '/staff', '/integrations', '/monitoring', '/revenue', '/campaigns'],
+    mustNotOffer: ['/control-plane', '/patients', '/scheduling', '/insurance', '/staff', '/integrations', '/monitoring', '/revenue', '/campaigns', '/front-desk', '/alert-thresholds', '/advisory'],
   },
 };
 

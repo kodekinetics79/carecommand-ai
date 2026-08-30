@@ -10,7 +10,7 @@ import { useSession } from '../../hooks/useSession';
 import { useEntitlements } from '../../hooks/useEntitlements';
 import { useFrontDeskPoll } from '../../hooks/useFrontDeskPoll';
 import { summarizeNeedsAction } from '../../lib/frontDesk';
-import { canOpenPath, hasPermission, type RoutePath } from '../../lib/access';
+import { canOpenPath, type RoutePath } from '../../lib/access';
 import { useUiPrefs } from '../../lib/uiPrefs';
 import Logo from '../ui/Logo';
 
@@ -154,15 +154,18 @@ export default function Sidebar({ mobileOpen = false, onNavigate }: { mobileOpen
   const [filter, setFilter] = useState('');
 
   // The Front Desk badge is the shared 20s task summary (one poller for the
-  // whole app). It is only fetched for a session that may read call artifacts,
-  // and NOTHING is shown when the summary failed to load: a missing badge means
+  // whole app). It is fetched only for a session that can open the board it
+  // badges — GET /v1/tasks/summary is guarded by staff:read, not by the call
+  // grant, so asking on behalf of an auditor was a 403 every 20 seconds for a
+  // number that could never arrive. One question, asked once: canOpenPath.
+  // NOTHING is shown when the summary failed to load: a missing badge means
   // "not known", and a zero would be a claim nobody verified.
   //
   // The critical number is the server's real count, not the length of the
   // capped preview (D7): a badge reading 5 beside nine open emergencies is
   // worse than no badge at all. Where only the capped preview is available the
   // badge reads "5+".
-  const frontDeskSummary = useFrontDeskPoll({ enabled: !loading && hasPermission(user, 'receptionist:call-artifacts:read') });
+  const frontDeskSummary = useFrontDeskPoll({ enabled: !loading && canOpenPath(user, '/front-desk') });
   const frontDeskCounts = summarizeNeedsAction(frontDeskSummary.state === 'ready' ? frontDeskSummary.data : null);
   const criticalBadge = frontDeskCounts.criticalExact ? frontDeskCounts.critical : `${frontDeskCounts.critical}+`;
   const frontDeskBadge: Pick<NavItem, 'badge' | 'badgeColor'> = frontDeskSummary.state !== 'ready'

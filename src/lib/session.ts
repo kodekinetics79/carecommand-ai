@@ -7,6 +7,26 @@ let csrfTokenMemory: string | null = null;
 let refreshInFlight: Promise<AuthSessionResponse> | null = null;
 const csrfCookieName = 'cc_csrf';
 
+/**
+ * An auth endpoint answered, and refused.
+ *
+ * The status matters to exactly one caller: whoever asked for a session and did
+ * not get one. `refreshSession()` rejecting with 401 means there is no session
+ * left to rebuild — the user signed out, or the refresh token expired or was
+ * revoked — and the app must return to /login. A refresh that failed because
+ * the network dropped is not an answer at all and must leave the session alone.
+ * A bare `Error` cannot tell those apart, and the app used to treat both as the
+ * second: after signing out, the workspace stayed on screen.
+ */
+export class AuthRequestError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'AuthRequestError';
+    this.status = status;
+  }
+}
+
 export interface SessionUser {
   id: string;
   email: string;
@@ -92,7 +112,7 @@ async function authRequest<T>(path: string, body?: unknown, acceptedErrorStatuse
   });
   if (!response.ok && !acceptedErrorStatuses.includes(response.status)) {
     const payload = await response.json().catch(() => null) as { message?: string } | null;
-    throw new Error(payload?.message ?? `Authentication request failed: ${response.status}`);
+    throw new AuthRequestError(response.status, payload?.message ?? `Authentication request failed: ${response.status}`);
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
