@@ -674,6 +674,15 @@ export class RlsBehaviorHarness {
       values.set('patientId', patient.row.id);
       values.delete('leadId');
     }
+    // Deployment fingerprints are hash-shaped by database CHECK (and carry a
+    // `mock:` prefix for fixture deployments). The generic text generator
+    // cannot know that, so the shape is stated here rather than weakening the
+    // constraint that keeps mock evidence distinguishable from live evidence.
+    if (table === 'ReceptionistAgentDeployment') {
+      for (const column of ['toolFingerprint', 'intakeFingerprint', 'configFingerprint']) {
+        values.set(column, createHash('sha256').update(`${table}:${column}:${tenantId}`).digest('hex'));
+      }
+    }
     if (table === 'ReceptionistVoiceConsentEvent') {
       values.set('purpose', 'PATIENT_REACTIVATION');
       values.set('policyVersion', 'rls-policy-v1');
