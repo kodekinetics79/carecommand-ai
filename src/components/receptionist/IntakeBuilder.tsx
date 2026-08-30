@@ -129,7 +129,10 @@ function IntakeFieldRow({ field, isFirst, isLast, moveDisabled, onMoveUp, onMove
   const busy = isBusy(saveState.state) || isBusy(removeState.state);
   const dirty = JSON.stringify(draft) !== JSON.stringify(field);
   const set = <K extends keyof IntakeField>(key: K, value: IntakeField[K]) => setDraft(prev => ({ ...prev, [key]: value }));
-  const hasOptions = field.fieldType === 'CUSTOM_DROPDOWN' || field.fieldType === 'PREFERRED_LOCATION';
+  // Preferred-location choices come from the campaign's active mapped
+  // locations. A second hand-maintained option list can drift from scheduling
+  // and previously made Retell export fail at runtime.
+  const hasOptions = field.fieldType === 'CUSTOM_DROPDOWN';
 
   async function save() {
     const saved = await saveState.run(async () => {

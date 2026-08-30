@@ -815,6 +815,30 @@ describe('AI receptionist trusted configuration', () => {
         message: expect.stringContaining('eligible location mapping unresolved'),
       });
     }
+
+    // Malformed legacy intake rows must also be an actionable conflict. They
+    // previously escaped the route boundary and appeared as an opaque 500.
+    await db.receptionistCampaign.update({ where: { id: campaign.json().id }, data: { eligibleLocationIds: [] } });
+    await db.receptionistIntakeField.create({
+      data: {
+        tenantId: t.id,
+        campaignId: campaign.json().id,
+        fieldType: 'CUSTOM_TEXT',
+        label: 'Legacy free text',
+        aiQuestion: 'Tell us more.',
+        options: ['stale-option'],
+        required: false,
+        sortOrder: 0,
+      },
+    });
+    const malformedIntake = await app.inject({
+      method: 'GET', url: `/v1/receptionist/campaigns/${campaign.json().id}/retell-config`, headers: auth(t, 'OWNER'),
+    });
+    expect(malformedIntake.statusCode).toBe(409);
+    expect(malformedIntake.json()).toMatchObject({
+      error: 'invalid_intake_configuration',
+      message: expect.stringContaining('Options are permitted only for CUSTOM DROPDOWN fields'),
+    });
   });
 
   it('rolls provider verification state back when its mandatory audit insert fails', async () => {

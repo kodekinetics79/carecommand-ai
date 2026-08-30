@@ -343,7 +343,10 @@ export const campaignRoutes: FastifyPluginAsync = async app => {
   });
 };
 
-const CONFIGURATION_ERROR_PREFIX = 'invalid_receptionist_configuration';
+const CONFIGURATION_ERROR_PREFIXES = [
+  'invalid_receptionist_configuration',
+  'invalid_intake_configuration',
+] as const;
 
 /**
  * A prompt that cannot be generated because the campaign's own configuration
@@ -352,13 +355,18 @@ const CONFIGURATION_ERROR_PREFIX = 'invalid_receptionist_configuration';
  * Surface it as 409 with the reason instead of a masked 500 (M71).
  */
 function isConfigurationError(error: unknown): error is Error {
-  return error instanceof Error && error.message.startsWith(CONFIGURATION_ERROR_PREFIX);
+  return error instanceof Error && CONFIGURATION_ERROR_PREFIXES.some(prefix => error.message.startsWith(prefix));
 }
 
 function configurationConflict(app: Parameters<FastifyPluginAsync>[0], error: Error) {
-  const reason = error.message.slice(CONFIGURATION_ERROR_PREFIX.length + 1) || 'unknown';
-  const conflict = app.httpErrors.conflict(`Receptionist configuration is invalid: ${reason.replaceAll('_', ' ')}. Fix the campaign's locations and agent before generating the prompt.`);
-  (conflict as Error & { code?: string }).code = CONFIGURATION_ERROR_PREFIX;
+  const prefix = CONFIGURATION_ERROR_PREFIXES.find(candidate => error.message.startsWith(candidate))
+    ?? CONFIGURATION_ERROR_PREFIXES[0];
+  const reason = error.message.slice(prefix.length + 1) || 'unknown';
+  const remedy = prefix === 'invalid_intake_configuration'
+    ? 'Fix the campaign intake fields before generating the prompt.'
+    : 'Fix the campaign locations and agent before generating the prompt.';
+  const conflict = app.httpErrors.conflict(`Receptionist configuration is invalid: ${reason.replaceAll('_', ' ')} ${remedy}`);
+  (conflict as Error & { code?: string }).code = prefix;
   return conflict;
 }
 

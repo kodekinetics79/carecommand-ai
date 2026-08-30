@@ -571,7 +571,12 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     language: agent.language,
     beginMessage,
     dynamicVariables,
-    webhookUrl: `${options.webhookBaseUrl.replace(/\/$/, '')}/v1/receptionist/webhooks/retell?clinicId=${clinic.id}&campaignId=${campaign.id}`,
+    // Keep this identical to the URL verified in agents.ts. Tenant/clinic
+    // context is resolved from the signed Retell destination/call identity;
+    // query parameters are neither trusted nor part of the deployable agent
+    // contract. Previously the Studio exported a URL that the readiness probe
+    // itself rejected as `webhook_mismatch`.
+    webhookUrl: `${options.webhookBaseUrl.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`,
     bookingFunction,
     intakeSchemaRevision: intakeContract.snapshot.revision,
     intakeSchemaFingerprint: intakeContract.fingerprint,

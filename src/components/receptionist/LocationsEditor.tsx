@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Plus, Trash2, MapPin, Pencil, Loader2 } from 'lucide-react';
+import { Plus, Trash2, MapPin, Pencil, Loader2, X } from 'lucide-react';
 import { Field, TextInput, Select, Toggle } from '../ui/Field';
 import { receptionistApi as api, TIMEZONE_OPTIONS, type Clinic, type Location, type SchedulingBranch, type WeeklyHours } from '../../lib/receptionist';
 import { useResource } from '../../hooks/useResource';
@@ -11,6 +11,34 @@ import { LoadFailureNotice, MutationNotice } from './MutationNotice';
 // Module scope on purpose: `useResource` keys the request on the loader's identity.
 const loadSchedulingBranches = () => api.listSchedulingBranches();
 
+const DAY_OPTIONS = [
+  ['monday', 'Monday'], ['tuesday', 'Tuesday'], ['wednesday', 'Wednesday'],
+  ['thursday', 'Thursday'], ['friday', 'Friday'], ['saturday', 'Saturday'], ['sunday', 'Sunday'],
+] as const;
+
+type DayKey = typeof DAY_OPTIONS[number][0];
+
+function defaultWeeklyHours(): Record<DayKey, { open: boolean; start: string; end: string }> {
+  return Object.fromEntries(DAY_OPTIONS.map(([day]) => [day, {
+    open: !['saturday', 'sunday'].includes(day),
+    start: '09:00',
+    end: '17:00',
+  }])) as Record<DayKey, { open: boolean; start: string; end: string }>;
+}
+
+function editableWeeklyHours(hours: WeeklyHours | null | undefined) {
+  const defaults = defaultWeeklyHours();
+  for (const [day] of DAY_OPTIONS) {
+    const saved = hours?.[day];
+    if (saved) defaults[day] = {
+      open: saved.open,
+      start: saved.start ?? defaults[day].start,
+      end: saved.end ?? defaults[day].end,
+    };
+  }
+  return defaults;
+}
+
 export function LocationsEditor({ clinic, onChanged }: { clinic: Clinic; onChanged: () => Promise<unknown> }) {
   const locations = clinic.locations ?? [];
   const branchesResource = useResource<SchedulingBranch[]>(loadSchedulingBranches);
@@ -18,7 +46,7 @@ export function LocationsEditor({ clinic, onChanged }: { clinic: Clinic; onChang
   const branches = receivedData(branchesResource.state) ?? [];
   const branchesLoading = branchesResource.state.status === 'loading';
   const [editingId, setEditingId] = useState<string | 'new' | null>(null);
-  const [form, setForm] = useState({ name: '', address: '', phone: '', branchId: '', timezone: clinic.timezone, active: true, hoursStart: '09:00', hoursEnd: '17:00' });
+  const [form, setForm] = useState({ name: '', address: '', phone: '', branchId: '', timezone: clinic.timezone, active: true, hours: defaultWeeklyHours() });
   const [formError, setFormError] = useState<string | null>(null);
   const saveState = useMutationState();
   const removeState = useMutationState();
@@ -27,18 +55,17 @@ export function LocationsEditor({ clinic, onChanged }: { clinic: Clinic; onChang
 
   function beginCreate() {
     const branch = branches.find(row => row.active);
-    setForm({ name: '', address: '', phone: '', branchId: branch?.id ?? '', timezone: branch?.timezone ?? clinic.timezone, active: true, hoursStart: '09:00', hoursEnd: '17:00' });
+    setForm({ name: '', address: '', phone: '', branchId: branch?.id ?? '', timezone: branch?.timezone ?? clinic.timezone, active: true, hours: defaultWeeklyHours() });
     setFormError(null);
     saveState.reset();
     setEditingId('new');
   }
 
   function beginEdit(location: Location) {
-    const monday = location.workingHours?.monday;
     setForm({
       name: location.name, address: location.address, phone: location.phone ?? '', branchId: location.branchId ?? '',
       timezone: location.timezone ?? clinic.timezone, active: location.active,
-      hoursStart: monday?.start ?? '09:00', hoursEnd: monday?.end ?? '17:00',
+      hours: editableWeeklyHours(location.workingHours),
     });
     setFormError(null);
     saveState.reset();
@@ -50,19 +77,14 @@ export function LocationsEditor({ clinic, onChanged }: { clinic: Clinic; onChang
       setFormError('Name, address, and an active scheduling branch are required.');
       return;
     }
-    const weekdays: WeeklyHours = {
-      monday: { open: true, start: form.hoursStart, end: form.hoursEnd },
-      tuesday: { open: true, start: form.hoursStart, end: form.hoursEnd },
-      wednesday: { open: true, start: form.hoursStart, end: form.hoursEnd },
-      thursday: { open: true, start: form.hoursStart, end: form.hoursEnd },
-      friday: { open: true, start: form.hoursStart, end: form.hoursEnd },
-      saturday: { open: false }, sunday: { open: false },
-    };
+    const workingHours = Object.fromEntries(DAY_OPTIONS.map(([day]) => [day, form.hours[day].open
+      ? { open: true, start: form.hours[day].start, end: form.hours[day].end }
+      : { open: false }])) as WeeklyHours;
     setFormError(null);
     const saved = await saveState.run(async () => {
       const payload = {
         name: form.name.trim(), address: form.address.trim(), phone: form.phone.trim() || null,
-        branchId: form.branchId, timezone: form.timezone, active: form.active, workingHours: weekdays,
+        branchId: form.branchId, timezone: form.timezone, active: form.active, workingHours,
       };
       if (editingId === 'new') await api.createLocation({ clinicId: clinic.id, ...payload });
       else if (editingId) await api.updateLocation(editingId, payload);
@@ -90,7 +112,7 @@ export function LocationsEditor({ clinic, onChanged }: { clinic: Clinic; onChang
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-bold text-t1 inline-flex items-center gap-2"><MapPin className="w-4 h-4 text-indigo" /> Locations</h3>
         <button type="button" onClick={editingId === 'new' ? () => setEditingId(null) : beginCreate} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-indigo hover:bg-[var(--s3)]">
-          <Plus className="w-3 h-3" /> Add location
+          {editingId === 'new' ? <X className="w-3 h-3" /> : <Plus className="w-3 h-3" />} {editingId === 'new' ? 'Cancel new location' : 'Add location'}
         </button>
       </div>
       {branchFailure && (
@@ -138,7 +160,23 @@ export function LocationsEditor({ clinic, onChanged }: { clinic: Clinic; onChang
           <Field label="Address" required><TextInput value={form.address} onChange={e => setFormValue('address', e.target.value)} /></Field>
           <Field label="Phone (E.164)"><TextInput placeholder="+12125550100" value={form.phone} onChange={e => setFormValue('phone', e.target.value)} /></Field>
           <Field label="Timezone" required><Select value={form.timezone} onChange={e => setFormValue('timezone', e.target.value)}>{TIMEZONE_OPTIONS.map(zone => <option key={zone}>{zone}</option>)}</Select></Field>
-          <div className="grid grid-cols-2 gap-2"><Field label="Weekday open"><TextInput type="time" value={form.hoursStart} onChange={e => setFormValue('hoursStart', e.target.value)} /></Field><Field label="Weekday close"><TextInput type="time" value={form.hoursEnd} onChange={e => setFormValue('hoursEnd', e.target.value)} /></Field></div>
+          <div className="space-y-2 md:col-span-2" aria-label="Location hours by day">
+            <p className="text-xs font-semibold text-t2">Hours by day</p>
+            {DAY_OPTIONS.map(([day, label]) => {
+              const hours = form.hours[day];
+              return (
+                <div key={day} className="grid grid-cols-[110px_1fr_1fr] items-end gap-2 rounded-lg border border-[var(--b1)] p-2">
+                  <Toggle
+                    checked={hours.open}
+                    onChange={open => setForm(previous => ({ ...previous, hours: { ...previous.hours, [day]: { ...previous.hours[day], open } } }))}
+                    label={label}
+                  />
+                  <Field label="Open"><TextInput aria-label={`${label} open time`} disabled={!hours.open} type="time" value={hours.start} onChange={event => setForm(previous => ({ ...previous, hours: { ...previous.hours, [day]: { ...previous.hours[day], start: event.target.value } } }))} /></Field>
+                  <Field label="Close"><TextInput aria-label={`${label} close time`} disabled={!hours.open} type="time" value={hours.end} onChange={event => setForm(previous => ({ ...previous, hours: { ...previous.hours, [day]: { ...previous.hours[day], end: event.target.value } } }))} /></Field>
+                </div>
+              );
+            })}
+          </div>
           <Toggle checked={form.active} onChange={value => setFormValue('active', value)} label="Location active" />
           <div className="flex items-end justify-end gap-2">
             <button type="button" onClick={() => setEditingId(null)} className="rounded-xl border border-[var(--b1)] px-3 py-2 text-sm font-semibold text-t2">Cancel</button>

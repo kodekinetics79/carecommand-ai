@@ -721,7 +721,7 @@ export const FIELD_CATALOG: Array<{ type: FieldType; label: string; question: st
   { type: 'EMAIL', label: 'Email', question: 'What email should we send the confirmation to?', group: 'Contact' },
   { type: 'PREFERRED_DATE', label: 'Preferred date', question: 'What day works best for you?', group: 'Scheduling' },
   { type: 'PREFERRED_TIME', label: 'Preferred time', question: 'Do you prefer morning or afternoon?', group: 'Scheduling' },
-  { type: 'PREFERRED_LOCATION', label: 'Preferred location', question: 'Which of our locations is most convenient?', group: 'Scheduling', hasOptions: true },
+  { type: 'PREFERRED_LOCATION', label: 'Preferred location', question: 'Which of our locations is most convenient?', group: 'Scheduling' },
   { type: 'PATIENT_STATUS', label: 'New or existing patient', question: 'Have you visited us before, or would this be your first time?', group: 'Clinical' },
   { type: 'INSURANCE_PROVIDER', label: 'Insurance provider', question: 'Which insurance provider do you have, if any?', group: 'Clinical' },
   { type: 'REASON_FOR_VISIT', label: 'Reason for visit', question: 'May I ask the main reason for your visit?', group: 'Clinical' },

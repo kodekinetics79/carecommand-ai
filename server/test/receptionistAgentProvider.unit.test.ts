@@ -83,6 +83,7 @@ describe('Retell agent provider contract', () => {
       intakeFields: [],
     };
     const exported = buildRetellConfig(config, { webhookBaseUrl: 'https://api.example.test' });
+    expect(exported.webhookUrl).toBe(webhookUrl);
     expect(JSON.stringify(exported)).not.toMatch(/\{\{|\$\{/);
 
     vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(String(url).includes('/get-retell-llm/')

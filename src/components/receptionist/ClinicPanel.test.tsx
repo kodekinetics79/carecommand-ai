@@ -125,4 +125,44 @@ describe('ClinicPanel — every server error is shown, nothing saves silently', 
     expect(screen.getByText(/Branch mapping unavailable/)).toBeInTheDocument();
     expect(screen.queryByText(/Not mapped — booking disabled/)).not.toBeInTheDocument();
   });
+
+  it('persists per-day location hours instead of cloning Monday across the week', async () => {
+    let patched: Record<string, unknown> | null = null;
+    respond = async (path, init) => {
+      if (path === '/v1/receptionist/scheduling-branches') return [{ id: 'branch-1', name: 'Main', location: 'Market Street', timezone: 'America/Los_Angeles', active: true }];
+      if (path === '/v1/receptionist/locations/loc-1' && init?.method === 'PATCH') {
+        patched = JSON.parse(String(init.body));
+        return { id: 'loc-1', ...patched };
+      }
+      throw new Error(`Unexpected request in test: ${init?.method ?? 'GET'} ${path}`);
+    };
+    const location = {
+      id: 'loc-1', clinicId: 'clinic-1', name: 'Market Street', address: '500 Market Street', phone: null,
+      branchId: 'branch-1', timezone: 'America/Los_Angeles', active: true,
+      workingHours: {
+        monday: { open: true, start: '08:00', end: '17:00' },
+        tuesday: { open: true, start: '10:00', end: '18:00' },
+        saturday: { open: false },
+      },
+    } as NonNullable<Clinic['locations']>[number];
+    render(<Harness initial={clinic({ locations: [location] })} onReload={() => clinic({ locations: [location] })} />);
+
+    await screen.findByText('Scheduling branch: Main');
+    fireEvent.click(screen.getByRole('button', { name: 'Edit location' }));
+    expect(screen.getByLabelText('Tuesday open time')).toHaveValue('10:00');
+    fireEvent.click(screen.getByRole('button', { name: 'Saturday' }));
+    fireEvent.change(screen.getByLabelText('Saturday open time'), { target: { value: '09:30' } });
+    fireEvent.change(screen.getByLabelText('Saturday close time'), { target: { value: '13:00' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save location' }));
+
+    await waitFor(() => expect(patched).not.toBeNull());
+    expect(patched).toMatchObject({
+      workingHours: {
+        monday: { open: true, start: '08:00', end: '17:00' },
+        tuesday: { open: true, start: '10:00', end: '18:00' },
+        saturday: { open: true, start: '09:30', end: '13:00' },
+        sunday: { open: false },
+      },
+    });
+  });
 });

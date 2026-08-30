@@ -155,18 +155,24 @@ export default function ReceptionistStudio() {
       {createDialog === 'campaign' && activeClinic && (
         <FormDialog
           title="Create receptionist campaign"
-          message={`Create a draft for ${activeClinic.name}. No calls are placed by this action.`}
+          message={`Create a truthful draft for ${activeClinic.name}. These details are used in the generated receptionist prompt; no calls are placed by this action.`}
           submitLabel="Create draft"
-          fields={[{ name: 'name', label: 'Campaign name', required: true, placeholder: 'Appointment follow-up' }]}
+          fields={[
+            { name: 'name', label: 'Internal campaign name', required: true, placeholder: 'New-patient scheduling' },
+            { name: 'offerTitle', label: 'Caller-facing purpose', required: true, placeholder: 'Schedule a dental appointment' },
+            { name: 'appointmentType', label: 'Appointment type', required: true, placeholder: 'New-patient exam' },
+            { name: 'offerDescription', label: 'Approved scope', required: true, placeholder: 'Help callers request or book an eligible appointment.' },
+            { name: 'offerScript', label: 'Approved opening after disclosure', required: true, placeholder: 'How can I help with scheduling today?' },
+          ]}
           onClose={closeCreateDialog}
           onSubmit={async values => {
             const campaign = await api.createCampaign({
               clinicId: activeClinicId,
               name: values.name,
-              offerTitle: 'New offer',
-              offerDescription: 'Describe the offer here.',
-              offerScript: 'Introduce the offer warmly and ask if they would like to book.',
-              appointmentType: 'Consultation',
+              offerTitle: values.offerTitle,
+              offerDescription: values.offerDescription,
+              offerScript: values.offerScript,
+              appointmentType: values.appointmentType,
               eligibleLocationIds: activeClinic.locations?.map(location => location.id) ?? [],
             });
             await loadCampaigns(activeClinicId);
@@ -303,7 +309,7 @@ export default function ReceptionistStudio() {
               activeCampaign ? <PreviewPanel key={activeCampaign.id} campaignId={activeCampaign.id} /> : <EmptyState text="Select a campaign to preview the generated agent." />
             )}
             {tab === 'retell' && (
-              activeCampaign ? <RetellPanel key={activeCampaign.id} campaignId={activeCampaign.id} /> : <EmptyState text="Select a campaign to export its RetellAI configuration." />
+              activeCampaign ? <RetellPanel key={activeCampaign.id} campaignId={activeCampaign.id} onConfigure={() => selectTab('campaign')} /> : <EmptyState text="Select a campaign to export its RetellAI configuration." />
             )}
             {tab === 'outbound' && (
               activeClinic ? <OutboundPanel key={activeClinic.id} clinic={activeClinic} />
