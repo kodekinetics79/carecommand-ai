@@ -5,8 +5,8 @@ import { Prisma, PrismaClient } from '../server/generated/prisma/client';
 import { syntheticProfiles } from './synthetic/profileManifest';
 import { assertSyntheticSeedTarget } from './synthetic/seedSafety';
 import { seedGrowthDemo } from './synthetic/growthDemo';
-import { PLATFORM_LOCALE_PACKS, platformLocalePackHash } from '../server/lib/receptionist/localePacks/defaults';
-import { knowledgeHash, type KnowledgeDocument } from '../server/lib/receptionist/knowledge';
+import type { KnowledgeDocument } from '../server/lib/receptionist/knowledge';
+import { seedReceptionistDemo } from './synthetic/receptionistDemo';
 
 const target = assertSyntheticSeedTarget({
   nodeEnv: process.env.NODE_ENV,
@@ -25,6 +25,22 @@ const { connectionString, databaseName } = target;
 // the synthetic database, even though every call site here passes its own
 // client explicitly.
 process.env.DATABASE_URL = connectionString;
+
+// The receptionist demo layer deploys through the PRODUCTION deploy path, which
+// refuses to run with no voice provider configured — correctly. A synthetic
+// seed is a rehearsal by definition, so default to the mock provider unless the
+// caller supplied its own. The env schema refuses a mock Retell key outside the
+// demo profile, so this cannot leak into a pilot.
+process.env.RETELL_API_KEY ??= `mock_synthetic_${databaseName}`.slice(0, 60);
+process.env.RETELL_FROM_NUMBER ??= '+15550100000';
+
+// Imported HERE, not at the top. Both of these reach `server/lib/db` (and so
+// `server/config/env`) transitively, and a static import is hoisted above the
+// assignments above — which would freeze the environment before the synthetic
+// database URL and the mock voice provider exist, and the receptionist demo
+// layer would then refuse to deploy with `setup_required`.
+const { PLATFORM_LOCALE_PACKS, platformLocalePackHash } = await import('../server/lib/receptionist/localePacks/defaults');
+const { knowledgeHash } = await import('../server/lib/receptionist/knowledge');
 
 // Inactivity windows are evaluated against the API's wall clock, so a
 // `lastVisitAt` pinned to the controlled clock would fall out of the 30-60 /
@@ -514,6 +530,15 @@ async function seed(): Promise<void> {
     userIds, userTenant, patientIds, patientTenant, patientBranch,
   });
 
+  // The receptionist spine: a mapped location, a named agent, a campaign with
+  // real intake, a bookable service and provider availability — then deploy,
+  // verify and activate through the production paths, so a demo tenant opens
+  // Studio on a working front desk rather than four empty states.
+  const receptionist = await seedReceptionistDemo({
+    db, now, demoClock, stableUuid,
+    clinicIds: receptionistClinicIds, branchIds, branchTenant, userIds, userTenant,
+  });
+
   const counts = {
     profile: profile.profile,
     database: databaseName,
@@ -533,6 +558,7 @@ async function seed(): Promise<void> {
     demoClock: demoClock.toISOString(),
     fixedSeed: profile.fixedSeed,
     growth,
+    receptionist,
   };
   console.log(JSON.stringify(counts));
 }

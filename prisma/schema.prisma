@@ -175,6 +175,7 @@ model Tenant {
   receptionistClinics                 ReceptionistClinic[]
   receptionistLocations               ReceptionistLocation[]
   receptionistAgents                  ReceptionistAgent[]
+  receptionistAgentDeployments        ReceptionistAgentDeployment[]
   receptionistCampaigns               ReceptionistCampaign[]
   receptionistIntakeFields            ReceptionistIntakeField[]
   receptionistCallLogs                ReceptionistCallLog[]
@@ -1840,6 +1841,22 @@ enum ReceptionistAgentProbeStatus {
   FAILED
 }
 
+enum ReceptionistDeploymentStatus {
+  PENDING
+  PUBLISHED
+  VERIFIED
+  FAILED
+  SUPERSEDED
+}
+
+// Who asked for a provider attempt: a signed-in user, the re-verification
+// worker, or a deploy (which verifies as part of its own flow).
+enum ReceptionistAttemptSource {
+  USER
+  SYSTEM
+  DEPLOY
+}
+
 enum ReceptionistCallOutcome {
   IN_PROGRESS
   BOOKED
@@ -2098,13 +2115,21 @@ model ReceptionistAgent {
   providerVerificationExpiresAt DateTime?
   providerLastAttemptAt         DateTime?
   providerLastAttemptStatus     ReceptionistAgentProbeStatus    @default(NEVER)
+  providerLastAttemptSource     ReceptionistAttemptSource        @default(USER)
   providerLastErrorCode         String?
+  // Prompt hash read back from the verified provider deployment. Compared with
+  // the draft plan so a prompt edited in the Retell console reads as drift.
+  providerPromptHash            String?
+  // The deployment this agent currently runs. Null for a manually linked (BYO)
+  // agent, whose prompt CareCommand cannot attest to.
+  currentDeploymentId           String?                          @db.Uuid
   createdAt                     DateTime                         @default(now())
   updatedAt                     DateTime                         @updatedAt
   tenant                        Tenant                           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   clinic                        ReceptionistClinic               @relation(fields: [clinicId], references: [id], onDelete: Cascade)
   campaigns                     ReceptionistCampaign[]
   outboundCampaigns             ReceptionistOutboundCampaign[]
+  deployments                   ReceptionistAgentDeployment[]
 
   @@index([tenantId, clinicId, active])
   @@index([providerAgentId, providerVersion], map: "ReceptionistAgent_provider_deployment_idx")
@@ -2151,10 +2176,66 @@ model ReceptionistCampaign {
   intakeFields        ReceptionistIntakeField[]
   callLogs            ReceptionistCallLog[]
   outboundAuthorityCampaigns ReceptionistOutboundCampaign[] @relation("OutboundBookingAuthority")
+  deployments         ReceptionistAgentDeployment[]
 
   @@index([tenantId, clinicId, status])
   @@unique([tenantId, clinicId, id])
   @@unique([tenantId, id])
+}
+
+// One CareCommand-authored deployment of a campaign's prompt/tools to Retell.
+// The row is the deployment record AND the provider evidence: mock mode answers
+// its probe from these columns, so the API, the worker and the seed can never
+// disagree about what the provider is running.
+model ReceptionistAgentDeployment {
+  id                   String                       @id @default(uuid()) @db.Uuid
+  tenantId             String                       @db.Uuid
+  clinicId             String                       @db.Uuid
+  agentId              String                       @db.Uuid
+  campaignId           String                       @db.Uuid
+  status               ReceptionistDeploymentStatus @default(PENDING)
+  // True when the deployment was made against the mock provider. Enforced
+  // against the hash prefixes by a CHECK so mock evidence can never be read as
+  // live evidence.
+  mock                 Boolean                      @default(false)
+  providerAgentId      String?
+  providerLlmId        String?
+  providerLlmVersion   Int?
+  // The exact published agent version this deployment pins. Retell has no
+  // public tag-assignment write, so the number is the binding, not the tag.
+  providerAgentVersion Int?
+  providerVersionTag   String                       @default("prod")
+  promptHash           String
+  beginMessageHash     String
+  toolFingerprint      String
+  intakeFingerprint    String
+  intakeSchemaRevision Int
+  configFingerprint    String
+  voiceId              String
+  language             String
+  // Deployed prompt and tools: tenant configuration, never PHI. Kept so the
+  // draft-versus-deployed comparison is a fact and not a re-derivation.
+  promptText           String
+  toolsJson            Json
+  steps                Json?
+  providerErrorCode    String?
+  numberBound          Boolean                      @default(false)
+  boundPhoneNumber     String?
+  deployedById         String?                      @db.Uuid
+  deployedBySource     ReceptionistAttemptSource    @default(USER)
+  startedAt            DateTime                     @default(now())
+  publishedAt          DateTime?
+  verifiedAt           DateTime?
+  createdAt            DateTime                     @default(now())
+  updatedAt            DateTime                     @updatedAt
+  tenant               Tenant                       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  agent                ReceptionistAgent            @relation(fields: [tenantId, clinicId, agentId], references: [tenantId, clinicId, id], onDelete: Cascade, map: "ReceptionistAgentDeployment_agent_scope_fkey")
+  campaign             ReceptionistCampaign         @relation(fields: [tenantId, campaignId], references: [tenantId, id], onDelete: Cascade, map: "ReceptionistAgentDeployment_campaign_scope_fkey")
+
+  @@unique([tenantId, id])
+  @@index([tenantId, agentId, createdAt])
+  @@index([tenantId, campaignId, status])
+  @@index([providerAgentId, providerAgentVersion])
 }
 
 model ReceptionistIntakeField {
