@@ -81,7 +81,11 @@ export function DeployPanel({ campaignId, config, pollIntervalMs = DEPLOYMENT_PO
     diffResource.reload();
   }, [statusResource, diffResource]);
 
-  const agentId = status?.agentScope.agentId ?? null;
+  // Remembered across a status refetch: reloading provider status empties
+  // `status` for a moment, and the agent we just deployed must not lose its
+  // "Verify again" action in that window.
+  const [knownAgentId, setKnownAgentId] = useState<string | null>(null);
+  const agentId = status?.agentScope.agentId ?? knownAgentId;
 
   async function verifyAndSettle(targetAgentId: string | null) {
     setVerifyError(null);
@@ -119,6 +123,7 @@ export function DeployPanel({ campaignId, config, pollIntervalMs = DEPLOYMENT_PO
         throw error;
       }
       setLatest(response.deployment);
+      setKnownAgentId(response.agent?.id ?? response.deployment?.agentId ?? agentId);
       if (response.verification.status === 'failed') {
         setVerifyError({ status: 'error', message: response.verification.message ?? 'Verification failed.', code: response.verification.code ?? null, fieldErrors: {}, failure: { message: response.verification.message ?? 'Verification failed.', code: response.verification.code, timedOut: false, offline: false, permissionDenied: false, sessionExpired: false } });
         setPhase('confirm');

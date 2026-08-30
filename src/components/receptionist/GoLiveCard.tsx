@@ -32,7 +32,7 @@ export function GoLiveCard({ readiness, campaignStatus, providerMode }: {
           <span className="badge badge-blue">{done}/{steps.length} steps</span>
         </div>
       </div>
-      <ol className="space-y-1.5">
+      <ol className="space-y-1.5" aria-label="Go live steps">
         {steps.map((step, index) => {
           const { Icon, className, word } = STEP_ICON[step.status];
           return (
