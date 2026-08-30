@@ -92,7 +92,7 @@ const BLOCKING_STATUSES = ['CONFIRMED', 'RISKY', 'ARRIVED', 'COMPLETED', 'WAITLI
 const overlaps = (aStart: Date, aEnd: Date, bStart: Date, bEnd: Date) => aStart < bEnd && bStart < aEnd;
 
 interface ParsedDate { year: number; month: number; day: number; dayOfWeek: number }
-interface LocalParts { dateISO: string; minuteOfDay: number; dayOfWeek: number }
+export interface LocalParts { dateISO: string; minuteOfDay: number; dayOfWeek: number }
 
 function parseDateISO(dateISO: string): ParsedDate {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateISO);
@@ -112,7 +112,7 @@ export function validateIanaTimezone(timezone: string): string {
   }
 }
 
-function partsAt(instant: Date, timezone: string): LocalParts {
+export function partsAt(instant: Date, timezone: string): LocalParts {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', hourCycle: 'h23',

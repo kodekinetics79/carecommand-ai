@@ -12,6 +12,10 @@ import type { Prisma } from '../generated/prisma/client';
 export type WorkflowEventType =
   | 'appointment.created' | 'appointment.cancelled' | 'appointment.rescheduled' | 'appointment.no_show'
   | 'appointment_request.created' | 'receptionist.appointmentRequest.created'
+  // AI receptionist clinic configuration and after-hours facts (C2).
+  | 'receptionist.call.after_hours'
+  | 'receptionist.clinic.hours_changed' | 'receptionist.clinic.timezone_changed' | 'receptionist.clinic.phone_changed'
+  | 'receptionist.knowledge.approved' | 'receptionist.locale_pack.approved'
   | 'deposit.required' | 'deposit.missing' | 'deposit.paid'
   | 'payment.request.created' | 'payment.link.created' | 'payment.succeeded' | 'payment.failed' | 'payment.expired'
   | 'revenue.leakage_detected'
@@ -118,6 +122,19 @@ async function deriveFromEvent(tenantId: string, input: EventInput, eventId: str
     }
     case 'revenue.leakage_detected': {
       await upsertSignal(tenantId, { signalType: 'revenue_leakage', entityType: 'revenueLeak', entityId: id, severity: 'high', score: 70, reason: 'Potential revenue leakage detected.', sourceEventId: eventId });
+      break;
+    }
+    case 'receptionist.call.after_hours': {
+      // The event is per call; the signal is per clinic and is refreshed with
+      // a rolling 7-day count. Once a human resolves it, it is never reopened.
+      const clinicId = typeof input.payload?.clinicId === 'string' ? input.payload.clinicId : null;
+      if (!clinicId) break;
+      const since = new Date(Date.now() - 7 * 86_400_000);
+      const count = await db.receptionistCallLog.count({ where: { tenantId, clinicId, direction: 'inbound', outsideHours: true, startedAt: { gte: since } } });
+      await upsertSignal(tenantId, {
+        signalType: 'after_hours_call', entityType: 'receptionistClinic', entityId: clinicId, severity: 'low', score: 20,
+        reason: `${count} inbound call${count === 1 ? '' : 's'} arrived outside configured hours in the last 7 days.`, sourceEventId: eventId,
+      });
       break;
     }
     default:

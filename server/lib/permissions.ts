@@ -90,6 +90,9 @@ export const PERMISSIONS = [
   'receptionist:recordings:read',
   // Configure receptionist clinics/agents/campaigns and mutate their workflow.
   'receptionist:manage',
+  // Read-only view of receptionist configuration (clinics, hours, knowledge,
+  // locale packs, catalog): the read-only Studio and the Front Desk page.
+  'receptionist:read',
   // Narrow front-desk operation: decide or reconcile an AI appointment request
   // against an already-created canonical scheduler appointment.
   'receptionist:booking-review',
@@ -149,6 +152,7 @@ export const ROLE_PERMISSIONS: Record<UserRole, Permission[]> = {
     'crm:read', 'crm:write', 'campaign:read', 'inventory:read', 'inventory:write', 'partner-report:write',
     'receptionist:call-artifacts:read',
     'receptionist:booking-review',
+    'receptionist:read',
   ],
   ANALYST: [
     'patient:read', 'appointment:read', 'billing:read', 'staff:read', 'settings:read', 'audit:read',
@@ -160,7 +164,7 @@ export const ROLE_PERMISSIONS: Record<UserRole, Permission[]> = {
   ],
   AUDITOR: [
     'compliance:read', 'audit:read',
-    'receptionist:call-artifacts:read', 'receptionist:recordings:read',
+    'receptionist:call-artifacts:read', 'receptionist:recordings:read', 'receptionist:read',
   ],
 };
 
