@@ -13,7 +13,7 @@ export type PromptFixtureName = 'us-full' | 'gb-full' | 'minimal-no-knowledge' |
 export function packFor(language: 'en-US' | 'en-GB'): PromptLocalePack {
   const platform = PLATFORM_LOCALE_PACKS.find(pack => pack.language === language);
   if (!platform) throw new Error(`No platform locale pack for ${language}`);
-  return { id: null, strings: platform.strings, evidenceHash: platformLocalePackHash(platform) };
+  return { id: null, strings: platform.strings, evidenceHash: platformLocalePackHash(platform), backfilledKeys: [] };
 }
 
 const KNOWLEDGE: KnowledgeDocument = {

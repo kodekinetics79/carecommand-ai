@@ -397,6 +397,22 @@ model Patient {
   tags                           String[]
   lastVisitAt                    DateTime?
   nextVisitAt                    DateTime?
+  // "Human only" — this person must never be answered by the AI line.
+  //
+  // A stored clinical decision, taken by a named human: cognitive impairment, a
+  // speech difference the line failed once already, a safeguarding note. It is
+  // deliberately NOT inferable — no model, no heuristic and no call outcome may
+  // set it, because the whole value of the flag is that a person decided it and
+  // a person can be asked why. `call_inbound` reads it before the receptionist
+  // takes a single turn.
+  //
+  // `humanOnlySetByUserId` is an attribution reference, not a relation: a
+  // composite FK here would add another managed constraint to the tenant
+  // integrity manifest for a field nothing joins on.
+  humanOnly                      Boolean                         @default(false)
+  humanOnlyReason                String?                         @db.VarChar(240)
+  humanOnlySetAt                 DateTime?
+  humanOnlySetByUserId           String?                         @db.Uuid
   deletedAt                      DateTime?
   createdAt                      DateTime                        @default(now())
   updatedAt                      DateTime                        @updatedAt
@@ -2365,6 +2381,14 @@ model ReceptionistCallLog {
   outsideHours                 Boolean?
   // 'connected' | 'unknown' from the provider disconnection reason at call end.
   transferOutcome              String?
+  // Comprehension. `unparseableTurns` counts CONSECUTIVE turns the receptionist
+  // could not parse on this call; the server owns the count so the decision to
+  // stop trying is not the model's to make. `comprehensionBailoutAt` is stamped
+  // the moment the second one arrives and the call is handed to a person — the
+  // durable record that this caller was failed by the line, and the row the
+  // "What it missed" ledger reads.
+  unparseableTurns             Int                                  @default(0)
+  comprehensionBailoutAt       DateTime?
   localePackId                 String?                              @db.Uuid
   outboundCampaignId           String?                              @db.Uuid
   targetId                     String?                              @db.Uuid
@@ -2399,6 +2423,9 @@ model ReceptionistCallLog {
   @@index([tenantId, transcriptRetentionExpiresAt])
   @@index([tenantId, reviewStatus, updatedAt])
   @@index([tenantId, boundProviderAgentId, boundProviderAgentVersion])
+  // Repeat-caller detection runs on every inbound call before the caller hears
+  // anything, so the window read has to be an index seek, not a scan.
+  @@index([tenantId, callerPhone, direction, createdAt], map: "ReceptionistCallLog_repeat_caller_idx")
   @@index([tenantId, patientId, createdAt])
   @@index([tenantId, clinicId, createdAt])
   @@index([tenantId, clinicId, direction, createdAt])

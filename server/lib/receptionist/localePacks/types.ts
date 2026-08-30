@@ -47,6 +47,26 @@ export const LOCALE_PACK_MESSAGE_KEYS = {
     mustContain: ['agent_name', 'clinic_name'],
     describe: 'Opening AI + recording disclosure. Its rendered text is hashed as consent evidence.',
   },
+
+  // --- Caller safety: the closing disclosure -------------------------------
+  // California AB 3030 requires the AI disclaimer on an audio interaction to be
+  // given verbally at the START *and* AT THE END. Every pack shipped an opening
+  // key and no closing one at all, so a US clinic answering with this product
+  // was out of compliance on every completed call.
+  //
+  // It is the opening disclosure's twin in every respect that matters: the
+  // baseline text is product-owned, it is rendered as a required final turn
+  // rather than a suggestion, its rendered text is hashed as evidence, and its
+  // ABSENCE FROM THE APPROVED PACK is a blocking readiness failure. A pack that
+  // acquires it only by platform backfill has not attested to it, and its
+  // evidence hash does not cover it — which is exactly what the readiness check
+  // refuses. AB 3030 also requires clear instructions for reaching a human, so
+  // the closing line says how, in the same breath.
+  'disclosure.closing': {
+    vars: ['agent_name', 'clinic_name'],
+    mustContain: ['agent_name', 'clinic_name'],
+    describe: 'Closing AI disclosure, spoken as the last turn of every call. Required by California AB 3030 and hashed as evidence.',
+  },
   'dnc.acknowledge': { vars: [], describe: 'Spoken immediately when a caller asks not to be contacted again.' },
   'dnc.confirmed': { vars: [], describe: 'Spoken only after the do-not-call tool confirms success.' },
   'dnc.failed': { vars: [], describe: 'Spoken when the do-not-call tool failed or was uncertain.' },
@@ -94,6 +114,12 @@ export const LOCALE_PACK_MESSAGE_KEYS = {
   'admission.denied.capacity': { vars: [], describe: 'Spoken when the tenant is already at its simultaneous-call limit.' },
   'admission.denied.demo': { vars: [], describe: 'Spoken when the workspace is in demonstration mode and may not take a patient call.' },
   'admission.denied.unavailable': { vars: [], describe: 'Spoken when the AI line is unavailable for any other admission reason.' },
+  // Caller safety: the two routings that happen BEFORE the receptionist takes a
+  // turn. Neither is a denial the caller caused, and neither says why — a
+  // patient does not need to be told they are flagged, only that a person is
+  // coming.
+  'admission.denied.human_only': { vars: [], describe: 'Spoken when this caller is marked Human only. Routed straight to a person with no AI turn; never explains the flag.' },
+  'admission.denied.repeat_caller': { vars: [], describe: 'Spoken when this number has reached the line repeatedly in a short window and the AI is evidently not helping.' },
 
   // --- C12: human handoff ---------------------------------------------------
   // Durable evidence (task id, acknowledgment state, transfer state) belongs in
@@ -110,6 +136,27 @@ export const LOCALE_PACK_MESSAGE_KEYS = {
   'tool.booking.confirmation_accepted': { vars: [], describe: 'Appended to a booking confirmation only when the messaging provider accepted the send.' },
   'tool.message.recorded': { vars: [], describe: 'take_message recorded a new callback request.' },
   'tool.message.appended': { vars: [], describe: 'take_message appended to the callback request already open for this call.' },
+
+  // --- Caller safety: the emergency path happens ON THE CALL ---------------
+  // An emergency used to produce a StaffTask and a critical signal, and the
+  // Front Desk board was the only thing that surfaced it: in-app only, a 20
+  // second poll, nobody alerted if no tab is open. An emergency could sit
+  // overnight behind a masked number. These two lines are what the receptionist
+  // says while it actually places the transfer or takes the callback, in the
+  // same turn as the emergency instruction. The board card becomes the record
+  // of what happened, not the mechanism that makes it happen.
+  'emergency.transfer.line': { vars: [], describe: 'Spoken immediately after the emergency instruction when the receptionist is placing the transfer to a person during the call.' },
+  'emergency.callback.line': { vars: [], describe: 'Spoken immediately after the emergency instruction when no transfer target exists and an immediate callback is being arranged instead.' },
+
+  // --- Caller safety: comprehension ----------------------------------------
+  // A stroke survivor tried five times to book an appointment and could not get
+  // past an AI line. After two consecutive turns it cannot parse, the
+  // receptionist stops trying: it apologises plainly and hands over. There is no
+  // third attempt, and none of these lines may instruct the caller to change how
+  // they speak, what they are calling from, or where they are.
+  'comprehension.retry': { vars: [], describe: 'Spoken after ONE turn the receptionist could not parse. The only retry there is; it never asks the caller to change anything about themselves.' },
+  'comprehension.bail_out.transfer': { vars: [], describe: 'Spoken on the second consecutive unparseable turn when a person can be reached: apologise and hand over. Never a third attempt.' },
+  'comprehension.bail_out.callback': { vars: [], describe: 'Spoken on the second consecutive unparseable turn when no transfer target exists: apologise and take a callback. Never a third attempt.' },
 } as const satisfies Record<string, MessageKeyContract>;
 
 export type LocalePackMessageKey = keyof typeof LOCALE_PACK_MESSAGE_KEYS;

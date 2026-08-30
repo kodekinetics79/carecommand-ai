@@ -132,7 +132,7 @@ export async function assemblePromptConfig(
         })),
       }
       : null,
-    localePack: { id: resolvedPack.id, strings: resolvedPack.strings, evidenceHash: resolvedPack.evidenceHash },
+    localePack: { id: resolvedPack.id, strings: resolvedPack.strings, evidenceHash: resolvedPack.evidenceHash, backfilledKeys: resolvedPack.backfilledKeys },
     campaign: {
       id: campaign.id,
       name: campaign.name,

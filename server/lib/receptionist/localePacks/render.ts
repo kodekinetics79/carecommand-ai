@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { containsInstructionOverride, sanitizePromptText } from '../promptSafety';
+import { PROHIBITED_CALLER_INSTRUCTIONS, findProhibitedCallerInstructions } from '../prohibitedPhrases';
 import {
   DATE_STYLES,
   LOCALE_PACK_MESSAGE_KEYS,
@@ -79,6 +80,17 @@ export function validateLocalePackStrings(strings: LocalePackStrings): { ok: boo
     if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(template)) issues.push({ path: `messages.${key}`, message: 'Message contains control characters.' });
     if (/\{%|%\}/.test(template) || /\{\{(?!\s*[A-Za-z0-9_]+\s*\}\})/.test(template)) issues.push({ path: `messages.${key}`, message: 'Only {{variable}} placeholders are allowed.' });
     if (containsInstructionOverride(template)) issues.push({ path: `messages.${key}`, message: 'Message contains instruction-override phrasing.' });
+    // A pack cannot be APPROVED with a sentence that tells the caller to change
+    // how they speak, what they are calling from, or where they are. The lint
+    // catches it in CI; this catches a clinic typing it into the Studio, which
+    // is the path that actually reaches a patient.
+    for (const id of findProhibitedCallerInstructions(template)) {
+      const entry = PROHIBITED_CALLER_INSTRUCTIONS.find(item => item.id === id);
+      issues.push({
+        path: `messages.${key}`,
+        message: `Message tells the caller to change how they speak, what they are calling from, or where they are (${id}: “${entry?.example ?? id}”). The receptionist hands over to a person instead; it never asks the caller to adapt.`,
+      });
+    }
     const used = placeholdersIn(template);
     for (const name of used) {
       if (!contract.vars.includes(name)) issues.push({ path: `messages.${key}`, message: `Placeholder {{${name}}} is not allowed here (allowed: ${contract.vars.join(', ') || 'none'}).` });

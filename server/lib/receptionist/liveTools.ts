@@ -27,10 +27,21 @@ import {
   renderRecordingDisclosure,
 } from './privacyLifecycle';
 import { restrictCallToBasicAttributes } from '../retell';
+import { closingDisclosureEvidenceHash } from '../../modules/receptionist/promptService';
 import { transferReadiness } from './transferReadiness';
 import { CONFIRMATION_OUTBOX_SOURCE, processAppointmentConfirmations } from './confirmationOutbox';
 import { lockDncDestinationFence } from './dncFence';
-import { createSafetyTask, possibleDuplicatePatientNote } from './frontDeskTask';
+import {
+  COMPREHENSION_BAILOUT_REASON,
+  COMPREHENSION_BAILOUT_STAFF_NOTE,
+  HUMAN_ONLY_REASON,
+  HUMAN_ONLY_STAFF_NOTE,
+  createSafetyTask,
+  possibleDuplicatePatientNote,
+} from './frontDeskTask';
+import { HUMAN_ONLY_PERMITTED_TOOLS, callIsHumanOnly } from './humanOnly';
+import { MAX_UNPARSEABLE_TURNS, comprehensionDecision } from './comprehension';
+import { recordWorkflowEvent } from '../intelligence';
 import { resolveCallLocalePack, resolvedLocaleFormat, type ResolvedLocalePack } from './localePacks/resolve';
 import { renderPackMessage } from './localePacks/render';
 import { EMERGENCY_FALLBACK_NUMBER_FREE } from './localePacks/defaults';
@@ -428,24 +439,137 @@ export async function takeMessage(ctx: ToolContext, args: Record<string, unknown
   };
 }
 
-/** Creates a critical staff signal without delaying immediate emergency advice. */
+/**
+ * Emergency handling that does not depend on anyone looking at a screen.
+ *
+ * This used to create a StaffTask and a critical signal and stop there. The
+ * Front Desk board was the only thing that surfaced either: in-app only, a
+ * twenty-second poll, and nobody alerted at all if no tab is open. An emergency
+ * could therefore sit overnight behind a masked number — which is the single
+ * most serious gap in the whole product, and it is not one a colour, a lane or
+ * a badge can close.
+ *
+ * So the mechanism moves onto the call. The receptionist gives the emergency
+ * instruction, and then, in the same turn, either places the transfer to the
+ * clinic's human fallback or promises an immediate callback. `next_action` is
+ * what the agent must do next, and the prompt is written to obey it. The board
+ * card is still created — it is now the durable RECORD of what happened, not
+ * the mechanism that makes it happen.
+ */
 export async function reportEmergency(ctx: ToolContext, args: Record<string, unknown>) {
   const task = await createSafetyTask(ctx, 'emergency', args);
   // The emergency number is jurisdictional: it comes from the call's approved
   // locale pack. With no pack (and no country to fall back on) the agent says
   // the number-free sentence rather than naming the wrong country's number.
-  const pack = await callPack(ctx);
-  const message = pack
+  const [pack, transfer] = await Promise.all([callPack(ctx), callTransferReadiness(ctx)]);
+  const instruction = pack
     ? renderPackMessage(pack.strings, 'tool.emergency.message', { emergency_number: pack.strings.emergencyNumber })
     : EMERGENCY_FALLBACK_NUMBER_FREE;
+  // The clinic-side half of the same turn. It is appended to the instruction
+  // rather than replacing it: calling the emergency services always comes
+  // first, and reaching the practice never displaces it.
+  const escalation = transfer.ready
+    ? speak(pack, 'emergency.transfer.line', {}, "I'm also connecting you to someone at the practice right now. Please stay on the line.")
+    : speak(pack, 'emergency.callback.line', {}, 'I have alerted the practice, and someone will call you straight back on this number. Please don’t wait for that call if you need help now.');
+  // Two pack renders joined, never a sentence written here: the emergency
+  // instruction the caller must hear first, then what we are doing about it.
+  const spoken = `${instruction} ${escalation}`;
   return {
     emergency_recorded: true,
     protocol_status: 'pending_provider_evidence',
     acknowledgment_pending: true,
+    // What the agent must DO next, on this call, while the caller is still on
+    // the line. Not advice; the prompt treats it as an instruction.
+    next_action: transfer.ready ? 'transfer_now' : 'offer_callback',
+    transfer_available: transfer.ready,
+    // The board card is evidence, not the alerting channel. Said plainly here
+    // so no future reader mistakes the task id for "somebody has been told".
+    alerting_channel: transfer.ready ? 'live_transfer' : 'immediate_callback',
     duplicate: task.duplicate,
     appended: task.appended,
     task_id: task.taskId,
-    message,
+    message: spoken,
+  };
+}
+
+/**
+ * Two consecutive turns the receptionist could not parse, and it stops trying.
+ *
+ * The count lives on the call row, not in the model's head, because a prompt
+ * instruction to give up is a suggestion and a server-side ceiling is a
+ * guarantee. Once `unparseableTurns` reaches the ceiling there is no branch in
+ * this function that returns a retry, however many times the agent asks — which
+ * is the property the "no third attempt" test pins.
+ *
+ * Nothing this returns ever asks the caller to change how they speak, what they
+ * are calling from, or where they are. That is enforced by the pack validator
+ * and by `receptionistProhibitedPhrases.lint.test.ts`, not by good intentions.
+ */
+export async function reportComprehensionFailure(ctx: ToolContext, args: Record<string, unknown>) {
+  const call = ctx.callId
+    ? await db.receptionistCallLog.findFirst({
+      where: { tenantId: ctx.tenantId, retellCallId: ctx.callId },
+      select: { id: true, clinicId: true, unparseableTurns: true, comprehensionBailoutAt: true },
+    })
+    : null;
+  const [pack, transfer] = await Promise.all([callPack(ctx), callTransferReadiness(ctx)]);
+
+  // No call row means we cannot count, and a comprehension failure we cannot
+  // count is not one we may keep retrying on a guess. Bail out immediately:
+  // the caller is already struggling, and the safe direction is toward a human.
+  const turns = call ? call.unparseableTurns + 1 : MAX_UNPARSEABLE_TURNS;
+  const decision = comprehensionDecision(turns);
+
+  if (call) {
+    await db.receptionistCallLog.update({
+      where: { id: call.id },
+      data: {
+        unparseableTurns: turns,
+        // Stamped once, on the turn the line gave up, and never moved after.
+        ...(decision.bailOut && !call.comprehensionBailoutAt ? { comprehensionBailoutAt: new Date() } : {}),
+      },
+    });
+  }
+
+  if (!decision.bailOut) {
+    return {
+      unparseable_turns: decision.unparseableTurns,
+      attempts_remaining: decision.attemptsRemaining,
+      bail_out: false,
+      next_action: 'ask_once_more',
+      message: speak(pack, 'comprehension.retry', {}, "I'm sorry, that's my fault — I didn't catch that. Could you tell me again?"),
+    };
+  }
+
+  // The handover is durable work, so it is filed as a handoff task with its own
+  // reason: the front desk sees "the line could not understand this person",
+  // which is a different thing to ask a human about than "they wanted a human".
+  const task = await createSafetyTask(ctx, 'human_handoff', {
+    ...args,
+    reason_category: COMPREHENSION_BAILOUT_REASON,
+    message: COMPREHENSION_BAILOUT_STAFF_NOTE,
+  });
+  if (call) {
+    await recordWorkflowEvent(ctx.tenantId, {
+      eventType: 'receptionist.call.comprehension_bailout',
+      entityType: 'receptionistCallLog',
+      entityId: call.id,
+      sourceModule: 'receptionist',
+      payload: { clinicId: call.clinicId, unparseableTurns: turns, transferAvailable: transfer.ready },
+    });
+  }
+  return {
+    unparseable_turns: decision.unparseableTurns,
+    // Zero, permanently. There is no third attempt.
+    attempts_remaining: 0,
+    bail_out: true,
+    next_action: transfer.ready ? 'transfer_now' : 'offer_callback',
+    transfer_available: transfer.ready,
+    task_id: task.taskId,
+    duplicate: task.duplicate,
+    message: transfer.ready
+      ? speak(pack, 'comprehension.bail_out.transfer', {}, "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I'm putting you through to a person at the practice now. Please stay on the line.")
+      : speak(pack, 'comprehension.bail_out.callback', {}, "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've asked someone at the practice to call you straight back on this number, and I've written down that we spoke."),
   };
 }
 
@@ -1362,6 +1486,38 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
 }
 
 export async function handleAgentTool(ctx: ToolContext, name: string, args: Record<string, unknown>) {
+  // "Human only", enforced where it cannot be talked out of.
+  //
+  // `call_inbound` already routed this caller to a person and the prompt is
+  // told to transfer without taking a turn. Both of those are instructions to a
+  // model, and a flag that exists because a patient must never be handled by an
+  // AI is not worth having as an instruction. So the tool layer refuses: on a
+  // Human-only call the receptionist may get the caller to a person, write down
+  // what they need, and raise an emergency. It may not check availability, book,
+  // cancel, reschedule, verify an identity or read a record — no matter what
+  // the prompt says, and no matter what the model decides to try.
+  if (!HUMAN_ONLY_PERMITTED_TOOLS.includes(name) && await callIsHumanOnly(db, { tenantId: ctx.tenantId, callId: ctx.callId })) {
+    const task = await createSafetyTask(ctx, 'human_handoff', {
+      ...args,
+      reason_category: HUMAN_ONLY_REASON,
+      message: HUMAN_ONLY_STAFF_NOTE,
+    });
+    const pack = await callPack(ctx);
+    return {
+      routed_to_human: true,
+      human_only: true,
+      tool_refused: name,
+      // No detail about the flag reaches the caller. They are being helped by a
+      // person; they are not being read their own record.
+      next_action: 'transfer_now',
+      task_id: task.taskId,
+      duplicate: task.duplicate,
+      message: speak(pack, 'admission.denied.human_only', {}, "Thanks for calling. I'm putting you straight through to someone at the front desk now — please stay on the line."),
+    };
+  }
+  // Any tool other than the comprehension report is evidence the receptionist
+  // understood this turn, so it clears the consecutive-failure count.
+  if (name !== 'report_comprehension_failure') await clearUnparseableTurns(ctx);
   if (name === 'record_recording_preference') {
     const decision = str(args.recording_decision)?.toUpperCase();
     if (!ctx.callId || !['GRANTED', 'REFUSED', 'WITHDRAWN'].includes(decision ?? '')) {
@@ -1436,6 +1592,16 @@ export async function handleAgentTool(ctx: ToolContext, name: string, args: Reco
         disclosureLocalePackId: consentPack?.id ?? null,
         disclosureLocale: consentPack ? `${consentPack.language}/${consentPack.country}` : null,
         disclosureSource: consentPack ? consentPack.source : 'baseline_template',
+        // AB 3030 requires the disclosure at BOTH ends of the call, so the
+        // consent artefact records both. The opening hash is what the caller
+        // was read before they answered; this is the hash of the words they
+        // will be read at the end, resolved from the same pack in the same
+        // breath — so a regulator reading this row a year later can reproduce
+        // the whole disclosure, not half of it.
+        closingDisclosureTextHash: closingDisclosureEvidenceHash(speak(consentPack, 'disclosure.closing', {
+          agent_name: configuredAgents[0].name,
+          clinic_name: call.clinic.name,
+        }, '')),
       },
     });
     return {
@@ -1463,5 +1629,28 @@ export async function handleAgentTool(ctx: ToolContext, name: string, args: Reco
   if (name === 'request_human_handoff') return requestHumanHandoff(ctx, args);
   if (name === 'take_message') return takeMessage(ctx, args);
   if (name === 'report_emergency') return reportEmergency(ctx, args);
+  if (name === 'report_comprehension_failure') return reportComprehensionFailure(ctx, args);
   return { error: 'unknown_function', message: "I'm not able to help with that just yet." };
+}
+
+/**
+ * A turn the receptionist DID understand clears the unparseable count.
+ *
+ * The ceiling is two CONSECUTIVE failures, and this is what makes that word
+ * true. Without it, a caller who is understood, misheard once, understood
+ * again, and misheard once more twenty turns later would be handed to a person
+ * for two entirely unrelated stumbles — which is a worse service, and would
+ * teach a practice to distrust the bail-out precisely when it matters.
+ *
+ * Calling any other tool is the evidence: the agent only reaches for a tool
+ * because it understood what the caller asked for. The `gt: 0` filter means
+ * this touches no rows on the overwhelming majority of calls, which is why it
+ * can sit on the dispatch path at all.
+ */
+async function clearUnparseableTurns(ctx: ToolContext): Promise<void> {
+  if (!ctx.callId) return;
+  await db.receptionistCallLog.updateMany({
+    where: { tenantId: ctx.tenantId, retellCallId: ctx.callId, unparseableTurns: { gt: 0 }, comprehensionBailoutAt: null },
+    data: { unparseableTurns: 0 },
+  }).catch(() => undefined);
 }

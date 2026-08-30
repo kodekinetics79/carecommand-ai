@@ -215,6 +215,8 @@ const EVIDENCE: Record<string, { evidence: EvidenceKind; why: string }> = {
   intake_attested: { evidence: 'provider_read_back', why: 'The published booking tool as the provider reports it, versus these intake fields.' },
   placeholders_absent: { evidence: 'own_configuration', why: 'Placeholder detection over the assembled prompt.' },
   disclosure_composed: { evidence: 'own_configuration', why: 'Whether the clinic added wording to the baseline disclosure.' },
+  closing_disclosure_present: { evidence: 'independent_row', why: 'AB 3030: the APPROVED `ReceptionistLocalePack` row must itself carry `disclosure.closing`. A key the platform backfilled at render time is not in the approved pack’s evidence hash, so this reads `backfilledKeys` and refuses it — a campaign cannot approve its own wording.' },
+  emergency_path_reachable: { evidence: 'own_configuration', why: 'Whether a human fallback number exists that is not the AI line. Our own row — and stated as its own check because "an emergency reaches a person" is a different promise from "a transfer does not loop", and this one blocks.' },
   confirmation_channels: { evidence: 'own_configuration', why: 'Whether a channel the campaign promises is configured on this deployment.' },
   transfer_target_distinct: { evidence: 'own_configuration', why: 'Whether the fallback number differs from the AI line.' },
   test_call_completed: { evidence: 'independent_row', why: 'B4: a call log a CALLER caused, scoped to this deployment. Nothing we wrote.' },

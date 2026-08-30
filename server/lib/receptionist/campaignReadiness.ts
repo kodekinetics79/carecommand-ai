@@ -7,7 +7,8 @@ import { clinicActivationState, type ClinicActivationBlocker } from './activatio
 import { confirmationChannelStatus } from './confirmationOutbox';
 import { campaignPromptConfig, deploymentChanges, planDeployment } from './retellDeploy';
 import { remediationFor, READINESS_KEYS, type ReadinessKey } from './remediation';
-import { mandatoryOpeningDisclosure } from '../../modules/receptionist/promptService';
+import { mandatoryClosingDisclosure, mandatoryOpeningDisclosure } from '../../modules/receptionist/promptService';
+import { transferReadiness } from './transferReadiness';
 import { RETELL_AGENT_VERIFICATION_TTL_MS, retellConfigStatus } from '../retell';
 
 // ===========================================================================
@@ -105,6 +106,8 @@ const LABELS: Record<ReadinessKey, string> = {
   intake_attested: 'The booking tool matches the intake fields',
   placeholders_absent: 'No placeholder text remains',
   disclosure_composed: 'The opening disclosure is composed',
+  closing_disclosure_present: 'The approved wording says goodbye as an AI',
+  emergency_path_reachable: 'An emergency reaches a person, not a screen',
   confirmation_channels: 'Enabled confirmations can be delivered',
   transfer_target_distinct: 'Transfers reach a human, not the AI line',
   test_call_completed: 'A test call has reached this line',
@@ -465,6 +468,26 @@ export async function evaluateCampaignReadiness(
       ? check('disclosure_composed', 'pass', 'The clinic’s wording is appended to the baseline AI and recording disclosure.', ctx)
       : check('disclosure_composed', 'warn', `Using the product baseline only: “${mandatoryOpeningDisclosure(promptConfig)}”`, ctx));
 
+  // California AB 3030 requires the AI disclaimer on an audio clinical
+  // interaction at the START *and* AT THE END. Every pack shipped an opening
+  // key and none at all for the close, so a US clinic answering with this
+  // product was out of compliance on every completed call.
+  //
+  // The bar is not "the agent will say something". `resolve.ts` backfills a
+  // missing key from the platform default, so the agent would say a closing
+  // line either way — and that is exactly the state this check exists to
+  // refuse. The pack's `evidenceHash` is the hash of what a named person
+  // APPROVED; a key that arrived by backfill was never in it, so the clinic has
+  // attested to wording that does not include its closing disclosure. Approving
+  // the current version is a thirty-second act and it is the difference between
+  // a compliance artefact and a plausible-looking one.
+  const closingBackfilled = promptConfig?.localePack.backfilledKeys.includes('disclosure.closing') ?? false;
+  checks.push(!promptConfig
+    ? check('closing_disclosure_present', 'fail', NO_LOCALE_PACK, ctx, 'closing_disclosure_present')
+    : closingBackfilled
+      ? check('closing_disclosure_present', 'fail', 'The approved wording pack carries no closing AI disclosure, so its evidence hash does not cover the words this clinic is required to end a call with. Approve the current version of the pack.', ctx, 'closing_disclosure_present')
+      : check('closing_disclosure_present', 'pass', `Every call ends with: “${mandatoryClosingDisclosure(promptConfig)}”`, ctx));
+
   // ---- Delivery and escalation ---------------------------------------------
   const enabledChannels: Array<'sms' | 'email'> = [
     ...(campaign.smsConfirmation ? ['sms' as const] : []),
@@ -492,6 +515,35 @@ export async function evaluateCampaignReadiness(
       : loops
         ? check('transfer_target_distinct', 'fail', 'The human fallback number is the same line the AI answers, so a transfer would loop back to the agent.', ctx, 'transfer_target_distinct')
         : check('transfer_target_distinct', 'pass', 'Transfers reach a number distinct from the AI line.', ctx));
+
+  // The compensating control for the single biggest gap in the product: there
+  // is no notification channel. Alerts are in-app only, on a twenty-second
+  // poll, and nobody is alerted if no tab is open — so an emergency task can
+  // sit overnight behind a masked number.
+  //
+  // `report_emergency` now places the transfer or promises the callback DURING
+  // the call, which closes that gap — but only if there is somewhere to
+  // transfer to. Without a usable fallback the emergency path degrades back to
+  // "a card appears on a board somebody may not be watching", and that is not a
+  // warning. A clinic whose emergency path is a screen nobody is watching
+  // should not be answering patient calls, so this blocks.
+  //
+  // It is deliberately a separate row from `transfer_target_distinct` rather
+  // than a change to it: that check answers "would a transfer loop back to the
+  // agent", which is a configuration question, and this one answers "can an
+  // emergency reach a human being today", which is a clinical one. They happen
+  // to read the same field. They are not the same promise, and an operator
+  // reading a checklist deserves to see the second one stated.
+  const emergencyTransfer = transferReadiness(campaign.clinic, {
+    inboundLineNumbers: campaign.clinic.locations.map(location => location.phone),
+  });
+  checks.push(emergencyTransfer.ready
+    ? check('emergency_path_reachable', 'pass', 'An emergency caller is put through to a person during the call, and the Front Desk card is the record of it.', ctx)
+    : check('emergency_path_reachable', 'fail', emergencyTransfer.reason === 'missing'
+      ? 'No human fallback number is set, so an emergency caller cannot be put through to anyone during the call. The alert would wait on the Front Desk board — in-app only, on a 20-second poll — for somebody to look at it.'
+      : emergencyTransfer.reason === 'loops_to_agent'
+        ? 'The human fallback number is the line the AI answers, so an emergency transfer would return the caller to the agent.'
+        : 'The human fallback number is not a valid E.164 number, so an emergency transfer could never connect.', ctx, 'emergency_path_reachable'));
 
   // ---- Proof it works on a real phone --------------------------------------
   // B4 — this used to count ANY inbound row for the clinic in 30 days. Clinics

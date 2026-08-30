@@ -371,6 +371,32 @@ export function possibleDuplicatePatientNote(possibleDuplicateOfPatientId: strin
     + 'The booking was made under a new patient record; please confirm whether the records should be merged.';
 }
 
+/**
+ * The reason a handoff exists when the line simply could not understand the
+ * caller. It is deliberately a distinct category from `human_requested`: the
+ * front desk needs to know this person did NOT ask for a human — the product
+ * failed them and gave up — because that is a different conversation to open
+ * with, and because it is the row the "What it missed" ledger counts.
+ */
+export const COMPREHENSION_BAILOUT_REASON = 'comprehension_failure';
+
+/**
+ * The staff-facing note on that handoff. Nobody speaks this; the front desk
+ * reads it off a card, which is why it lives here beside TASK_TITLES rather
+ * than in a locale pack.
+ */
+export const COMPREHENSION_BAILOUT_STAFF_NOTE =
+  'The receptionist could not understand this caller after two consecutive turns and stopped trying, as designed. '
+  + 'They did not ask for a person — we handed them to one. Please call them back and do not ask them to repeat what happened.';
+
+/** Why a handoff exists when the caller is marked Human only. */
+export const HUMAN_ONLY_REASON = 'human_only';
+
+/** The staff-facing note on that handoff. Nobody speaks this. */
+export const HUMAN_ONLY_STAFF_NOTE =
+  'This caller is marked Human only, so the receptionist did not handle the call and will not book, cancel or look anything up on it. '
+  + 'Please pick this up as a person.';
+
 const TASK_TITLES: Record<ReceptionistTaskKind, string> = {
   human_handoff: 'AI receptionist human handoff requested',
   message: 'AI receptionist callback requested',

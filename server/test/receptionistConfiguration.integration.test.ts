@@ -402,7 +402,10 @@ describe('AI receptionist trusted configuration', () => {
 
   it('links and verifies one exact published provider deployment with durable safety evidence', async () => {
     const [owner, foreign] = await Promise.all([tenant(), tenant()]);
-    const ownerClinicRow = (await createClinic(owner, { name: 'Provider-ready clinic' })).json() as { id: string; phone: string };
+    // `emergency_path_reachable` blocks activation without a human fallback:
+    // this clinic goes live in this test, so it needs somewhere an emergency
+    // caller can actually be put through to.
+    const ownerClinicRow = (await createClinic(owner, { name: 'Provider-ready clinic', humanFallbackNumber: phone() })).json() as { id: string; phone: string };
     const ownerClinic = ownerClinicRow.id;
     const foreignClinic = (await createClinic(foreign, { name: 'Foreign provider clinic' })).json().id as string;
     const providerAgentId = `agent_pilot_exact_${randomUUID()}`;

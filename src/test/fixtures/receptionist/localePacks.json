@@ -46,7 +46,15 @@
           "tool.booking.already": "You're already booked for {{booking}}.{{confirmation}}",
           "tool.booking.confirmation_accepted": "I've sent your confirmation; I can't confirm it has arrived yet.",
           "tool.message.recorded": "Thank you. That's written down for reception with your number. Someone will pick it up and get back to you; I can't promise exactly when.",
-          "tool.message.appended": "Thank you. I've added that to the same note for reception. Someone will pick it up and get back to you; I can't promise exactly when."
+          "tool.message.appended": "Thank you. I've added that to the same note for reception. Someone will pick it up and get back to you; I can't promise exactly when.",
+          "disclosure.closing": "Before you go — just so you know, you have been speaking with {{agent_name}}, an AI assistant for {{clinic_name}}, and not a member of the team. If you would like to speak with a person about anything from this call, ring us back and ask for reception. Take care.",
+          "admission.denied.human_only": "Thanks for calling. I'm putting you straight through to someone at reception now — please stay on the line.",
+          "admission.denied.repeat_caller": "Thanks for ringing back. Rather than have you go through this again, I'm putting you straight through to someone at reception — please stay on the line.",
+          "emergency.transfer.line": "I'm also connecting you to someone at the practice right now. Please stay on the line.",
+          "emergency.callback.line": "I have alerted the practice, and someone will ring you straight back on this number. Please don't wait for that call if you need help now.",
+          "comprehension.retry": "I'm sorry, that's my fault — I didn't catch that. Could you tell me again?",
+          "comprehension.bail_out.transfer": "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I'm putting you through to a person at the practice now. Please stay on the line.",
+          "comprehension.bail_out.callback": "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've asked someone at the practice to ring you straight back on this number, and I've written down that we spoke."
         }
       },
       "evidenceHash": "ce30e8be04af5d9273c10270af44ab4f0470f6a326fab3de601f66b1455b5045",
@@ -106,7 +114,15 @@
           "tool.booking.already": "You're already booked for {{booking}}.{{confirmation}}",
           "tool.booking.confirmation_accepted": "I've sent your confirmation; I can't confirm it has arrived yet.",
           "tool.message.recorded": "Thank you. That's written down for reception with your number. Someone will pick it up and get back to you; I can't promise exactly when.",
-          "tool.message.appended": "Thank you. I've added that to the same note for reception. Someone will pick it up and get back to you; I can't promise exactly when."
+          "tool.message.appended": "Thank you. I've added that to the same note for reception. Someone will pick it up and get back to you; I can't promise exactly when.",
+          "disclosure.closing": "Before you go — just so you know, you have been speaking with {{agent_name}}, an AI assistant for {{clinic_name}}, and not a member of the team. If you would like to speak with a person about anything from this call, ring us back and ask for reception. Take care.",
+          "admission.denied.human_only": "Thanks for calling. I'm putting you straight through to someone at reception now — please stay on the line.",
+          "admission.denied.repeat_caller": "Thanks for ringing back. Rather than have you go through this again, I'm putting you straight through to someone at reception — please stay on the line.",
+          "emergency.transfer.line": "I'm also connecting you to someone at the practice right now. Please stay on the line.",
+          "emergency.callback.line": "I have alerted the practice, and someone will ring you straight back on this number. Please don't wait for that call if you need help now.",
+          "comprehension.retry": "I'm sorry, that's my fault — I didn't catch that. Could you tell me again?",
+          "comprehension.bail_out.transfer": "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I'm putting you through to a person at the practice now. Please stay on the line.",
+          "comprehension.bail_out.callback": "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've asked someone at the practice to ring you straight back on this number, and I've written down that we spoke."
         }
       },
       "evidenceHash": "7b585a11d5603acc4faa5220d201ebb6fcf41231b0773ef97f3b1abbfa13305b",
