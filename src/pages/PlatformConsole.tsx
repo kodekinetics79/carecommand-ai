@@ -272,7 +272,17 @@ function IntegrationsSection({ canManage }: { canManage: boolean }) {
                   <Plug className="w-4 h-4 text-t3 shrink-0" />
                   <span className="text-[12px] font-semibold text-t1 truncate">{p.label}</span>
                   {p.source && <span className="text-[10px] text-t3">· via {p.source}</span>}
-                  {p.lastTestStatus && <span className={`text-[10px] font-semibold ${p.lastTestStatus === 'ok' ? 'text-emerald-v' : 'text-red-v'}`}>· test {p.lastTestStatus}</span>}
+                  {p.lastTestStatus && (
+                    // "not_verified" is a real answer: the credential is stored
+                    // but this provider has no connection test, so claiming a
+                    // green "ok" would be the exact lie this console is fixing.
+                    <span
+                      className={`text-[10px] font-semibold ${p.lastTestStatus === 'ok' ? 'text-emerald-v' : p.lastTestStatus === 'not_verified' ? 'text-amber-v' : 'text-red-v'}`}
+                      title={p.lastTestDetail ?? undefined}
+                    >
+                      · {p.lastTestStatus === 'not_verified' ? 'stored, not verified' : `test ${p.lastTestStatus}`}
+                    </span>
+                  )}
                 </div>
                 <div className="flex items-center gap-1.5 shrink-0">
                   <span className={`badge ${p.status === 'connected' ? 'badge-emerald' : 'badge-amber'}`}>{p.status === 'connected' ? 'connected' : 'setup required'}</span>

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { env } from '../config/env';
+import { providerConfig } from './providerCredentials';
 import {
   fingerprintJson,
   normalizeBookAppointmentToolContract,
@@ -13,11 +14,27 @@ import {
 
 export interface RetellConfigStatus { configured: boolean; mock: boolean; missing: string[] }
 
+/**
+ * The credentials this module will actually use: a complete credential saved in
+ * the Control Tower wins over the environment. Everything below reads through
+ * here so the console's "connected" badge and the calls we place cannot
+ * disagree.
+ */
+export function retellCredentials(): { apiKey: string | undefined; fromNumber: string | undefined; source: 'db' | 'env' | null } {
+  const { values, source } = providerConfig('voice');
+  return {
+    apiKey: values.apiKey ?? env.RETELL_API_KEY,
+    fromNumber: values.fromNumber ?? env.RETELL_FROM_NUMBER,
+    source,
+  };
+}
+
 export function retellConfigStatus(): RetellConfigStatus {
+  const { apiKey, fromNumber } = retellCredentials();
   const missing: string[] = [];
-  if (!env.RETELL_API_KEY) missing.push('RETELL_API_KEY');
-  if (!env.RETELL_FROM_NUMBER) missing.push('RETELL_FROM_NUMBER');
-  return { configured: missing.length === 0, mock: (env.RETELL_API_KEY ?? '').startsWith('mock'), missing };
+  if (!apiKey) missing.push('RETELL_API_KEY');
+  if (!fromNumber) missing.push('RETELL_FROM_NUMBER');
+  return { configured: missing.length === 0, mock: (apiKey ?? '').startsWith('mock'), missing };
 }
 
 export interface CreatePhoneCallInput {
@@ -79,9 +96,9 @@ export async function createPhoneCall(input: CreatePhoneCallInput): Promise<Crea
     const providerWebhookUrl = providerReachableWebhookUrl(input.webhookUrl);
     const response = await fetchWithTimeout(`${env.RETELL_BASE_URL}/v2/create-phone-call`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${env.RETELL_API_KEY}`, 'Content-Type': 'application/json' },
+      headers: { Authorization: `Bearer ${retellCredentials().apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        from_number: env.RETELL_FROM_NUMBER,
+        from_number: retellCredentials().fromNumber,
         to_number: input.toNumber,
         override_agent_id: input.agentId,
         override_agent_version: input.agentVersion,
@@ -190,7 +207,7 @@ export async function getPhoneCall(callId: string): Promise<GetPhoneCallResult> 
   try {
     const response = await fetchWithTimeout(`${env.RETELL_BASE_URL}/v2/get-call/${encodeURIComponent(callId)}`, {
       method: 'GET',
-      headers: { Authorization: `Bearer ${env.RETELL_API_KEY}` },
+      headers: { Authorization: `Bearer ${retellCredentials().apiKey}` },
     });
     if (!response.ok) return { ok: false, error: `retell_error_${response.status}` };
     const body = await response.json().catch(() => null) as Record<string, unknown> | null;
@@ -538,7 +555,7 @@ async function probeRetellBookTool(responseEngineType: string, responseEngineId:
     const endpoint = responseEngineType === 'retell-llm' ? 'get-retell-llm' : 'get-conversation-flow';
     const response = await fetchWithTimeout(
       `${env.RETELL_BASE_URL}/${endpoint}/${encodeURIComponent(responseEngineId)}?version=${responseEngineVersion}`,
-      { headers: { Authorization: `Bearer ${env.RETELL_API_KEY}` } },
+      { headers: { Authorization: `Bearer ${retellCredentials().apiKey}` } },
     );
     if (!response.ok) return { status: 'UNAVAILABLE' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint: null };
     const body = await response.json().catch(() => null) as Record<string, unknown> | null;
@@ -600,10 +617,10 @@ async function probeRetellEmptyTagDefaults(
       return url;
     };
     const requestList = (legacy: boolean) => fetchWithTimeout(buildUrl(legacy).toString(), legacy
-      ? { headers: { Authorization: `Bearer ${env.RETELL_API_KEY}` } }
+      ? { headers: { Authorization: `Bearer ${retellCredentials().apiKey}` } }
       : {
         method: 'POST',
-        headers: { Authorization: `Bearer ${env.RETELL_API_KEY}`, 'Content-Type': 'application/json' },
+        headers: { Authorization: `Bearer ${retellCredentials().apiKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           filter_criteria: {
             channel: { type: 'string', op: 'eq', value: 'voice' },
@@ -666,15 +683,16 @@ async function probeRetellEmptyTagDefaults(
  * never falls back from the requested tag to an unverified "latest" version.
  */
 export async function probeRetellAgent(agentId: string, versionTag: string): Promise<RetellAgentProbeResult> {
-  if (!env.RETELL_API_KEY) return { ok: false, error: 'setup_required' };
-  if (env.RETELL_API_KEY.startsWith('mock')) return { ok: false, error: 'mock_not_verifiable' };
+  const { apiKey } = retellCredentials();
+  if (!apiKey) return { ok: false, error: 'setup_required' };
+  if (apiKey.startsWith('mock')) return { ok: false, error: 'mock_not_verifiable' };
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(agentId) || !isValidRetellVersionTag(versionTag)) {
     return { ok: false, error: 'invalid_response' };
   }
   try {
     const response = await fetchWithTimeout(
       `${env.RETELL_BASE_URL}/get-agent/${encodeURIComponent(agentId)}?version=${encodeURIComponent(versionTag)}`,
-      { headers: { Authorization: `Bearer ${env.RETELL_API_KEY}` } },
+      { headers: { Authorization: `Bearer ${retellCredentials().apiKey}` } },
     );
     if (response.status === 401 || response.status === 403) return { ok: false, error: 'unauthorized' };
     if (response.status === 404) return { ok: false, error: 'not_found' };
@@ -776,7 +794,7 @@ export async function stopPhoneCall(callId: string): Promise<RetellMutationResul
   try {
     const response = await fetchWithTimeout(`${env.RETELL_BASE_URL}/v2/stop-call/${encodeURIComponent(callId)}`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${env.RETELL_API_KEY}` },
+      headers: { Authorization: `Bearer ${retellCredentials().apiKey}` },
     });
     if (!response.ok) {
       return { ok: false, applied: false, mock: false, error: `retell_error_${response.status}` };
@@ -800,7 +818,7 @@ export async function restrictCallToBasicAttributes(callId: string): Promise<Ret
   try {
     const response = await fetchWithTimeout(`${env.RETELL_BASE_URL}/v2/update-call/${encodeURIComponent(callId)}`, {
       method: 'PATCH',
-      headers: { Authorization: `Bearer ${env.RETELL_API_KEY}`, 'Content-Type': 'application/json' },
+      headers: { Authorization: `Bearer ${retellCredentials().apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ data_storage_setting: 'basic_attributes_only', opt_in_signed_url: true }),
     });
     if (!response.ok) {
@@ -820,7 +838,7 @@ export async function deleteCallData(callId: string): Promise<RetellMutationResu
   try {
     const response = await fetchWithTimeout(`${env.RETELL_BASE_URL}/v2/delete-call/${encodeURIComponent(callId)}`, {
       method: 'DELETE',
-      headers: { Authorization: `Bearer ${env.RETELL_API_KEY}` },
+      headers: { Authorization: `Bearer ${retellCredentials().apiKey}` },
     });
     if (!response.ok) {
       return { ok: false, applied: false, mock: false, error: `retell_error_${response.status}` };

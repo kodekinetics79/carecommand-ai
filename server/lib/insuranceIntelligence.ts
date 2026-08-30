@@ -1,5 +1,6 @@
 import { db } from './db';
 import { env } from './../config/env';
+import { providerValue } from './providerCredentials';
 import { runWithTenantContext } from './tenantContext';
 import { emitBusinessEvent, upsertSignal, createRecommendation } from './intelligence';
 import { ensureStaffTask } from './staffTasks';
@@ -28,7 +29,7 @@ export function eligibilityProviderStatus(): EligibilityProviderStatus {
     return { provider, configured: allowed, mock: true, setupRequired: !allowed, missing: allowed ? [] : ['INSURANCE_PROVIDER'] };
   }
   if (provider === 'stedi') {
-    const configured = Boolean(env.STEDI_API_KEY);
+    const configured = Boolean(providerValue('insurance', 'apiKey'));
     return { provider, configured, mock: false, setupRequired: !configured, missing: configured ? [] : ['STEDI_API_KEY'] };
   }
   // availity / pverify / optum are placeholders — not really integrated.

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { env } from '../config/env';
+import { providerValue } from './providerCredentials';
 import { runWithTenantContext } from './tenantContext';
 import { isFeatureEnabled } from './entitlements';
 import { recordWorkflowEvent } from './intelligence';
@@ -37,8 +38,8 @@ export function paymentProviderStatus(): PaymentProviderStatus {
     return { provider, mode: 'mock', configured: true, mock: true, setupRequired: false };
   }
   if (provider === 'stripe') {
-    const configured = Boolean(env.STRIPE_SECRET_KEY);
-    const mode = !configured ? 'unconfigured' : env.STRIPE_SECRET_KEY!.startsWith('sk_test_') || env.NODE_ENV !== 'production' ? 'sandbox' : 'live';
+    const configured = Boolean(providerValue('payments', 'secretKey'));
+    const mode = !configured ? 'unconfigured' : providerValue('payments', 'secretKey')!.startsWith('sk_test_') || env.NODE_ENV !== 'production' ? 'sandbox' : 'live';
     return { provider, mode, configured, mock: false, setupRequired: !configured };
   }
   // square / authorize_net / clover / paypal: not implemented → setup required.

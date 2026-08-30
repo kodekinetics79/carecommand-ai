@@ -78,6 +78,9 @@ describe('RLS runtime-role guard', () => {
       'ReceptionistOutboundProviderIntent',
       'ReceptionistRecordingConsentEvent',
       'ReceptionistVoiceConsentEvent',
+      // Billing ledger: append-only by grant and by trigger, so a recorded
+      // charge can never be quietly rewritten.
+      'UsageEvent',
     ]);
     expect([...TENANT_DELETE_PROTECTED_TABLES].sort()).toEqual([
       'Campaign',

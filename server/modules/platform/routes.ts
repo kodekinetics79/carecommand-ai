@@ -11,6 +11,7 @@ import { env } from '../../config/env';
 import { encryptSecret, decryptSecret } from '../../lib/security';
 import { runWithPlatformDatabaseRequest } from '../../lib/platformContextStore';
 import { validateIanaTimezone } from '../../lib/scheduling';
+import { PROVIDER_CATALOG, PROVIDER_KEYS, providerConfig, invalidateProviderCredentials, refreshProviderCredentials, type ProviderDef as SharedProviderDef } from '../../lib/providerCredentials';
 import { periodUsageByMetric, usagePeriodKey, USAGE_LIMIT_KEY_BY_METRIC } from '../../lib/usageMetering';
 
 const timezoneInput = z.string().trim().min(1).max(80).refine(value => {
@@ -19,29 +20,10 @@ const timezoneInput = z.string().trim().min(1).max(80).refine(value => {
 
 // Integration provider catalog. `env` is the fallback config source; UI-saved
 // credentials live encrypted in PlatformIntegration and take precedence.
-interface ProviderField { k: string; label: string; secret: boolean }
-interface ProviderDef { label: string; fields: ProviderField[]; required: string[]; env: Record<string, keyof typeof env> }
-const PROVIDERS: Record<string, ProviderDef> = {
-  sms: { label: 'SMS (Twilio)', required: ['accountSid', 'authToken', 'fromNumber'],
-    fields: [{ k: 'accountSid', label: 'Account SID', secret: false }, { k: 'authToken', label: 'Auth Token', secret: true }, { k: 'fromNumber', label: 'From Number', secret: false }],
-    env: { accountSid: 'TWILIO_ACCOUNT_SID', authToken: 'TWILIO_AUTH_TOKEN', fromNumber: 'TWILIO_FROM_NUMBER' } },
-  email: { label: 'Email (HTTP API)', required: ['apiUrl', 'apiKey'],
-    fields: [{ k: 'apiUrl', label: 'API URL', secret: false }, { k: 'apiKey', label: 'API Key', secret: true }, { k: 'fromAddress', label: 'From Address', secret: false }],
-    env: { apiUrl: 'EMAIL_HTTP_API_URL', apiKey: 'EMAIL_HTTP_API_KEY', fromAddress: 'EMAIL_FROM_ADDRESS' } },
-  payments: { label: 'Payments (Stripe)', required: ['secretKey'],
-    fields: [{ k: 'secretKey', label: 'Secret Key', secret: true }],
-    env: { secretKey: 'STRIPE_SECRET_KEY' } },
-  payments_webhook: { label: 'Payment webhook', required: ['webhookSecret'],
-    fields: [{ k: 'webhookSecret', label: 'Webhook Secret', secret: true }],
-    env: { webhookSecret: 'STRIPE_WEBHOOK_SECRET' } },
-  insurance: { label: 'Insurance (Stedi)', required: ['apiKey'],
-    fields: [{ k: 'apiKey', label: 'API Key', secret: true }],
-    env: { apiKey: 'STEDI_API_KEY' } },
-  voice: { label: 'Voice (Retell)', required: ['apiKey', 'fromNumber'],
-    fields: [{ k: 'apiKey', label: 'API Key', secret: true }, { k: 'fromNumber', label: 'From Number', secret: false }],
-    env: { apiKey: 'RETELL_API_KEY', fromNumber: 'RETELL_FROM_NUMBER' } },
-};
-const PROVIDER_KEYS = Object.keys(PROVIDERS) as Array<keyof typeof PROVIDERS & string>;
+type ProviderDef = SharedProviderDef;
+// The catalog lives in lib/providerCredentials so the console and the senders
+// cannot disagree about which fields a provider has, or which credential wins.
+const PROVIDERS = PROVIDER_CATALOG;
 
 const reasonSchema = z.string().trim().min(3).max(500);
 const USAGE_KEYS = ['seats', 'locations', 'storage_gb', 'sms', 'voice_minutes', 'ai_credits', 'devices'] as const;
@@ -996,12 +978,12 @@ export const platformRoutes: FastifyPluginAsync = async app => {
     try { return JSON.parse(decryptSecret(row.configEnc) ?? '{}') as Record<string, string>; } catch { return {}; }
   }
   function resolveValues(key: string, def: ProviderDef, row: IntegrationRow | null): { values: Record<string, string>; source: 'db' | 'env' | null } {
+    // Catalog providers resolve exactly the way a sender resolves them, so the
+    // badge cannot say "connected - via db" over a credential the product will
+    // not use. Custom services have no sender and no env, so they answer from
+    // their own row.
+    if (PROVIDERS[key]) return providerConfig(key);
     if (row?.configEnc) { const v = decryptConfig(row); if (Object.keys(v).length) return { values: v, source: 'db' }; }
-    if (PROVIDERS[key]) {
-      const values: Record<string, string> = {};
-      for (const f of def.fields) { const ev = env[def.env[f.k]] as string | undefined; if (ev) values[f.k] = ev; }
-      if (Object.keys(values).length) return { values, source: 'env' };
-    }
     return { values: {}, source: null };
   }
   function viewFor(key: string, def: ProviderDef, row: IntegrationRow | null) {
@@ -1076,6 +1058,10 @@ export const platformRoutes: FastifyPluginAsync = async app => {
       update: { configEnc, setFields, status: configured ? 'connected' : 'disconnected', updatedById: request.platformUser?.id },
       create: { key, configEnc, setFields, status: configured ? 'connected' : 'disconnected', updatedById: request.platformUser?.id },
     }));
+    // The senders read a cached snapshot; a save that does not invalidate it
+    // would leave the console green and the product on the old credential.
+    invalidateProviderCredentials();
+    await refreshProviderCredentials();
     const fresh = await loadRow(key);
     return viewFor(key, defFor(key, fresh)!, fresh);
   });
@@ -1086,6 +1072,8 @@ export const platformRoutes: FastifyPluginAsync = async app => {
     await runPlatformAuditedMutation(request, {
       action: row?.isCustom ? 'integration.service.deleted' : 'integration.disconnected', target: { type: 'integration', id: key }, metadata: {},
     }, tx => tx.platformIntegration.deleteMany({ where: { key } }));
+    invalidateProviderCredentials();
+    await refreshProviderCredentials();
     // Built-ins revert to env fallback; custom services are gone.
     if (PROVIDERS[key]) return viewFor(key, PROVIDERS[key], null);
     return { key, deleted: true };
@@ -1109,8 +1097,19 @@ export const platformRoutes: FastifyPluginAsync = async app => {
           const auth = Buffer.from(`${values.accountSid}:${values.authToken}`).toString('base64');
           const res = await withTimeout(fetch(`https://api.twilio.com/2010-04-01/Accounts/${values.accountSid}.json`, { headers: { Authorization: `Basic ${auth}` } }), 4000);
           status = res.ok ? 'ok' : 'failed'; detail = res.ok ? 'Twilio account reachable' : `Twilio returned ${res.status}`;
+        } else if (key === 'voice') {
+          // Retell has no cheap unauthenticated probe, but listing agents proves
+          // the key is accepted. Previously this branch reported "ok" for any
+          // provider without a ping, so "Voice (Retell) - test ok" meant only
+          // "two fields are non-empty".
+          const res = await withTimeout(fetch('https://api.retellai.com/list-agents', { headers: { Authorization: `Bearer ${values.apiKey}` } }), 4000);
+          status = res.ok ? 'ok' : 'failed';
+          detail = res.ok ? 'Retell API accepted the key' : `Retell returned ${res.status}`;
         } else {
-          detail = 'Credentials present (no live ping for this provider)';
+          // Say what was actually established. Reporting "ok" for an unverified
+          // credential is the failure mode this whole change exists to remove.
+          status = 'not_verified';
+          detail = 'Credentials are present. This provider has no connection test, so nothing has been verified.';
         }
       } catch (e) { status = 'failed'; detail = `Connection error: ${(e as Error).message.slice(0, 80)}`; }
     }
