@@ -167,24 +167,26 @@ Closed since: tenant mode was the first of the seven "what you didn't ask" items
 expiry, onboarding scored on first answered call, number provisioning in the
 console, a release stamp in production, and tenant health signals - are still open.
 
-## 8. Known-failing tests (pre-existing, deliberately left failing)
+## 8. Known-failing tests — RESOLVED 2026-08-30
 
-`server/test/pilotImport.test.ts` - two cases:
+`server/test/pilotImport.test.ts` was left failing on purpose: revert `2bdffe6`
+removed idempotency handling from the pilot-import routes while the console kept
+sending an `Idempotency-Key` that nothing read. The two tests asserted the correct
+behaviour of a capability that had been reverted away, so weakening them would have
+locked in the regression.
 
-1. **Preset save is not idempotent.** The replayed save creates a second row instead of
-   returning the stored response.
-2. **A retried commit records a second durable intent** (`pilot.import.committed.requested`).
+The capability is restored in `74d3368` (`server/lib/idempotentRequest.ts`): stored
+response replayed verbatim, request fingerprint binding a key to its first request
+(409 on reuse with different content), and durable intent recorded once per key.
+Three routes carry it — preset save, import commit, share-link creation. All three
+tests pass.
 
-Cause: commit `2bdffe6` (a revert of PR #4) removed idempotency handling from
-`pilot.routes.ts`. The console still sends an `Idempotency-Key` header that **nothing
-reads** - grep finds no idempotency handling in that file at all. So a double-clicked
-import is not protected by the mechanism the client believes is protecting it (data-key
-upserts limit the damage, but that is luck, not design).
+Two CI-only failures were fixed in `00c173d`: both asserted against ambient state a
+checked-out repository does not have (`providerCredentialPrecedence` read whatever
+provider credentials were in the environment; `platformPlaneIsolation` read the
+repo's `.env`, which CI has none of). The precedence rule is now a pure function
+asserted with explicit inputs.
 
-Both tests assert the correct behaviour of a capability that was reverted away. They are
-left failing rather than weakened to match the regression. Restoring idempotency on these
-routes is P1.
-
-Separately, the shared dev database has accumulated 72 `PilotImportPreset` rows with
-`isDefault = true`, which makes any "the default preset" assertion ambiguous - a test
-isolation problem worth fixing when that suite is next touched.
+Separately, the shared dev database has accumulated `PilotImportPreset` rows with
+`isDefault = true`, which makes any "the default preset" assertion ambiguous — a
+test-isolation problem worth fixing when that suite is next touched.
