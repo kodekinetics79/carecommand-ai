@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { env } from '../config/env';
-import { evaluateRetellAgentReadiness, probeRetellAgent } from '../lib/retell';
+import { evaluateRetellAgentReadiness, hashPrompt, probeRetellAgent } from '../lib/retell';
 import { bookAppointmentToolFingerprint, compileIntakeContract } from '../modules/receptionist/intakeContract';
 import { buildRetellConfig, type PromptConfig } from '../modules/receptionist/promptService';
 import { promptFixture } from './fixtures/receptionistPromptConfigs';
@@ -96,26 +96,20 @@ describe('Retell agent provider contract', () => {
       : providerAgentApiBody(url)), { status: 200 })));
 
     const result = await probeRetellAgent('agent_pilot', 'prod');
-    // KNOWN CROSS-PACKAGE CONFLICT (C2 contract section 3 vs server/lib/retell.ts).
-    // The C2 prompt deliberately carries Retell runtime variables such as
-    // {{is_open_now}}, which the agent needs in order to answer "are you open
-    // right now". probeRetellBookTool refuses ANY {{...}} anywhere in the
-    // response-engine body, so it returns a snapshot with no book-tool schema
-    // and no strict-mode evidence, which makes the campaign unattestable
-    // (intake_schema_unattested) and therefore unactivatable with a real
-    // deployment. C5 owns retell.ts and must allow exactly the names in
-    // RUNTIME_DYNAMIC_VARIABLES before an agent can be deployed with this
-    // prompt. This test pins the CURRENT behaviour so the fix is visible: when
-    // C5 lands the allowlist, this expectation must flip back to
-    // { toolCallStrictMode: true } and the two assertions below restored.
+    // RESOLVED (C2 contract section 3 x C5 retell.ts). The C2 prompt carries
+    // the Retell runtime variables the agent needs to answer "are you open
+    // right now", and `containsProviderTemplateSyntax` now allows exactly the
+    // names in RUNTIME_DYNAMIC_VARIABLES and nothing else — so the probe reads
+    // the book tool and the campaign is attestable with a real deployment.
+    // The old pin recorded the broken state and said to flip it here.
     expect(result).toMatchObject({
       ok: true,
-      snapshot: { bookToolProbeStatus: 'SUCCEEDED', toolCallStrictMode: null, bookToolSchema: null, bookToolFingerprint: null },
+      snapshot: { bookToolProbeStatus: 'SUCCEEDED', toolCallStrictMode: true },
     });
     if (!result.ok) throw new Error('expected provider snapshot');
-    // The exported tool contract itself is still well-formed and fingerprintable;
-    // only the provider-side read of it is currently refused.
+    expect(bookAppointmentToolFingerprint(result.snapshot.bookToolSchema)).toBe(exported.intakeToolFingerprint);
     expect(bookAppointmentToolFingerprint(exported.bookingFunction)).toBe(exported.intakeToolFingerprint);
+    expect(result.snapshot.bookToolFingerprint).toMatch(/^[a-f0-9]{64}$/);
   });
 
   it('uses exact tag/auth GET contract and produces a non-secret deterministic safety snapshot', async () => {
@@ -380,8 +374,62 @@ describe('Retell agent provider contract', () => {
     if (!first.ok) throw new Error('expected provider snapshot');
     expect(first.snapshot.effectiveDynamicVariables).toEqual({});
 
+    // Defaults on the version we actually run are a specific, fixable fault —
+    // not the generic "unreadable provider" the whole agent used to fail with.
     dynamicVariables = { first_name: '' };
-    await expect(probeRetellAgent('agent_pilot', 'prod')).resolves.toEqual({ ok: false, error: 'invalid_response' });
+    await expect(probeRetellAgent('agent_pilot', 'prod')).resolves.toEqual({ ok: false, error: 'tag_dynamic_variables_not_empty' });
+  });
+
+  it('ignores a sibling tag whose defaults belong to a version we do not run', async () => {
+    env.RETELL_API_KEY = 'real-key';
+    vi.stubGlobal('fetch', vi.fn(async url => {
+      if (String(url).includes('/get-retell-llm/')) {
+        return new Response(JSON.stringify({ llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true, general_tools: [bookingTool()] }), { status: 200 });
+      }
+      if (String(url).includes('list-agents')) {
+        return new Response(JSON.stringify({
+          has_more: false,
+          items: [{
+            agent_id: 'agent_pilot', agent_name: 'Pilot agent', channel: 'voice', user_modified_timestamp: 1,
+            tags: {
+              prod: { version: 12, dynamic_variables: {} },
+              // A staging tag pointing at a different version, carrying its own
+              // defaults. It is not what production runs, so it is not our
+              // problem — the agent must still verify.
+              staging: { version: 3, dynamic_variables: { first_name: 'Sam' } },
+            },
+          }],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify(providerAgent()), { status: 200 });
+    }));
+    await expect(probeRetellAgent('agent_pilot', 'prod')).resolves.toMatchObject({ ok: true });
+  });
+
+  it('carries prompt, begin-message and tool evidence on the snapshot', async () => {
+    env.RETELL_API_KEY = 'real-key';
+    vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(String(url).includes('/get-retell-llm/')
+      ? {
+        llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+        general_prompt: 'You are Avery, the AI receptionist.', begin_message: 'Hi, this may be recorded. Is that okay?',
+        general_tools: [bookingTool()],
+      }
+      : providerAgentApiBody(url)), { status: 200 })));
+    const result = await probeRetellAgent('agent_pilot', 'prod');
+    if (!result.ok) throw new Error('expected provider snapshot');
+    // Read from the SAME engine body the booking-tool probe already fetches:
+    // drift detection costs no extra provider round trip.
+    expect(result.snapshot.promptHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(result.snapshot.beginMessageHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(result.snapshot.toolsFingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(result.snapshot.mock).toBe(false);
+
+    // The same prompt hashes the same way wherever it is computed, which is
+    // what makes "the provider drifted" a fact rather than a guess.
+    expect(hashPrompt('You are Avery, the AI receptionist.')).toBe(result.snapshot.promptHash);
+    expect(evaluateRetellAgentReadiness(result.snapshot, {
+      versionTag: 'prod', webhookUrl, expectedPromptHash: hashPrompt('A different prompt entirely.'),
+    })).toBe('prompt_drift');
   });
 
   it('paginates official List Agents metadata until it establishes one exact agent', async () => {
@@ -443,7 +491,17 @@ describe('Retell agent provider contract', () => {
   it.each([
     ['LLM prompt placeholder', 'retell-llm', {
       llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+      // `first_name` is NOT a runtime dynamic variable: nothing substitutes it,
+      // so a caller would hear the braces read aloud.
       general_prompt: 'Welcome {{first_name}}', general_tools: [bookingTool()],
+    }],
+    ['LLM control syntax', 'retell-llm', {
+      llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+      general_prompt: 'Welcome {% if vip %}back{% endif %}', general_tools: [bookingTool()],
+    }],
+    ['LLM shell-style interpolation', 'retell-llm', {
+      llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+      general_prompt: 'Welcome ${caller}', general_tools: [bookingTool()],
     }],
     ['LLM default variable', 'retell-llm', {
       llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
@@ -464,6 +522,47 @@ describe('Retell agent provider contract', () => {
           : { type: engineType, conversation_flow_id: 'flow_pilot', version: 4 } }),
     ), { status: 200 })));
     const result = await probeRetellAgent('agent_pilot', 'prod');
+    expect(result).toMatchObject({ ok: true, snapshot: { bookToolSchema: null, bookToolFingerprint: null } });
+  });
+
+  it('accepts the runtime dynamic variables the deployed prompt is REQUIRED to carry', async () => {
+    // Contract §3: Retell substitutes these per call, so they cannot be
+    // resolved at deploy time and must survive into the published prompt.
+    // Rejecting them made verification fail forever — the deploy succeeded,
+    // attestation always reported the booking tool unattested, and the
+    // campaign could never be activated.
+    env.RETELL_API_KEY = 'real-key';
+    vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(String(url).includes('/get-retell-llm/')
+      ? {
+        llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+        general_prompt: [
+          'We are {{is_open_now}} right now. Today: {{hours_today}}; next open {{next_opening}}.',
+          'Closure reason: {{closure_reason}}. Emergencies: {{emergency_number}}.',
+          'Caller: {{known_first_name}} ({{admission_state}}). Staff line {{human_fallback_number}}.',
+          'Location {{location_name}}, {{location_address}}, {{location_phone}}.',
+        ].join('\n'),
+        general_tools: [bookingTool()],
+      }
+      : providerAgentApiBody(url)), { status: 200 })));
+    const result = await probeRetellAgent('agent_pilot', 'prod');
+    // Attested, with a real booking tool and strict mode — not waved through.
+    expect(result).toMatchObject({ ok: true, snapshot: { toolCallStrictMode: true } });
+    if (!result.ok) throw new Error('expected an attested snapshot');
+    expect(result.snapshot.bookToolFingerprint).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('still rejects an unapproved variable sitting beside approved ones', async () => {
+    env.RETELL_API_KEY = 'real-key';
+    vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(String(url).includes('/get-retell-llm/')
+      ? {
+        llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+        general_prompt: 'We are {{is_open_now}}. Your balance is {{account_balance}}.',
+        general_tools: [bookingTool()],
+      }
+      : providerAgentApiBody(url)), { status: 200 })));
+    const result = await probeRetellAgent('agent_pilot', 'prod');
+    // One unknown placeholder is enough: it is either an unrendered value or
+    // text somebody injected hoping the provider would interpolate it.
     expect(result).toMatchObject({ ok: true, snapshot: { bookToolSchema: null, bookToolFingerprint: null } });
   });
 
@@ -613,8 +712,26 @@ describe('Retell agent provider contract', () => {
   });
 
   it('never treats mock, malformed, wrong-id, or rejected provider calls as verified', async () => {
+    // A mock agent with no deployment behind it is honestly unverifiable: the
+    // fixture answers only for a deployment CareCommand itself performed.
     env.RETELL_API_KEY = 'mock_provider';
-    await expect(probeRetellAgent('agent_pilot', 'prod')).resolves.toEqual({ ok: false, error: 'mock_not_verifiable' });
+    await expect(probeRetellAgent('agent_pilot', 'prod')).resolves.toEqual({ ok: false, error: 'not_found' });
+
+    const mockDeployment = {
+      providerAgentId: 'agent_pilot', providerAgentVersion: 3,
+      providerLlmId: 'mock_llm_1', providerLlmVersion: 1, providerVersionTag: 'prod',
+      promptHash: 'mock:prompt', beginMessageHash: 'mock:begin', toolFingerprint: 'mock:tools',
+      voiceId: 'mock-voice-nova', language: 'en-US', toolsJson: [bookingTool()],
+    };
+    const mocked = await probeRetellAgent('agent_pilot', 'prod', { mockDeployment });
+    if (!mocked.ok) throw new Error('expected a mock snapshot for a deployment we made');
+    expect(mocked.snapshot.mock).toBe(true);
+    // The fixture satisfies every readiness rule, so a demo tenant verifies for
+    // a real reason rather than being waved through.
+    expect(evaluateRetellAgentReadiness(mocked.snapshot, {
+      versionTag: 'prod', webhookUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`,
+      pinnedVersion: 3, expectedPromptHash: 'mock:prompt', expectedToolsFingerprint: 'mock:tools',
+    })).toBeNull();
 
     env.RETELL_API_KEY = 'real-key';
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(providerAgent({ agent_id: 'agent_other' })), { status: 200 })));

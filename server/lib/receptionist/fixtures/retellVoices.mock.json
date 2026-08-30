@@ -1,0 +1,10 @@
+[
+  { "voiceId": "mock-voice-adrian", "name": "Adrian", "provider": "mock", "gender": "male", "accent": "American", "age": "Middle Aged", "previewUrl": null },
+  { "voiceId": "mock-voice-nova", "name": "Nova", "provider": "mock", "gender": "female", "accent": "American", "age": "Young", "previewUrl": null },
+  { "voiceId": "mock-voice-sage", "name": "Sage", "provider": "mock", "gender": "female", "accent": "American", "age": "Middle Aged", "previewUrl": null },
+  { "voiceId": "mock-voice-oliver", "name": "Oliver", "provider": "mock", "gender": "male", "accent": "British", "age": "Middle Aged", "previewUrl": null },
+  { "voiceId": "mock-voice-amelia", "name": "Amelia", "provider": "mock", "gender": "female", "accent": "British", "age": "Young", "previewUrl": null },
+  { "voiceId": "mock-voice-lucia", "name": "Lucía", "provider": "mock", "gender": "female", "accent": "Latin American", "age": "Middle Aged", "previewUrl": null },
+  { "voiceId": "mock-voice-mateo", "name": "Mateo", "provider": "mock", "gender": "male", "accent": "Latin American", "age": "Young", "previewUrl": null },
+  { "voiceId": "mock-voice-priya", "name": "Priya", "provider": "mock", "gender": "female", "accent": "Indian", "age": "Young", "previewUrl": null }
+]

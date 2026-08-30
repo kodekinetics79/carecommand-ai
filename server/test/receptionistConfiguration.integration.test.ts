@@ -20,6 +20,7 @@ const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
 const { compileIntakeContract } = await import('../modules/receptionist/intakeContract');
 const { PLATFORM_LOCALE_PACKS, platformLocalePackHash } = await import('../lib/receptionist/localePacks/defaults');
+const { readyCampaignFixture } = await import('./helpers/receptionistFixtures');
 
 type Role = 'OWNER' | 'MANAGER' | 'BILLING';
 type TenantFixture = { id: string; users: Record<Role, string>; branchId: string };
@@ -439,9 +440,14 @@ describe('AI receptionist trusted configuration', () => {
 
       const verified = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agentId}/verify-provider`, headers: auth(owner, 'OWNER') });
       expect(verified.statusCode).toBe(200);
+      // The verify route answers { code, message, agent }: a bare agent row
+      // gave the browser no way to render WHY a verification failed.
       expect(verified.json()).toMatchObject({
-        providerStatus: 'VERIFIED', providerVersion: 17, providerPublished: true,
-        providerVoiceId: 'voice_safe', providerLanguage: 'en-US', providerLastAttemptStatus: 'SUCCEEDED',
+        code: null,
+        agent: {
+          providerStatus: 'VERIFIED', providerVersion: 17, providerPublished: true,
+          providerVoiceId: 'voice_safe', providerLanguage: 'en-US', providerLastAttemptStatus: 'SUCCEEDED',
+        },
       });
       expect(fetchMock).toHaveBeenCalledWith(
         `https://api.retellai.com/get-agent/${providerAgentId}?version=prod`,
@@ -494,14 +500,37 @@ describe('AI receptionist trusted configuration', () => {
         payload: {
           clinicId: ownerClinic, agentId, name: 'Verified deployment campaign', status: 'DRAFT',
           offerTitle: 'Appointment', offerDescription: 'Schedule care', offerScript: 'Would you like an appointment?', appointmentType: 'Consultation',
+          // `smsConfirmation` defaults to true, and C5's readiness gate refuses
+          // to activate a campaign that promises a text no provider is
+          // configured to send. This suite is about provider attestation, so it
+          // promises no confirmation channel — the same way the deployment
+          // suite and the demo seed do.
+          smsConfirmation: false, emailConfirmation: false,
         },
       });
       expect(campaignDraft.statusCode).toBe(201);
       await expect(db.$executeRaw`UPDATE "ReceptionistCampaign" SET status = 'ACTIVE' WHERE id = ${campaignDraft.json().id}::uuid`)
         .rejects.toThrow(/ReceptionistCampaign_active_intake_attestation_check/);
+      // Activation is gated on readiness now, so this campaign needs what a
+      // real clinic needs: a mapped location, a bookable service, a provider
+      // with hours, a chosen voice and one proven inbound call. The mapped
+      // location is part of the booking contract, so it is created BEFORE the
+      // provider's booking tool is compiled — otherwise attestation would
+      // correctly report a mismatch against a contract that gained a location.
+      const readiness = await readyCampaignFixture({
+        tenantId: owner.id, clinicId: ownerClinic, campaignId: campaignDraft.json().id,
+        branchId: owner.branchId, appointmentType: 'Consultation', agentId,
+      });
+      // Mapping a location is itself an intake-contract change, so the
+      // campaign's revision has moved on; compile against the current one.
+      const readyRevision = (await db.receptionistCampaign.findUniqueOrThrow({
+        where: { id: campaignDraft.json().id }, select: { intakeSchemaRevision: true },
+      })).intakeSchemaRevision;
       providerBookingTool = compileIntakeContract({
-        campaignId: campaignDraft.json().id, revision: campaignDraft.json().intakeSchemaRevision,
-        appointmentType: 'Consultation', eligibleLocations: [], fields: [],
+        campaignId: campaignDraft.json().id, revision: readyRevision,
+        appointmentType: 'Consultation',
+        eligibleLocations: [{ id: readiness.locationId, name: 'Readiness fixture location' }],
+        fields: [],
         toolUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell/fn?clinicId=${ownerClinic}`,
       }).snapshot.bookAppointmentToolContract;
       const schemaVerified = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agentId}/verify-provider`, headers: auth(owner, 'OWNER') });
@@ -511,7 +540,7 @@ describe('AI receptionist trusted configuration', () => {
       });
       expect(activeCampaign.statusCode).toBe(200);
       expect(activeCampaign.json()).toMatchObject({
-        status: 'ACTIVE', intakeSchemaAttestedRevision: campaignDraft.json().intakeSchemaRevision,
+        status: 'ACTIVE', intakeSchemaAttestedRevision: readyRevision,
         intakeSchemaProviderAgentId: providerAgentId, intakeSchemaProviderVersion: 17,
       });
       expect(activeCampaign.json().intakeSchemaFingerprint).toMatch(/^[a-f0-9]{64}$/);
@@ -574,6 +603,7 @@ describe('AI receptionist trusted configuration', () => {
       const driftBlocked = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agentId}/verify-provider`, headers: auth(owner, 'OWNER') });
       expect(driftBlocked.statusCode).toBe(409);
       expect(driftBlocked.json().message).toContain('drift');
+      expect(driftBlocked.json().code).toBe('provider_deployment_drift');
       expect(await db.receptionistAgent.findUniqueOrThrow({ where: { id: agentId } })).toMatchObject({
         providerVersion: 17,
         providerStatus: 'VERIFIED',
@@ -588,10 +618,32 @@ describe('AI receptionist trusted configuration', () => {
         method: 'PATCH', url: `/v1/receptionist/campaigns/${activeCampaign.json().id}`, headers: auth(owner, 'OWNER'), payload: { status: 'PAUSED' },
       });
       expect(paused.statusCode).toBe(200);
-      const impossibleLocation = await app.inject({
+      // Asking a caller to choose a location is only answerable when the
+      // clinic HAS a mapped location. This campaign's clinic now does (a
+      // deployable campaign must), so the field is accepted here...
+      const possibleLocation = await app.inject({
         method: 'POST', url: '/v1/receptionist/intake-fields', headers: auth(owner, 'OWNER'),
         payload: {
           campaignId: activeCampaign.json().id, fieldType: 'PREFERRED_LOCATION', label: 'Preferred clinic',
+          aiQuestion: 'Which clinic location do you prefer?', required: true,
+        },
+      });
+      expect(possibleLocation.statusCode).toBe(201);
+
+      // ...and refused on a clinic with nothing mapped, which is the case the
+      // guard exists for: the agent must not ask an unanswerable question.
+      const unmappedClinic = (await createClinic(owner, { name: 'Unmapped location clinic' })).json().id as string;
+      const unmappedCampaign = await app.inject({
+        method: 'POST', url: '/v1/receptionist/campaigns', headers: auth(owner, 'OWNER'),
+        payload: {
+          clinicId: unmappedClinic, name: 'Unmapped campaign', status: 'DRAFT', offerTitle: 'Appointment',
+          offerDescription: 'Schedule care', offerScript: 'Schedule now', appointmentType: 'Consultation',
+        },
+      });
+      const impossibleLocation = await app.inject({
+        method: 'POST', url: '/v1/receptionist/intake-fields', headers: auth(owner, 'OWNER'),
+        payload: {
+          campaignId: unmappedCampaign.json().id, fieldType: 'PREFERRED_LOCATION', label: 'Preferred clinic',
           aiQuestion: 'Which clinic location do you prefer?', required: true,
         },
       });
@@ -615,7 +667,7 @@ describe('AI receptionist trusted configuration', () => {
       expect(staleSchemaActivation.json().message).toContain('intake_schema_mismatch');
       const approvedUpdate = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agentId}/verify-provider`, headers: auth(owner, 'OWNER') });
       expect(approvedUpdate.statusCode).toBe(200);
-      expect(approvedUpdate.json()).toMatchObject({ providerVersion: 18, providerStatus: 'VERIFIED' });
+      expect(approvedUpdate.json().agent).toMatchObject({ providerVersion: 18, providerStatus: 'VERIFIED' });
       expect(await db.auditEvent.count({ where: { tenantId: owner.id, resourceId: agentId, action: 'receptionistAgent.providerDeploymentUpdated' } })).toBe(2);
     } finally {
       vi.unstubAllGlobals();
@@ -648,12 +700,18 @@ describe('AI receptionist trusted configuration', () => {
       vi.stubGlobal('fetch', vi.fn(async () => new Response('temporary provider outage', { status: 503 })));
       const unavailable = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agent.id}/verify-provider`, headers: auth(t, 'OWNER') });
       expect(unavailable.statusCode).toBe(503);
+      // A provider outage must not downgrade a verification that is working:
+      // the snapshot is preserved and only the attempt is recorded as failed.
+      // The row is also spread at the top level, for callers that read it
+      // straight off the body.
       expect(unavailable.json()).toMatchObject({ providerStatus: 'VERIFIED', providerVersion: 4, providerLastAttemptStatus: 'FAILED', providerLastErrorCode: 'provider_unavailable' });
       // Every non-2xx from this route names its cause: `{ code, message, agent }` (C1 / M20).
+      // The message now comes from C5's shared remediation catalogue, which is
+      // the single home for operator copy.
       expect(unavailable.json()).toMatchObject({
         code: 'provider_unavailable',
-        message: expect.stringMatching(/could not be reached|could not be verified/),
-        agent: { id: agent.id, providerStatus: 'VERIFIED', providerLastErrorCode: 'provider_unavailable' },
+        message: expect.stringMatching(/unreachable|could not be reached|could not be verified/),
+        agent: { id: agent.id, providerStatus: 'VERIFIED', providerVersion: 4, providerLastAttemptStatus: 'FAILED', providerLastErrorCode: 'provider_unavailable' },
       });
 
       vi.stubGlobal('fetch', vi.fn(async url => new Response(
@@ -672,9 +730,12 @@ describe('AI receptionist trusted configuration', () => {
       const unresolvedNewEngine = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agent.id}/verify-provider`, headers: auth(t, 'OWNER') });
       expect(unresolvedNewEngine.statusCode).toBe(503);
       expect(unresolvedNewEngine.json()).toMatchObject({
-        providerStatus: 'INVALID', providerVersion: 4, providerResponseEngineId: 'llm-original',
-        providerBookToolFingerprint: 'c'.repeat(64), providerLastAttemptStatus: 'FAILED',
-        providerLastErrorCode: 'provider_response_engine_unavailable',
+        code: 'provider_response_engine_unavailable',
+        agent: {
+          providerStatus: 'INVALID', providerVersion: 4, providerResponseEngineId: 'llm-original',
+          providerBookToolFingerprint: 'c'.repeat(64), providerLastAttemptStatus: 'FAILED',
+          providerLastErrorCode: 'provider_response_engine_unavailable',
+        },
       });
       const blockedActivation = await app.inject({
         method: 'POST', url: '/v1/receptionist/campaigns', headers: auth(t, 'OWNER'),
