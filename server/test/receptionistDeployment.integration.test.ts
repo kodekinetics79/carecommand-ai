@@ -17,7 +17,7 @@ vi.mock('../workers/queues', () => ({
 const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
-const { readyCampaignFixture, clinicFixtureData } = await import('./helpers/receptionistFixtures');
+const { readyCampaignFixture, clinicFixtureData, proveTestCall } = await import('./helpers/receptionistFixtures');
 const { hashPrompt, llmRequestBody } = await import('../lib/retell');
 const { RETELL_GENERAL_TOOL_TYPES, retellLlmRequestIssues } = await import('../lib/receptionist/retellMock');
 
@@ -470,6 +470,10 @@ describe('readiness and activation', () => {
       const { agent, campaign } = await deployableCampaign(t);
       await app.inject({ method: 'POST', url: `/v1/receptionist/campaigns/${campaign.id}/deploy`, headers: auth(t) });
       await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agent.id}/verify-provider`, headers: auth(t) });
+      // B4: the go-live card is only green once a call actually reached THIS
+      // deployment. Prove it the way an operator does — after deploy + verify.
+      const deployed = await db.receptionistAgent.findUniqueOrThrow({ where: { id: agent.id }, select: { currentDeploymentId: true, clinicId: true } });
+      await proveTestCall({ tenantId: t.id, clinicId: deployed.clinicId, campaignId: campaign.id, deploymentId: deployed.currentDeploymentId });
 
       const activated = await app.inject({ method: 'POST', url: `/v1/receptionist/campaigns/${campaign.id}/activate`, headers: auth(t) });
       expect(activated.statusCode).toBe(200);
