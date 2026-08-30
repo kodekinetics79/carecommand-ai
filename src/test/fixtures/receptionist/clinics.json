@@ -1,0 +1,72 @@
+[
+  {
+    "id": "clinic-1",
+    "name": "Harley Street Medical Group",
+    "logoUrl": null,
+    "phone": "+442071234567",
+    "website": "https://harley.example.com",
+    "addressLine": "12 Harley Street, London",
+    "country": "GB",
+    "timezone": "Europe/London",
+    "defaultLanguage": "en-GB",
+    "complianceDisclosure": null,
+    "humanFallbackNumber": "+442071234568",
+    "doNotContactPolicy": null,
+    "workingHours": {
+      "monday": { "open": true, "start": "09:00", "end": "17:00" },
+      "tuesday": { "open": true, "start": "09:00", "end": "17:00" },
+      "wednesday": { "open": true, "start": "09:00", "end": "17:00" },
+      "thursday": { "open": true, "start": "09:00", "end": "17:00" },
+      "friday": { "open": true, "start": "09:00", "end": "17:00" },
+      "saturday": { "open": true, "start": "09:00", "end": "13:00" },
+      "sunday": { "open": false }
+    },
+    "active": true,
+    "updatedAt": "2026-08-29T12:00:00.000Z",
+    "locations": [
+      { "id": "loc-1", "clinicId": "clinic-1", "branchId": "branch-1", "name": "Harley Street", "address": "12 Harley Street", "phone": null, "timezone": "Europe/London", "accessNotes": "Entrance on Queen Anne Street; step-free access.", "workingHours": null, "active": true }
+    ],
+    "agents": [],
+    "_count": { "campaigns": 1 },
+    "readiness": {
+      "transferReady": true,
+      "transferReason": null,
+      "country": "GB",
+      "countryConfirmed": true,
+      "hoursConfigured": true,
+      "localePack": { "language": "en-GB", "country": "GB", "status": "APPROVED", "packId": "pack-gb-1", "evidenceHash": "sha256:gb1" },
+      "knowledge": { "status": "APPROVED", "approvedRevision": 3, "dirty": false },
+      "blockers": []
+    }
+  },
+  {
+    "id": "clinic-2",
+    "name": "Brightsmile Dental Group",
+    "logoUrl": null,
+    "phone": "+14155550142",
+    "website": null,
+    "addressLine": "500 Market Street",
+    "country": null,
+    "timezone": "America/Los_Angeles",
+    "defaultLanguage": "en-US",
+    "complianceDisclosure": "Hi, this is Riley, the AI assistant calling on behalf of Brightsmile Dental Group.",
+    "humanFallbackNumber": null,
+    "doNotContactPolicy": null,
+    "workingHours": null,
+    "active": true,
+    "updatedAt": "2026-08-29T12:00:00.000Z",
+    "locations": [],
+    "agents": [],
+    "_count": { "campaigns": 1 },
+    "readiness": {
+      "transferReady": false,
+      "transferReason": "not_set",
+      "country": null,
+      "countryConfirmed": false,
+      "hoursConfigured": false,
+      "localePack": { "language": "en-US", "country": null, "status": "MISSING", "packId": null, "evidenceHash": null },
+      "knowledge": { "status": "MISSING", "approvedRevision": null, "dirty": false },
+      "blockers": ["clinic_country_missing", "clinic_hours_missing", "locale_pack_unapproved"]
+    }
+  }
+]
