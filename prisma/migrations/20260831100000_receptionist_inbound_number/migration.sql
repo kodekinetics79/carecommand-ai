@@ -88,5 +88,7 @@ ALTER TABLE "ReceptionistAgentDeployment"
     );
 
 -- Deploy asks "does a live deployment already own this line?" before it binds.
-CREATE INDEX "ReceptionistAgentDeployment_tenantId_boundPhoneNumber_status_idx"
+-- 63-byte identifier limit: this is exactly the name Prisma gives
+-- @@index([tenantId, boundPhoneNumber, status]).
+CREATE INDEX "ReceptionistAgentDeployment_tenantId_boundPhoneNumber_statu_idx"
   ON "ReceptionistAgentDeployment"("tenantId", "boundPhoneNumber", "status");

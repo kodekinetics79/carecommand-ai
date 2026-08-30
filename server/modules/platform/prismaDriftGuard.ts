@@ -6,14 +6,21 @@ import type { PrismaClient } from '../../generated/prisma/client';
  * tenant-consistency FK on the same relation without a destructive rewrite.
  */
 export const TENANT_INTEGRITY_MANIFEST = Object.freeze({
-  compositeForeignKeys: 123,
-  childSupportingIndexes: 123,
+  // 20260830130000_front_desk_loop dropped the dead ReceptionistAppointmentRequest
+  // table, and DROP TABLE takes the two composite FKs the generator had built for
+  // its clinicId and campaignId relations (rls_fk_4f9522140340599c0abf,
+  // rls_fk_8ac2cbf8d46bb044d220) and their two supporting child indexes
+  // (rls_ix_99b8d38f420976c6a62c, rls_ix_2db737562fe7cfbf7c87) with it. That is
+  // the whole difference from the previous 123/123/154/135 pins; the parent
+  // unique indexes are shared with live tables and are unchanged.
+  compositeForeignKeys: 121,
+  childSupportingIndexes: 121,
   parentUniqueIndexes: 31,
-  totalManagedIndexes: 154,
+  totalManagedIndexes: 152,
   // Nineteen managed indexes are structurally represented by ordinary Prisma
   // indexes. Prisma therefore preserves them even though their physical names
   // use the migration-owned prefixes; only the remainder appears in diff SQL.
-  prismaDiffManagedIndexes: 135,
+  prismaDiffManagedIndexes: 133,
   foreignKeyPrefix: 'rls_fk_',
   childIndexPrefix: 'rls_ix_',
   parentIndexPrefix: 'rls_uq_',

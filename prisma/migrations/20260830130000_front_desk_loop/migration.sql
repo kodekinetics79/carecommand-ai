@@ -78,7 +78,9 @@ ALTER TABLE "ReceptionistClinic" ADD COLUMN "frontDeskPolicy" JSONB;
 -- 4. AppointmentNote: append-only notes
 -- ---------------------------------------------------------------------------
 CREATE TABLE "AppointmentNote" (
-  "id" UUID NOT NULL DEFAULT gen_random_uuid(),
+  -- No database default: the house convention is `@id @default(uuid())`,
+  -- generated client-side by Prisma. The backfill below supplies its own id.
+  "id" UUID NOT NULL,
   "tenantId" UUID NOT NULL,
   "appointmentId" UUID NOT NULL,
   "text" TEXT NOT NULL,
@@ -113,8 +115,8 @@ GRANT SELECT, INSERT ON TABLE "AppointmentNote" TO app_rls;
 
 -- Legacy free-text Appointment.notes becomes the first note (the column is kept
 -- for old readers; the note row is the durable history going forward).
-INSERT INTO "AppointmentNote" ("tenantId", "appointmentId", "text", "actorType", "createdAt")
-SELECT "tenantId", "id", left("notes", 1000), 'system', "createdAt"
+INSERT INTO "AppointmentNote" ("id", "tenantId", "appointmentId", "text", "actorType", "createdAt")
+SELECT gen_random_uuid(), "tenantId", "id", left("notes", 1000), 'system', "createdAt"
 FROM "Appointment"
 WHERE "notes" IS NOT NULL AND btrim("notes") <> '';
 

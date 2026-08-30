@@ -10,7 +10,11 @@
 -- trigger: a billing record that can be updated in place is not evidence.
 
 CREATE TABLE "UsageEvent" (
-  "id"              UUID NOT NULL DEFAULT gen_random_uuid(),
+  -- No database default: every other model in this schema declares
+  -- `@id @default(uuid())`, which Prisma generates client-side, and
+  -- 20260613220605_device_integration_module already dropped exactly this
+  -- stray default from thirteen tables. A default here reads as drift.
+  "id"              UUID NOT NULL,
   "tenantId"        UUID NOT NULL,
   "metric"          TEXT NOT NULL,
   "quantity"        INTEGER NOT NULL,

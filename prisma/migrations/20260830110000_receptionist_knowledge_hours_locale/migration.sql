@@ -170,7 +170,9 @@ ALTER TABLE "ReceptionistCallLog"
   ADD COLUMN "localePackId" UUID,
   ADD CONSTRAINT "ReceptionistCallLog_transferOutcome_check" CHECK ("transferOutcome" IS NULL OR "transferOutcome" IN ('connected', 'unknown')),
   ADD CONSTRAINT "ReceptionistCallLog_locale_pack_scope_fkey" FOREIGN KEY ("tenantId", "localePackId") REFERENCES "ReceptionistLocalePack"("tenantId", "id") ON DELETE RESTRICT ON UPDATE CASCADE;
-CREATE INDEX "ReceptionistCallLog_tenantId_clinicId_outsideHours_startedAt_idx" ON "ReceptionistCallLog"("tenantId", "clinicId", "outsideHours", "startedAt");
+-- 63-byte identifier limit: this is exactly the name Prisma gives
+-- @@index([tenantId, clinicId, outsideHours, startedAt]).
+CREATE INDEX "ReceptionistCallLog_tenantId_clinicId_outsideHours_startedA_idx" ON "ReceptionistCallLog"("tenantId", "clinicId", "outsideHours", "startedAt");
 
 ALTER TABLE "ReceptionistCampaign"
   ADD COLUMN "attestedLocalePackId" UUID,

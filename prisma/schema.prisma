@@ -2169,6 +2169,12 @@ model ReceptionistAgent {
 
   @@index([tenantId, clinicId, active])
   @@index([providerAgentId, providerVersion], map: "ReceptionistAgent_provider_deployment_idx")
+  // `currentDeploymentId` is deliberately not a foreign key (see
+  // 20260830140000_receptionist_agent_deployment: an enforced inverse would make
+  // the two deletes circular), so this index is the only thing keeping the
+  // deployment-to-agent lookup off a sequential scan. Declared here so the
+  // schema and that migration name the same index.
+  @@index([currentDeploymentId])
   @@unique([tenantId, clinicId, id])
 }
 
@@ -2396,6 +2402,10 @@ model ReceptionistCallLog {
   @@index([tenantId, patientId, createdAt])
   @@index([tenantId, clinicId, createdAt])
   @@index([tenantId, clinicId, direction, createdAt])
+  // The after-hours read: which calls landed outside the clinic's hours, in
+  // arrival order. Created by 20260830110000_receptionist_knowledge_hours_locale;
+  // declared here so the schema and that migration name the same index.
+  @@index([tenantId, clinicId, outsideHours, startedAt])
 }
 
 // Append-only recording decisions. Database triggers reject UPDATE and DELETE.

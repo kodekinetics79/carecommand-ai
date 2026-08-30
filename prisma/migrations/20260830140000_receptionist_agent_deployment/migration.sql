@@ -118,7 +118,11 @@ CREATE INDEX "ReceptionistAgentDeployment_tenantId_agentId_createdAt_idx"
   ON "ReceptionistAgentDeployment"("tenantId", "agentId", "createdAt");
 CREATE INDEX "ReceptionistAgentDeployment_tenantId_campaignId_status_idx"
   ON "ReceptionistAgentDeployment"("tenantId", "campaignId", "status");
-CREATE INDEX "ReceptionistAgentDeployment_providerAgentId_providerAgentVersion_idx"
+-- PostgreSQL truncates identifiers at 63 bytes, so the un-truncated name
+-- ("..._providerAgentVersion_idx", 68 bytes) would land in the catalogue as
+-- something Prisma does not recognise as its own index. Written here exactly
+-- as Prisma names @@index([providerAgentId, providerAgentVersion]).
+CREATE INDEX "ReceptionistAgentDeployment_providerAgentId_providerAgentVe_idx"
   ON "ReceptionistAgentDeployment"("providerAgentId", "providerAgentVersion");
 
 -- ---------------------------------------------------------------------------
