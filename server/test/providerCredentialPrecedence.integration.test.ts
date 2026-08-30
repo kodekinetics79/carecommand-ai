@@ -11,7 +11,7 @@ vi.mock('../workers/queues', () => ({
   registerCampaignSchedules: async () => undefined,
 }));
 
-const { providerConfig, providerValue, providerConfigured, __setProviderSnapshotForTests, PROVIDER_CATALOG } =
+const { providerConfig, providerValue, providerConfigured, resolveCredentialPrecedence, __setProviderSnapshotForTests, PROVIDER_CATALOG } =
   await import('../lib/providerCredentials');
 const { retellConfigStatus, retellCredentials } = await import('../lib/retell');
 
@@ -41,17 +41,45 @@ describe('provider credential precedence', () => {
     expect(providerValue('sms', 'fromNumber')).toBe('+15550000001');
   });
 
-  it('refuses to let a half-saved credential shadow working environment config', () => {
-    // Saving one field of three must not take SMS offline.
-    __setProviderSnapshotForTests({ sms: { accountSid: 'AC_saved' } });
-    const resolved = providerConfig('sms');
-    expect(resolved.source).not.toBe('db');
-    expect(resolved.values.accountSid).not.toBe('AC_saved');
-  });
+  /**
+   * The rule, asserted against explicit inputs.
+   *
+   * These used to go through providerConfig, which reads whatever provider
+   * credentials happen to be in the ambient environment - so they passed on a
+   * laptop with a populated .env and failed in CI, which has none. A test that
+   * reports which machine ran it is worse than no test.
+   */
+  describe('the precedence rule, independent of any machine', () => {
+    const COMPLETE_ENV = { accountSid: 'AC_env', authToken: 'tok_env', fromNumber: '+15550000002' };
 
-  it('falls back to the environment when nothing is saved', () => {
-    const resolved = providerConfig('voice');
-    expect(resolved.source === 'env' || resolved.source === null).toBe(true);
+    it('prefers a complete saved credential over complete environment config', () => {
+      const resolved = resolveCredentialPrecedence('sms', { accountSid: 'AC_saved', authToken: 'tok_saved', fromNumber: '+15550000001' }, COMPLETE_ENV);
+      expect(resolved).toMatchObject({ source: 'db' });
+      expect(resolved.values.authToken).toBe('tok_saved');
+    });
+
+    it('refuses to let a half-saved credential shadow working environment config', () => {
+      // Saving one field of three must not take SMS offline mid-edit.
+      const resolved = resolveCredentialPrecedence('sms', { accountSid: 'AC_saved' }, COMPLETE_ENV);
+      expect(resolved.source).toBe('env');
+      expect(resolved.values.accountSid).toBe('AC_env');
+    });
+
+    it('falls back to the environment when nothing is saved', () => {
+      expect(resolveCredentialPrecedence('sms', undefined, COMPLETE_ENV)).toMatchObject({ source: 'env' });
+    });
+
+    it('reports a partial save when there is no environment to fall back to', () => {
+      // Worth reporting rather than pretending nothing is set: the console
+      // shows it, and providerConfigured still says it is not usable.
+      const resolved = resolveCredentialPrecedence('sms', { accountSid: 'AC_saved' }, {});
+      expect(resolved).toMatchObject({ source: 'db' });
+      expect(resolved.values.fromNumber).toBeUndefined();
+    });
+
+    it('reports nothing configured when neither plane has anything', () => {
+      expect(resolveCredentialPrecedence('sms', undefined, {})).toEqual({ values: {}, source: null });
+    });
   });
 
   it('reports a provider as unconfigured when neither plane has all of it', () => {
@@ -75,19 +103,14 @@ describe('provider credential precedence', () => {
     expect(status.mock).toBe(true);
   });
 
-  it('never lets a half-saved credential be reported as connected', () => {
+  it('never reports a half-saved credential as connected, on any machine', () => {
+    // The wiring test stays tolerant of the ambient environment on purpose: the
+    // rule is pinned above with explicit inputs, and what matters here is that
+    // an incomplete credential is never called configured either way.
     __setProviderSnapshotForTests({ voice: { apiKey: 'only-the-key' } });
     const resolved = providerConfig('voice');
-    // Whichever plane answers, an incomplete credential set is not "connected".
-    if (resolved.source === 'db') {
-      expect(providerConfigured('voice')).toBe(false);
-      expect(resolved.values.fromNumber).toBeUndefined();
-    } else {
-      // Complete environment configuration wins over a partial save, so the
-      // product keeps working while the operator is mid-edit.
-      expect(resolved.source).toBe('env');
-      expect(resolved.values.apiKey).not.toBe('only-the-key');
-    }
+    if (resolved.source === 'db') expect(providerConfigured('voice')).toBe(false);
+    else expect(resolved.values.apiKey).not.toBe('only-the-key');
   });
 
   it('keeps one catalog for the console and the senders', () => {

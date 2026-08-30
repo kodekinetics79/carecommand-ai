@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -27,7 +27,13 @@ async function importPlatformDbWithoutTheVariable() {
   const dir = mkdtempSync(join(tmpdir(), 'platform-plane-'));
   try {
     const envFile = join(dir, 'env');
-    const stripped = readFileSync(join(repoRoot, '.env'), 'utf8')
+    // A checked-out repo has no .env - CI supplies configuration through the
+    // workflow environment instead - and requiring the file made this fail
+    // there for a reason that had nothing to do with what it tests. The child
+    // inherits process.env below either way; this file exists only to give
+    // dotenv something to load that does NOT set PLATFORM_DATABASE_URL.
+    const localEnv = existsSync(join(repoRoot, '.env')) ? readFileSync(join(repoRoot, '.env'), 'utf8') : '';
+    const stripped = localEnv
       .split('\n').filter(line => !line.startsWith('PLATFORM_DATABASE_URL')).join('\n');
     writeFileSync(envFile, stripped);
 

@@ -138,9 +138,24 @@ function isComplete(key: string, values: Record<string, string>): boolean {
  */
 export function providerConfig(key: string): { values: Record<string, string>; source: 'db' | 'env' | null } {
   refreshIfStale();
-  const stored = snapshot.get(key);
+  return resolveCredentialPrecedence(key, snapshot.get(key), envValues(key));
+}
+
+/**
+ * The precedence rule itself, as a pure function of its two inputs.
+ *
+ * Split out from providerConfig deliberately: the rule is the thing worth
+ * pinning, and pinning it through providerConfig means asserting against
+ * whatever provider credentials happen to be in the ambient environment. That
+ * passes on a laptop with a populated .env and fails in CI which has none - a
+ * test that reports the machine it ran on rather than the behaviour.
+ */
+export function resolveCredentialPrecedence(
+  key: string,
+  stored: Record<string, string> | undefined,
+  fromEnv: Record<string, string>,
+): { values: Record<string, string>; source: 'db' | 'env' | null } {
   if (stored && isComplete(key, stored)) return { values: stored, source: 'db' };
-  const fromEnv = envValues(key);
   if (Object.keys(fromEnv).length) return { values: fromEnv, source: 'env' };
   // A partial saved credential is still worth reporting rather than pretending
   // nothing is set - the console shows it as not configured.
