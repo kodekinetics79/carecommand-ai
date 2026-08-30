@@ -2596,6 +2596,15 @@ model IdempotencyKey {
   scope     String
   key       String
   resultId  String?
+  // The response the FIRST completed attempt returned, replayed verbatim to a
+  // repeat of the same key. A resultId can only point at a row, which is not
+  // enough: a replay must return what the caller was told, not what the row has
+  // since become.
+  response  Json?
+  // Digest of the request the key was first used for. A key reused with a
+  // DIFFERENT request is a client bug, and answering it with the old receipt
+  // would hide that: it is refused as a conflict instead.
+  fingerprint String?
   createdAt DateTime @default(now())
 
   @@unique([scope, key])
