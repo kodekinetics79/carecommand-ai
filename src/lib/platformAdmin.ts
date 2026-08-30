@@ -212,7 +212,9 @@ export const platformAdmin = {
   users: () => pf<Array<{ id: string; email: string; name: string; role: string; status: string; mfaEnabled: boolean; lastLoginAt: string | null }>>(`/v1/platform/users`),
   createUser: (body: { email: string; name: string; password: string; role: string }) => pf<unknown>(`/v1/platform/users`, { method: 'POST', body: JSON.stringify(body) }),
   updateUser: (id: string, body: { status?: string; role?: string }) => pf<unknown>(`/v1/platform/users/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
-  audit: (limit = 100) => pf<Array<{ id: string; action: string; targetType: string; targetId: string | null; tenantId: string | null; metadata: unknown; createdAt: string }>>(`/v1/platform/audit?limit=${limit}`),
+  // tenantId is pushed to the server: filtering the global newest-N client-side
+  // made a busy platform render a tenant's real history as "no events yet".
+  audit: (limit = 100, tenantId?: string) => pf<Array<{ id: string; action: string; targetType: string; targetId: string | null; tenantId: string | null; metadata: unknown; createdAt: string }>>(`/v1/platform/audit?limit=${limit}${tenantId ? `&tenantId=${encodeURIComponent(tenantId)}` : ''}`),
 
   // ── Control Tower (Phase 2) ──────────────────────────────────────────
   getBilling: (id: string) => pf<TenantBilling>(`/v1/platform/tenants/${id}/billing`),

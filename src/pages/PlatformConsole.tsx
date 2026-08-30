@@ -131,12 +131,12 @@ export default function PlatformConsole() {
         </header>
 
         <div className="max-w-6xl mx-auto px-6 py-6 space-y-6 animate-fade-up">
-          {section === 'overview' && <OverviewSection overview={overview} onGoTenants={() => setSection('tenants')} />}
-          {section === 'tenants' && <TenantsTab onOpenTenant={openTenant} />}
+          {section === 'overview' && <OverviewSection overview={overview} onGo={setSection} />}
+          {section === 'tenants' && <TenantsTab canManage={canManage} onOpenTenant={openTenant} />}
           {section === 'pilot' && <PlatformPilot />}
           {section === 'requests' && <RequestsTab />}
           {section === 'plans' && <PlansSection />}
-          {section === 'entitlements' && <TenantPicker title="Feature entitlements" subtitle="Open a tenant to toggle any of the 15 premium features (platform override)" hint="features" onOpenTenant={openTenant} />}
+          {section === 'entitlements' && <TenantPicker title="Feature entitlements" subtitle={`Open a tenant to toggle any of the ${Object.keys(FEATURE_LABELS).length} premium features (platform override)`} hint="features" onOpenTenant={openTenant} />}
           {section === 'operators' && <UsersTab canManage={canManage} />}
           {section === 'health' && <SystemStatus expanded />}
           {section === 'audit' && <AuditTab />}
@@ -156,7 +156,7 @@ export default function PlatformConsole() {
 }
 
 /* ─────────────────────────────────────────────────────────── */
-function OverviewSection({ overview, onGoTenants }: { overview: Overview | null; onGoTenants: () => void }) {
+function OverviewSection({ overview, onGo }: { overview: Overview | null; onGo: (section: SectionId) => void }) {
   return (
     <div className="space-y-6">
       {overview && (
@@ -171,11 +171,15 @@ function OverviewSection({ overview, onGoTenants }: { overview: Overview | null;
       <SystemStatus />
       <Panel title="Quick actions" subtitle="Jump to the most common operator workflows">
         <div className="grid sm:grid-cols-3 gap-3">
-          <button type="button" onClick={onGoTenants} className="flex items-center gap-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-3 text-left hover:border-[var(--b2)]">
+          <button type="button" onClick={() => onGo('tenants')} className="flex items-center gap-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-3 text-left hover:border-[var(--b2)]">
             <Building2 className="w-5 h-5 text-indigo" /><div><p className="text-sm font-semibold text-t1">Provision a company</p><p className="text-[11px] text-t3">Create a client tenant + owner login</p></div>
           </button>
-          <div className="flex items-center gap-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-3"><Gauge className="w-5 h-5 text-emerald-v" /><div><p className="text-sm font-semibold text-t1">System health</p><p className="text-[11px] text-t3">Latest API, database, and cache status</p></div></div>
-          <div className="flex items-center gap-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-3"><ScrollText className="w-5 h-5 text-violet-v" /><div><p className="text-sm font-semibold text-t1">Audit trail</p><p className="text-[11px] text-t3">Review recorded operator events</p></div></div>
+          <button type="button" onClick={() => onGo('health')} className="flex items-center gap-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-3 text-left hover:border-[var(--b2)]">
+            <Gauge className="w-5 h-5 text-emerald-v" /><div><p className="text-sm font-semibold text-t1">System health</p><p className="text-[11px] text-t3">API, database, queues and providers</p></div>
+          </button>
+          <button type="button" onClick={() => onGo('audit')} className="flex items-center gap-3 rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-3 text-left hover:border-[var(--b2)]">
+            <ScrollText className="w-5 h-5 text-violet-v" /><div><p className="text-sm font-semibold text-t1">Audit trail</p><p className="text-[11px] text-t3">Every privileged platform action</p></div>
+          </button>
         </div>
       </Panel>
     </div>
@@ -210,10 +214,16 @@ function PlansSection() {
 
 function TenantPicker({ title, subtitle, hint, onOpenTenant }: { title: string; subtitle: string; hint: string; onOpenTenant: (t: TenantSummary) => void }) {
   const [tenants, setTenants] = useState<TenantSummary[]>([]);
-  useEffect(() => { let a = true; void (async () => { const t = await platformAdmin.tenants(); if (a) setTenants(t); })(); return () => { a = false; }; }, []);
+  const [error, setError] = useState<string | null>(null);
+  const load = useCallback(async () => {
+    try { setTenants(await platformAdmin.tenants()); setError(null); }
+    catch (e) { setError(e instanceof Error ? e.message : 'Tenants could not be loaded'); }
+  }, []);
+  useEffect(() => { void (async () => { await load(); })(); }, [load]);
   return (
     <Panel title={title} subtitle={subtitle}>
-      {tenants.length === 0 ? <EmptyState icon={SlidersHorizontal} text="No tenants yet." /> : (
+      {error ? <LoadFailure message={error} onRetry={() => void load()} />
+        : tenants.length === 0 ? <EmptyState icon={SlidersHorizontal} text="No tenants yet." /> : (
         <div className="space-y-2">
           {tenants.map(t => t.tenant && (
             <button key={t.tenant.id} type="button" onClick={() => onOpenTenant(t)} className="w-full flex items-center justify-between gap-3 rounded-lg border border-[var(--b1)] px-3 py-2.5 hover:bg-[var(--s2)] text-left">
@@ -384,8 +394,12 @@ function AnnouncementsSection({ canManage }: { canManage: boolean }) {
   const [creating, setCreating] = useState(false);
   const [title, setTitle] = useState(''); const [body, setBody] = useState(''); const [severity, setSeverity] = useState('info');
   const [busy, setBusy] = useState(false);
-  const load = useCallback(async () => { setRows(await platformAdmin.announcements()); }, []);
-  useEffect(() => { let a = true; void (async () => { try { const r = await platformAdmin.announcements(); if (a) setRows(r); } catch { /* ignore */ } })(); return () => { a = false; }; }, []);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const load = useCallback(async () => {
+    try { setRows(await platformAdmin.announcements()); setLoadError(null); }
+    catch (e) { setLoadError(e instanceof Error ? e.message : 'Announcements could not be loaded'); }
+  }, []);
+  useEffect(() => { void (async () => { await load(); })(); }, [load]);
   async function create() { setBusy(true); try { await platformAdmin.createAnnouncement({ title: title.trim(), body: body.trim(), severity }); setTitle(''); setBody(''); setCreating(false); await load(); } finally { setBusy(false); } }
   const sevBadge = (s: string) => s === 'critical' ? 'badge-red' : s === 'warning' ? 'badge-amber' : 'badge-blue';
   return (
@@ -401,7 +415,8 @@ function AnnouncementsSection({ canManage }: { canManage: boolean }) {
           </div>
         </div>
       )}
-      {rows.length === 0 ? <EmptyState icon={Megaphone} text="No announcements yet." /> : (
+      {loadError ? <LoadFailure message={loadError} onRetry={() => void load()} />
+        : rows.length === 0 ? <EmptyState icon={Megaphone} text="No announcements yet." /> : (
         <div className="space-y-2">
           {rows.map(a => (
             <div key={a.id} className="rounded-lg border border-[var(--b1)] px-3 py-2.5">
@@ -447,14 +462,14 @@ function TenantDrawer({ tenant, canManage, onClose }: { tenant: TenantSummary; c
     const [d, p, au, acct] = await Promise.all([
       platformAdmin.tenant(tid).catch(() => tenant),
       platformAdmin.plans().catch(() => []),
-      platformAdmin.audit(200).catch(() => []),
+      platformAdmin.audit(200, tid).catch(() => []),
       // Settled rather than caught-to-null: a failure here is a real error the
       // Company tab must show, not an empty record it would render as "nothing
       // recorded yet".
       platformAdmin.company(tid).then(r => ({ ok: true as const, r })).catch((e: unknown) => ({ ok: false as const, e })),
     ]);
     if (!a) return;
-    setDetail(d); setPlans(p); setAudit(au.filter(x => x.tenantId === tid));
+    setDetail(d); setPlans(p); setAudit(au);
     if (acct.ok) { setAccount(acct.r); setAccountError(null); }
     else { setAccount(null); setAccountError(acct.e instanceof Error ? acct.e.message : 'Could not load the account record'); }
   })(); return () => { a = false; }; }, [tid, tenant]);
@@ -502,7 +517,7 @@ function TenantDrawer({ tenant, canManage, onClose }: { tenant: TenantSummary; c
               <DCard label="Setup status" value={d.setupStatus} />
               <DCard label="Active users" value={String(d.activeUsers)} />
               <DCard label="Branches" value={String(d.branches)} />
-              <DCard label="Enabled features" value={`${d.enabledFeatures}/15`} />
+              <DCard label="Enabled features" value={`${d.enabledFeatures}/${Object.keys(FEATURE_LABELS).length}`} />
               <DCard label="Last activity" value={new Date(d.tenant!.lastActivityAt).toLocaleDateString()} />
               <DCard label="Plan" value={d.subscription?.planKey ?? '—'} />
               <DCard label="Sub status" value={d.subscription?.status ?? '—'} />
@@ -533,7 +548,7 @@ function TenantDrawer({ tenant, canManage, onClose }: { tenant: TenantSummary; c
             </div>
           )}
 
-          {tab === 'entitlements' && <TenantFeatureControls tenantId={tid} onChanged={reload} />}
+          {tab === 'entitlements' && <TenantFeatureControls tenantId={tid} canManage={canManage} onChanged={reload} />}
 
           {tab === 'usage' && <UsageTab tid={tid} canManage={canManage} />}
           {tab === 'billing' && <BillingTab tid={tid} canManage={canManage} />}
@@ -1271,6 +1286,21 @@ function Panel({ title, subtitle, action, children }: { title: string; subtitle?
   );
 }
 
+/**
+ * A load that failed is not an empty list. Rendering "you're all caught up"
+ * over a 500 is a correctness lie, so every list below distinguishes the two.
+ */
+function LoadFailure({ message, onRetry }: { message: string; onRetry?: () => void }) {
+  return (
+    <div className="flex flex-col items-center justify-center py-12 text-center gap-2" role="alert">
+      <div className="w-11 h-11 rounded-xl bg-red-soft grid place-items-center"><Ban className="w-5 h-5 text-red-v" /></div>
+      <p className="text-[13px] font-semibold text-red-v">Could not load this list</p>
+      <p className="text-[11px] text-t3 max-w-md">{message}</p>
+      {onRetry && <button type="button" onClick={onRetry} className="mt-1 rounded-lg border border-[var(--b1)] px-3 py-1.5 text-[11px] font-semibold text-t2 hover:bg-[var(--s1)]">Try again</button>}
+    </div>
+  );
+}
+
 function EmptyState({ icon: Icon, text }: { icon: React.ElementType; text: string }) {
   return (
     <div className="flex flex-col items-center justify-center py-12 text-center">
@@ -1281,7 +1311,10 @@ function EmptyState({ icon: Icon, text }: { icon: React.ElementType; text: strin
 }
 
 /* ─────────────────────────────────────────────────────────── */
-function TenantsTab({ onOpenTenant }: { onOpenTenant?: (t: TenantSummary) => void }) {
+// canManage was computed at the top of the console and never reached here, so
+// a PLATFORM_SUPPORT / BILLING / AUDITOR operator was handed fully enabled
+// provisioning, plan, suspend and entitlement controls that 403 on click.
+function TenantsTab({ canManage, onOpenTenant }: { canManage: boolean; onOpenTenant?: (t: TenantSummary) => void }) {
   const [tenants, setTenants] = useState<TenantSummary[]>([]);
   const [plans, setPlans] = useState<Array<{ key: string; name: string }>>([]);
   const [busy, setBusy] = useState<string | null>(null);
@@ -1320,9 +1353,13 @@ function TenantsTab({ onOpenTenant }: { onOpenTenant?: (t: TenantSummary) => voi
             <Search className="w-3.5 h-3.5 text-t3 shrink-0" />
             <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search…" className="w-full bg-transparent text-xs text-t1 outline-none placeholder:text-t3" />
           </div>
-          <button type="button" onClick={() => setCreating(v => !v)} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90">
-            <Building2 className="w-3.5 h-3.5" /> New company
-          </button>
+          {canManage
+            ? (
+              <button type="button" onClick={() => setCreating(v => !v)} className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90">
+                <Building2 className="w-3.5 h-3.5" /> New company
+              </button>
+            )
+            : <span className="text-[11px] text-t3">Your platform role cannot provision companies.</span>}
         </div>
       }>
       {creating && <CreateCompanyForm plans={plans} plansError={plansError} onCancel={() => setCreating(false)} onCreated={async () => { setCreating(false); await reload(); }} />}
@@ -1349,7 +1386,7 @@ function TenantsTab({ onOpenTenant }: { onOpenTenant?: (t: TenantSummary) => voi
                   {t.subscription && <span className={`badge ${SUB_STATUS_BADGE[t.subscription.status] ?? 'badge-blue'}`}>{t.subscription.planKey} · {t.subscription.status.toLowerCase()}</span>}
                 </div>
               </div>
-              <p className="text-[10px] text-t3 pl-12 mt-1">Last activity {new Date(t.tenant.lastActivityAt).toLocaleDateString()} · billing/MRR available via platformAdmin.getBilling</p>
+              <p className="text-[10px] text-t3 pl-12 mt-1">Last activity {new Date(t.tenant.lastActivityAt).toLocaleDateString()}</p>
               <div className="mt-2.5 flex flex-wrap items-center gap-2 pl-12">
                 <select aria-label="Change plan" disabled={busy === t.tenant.id} defaultValue=""
                   onChange={e => e.target.value && act(t.tenant!.id, () => platformAdmin.changePlan(t.tenant!.id, e.target.value))}
@@ -1380,7 +1417,7 @@ function TenantsTab({ onOpenTenant }: { onOpenTenant?: (t: TenantSummary) => voi
                   </button>
                 )}
               </div>
-              {expanded === t.tenant.id && <TenantFeatureControls tenantId={t.tenant.id} onChanged={reload} />}
+              {expanded === t.tenant.id && <TenantFeatureControls tenantId={t.tenant.id} canManage={canManage} onChanged={reload} />}
             </div>
           ))}
         </div>
@@ -1512,7 +1549,7 @@ function CreateCompanyForm({ plans, plansError, onCancel, onCreated }: { plans: 
 }
 
 /* ─────────────────────────────────────────────────────────── */
-function TenantFeatureControls({ tenantId, onChanged }: { tenantId: string; onChanged: () => void }) {
+function TenantFeatureControls({ tenantId, canManage, onChanged }: { tenantId: string; canManage: boolean; onChanged: () => void }) {
   const [ents, setEnts] = useState<Array<{ featureKey: string; enabled: boolean; source: string; limitValue: number | null }> | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1555,7 +1592,7 @@ function TenantFeatureControls({ tenantId, onChanged }: { tenantId: string; onCh
                   <p className="text-[10px] text-t3">{overridden ? 'platform override' : `via ${e?.source ?? 'plan'}`}{e?.limitValue != null ? ` · limit ${e.limitValue}` : ''}</p>
                 </div>
                 <button type="button" role="switch" aria-checked={enabled ? 'true' : 'false'} aria-label={`Toggle ${FEATURE_LABELS[key] ?? key}`}
-                  disabled={busyKey === key} onClick={() => toggle(key, !enabled)}
+                  disabled={busyKey === key || !canManage} title={canManage ? undefined : 'Your platform role cannot change entitlements'} onClick={() => toggle(key, !enabled)}
                   className={`relative w-9 h-5 rounded-full shrink-0 transition-colors disabled:opacity-50 ${enabled ? 'bg-[var(--indigo)]' : 'bg-[var(--b2)]'}`}>
                   {busyKey === key
                     ? <Loader2 className="w-3 h-3 animate-spin text-white absolute top-1 left-3" />
@@ -1575,12 +1612,23 @@ function TenantFeatureControls({ tenantId, onChanged }: { tenantId: string; onCh
 function RequestsTab() {
   const [rows, setRows] = useState<Array<{ id: string; tenantName: string; requestType: string; status: string; requestedPlanKey: string | null; createdAt: string }>>([]);
   const [busy, setBusy] = useState<string | null>(null);
-  const reload = useCallback(async () => { setRows(await platformAdmin.requests('PENDING')); }, []);
-  useEffect(() => { let a = true; void (async () => { const r = await platformAdmin.requests('PENDING'); if (a) setRows(r); })(); return () => { a = false; }; }, []);
-  async function act(id: string, fn: () => Promise<unknown>) { setBusy(id); try { await fn(); await reload(); } finally { setBusy(null); } }
+  const [error, setError] = useState<string | null>(null);
+  const reload = useCallback(async () => {
+    try { setRows(await platformAdmin.requests('PENDING')); setError(null); }
+    catch (e) { setError(e instanceof Error ? e.message : 'Subscription requests could not be loaded'); }
+  }, []);
+  useEffect(() => { void (async () => { await reload(); })(); }, [reload]);
+  async function act(id: string, fn: () => Promise<unknown>) {
+    setBusy(id); setError(null);
+    try { await fn(); await reload(); }
+    catch (e) { setError(e instanceof Error ? e.message : 'That action failed'); }
+    finally { setBusy(null); }
+  }
   return (
     <Panel title="Subscription requests" subtitle="Plan changes awaiting operator approval">
-      {rows.length === 0 ? <EmptyState icon={FileCheck2} text="No pending subscription requests. You're all caught up." /> : (
+      {error && rows.length > 0 && <p className="mb-3 text-xs text-red-v" role="alert">{error}</p>}
+      {error && rows.length === 0 ? <LoadFailure message={error} onRetry={() => void reload()} />
+        : rows.length === 0 ? <EmptyState icon={FileCheck2} text="No pending subscription requests. You're all caught up." /> : (
         <div className="overflow-hidden rounded-xl border border-[var(--b1)] divide-y divide-[var(--b1)]">
           {rows.map(r => (
             <div key={r.id} className="flex items-center justify-between gap-3 px-4 py-3 hover:bg-[var(--s2)] transition-colors">
@@ -1618,8 +1666,12 @@ function UsersTab({ canManage }: { canManage: boolean }) {
   const [error, setError] = useState<string | null>(null);
   const [form, setForm] = useState({ email: '', name: '', password: '', role: 'PLATFORM_SUPPORT' });
 
-  const reload = useCallback(async () => setRows(await platformAdmin.users()), []);
-  useEffect(() => { let a = true; void (async () => { const r = await platformAdmin.users(); if (a) setRows(r); })(); return () => { a = false; }; }, []);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const reload = useCallback(async () => {
+    try { setRows(await platformAdmin.users()); setLoadError(null); }
+    catch (e) { setLoadError(e instanceof Error ? e.message : 'Operators could not be loaded'); }
+  }, []);
+  useEffect(() => { void (async () => { await reload(); })(); }, [reload]);
   async function run(id: string, fn: () => Promise<unknown>) { setBusy(id); setError(null); try { await fn(); await reload(); } catch (e) { setError(e instanceof Error ? e.message : 'Action failed'); } finally { setBusy(null); } }
   async function invite() {
     setBusy('invite'); setError(null);
@@ -1647,7 +1699,8 @@ function UsersTab({ canManage }: { canManage: boolean }) {
           </div>
         </div>
       )}
-      {rows.length === 0 ? <EmptyState icon={Users2} text="No operators found." /> : (
+      {loadError ? <LoadFailure message={loadError} onRetry={() => void reload()} />
+        : rows.length === 0 ? <EmptyState icon={Users2} text="No operators found." /> : (
         <div className="overflow-hidden rounded-xl border border-[var(--b1)] divide-y divide-[var(--b1)]">
           {rows.map(u => (
             <div key={u.id} className="flex items-center justify-between gap-3 px-4 py-3 hover:bg-[var(--s2)] transition-colors">
@@ -1691,11 +1744,17 @@ function UsersTab({ canManage }: { canManage: boolean }) {
 /* ─────────────────────────────────────────────────────────── */
 function AuditTab() {
   const [rows, setRows] = useState<Array<{ id: string; action: string; targetType: string; tenantId: string | null; createdAt: string }>>([]);
-  useEffect(() => { let a = true; void (async () => { const r = await platformAdmin.audit(150); if (a) setRows(r); })(); return () => { a = false; }; }, []);
+  const [error, setError] = useState<string | null>(null);
+  const load = useCallback(async () => {
+    try { setRows(await platformAdmin.audit(150)); setError(null); }
+    catch (e) { setError(e instanceof Error ? e.message : 'Audit events could not be loaded'); }
+  }, []);
+  useEffect(() => { void (async () => { await load(); })(); }, [load]);
   return (
     <Panel title="Audit log" subtitle="Recorded operator events. Review exported fields before sharing them outside the authorized team."
       action={<button type="button" onClick={() => void downloadAuditCsv()} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-t2 hover:bg-[var(--s2)]"><Download className="w-3.5 h-3.5" /> Export CSV</button>}>
-      {rows.length === 0 ? <EmptyState icon={Activity} text="No audit events recorded yet." /> : (
+      {error ? <LoadFailure message={error} onRetry={() => void load()} />
+        : rows.length === 0 ? <EmptyState icon={Activity} text="No audit events recorded yet." /> : (
         <div className="overflow-hidden rounded-xl border border-[var(--b1)] divide-y divide-[var(--b1)]">
           {rows.map(r => (
             <div key={r.id} className="flex items-center justify-between gap-3 px-4 py-2.5 hover:bg-[var(--s2)] transition-colors">
