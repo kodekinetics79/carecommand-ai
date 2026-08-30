@@ -19,7 +19,7 @@ import type { Clinic } from '../lib/receptionist';
 import { ReceptionistTaskCard, type TaskCardPermissions } from '../components/receptionist/ReceptionistTaskCard';
 import { CriticalSignalBanner } from '../components/receptionist/CriticalSignalBanner';
 import { BookItDialog } from '../components/receptionist/BookItDialog';
-import { AfterHoursSlot } from '../components/receptionist/AfterHoursSlot';
+import { AfterHoursCard } from '../components/receptionist/AfterHoursCard';
 import { MutationNotice } from '../components/receptionist/MutationNotice';
 import { formatEnumLabel } from '../components/receptionist/helpers';
 
@@ -370,7 +370,7 @@ export default function FrontDesk() {
             )}
           </BentoCard>
 
-          <AfterHoursSlot clinicName={clinic?.name ?? null} />
+          <AfterHoursCard />
 
           <div className="rounded-2xl border border-[var(--b1)] bg-[var(--s2)] p-4">
             <p className="text-xs font-bold text-t1 inline-flex items-center gap-1.5"><AlertCircle className="h-3.5 w-3.5 text-amber-v" aria-hidden="true" /> How you are notified</p>
