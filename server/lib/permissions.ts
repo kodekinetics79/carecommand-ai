@@ -228,6 +228,44 @@ export async function hasPermission(request: FastifyRequest, permission: Permiss
  * the caller would need; when several grants are accepted it names the broad
  * one, because that is the grant an administrator would actually assign.
  */
+/**
+ * Guard for editing a tenant's RoleDefinition rows.
+ *
+ * A RoleDefinition whose `name` matches a built-in role REPLACES that role's
+ * default grants for everyone holding it (see resolvePermissions). Role CRUD is
+ * gated on `settings:write`, which MANAGER holds - so without this guard a
+ * Branch Manager could write a definition named "Branch Manager" granting
+ * `admin:manage`, `patient:export` and `audit:read`, and hold them on the next
+ * request. Two rules close it:
+ *
+ *   1. You may not grant a permission you do not already hold.
+ *   2. You may not define or edit a built-in role's grants without `admin:manage`.
+ *
+ * OWNER and ADMIN hold every permission, so neither rule constrains them.
+ */
+export async function assertRoleEditWithinAuthority(
+  request: FastifyRequest,
+  input: { names: Array<string | null | undefined>; permissions?: Permission[] },
+): Promise<{ ok: true } | { ok: false; status: 403; error: string; message: string }> {
+  const granted = await getRequestPermissions(request);
+  const reserved = new Set(Object.values(ROLE_ENUM_TO_NAME).map(name => name.toLowerCase()));
+  const touchesBuiltIn = input.names.some(name => typeof name === 'string' && reserved.has(name.trim().toLowerCase()));
+  if (touchesBuiltIn && !granted.has('admin:manage')) {
+    return {
+      ok: false, status: 403, error: 'reserved_role_name',
+      message: 'That name belongs to a built-in role. Redefining a built-in role requires the admin:manage permission.',
+    };
+  }
+  const escalation = (input.permissions ?? []).find(permission => !granted.has(permission));
+  if (escalation) {
+    return {
+      ok: false, status: 403, error: 'permission_escalation',
+      message: `You cannot grant a permission you do not hold yourself (${escalation}).`,
+    };
+  }
+  return { ok: true };
+}
+
 export function denyPermission(reply: FastifyReply, permission: Permission) {
   return reply.code(403).send({
     error: 'insufficient_permission',

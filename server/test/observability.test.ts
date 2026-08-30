@@ -25,6 +25,32 @@ describe('observability — log redaction', () => {
     expect(out).not.toContain('rt_secret');
     expect(out).toContain(REDACTED);
   });
+
+  /**
+   * Request URLs used to be logged verbatim, so a patient search and every
+   * single-use patient token landed in application logs at `info`. These are
+   * the four shapes that leaked.
+   */
+  it('never writes a patient name or a one-time token from a request URL', async () => {
+    const lines: string[] = [];
+    const app = Fastify({ logger: { ...loggerOptions, level: 'info', stream: { write: (s: string) => { lines.push(s); } } } });
+    // Own the 404 the way the app does: Fastify's built-in one logs the raw URL.
+    app.setNotFoundHandler(async (request, reply) => { reply.code(404).send({ error: 'not_found', message: `Route ${request.method} not found.` }); });
+    app.get('/v1/patients', async () => ({ ok: true }));
+    app.get('/v1/intake/public/:token', async () => ({ ok: true }));
+    await app.inject({ method: 'GET', url: '/v1/patients?search=Jane%20Doe' });
+    await app.inject({ method: 'GET', url: '/v1/intake/public/6f1a2b3c4d5e6f708192a3b4c5d6e7f8' });
+    // An unrouted path still has to be scrubbed: there is no route template to
+    // fall back on for a 404.
+    await app.inject({ method: 'GET', url: '/v1/unknown/6f1a2b3c4d5e6f708192a3b4c5d6e7f8?search=Jane%20Doe' });
+    await app.close();
+
+    const out = lines.join('\n');
+    expect(out).not.toContain('Jane');
+    expect(out).not.toContain('6f1a2b3c4d5e6f708192a3b4c5d6e7f8');
+    // Still useful: the route template survives, so logs remain diagnosable.
+    expect(out).toContain('/v1/intake/public/:token');
+  });
 });
 
 describe('observability — captureException', () => {

@@ -159,6 +159,13 @@ export async function buildApp() {
     app.get('/docs/json', async (_request, reply) => reply.send(app.swagger()));
   }
   await app.register(errorPlugin);
+  // Fastify's built-in 404 logs "Route GET:<raw url> not found", which puts the
+  // full URL - a mistyped or expired intake/checkout/share token, or a patient
+  // search string - into logs at info. Own the handler so the reply is the same
+  // and the raw URL is never written.
+  app.setNotFoundHandler(async (request, reply) => {
+    reply.code(404).send({ error: 'not_found', message: `Route ${request.method} not found.` });
+  });
   // Metrics before auth so its onRequest/onResponse hooks time EVERY route
   // (including public/webhook ones) and /metrics stays outside the JWT scope.
   await app.register(metricsPlugin);
