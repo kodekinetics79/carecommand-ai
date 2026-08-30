@@ -4,7 +4,7 @@ import { db } from '../../lib/db';
 import { runWithTenantContext } from '../../lib/tenantContext';
 import { isValidRetellVersionTag } from '../../lib/retell';
 import { Prisma, type ReceptionistAgent } from '../../generated/prisma/client';
-import { uuid, idParam, writeRoles, callArtifactRead, isReceptionistDestinationConflict, lockReceptionistConfiguration, auditReceptionistMutation } from './shared';
+import { uuid, idParam, writeRoles, callArtifactRead, isProviderDeploymentConflict, isClinicNameConflict, lockReceptionistConfiguration, auditReceptionistMutation, PROVIDER_DEPLOYMENT_CONFLICT_MESSAGE } from './shared';
 import { verifyAgentProvider, type VerifyActor } from '../../lib/receptionist/agentVerification';
 import { remediationFor } from '../../lib/receptionist/remediation';
 
@@ -124,6 +124,12 @@ export const agentRoutes: FastifyPluginAsync = async app => {
         providerLastAttemptStatus: 'NEVER',
         providerLastAttemptAt: null,
         providerLastErrorCode: null,
+        // A7 - the deployment CareCommand published describes the OLD provider
+        // agent. Leaving `currentDeploymentId` pointing at it after the binding
+        // moves is what let a later deploy treat somebody's hand-built agent as
+        // one we own, and would have had verification compare a stranger's
+        // agent against our prompt hash.
+        currentDeploymentId: null,
       });
       const row = await tx.receptionistAgent.update({ where: { id }, data });
       await auditReceptionistMutation(tx, request, {
@@ -133,7 +139,10 @@ export const agentRoutes: FastifyPluginAsync = async app => {
         return row;
       });
     } catch (error) {
-      if (isReceptionistDestinationConflict(error)) throw app.httpErrors.conflict('This active provider deployment is already assigned to another agent.');
+      // Exactly the two unique rules this route can provoke, each with the
+      // sentence that belongs to it. Anything else is not ours to name.
+      if (isProviderDeploymentConflict(error)) throw app.httpErrors.conflict(PROVIDER_DEPLOYMENT_CONFLICT_MESSAGE);
+      if (isClinicNameConflict(error)) throw app.httpErrors.conflict('A clinic with this name already exists in this tenant.');
       throw error;
     }
   });
@@ -180,9 +189,14 @@ export const agentRoutes: FastifyPluginAsync = async app => {
           return verifyReply(200, null, null, outcome.agent);
       }
     } catch (error) {
-      if (isReceptionistDestinationConflict(error)) {
+      // Verification adopts the provider's reported version onto the agent, so
+      // the one uniqueness rule it can trip is the cross-tenant active-provider
+      // index. The winning row is frequently invisible to this tenant, which is
+      // why the message names the fact and the next action rather than "another
+      // agent" the operator will go looking for and never find.
+      if (isProviderDeploymentConflict(error)) {
         const current = await db.receptionistAgent.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-        return verifyReply(409, 'provider_destination_conflict', 'This active provider deployment is already assigned to another agent.', current);
+        return verifyReply(409, 'provider_deployment_ambiguous', PROVIDER_DEPLOYMENT_CONFLICT_MESSAGE, current);
       }
       throw error;
     }

@@ -11,6 +11,7 @@ import {
   mockCreateAgent,
   mockCreateLlm,
   mockListVoices,
+  mockPhoneNumberBinding,
   mockPublishAgent,
   mockUpdateAgent,
   mockUpdateLlm,
@@ -1248,6 +1249,18 @@ export async function publishRetellAgent(agentId: string, version: number): Prom
 
 export interface PhoneNumberBinding { phoneNumber: string; inboundAgentId: string | null; inboundAgentVersion: number | null }
 
+/**
+ * What a mock-mode read-back answers from: the deployment row CareCommand
+ * wrote, resolved by the caller INSIDE its tenant context so the provider
+ * client stays database-free and cannot silently read zero rows under RLS.
+ */
+export interface MockPhoneNumberBinding {
+  boundPhoneNumber: string | null;
+  numberBound: boolean;
+  providerAgentId: string | null;
+  providerAgentVersion: number | null;
+}
+
 function parsePhoneNumberBinding(phoneNumber: string, body: Record<string, unknown>): PhoneNumberBinding {
   const agents = Array.isArray(body.inbound_agents)
     ? body.inbound_agents.map(record).filter((item): item is Record<string, unknown> => item !== null)
@@ -1280,9 +1293,25 @@ export async function updatePhoneNumberInboundAgent(
   return { ok: true, value: parsePhoneNumberBinding(phoneNumber, result.value), mock: false };
 }
 
-export async function getPhoneNumberBinding(phoneNumber: string): Promise<RetellProviderResult<PhoneNumberBinding>> {
+/**
+ * Ask the provider who currently answers a number.
+ *
+ * This is the read-back that makes `number_bound` an attestation rather than a
+ * claim: the deploy wrote a binding, and this is the only thing that can say
+ * the binding is still there. It had zero callers until A2.
+ *
+ * Mock mode answers from the deployment row the caller resolved inside its
+ * tenant context — the same discipline `probeRetellAgent` uses — so the demo
+ * and the tests exercise this code path instead of routing around it. A mock
+ * caller that supplies no binding gets an honest "nothing is bound", never a
+ * fabricated pass.
+ */
+export async function getPhoneNumberBinding(
+  phoneNumber: string,
+  options: { mockBinding?: MockPhoneNumberBinding | null } = {},
+): Promise<RetellProviderResult<PhoneNumberBinding>> {
   if (!retellCredentials().apiKey) return { ok: false, error: 'setup_required', mock: false };
-  if (retellConfigStatus().mock) return { ok: true, value: { phoneNumber, inboundAgentId: null, inboundAgentVersion: null }, mock: true };
+  if (retellConfigStatus().mock) return mockPhoneNumberBinding(phoneNumber, options.mockBinding ?? null);
   const result = await providerRequest(`/get-phone-number/${encodeURIComponent(phoneNumber)}`, { method: 'GET' });
   if (!result.ok) return result;
   return { ok: true, value: parsePhoneNumberBinding(phoneNumber, result.value), mock: false };

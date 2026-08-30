@@ -27,22 +27,49 @@ import { assemblePromptConfig, type PromptAssemblyClient } from './promptAssembl
 import type { DeployFailureCode } from './remediation';
 import { verifyAgentProvider, type VerifyActor, type VerifyOutcome } from './agentVerification';
 
+/**
+ * Failure codes Package A adds on top of the catalogue's `DeployFailureCode`.
+ * Declared here rather than in `remediation.ts`, which Package B owns this
+ * cycle; each one carries its own operator sentence in `message`, and B is
+ * asked to add matching CATALOGUE entries so the Fix link resolves too.
+ */
+export const PACKAGE_A_DEPLOY_FAILURE_CODES = [
+  'inbound_number_unassigned',
+  'inbound_number_conflict',
+  'campaign_active_deploy_blocked',
+] as const;
+
+export type ReceptionistDeployFailureCode = DeployFailureCode | typeof PACKAGE_A_DEPLOY_FAILURE_CODES[number];
+
+/** Statuses whose deployment is (or is about to be) answering a live number. */
+const LIVE_DEPLOYMENT_STATUSES = ['PUBLISHED', 'VERIFIED'] as const;
+
 // ===========================================================================
 // Deploying a campaign to Retell.
 //
 // The shape of this file is dictated by two facts. Provider calls take
-// seconds, and `runWithTenantContext` is a Prisma interactive transaction that
-// holds a tenant-wide advisory lock — so no provider call may happen inside
-// one. And the API runs on a function with a 60 s ceiling, so the whole thing
-// must fit a budget with room to answer.
+// seconds, and `runWithTenantContext` is a Prisma interactive transaction — so
+// no provider call may happen inside one. And the API runs on a function with
+// a 60 s ceiling, so the whole thing must fit a budget with room to answer.
 //
 // Hence: two short transactions with the provider work between them, exactly
-// like the verify route already does. Transaction #1 plans and claims;
-// provider calls run with nothing open; transaction #2 re-reads the agent,
-// refuses if it changed underneath us, and commits the deployment, the agent
-// and the audit event together. A deploy answers PUBLISHED with verification
-// pending, and the client calls verify — publishing and attesting are two
-// requests because together they do not fit in one.
+// like the verify route already does. Transaction #1 takes the per-agent
+// advisory lock, plans and claims; provider calls run with nothing open;
+// transaction #2 re-reads the agent, refuses if it changed underneath us, and
+// commits the deployment, the agent and the audit event together. A deploy
+// answers PUBLISHED with verification pending, and the client calls verify —
+// publishing and attesting are two requests because together they do not fit
+// in one.
+//
+// Serialising two racing deploys therefore takes both halves (A6). The
+// advisory lock in tx#1 stops two claims being planned against the same agent
+// state; the lock cannot be held across the provider window, so tx#2 bumps
+// `providerConfigRevision` on EVERY successful deploy and refuses to commit
+// against a revision that moved. The loser publishes at the provider but does
+// not adopt — which is the only outcome that keeps `currentDeploymentId` and
+// the provider's binding describing the same version. The file used to claim a
+// lock it never took, and the revision only moved when the agent id changed,
+// so two racing deploys both committed.
 // ===========================================================================
 
 export interface DeployPlan {
@@ -121,7 +148,7 @@ export type DeploymentRow = Prisma.ReceptionistAgentDeploymentGetPayload<Record<
 
 export type DeployOutcome =
   | { ok: true; deployment: DeploymentRow; verification: { status: 'pending' } }
-  | { ok: false; code: DeployFailureCode; message: string; deployment: DeploymentRow | null; retryAfterSeconds?: number; placeholders?: Placeholder[] };
+  | { ok: false; code: ReceptionistDeployFailureCode; message: string; deployment: DeploymentRow | null; retryAfterSeconds?: number; placeholders?: Placeholder[] };
 
 export interface DeployInput {
   tenantId: string;
@@ -163,8 +190,35 @@ export function loadCampaignGraph(client: TenantTxClient | typeof db, tenantId: 
   return client.receptionistCampaign.findFirst({ where: { id: campaignId, tenantId }, include: campaignInclude });
 }
 
-function fail(code: DeployFailureCode, message: string, deployment: DeploymentRow | null = null, extra: Partial<DeployOutcome & object> = {}): DeployOutcome {
+function fail(code: ReceptionistDeployFailureCode, message: string, deployment: DeploymentRow | null = null, extra: Partial<DeployOutcome & object> = {}): DeployOutcome {
   return { ok: false, code, message, deployment, ...extra } as DeployOutcome;
+}
+
+/**
+ * The number THIS clinic answers on.
+ *
+ * Not `env.RETELL_FROM_NUMBER`. That single process-wide value is why the
+ * second clinic's deploy repointed the first clinic's line while both
+ * checklists stayed green; it degrades here to what it always actually was —
+ * the outbound caller-id default used by `createPhoneCall`.
+ *
+ * A clinic with no assigned line falls back to its own published `phone`,
+ * because that is the number patients are told to call, and because `phone`
+ * already carries the same global active-unique index — so the fallback can
+ * never collapse two clinics onto one line either. The claim is then written
+ * back, so from the next deploy on it is an explicit, operator-visible fact
+ * rather than a derivation.
+ */
+export function clinicInboundNumber(clinic: { inboundNumber: string | null; phone: string }): string | null {
+  const assigned = clinic.inboundNumber?.trim();
+  if (assigned) return assigned;
+  const advertised = clinic.phone?.trim();
+  return advertised || null;
+}
+
+/** Postgres advisory lock, transaction-scoped, keyed on the one agent being deployed. */
+async function lockAgentDeploy(tx: TenantTxClient, tenantId: string, agentId: string): Promise<void> {
+  await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`receptionist-deploy:${tenantId}:${agentId}`}::text, 0))::text AS locked`;
 }
 
 function providerFailureCode(error: string): DeployFailureCode {
@@ -195,22 +249,58 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
 
   // ---- Transaction #1: plan, gate, claim -----------------------------------
   const claim = await runWithTenantContext(input.tenantId, async tx => {
-    const campaign = await loadCampaignGraph(tx, input.tenantId, input.campaignId);
-    if (!campaign) return { kind: 'not_found' as const };
-    if (!campaign.clinic.active) return { kind: 'error' as const, code: 'agent_inactive' as DeployFailureCode, message: 'The clinic is deactivated.' };
-    const agent = campaign.agent;
-    if (!agent) return { kind: 'error' as const, code: 'agent_unlinked_and_not_creatable' as DeployFailureCode, message: 'Link an agent to this campaign before deploying.' };
-    if (!agent.active) return { kind: 'error' as const, code: 'agent_inactive' as DeployFailureCode, message: 'The agent is deactivated.' };
+    const loaded = await loadCampaignGraph(tx, input.tenantId, input.campaignId);
+    if (!loaded) return { kind: 'not_found' as const };
+    if (!loaded.agent) return { kind: 'error' as const, code: 'agent_unlinked_and_not_creatable' as ReceptionistDeployFailureCode, message: 'Link an agent to this campaign before deploying.' };
+
+    // A6 — everything decision-relevant below is read AFTER this lock, and the
+    // agent is re-read through it, so two concurrent deploys of the same agent
+    // cannot both plan against the same state.
+    await lockAgentDeploy(tx, input.tenantId, loaded.agent.id);
+    const agent = await tx.receptionistAgent.findFirst({ where: { id: loaded.agent.id, tenantId: input.tenantId } });
+    if (!agent) return { kind: 'error' as const, code: 'agent_unlinked_and_not_creatable' as ReceptionistDeployFailureCode, message: 'Link an agent to this campaign before deploying.' };
+    const campaign = { ...loaded, agent };
+    if (!campaign.clinic.active) return { kind: 'error' as const, code: 'agent_inactive' as ReceptionistDeployFailureCode, message: 'The clinic is deactivated.' };
+    if (!agent.active) return { kind: 'error' as const, code: 'agent_inactive' as ReceptionistDeployFailureCode, message: 'The agent is deactivated.' };
 
     const latest = await tx.receptionistAgentDeployment.findFirst({
       where: { tenantId: input.tenantId, agentId: agent.id },
       orderBy: { startedAt: 'desc' },
     });
-    // An agent that already points at a provider agent CareCommand never
-    // deployed is somebody's hand-built agent; deploying would overwrite it.
-    if (agent.providerAgentId && !latest) {
-      return { kind: 'error' as const, code: 'engine_not_owned' as DeployFailureCode, message: 'This agent was linked manually. Unlink it before deploying, so CareCommand does not overwrite an agent it did not create.' };
+    // A7 — ownership is a question about THIS provider agent id, not about
+    // whether any deployment row happens to exist. Deploy once, then relink
+    // `providerAgentId` to a hand-built agent (PATCH /agents/:id allows it),
+    // and the old test — "a row exists, so we must own it" — would have let the
+    // next deploy PATCH and republish somebody else's agent.
+    const owned = agent.providerAgentId
+      ? await tx.receptionistAgentDeployment.findFirst({
+        where: { tenantId: input.tenantId, agentId: agent.id, providerAgentId: agent.providerAgentId },
+        select: { id: true },
+      })
+      : null;
+    if (agent.providerAgentId && !owned) {
+      return { kind: 'error' as const, code: 'engine_not_owned' as ReceptionistDeployFailureCode, message: 'This agent points at a Retell agent CareCommand did not create. Unlink it before deploying, so a deployment does not overwrite an agent it does not own.' };
     }
+
+    // A4 — a redeploy flips the agent to UNVERIFIED, and the runtime gate then
+    // drops every caller to the five safe tools until verification lands. That
+    // is a degrade window on a line that is answering patients right now, so it
+    // is refused here exactly as `PATCH /agents/:id` already refuses the
+    // analogous change. Pause the campaign, deploy, verify, activate.
+    const [activeStudioCampaign, runnableOutboundCampaign] = await Promise.all([
+      tx.receptionistCampaign.findFirst({ where: { tenantId: input.tenantId, agentId: agent.id, status: 'ACTIVE' }, select: { id: true, name: true } }),
+      tx.receptionistOutboundCampaign.findFirst({ where: { tenantId: input.tenantId, agentId: agent.id, status: { in: ['SCHEDULED', 'RUNNING'] } }, select: { id: true } }),
+    ]);
+    if (activeStudioCampaign || runnableOutboundCampaign) {
+      return {
+        kind: 'error' as const,
+        code: 'campaign_active_deploy_blocked' as ReceptionistDeployFailureCode,
+        message: activeStudioCampaign
+          ? `“${activeStudioCampaign.name}” is active and answering calls on this agent. Deploying would publish a new version and leave callers on the reduced safe tool set until it verifies. Pause the campaign, deploy, verify, then activate again.`
+          : 'A scheduled or running outbound campaign uses this agent. Pause it, deploy, verify, then resume.',
+      };
+    }
+
     const cooldown = userCooldownMs();
     if (input.actor.source === 'USER' && cooldown > 0 && latest && now.getTime() - latest.startedAt.getTime() < cooldown) {
       const retryAfterSeconds = Math.ceil((cooldown - (now.getTime() - latest.startedAt.getTime())) / 1_000);
@@ -229,7 +319,36 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
     }
     const plan = planDeployment(promptConfig, { mock: status.mock });
     if (plan.placeholders.length) {
-      return { kind: 'error' as const, code: 'placeholders_present' as DeployFailureCode, message: 'Replace the placeholder values before deploying.', placeholders: plan.placeholders };
+      return { kind: 'error' as const, code: 'placeholders_present' as ReceptionistDeployFailureCode, message: 'Replace the placeholder values before deploying.', placeholders: plan.placeholders };
+    }
+
+    // ---- A1: which line does THIS clinic answer on? ------------------------
+    const inboundNumber = clinicInboundNumber(campaign.clinic);
+    if (!inboundNumber) {
+      return { kind: 'error' as const, code: 'inbound_number_unassigned' as ReceptionistDeployFailureCode, message: 'This clinic has no inbound number, so a deployment has nothing to bind. Set the clinic’s inbound line in Studio, then deploy.' };
+    }
+    // Another live deployment in this tenant already owns the line. Binding
+    // anyway is exactly the theft this defect is about: the other clinic's
+    // callers would reach this agent, this clinic's hours and this clinic's
+    // branch, while both checklists still read green. (Across tenants the
+    // clinic-level global unique index settles it before we get here.)
+    const numberOwner = await tx.receptionistAgentDeployment.findFirst({
+      where: {
+        tenantId: input.tenantId,
+        boundPhoneNumber: inboundNumber,
+        numberBound: true,
+        status: { in: [...LIVE_DEPLOYMENT_STATUSES] },
+        clinicId: { not: campaign.clinicId },
+      },
+      select: { id: true, clinicId: true },
+    });
+    if (numberOwner) {
+      return { kind: 'error' as const, code: 'inbound_number_conflict' as ReceptionistDeployFailureCode, message: 'Another clinic’s live deployment already answers on this number. Give this clinic its own inbound line, or retire the other clinic’s deployment first — one number cannot answer for two clinics.' };
+    }
+    // Persist the claim so the line is an explicit fact from here on and the
+    // active-unique index — not whichever deploy ran last — owns it.
+    if (campaign.clinic.inboundNumber !== inboundNumber) {
+      await tx.receptionistClinic.update({ where: { id: campaign.clinicId }, data: { inboundNumber } });
     }
 
     const deployment = await tx.receptionistAgentDeployment.create({
@@ -257,16 +376,27 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
         startedAt: now,
       },
     });
+    // A5 — the response engine to reuse is the newest row that actually CARRIES
+    // one, not merely the newest row. A failed deploy is still the newest row,
+    // and reading `priorLlmId` off it as null is what made every retry mint a
+    // fresh orphan LLM: at the 20/hour limit, twenty unreachable engines per
+    // tenant per hour, and a response-engine id that churned on every deploy.
+    const priorEngine = await tx.receptionistAgentDeployment.findFirst({
+      where: { tenantId: input.tenantId, agentId: agent.id, providerLlmId: { not: null }, id: { not: deployment.id } },
+      orderBy: { startedAt: 'desc' },
+      select: { providerLlmId: true, providerLlmVersion: true, providerAgentVersion: true },
+    });
     return {
       kind: 'claimed' as const,
       deployment,
       plan,
+      inboundNumber,
       agentName: agent.name,
       providerConfigRevision: agent.providerConfigRevision,
       providerAgentId: agent.providerAgentId,
-      priorLlmId: latest?.providerLlmId ?? null,
-      priorLlmVersion: latest?.providerLlmVersion ?? 0,
-      priorAgentVersion: latest?.providerAgentVersion ?? 0,
+      priorLlmId: priorEngine?.providerLlmId ?? null,
+      priorLlmVersion: priorEngine?.providerLlmVersion ?? 0,
+      priorAgentVersion: latest?.providerAgentVersion ?? priorEngine?.providerAgentVersion ?? 0,
     };
   }, input.actor.trustedActor);
 
@@ -284,11 +414,22 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
     steps.push({ name, status, at: new Date().toISOString(), ...extra });
   };
   const outOfBudget = () => Date.now() >= deadline;
-  const failDeployment = async (code: DeployFailureCode, providerErrorCode: string, message: string): Promise<DeployOutcome> => {
+  // A5 — whatever the provider has already given us is recorded even when the
+  // deploy goes on to fail, because it exists at Retell whether or not we
+  // remember it. `failDeployment` writes it too: forgetting the engine id was
+  // how a flapping provider leaked one orphan LLM per attempt.
+  const created: { llmId: string | null; llmVersion: number | null; agentId: string | null; agentVersion: number | null } = {
+    llmId: null, llmVersion: null, agentId: null, agentVersion: null,
+  };
+  const providerEvidence = () => ({
+    ...(created.llmId ? { providerLlmId: created.llmId, providerLlmVersion: created.llmVersion } : {}),
+    ...(created.agentId ? { providerAgentId: created.agentId } : {}),
+  });
+  const failDeployment = async (code: ReceptionistDeployFailureCode, providerErrorCode: string, message: string): Promise<DeployOutcome> => {
     const row = await runWithTenantContext(input.tenantId, async tx => {
       const updated = await tx.receptionistAgentDeployment.update({
         where: { id: claim.deployment.id },
-        data: { status: 'FAILED', providerErrorCode, steps: steps as unknown as Prisma.InputJsonValue },
+        data: { status: 'FAILED', providerErrorCode, steps: steps as unknown as Prisma.InputJsonValue, ...providerEvidence() },
       });
       // The agent itself is untouched except for the attempt stamp: a failed
       // deploy must never downgrade a deployment that is currently working.
@@ -304,7 +445,7 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
         resourceId: claim.deployment.id,
         requestId: input.actor.requestId,
         ipAddress: input.actor.ip,
-        metadata: { agentId: claim.deployment.agentId, campaignId: claim.deployment.campaignId, code, providerErrorCode, mock: claim.plan.mock },
+        metadata: { agentId: claim.deployment.agentId, campaignId: claim.deployment.campaignId, code, providerErrorCode, mock: claim.plan.mock, providerLlmRetained: Boolean(created.llmId), providerAgentRetained: Boolean(created.agentId) },
       } });
       return updated;
     }, input.actor.trustedActor);
@@ -330,6 +471,8 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
     stamp('ensure_llm', 'failed', { providerErrorCode: llm.error });
     return failDeployment(providerFailureCode(llm.error), llm.error, 'Retell did not accept the prompt. Nothing was published.');
   }
+  created.llmId = llm.value.llmId;
+  created.llmVersion = llm.value.version;
   stamp('ensure_llm', 'ok');
   if (outOfBudget()) {
     stamp('ensure_agent', 'skipped', { detail: 'deploy budget exhausted' });
@@ -355,6 +498,8 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
     stamp('ensure_agent', 'failed', { providerErrorCode: providerAgent.error });
     return failDeployment(providerFailureCode(providerAgent.error), providerAgent.error, 'Retell did not accept the agent configuration. Nothing was published.');
   }
+  created.agentId = providerAgent.value.agentId;
+  created.agentVersion = providerAgent.value.version;
   stamp('ensure_agent', 'ok');
   if (outOfBudget()) {
     stamp('publish', 'skipped', { detail: 'deploy budget exhausted' });
@@ -369,25 +514,35 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
   }
   stamp('publish', 'ok');
 
-  // Step 4 — point the inbound number at the published version, so a patient
-  // calling the clinic reaches this deployment and not whatever answered before.
-  let boundNumber: string | null = null;
-  if (env.RETELL_FROM_NUMBER && !outOfBudget()) {
-    const bound = await updatePhoneNumberInboundAgent(env.RETELL_FROM_NUMBER, {
+  // Step 4 — point THIS CLINIC'S inbound number at the published version, so a
+  // patient calling this clinic reaches this deployment and not whatever
+  // answered before — and so that no other clinic's line is touched. The
+  // number is `campaign.clinic.inboundNumber`, claimed and uniqueness-checked
+  // in transaction #1; `env.RETELL_FROM_NUMBER` is the outbound caller-id
+  // default and has no business deciding who answers an inbound call.
+  let numberBound = false;
+  const targetNumber = claim.inboundNumber;
+  let bindError: string | null = null;
+  if (!outOfBudget()) {
+    const bound = await updatePhoneNumberInboundAgent(targetNumber, {
       agentId: providerAgent.value.agentId,
       agentVersion: published.value.version,
       inboundWebhookUrl: expectedRetellAgentWebhookUrl(),
     });
     if (bound.ok) {
-      boundNumber = bound.value.phoneNumber;
+      numberBound = true;
       stamp('bind_number', 'ok');
     } else {
       // The agent IS published; only the inbound binding failed. Readiness
-      // reports `number_bound` as failing rather than the deploy pretending.
+      // reports `number_bound` as not passing rather than the deploy
+      // pretending, and the number we tried is still recorded so an operator
+      // can see which line Retell refused.
+      bindError = bound.error;
       stamp('bind_number', 'failed', { providerErrorCode: bound.error });
     }
   } else {
-    stamp('bind_number', 'skipped', { detail: env.RETELL_FROM_NUMBER ? 'deploy budget exhausted' : 'no RETELL_FROM_NUMBER configured' });
+    bindError = 'deploy_budget_exhausted';
+    stamp('bind_number', 'skipped', { detail: 'deploy budget exhausted' });
   }
   stamp('verify', 'skipped', { detail: 'verification runs as a separate request' });
 
@@ -410,8 +565,16 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
         providerAgentVersion: published.value.version,
         providerLlmId: llm.value.llmId,
         providerLlmVersion: llm.value.version,
-        numberBound: boundNumber !== null,
-        boundPhoneNumber: boundNumber,
+        // What we ASKED for. `numberBinding*` — what the provider ANSWERS when
+        // asked again — stays null until verification reads it back, so a
+        // fresh deployment is `pending`, never `pass`.
+        numberBound,
+        boundPhoneNumber: targetNumber,
+        numberBindingReadAt: null,
+        numberBindingAgentId: null,
+        numberBindingAgentVersion: null,
+        numberBindingVerifiedAt: null,
+        numberBindingErrorCode: bindError,
         publishedAt: new Date(),
         steps: steps as unknown as Prisma.InputJsonValue,
         providerErrorCode: null,
@@ -436,7 +599,12 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
         providerLastAttemptStatus: 'SUCCEEDED',
         providerLastAttemptSource: 'DEPLOY',
         providerLastErrorCode: null,
-        ...(current.providerAgentId !== providerAgent.value.agentId ? { providerConfigRevision: { increment: 1 } } : {}),
+        // A6 — every successful deploy moves the revision, not only one that
+        // repointed the agent id. The revision is what a racing deploy's own
+        // transaction #2 compares against, so a revision that stood still let
+        // two deploys both commit; and verification re-attests per revision, so
+        // moving it is also what forces this exact version to be attested.
+        providerConfigRevision: { increment: 1 },
       },
     });
     await tx.auditEvent.create({ data: {
@@ -454,6 +622,8 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
         toolFingerprint: deployment.toolFingerprint,
         providerAgentVersion: deployment.providerAgentVersion,
         numberBound: deployment.numberBound,
+        boundPhoneNumber: deployment.boundPhoneNumber,
+        clinicId: deployment.clinicId,
         mock: deployment.mock,
       },
     } });
