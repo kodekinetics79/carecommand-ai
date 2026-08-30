@@ -4,6 +4,7 @@ import { MemoryRouter } from 'react-router';
 import { describe, expect, it, vi } from 'vitest';
 
 import { ApiError } from '../../lib/api';
+import { mergeVoicesSection, normalizeCatalog } from '../../lib/receptionistDeployment';
 import type { AgentRow, Blocker, CatalogView, VerificationView } from '../../lib/receptionistDeployment';
 import { AgentEditor } from './AgentEditor';
 
@@ -25,13 +26,32 @@ function agent(overrides: Partial<AgentRow> = {}): AgentRow {
   };
 }
 
-const catalog: CatalogView = {
-  voices: [{ voiceId: '11labs-Anna', name: 'Anna', provider: 'elevenlabs', gender: 'female', accent: 'American', previewUrl: null }],
+/**
+ * Built through the real normalisers from the bodies the two routes actually
+ * send, not hand-written. `GET /v1/receptionist/catalog` carries no `voices`
+ * section at all — which is exactly why the picker was empty in every tenant
+ * and no test noticed. `GET /v1/receptionist/voices` is where the list lives
+ * until the server folds it into the catalog (contract §7).
+ */
+const CATALOG_BODY = {
   languages: [{ id: 'en-US', label: 'English (US)' }],
   tones: [{ id: 'Warm and professional', label: 'Warm and professional' }],
   campaignTypes: [],
-  providerMode: 'live',
+  countries: [{ code: 'US', name: 'United States' }],
 };
+
+const VOICES_BODY = {
+  providerMode: 'live',
+  source: 'provider',
+  fetchedAt: '2026-08-30T09:00:00.000Z',
+  error: null,
+  voices: [
+    { voiceId: '11labs-Anna', name: 'Anna', provider: 'elevenlabs', gender: 'female', accent: 'American', age: 'young', previewUrl: null },
+    { voiceId: '11labs-Marcus', name: 'Marcus', provider: 'elevenlabs', gender: 'male', accent: 'British', age: 'middle', previewUrl: null },
+  ],
+};
+
+const catalog: CatalogView = mergeVoicesSection(normalizeCatalog(CATALOG_BODY), VOICES_BODY);
 
 const verified: VerificationView = {
   status: 'VERIFIED', expiresAt: '2026-08-30T17:00:00.000Z', expiresInMs: 19 * 60 * 60 * 1000,
@@ -170,5 +190,94 @@ describe('AgentEditor', () => {
     const remove = screen.getByRole('button', { name: /Delete agent/ });
     expect(remove).toBeDisabled();
     expect(remove).toHaveAttribute('title', 'Unlink this agent from the campaign before deleting it.');
+  });
+});
+
+describe('AgentEditor — the voice picker (E9)', () => {
+  it('offers the provider voices the /voices section carries, which the catalog alone does not', () => {
+    // The catalog body on its own has no voices: the stored value would be the
+    // only option, labelled "(not in catalog)".
+    const catalogOnly = normalizeCatalog(CATALOG_BODY);
+    expect(catalogOnly.voices).toHaveLength(0);
+
+    renderEditor({ catalog });
+
+    const picker = screen.getByLabelText('Voice') as HTMLSelectElement;
+    expect([...picker.options].map(option => option.value)).toEqual(['11labs-Anna', '11labs-Marcus']);
+    expect(screen.getByText('Anna (female, American) · elevenlabs')).toBeInTheDocument();
+  });
+
+  it('says why the list is empty rather than showing a picker with one silent option', () => {
+    const unavailable = mergeVoicesSection(normalizeCatalog(CATALOG_BODY), { providerMode: 'live', voices: [], source: 'unavailable', error: 'provider_unavailable' });
+    renderEditor({ catalog: unavailable });
+
+    expect(screen.getByText(/could not be read from the provider \(provider_unavailable\)/)).toBeInTheDocument();
+    // The stored voice is still offered, marked, so nothing is silently replaced.
+    expect(screen.getByText('11labs-Anna (not in catalog)')).toBeInTheDocument();
+  });
+});
+
+describe('AgentEditor — the draft follows the stored row (E10)', () => {
+  it('re-seeds the picker after an adopt changes the stored voice, and stops reverting it on the next Save', () => {
+    const { rerender } = render(<MemoryRouter><AgentEditor
+      agent={agent({ voice: '11labs-Anna' })}
+      catalog={catalog}
+      onSave={vi.fn().mockResolvedValue(agent())}
+      onVerify={vi.fn().mockResolvedValue(undefined)}
+    /></MemoryRouter>);
+    expect((screen.getByLabelText('Voice') as HTMLSelectElement).value).toBe('11labs-Anna');
+
+    // What "Adopt provider values" does: the server row comes back with the
+    // provider's voice. The editor used to keep showing the old one, so Save
+    // silently undid the adoption.
+    rerender(<MemoryRouter><AgentEditor
+      agent={agent({ voice: '11labs-Marcus' })}
+      catalog={catalog}
+      onSave={vi.fn().mockResolvedValue(agent())}
+      onVerify={vi.fn().mockResolvedValue(undefined)}
+    /></MemoryRouter>);
+
+    expect((screen.getByLabelText('Voice') as HTMLSelectElement).value).toBe('11labs-Marcus');
+    expect(screen.getByRole('button', { name: /Save changes/ })).toBeDisabled();
+  });
+
+  it('keeps a half-typed name when the same row is handed back after a sibling reload', () => {
+    const { rerender } = render(<MemoryRouter><AgentEditor
+      agent={agent()} catalog={catalog}
+      onSave={vi.fn().mockResolvedValue(agent())} onVerify={vi.fn().mockResolvedValue(undefined)}
+    /></MemoryRouter>);
+
+    fireEvent.change(screen.getByDisplayValue('Riley'), { target: { value: 'Rileyanne' } });
+    rerender(<MemoryRouter><AgentEditor
+      agent={agent()} catalog={catalog}
+      onSave={vi.fn().mockResolvedValue(agent())} onVerify={vi.fn().mockResolvedValue(undefined)}
+    /></MemoryRouter>);
+
+    expect(screen.getByDisplayValue('Rileyanne')).toBeInTheDocument();
+  });
+
+  it('keeps the adopt confirmation visible after the mismatch it fixed has gone', async () => {
+    const onAdoptProviderValues = vi.fn().mockResolvedValue(undefined);
+    const { rerender } = render(<MemoryRouter><AgentEditor
+      agent={agent({ voice: '11labs-Marcus', providerVoiceId: '11labs-Anna' })}
+      catalog={catalog}
+      onSave={vi.fn().mockResolvedValue(agent())} onVerify={vi.fn().mockResolvedValue(undefined)}
+      onAdoptProviderValues={onAdoptProviderValues}
+    /></MemoryRouter>);
+
+    fireEvent.click(screen.getByRole('button', { name: /Adopt provider values/ }));
+    await waitFor(() => expect(onAdoptProviderValues).toHaveBeenCalled());
+
+    // The adopt succeeded, so the mismatch badge is gone — the confirmation
+    // used to live inside that block and vanish with it.
+    rerender(<MemoryRouter><AgentEditor
+      agent={agent({ voice: '11labs-Anna', providerVoiceId: '11labs-Anna' })}
+      catalog={catalog}
+      onSave={vi.fn().mockResolvedValue(agent())} onVerify={vi.fn().mockResolvedValue(undefined)}
+      onAdoptProviderValues={onAdoptProviderValues}
+    /></MemoryRouter>);
+
+    expect(screen.queryByTestId('provider-mismatch')).not.toBeInTheDocument();
+    expect(screen.getByText('Provider voice and language adopted')).toBeInTheDocument();
   });
 });

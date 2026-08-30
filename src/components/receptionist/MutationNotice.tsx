@@ -1,12 +1,17 @@
 import type { ReactNode } from 'react';
 import { AlertCircle, Check } from 'lucide-react';
 import type { MutationState } from '../../hooks/useMutationState';
+import { FixLink } from './ReadinessChecklist';
 
 /**
  * Renders the outcome of a `useMutationState` run: the server's own error
- * (role="alert", with its code and an optional action), a "Saved" pill, or
- * nothing at all. Idle and busy render nothing — the calling control shows
- * its own spinner.
+ * (role="alert", with its code, the remediation sentence it wrote for that
+ * code and a Fix link), a "Saved" pill, or nothing at all. Idle and busy
+ * render nothing — the calling control shows its own spinner.
+ *
+ * The remediation block is the same copy the readiness rows show. Rendering
+ * it here is what stops a refused deploy / activate / verify / campaign edit
+ * from degrading to a bare identifier next to fully guided checklist rows.
  */
 export function MutationNotice({
   state,
@@ -41,12 +46,19 @@ export function MutationNotice({
               ))}
             </ul>
           )}
+          {state.remediation?.action && (
+            <p className="mt-1 text-red-v/90" data-testid="remediation-action">
+              {state.remediation.title && state.remediation.title !== state.message && <span className="font-semibold">{state.remediation.title} — </span>}
+              {state.remediation.action}
+            </p>
+          )}
           {state.code && <p className="mt-0.5 font-mono text-[10px] text-red-v/80">code: {state.code}</p>}
-          {(onRetry || action) && (
+          {(onRetry || action || state.remediation?.fixHref) && (
             <div className="mt-1.5 flex flex-wrap items-center gap-2">
               {onRetry && (
                 <button type="button" onClick={onRetry} className="rounded-lg border border-red-v/40 px-2.5 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--s2)]">{retryLabel}</button>
               )}
+              <FixLink href={state.remediation?.fixHref ?? null} label={`Fix ${state.remediation?.title ?? state.message}`} />
               {action}
             </div>
           )}

@@ -21,6 +21,8 @@ function editableFields(agent: Agent) {
   };
 }
 
+const sameEditableFields = (a: Agent, b: Agent) => JSON.stringify(editableFields(a)) === JSON.stringify(editableFields(b));
+
 function bindingChanged(draft: Agent, agent: Agent): boolean {
   return (draft.providerAgentId ?? '') !== (agent.providerAgentId ?? '') || draft.providerVersionTag !== agent.providerVersionTag;
 }
@@ -56,6 +58,13 @@ export function AgentEditor({
   catalog?: CatalogView | null;
 }) {
   const [draft, setDraft] = useState<Agent>(agent);
+  // The row the editor last agreed with. When the server row changes value —
+  // an adopt, another operator's save, a verification that normalised a field
+  // — the draft restarts from it. Without this the picker kept showing the old
+  // voice after "Adopt provider values" succeeded, and the next Save silently
+  // reverted the adoption. Compared by value, not identity, so a refetch that
+  // returns the same row never discards a half-typed edit.
+  const [seed, setSeed] = useState<Agent>(agent);
   const [confirmBinding, setConfirmBinding] = useState(false);
   const [saveBlockedBy, setSaveBlockedBy] = useState<BlockedByCampaign[]>([]);
   const [cooldownUntil, setCooldownUntil] = useState<number | null>(null);
@@ -65,8 +74,15 @@ export function AgentEditor({
   const adoptState = useMutationState();
   const deleteState = useMutationState();
   const busy = isBusy(saveState.state) || isBusy(verifyState.state) || isBusy(adoptState.state) || isBusy(deleteState.state);
-  const dirty = JSON.stringify(editableFields(draft)) !== JSON.stringify(editableFields(agent));
+  const dirty = !sameEditableFields(draft, agent);
   const set = <K extends keyof Agent>(key: K, value: Agent[K]) => setDraft(prev => ({ ...prev, [key]: value }));
+
+  // During render rather than in an effect, so the first paint after a change
+  // already shows the server's values instead of the stale draft.
+  if (!sameEditableFields(seed, agent)) {
+    setSeed(agent);
+    setDraft(agent);
+  }
 
   useEffect(() => {
     if (cooldownUntil === null) return;
@@ -91,7 +107,10 @@ export function AgentEditor({
     });
     // The draft is refreshed from the row the server actually stored, so a
     // normalised or server-defaulted field never leaves a stale value on screen.
-    if (updated) setDraft(updated);
+    if (updated) {
+      setSeed(updated);
+      setDraft(updated);
+    }
   }
 
   function save() {
@@ -138,6 +157,12 @@ export function AgentEditor({
   const languageOptions = withCurrentOption(catalog?.languages ?? [], draft.language);
   const toneOptions = withCurrentOption(catalog?.tones ?? [], draft.tone);
   const catalogHint = catalog ? undefined : 'Catalog not loaded — only the stored value is offered.';
+  // A picker with one option and no explanation is indistinguishable from a
+  // tenant that genuinely has one voice. The server's own reason is printed.
+  const voiceHint = catalogHint
+    ?? (catalog && catalog.voices.length === 0
+      ? `${catalog.voicesUnavailable ?? 'The voice catalogue is empty.'} Only the stored voice is offered.`
+      : 'Deployed to Retell with the campaign.');
 
   // Why Verify is disabled, in words. A greyed button with no explanation is
   // the failure this replaces; the cooldown has its own countdown line below.
@@ -151,7 +176,7 @@ export function AgentEditor({
     <div className="space-y-4">
       <div className="grid gap-4 md:grid-cols-2">
         <Field label="Agent name" required><TextInput value={draft.name} onChange={e => set('name', e.target.value)} /></Field>
-        <Field label="Voice" hint={catalogHint ?? 'Deployed to Retell with the campaign.'}>
+        <Field label="Voice" hint={voiceHint}>
           <Select aria-label="Voice" value={draft.voice} onChange={e => set('voice', e.target.value)}>
             {voiceOptions.map(v => <option key={v.id} value={v.id}>{v.label}</option>)}
           </Select>
@@ -196,13 +221,23 @@ export function AgentEditor({
               Differs from verified provider ({[mismatch.voice ? agent.providerVoiceId : null, mismatch.language ? agent.providerLanguage : null].filter(Boolean).join(' / ')})
             </span>
             {onAdoptProviderValues && (
-              <button type="button" disabled={busy || dirty} onClick={adopt} className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-t1 disabled:opacity-40">
+              <button
+                type="button"
+                disabled={busy || dirty}
+                onClick={adopt}
+                title={dirty ? 'Save or discard these changes before adopting the provider values.' : 'Copy the verified provider voice and language onto this agent.'}
+                className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-t1 disabled:opacity-40"
+              >
                 {isBusy(adoptState.state) ? <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" /> : <ArrowDownToLine className="h-3 w-3" aria-hidden="true" />} Adopt provider values
               </button>
             )}
-            <MutationNotice state={adoptState.state} />
+            {dirty && onAdoptProviderValues && <span className="text-[11px] font-semibold text-amber-v">Save or discard these changes before adopting the provider values.</span>}
           </div>
         )}
+        {/* Outside the mismatch block on purpose: a successful adopt clears the
+            mismatch, and the notice used to vanish with it — so the one action
+            that fixed the drift never confirmed that it had. */}
+        <MutationNotice state={adoptState.state} savedLabel="Provider voice and language adopted" />
         {agent.providerLastErrorCode && (
           <div role="alert" className="space-y-1 rounded-lg border border-red-v/40 bg-[var(--red-soft)] px-3 py-2 text-xs text-red-v">
             <p className="font-semibold">

@@ -165,13 +165,43 @@ describe('CampaignPanel', () => {
     expect(screen.queryByText('Saved')).not.toBeInTheDocument();
   });
 
-  it('renders the agent editor with the go-live steps once an agent is linked', async () => {
+  it('renders the agent editor once an agent is linked, and leaves the go-live rail to the Studio header', async () => {
     respond = routes({ agents: () => Promise.resolve([agent()]) });
     renderPanel(campaign({ agentId: 'agent-1' }));
 
     expect(await screen.findByDisplayValue('Riley')).toBeInTheDocument();
-    expect(screen.getByRole('list', { name: 'Go live steps' })).toBeInTheDocument();
     expect(screen.getByText('Verified · expires in 19h — auto-renews')).toBeInTheDocument();
+    // SF-4 promoted the ordered path into the persistent Studio rail, so it
+    // exists once per screen rather than once per panel.
+    expect(screen.queryByRole('list', { name: 'Go live steps' })).not.toBeInTheDocument();
+  });
+
+  // The agent editor has its own SaveBar; the campaign's is the last one.
+  const campaignSaveButton = () => screen.getAllByRole('button', { name: /Save changes/ }).at(-1)!;
+
+  it('does not report unsaved changes just because the campaign was activated elsewhere', async () => {
+    respond = routes({ agents: () => Promise.resolve([agent()]) });
+    const { rerender } = renderPanel(campaign({ agentId: 'agent-1' }));
+    await screen.findByDisplayValue('Riley');
+    expect(campaignSaveButton()).toBeDisabled();
+
+    // The activation transition changes only `status`, which this panel does
+    // not edit. It used to flip the panel to dirty, and the next Save re-posted
+    // a draft assembled before the transition.
+    rerender(<MemoryRouter><CampaignPanel clinic={clinic()} campaign={campaign({ agentId: 'agent-1', status: 'ACTIVE' })} onChanged={() => Promise.resolve()} /></MemoryRouter>);
+    expect(campaignSaveButton()).toBeDisabled();
+  });
+
+  it('keeps a half-typed edit when the campaign row reloads unchanged', async () => {
+    respond = routes({ agents: () => Promise.resolve([agent()]) });
+    const { rerender } = renderPanel(campaign({ agentId: 'agent-1' }));
+    await screen.findByDisplayValue('Riley');
+
+    fireEvent.change(screen.getByDisplayValue('Spring Cleaning Reactivation'), { target: { value: 'Autumn recall' } });
+    // A sibling reload hands back an equal-by-value row with a new identity.
+    rerender(<MemoryRouter><CampaignPanel clinic={clinic()} campaign={campaign({ agentId: 'agent-1' })} onChanged={() => Promise.resolve()} /></MemoryRouter>);
+
+    expect(screen.getByDisplayValue('Autumn recall')).toBeInTheDocument();
   });
 
   it('names a failed readiness load rather than showing a campaign with no checks', async () => {
