@@ -955,7 +955,22 @@ async function probeRetellEmptyTagDefaults(
     const metadata = record(metadataValue);
     if (!nonEmptyString(tagName) || !metadata) return { ok: false, error: 'invalid_response' };
     const version = nonNegativeInteger(metadata.version);
-    if (version === null) return { ok: false, error: 'invalid_response' };
+    // A tag whose metadata carries no version cannot be pinning THIS
+    // deployment's version, so it is a sibling and the comment above already
+    // says siblings are ignored. It used to be read before relevance was
+    // decided, so it was not ignored at all: `v2/list-agents` returns
+    // `tags: { staging: {}, prod: {} }` for tags that exist without version
+    // metadata, and the first such tag failed verification of a perfectly good
+    // deployment with `invalid_response`. A real Brightsmile deploy — correct
+    // agent, 14 tools, published, number bound — was refused by a `staging`
+    // tag it does not use.
+    //
+    // Missing metadata on the tag we actually asked about is still a hard
+    // failure: there the provider owes us an answer and did not give one.
+    if (version === null) {
+      if (tagName === versionTag) return { ok: false, error: 'invalid_response' };
+      continue;
+    }
     const relevant = tagName === versionTag || version === expectedVersion;
     if (!relevant) continue;
     if (metadata.dynamic_variables !== undefined && metadata.dynamic_variables !== null && record(metadata.dynamic_variables) === null) {

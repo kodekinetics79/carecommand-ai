@@ -406,6 +406,54 @@ describe('Retell agent provider contract', () => {
     await expect(probeRetellAgent('agent_pilot', 'prod')).resolves.toMatchObject({ ok: true });
   });
 
+  it('ignores a sibling tag that carries no version metadata at all', async () => {
+    // Found against the live provider on 2026-08-30. `v2/list-agents` returned
+    // `tags: { staging: {}, prod: {} }` — tags that exist with EMPTY metadata.
+    // The version was parsed before relevance was decided, so the first such
+    // tag failed the whole probe with `invalid_response`, and a real, correct
+    // deployment (right agent, 14 tools, published, number bound) could not be
+    // verified because of a `staging` tag it does not use.
+    env.RETELL_API_KEY = 'real-key';
+    vi.stubGlobal('fetch', vi.fn(async url => {
+      if (String(url).includes('/get-retell-llm/')) {
+        return new Response(JSON.stringify({ llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true, general_tools: [bookingTool()] }), { status: 200 });
+      }
+      if (String(url).includes('list-agents')) {
+        return new Response(JSON.stringify({
+          has_more: false,
+          items: [{
+            agent_id: 'agent_pilot', agent_name: 'Pilot agent', channel: 'voice', user_modified_timestamp: 1,
+            tags: { staging: {}, prod: { version: 12, dynamic_variables: {} } },
+          }],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify(providerAgent()), { status: 200 });
+    }));
+    await expect(probeRetellAgent('agent_pilot', 'prod')).resolves.toMatchObject({ ok: true });
+  });
+
+  it('still refuses when the tag we asked about is the one missing its version', async () => {
+    // The provider owes us an answer about OUR tag. Empty metadata there is a
+    // genuinely unreadable response, not a sibling to skip.
+    env.RETELL_API_KEY = 'real-key';
+    vi.stubGlobal('fetch', vi.fn(async url => {
+      if (String(url).includes('/get-retell-llm/')) {
+        return new Response(JSON.stringify({ llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true, general_tools: [bookingTool()] }), { status: 200 });
+      }
+      if (String(url).includes('list-agents')) {
+        return new Response(JSON.stringify({
+          has_more: false,
+          items: [{
+            agent_id: 'agent_pilot', agent_name: 'Pilot agent', channel: 'voice', user_modified_timestamp: 1,
+            tags: { prod: {} },
+          }],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify(providerAgent()), { status: 200 });
+    }));
+    await expect(probeRetellAgent('agent_pilot', 'prod')).resolves.toEqual({ ok: false, error: 'invalid_response' });
+  });
+
   it('carries prompt, begin-message and tool evidence on the snapshot', async () => {
     env.RETELL_API_KEY = 'real-key';
     vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(String(url).includes('/get-retell-llm/')
