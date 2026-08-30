@@ -657,6 +657,9 @@ export class RlsBehaviorHarness {
       values.set('phase', 'INTENT');
       values.set('status', 'started');
     }
+    // AppointmentNote CHECKs its actor vocabulary; the generic string synthesizer
+    // would not satisfy it.
+    if (table === 'AppointmentNote') values.set('actorType', 'system');
     if (table === 'ConversationReplyAttempt') {
       values.set('phase', 'INTENT');
       values.set('status', 'authorized');

@@ -229,7 +229,7 @@ export const campaignRoutes: FastifyPluginAsync = async app => {
         agent: { select: { id: true, name: true, voice: true } },
         clinic: { select: { id: true, name: true } },
         intakeFields: { orderBy: { sortOrder: 'asc' } },
-        _count: { select: { callLogs: true, appointmentRequests: true } },
+        _count: { select: { callLogs: true } },
       },
     });
   });

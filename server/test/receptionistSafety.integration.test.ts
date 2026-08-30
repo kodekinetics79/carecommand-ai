@@ -52,7 +52,11 @@ describe('AI receptionist safety workflows', () => {
     expect(task).toMatchObject({ branchId: tenant.branchId, priority: 'high', status: 'OPEN' });
     expect(task.metadata).toMatchObject({
       kind: 'human_handoff',
-      callbackPhone: '+12125550177', // verified caller wins over tool input
+      // C4 keeps both numbers apart instead of silently preferring one: the
+      // front desk sees what the caller asked for AND what the network proved.
+      verifiedPhone: '+12125550177',
+      requestedCallbackPhone: '+12125550999',
+      callbackPhone: '+12125550999',
       requiresAcknowledgement: true,
     });
 
@@ -108,7 +112,8 @@ describe('AI receptionist safety workflows', () => {
     });
     expect(signal).toMatchObject({ severity: 'critical', score: 100, status: 'open' });
     const task = await db.staffTask.findUniqueOrThrow({ where: { id: String(result.task_id) } });
-    expect(task).toMatchObject({ priority: 'high', status: 'OPEN' });
+    // An emergency is critical, never merely high, and is due immediately.
+    expect(task).toMatchObject({ priority: 'critical', status: 'OPEN' });
   });
 
   it('keeps voice identity proof server-side, records failures, and locks after three attempts', async () => {
