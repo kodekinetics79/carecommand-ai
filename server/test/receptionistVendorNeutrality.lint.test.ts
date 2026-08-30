@@ -78,18 +78,22 @@ const ALLOWLIST: Record<string, string> = {
     'Platform Console. Operators must see supplier identities, credential field names and raw provider payloads — that is the point of moving them here.',
 
   // --- Services the CLINIC contracts and configures itself -----------------
-  // Not our supply chain: the clinic holds the account and types its own API
-  // key into these screens. "Enter your API key" for an unnamed service is not
-  // vendor-neutral, it is unusable. These leave the list when the clinic stops
-  // being the contracting party.
-  'src/pages/Insurance.tsx':
-    'Eligibility clearinghouse selector. The clinic picks and pays its own clearinghouse; the list is its choice to make.',
-  'src/pages/InsuranceEligibility.tsx':
-    'Eligibility screen. Names the clearinghouse the clinic configured, so "not configured" says which account to go and fix.',
-  'src/pages/IntegrationSetup.tsx':
-    'Credential entry for clinic-owned integrations. The field must say which service the key belongs to.',
-  'src/pages/RevenueProtection.tsx':
-    'Explains when Mock Mode appears, by naming the clinic-owned integrations that were not configured.',
+  //
+  // 2026-08-30: this section is EMPTY, and that is the point of the ratchet.
+  //
+  // Four screens lived here on the argument that the clinic holds the account
+  // and therefore has to be told which one: the clearinghouse selector on
+  // Insurance, the provider strip on InsuranceEligibility, the credential
+  // fields on IntegrationSetup, and the Mock Mode explainer on
+  // RevenueProtection. The argument does not survive contact with a practice
+  // manager. None of them holds a clearinghouse contract, none can rotate a
+  // card-processor key, and every one of those screens ended in a support
+  // ticket with a supplier's name on it.
+  //
+  // All four now state a CAPABILITY and name us as the next step —
+  // "Card payments: not set up. Contact CareCommand support to switch it on."
+  // IntegrationSetup was deleted outright; the catalogue, the credential
+  // fields and the health checks are Platform Console surfaces.
 };
 
 /** Lines that keep a vendor token for a stated, structural reason. */
@@ -177,7 +181,7 @@ describe('the tenant sees CareCommand, not our suppliers', () => {
       expect(reason.length, `${file} is allowlisted without a reason`).toBeGreaterThan(40);
       expect(sourceFiles(SRC).map(f => relative(process.cwd(), f).split(sep).join('/')), `${file} is allowlisted but does not exist — delete the entry`).toContain(file);
     }
-    expect(Object.keys(ALLOWLIST).length, 'the vendor-neutrality allowlist grew').toBeLessThanOrEqual(5);
+    expect(Object.keys(ALLOWLIST).length, 'the vendor-neutrality allowlist grew').toBeLessThanOrEqual(1);
   });
 
   it('keeps inline exemptions a ceiling too', () => {

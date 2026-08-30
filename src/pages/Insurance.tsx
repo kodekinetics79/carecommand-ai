@@ -12,6 +12,8 @@ interface Payer {
   name: string;
   tradingPartnerServiceId: string | null;
   sourceProvider: string;
+  /** Server-rendered, tenant-safe wording for `sourceProvider`. */
+  verificationLabel: string;
   active: boolean;
   sortOrder: number;
   policyCount: number;
@@ -21,7 +23,15 @@ interface InsuranceOverview {
   payers: Payer[];
 }
 
-const PROVIDERS = ['mock', 'stedi', 'availity', 'pverify', 'optum'];
+// How this payer is verified, in the clinic's terms. This used to be the list
+// of clearinghouses we buy from — five supplier names, four with no adapter
+// behind them, on the screen of a practice that holds an account with none of
+// them. The SERVER resolves which clearinghouse "verified electronically"
+// means; the clinic records the fact it actually knows.
+const PAYER_VERIFICATION = [
+  { value: false, label: 'Not verified electronically' },
+  { value: true, label: 'Verified through CareCommand' },
+];
 
 export default function Insurance() {
   const navigate = useNavigate();
@@ -30,7 +40,7 @@ export default function Insurance() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [pendingId, setPendingId] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState({ name: '', sourceProvider: 'mock' });
+  const [form, setForm] = useState({ name: '', electronicVerification: false });
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -74,8 +84,8 @@ export default function Insurance() {
     setPendingId('new');
     setError(null);
     try {
-      await apiRequest('/v1/insurance/payers', { method: 'POST', body: JSON.stringify({ name: form.name.trim(), sourceProvider: form.sourceProvider }) });
-      setForm({ name: '', sourceProvider: 'mock' });
+      await apiRequest('/v1/insurance/payers', { method: 'POST', body: JSON.stringify({ name: form.name.trim(), electronicVerification: form.electronicVerification }) });
+      setForm({ name: '', electronicVerification: false });
       setShowForm(false);
       await reload();
     } catch (err) {
@@ -157,7 +167,7 @@ export default function Insurance() {
                   </div>
                   <div className="min-w-0">
                     <p className="text-xs font-bold text-t1 truncate">{payer.name}</p>
-                    <p className="text-[10px] text-t3">{payer.policyCount} {payer.policyCount === 1 ? 'policy record' : 'policy records'} · via {payer.sourceProvider}</p>
+                    <p className="text-[10px] text-t3">{payer.policyCount} {payer.policyCount === 1 ? 'policy record' : 'policy records'} · {payer.verificationLabel}</p>
                   </div>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
@@ -182,8 +192,8 @@ export default function Insurance() {
           {showForm ? (
             <div className="mt-3 p-3 rounded-xl border border-[var(--b2)] bg-[var(--s2)] space-y-2">
               <input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="Insurer name (e.g. MetLife)" className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s1)] text-xs text-t1 outline-none focus:border-[var(--b3)]" />
-              <select aria-label="Eligibility provider" value={form.sourceProvider} onChange={e => setForm(f => ({ ...f, sourceProvider: e.target.value }))} className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s1)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
-                {PROVIDERS.map(p => <option key={p} value={p}>Eligibility via {p}</option>)}
+              <select aria-label="How this payer is verified" value={String(form.electronicVerification)} onChange={e => setForm(f => ({ ...f, electronicVerification: e.target.value === 'true' }))} className="w-full px-3 py-2 rounded-lg border border-[var(--b1)] bg-[var(--s1)] text-xs text-t1 outline-none focus:border-[var(--b3)]">
+                {PAYER_VERIFICATION.map(p => <option key={String(p.value)} value={String(p.value)}>{p.label}</option>)}
               </select>
               <div className="flex gap-2">
                 <button type="button" disabled={pendingId === 'new'} onClick={addPayer} className="flex-1 py-2 rounded-lg bg-[var(--indigo)] text-white text-xs font-semibold hover:opacity-90 disabled:opacity-40">{pendingId === 'new' ? 'Adding…' : 'Accept insurer'}</button>

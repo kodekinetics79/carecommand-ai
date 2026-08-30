@@ -1,9 +1,7 @@
 import { useMemo, useState } from 'react';
-import { useNavigate } from 'react-router';
 import {
   AlertTriangle,
   Activity,
-  ArrowRight,
   CheckCircle2,
   Database,
   Globe2,
@@ -15,13 +13,9 @@ import {
   Search,
   ServerCog,
   ShieldCheck,
-  Sparkles,
   Users2,
-  DollarSign,
   Building2,
   FileClock,
-  Network,
-  Stethoscope,
   BadgeCheck,
 } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
@@ -33,8 +27,14 @@ import { describeFailure, receivedData, type ResourceFailure } from '../lib/reso
 import { useResource } from '../hooks/useResource';
 import { getLocale } from '../lib/preferences';
 import { useSession } from '../hooks/useSession';
-import type { AdminAuditEvent, AdminRole, AdminUser, IntegrationStatus, SecurityPosture, SecuritySession } from '../types';
+import type { AdminAuditEvent, AdminRole, AdminUser, SecurityPosture, SecuritySession } from '../types';
 
+// Three tabs left with the supplier catalogue: Integration Hub (17 vendor
+// cards with Mock Mode badges and Test connection), Insurance Rails and
+// Finance Rails (per-vendor readiness, error rates and provider run logs).
+// A clinic owner cannot act on any of it — they hold no account with the
+// companies named — and every one of those screens is now in the Platform
+// Console at /v1/platform/tenants/:tenantId/providers, whole.
 type TabKey =
   | 'overview'
   | 'users'
@@ -42,9 +42,6 @@ type TabKey =
   | 'clinics'
   | 'audit'
   | 'security'
-  | 'integrations'
-  | 'insurance'
-  | 'finance'
   | 'system';
 
 interface ControlPlaneOverview {
@@ -55,21 +52,12 @@ interface ControlPlaneOverview {
     adminUsers: number;
     inactiveUsers: number;
     clinics: number;
-    activeIntegrations: number;
-    sandboxIntegrations: number;
-    mockIntegrations: number;
-    failedIntegrations: number;
     auditEventsToday: number;
     securityAlerts: number;
-    paymentRailsStatus: string;
-    insuranceRailsStatus: string;
     productionReadinessScore: number;
   };
   branches: Array<{ id: string; name: string; location: string; active: boolean }>;
   securityPosture: SecurityPosture;
-  integrations: IntegrationStatus[];
-  insuranceRails: InsuranceRail[];
-  financeRails: FinanceRail[];
   systemHealth: SystemHealth;
   auditEventsToday: Array<{ id: string; action: string; occurredAt: string }>;
 }
@@ -93,7 +81,6 @@ interface ControlPlaneClinicsResponse {
   location: string;
   active: boolean;
   userCount: number;
-  integrationCount: number;
   securityAlerts: number;
 }
 
@@ -124,47 +111,6 @@ interface ControlPlaneUserAuditEntry {
   metadata: unknown;
 }
 
-interface InsuranceRail {
-  provider: string;
-  name: string;
-  configured: boolean;
-  mode: 'mock' | 'sandbox' | 'live';
-  modeLabel: string;
-  eligibilitySupported: boolean;
-  benefitsSupported: boolean;
-  priorAuthSupported: boolean;
-  priorAuthTrackingSupported: boolean;
-  claimStatusSupportedFuture: boolean;
-  payerListStatus: string;
-  lastEligibilityCheck: string | null;
-  lastFailedCheck: string | null;
-  errorRate: number;
-  workflows: string[];
-  actions: string[];
-  logs: Array<{ id: string; operation: string; status: string; createdAt: string; providerMode: string }>;
-  payerCount: number;
-  authCount: number;
-}
-
-interface FinanceRail {
-  provider: string;
-  name: string;
-  configured: boolean;
-  mode: 'mock' | 'sandbox' | 'live';
-  modeLabel: string;
-  paymentLinksSupported: boolean;
-  depositsSupported: boolean;
-  copayCollectionSupported: boolean;
-  refundsFuture: boolean;
-  webhooksConfigured: boolean;
-  lastPaymentRequest: string | null;
-  failedPaymentCount: number;
-  health: 'healthy' | 'not_configured' | 'degraded';
-  logs: Array<{ id: string; operation: string; status: string; createdAt: string; providerMode: string }>;
-  providerConnectionId: string | null;
-  actions: string[];
-}
-
 interface SystemHealth {
   apiStatus: string;
   databaseStatus: string;
@@ -173,7 +119,6 @@ interface SystemHealth {
   latestMigration: string | null;
   authStatus: string;
   revenueProtectionStatus: string;
-  integrationStatus: string;
   backgroundJobs: string;
   environmentMode: string;
   buildVersion: string | null;
@@ -187,9 +132,6 @@ const tabs: Array<{ key: TabKey; label: string; icon: React.ElementType }> = [
   { key: 'clinics', label: 'Clinics & Tenants', icon: Building2 },
   { key: 'audit', label: 'Audit Logs', icon: FileClock },
   { key: 'security', label: 'Security Posture', icon: Lock },
-  { key: 'integrations', label: 'Integration Hub', icon: Network },
-  { key: 'insurance', label: 'Insurance Rails', icon: Stethoscope },
-  { key: 'finance', label: 'Finance Rails', icon: DollarSign },
   { key: 'system', label: 'System Health', icon: Activity },
 ];
 
@@ -210,7 +152,6 @@ function formatRisk(value?: 'low' | 'medium' | 'high') {
 }
 
 export default function ControlPlane() {
-  const navigate = useNavigate();
   const { user } = useSession();
   const [activeTab, setActiveTab] = useState<TabKey>('overview');
 
@@ -223,9 +164,6 @@ export default function ControlPlane() {
   const posture = useResource<SecurityPosture>('/v1/control-plane/security-posture');
   const securityEvents = useResource<ControlPlaneSecurityEvent[]>('/v1/control-plane/security-events');
   const sessions = useResource<SecuritySession[]>('/v1/control-plane/sessions?limit=100');
-  const integrations = useResource<IntegrationStatus[]>('/v1/control-plane/integrations');
-  const insuranceRails = useResource<InsuranceRail[]>('/v1/control-plane/insurance-rails');
-  const financeRails = useResource<FinanceRail[]>('/v1/control-plane/finance-rails');
   const systemHealth = useResource<SystemHealth>('/v1/control-plane/system-health');
 
   const [auditFilters, setAuditFilters] = useState(AUDIT_FILTER_DEFAULTS);
@@ -273,9 +211,6 @@ export default function ControlPlane() {
     posture.reload();
     securityEvents.reload();
     sessions.reload();
-    integrations.reload();
-    insuranceRails.reload();
-    financeRails.reload();
     systemHealth.reload();
     auditLogs.reload();
   }
@@ -378,30 +313,6 @@ export default function ControlPlane() {
     );
   }
 
-  async function testIntegration(provider: string) {
-    await runAction(
-      `integration:${provider}`,
-      () => apiRequest(`/v1/control-plane/integrations/${provider}/test`, { method: 'POST' }),
-      () => { integrations.reload(); overview.reload(); },
-    );
-  }
-
-  async function testInsurance(provider: string) {
-    await runAction(
-      `insurance:${provider}`,
-      () => apiRequest(`/v1/control-plane/insurance-rails/${provider}/test-eligibility`, { method: 'POST' }),
-      () => { insuranceRails.reload(); },
-    );
-  }
-
-  async function testFinance(provider: string) {
-    await runAction(
-      `finance:${provider}`,
-      () => apiRequest(`/v1/control-plane/finance-rails/${provider}/test-payment-link`, { method: 'POST' }),
-      () => { financeRails.reload(); },
-    );
-  }
-
   const inviteValid = inviteForm.name.trim().length >= 2 && /.+@.+\..+/.test(inviteForm.email) && inviteForm.password.length >= 8;
 
   return (
@@ -456,12 +367,11 @@ export default function ControlPlane() {
           >
             {data => (
               <div className="space-y-6">
-                <div className="grid gap-3 grid-cols-2 xl:grid-cols-6">
+                <div className="grid gap-3 grid-cols-2 xl:grid-cols-5">
                   <StatCard title="Users" value={data.summary.totalUsers} subtitle="Tenant accounts" icon={<Users2 className="w-4 h-4" />} accent="blue" />
                   <StatCard title="Active users" value={data.summary.activeUsers} subtitle="Enabled accounts" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
                   <StatCard title="Admin users" value={data.summary.adminUsers} subtitle="OWNER / ADMIN" icon={<ShieldCheck className="w-4 h-4" />} accent="violet" />
                   <StatCard title="Clinics" value={data.summary.clinics} subtitle="Branches in tenant" icon={<Building2 className="w-4 h-4" />} accent="amber" />
-                  <StatCard title="Integration health" value={`${data.summary.activeIntegrations}/${data.integrations.length}`} subtitle="Active integrations" icon={<Network className="w-4 h-4" />} accent="indigo" />
                   <StatCard title="Control checks" value={`${data.summary.productionReadinessScore}%`} subtitle="Configured-check score" icon={<BadgeCheck className="w-4 h-4" />} accent="emerald" />
                 </div>
 
@@ -470,22 +380,13 @@ export default function ControlPlane() {
                     <div className="rounded-2xl border border-[var(--b1)] p-4">
                       <p className="text-xs text-t3">Configured-check score</p>
                       <p className="mt-2 text-3xl font-black text-t1">{data.summary.productionReadinessScore}%</p>
-                      <p className="mt-1 text-xs text-t3">Calculated from authentication, secret configuration, integration status, access controls, audit logging, and tenant-isolation checks.</p>
+                      <p className="mt-1 text-xs text-t3">Calculated from authentication, secret configuration, access controls, audit logging, and tenant-isolation checks.</p>
                     </div>
                     <div className="rounded-2xl border border-[var(--b1)] p-4">
-                      <p className="text-xs text-t3">Payment rails</p>
-                      <p className="mt-2 text-base font-semibold text-t1">{data.summary.paymentRailsStatus}</p>
-                      <p className="mt-1 text-xs text-t3">Insurance rails: {data.summary.insuranceRailsStatus}</p>
+                      <p className="text-xs text-t3">Audit events today</p>
+                      <p className="mt-2 text-3xl font-black text-t1">{data.summary.auditEventsToday}</p>
+                      <p className="mt-1 text-xs text-t3">Recorded in this workspace since midnight.</p>
                     </div>
-                  </div>
-                </BentoCard>
-
-                <BentoCard title="Operational Snapshot" subtitle="Audit events, integration modes, and system health">
-                  <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                    <MetricBox label="Audit events today" value={String(data.summary.auditEventsToday)} strong />
-                    <MetricBox label="Mock integrations" value={String(data.summary.mockIntegrations)} strong />
-                    <MetricBox label="Sandbox integrations" value={String(data.summary.sandboxIntegrations)} strong />
-                    <MetricBox label="Failed integrations" value={String(data.summary.failedIntegrations)} strong />
                   </div>
                 </BentoCard>
               </div>
@@ -901,7 +802,7 @@ export default function ControlPlane() {
 
       {activeTab === 'clinics' && (
         <div className="space-y-4">
-          <BentoCard title="Tenant Governance" subtitle="Clinics, tenant status, user access, integrations, and security alerts">
+          <BentoCard title="Tenant Governance" subtitle="Clinics, tenant status, user access, and security alerts">
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
               <ResourceSection label="Tenant" state={overview.state} onRetry={overview.reload} compact loading={<ResourceSkeleton label="tenant" lines={1} rowClassName="h-[76px] rounded-2xl" />}>
                 {data => <MetricBox label="Tenant" value={data.tenant?.name ?? 'No tenant record returned'} />}
@@ -909,8 +810,8 @@ export default function ControlPlane() {
               <ResourceSection label="Clinic count" state={clinics.state} onRetry={clinics.reload} compact isEmpty={() => false} loading={<ResourceSkeleton label="clinic count" lines={1} rowClassName="h-[76px] rounded-2xl" />}>
                 {rows => <MetricBox label="Clinics" value={String(rows.length)} />}
               </ResourceSection>
-              <ResourceSection label="Integration rail status" state={overview.state} onRetry={overview.reload} compact loading={<ResourceSkeleton label="integration rail status" lines={1} rowClassName="h-[76px] rounded-2xl" />}>
-                {data => <MetricBox label="Integration rail status" value={`${data.summary.paymentRailsStatus} / ${data.summary.insuranceRailsStatus}`} />}
+              <ResourceSection label="Active user count" state={overview.state} onRetry={overview.reload} compact loading={<ResourceSkeleton label="active user count" lines={1} rowClassName="h-[76px] rounded-2xl" />}>
+                {data => <MetricBox label="Active users" value={String(data.summary.activeUsers)} />}
               </ResourceSection>
               <ResourceSection label="Security alert count" state={overview.state} onRetry={overview.reload} compact loading={<ResourceSkeleton label="security alert count" lines={1} rowClassName="h-[76px] rounded-2xl" />}>
                 {data => <MetricBox label="Security alerts" value={String(data.summary.securityAlerts)} />}
@@ -937,7 +838,6 @@ export default function ControlPlane() {
                       <tr>
                         <th className="px-4 py-3">Clinic</th>
                         <th className="px-4 py-3">Users</th>
-                        <th className="px-4 py-3">Integrations</th>
                         <th className="px-4 py-3">Security alerts</th>
                         <th className="px-4 py-3">Status</th>
                         <th className="px-4 py-3">Actions</th>
@@ -948,7 +848,6 @@ export default function ControlPlane() {
                         <tr key={clinic.id} className="border-t border-[var(--b1)]">
                           <td className="px-4 py-3"><p className="font-semibold text-t1">{clinic.name}</p><p className="text-xs text-t3">{clinic.location}</p></td>
                           <td className="px-4 py-3 text-xs text-t2">{clinic.userCount}</td>
-                          <td className="px-4 py-3 text-xs text-t2">{clinic.integrationCount}</td>
                           <td className="px-4 py-3 text-xs text-t2">{clinic.securityAlerts}</td>
                           <td className="px-4 py-3"><span className={`badge ${clinic.active ? 'badge-emerald' : 'badge-red'}`}>{clinic.active ? 'Active' : 'Inactive'}</span></td>
                           <td className="px-4 py-3">
@@ -1154,180 +1053,6 @@ export default function ControlPlane() {
         </div>
       )}
 
-      {activeTab === 'integrations' && (
-        <div className="space-y-4">
-          <ResourceSection
-            label="Integration counts"
-            state={overview.state}
-            onRetry={overview.reload}
-            loading={<ResourceSkeleton label="integration counts" lines={1} rowClassName="h-[104px] rounded-2xl" />}
-          >
-            {data => (
-              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                <StatCard title="Active" value={data.summary.activeIntegrations} subtitle="Configured and healthy" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
-                <StatCard title="Sandbox" value={data.summary.sandboxIntegrations} subtitle="Sandbox ready/active" icon={<Sparkles className="w-4 h-4" />} accent="violet" />
-                <StatCard title="Mock" value={data.summary.mockIntegrations} subtitle="Not configured" icon={<AlertTriangle className="w-4 h-4" />} accent="amber" />
-                <StatCard title="Failed" value={data.summary.failedIntegrations} subtitle="Needs attention" icon={<AlertTriangle className="w-4 h-4" />} accent="red" />
-              </div>
-            )}
-          </ResourceSection>
-          <BentoCard title="Integration Hub" subtitle="Honest provider readiness">
-            <ResourceSection
-              label="Integrations"
-              state={integrations.state}
-              onRetry={integrations.reload}
-              empty={{
-                icon: <Network className="w-5 h-5" />,
-                title: 'No integrations returned',
-                description: 'The integration hub loaded successfully and returned no providers.',
-              }}
-              loading={<ResourceSkeleton label="integrations" lines={4} />}
-            >
-              {rows => (
-                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                  {rows.map(row => (
-                    <div key={row.key} className="rounded-2xl border border-[var(--b1)] p-4">
-                      <div className="flex items-center justify-between gap-2">
-                        <div>
-                          <p className="text-sm font-semibold text-t1">{row.name}</p>
-                          <p className="text-[11px] text-t3">{row.category}</p>
-                        </div>
-                        <span className={`badge ${row.health === 'healthy' ? 'badge-emerald' : row.health === 'degraded' ? 'badge-amber' : row.health === 'not_configured' ? 'badge-blue' : 'badge-red'}`}>{row.modeLabel}</span>
-                      </div>
-                      <p className="mt-2 text-[11px] text-t3">{row.description}</p>
-                      <div className="mt-2 flex flex-wrap gap-1.5">{row.supportedWorkflows.map(workflow => <span key={workflow} className="badge badge-indigo">{workflow}</span>)}</div>
-                      {row.missingConfigCount > 0 && <p className="mt-2 text-[11px] text-t3">Setup incomplete — your administrator must finish connecting this provider.</p>}
-                      <button type="button" onClick={() => void testIntegration(row.key)} disabled={!canManage || savingAction === `integration:${row.key}`} className="mt-3 inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition disabled:opacity-40">Test connection</button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </ResourceSection>
-          </BentoCard>
-        </div>
-      )}
-
-      {activeTab === 'insurance' && (
-        <div className="space-y-4">
-          <ResourceSection
-            label="Insurance rails"
-            state={insuranceRails.state}
-            onRetry={insuranceRails.reload}
-            empty={{
-              icon: <Stethoscope className="w-5 h-5" />,
-              title: 'No insurance rails returned',
-              description: 'The insurance rail list loaded successfully and returned no providers.',
-            }}
-            loading={<ResourceSkeleton label="insurance rails" lines={3} rowClassName="h-24 rounded-2xl" />}
-          >
-            {rails => (
-              <div className="space-y-4">
-                <BentoCard title="Insurance Rails" subtitle="Eligibility, benefits, and prior auth readiness">
-                  <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-                    {rails.map(provider => (
-                      <div key={provider.provider} className="rounded-2xl border border-[var(--b1)] p-4">
-                        <div className="flex items-center justify-between gap-2">
-                          <p className="text-sm font-semibold text-t1">{provider.name}</p>
-                          <span className={`badge ${provider.configured ? 'badge-emerald' : 'badge-amber'}`}>{provider.modeLabel}</span>
-                        </div>
-                        <div className="mt-2 space-y-1 text-[11px] text-t2">
-                          <p>Eligibility: {provider.eligibilitySupported ? 'Yes' : 'No'}</p>
-                          <p>Benefits: {provider.benefitsSupported ? 'Yes' : 'No'}</p>
-                          <p>Prior auth: {provider.priorAuthSupported ? 'Payer-connected' : provider.priorAuthTrackingSupported ? 'Manual tracking only' : 'No'}</p>
-                          <p>Payer list: {provider.payerListStatus}</p>
-                          <p>Error rate: {provider.errorRate}%</p>
-                        </div>
-                        <div className="mt-2 flex flex-wrap gap-1.5">{provider.workflows.map(workflow => <span key={workflow} className="badge badge-indigo">{workflow}</span>)}</div>
-                        <button type="button" onClick={() => void testInsurance(provider.provider)} disabled={!canManage || savingAction === `insurance:${provider.provider}`} className="mt-3 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition disabled:opacity-40">Test eligibility</button>
-                      </div>
-                    ))}
-                  </div>
-                </BentoCard>
-                <BentoCard title="Insurance Logs" subtitle="Normalized eligibility and provider runs">
-                  <div className="space-y-2">
-                    {rails.flatMap(provider => provider.logs.map(log => (
-                      <div key={log.id} className="rounded-xl border border-[var(--b1)] p-3">
-                        <div className="flex items-center justify-between gap-2">
-                          <p className="text-sm font-semibold text-t1">{provider.name} · {log.operation}</p>
-                          <span className="badge badge-indigo">{log.status}</span>
-                        </div>
-                        <p className="mt-1 text-[11px] text-t3">{formatDateTime(log.createdAt)} · {log.providerMode}</p>
-                      </div>
-                    )))}
-                    {rails.every(provider => provider.logs.length === 0) && (
-                      <p className="py-4 text-center text-xs text-t3">The insurance rails loaded successfully and recorded no provider runs.</p>
-                    )}
-                  </div>
-                  <button type="button" onClick={() => navigate('/revenue-protection')} className="mt-4 inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white">
-                    Open Revenue Protection <ArrowRight className="w-4 h-4" />
-                  </button>
-                </BentoCard>
-              </div>
-            )}
-          </ResourceSection>
-        </div>
-      )}
-
-      {activeTab === 'finance' && (
-        <div className="space-y-4">
-          <ResourceSection
-            label="Finance rails"
-            state={financeRails.state}
-            onRetry={financeRails.reload}
-            empty={{
-              icon: <DollarSign className="w-5 h-5" />,
-              title: 'No finance rails returned',
-              description: 'The finance rail list loaded successfully and returned no providers.',
-            }}
-            loading={<ResourceSkeleton label="finance rails" lines={3} rowClassName="h-24 rounded-2xl" />}
-          >
-            {rails => (
-              <div className="space-y-4">
-                <BentoCard title="Finance Rails" subtitle="Payment links, deposits, copays, and webhook posture">
-                  <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                    {rails.map(provider => (
-                      <div key={provider.provider} className="rounded-2xl border border-[var(--b1)] p-4">
-                        <div className="flex items-center justify-between gap-2">
-                          <p className="text-sm font-semibold text-t1">{provider.name}</p>
-                          <span className={`badge ${provider.configured ? 'badge-emerald' : 'badge-amber'}`}>{provider.modeLabel}</span>
-                        </div>
-                        <div className="mt-2 space-y-1 text-[11px] text-t2">
-                          <p>Payment links: {provider.paymentLinksSupported ? 'Yes' : 'No'}</p>
-                          <p>Deposits: {provider.depositsSupported ? 'Yes' : 'No'}</p>
-                          <p>Copays: {provider.copayCollectionSupported ? 'Yes' : 'No'}</p>
-                          <p>Webhooks: {provider.webhooksConfigured ? 'Configured' : 'Missing'}</p>
-                          <p>Failed payments: {provider.failedPaymentCount}</p>
-                        </div>
-                        <button type="button" onClick={() => void testFinance(provider.provider)} disabled={!canManage || savingAction === `finance:${provider.provider}`} className="mt-3 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t2 hover:bg-[var(--s3)] transition disabled:opacity-40">Test payment link</button>
-                      </div>
-                    ))}
-                  </div>
-                </BentoCard>
-                <BentoCard title="Payment Logs" subtitle="Recorded payment provider actions">
-                  <div className="space-y-2">
-                    {rails.flatMap(provider => provider.logs.map(log => (
-                      <div key={log.id} className="rounded-xl border border-[var(--b1)] p-3">
-                        <div className="flex items-center justify-between gap-2">
-                          <p className="text-sm font-semibold text-t1">{provider.name} · {log.operation}</p>
-                          <span className="badge badge-indigo">{log.status}</span>
-                        </div>
-                        <p className="mt-1 text-[11px] text-t3">{formatDateTime(log.createdAt)} · {log.providerMode}</p>
-                      </div>
-                    )))}
-                    {rails.every(provider => provider.logs.length === 0) && (
-                      <p className="py-4 text-center text-xs text-t3">The finance rails loaded successfully and recorded no provider actions.</p>
-                    )}
-                  </div>
-                  <button type="button" onClick={() => navigate('/revenue-protection')} className="mt-4 inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white">
-                    Open Payment Queue <ArrowRight className="w-4 h-4" />
-                  </button>
-                </BentoCard>
-              </div>
-            )}
-          </ResourceSection>
-        </div>
-      )}
-
       {activeTab === 'system' && (
         <ResourceSection
           label="System health"
@@ -1349,7 +1074,6 @@ export default function ControlPlane() {
                     ['Migration status', data.migrationStatus],
                     ['Latest migration', data.latestMigration ?? 'None reported'],
                     ['Revenue protection', data.revenueProtectionStatus],
-                    ['Integration status', data.integrationStatus],
                     ['Background jobs', data.backgroundJobs],
                     ['Build version', data.buildVersion ?? 'None reported'],
                     ['Audit event count', String(data.auditEventCount)],

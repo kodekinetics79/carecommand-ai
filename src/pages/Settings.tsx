@@ -1,9 +1,9 @@
-import { useMemo, useState, type ReactNode, useEffect, useRef, type FormEvent } from 'react';
+import { useState, type ReactNode, useEffect, useRef, type FormEvent } from 'react';
 import { useNavigate } from 'react-router';
 import { useSession } from '../hooks/useSession';
 import {
-  Building2, Users, Lock, Bell, Cable, ShieldCheck, CheckCircle2, Circle, RefreshCw,
-  Trash2, Plus, MapPin, Activity, AlertTriangle, KeyRound, Clock, Coins, Globe, Check,
+  Building2, Users, Lock, Bell, ShieldCheck, CheckCircle2, Circle,
+  Trash2, Plus, MapPin, Activity, KeyRound, Clock, Coins, Globe, Check,
 } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import BentoCard from '../components/ui/BentoCard';
@@ -31,11 +31,6 @@ interface AdminUser {
 interface AdminUsersResponse { users: AdminUser[]; branches: Branch[]; summary?: unknown }
 interface RoleDef { id: string; name: string; description: string; accent: string; userCount: number }
 interface Template { id: string; name: string; channel: string; status: 'ACTIVE' | 'PAUSED' }
-interface IntegrationStatus {
-  key: string; name: string; category: string; description: string; supportedWorkflows: string[];
-  mode: string; modeLabel: string; configured: boolean; health: string; lastSyncAt: string | null;
-  missingConfigCount: number; riskLevel: string;
-}
 interface SecurityPosture {
   authMode: string; rbacEnabled: boolean; auditLoggingEnabled: boolean; rateLimitingEnabled: boolean;
   devTokenDisabledInProduction: boolean; httpsRequired: boolean; csrf: { enabled: boolean };
@@ -58,20 +53,12 @@ const accentBadge: Record<string, string> = {
   violet: 'badge badge-violet', blue: 'badge badge-blue', emerald: 'badge badge-emerald',
   amber: 'badge badge-amber', red: 'badge badge-red',
 };
-const healthDot: Record<string, string> = {
-  healthy: 'bg-emerald-500', degraded: 'bg-amber-500', disconnected: 'bg-red-500', not_configured: 'bg-slate-400',
-};
-const modeBadge: Record<string, string> = {
-  live: 'badge badge-emerald', sandbox: 'badge badge-blue', mock: 'badge badge-amber',
-};
-
 const NAV = [
   { id: 'overview', label: 'Overview', icon: Building2 },
   { id: 'preferences', label: 'Display & Currency', icon: Coins },
   { id: 'team', label: 'Team & Users', icon: Users },
   { id: 'roles', label: 'Roles & Access', icon: Lock },
   { id: 'notifications', label: 'Notifications', icon: Bell },
-  { id: 'integrations', label: 'Integrations', icon: Cable },
   { id: 'security', label: 'Security', icon: ShieldCheck },
 ] as const;
 type SectionId = typeof NAV[number]['id'];
@@ -135,7 +122,6 @@ export default function Settings() {
           {section === 'team' && <TeamSection />}
           {section === 'roles' && <RolesSection />}
           {section === 'notifications' && <NotificationsSection />}
-          {section === 'integrations' && <IntegrationsSection />}
           {section === 'security' && <SecuritySection />}
         </div>
       </div>
@@ -145,21 +131,14 @@ export default function Settings() {
 
 function SettingsSummary() {
   const overview = useResource<AdminOverview>('/v1/admin/overview');
-  const integrations = useResource<IntegrationStatus[]>('/v1/integrations/status');
   const posture = useResource<SecurityPosture>('/v1/security/posture');
 
   return (
     <BentoCard title="Workspace summary" subtitle="Current configuration and the latest recorded control status">
       <div className="grid gap-3 xl:grid-cols-[1.3fr_0.9fr]">
-        <div className="grid gap-3 grid-cols-2 xl:grid-cols-4">
+        <div className="grid gap-3 grid-cols-2 xl:grid-cols-3">
           <ResourceSection label="Team members" state={overview.state} onRetry={overview.reload} compact loading={<TileSkeleton label="team members" />}>
             {data => <StatCard title="Team Members" value={data.summary.totalUsers} subtitle={`${data.summary.activeUsers} active`} icon={<Users className="w-4 h-4" />} accent="blue" />}
-          </ResourceSection>
-
-          {/* A response listing zero integrations is a real answer, so these
-              tiles show the received 0 rather than the empty-state card. */}
-          <ResourceSection label="Integration status" state={integrations.state} onRetry={integrations.reload} compact isEmpty={() => false} loading={<TileSkeleton label="integration status" />}>
-            {rows => <StatCard title="Configured" value={rows.filter(item => item.configured).length} subtitle={`${rows.length} integrations`} icon={<Cable className="w-4 h-4" />} accent="emerald" />}
           </ResourceSection>
 
           <ResourceSection label="Security checks" state={posture.state} onRetry={posture.reload} compact loading={<TileSkeleton label="security checks" />}>
@@ -188,19 +167,6 @@ function SettingsSummary() {
             </ResourceSection>
           </div>
           <div className="space-y-2.5">
-            <StatusRow label="Recorded integration health">
-              <ResourceSection label="Integration status" state={integrations.state} onRetry={integrations.reload} compact isEmpty={() => false}
-                loading={<ResourceSkeleton label="integration status" lines={1} rowClassName="h-3.5 w-32 rounded" />}>
-                {rows => {
-                  const risky = rows.filter(item => item.health !== 'healthy').length;
-                  return (
-                    <span className="font-semibold text-t1">
-                      {rows.length === 0 ? 'No integrations returned' : risky === 0 ? 'No issues reported' : `${risky} need attention`}
-                    </span>
-                  );
-                }}
-              </ResourceSection>
-            </StatusRow>
             <StatusRow label="Security posture">
               <ResourceSection label="Security posture" state={posture.state} onRetry={posture.reload} compact
                 loading={<ResourceSkeleton label="security posture" lines={1} rowClassName="h-3.5 w-24 rounded" />}>
@@ -547,110 +513,12 @@ function NotificationsSection() {
   );
 }
 
-/* ------------------------------------------------------------------ Integrations */
-function IntegrationsSection() {
-  const integrations = useResource<IntegrationStatus[]>('/v1/integrations/status');
-  const [testingKey, setTestingKey] = useState<string | null>(null);
-  const [toast, setToast] = useState<string | null>(null);
-
-  // Held here rather than in the rendered list so a reload cannot discard the
-  // result of a connection test the user just ran.
-  async function test(key: string) {
-    setTestingKey(key);
-    setToast(null);
-    try {
-      const res = await apiRequest<{ message?: string; modeLabel?: string }>(`/v1/integrations/${key}/test`, { method: 'POST' });
-      setToast(`${key}: ${res.modeLabel ?? 'tested'} — ${res.message ?? 'ok'}`);
-      integrations.reload();
-    } catch (err) {
-      setToast(`${key}: ${describeFailure(err).message}`);
-    } finally {
-      setTestingKey(null);
-    }
-  }
-
-  return (
-    <div className="space-y-4">
-      {toast && <div role="status" aria-live="polite" className="rounded-xl border border-[var(--b2)] bg-[var(--blue-soft)] px-3 py-2 text-[11px] font-semibold text-blue-v">{toast}</div>}
-
-      <ResourceSection
-        label="Integrations"
-        state={integrations.state}
-        onRetry={integrations.reload}
-        loading={<ResourceSkeleton label="integrations" lines={4} rowClassName="h-16 rounded-xl" />}
-        empty={{
-          icon: <Cable className="w-5 h-5" />,
-          title: 'No integrations available',
-          description: 'The integration catalogue loaded successfully and returned no providers.',
-        }}
-      >
-        {rows => <IntegrationsView rows={rows} testingKey={testingKey} onTest={test} />}
-      </ResourceSection>
-    </div>
-  );
-}
-
-function IntegrationsView({ rows, testingKey, onTest }: { rows: IntegrationStatus[]; testingKey: string | null; onTest: (key: string) => void }) {
-  const grouped = useMemo(() => {
-    const map = new Map<string, IntegrationStatus[]>();
-    for (const item of rows) {
-      if (!map.has(item.category)) map.set(item.category, []);
-      map.get(item.category)!.push(item);
-    }
-    return [...map.entries()];
-  }, [rows]);
-
-  const connected = rows.filter(d => d.configured).length;
-
-  return (
-    <div className="space-y-4">
-      <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
-        <StatCard title="Integrations" value={rows.length} subtitle="Available providers" icon={<Cable className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Configured" value={connected} subtitle="Configuration detected" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
-        <StatCard title="Needs Setup" value={rows.length - connected} subtitle="Awaiting credentials" icon={<AlertTriangle className="w-4 h-4" />} accent="amber" />
-        <StatCard title="Categories" value={grouped.length} subtitle="Provider types" icon={<Activity className="w-4 h-4" />} accent="violet" />
-      </div>
-
-      {grouped.map(([category, items]) => (
-        <BentoCard key={category} title={category} subtitle={`${items.filter(i => i.configured).length}/${items.length} connected`}>
-          <div className="grid gap-3 sm:grid-cols-2">
-            {items.map(item => (
-              <div key={item.key} className="p-4 rounded-2xl border border-[var(--b1)] hover:border-[var(--b2)] transition-all flex flex-col">
-                <div className="flex items-start justify-between gap-2 mb-2">
-                  <div className="min-w-0">
-                    <p className="text-xs font-bold text-t1">{item.name}</p>
-                    <p className="text-[11px] text-t3 mt-0.5 leading-relaxed">{item.description}</p>
-                  </div>
-                  <span className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full shrink-0 ${modeBadge[item.mode] ?? 'badge badge-blue'}`}>
-                    <span className={`w-1.5 h-1.5 rounded-full ${healthDot[item.health] ?? 'bg-slate-400'}`} />
-                    {item.modeLabel}
-                  </span>
-                </div>
-
-                <div className="flex flex-wrap gap-1 mb-2">
-                  {item.supportedWorkflows.slice(0, 3).map(w => (
-                    <span key={w} className="text-[9px] font-semibold text-t3 bg-[var(--s3)] px-1.5 py-0.5 rounded">{w}</span>
-                  ))}
-                </div>
-
-                {item.missingConfigCount > 0 && (
-                  <p className="text-[10px] text-amber-v mb-2 flex items-center gap-1"><KeyRound className="w-3 h-3 shrink-0" /> Setup required — your administrator must finish connecting this provider.</p>
-                )}
-
-                <div className="mt-auto flex items-center justify-between gap-2 pt-1">
-                  <span className="text-[10px] text-t3">{item.lastSyncAt ? `Synced ${new Date(item.lastSyncAt).toLocaleDateString('en-GB')}` : 'Never synced'}</span>
-                  <button type="button" disabled={testingKey === item.key} onClick={() => onTest(item.key)} className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo bg-[var(--indigo-soft)] px-2.5 py-1 rounded-lg hover:opacity-80 disabled:opacity-40">
-                    <RefreshCw className={`w-3 h-3 ${testingKey === item.key ? 'animate-spin' : ''}`} /> {testingKey === item.key ? 'Testing…' : 'Test connection'}
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </BentoCard>
-      ))}
-    </div>
-  );
-}
+// The Integrations section lived here: the whole provider catalogue grouped by
+// category, with Mock Mode badges, a "Setup required" credential prompt and a
+// Test-connection button on every card. It answered a question no clinic can
+// act on and priced our stack while it did it. The catalogue moved to the
+// Platform Console; what a clinic needs to know about a capability is stated on
+// the screen where that capability is used.
 
 /* ------------------------------------------------------------------ Security */
 function ChangePasswordCard() {

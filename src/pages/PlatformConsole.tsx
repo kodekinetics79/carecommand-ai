@@ -10,7 +10,7 @@ import {
   platformAdmin, setPlatformToken, downloadAuditCsv, TENANT_STATUS_BADGE, SUB_STATUS_BADGE, FEATURE_LABELS,
   type PlatformMe, type TenantSummary, type SystemHealth, type TenantBilling, type AiUsageView, type SecurityView, type IntegrationView,
   type TenantAccountRecord, type TenantCompany, type TenantRoster,
-  type PlatformSettings, type PlatformSettingPreset, type UsageLimitRow,
+  type PlatformSettings, type PlatformSettingPreset, type UsageLimitRow, type TenantProviderConsole,
 } from '../lib/platformAdmin';
 import PlatformPilot from './PlatformPilot';
 
@@ -494,7 +494,12 @@ function AnnouncementsSection({ canManage }: { canManage: boolean }) {
   );
 }
 
-type DrawerTab = 'overview' | 'company' | 'subscription' | 'entitlements' | 'usage' | 'billing' | 'ai' | 'security' | 'audit' | 'danger';
+// 'providers' is where the tenant Control Plane's Integration Hub, Insurance
+// Rails and Finance Rails tabs landed. They were removed from the clinic's own
+// screen, not deleted: an operator still needs the supplier catalogue, the
+// per-vendor readiness, the missing credential names and the Test buttons —
+// they are simply the only people who can act on any of it.
+type DrawerTab = 'overview' | 'company' | 'subscription' | 'entitlements' | 'usage' | 'billing' | 'ai' | 'providers' | 'security' | 'audit' | 'danger';
 function TenantDrawer({ tenant, canManage, onClose }: { tenant: TenantSummary; canManage: boolean; onClose: () => void }) {
   const [tab, setTab] = useState<DrawerTab>('overview');
   const [account, setAccount] = useState<TenantAccountRecord | null>(null);
@@ -539,6 +544,7 @@ function TenantDrawer({ tenant, canManage, onClose }: { tenant: TenantSummary; c
     { id: 'subscription', label: 'Subscription', live: true },
     { id: 'entitlements', label: 'Feature Entitlements', live: true }, { id: 'usage', label: 'Usage & Limits', live: true },
     { id: 'billing', label: 'Billing', live: true }, { id: 'ai', label: 'AI Controls', live: true },
+    { id: 'providers', label: 'Providers', live: true },
     { id: 'security', label: 'Security', live: true }, { id: 'audit', label: 'Audit Trail', live: true },
     { id: 'danger', label: 'Danger Zone', live: true },
   ];
@@ -611,6 +617,7 @@ function TenantDrawer({ tenant, canManage, onClose }: { tenant: TenantSummary; c
           {tab === 'usage' && <UsageTab tid={tid} canManage={canManage} />}
           {tab === 'billing' && <BillingTab tid={tid} canManage={canManage} />}
           {tab === 'ai' && <AiTab tid={tid} canManage={canManage} />}
+          {tab === 'providers' && <ProvidersTab tid={tid} canManage={canManage} />}
           {tab === 'security' && <SecurityTab tid={tid} canManage={canManage} />}
 
           {tab === 'audit' && (
@@ -1000,6 +1007,129 @@ function UsageTab({ tid, canManage }: { tid: string; canManage: boolean }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+/**
+ * One tenant's supplier picture — the relocated Integration Hub, Insurance
+ * Rails and Finance Rails.
+ *
+ * Two things are deliberately here and nowhere else. `missingConfigKeys` names
+ * the environment variables that are unset, which is only useful to somebody
+ * who can go and set them. And the Test buttons keep their honesty gates: a
+ * provider with no live probe reports "configured, not verified", never a
+ * green tick.
+ */
+function ProvidersTab({ tid, canManage }: { tid: string; canManage: boolean }) {
+  const [view, setView] = useState<TenantProviderConsole | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [result, setResult] = useState<Record<string, string>>({});
+
+  const load = useCallback(async () => {
+    try { setView(await platformAdmin.tenantProviders(tid)); setError(null); }
+    catch (e) { setView(null); setError(e instanceof Error ? e.message : 'Could not read this tenant\u2019s providers'); }
+  }, [tid]);
+  useEffect(() => { void load(); }, [load]);
+
+  async function run(key: string, call: () => Promise<{ status: string; message: string }>) {
+    setBusy(key);
+    try {
+      const r = await call();
+      setResult(current => ({ ...current, [key]: `${r.status} \u2014 ${r.message}` }));
+      await load();
+    } catch (e) {
+      setResult(current => ({ ...current, [key]: e instanceof Error ? e.message : 'Test failed' }));
+    } finally { setBusy(null); }
+  }
+
+  if (error) return <div className="rounded-lg bg-red-soft border border-[rgba(220,38,38,0.18)] px-3 py-2 text-xs text-red-v">{error}</div>;
+  if (!view) return <div className="py-6 text-center"><Loader2 className="inline w-5 h-5 animate-spin text-indigo" /></div>;
+
+  return (
+    <div className="space-y-4">
+      <p className="text-[11px] text-t3">
+        Operator view. The clinic sees none of this: on its own screens a capability reads
+        &ldquo;Card payments: not set up&rdquo; and names CareCommand support as the next step.
+      </p>
+      <div className="grid grid-cols-4 gap-2">
+        <DCard label="Active" value={String(view.summary.active)} />
+        <DCard label="Sandbox" value={String(view.summary.sandbox)} />
+        <DCard label="Mock" value={String(view.summary.mock)} />
+        <DCard label="Failed" value={String(view.summary.failed)} />
+      </div>
+
+      <section className="space-y-2">
+        <p className="text-[11px] font-bold uppercase tracking-widest text-t3">Provider catalogue</p>
+        {view.integrations.map(row => (
+          <div key={row.key} className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[12px] font-semibold text-t1">{row.name}</span>
+              <span className={`badge ${row.health === 'healthy' ? 'badge-emerald' : row.health === 'degraded' ? 'badge-amber' : 'badge-blue'}`}>{row.modeLabel}</span>
+            </div>
+            <p className="mt-1 text-[10.5px] text-t3">{row.category} \u00b7 {row.supportedWorkflows.join(' \u00b7 ')}</p>
+            {row.missingConfigKeys.length > 0 && (
+              <p className="mt-1 text-[10.5px] text-amber-v">Unset: {row.missingConfigKeys.join(', ')}</p>
+            )}
+            {result[`i:${row.key}`] && <p className="mt-1 text-[10.5px] text-t2">{result[`i:${row.key}`]}</p>}
+            {canManage && (
+              <button type="button" disabled={busy === `i:${row.key}`} onClick={() => void run(`i:${row.key}`, () => platformAdmin.testTenantProvider(tid, row.key))}
+                className="mt-2 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-t2 hover:bg-[var(--s3)] disabled:opacity-50">
+                {busy === `i:${row.key}` ? '\u2026' : 'Test connection'}
+              </button>
+            )}
+          </div>
+        ))}
+      </section>
+
+      <section className="space-y-2">
+        <p className="text-[11px] font-bold uppercase tracking-widest text-t3">Eligibility rails</p>
+        {view.insuranceRails.map(rail => (
+          <div key={rail.provider} className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[12px] font-semibold text-t1">{rail.name}</span>
+              <span className={`badge ${rail.configured ? 'badge-emerald' : 'badge-amber'}`}>{rail.modeLabel}</span>
+            </div>
+            <p className="mt-1 text-[10.5px] text-t3">
+              Eligibility {rail.eligibilitySupported ? 'yes' : 'no'} \u00b7 benefits {rail.benefitsSupported ? 'yes' : 'no'} \u00b7
+              prior auth {rail.priorAuthSupported ? 'payer-connected' : rail.priorAuthTrackingSupported ? 'manual tracking only' : 'no'} \u00b7
+              payer list {rail.payerListStatus} \u00b7 error rate {rail.errorRate}%
+            </p>
+            {result[`e:${rail.provider}`] && <p className="mt-1 text-[10.5px] text-t2">{result[`e:${rail.provider}`]}</p>}
+            {canManage && (
+              <button type="button" disabled={busy === `e:${rail.provider}`} onClick={() => void run(`e:${rail.provider}`, () => platformAdmin.testTenantEligibility(tid, rail.provider))}
+                className="mt-2 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-t2 hover:bg-[var(--s3)] disabled:opacity-50">
+                {busy === `e:${rail.provider}` ? '\u2026' : 'Test eligibility'}
+              </button>
+            )}
+          </div>
+        ))}
+      </section>
+
+      <section className="space-y-2">
+        <p className="text-[11px] font-bold uppercase tracking-widest text-t3">Payment rails</p>
+        {view.financeRails.map(rail => (
+          <div key={rail.provider} className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[12px] font-semibold text-t1">{rail.name}</span>
+              <span className={`badge ${rail.configured ? 'badge-emerald' : 'badge-amber'}`}>{rail.modeLabel}</span>
+            </div>
+            <p className="mt-1 text-[10.5px] text-t3">
+              Links {rail.paymentLinksSupported ? 'yes' : 'no'} \u00b7 deposits {rail.depositsSupported ? 'yes' : 'no'} \u00b7
+              copays {rail.copayCollectionSupported ? 'yes' : 'no'} \u00b7 webhooks {rail.webhooksConfigured ? 'configured' : 'missing'} \u00b7
+              failed payments {rail.failedPaymentCount}
+            </p>
+            {result[`f:${rail.provider}`] && <p className="mt-1 text-[10.5px] text-t2">{result[`f:${rail.provider}`]}</p>}
+            {canManage && (
+              <button type="button" disabled={busy === `f:${rail.provider}`} onClick={() => void run(`f:${rail.provider}`, () => platformAdmin.testTenantPaymentLink(tid, rail.provider))}
+                className="mt-2 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-t2 hover:bg-[var(--s3)] disabled:opacity-50">
+                {busy === `f:${rail.provider}` ? '\u2026' : 'Test payment link'}
+              </button>
+            )}
+          </div>
+        ))}
+      </section>
     </div>
   );
 }

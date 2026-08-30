@@ -189,7 +189,7 @@ export default function CRM() {
                       icon={<Flame className="w-5 h-5" />}
                       title="No open leads yet"
                       description="There is nothing in the pipeline to rank. New inquiries appear here as soon as a lead source — your receptionist, a web form, or an import — starts sending them to CareCommand."
-                      cta={{ label: 'Review lead sources', onClick: () => navigate('/integrations') }}
+                      cta={{ label: 'Review campaigns', onClick: () => navigate('/campaigns') }}
                     />
                   : <EmptyStatePremium
                       icon={<Flame className="w-5 h-5" />}

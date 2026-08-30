@@ -44,6 +44,7 @@ import { subscriptionRoutes } from './modules/subscriptions/routes';
 import { onboardingRoutes } from './modules/onboarding/routes';
 import { platformRoutes } from './modules/platform/routes';
 import { pilotRoutes } from './modules/platform/pilot.routes';
+import { platformProviderConsoleRoutes } from './modules/platform/providerConsole';
 import { pilotPublicRoutes } from './modules/platform/pilot.public.routes';
 import { platformAuthRoutes } from './modules/platform/auth';
 import { portalAuthRoutes } from './modules/portal/auth';
@@ -203,6 +204,9 @@ export async function buildApp() {
   await app.register(platformAuthRoutes, { prefix: '/v1/platform/auth' });
   await app.register(platformRoutes, { prefix: '/v1/platform' });
   await app.register(pilotRoutes, { prefix: '/v1/platform' });
+  // The supplier console. Its routes answer a platform JWT only; the tenant
+  // equivalents under /v1/control-plane were removed, not duplicated.
+  await app.register(platformProviderConsoleRoutes, { prefix: '/v1/platform' });
 
   // Patient / Client Portal — separate identity; portal JWT (type:'portal')
   // cannot access staff APIs and staff JWT cannot access these.

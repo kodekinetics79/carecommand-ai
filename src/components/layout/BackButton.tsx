@@ -6,7 +6,6 @@ import { ChevronLeft } from 'lucide-react';
 // (deep link, hard refresh) so the user is never stranded.
 const SUBROUTE_PARENTS: Record<string, string> = {
   '/insurance-eligibility': '/insurance',
-  '/integration-setup': '/integrations',
   '/sync-logs': '/devices',
   '/alert-thresholds': '/monitoring',
   '/enrollments': '/monitoring',
