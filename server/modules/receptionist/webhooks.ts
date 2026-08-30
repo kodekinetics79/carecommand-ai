@@ -4,7 +4,13 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { env } from '../../config/env';
 import { targetStatusAfterOutcome, DEFAULT_VOICE_MINUTES_LIMIT } from './outbound';
-import { MAX_TENANT_ACTIVE_CALLS } from '../../lib/receptionist/admissionPolicy';
+import { admissionDenialPolicy, MAX_TENANT_ACTIVE_CALLS, type AdmissionDenialPolicy } from '../../lib/receptionist/admissionPolicy';
+import { runtimeDynamicVariableDefaults } from '../../lib/receptionist/runtimeVariables';
+import { buildHoursDynamicVariables, hoursStatus } from '../../lib/receptionist/clinicHours';
+import { loadHoursSource } from '../../lib/receptionist/hoursSource';
+import { resolveLocalePackWithFallback, resolvedLocaleFormat } from '../../lib/receptionist/localePacks/resolve';
+import { renderTemplate } from '../../lib/receptionist/localePacks/render';
+import type { LocalePackStrings } from '../../lib/receptionist/localePacks/types';
 import { recordUsageEvent, periodUsageTotal, voiceCallDedupeKey, USAGE_METRICS } from '../../lib/usageMetering';
 import { liveCallingBlockReason } from '../../lib/tenantMode';
 import { handleAgentTool, requestHumanHandoff, type TrustedBookingContext } from '../../lib/receptionist/liveTools';
@@ -19,7 +25,7 @@ import { lockDncDestinationFence } from '../../lib/receptionist/dncFence';
 import { enforceInvalidRetellSignatureRateLimit, enforceVerifiedRetellRateLimit } from '../../lib/receptionist/providerRateLimit';
 import { recoverOutboundProviderIntent } from '../../lib/receptionist/providerIntentRecovery';
 import { retellRateStore } from '../../lib/receptionist/retellRateStore';
-import { fingerprintJson, type IntakeContractSnapshot } from './intakeContract';
+import { fingerprintJson, resolveBookableService, type IntakeContractSnapshot } from './intakeContract';
 import { callHoursStamp } from '../../lib/receptionist/hoursSource';
 import { recordWorkflowEvent } from '../../lib/intelligence';
 import { uuid } from './shared';
@@ -286,12 +292,20 @@ async function persistProviderIntentRecoveryReview(input: {
   };
 }
 
-async function admitInboundReceptionist(tenantId: string, providerCallId: string, reservation: {
+async function admitInboundReceptionist(tenantId: string, providerCallId: string | null, reservation: {
   clinicId?: string; campaignId?: string; callerPhone?: string; direction?: string; enforceAdmission?: boolean;
+  /**
+   * `call_inbound` arrives BEFORE the provider has a call id, so admission is
+   * evaluated there without reserving anything. The reservation still happens
+   * at the first lifecycle event, under the same capacity lock.
+   */
+  reserve?: boolean;
 } = {}) {
   return db.$transaction(async tx => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-capacity:${tenantId}`})::bigint)`;
-    const existing = await tx.receptionistCallLog.findFirst({ where: { tenantId, retellCallId: providerCallId }, select: { id: true } });
+    const existing = providerCallId
+      ? await tx.receptionistCallLog.findFirst({ where: { tenantId, retellCallId: providerCallId }, select: { id: true } })
+      : null;
     if (reservation.enforceAdmission !== false && !(await isFeatureEnabled(tenantId, 'ai_receptionist', tx))) return { allowed: false as const, reason: 'feature_locked' };
     if (reservation.enforceAdmission === false) {
       // Terminal delivery may bypass a newly enabled kill switch only to
@@ -355,7 +369,10 @@ async function admitInboundReceptionist(tenantId: string, providerCallId: string
       select: { used: true, limitValue: true },
     });
     const activeCalls = await tx.receptionistCallLog.count({
-      where: { tenantId, outcome: 'IN_PROGRESS', endedAt: null, retellCallId: { not: providerCallId } },
+      where: {
+        tenantId, outcome: 'IN_PROGRESS', endedAt: null,
+        ...(providerCallId ? { retellCallId: { not: providerCallId } } : {}),
+      },
     });
     if (activeCalls >= MAX_TENANT_ACTIVE_CALLS) return { allowed: false as const, reason: 'concurrency_limit_reached' };
     // Included minutes are per billing period. TenantUsageLimit.used and
@@ -366,6 +383,7 @@ async function admitInboundReceptionist(tenantId: string, providerCallId: string
     if (!aiUsage.overageAllowed && voiceUsage.limitValue !== null && usedMinutes + activeCalls >= voiceUsage.limitValue) {
       return { allowed: false as const, reason: 'voice_minutes_limit_reached' };
     }
+    if (reservation.reserve === false || !providerCallId) return { allowed: true as const, reserved: false };
     if (!existing) await tx.receptionistCallLog.create({ data: { tenantId, clinicId: reservation.clinicId, campaignId: reservation.campaignId, retellCallId: providerCallId, callerPhone: reservation.callerPhone, direction: reservation.direction ?? 'inbound', startedAt: new Date() } });
     return { allowed: true as const, reserved: !existing };
   });
@@ -373,6 +391,65 @@ async function admitInboundReceptionist(tenantId: string, providerCallId: string
 
 async function flagInboundAdmissionDenied(tenantId: string, providerCallId: string, reason: string) {
   await flagRetellIngressReview(tenantId, providerCallId, `Inbound receptionist admission denied: ${reason}`);
+}
+
+/**
+ * What a refused caller hears, and where they go.
+ *
+ * Every one of these paths used to call `stopPhoneCall`: the fourth
+ * simultaneous caller on a Monday morning heard the disclosure, said yes, and
+ * then the line died. "We are busy" is not a provider-integrity failure, and it
+ * is never a reason to hang up on a patient. The line comes from the clinic's
+ * approved locale pack; the caller goes to the clinic's human fallback.
+ *
+ * `stopPhoneCall` survives ONLY where an unverified deployment would otherwise
+ * reach patient data — a different failure with a different answer.
+ */
+function speakOptionalPackMessage(
+  strings: LocalePackStrings | null | undefined,
+  key: string,
+  fallback: string,
+): string {
+  // The pack owns the wording. `receptionist.degraded.*` is C3's namespace and
+  // lands with the pack work; reading the map directly (rather than through the
+  // typed key union) means this picks those strings up the moment they exist,
+  // and speaks a plain sentence rather than silence until then.
+  const template = strings?.messages?.[key];
+  if (typeof template !== 'string' || !template.trim()) return fallback;
+  try { return renderTemplate(template, {}); } catch { return fallback; }
+}
+
+async function inboundAdmissionDenialResponse(input: {
+  tenantId: string;
+  providerCallId: string;
+  reason: string;
+  clinicId?: string | null;
+}): Promise<{
+  policy: AdmissionDenialPolicy;
+  message: string;
+  humanFallbackNumber: string | null;
+}> {
+  const policy = admissionDenialPolicy(input.reason);
+  const clinic = input.clinicId
+    ? await db.receptionistClinic.findFirst({
+      where: { id: input.clinicId, tenantId: input.tenantId },
+      select: { humanFallbackNumber: true, country: true, defaultLanguage: true },
+    })
+    : null;
+  const pack = clinic
+    ? await resolveLocalePackWithFallback(db, {
+      tenantId: input.tenantId,
+      language: clinic.defaultLanguage,
+      country: clinic.country,
+    }).catch(() => null)
+    : null;
+  const message = speakOptionalPackMessage(pack?.strings, policy.messageKey, policy.fallbackMessage);
+  await flagInboundAdmissionDenied(
+    input.tenantId,
+    input.providerCallId,
+    `${input.reason}; disposition=${policy.disposition}; provider_stop_applied=false`,
+  ).catch(() => undefined);
+  return { policy, message, humanFallbackNumber: clinic?.humanFallbackNumber ?? null };
 }
 
 // ===== Public webhook (no JWT — Retell posts events here) =================
@@ -386,6 +463,13 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     const query = z.object({ clinicId: uuid.optional(), campaignId: uuid.optional() }).parse(request.query);
     const body = z.object({
       event: z.string().optional(),
+      // Retell's pre-answer hook. It carries no call id — the call does not
+      // exist yet — so it is answered before any of the call-id machinery below.
+      call_inbound: z.object({
+        agent_id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/).optional(),
+        from_number: z.string().max(40).optional(),
+        to_number: z.string().max(40).optional(),
+      }).partial().optional(),
       call: z.object({
         call_id: z.string().optional(),
         agent_id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/).optional(),
@@ -430,6 +514,130 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       }
       request.log.error({ sourceRef, decision: invalidRate.allowed ? 'rejected' : invalidRate.reason }, 'Retell webhook rejected: RETELL_API_KEY not configured');
       return reply.code(503).send({ error: 'WEBHOOK_NOT_CONFIGURED' });
+    }
+
+    // ── call_inbound: the values a patient actually hears ────────────────────
+    //
+    // Everything below this block needs a provider call id. `call_inbound`
+    // arrives before one exists, and it is the ONLY moment we can hand Retell
+    // the per-call values the prompt reads. Without it the deployed prompt ran
+    // with literal `{{is_open_now}}` / `{{hours_today}}` / `{{next_opening}}`
+    // and the agent was instructed to say, verbatim, "We next open
+    // {{next_opening}}." The whole hours engine never reached an inbound caller.
+    //
+    // Two rules hold on every path out of here, including the failure ones:
+    //   * the response ALWAYS carries the full runtime variable set, seeded
+    //     from `runtimeDynamicVariableDefaults()`. The worst thing a caller can
+    //     hear is the word "unknown"; it can never be a brace.
+    //   * a caller is never refused here. Admission is EVALUATED so the prompt
+    //     knows to route immediately (`admission_state`), and the reservation
+    //     still happens at the first lifecycle event.
+    if (body.event === 'call_inbound' || body.call_inbound) {
+      const inbound = body.call_inbound ?? {};
+      const destination = canonicalRetellDestination(inbound.to_number);
+      const variables: Record<string, string> = runtimeDynamicVariableDefaults();
+      const inboundResolution = destination
+        ? await resolveIngressTenant('retell_destination_phone', destination)
+        : null;
+      if (!inboundResolution) {
+        request.log.warn({
+          destinationRef: opaqueIngressReference(destination ?? undefined).slice(0, 16),
+        }, 'Retell call_inbound could not be mapped to one active clinic');
+        await flagUnresolvedRetellIngress(undefined, destination, 'inbound');
+        return reply.code(200).send({ call_inbound: { dynamic_variables: variables } });
+      }
+      const inboundTenantId = inboundResolution.tenantId;
+      const inboundClinicId = inboundResolution.resourceId;
+      enterTenantContext({
+        tenantId: inboundTenantId, actorId: `webhook:retell-inbound:${inboundClinicId}`,
+        actorRole: 'WEBHOOK', source: 'webhook', requestId: request.id,
+      });
+      const clinic = await db.receptionistClinic.findFirst({
+        where: { id: inboundClinicId, tenantId: inboundTenantId, active: true },
+        select: {
+          id: true, name: true, phone: true, addressLine: true, country: true,
+          defaultLanguage: true, humanFallbackNumber: true,
+        },
+      });
+      if (!clinic) return reply.code(200).send({ call_inbound: { dynamic_variables: variables } });
+
+      const [bundle, pack] = await Promise.all([
+        loadHoursSource(db, { tenantId: inboundTenantId, clinicId: clinic.id }).catch(() => null),
+        resolveLocalePackWithFallback(db, {
+          tenantId: inboundTenantId, language: clinic.defaultLanguage, country: clinic.country,
+        }).catch(() => null),
+      ]);
+      const locale = resolvedLocaleFormat(pack, clinic.defaultLanguage);
+      const status = bundle ? hoursStatus(bundle.source, new Date(), locale) : null;
+      Object.assign(variables, buildHoursDynamicVariables({ status, strings: pack?.strings ?? null }));
+
+      // Where the caller is calling. One active location speaks for itself;
+      // with several, the clinic's own address is the honest answer rather
+      // than naming a site the caller did not ask for.
+      const activeLocations = (bundle?.locations ?? []).filter(location => location.active);
+      const location = activeLocations.length === 1 ? activeLocations[0] : null;
+      variables.location_name = location?.name ?? clinic.name;
+      variables.location_address = location?.address ?? clinic.addressLine ?? '';
+      variables.location_phone = location?.phone ?? clinic.phone;
+      variables.human_fallback_number = clinic.humanFallbackNumber ?? '';
+
+      // A returning caller by their name, not an interrogation. One canonical
+      // phone match only: two family members on one number stay anonymous
+      // until the DOB ladder says which of them is on the line.
+      const callerPhone = canonicalRetellDestination(inbound.from_number);
+      let patientKnown = false;
+      if (callerPhone) {
+        const matches = await db.$queryRaw<Array<{ firstName: string }>>`
+          SELECT "firstName"
+          FROM "Patient"
+          WHERE "tenantId" = ${inboundTenantId}::uuid
+            AND "deletedAt" IS NULL
+            AND "phone" IS NOT NULL
+            AND CASE
+              WHEN "phone" LIKE '+%' THEN '+' || regexp_replace("phone", '[^0-9]', '', 'g')
+              WHEN length(regexp_replace("phone", '[^0-9]', '', 'g')) = 10 THEN '+1' || regexp_replace("phone", '[^0-9]', '', 'g')
+              ELSE '+' || regexp_replace("phone", '[^0-9]', '', 'g')
+            END = ${callerPhone}
+          ORDER BY id
+          LIMIT 2
+        `;
+        if (matches.length === 1) {
+          variables.known_first_name = matches[0].firstName.trim().slice(0, 80);
+          patientKnown = true;
+        }
+      }
+
+      // Admission moves here, off the first tool call. A caller who cannot be
+      // admitted is told so in their first turn and routed to a human — rather
+      // than answering six intake questions and then having the line die.
+      const admission = await admitInboundReceptionist(inboundTenantId, null, {
+        clinicId: clinic.id, direction: 'inbound', reserve: false,
+      });
+      let admissionMessage: string | null = null;
+      if (!admission.allowed) {
+        const policy = admissionDenialPolicy(admission.reason);
+        variables.admission_state = policy.admissionState;
+        admissionMessage = speakOptionalPackMessage(pack?.strings, policy.messageKey, policy.fallbackMessage);
+        await flagRetellIngressReview(
+          inboundTenantId,
+          `call_inbound:${destination}`,
+          `Inbound receptionist admission denied at call_inbound: ${admission.reason}; disposition=${policy.disposition}`,
+        ).catch(() => undefined);
+      } else {
+        variables.admission_state = 'admitted';
+      }
+
+      return reply.code(200).send({
+        call_inbound: {
+          dynamic_variables: variables,
+          metadata: {
+            clinic_id: clinic.id,
+            patient_known: patientKnown,
+            admission_state: variables.admission_state,
+            ...(admissionMessage ? { admission_message: admissionMessage } : {}),
+          },
+        },
+      });
     }
 
     // Retell's signature authenticates the exact provider body globally. A
@@ -550,9 +758,19 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         enforceAdmission: !endedEvent,
       });
       if (!admission.allowed) {
-        const stopped = await stopPhoneCall(providerCallId);
-        await flagInboundAdmissionDenied(tenantId, providerCallId, `${admission.reason}; provider_stop_applied=${stopped.applied}`);
-        return reply.code(202).send({ ok: true, ignored: true, reason: 'admission_denied', providerStopApplied: stopped.applied });
+        const denial = await inboundAdmissionDenialResponse({
+          tenantId, providerCallId, reason: admission.reason, clinicId: trustedClinicId,
+        });
+        return reply.code(202).send({
+          ok: true,
+          ignored: true,
+          reason: 'admission_denied',
+          admission_state: denial.policy.admissionState,
+          disposition: denial.policy.disposition,
+          transfer_number: denial.humanFallbackNumber,
+          message: denial.message,
+          providerStopApplied: false,
+        });
       }
     }
 
@@ -1009,9 +1227,19 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     if (inboundTool) {
       const admission = await admitInboundReceptionist(tenantId, providerCallId, { clinicId: trustedClinicId, callerPhone: body.call?.from_number, direction: 'inbound' });
       if (!admission.allowed) {
-        const stopped = await stopPhoneCall(providerCallId);
-        await flagInboundAdmissionDenied(tenantId, providerCallId, `${admission.reason}; provider_stop_applied=${stopped.applied}`);
-        return reply.code(202).send({ message: "I'm sorry, this clinic's AI receptionist is unavailable right now. I can only direct you to staff.", providerStopApplied: stopped.applied });
+        const denial = await inboundAdmissionDenialResponse({
+          tenantId, providerCallId, reason: admission.reason, clinicId: trustedClinicId,
+        });
+        return reply.code(202).send({
+          allowed: false,
+          needs_human: true,
+          admission_state: denial.policy.admissionState,
+          disposition: denial.policy.disposition,
+          transfer_number: denial.humanFallbackNumber,
+          transfer_required: denial.policy.disposition === 'transfer_to_human' && Boolean(denial.humanFallbackNumber),
+          message: denial.message,
+          providerStopApplied: false,
+        });
       }
     }
 
@@ -1196,6 +1424,11 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         ? campaign.intakeSchemaSnapshot as unknown as IntakeContractSnapshot
         : null;
       const semanticFingerprint = typeof snapshot?.semanticFingerprint === 'string' ? snapshot.semanticFingerprint : null;
+      // One campaign is no longer one service. The caller's choice must be a
+      // member of the exact enum this deployment attested — never free text,
+      // and never silently rewritten to the campaign's advertised type on a
+      // booking mutation.
+      const chosenService = snapshot ? resolveBookableService(snapshot, body.args.service) : null;
       const persistedCallerPhone = canonicalRetellDestination(activeCall.callerPhone ?? undefined);
       const envelopeCallerPhone = canonicalRetellDestination(
         body.call?.direction === 'outbound' ? body.call.to_number : body.call?.from_number,
@@ -1213,7 +1446,7 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         && semanticFingerprint
         && (!isBookingMutation || body.args.intake_contract_fingerprint === semanticFingerprint)
         && (!isBookingMutation || body.args.intake_schema_revision === campaign.intakeSchemaRevision)
-        && (!isBookingMutation || body.args.service === campaign.appointmentType)
+        && (!isBookingMutation || Boolean(chosenService))
         && body.call?.agent_id === campaign?.intakeSchemaProviderAgentId
         && body.call?.agent_version === campaign?.intakeSchemaProviderVersion,
       );
@@ -1235,7 +1468,9 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       }
       // Persisted call/campaign state is authoritative. Provider-applied consts
       // are cross-checks only, and model-supplied phone data is never forwarded.
-      trustedToolArgs = { ...body.args, service: campaign!.appointmentType };
+      // `service` is the one caller-chosen value, and it is replaced with the
+      // catalogue's own spelling of whichever attested option was picked.
+      trustedToolArgs = { ...body.args, service: chosenService ?? campaign!.appointmentType };
       delete trustedToolArgs.phone;
 
       const eligibleLocationIds = Array.isArray(snapshot!.eligibleLocationIds)

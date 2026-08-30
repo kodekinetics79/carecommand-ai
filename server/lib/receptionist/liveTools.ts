@@ -2,7 +2,15 @@ import { db } from '../db';
 import { randomUUID } from 'node:crypto';
 import type { Prisma } from '../../generated/prisma/client';
 import { toE164, isValidE164 } from '../campaigns';
-import { getOpenSlots, parseSlot, speakTime, SLOT_MIN } from './availability';
+import {
+  getOpenSlotsAcrossProviders,
+  listBookableProviders,
+  matchPreferredProvider,
+  parseSlot,
+  speakTime,
+  SLOT_MIN,
+  type BookableProvider,
+} from './availability';
 import { findSlotConflict, getSchedulingPolicy, isDoubleBookConflictError, resolveSchedulingService, unmetPreVisitRequirements } from '../scheduling';
 import { evaluateDepositForAppointment } from '../deposits';
 import {
@@ -10,6 +18,7 @@ import {
   fingerprintJson,
   MAX_INTAKE_FIELDS,
   normalizeBookAppointmentToolContract,
+  resolveBookableService,
   type IntakeContractSnapshot,
 } from '../../modules/receptionist/intakeContract';
 import {
@@ -116,11 +125,57 @@ async function auditLive(
   await client.auditEvent.create({ data: { tenantId, actorUserId: null, action, resource: 'receptionistLiveAgent', resourceId: resourceId ?? undefined, userAgent: 'retell-webhook', metadata: metadata as Prisma.InputJsonValue } });
 }
 
-// Live booking requires an unambiguous provider. Ambiguity is routed to staff;
-// provider-null appointments would bypass the canonical capacity guard.
-async function resolveSoleProvider(tenantId: string, branchId: string): Promise<string | null> {
-  const providers = await db.providerProfile.findMany({ where: { tenantId, branchId, active: true }, select: { id: true }, take: 2 });
-  return providers.length === 1 ? providers[0].id : null;
+// Live booking requires an unambiguous provider PER SLOT, not per branch.
+//
+// This used to be `resolveSoleProvider`: it returned null unless the branch had
+// exactly one active clinician, so a two-dentist practice was told "I need a
+// team member to confirm the provider or service" on every call, forever. A
+// provider-null appointment would bypass the canonical capacity guard, which is
+// the real constraint — and it is satisfied by choosing a provider who is
+// demonstrably free at the requested time, not by there being only one to
+// choose from.
+//
+// `PREFERRED_PROVIDER` narrows the roster when the caller named someone. A name
+// we cannot resolve is never silently replaced with a different clinician.
+const HHMM = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+
+type ProviderSelection =
+  | { ok: true; providers: BookableProvider[]; preferred: BookableProvider | null }
+  | { ok: false; reason: 'no_bookable_provider' | 'preferred_provider_unknown' };
+
+async function selectBookableProviders(
+  tenantId: string,
+  branchId: string,
+  requestedProvider: unknown,
+  client: typeof db | Prisma.TransactionClient = db,
+): Promise<ProviderSelection> {
+  const providers = await listBookableProviders(tenantId, branchId, client);
+  if (!providers.length) return { ok: false, reason: 'no_bookable_provider' };
+  const named = typeof requestedProvider === 'string' ? requestedProvider.trim() : '';
+  if (!named) return { ok: true, providers, preferred: null };
+  const preferred = matchPreferredProvider(providers, named);
+  if (!preferred) return { ok: false, reason: 'preferred_provider_unknown' };
+  return { ok: true, providers: [preferred], preferred };
+}
+
+/**
+ * The tool schema declares `callback_window` as `{date, from, to}` — what a
+ * caller actually says. The task contract stores `{start, end}`. One mapping,
+ * here, so neither side has to know about the other.
+ */
+export function normalizeCallbackWindowArg(value: unknown): { start: string; end: string } | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.start === 'string' && typeof raw.end === 'string') return { start: raw.start, end: raw.end };
+  const date = typeof raw.date === 'string' ? raw.date.trim() : '';
+  const from = typeof raw.from === 'string' ? raw.from.trim() : '';
+  const to = typeof raw.to === 'string' ? raw.to.trim() : '';
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !HHMM.test(from) || !HHMM.test(to)) return undefined;
+  return { start: `${date}T${from}`, end: `${date}T${to}` };
+}
+
+function withCallbackWindow(args: Record<string, unknown>): Record<string, unknown> {
+  return { ...args, callback_window: normalizeCallbackWindowArg(args.callback_window) };
 }
 
 async function patientsByCanonicalPhone(
@@ -280,10 +335,12 @@ export { createSafetyTask } from './frontDeskTask';
 
 /** Records an acknowledgment-required handoff before Retell attempts transfer. */
 export async function requestHumanHandoff(ctx: ToolContext, args: Record<string, unknown>) {
-  const task = await createSafetyTask(ctx, 'human_handoff', args);
+  const callbackWindow = normalizeCallbackWindowArg(args.callback_window);
+  const task = await createSafetyTask(ctx, 'human_handoff', withCallbackWindow(args));
   return {
     handoff_recorded: true,
     transfer_completed: false,
+    callback_window_recorded: Boolean(callbackWindow),
     duplicate: task.duplicate,
     appended: task.appended,
     task_id: task.taskId,
@@ -293,11 +350,13 @@ export async function requestHumanHandoff(ctx: ToolContext, args: Record<string,
 
 /** Persists a bounded callback message as a staff task with explicit acknowledgment status. */
 export async function takeMessage(ctx: ToolContext, args: Record<string, unknown>) {
-  const task = await createSafetyTask(ctx, 'message', args);
+  const callbackWindow = normalizeCallbackWindowArg(args.callback_window);
+  const task = await createSafetyTask(ctx, 'message', withCallbackWindow(args));
   return {
     // True only when a task was created or a message appended on this call.
     message_recorded: !task.duplicate,
     acknowledgment_pending: true,
+    callback_window_recorded: Boolean(callbackWindow),
     duplicate: task.duplicate,
     appended: task.appended,
     task_id: task.taskId,
@@ -631,12 +690,26 @@ export async function checkAvailability(ctx: ToolContext, args: Record<string, u
   if (!authority || !trusted.intakeSnapshot.eligibleLocationIds.includes(trusted.locationId)) {
     return { available: false, needs_review: true, slots: [], message: "I cannot verify this location against the active booking campaign." };
   }
-  const providerProfileId = await resolveSoleProvider(ctx.tenantId, trusted.branchId);
-  const requestedService = trusted.intakeSnapshot.appointmentType;
-  const service = await resolveSchedulingService({ tenantId: ctx.tenantId, service: requestedService, fallbackDurationMin: SLOT_MIN });
-  if (!providerProfileId || !service) {
-    await auditLive(ctx.tenantId, 'receptionist.availability.needsReview', trusted.branchId, { reason: !providerProfileId ? 'provider_ambiguous' : 'service_ambiguous' });
-    return { available: false, needs_review: true, slots: [], message: "I need a team member to confirm the provider or service before I offer a time." };
+  // The caller's own words decide the service, checked against the exact menu
+  // this deployment attested. An unrecognised name falls back to the campaign's
+  // advertised type rather than silently searching the wrong appointment length.
+  const requestedService = resolveBookableService(trusted.intakeSnapshot, args.service)
+    ?? trusted.intakeSnapshot.appointmentType;
+  const service = await resolveSchedulingService(
+    { tenantId: ctx.tenantId, service: requestedService, fallbackDurationMin: SLOT_MIN, useVoiceDuration: true },
+  );
+  const selection = await selectBookableProviders(ctx.tenantId, trusted.branchId, args.preferred_provider);
+  if (!selection.ok || !service) {
+    const reason = !service ? 'service_ambiguous' : selection.ok ? 'provider_ambiguous' : selection.reason;
+    await auditLive(ctx.tenantId, 'receptionist.availability.needsReview', trusted.branchId, { reason });
+    return {
+      available: false,
+      needs_review: true,
+      slots: [],
+      message: reason === 'preferred_provider_unknown'
+        ? "I could not match that clinician's name at this location. Would another clinician work, or shall I have a team member call you back?"
+        : "I need a team member to confirm the provider or service before I offer a time.",
+    };
   }
   const policy = await getSchedulingPolicy(ctx.tenantId);
   if (!policy.selfBookEnabled) return { available: false, needs_review: true, slots: [], message: 'This clinic requires staff review before offering self-booking times.' };
@@ -663,23 +736,40 @@ export async function checkAvailability(ctx: ToolContext, args: Record<string, u
     }
   }
 
-  const slots = (await getOpenSlots(ctx.tenantId, trusted.branchId, date, service.durationMin, 6, providerProfileId))
+  // Every clinician who can see this caller, merged into one offer. A branch
+  // with five dentists now answers with five calendars' worth of openings
+  // instead of refusing because there was more than one of them.
+  const slots = (await getOpenSlotsAcrossProviders({
+    tenantId: ctx.tenantId,
+    branchId: trusted.branchId,
+    dateISO: date,
+    durationMin: service.durationMin,
+    limit: 6,
+    providerProfileIds: selection.providers.map(provider => provider.id),
+  }))
     .filter(slot => {
       const startsAt = parseSlot(date, slot.time, trusted.branchTimezone!);
       return startsAt && startsAt.getTime() >= Date.now() + policy.minNoticeHours * 3_600_000
         && startsAt.getTime() <= Date.now() + policy.maxHorizonDays * 86_400_000;
     });
-  await auditLive(ctx.tenantId, 'receptionist.availability.checked', trusted.branchId, { date, count: slots.length, campaignId: trusted.campaignId });
+  await auditLive(ctx.tenantId, 'receptionist.availability.checked', trusted.branchId, {
+    date, count: slots.length, campaignId: trusted.campaignId,
+    providerCount: selection.providers.length,
+    preferredProviderRequested: Boolean(selection.preferred),
+    service: service.name, durationMin: service.durationMin,
+  });
   if (slots.length === 0) return { available: false, slots: [], message: `I don't see any openings on ${date}. Would a different day work?` };
   return {
     available: true,
+    service: service.name,
+    duration_minutes: service.durationMin,
     slots: slots.map(s => ({ time: s.time, label: speakTime(s.time) })),
     message: `On ${date} I have ${speakList(slots.map(s => s.time))}. Which works best for you?`,
   };
 }
 
 type BookingTransactionResult =
-  | { kind: 'booked'; tenantId: string; appointmentId: string; requestId: string; patientId: string; firstName: string; email: string | null; phone: string | null; service: string; startsAt: Date; timezone: string; locationName: string; locationAddress: string | null; providerName: string | null; smsEnabled: boolean; emailEnabled: boolean; messagingConsent: boolean | null; duplicate: boolean }
+  | { kind: 'booked'; tenantId: string; appointmentId: string; requestId: string; patientId: string; firstName: string; email: string | null; phone: string | null; service: string; startsAt: Date; timezone: string; locationName: string; locationAddress: string | null; providerName: string | null; smsEnabled: boolean; emailEnabled: boolean; messagingConsent: boolean | null; duplicate: boolean; possibleDuplicateOfPatientId?: string | null }
   | { kind: 'review'; requestId: string; duplicate: boolean; message: string }
   | { kind: 'rejected'; message: string };
 
@@ -700,7 +790,13 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
   const messagingConsent = typeof recognizedAnswers.messaging_consent === 'boolean'
     ? recognizedAnswers.messaging_consent
     : null;
-  const service = trusted.intakeSnapshot.appointmentType;
+  // One campaign is no longer one service. The caller's choice is resolved
+  // against the exact enum this deployment attested; anything else is treated
+  // as unrecognised and falls back to the campaign's advertised type, so a
+  // model that invents a service name can never widen what we book.
+  const requestedServiceName = resolveBookableService(trusted.intakeSnapshot, recognizedAnswers.service);
+  const service = requestedServiceName ?? trusted.intakeSnapshot.appointmentType;
+  const preferredProviderRequest = sanitizeText(recognizedAnswers.preferred_provider, MAX_NAME);
   const phone = validPhone(trusted.observedPhone);
   const persistedAnswers = validation.answers
     ? boundedCanonicalObject({ ...validation.answers, observed_phone: phone })
@@ -926,21 +1022,27 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
     if (!policy.selfBookEnabled || startsAt < earliest || startsAt > latest) {
       return review('Canonical self-booking policy does not permit the requested time', ['schedulingPolicy'], 'A team member needs to review this appointment request.');
     }
-    const providers = await tx.providerProfile.findMany({
-      where: { tenantId: ctx.tenantId, branchId: trusted.branchId!, active: true, user: { active: true } },
-      select: {
-        id: true,
-        user: { select: { displayName: true } },
-        branch: { select: { name: true, location: true } },
-      }, take: 2,
-    });
-    const schedulingService = await resolveSchedulingService({ tenantId: ctx.tenantId, service, fallbackDurationMin: SLOT_MIN }, tx);
-    if (providers.length !== 1 || !schedulingService) {
-      return review(providers.length !== 1 ? 'Provider selection is ambiguous' : 'Configured service is not canonical', [providers.length !== 1 ? 'preferredProvider' : 'preferredService'], 'A team member needs to confirm the provider or service before booking.');
-    }
-    const providerProfileId = providers[0].id;
-    if (existingPatients.length && !verifiedExistingPatientId) {
-      return review(existingPatients.length > 1 ? 'Patient identity is ambiguous' : 'Existing patient identity was not verified for this call', ['identityVerification'], 'I need identity verification or front desk assistance before linking this booking.');
+    // Every clinician who could take this booking, not the one-and-only-one the
+    // old code demanded. The caller may have named someone; if they did and we
+    // cannot resolve the name, we ask rather than substituting a stranger.
+    const selection = await selectBookableProviders(ctx.tenantId, trusted.branchId!, preferredProviderRequest, tx);
+    const schedulingService = await resolveSchedulingService(
+      { tenantId: ctx.tenantId, service, fallbackDurationMin: SLOT_MIN, useVoiceDuration: true },
+      tx,
+    );
+    if (!selection.ok || !schedulingService) {
+      const reason = !schedulingService
+        ? 'Configured service is not canonical'
+        : selection.ok
+          ? 'No active clinician is bookable at this location'
+          : selection.reason === 'preferred_provider_unknown'
+            ? 'Requested clinician could not be matched at this location'
+            : 'No active clinician is bookable at this location';
+      return review(
+        reason,
+        [schedulingService ? 'preferredProvider' : 'preferredService'],
+        'A team member needs to confirm the provider or service before booking.',
+      );
     }
     if ((policy.requireEligibilityForSelfBook || policy.requireIntakeForSelfBook) && !verifiedExistingPatientId) {
       return review('Canonical pre-visit policy requires an existing verified patient', ['preVisitRequirements'], 'A team member must review eligibility or intake requirements before booking.');
@@ -950,10 +1052,44 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
       if (unmet.length) return review(`Canonical pre-visit requirements are incomplete: ${unmet.join(', ')}`, unmet, 'A team member must review eligibility or intake requirements before booking.');
     }
 
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-book-slot:${ctx.tenantId}:${providerProfileId}:${startsAt.toISOString()}`})::bigint)`;
-    const slotConflict = await findSlotConflict({ tenantId: ctx.tenantId, providerProfileId, startsAt, durationMin: schedulingService.durationMin }, tx);
-    if (slotConflict) return review(`Canonical scheduler rejected the slot: ${slotConflict}`, ['preferredDateTime'], `I'm sorry — that time is unavailable. I recorded the same request for staff review.`);
+    // Lock each candidate's slot in roster order — the ids are already sorted,
+    // so two concurrent callers acquire the same locks in the same order and
+    // cannot deadlock — and take the first clinician who is genuinely free.
+    let booked: { providerProfileId: string; providerName: string | null; branchName: string; branchLocation: string } | null = null;
+    let lastConflict: string | null = null;
+    for (const candidate of selection.providers) {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-book-slot:${ctx.tenantId}:${candidate.id}:${startsAt.toISOString()}`})::bigint)`;
+      const conflict = await findSlotConflict(
+        { tenantId: ctx.tenantId, providerProfileId: candidate.id, startsAt, durationMin: schedulingService.durationMin },
+        tx,
+      );
+      if (conflict) { lastConflict = conflict; continue; }
+      const branch = await tx.providerProfile.findFirst({
+        where: { id: candidate.id, tenantId: ctx.tenantId },
+        select: { branch: { select: { name: true, location: true } } },
+      });
+      if (!branch) { lastConflict = 'outside_availability'; continue; }
+      booked = {
+        providerProfileId: candidate.id,
+        providerName: candidate.displayName || null,
+        branchName: branch.branch.name,
+        branchLocation: branch.branch.location,
+      };
+      break;
+    }
+    if (!booked) {
+      return review(`Canonical scheduler rejected the slot: ${lastConflict ?? 'already_booked'}`, ['preferredDateTime'], `I'm sorry — that time is unavailable. I recorded the same request for staff review.`);
+    }
+    const providerProfileId = booked.providerProfileId;
 
+    // A returning caller is most inbound calls. Matching their number to a
+    // Patient row used to end the call in human review — and two family members
+    // sharing one number was a hard dead end. When the DOB ladder verified them
+    // we link; when it did not, we still book them, as a new record, and hand
+    // the front desk a `booking_review` task naming the possible duplicate.
+    const possibleDuplicateOfPatientId = !verifiedExistingPatientId && existingPatients.length === 1
+      ? existingPatients[0].id
+      : null;
     let patient = verifiedExistingPatientId
       ? await tx.patient.findFirst({ where: { id: verifiedExistingPatientId, tenantId: ctx.tenantId, deletedAt: null }, select: { id: true } })
       : null;
@@ -963,6 +1099,14 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
         select: { id: true },
       });
     }
+    // The duplicate marker travels WITH the request the front desk opens, so a
+    // reviewer sees which existing record this booking might belong to.
+    const bookedAnswers = possibleDuplicateOfPatientId
+      ? (boundedCanonicalObject({ ...(validation.answers ?? {}), observed_phone: phone, possible_duplicate_of_patient_id: possibleDuplicateOfPatientId }) ?? rawAnswers)
+      : rawAnswers;
+    const bookedOutcomeReason = possibleDuplicateOfPatientId
+      ? 'Booked live by AI receptionist as a new patient; this number already matches an existing record'
+      : 'Booked live by AI receptionist';
     const endsAt = new Date(startsAt.getTime() + schedulingService.durationMin * 60_000);
     const appointment = await tx.appointment.create({
       data: {
@@ -980,8 +1124,8 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
           branchId: trusted.branchId, patientId: patient.id, campaignId: trusted.campaignId,
           requestedService: service, requestedDateTime: startsAt,
           collectedName: `${firstName} ${lastName}`, collectedPhone: phone, collectedEmail: email,
-          rawCollectedFields: rawAnswers, status: 'BOOKED', missingFields: [],
-          bookedAppointmentId: appointment.id, outcomeReason: 'Booked live by AI receptionist',
+          rawCollectedFields: bookedAnswers, status: 'BOOKED', missingFields: [],
+          bookedAppointmentId: appointment.id, outcomeReason: bookedOutcomeReason,
         },
         select: { id: true },
       })
@@ -991,8 +1135,8 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
           campaignId: trusted.campaignId, callLogId: trusted.callLogId,
           requestedService: service, requestedDateTime: startsAt,
           collectedName: `${firstName} ${lastName}`, collectedPhone: phone, collectedEmail: email,
-          rawCollectedFields: rawAnswers, source: 'ai_receptionist', status: 'BOOKED',
-          missingFields: [], bookedAppointmentId: appointment.id, outcomeReason: 'Booked live by AI receptionist',
+          rawCollectedFields: bookedAnswers, source: 'ai_receptionist', status: 'BOOKED',
+          missingFields: [], bookedAppointmentId: appointment.id, outcomeReason: bookedOutcomeReason,
         },
         select: { id: true },
       });
@@ -1034,6 +1178,10 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
     await auditLive(ctx.tenantId, 'receptionist.appointment.booked', appointment.id, {
       branchId: trusted.branchId, appointmentRequestId: request.id, callLogId: trusted.callLogId,
       via: 'live_call', messagingConsent,
+      providerProfileId, service: schedulingService.name, durationMin: schedulingService.durationMin,
+      providerCandidateCount: selection.providers.length,
+      preferredProviderRequested: Boolean(selection.preferred),
+      possibleDuplicateOfPatientId,
       notificationPreferencePolicy: APPOINTMENT_NOTIFICATION_PREFERENCE_POLICY,
       notificationPreferenceAuthorizesMarketing: false,
     }, tx);
@@ -1045,6 +1193,8 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
         callLogId: trusted.callLogId,
         live: true,
         messagingConsent,
+        service: schedulingService.name,
+        possibleDuplicateOfPatientId,
         notificationPreferencePolicy: APPOINTMENT_NOTIFICATION_PREFERENCE_POLICY,
         notificationPreferenceAuthorizesMarketing: false,
       },
@@ -1053,10 +1203,11 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
     return {
       kind: 'booked', tenantId: ctx.tenantId, appointmentId: appointment.id, requestId: request.id, patientId: patient.id,
       firstName, email, phone, service: schedulingService.name, startsAt, timezone: trusted.branchTimezone!,
-      locationName: providers[0].branch.name,
-      locationAddress: providers[0].branch.location.trim() || null,
-      providerName: providers[0].user.displayName.trim() || null,
+      locationName: booked.branchName,
+      locationAddress: booked.branchLocation.trim() || null,
+      providerName: booked.providerName,
       smsEnabled: campaign.smsConfirmation, emailEnabled: campaign.emailConfirmation, messagingConsent, duplicate: false,
+      possibleDuplicateOfPatientId,
     };
   });
 
@@ -1069,6 +1220,19 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
   }
   if (result.kind === 'rejected') return { booked: false, needs_human: true, message: result.message };
   if (result.kind === 'review') return { booked: false, needs_review: true, duplicate: result.duplicate, appointment_request_id: result.requestId, message: result.message };
+
+  // The caller is booked. If their number already belonged to somebody and the
+  // DOB ladder did not verify them, the front desk gets a task naming both
+  // records — merging is a human decision, and it is not one worth ending a
+  // patient's call over.
+  if (result.possibleDuplicateOfPatientId && !result.duplicate) {
+    await createSafetyTask(ctx, 'booking_review', {
+      reason_category: 'possible_duplicate_patient',
+      message: `This caller's number already matches patient ${result.possibleDuplicateOfPatientId}, and identity was not verified on the call. The booking was made under a new patient record; please confirm whether the records should be merged.`,
+      appointment_request_id: result.requestId,
+      appointment_id: result.appointmentId,
+    }).catch(() => undefined);
+  }
 
   const bookingLocale = await callLocaleFormat(ctx);
   const localLabel = localAppointmentLabel(result.startsAt, result.timezone, bookingLocale);
