@@ -10,6 +10,7 @@ import { autopilotQueue } from '../../workers/queues';
 import { createPaymentProvider, createInsuranceProvider, type PaymentRequestContext } from '../revenue-protection';
 import { paymentProviderStatus } from '../../lib/deposits';
 import { eligibilityProviderStatus } from '../../lib/insuranceIntelligence';
+import { retellConfigStatus } from '../../lib/retell';
 import { runWithTenantContext } from '../../lib/tenantContext';
 import { Prisma } from '../../generated/prisma/client';
 import { lockClinicAccessMutation } from '../../lib/clinicAccessSafety';
@@ -95,6 +96,7 @@ const integrationDefinitions = [
   { key: 'whatsapp_business', name: 'WhatsApp Business', category: 'Communications', envVars: ['WHATSAPP_ACCESS_TOKEN'], providerType: 'communications' },
   { key: 'google_business_profile', name: 'Google Business Profile', category: 'Reputation / Marketing', envVars: ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET'], providerType: 'marketing' },
   { key: 'meta', name: 'Meta / Facebook', category: 'Reputation / Marketing', envVars: ['META_APP_ID', 'META_APP_SECRET'], providerType: 'marketing' },
+  { key: 'voice', name: 'Retell (AI Voice)', category: 'Voice', envVars: ['RETELL_API_KEY', 'RETELL_FROM_NUMBER'], providerType: 'voice' },
   { key: 'ollama', name: 'Ollama', category: 'AI Providers', envVars: ['AI_PROVIDER', 'OLLAMA_BASE_URL', 'OLLAMA_MODEL'], providerType: 'ai' },
   { key: 'openai', name: 'OpenAI', category: 'AI Providers', envVars: ['AI_PROVIDER', 'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_MODEL'], providerType: 'ai' },
   { key: 'claude', name: 'Claude', category: 'AI Providers', envVars: ['AI_PROVIDER', 'CLAUDE_API_KEY', 'CLAUDE_BASE_URL', 'CLAUDE_MODEL'], providerType: 'ai' },
@@ -208,7 +210,9 @@ async function buildIntegrationRows(tenantId: string) {
     const paymentRow = paymentConnections.find(row => row.providerKey === definition.key);
     const latestLog = logs.find(log => log.provider === definition.key || log.provider === definition.name.toLowerCase());
     // Operator-only detail. Tenants receive a count, never the variable names.
-    const missingConfigCount = definition.envVars.filter(name => !process.env[name]).length;
+    const missingConfigCount = definition.providerType === 'voice'
+      ? retellConfigStatus().missing.length
+      : definition.envVars.filter(name => !process.env[name]).length;
 
     let mode: 'mock' | 'sandbox' | 'live';
     let configured: boolean;
@@ -235,6 +239,15 @@ async function buildIntegrationRows(tenantId: string) {
       mode = configured ? (paymentRow?.mode === 'live' ? 'live' : 'sandbox') : 'mock';
       health = configured ? 'healthy' : 'not_configured';
       lastSyncAt = paymentRow?.lastSyncAt?.toISOString() ?? latestLog?.createdAt.toISOString() ?? null;
+    } else if (definition.providerType === 'voice') {
+      // The AI receptionist's provider. Status must come from the same resolver
+      // the senders use (platform credential vault first, environment second),
+      // or the console would disagree with the calls we actually place.
+      const status = retellConfigStatus();
+      configured = status.configured;
+      mode = !configured ? 'mock' : status.mock ? 'sandbox' : 'live';
+      health = configured ? 'healthy' : 'not_configured';
+      lastSyncAt = latestLog?.createdAt.toISOString() ?? null;
     } else if (definition.providerType === 'ai') {
       configured = (env.AI_PROVIDER === definition.key) && Boolean(process.env[`${definition.key.toUpperCase()}_API_KEY`] || process.env.OLLAMA_BASE_URL);
       mode = configured ? (definition.key === 'ollama' ? 'sandbox' : 'live') : 'mock';
@@ -258,6 +271,8 @@ async function buildIntegrationRows(tenantId: string) {
           ? ['Payment link', 'Deposits', 'Copay collection']
           : definition.category === 'Communications'
             ? ['Reminders', 'Follow-ups', 'Patient messages']
+            : definition.category === 'Voice'
+              ? ['Inbound answering', 'Appointment booking', 'Message taking']
             : definition.category === 'AI Providers'
               ? ['Advisory brief', 'Summaries', 'Workflow suggestions']
               : ['Monitoring'],
