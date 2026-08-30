@@ -1,6 +1,7 @@
 // ===========================================================================
 
 import { renderRecordingDisclosure } from '../../lib/receptionist/privacyLifecycle';
+import { expectedRetellAgentWebhookUrl, expectedRetellToolUrl, hashPrompt } from '../../lib/retell';
 import {
   buildBookAppointmentTool,
   compileIntakeContract,
@@ -351,7 +352,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
   // The agent asks the canonical scheduling service for current open slots and
   // books only from a successful tool result. Confirmation dispatch and final
   // delivery are separate states and must be reported exactly.
-  const fnUrl = `${options.webhookBaseUrl.replace(/\/$/, '')}/v1/receptionist/webhooks/retell/fn?clinicId=${clinic.id}`;
+  const fnUrl = expectedRetellToolUrl(clinic.id, options.webhookBaseUrl);
   const intakeContract = compileIntakeContract({
     campaignId: campaign.id,
     revision: campaign.intakeSchemaRevision ?? 1,
@@ -571,7 +572,10 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     language: agent.language,
     beginMessage,
     dynamicVariables,
-    webhookUrl: `${options.webhookBaseUrl.replace(/\/$/, '')}/v1/receptionist/webhooks/retell?clinicId=${clinic.id}&campaignId=${campaign.id}`,
+    // The agent-level webhook is the bare route: it is what a deployment
+    // publishes and what verification compares against, and the handler already
+    // resolves clinic/campaign from the signed provider envelope.
+    webhookUrl: expectedRetellAgentWebhookUrl(options.webhookBaseUrl),
     bookingFunction,
     intakeSchemaRevision: intakeContract.snapshot.revision,
     intakeSchemaFingerprint: intakeContract.fingerprint,
@@ -609,4 +613,74 @@ export function generateSamples(config: PromptConfig): PromptSamples {
   const confirmation = `Example only — after book_appointment returns booked=true: "Your appointment is confirmed with ${clinic.name} for the exact date, time, service, location, and provider returned by the booking tool." Mention ${confirmationChannels} only with the exact accepted, delivered, queued, failed, suppressed, or unknown status returned by the tool.`;
 
   return { greeting, pitch, intakeQuestions, confirmation };
+}
+
+// --- Deployment sample transcripts (C5 preview) ----------------------------
+//
+// Deterministic scripts built from the SAME prompt facts the agent is
+// deployed with, so the preview cannot drift from what a caller would hear.
+// Nothing here is generated: every line is either product-owned copy or a
+// configured value, and tool turns are shown as tool turns.
+
+export type PreviewSpeaker = 'agent' | 'caller' | 'tool';
+export interface PreviewTurn { speaker: PreviewSpeaker; text: string; note?: string }
+export interface SampleTranscripts {
+  openingSequence: PreviewTurn[];
+  inboundSample: PreviewTurn[];
+  outboundSample: PreviewTurn[];
+}
+
+/** Stable hash of the prompt this config renders; shared with deployment attestation. */
+export function promptConfigHash(config: PromptConfig, options: { mock?: boolean } = {}): string {
+  return hashPrompt(generateSystemPrompt(config), options);
+}
+
+export function generateSampleTranscripts(config: PromptConfig): SampleTranscripts {
+  const { clinic, agent, campaign } = config;
+  const disclosure = mandatoryOpeningDisclosure(config);
+  const questions = orderedFields(config.intakeFields).map(field => field.aiQuestion);
+  const confirmationChannels = [campaign.smsConfirmation ? 'a text' : null, campaign.emailConfirmation ? 'an email' : null]
+    .filter(Boolean).join(' and ');
+
+  const openingSequence: PreviewTurn[] = [
+    { speaker: 'agent', text: disclosure, note: 'Mandatory disclosure; the agent stops here and waits.' },
+    { speaker: 'caller', text: 'Yes, that\u2019s fine.' },
+    { speaker: 'tool', text: 'record_recording_preference(recording_decision: "GRANTED")', note: 'Consent is recorded before any information is collected.' },
+  ];
+
+  const intakeTurns: PreviewTurn[] = questions.length
+    ? questions.flatMap(question => [
+      { speaker: 'agent' as const, text: question },
+      { speaker: 'caller' as const, text: '\u2026' },
+    ])
+    : [{ speaker: 'agent', text: 'I can take a message for the team and someone will call you back.', note: 'No intake fields are configured, so the agent cannot collect booking details.' }];
+
+  const bookingTurns: PreviewTurn[] = questions.length
+    ? [
+      { speaker: 'tool', text: `check_availability(service: "${campaign.appointmentType}")`, note: 'Times are only ever read from the scheduling service.' },
+      { speaker: 'agent', text: 'I have a few openings. Which suits you best?' },
+      { speaker: 'caller', text: 'The first one, please.' },
+      { speaker: 'tool', text: 'book_appointment(\u2026)' },
+      { speaker: 'agent', text: `You\u2019re booked with ${clinic.name}.${confirmationChannels ? ` I\u2019ll send ${confirmationChannels} if the confirmation is accepted.` : ''}`, note: 'Confirmed only on booked=true; delivery is reported exactly as the tool returns it.' },
+    ]
+    : [];
+
+  return {
+    openingSequence,
+    inboundSample: [
+      ...openingSequence,
+      { speaker: 'agent', text: `Thanks. How can I help you today at ${clinic.name}?` },
+      { speaker: 'caller', text: 'I\u2019d like to book an appointment.' },
+      ...intakeTurns,
+      ...bookingTurns,
+    ],
+    outboundSample: [
+      ...openingSequence,
+      { speaker: 'agent', text: campaign.offerScript.trim() || `${campaign.offerTitle}. ${campaign.offerDescription}`, note: 'Offer is spoken only after consent and only to a confirmed intended party.' },
+      { speaker: 'caller', text: 'Tell me more.' },
+      ...intakeTurns,
+      ...bookingTurns,
+      { speaker: 'agent', text: `If you\u2019d rather not hear from us again, just say so \u2014 ${agent.name} will record it.`, note: 'Do-not-contact is always offered on an outbound call.' },
+    ],
+  };
 }

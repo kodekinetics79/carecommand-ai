@@ -1,7 +1,7 @@
 import type { FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { env } from '../../config/env';
 import { RECEPTIONIST_PERMISSIONS, requireReceptionistPermission } from '../../lib/receptionist/accessControl';
+import { expectedRetellToolUrl } from '../../lib/retell';
 import { Prisma } from '../../generated/prisma/client';
 import { requireRoles } from '../../plugins/roles';
 import { compileIntakeContract } from './intakeContract';
@@ -57,7 +57,7 @@ export async function compileCampaignIntakeContract(
     appointmentType: campaign.appointmentType,
     eligibleLocations: locations,
     fields,
-    toolUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell/fn?clinicId=${campaign.clinicId}`,
+    toolUrl: expectedRetellToolUrl(campaign.clinicId),
   });
 }
 

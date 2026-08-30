@@ -4,6 +4,15 @@ import {
   fingerprintJson,
   normalizeBookAppointmentToolContract,
 } from '../modules/receptionist/intakeContract';
+import {
+  buildMockAgentSnapshot,
+  mockCreateAgent,
+  mockCreateLlm,
+  mockListVoices,
+  mockPublishAgent,
+  mockUpdateAgent,
+  mockUpdateLlm,
+} from './receptionist/retellMock';
 
 // ===========================================================================
 // Retell outbound dial trigger. Real Retell API when credentials are present;
@@ -18,6 +27,124 @@ export function retellConfigStatus(): RetellConfigStatus {
   if (!env.RETELL_API_KEY) missing.push('RETELL_API_KEY');
   if (!env.RETELL_FROM_NUMBER) missing.push('RETELL_FROM_NUMBER');
   return { configured: missing.length === 0, mock: (env.RETELL_API_KEY ?? '').startsWith('mock'), missing };
+}
+
+export type RetellProviderMode = 'live' | 'mock' | 'unconfigured';
+
+export function retellProviderMode(): RetellProviderMode {
+  const status = retellConfigStatus();
+  if (!status.configured) return 'unconfigured';
+  return status.mock ? 'mock' : 'live';
+}
+
+// ---------------------------------------------------------------------------
+// Shared webhook contract. The bare agent-level webhook URL is what the agent
+// deployment carries and what verification compares against; the per-clinic
+// tool URL is embedded in the intake-contract fingerprint and must not change.
+// ---------------------------------------------------------------------------
+export function expectedRetellAgentWebhookUrl(baseUrl = env.PUBLIC_API_URL): string {
+  return `${baseUrl.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`;
+}
+
+export function expectedRetellToolUrl(clinicId: string, baseUrl = env.PUBLIC_API_URL): string {
+  return `${baseUrl.replace(/\/$/, '')}/v1/receptionist/webhooks/retell/fn?clinicId=${clinicId}`;
+}
+
+export const REQUIRED_RETELL_WEBHOOK_EVENTS = ['call_started', 'call_ended', 'call_analyzed'] as const;
+
+export const RETELL_DATA_STORAGE_SETTING = 'basic_attributes_only';
+
+// ---------------------------------------------------------------------------
+// Deployment fingerprints. One hashing rule is shared by the deploy plan, the
+// provider probe and readiness so "what we deployed" and "what the provider
+// runs" are comparable byte-for-byte. Mock-mode hashes carry a `mock:` prefix
+// so a deployment made against the fixture can never be mistaken for live
+// evidence (and the database CHECK on the deployment row enforces it).
+// ---------------------------------------------------------------------------
+export function normalizePromptText(text: string): string {
+  return text
+    .normalize('NFC')
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map(line => line.replace(/[ \t]+$/g, ''))
+    .join('\n')
+    .trim();
+}
+
+export function hashPrompt(text: string, options: { mock?: boolean } = {}): string {
+  const digest = createHash('sha256').update(normalizePromptText(text)).digest('hex');
+  return options.mock ? `mock:${digest}` : digest;
+}
+
+export function fingerprintTools(tools: unknown[], options: { mock?: boolean } = {}): string {
+  const named = tools
+    .map(tool => record(tool))
+    .filter((tool): tool is Record<string, unknown> => tool !== null)
+    .sort((a, b) => String(a.name ?? '').localeCompare(String(b.name ?? '')));
+  const digest = fingerprintJson(named);
+  return options.mock ? `mock:${digest}` : digest;
+}
+
+// ---------------------------------------------------------------------------
+// Provider mutation results. Every write to Retell shares one error contract so
+// the deploy service maps statuses without ever surfacing a provider body.
+// ---------------------------------------------------------------------------
+export type RetellProviderErrorCode =
+  | 'setup_required'
+  | 'unauthorized'
+  | 'forbidden'
+  | 'not_found'
+  | 'invalid_request'
+  | 'rate_limited'
+  | 'provider_unavailable'
+  | 'invalid_response'
+  | 'request_failed';
+
+export type RetellProviderResult<T> =
+  | { ok: true; value: T; mock: boolean }
+  | { ok: false; error: RetellProviderErrorCode; status?: number; mock: boolean };
+
+export function mapRetellProviderStatus(status: number): RetellProviderErrorCode {
+  if (status === 401) return 'unauthorized';
+  if (status === 403) return 'forbidden';
+  if (status === 404) return 'not_found';
+  if (status === 400 || status === 422) return 'invalid_request';
+  if (status === 429) return 'rate_limited';
+  return 'provider_unavailable';
+}
+
+export function isTransientRetellProviderError(code: string | null | undefined): boolean {
+  return code === 'provider_unavailable' || code === 'rate_limited' || code === 'request_failed';
+}
+
+async function providerRequest(
+  path: string,
+  init: { method: 'GET' | 'POST' | 'PATCH' | 'DELETE'; body?: unknown; timeoutMs?: number },
+): Promise<RetellProviderResult<Record<string, unknown>>> {
+  if (!env.RETELL_API_KEY) return { ok: false, error: 'setup_required', mock: false };
+  try {
+    const response = await fetchWithTimeout(`${env.RETELL_BASE_URL}${path}`, {
+      method: init.method,
+      headers: {
+        Authorization: `Bearer ${env.RETELL_API_KEY}`,
+        ...(init.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      },
+      ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
+    }, init.timeoutMs ?? env.RETELL_DEPLOY_TIMEOUT_MS);
+    if (!response.ok) return { ok: false, error: mapRetellProviderStatus(response.status), status: response.status, mock: false };
+    // Bodies are parsed for ids/versions only and are never logged: they can
+    // carry prompt text and provider account details.
+    const body = await response.json().catch(() => null) as unknown;
+    const parsed = record(body);
+    if (!parsed) {
+      // Some mutation endpoints answer 200/204 with an empty body.
+      if (response.status === 204 || response.status === 200) return { ok: true, value: {}, mock: false };
+      return { ok: false, error: 'invalid_response', status: response.status, mock: false };
+    }
+    return { ok: true, value: parsed, mock: false };
+  } catch {
+    return { ok: false, error: 'provider_unavailable', mock: false };
+  }
 }
 
 export interface CreatePhoneCallInput {
@@ -253,13 +380,53 @@ export interface RetellAgentSnapshot {
   effectiveDynamicVariables: Record<string, string>;
   lastModifiedAt: Date | null;
   fingerprint: string;
+  /** Hash of the response engine's general prompt (retell-llm only); null when the engine body was unavailable or is a conversation flow. */
+  promptHash: string | null;
+  beginMessageHash: string | null;
+  /** Order-independent fingerprint of the engine's reachable tools (retell-llm only). */
+  toolsFingerprint: string | null;
+  mock: boolean;
 }
 
-type RetellAgentProbeError = 'setup_required' | 'mock_not_verifiable' | 'unauthorized' | 'not_found' | 'invalid_request' | 'provider_unavailable' | 'invalid_response';
+export type RetellAgentProbeError =
+  | 'setup_required'
+  | 'unauthorized'
+  | 'not_found'
+  | 'invalid_request'
+  | 'provider_unavailable'
+  | 'invalid_response'
+  | 'tag_dynamic_variables_not_empty';
 
 export type RetellAgentProbeResult =
   | { ok: true; snapshot: RetellAgentSnapshot }
   | { ok: false; error: RetellAgentProbeError };
+
+/**
+ * Deployment evidence the mock provider answers from. It is resolved by the
+ * caller inside its own tenant context (the provider client never touches the
+ * database) and is ignored entirely when a real key is configured.
+ */
+export interface MockDeploymentSnapshot {
+  providerAgentId: string;
+  providerAgentVersion: number;
+  providerLlmId: string;
+  providerLlmVersion: number;
+  providerVersionTag: string;
+  promptHash: string;
+  beginMessageHash: string;
+  toolFingerprint: string;
+  voiceId: string;
+  language: string;
+  toolsJson: unknown;
+}
+
+export interface RetellAgentProbeOptions {
+  /** Pin the probe to an exact published version instead of a tag (deployments made by CareCommand). */
+  pinnedVersion?: number | null;
+  /** Mock-mode evidence; see MockDeploymentSnapshot. */
+  mockDeployment?: MockDeploymentSnapshot | null;
+  timeoutMs?: number;
+}
 
 function nonEmptyString(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
@@ -530,32 +697,62 @@ function reachableConversationFlowTools(body: Record<string, unknown>): { tools:
   return { tools: reachableTools };
 }
 
-async function probeRetellBookTool(responseEngineType: string, responseEngineId: string, responseEngineVersion: number | null) {
+type BookToolProbe = {
+  status: 'SUCCEEDED' | 'UNAVAILABLE' | 'UNSUPPORTED';
+  schema: Record<string, unknown> | null;
+  fingerprint: string | null;
+  strictMode: boolean | null;
+  graphFingerprint: string | null;
+  promptHash: string | null;
+  beginMessageHash: string | null;
+  toolsFingerprint: string | null;
+};
+
+function bookToolProbeFailure(status: 'UNAVAILABLE' | 'UNSUPPORTED'): BookToolProbe {
+  return { status, schema: null, fingerprint: null, strictMode: null, graphFingerprint: null, promptHash: null, beginMessageHash: null, toolsFingerprint: null };
+}
+
+async function probeRetellBookTool(
+  responseEngineType: string,
+  responseEngineId: string,
+  responseEngineVersion: number | null,
+  timeoutMs?: number,
+): Promise<BookToolProbe> {
   if (!['retell-llm', 'conversation-flow'].includes(responseEngineType) || responseEngineVersion === null) {
-    return { status: 'UNSUPPORTED' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint: null };
+    return bookToolProbeFailure('UNSUPPORTED');
   }
   try {
     const endpoint = responseEngineType === 'retell-llm' ? 'get-retell-llm' : 'get-conversation-flow';
     const response = await fetchWithTimeout(
       `${env.RETELL_BASE_URL}/${endpoint}/${encodeURIComponent(responseEngineId)}?version=${responseEngineVersion}`,
       { headers: { Authorization: `Bearer ${env.RETELL_API_KEY}` } },
+      timeoutMs,
     );
-    if (!response.ok) return { status: 'UNAVAILABLE' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint: null };
+    if (!response.ok) return bookToolProbeFailure('UNAVAILABLE');
     const body = await response.json().catch(() => null) as Record<string, unknown> | null;
     const resolvedId = responseEngineType === 'retell-llm'
       ? nonEmptyString(body?.llm_id)
       : nonEmptyString(body?.conversation_flow_id);
     if (!body || resolvedId !== responseEngineId || nonNegativeInteger(body.version) !== responseEngineVersion) {
-      return { status: 'UNAVAILABLE' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint: null };
+      return bookToolProbeFailure('UNAVAILABLE');
     }
     const graphFingerprint = fingerprintJson(body);
+    // Prompt/tool evidence comes from the same body the booking tool is read
+    // from, so drift detection costs no extra provider call. Conversation
+    // flows have no single prompt; they stay BYO-only and report nulls.
+    const isLlm = responseEngineType === 'retell-llm';
+    const promptHash = isLlm ? hashPrompt(typeof body.general_prompt === 'string' ? body.general_prompt : '') : null;
+    const beginMessageHash = isLlm ? hashPrompt(typeof body.begin_message === 'string' ? body.begin_message : '') : null;
+    const reachableTools = isLlm ? reachableRetellLlmTools(body) : null;
+    const toolsFingerprint = isLlm && reachableTools ? fingerprintTools(reachableTools) : null;
+    const evidence = { graphFingerprint, promptHash, beginMessageHash, toolsFingerprint };
     if (containsProviderTemplateSyntax(body) || !emptyProviderDynamicVariables(body.default_dynamic_variables)) {
-      return { status: 'SUCCEEDED' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint };
+      return { status: 'SUCCEEDED', schema: null, fingerprint: null, strictMode: null, ...evidence };
     }
-    const discovery = responseEngineType === 'retell-llm'
-      ? { tools: reachableRetellLlmTools(body) }
+    const discovery = isLlm
+      ? { tools: reachableTools }
       : reachableConversationFlowTools(body);
-    if (!discovery || !discovery.tools) return { status: 'SUCCEEDED' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint };
+    if (!discovery || !discovery.tools) return { status: 'SUCCEEDED', schema: null, fingerprint: null, strictMode: null, ...evidence };
     const tools = discovery.tools;
     const bookingTools = tools.filter(tool => tool && typeof tool === 'object' && nonEmptyString((tool as Record<string, unknown>).name) === 'book_appointment') as Array<Record<string, unknown>>;
     const contract = bookingTools.length === 1 ? normalizeBookAppointmentToolContract(bookingTools[0]) : null;
@@ -564,20 +761,20 @@ async function probeRetellBookTool(responseEngineType: string, responseEngineId:
     // production publication is enforced on the exact agent tag/version.
     const published = responseEngineType === 'conversation-flow' || body.is_published === true;
     if (!published || !contract) {
-      return { status: 'SUCCEEDED' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint };
+      return { status: 'SUCCEEDED', schema: null, fingerprint: null, strictMode: null, ...evidence };
     }
     return {
-      status: 'SUCCEEDED' as const,
-      schema: contract,
+      status: 'SUCCEEDED',
+      schema: contract as unknown as Record<string, unknown>,
       fingerprint: fingerprintJson({
         tool: contract,
         engine: { type: responseEngineType, id: responseEngineId, version: responseEngineVersion, graphFingerprint },
       }),
       strictMode,
-      graphFingerprint,
+      ...evidence,
     };
   } catch {
-    return { status: 'UNAVAILABLE' as const, schema: null, fingerprint: null, strictMode: null, graphFingerprint: null };
+    return bookToolProbeFailure('UNAVAILABLE');
   }
 }
 
@@ -586,6 +783,7 @@ async function probeRetellEmptyTagDefaults(
   versionTag: string,
   expectedVersion: number,
   assignedTags: string[],
+  options: { pinned: boolean; timeoutMs?: number },
 ): Promise<{ ok: true; dynamicVariables: Record<string, string> } | { ok: false; error: RetellAgentProbeError }> {
   let paginationKey: string | null = null;
   let legacyEndpoint = false;
@@ -610,7 +808,7 @@ async function probeRetellEmptyTagDefaults(
             query: agentId,
           },
         }),
-      });
+      }, options.timeoutMs);
     let response: Response;
     try {
       response = await requestList(legacyEndpoint);
@@ -647,17 +845,30 @@ async function probeRetellEmptyTagDefaults(
   if (exactItems.length !== 1) return { ok: false, error: exactItems.length ? 'invalid_response' : 'not_found' };
   const tags = record(exactItems[0]!.tags);
   if (!tags) return { ok: false, error: 'invalid_response' };
+  // Only the requested tag and any alias tag that points at the same version
+  // are executable for this deployment; sibling tags (a `staging` with
+  // defaults, say) are ignored. Malformed tag metadata is still a hard
+  // invalid_response; non-empty defaults on the requested version are a
+  // specific, fixable error.
   for (const [tagName, metadataValue] of Object.entries(tags)) {
     const metadata = record(metadataValue);
-    if (!nonEmptyString(tagName) || !metadata || !emptyProviderDynamicVariables(metadata.dynamic_variables)) {
+    if (!nonEmptyString(tagName) || !metadata) return { ok: false, error: 'invalid_response' };
+    const version = nonNegativeInteger(metadata.version);
+    if (version === null) return { ok: false, error: 'invalid_response' };
+    const relevant = tagName === versionTag || version === expectedVersion;
+    if (!relevant) continue;
+    if (metadata.dynamic_variables !== undefined && metadata.dynamic_variables !== null && record(metadata.dynamic_variables) === null) {
       return { ok: false, error: 'invalid_response' };
     }
+    if (!emptyProviderDynamicVariables(metadata.dynamic_variables)) return { ok: false, error: 'tag_dynamic_variables_not_empty' };
   }
   for (const assignedTag of assignedTags) {
     const metadata = record(tags[assignedTag]);
     if (!metadata || nonNegativeInteger(metadata.version) !== expectedVersion) return { ok: false, error: 'invalid_response' };
   }
-  if (nonNegativeInteger(record(tags[versionTag])?.version) !== expectedVersion) return { ok: false, error: 'invalid_response' };
+  // A CareCommand deployment is pinned by numeric version (Retell exposes no
+  // public tag-assignment write), so the tag is not required to exist.
+  if (!options.pinned && nonNegativeInteger(record(tags[versionTag])?.version) !== expectedVersion) return { ok: false, error: 'invalid_response' };
   return { ok: true, dynamicVariables: {} };
 }
 
@@ -665,16 +876,26 @@ async function probeRetellEmptyTagDefaults(
  * Read-only Retell deployment probe. It never returns raw provider text and it
  * never falls back from the requested tag to an unverified "latest" version.
  */
-export async function probeRetellAgent(agentId: string, versionTag: string): Promise<RetellAgentProbeResult> {
+export async function probeRetellAgent(agentId: string, versionTag: string, options: RetellAgentProbeOptions = {}): Promise<RetellAgentProbeResult> {
   if (!env.RETELL_API_KEY) return { ok: false, error: 'setup_required' };
-  if (env.RETELL_API_KEY.startsWith('mock')) return { ok: false, error: 'mock_not_verifiable' };
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(agentId) || !isValidRetellVersionTag(versionTag)) {
     return { ok: false, error: 'invalid_response' };
   }
+  if (env.RETELL_API_KEY.startsWith('mock')) {
+    // The fixture answers only from a deployment CareCommand itself made; a
+    // manually linked agent under a mock key is honestly unverifiable.
+    const deployment = options.mockDeployment;
+    if (!deployment || deployment.providerAgentId !== agentId) return { ok: false, error: 'not_found' };
+    return { ok: true, snapshot: buildMockAgentSnapshot({ agentId, versionTag, deployment, webhookUrl: expectedRetellAgentWebhookUrl() }) };
+  }
+  const pinnedVersion = typeof options.pinnedVersion === 'number' && Number.isSafeInteger(options.pinnedVersion) && options.pinnedVersion >= 0
+    ? options.pinnedVersion
+    : null;
   try {
     const response = await fetchWithTimeout(
-      `${env.RETELL_BASE_URL}/get-agent/${encodeURIComponent(agentId)}?version=${encodeURIComponent(versionTag)}`,
+      `${env.RETELL_BASE_URL}/get-agent/${encodeURIComponent(agentId)}?version=${pinnedVersion === null ? encodeURIComponent(versionTag) : pinnedVersion}`,
       { headers: { Authorization: `Bearer ${env.RETELL_API_KEY}` } },
+      options.timeoutMs,
     );
     if (response.status === 401 || response.status === 403) return { ok: false, error: 'unauthorized' };
     if (response.status === 404) return { ok: false, error: 'not_found' };
@@ -699,11 +920,12 @@ export async function probeRetellAgent(agentId: string, versionTag: string): Pro
     }
     const assignedTags = Array.isArray(body.assigned_tags) ? body.assigned_tags.filter((item): item is string => typeof item === 'string') : [];
     const webhookEvents = Array.isArray(body.webhook_events) ? body.webhook_events.filter((item): item is string => typeof item === 'string') : [];
-    const tagDefaults = await probeRetellEmptyTagDefaults(agentId, versionTag, version, assignedTags);
+    if (pinnedVersion !== null && version !== pinnedVersion) return { ok: false, error: 'invalid_response' };
+    const tagDefaults = await probeRetellEmptyTagDefaults(agentId, versionTag, version, assignedTags, { pinned: pinnedVersion !== null, timeoutMs: options.timeoutMs });
     if (!tagDefaults.ok) return tagDefaults;
     const effectiveDynamicVariables = tagDefaults.dynamicVariables;
     const responseEngineVersion = nonNegativeInteger(responseEngine?.version);
-    const bookTool = await probeRetellBookTool(responseEngineType, responseEngineId, responseEngineVersion);
+    const bookTool = await probeRetellBookTool(responseEngineType, responseEngineId, responseEngineVersion, options.timeoutMs);
     const safety = {
       agentId: resolvedAgentId,
       version,
@@ -730,6 +952,10 @@ export async function probeRetellAgent(agentId: string, versionTag: string): Pro
         bookToolSchema: bookTool.schema as unknown as Record<string, unknown> | null,
         bookToolFingerprint: bookTool.fingerprint,
         toolCallStrictMode: bookTool.strictMode,
+        promptHash: bookTool.promptHash,
+        beginMessageHash: bookTool.beginMessageHash,
+        toolsFingerprint: bookTool.toolsFingerprint,
+        mock: false,
         fingerprint: createHash('sha256').update(JSON.stringify({
           ...safety,
           lastModifiedAt: safety.lastModifiedAt?.toISOString() ?? null,
@@ -743,23 +969,42 @@ export async function probeRetellAgent(agentId: string, versionTag: string): Pro
 
 export type RetellAgentReadinessFailure =
   | 'tag_unassigned'
+  | 'version_mismatch'
   | 'unpublished'
   | 'webhook_mismatch'
   | 'webhook_events_mismatch'
   | 'storage_policy_mismatch'
-  | 'signed_url_disabled';
+  | 'signed_url_disabled'
+  | 'prompt_drift'
+  | 'tools_drift';
+
+export interface RetellAgentReadinessRequirements {
+  versionTag: string;
+  webhookUrl: string;
+  /** Exact version CareCommand published; replaces the tag requirement when set. */
+  pinnedVersion?: number | null;
+  expectedPromptHash?: string | null;
+  expectedToolsFingerprint?: string | null;
+}
 
 export function evaluateRetellAgentReadiness(
   snapshot: RetellAgentSnapshot,
-  requirements: { versionTag: string; webhookUrl: string },
+  requirements: RetellAgentReadinessRequirements,
 ): RetellAgentReadinessFailure | null {
-  if (!snapshot.assignedTags.includes(requirements.versionTag)) return 'tag_unassigned';
+  const pinned = typeof requirements.pinnedVersion === 'number';
+  if (pinned) {
+    if (snapshot.version !== requirements.pinnedVersion) return 'version_mismatch';
+  } else if (!snapshot.assignedTags.includes(requirements.versionTag)) return 'tag_unassigned';
   if (!snapshot.published) return 'unpublished';
   if (snapshot.webhookUrl !== requirements.webhookUrl) return 'webhook_mismatch';
   const events = new Set(snapshot.webhookEvents);
-  if (!['call_started', 'call_ended', 'call_analyzed'].every(event => events.has(event))) return 'webhook_events_mismatch';
-  if (snapshot.dataStorageSetting !== 'basic_attributes_only') return 'storage_policy_mismatch';
+  if (!REQUIRED_RETELL_WEBHOOK_EVENTS.every(event => events.has(event))) return 'webhook_events_mismatch';
+  if (snapshot.dataStorageSetting !== RETELL_DATA_STORAGE_SETTING) return 'storage_policy_mismatch';
   if (!snapshot.signedUrl) return 'signed_url_disabled';
+  // Drift is only judged when the engine body was readable; an unavailable
+  // engine is reported by the intake-evidence path instead of as drift.
+  if (requirements.expectedPromptHash && snapshot.promptHash !== null && snapshot.promptHash !== requirements.expectedPromptHash) return 'prompt_drift';
+  if (requirements.expectedToolsFingerprint && snapshot.toolsFingerprint !== null && snapshot.toolsFingerprint !== requirements.expectedToolsFingerprint) return 'tools_drift';
   return null;
 }
 
@@ -828,5 +1073,204 @@ export async function deleteCallData(callId: string): Promise<RetellMutationResu
     return { ok: true, applied: true, mock: false };
   } catch {
     return { ok: false, applied: false, mock: false, error: 'retell_request_failed' };
+  }
+}
+
+// ===========================================================================
+// Deployment client. Every function below is a thin, body-free mapping over
+// the public Retell API; the mock key routes to the fixture in
+// receptionist/retellMock.ts and a real key never touches it.
+//
+// Provider facts pinned here (docs.retellai.com, 2026-08-29):
+//   - create/update-retell-llm return { llm_id, version, is_published }.
+//   - create-agent returns { agent_id, version, is_published }; every
+//     update-agent PATCH creates a NEW draft version, so response_engine.version
+//     must be set to the LLM version being deployed in the same call.
+//   - Publishing is POST /publish-agent-version/{agent_id} { version }. The
+//     response body is undocumented; the published version is the one we asked
+//     for and verification reads it back with get-agent?version=<n>.
+//   - There is no public write endpoint for version tags; deployments pin by
+//     numeric version and the tag stays a BYO-only evidence path.
+// ===========================================================================
+
+export interface RetellLlmSpec {
+  model?: string;
+  generalPrompt: string;
+  beginMessage: string;
+  tools: Array<Record<string, unknown>>;
+}
+
+export interface RetellAgentSpec {
+  agentName: string;
+  llmId: string;
+  llmVersion: number;
+  voiceId: string;
+  language: string;
+  webhookUrl: string;
+  postCallAnalysisData: Array<Record<string, unknown>>;
+  maxCallDurationMs?: number;
+}
+
+function llmRequestBody(spec: RetellLlmSpec) {
+  return {
+    ...(spec.model ? { model: spec.model } : {}),
+    general_prompt: spec.generalPrompt,
+    begin_message: spec.beginMessage,
+    general_tools: spec.tools,
+    tool_call_strict_mode: true,
+    default_dynamic_variables: {},
+  };
+}
+
+function agentRequestBody(spec: RetellAgentSpec) {
+  return {
+    agent_name: spec.agentName,
+    response_engine: { type: 'retell-llm', llm_id: spec.llmId, version: spec.llmVersion },
+    voice_id: spec.voiceId,
+    language: spec.language,
+    webhook_url: spec.webhookUrl,
+    webhook_events: [...REQUIRED_RETELL_WEBHOOK_EVENTS],
+    data_storage_setting: RETELL_DATA_STORAGE_SETTING,
+    opt_in_signed_url: true,
+    post_call_analysis_data: spec.postCallAnalysisData,
+    ...(spec.maxCallDurationMs ? { max_call_duration_ms: spec.maxCallDurationMs } : {}),
+  };
+}
+
+function parseLlmResponse(value: Record<string, unknown>, expectedId?: string): RetellProviderResult<{ llmId: string; version: number }> {
+  const llmId = nonEmptyString(value.llm_id);
+  const version = nonNegativeInteger(value.version);
+  if (!llmId || version === null || (expectedId && llmId !== expectedId)) return { ok: false, error: 'invalid_response', mock: false };
+  return { ok: true, value: { llmId, version }, mock: false };
+}
+
+function parseAgentResponse(value: Record<string, unknown>, expectedId?: string): RetellProviderResult<{ agentId: string; version: number }> {
+  const agentId = nonEmptyString(value.agent_id);
+  const version = nonNegativeInteger(value.version);
+  if (!agentId || version === null || (expectedId && agentId !== expectedId)) return { ok: false, error: 'invalid_response', mock: false };
+  return { ok: true, value: { agentId, version }, mock: false };
+}
+
+export async function createRetellLlm(spec: RetellLlmSpec): Promise<RetellProviderResult<{ llmId: string; version: number }>> {
+  if (!env.RETELL_API_KEY) return { ok: false, error: 'setup_required', mock: false };
+  if (retellConfigStatus().mock) return mockCreateLlm();
+  const result = await providerRequest('/create-retell-llm', { method: 'POST', body: llmRequestBody(spec) });
+  return result.ok ? parseLlmResponse(result.value) : result;
+}
+
+export async function updateRetellLlm(llmId: string, spec: RetellLlmSpec, previousVersion = 0): Promise<RetellProviderResult<{ llmId: string; version: number }>> {
+  if (!env.RETELL_API_KEY) return { ok: false, error: 'setup_required', mock: false };
+  if (retellConfigStatus().mock) return mockUpdateLlm(llmId, previousVersion);
+  const result = await providerRequest(`/update-retell-llm/${encodeURIComponent(llmId)}`, { method: 'PATCH', body: llmRequestBody(spec) });
+  return result.ok ? parseLlmResponse(result.value, llmId) : result;
+}
+
+export async function createRetellAgent(spec: RetellAgentSpec): Promise<RetellProviderResult<{ agentId: string; version: number }>> {
+  if (!env.RETELL_API_KEY) return { ok: false, error: 'setup_required', mock: false };
+  if (retellConfigStatus().mock) return mockCreateAgent();
+  const result = await providerRequest('/create-agent', { method: 'POST', body: agentRequestBody(spec) });
+  return result.ok ? parseAgentResponse(result.value) : result;
+}
+
+export async function updateRetellAgent(agentId: string, spec: RetellAgentSpec, previousVersion = 0): Promise<RetellProviderResult<{ agentId: string; version: number }>> {
+  if (!env.RETELL_API_KEY) return { ok: false, error: 'setup_required', mock: false };
+  if (retellConfigStatus().mock) return mockUpdateAgent(agentId, previousVersion);
+  const result = await providerRequest(`/update-agent/${encodeURIComponent(agentId)}`, { method: 'PATCH', body: agentRequestBody(spec) });
+  return result.ok ? parseAgentResponse(result.value, agentId) : result;
+}
+
+/**
+ * Publish one exact draft version. The response is deliberately not trusted
+ * for the version number: the caller verifies `get-agent?version=<n>` next.
+ */
+export async function publishRetellAgent(agentId: string, version: number): Promise<RetellProviderResult<{ version: number }>> {
+  if (!env.RETELL_API_KEY) return { ok: false, error: 'setup_required', mock: false };
+  const status = retellConfigStatus();
+  if (!Number.isSafeInteger(version) || version < 0) return { ok: false, error: 'invalid_request', mock: status.mock };
+  if (status.mock) return mockPublishAgent(agentId, version);
+  const result = await providerRequest(`/publish-agent-version/${encodeURIComponent(agentId)}`, { method: 'POST', body: { version } });
+  return result.ok ? { ok: true, value: { version }, mock: false } : result;
+}
+
+export interface PhoneNumberBinding { phoneNumber: string; inboundAgentId: string | null; inboundAgentVersion: number | null }
+
+function parsePhoneNumberBinding(phoneNumber: string, body: Record<string, unknown>): PhoneNumberBinding {
+  const agents = Array.isArray(body.inbound_agents)
+    ? body.inbound_agents.map(record).filter((item): item is Record<string, unknown> => item !== null)
+    : [];
+  const first = agents[0];
+  return {
+    phoneNumber: nonEmptyString(body.phone_number) ?? phoneNumber,
+    inboundAgentId: nonEmptyString(first?.agent_id) ?? nonEmptyString(body.inbound_agent_id),
+    inboundAgentVersion: nonNegativeInteger(first?.agent_version) ?? nonNegativeInteger(body.inbound_agent_version),
+  };
+}
+
+/** Point the inbound side of a Retell-owned number at one exact published agent version. */
+export async function updatePhoneNumberInboundAgent(
+  phoneNumber: string,
+  binding: { agentId: string; agentVersion: number; inboundWebhookUrl?: string },
+): Promise<RetellProviderResult<PhoneNumberBinding>> {
+  if (!env.RETELL_API_KEY) return { ok: false, error: 'setup_required', mock: false };
+  const status = retellConfigStatus();
+  if (!/^\+[1-9]\d{7,14}$/.test(phoneNumber)) return { ok: false, error: 'invalid_request', mock: status.mock };
+  if (status.mock) return { ok: true, value: { phoneNumber, inboundAgentId: binding.agentId, inboundAgentVersion: binding.agentVersion }, mock: true };
+  const result = await providerRequest(`/update-phone-number/${encodeURIComponent(phoneNumber)}`, {
+    method: 'PATCH',
+    body: {
+      inbound_agents: [{ agent_id: binding.agentId, agent_version: binding.agentVersion, weight: 1 }],
+      ...(binding.inboundWebhookUrl ? { inbound_webhook_url: binding.inboundWebhookUrl } : {}),
+    },
+  });
+  if (!result.ok) return result;
+  return { ok: true, value: parsePhoneNumberBinding(phoneNumber, result.value), mock: false };
+}
+
+export async function getPhoneNumberBinding(phoneNumber: string): Promise<RetellProviderResult<PhoneNumberBinding>> {
+  if (!env.RETELL_API_KEY) return { ok: false, error: 'setup_required', mock: false };
+  if (retellConfigStatus().mock) return { ok: true, value: { phoneNumber, inboundAgentId: null, inboundAgentVersion: null }, mock: true };
+  const result = await providerRequest(`/get-phone-number/${encodeURIComponent(phoneNumber)}`, { method: 'GET' });
+  if (!result.ok) return result;
+  return { ok: true, value: parsePhoneNumberBinding(phoneNumber, result.value), mock: false };
+}
+
+export interface RetellVoice {
+  voiceId: string;
+  name: string;
+  provider: string;
+  gender: string | null;
+  accent: string | null;
+  age: string | null;
+  previewUrl: string | null;
+}
+
+export async function listRetellVoices(): Promise<RetellProviderResult<RetellVoice[]>> {
+  if (!env.RETELL_API_KEY) return { ok: false, error: 'setup_required', mock: false };
+  if (retellConfigStatus().mock) return { ok: true, value: mockListVoices(), mock: true };
+  try {
+    const response = await fetchWithTimeout(`${env.RETELL_BASE_URL}/list-voices`, {
+      headers: { Authorization: `Bearer ${env.RETELL_API_KEY}` },
+    }, env.RETELL_DEPLOY_TIMEOUT_MS);
+    if (!response.ok) return { ok: false, error: mapRetellProviderStatus(response.status), status: response.status, mock: false };
+    const body = await response.json().catch(() => null) as unknown;
+    if (!Array.isArray(body)) return { ok: false, error: 'invalid_response', mock: false };
+    const voices: RetellVoice[] = [];
+    for (const item of body) {
+      const voice = record(item);
+      const voiceId = nonEmptyString(voice?.voice_id);
+      if (!voice || !voiceId) continue;
+      voices.push({
+        voiceId,
+        name: nonEmptyString(voice.voice_name) ?? voiceId,
+        provider: nonEmptyString(voice.provider) ?? 'unknown',
+        gender: nonEmptyString(voice.gender),
+        accent: nonEmptyString(voice.accent),
+        age: nonEmptyString(voice.age),
+        previewUrl: nonEmptyString(voice.preview_audio_url),
+      });
+    }
+    return { ok: true, value: voices, mock: false };
+  } catch {
+    return { ok: false, error: 'provider_unavailable', mock: false };
   }
 }
