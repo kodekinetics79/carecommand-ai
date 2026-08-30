@@ -482,6 +482,29 @@ Say: "${notInterestedLine}" Then end politely.
 
 // --- RetellAI configuration -----------------------------------------------
 
+/**
+ * "When's a good time to call you back" — the single most useful thing a
+ * message-taking receptionist collects. The task layer has read
+ * `args.callback_window` since C4-pre and `dueAt` already prefers it, but no
+ * tool declared the parameter, and `tool_call_strict_mode: true` means an
+ * undeclared field is dropped before it ever reaches us. So the field on the
+ * task card was always empty and staff called back blind.
+ *
+ * Declared as three flat strings rather than a timestamp: it is what a caller
+ * actually says ("Thursday, between two and four"), and the branch timezone is
+ * applied server-side where it is known.
+ */
+const CALLBACK_WINDOW_PARAMETER = {
+  type: 'object',
+  description: 'When the caller said they can take a call back. Only from what they actually said; never guess or offer a time yourself.',
+  properties: {
+    date: { type: 'string', description: 'Calendar date the caller gave (YYYY-MM-DD), in the clinic\'s local time.' },
+    from: { type: 'string', description: 'Earliest local time they can be reached (HH:mm, 24-hour).' },
+    to: { type: 'string', description: 'Latest local time they can be reached (HH:mm, 24-hour).' },
+  },
+  required: ['date', 'from', 'to'],
+} as const;
+
 export interface RetellConfig {
   systemPrompt: string;
   voiceId: string;
@@ -540,6 +563,11 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
   // provider now enforces that same enum (server/lib/receptionist/retellMock.ts)
   // so this can never again be discovered on a real account.
   const fnUrl = expectedRetellToolUrl(clinic.id, options.webhookBaseUrl);
+  // The bookable menu the caller may choose from. `bookableByVoice` is the
+  // clinic's own answer to "may the phone book this?", and it is the same list
+  // the prompt's `# Services` section reads, so the agent can never offer a
+  // service the tool schema refuses.
+  const bookableServices = config.services.filter(service => service.bookableByVoice).map(service => service.name);
   const intakeContract = compileIntakeContract({
     campaignId: campaign.id,
     revision: campaign.intakeSchemaRevision ?? 1,
@@ -547,7 +575,9 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     eligibleLocations: locations,
     fields: config.intakeFields,
     toolUrl: fnUrl,
+    bookableServices,
   });
+  const serviceEnum = intakeContract.snapshot.bookableServices;
   // This is the sole executable book_appointment schema. `bookingFunction`
   // remains a compatibility alias to this exact object for existing export
   // consumers; it is not independently generated.
@@ -660,14 +690,15 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     {
       type: 'custom',
       name: 'check_availability',
-      description: `Ask the canonical scheduling service for currently open appointment slots at ${clinic.name} on a date. ALWAYS call this before offering times or booking, and never imply a returned slot is held.`,
+      description: `Ask the canonical scheduling service for currently open appointment slots at ${clinic.name} on a date. ALWAYS call this before offering times or booking, and never imply a returned slot is held. The times returned already reflect the length of the service you name, and they cover every clinician who can provide it.`,
       url: fnUrl,
       speak_during_execution: true,
       parameters: {
         type: 'object',
         properties: {
           appointment_date: { type: 'string', description: 'Date to check (YYYY-MM-DD).' },
-          service: { type: 'string', const: campaign.appointmentType, description: 'Server-configured appointment service.' },
+          service: { type: 'string', enum: serviceEnum, description: 'The service the caller asked for. Choose only from this list.' },
+          preferred_provider: { type: 'string', description: 'Only when the caller names a clinician they want to see; otherwise omit it and every available clinician is searched.' },
         },
         required: ['appointment_date', 'service'],
       },
@@ -687,6 +718,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
           callback_phone: { type: 'string', description: 'Callback number only when the verified caller number is unavailable.' },
           reason_category: { type: 'string', description: 'Non-clinical routing category.', enum: ['human_requested', 'unsupported_intent', 'complaint', 'billing', 'refill', 'results', 'other'] },
           message: { type: 'string', description: 'Brief minimum-necessary callback message; do not include detailed medical history.' },
+          callback_window: CALLBACK_WINDOW_PARAMETER,
         },
         required: ['reason_category'],
       },
@@ -705,6 +737,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
           callback_phone: { type: 'string', description: 'Callback number only when the verified caller number is unavailable.' },
           reason_category: { type: 'string', description: 'Non-clinical routing category.', enum: ['unsupported_intent', 'complaint', 'billing', 'refill', 'results', 'transfer_failed', 'other'] },
           message: { type: 'string', description: 'Brief minimum-necessary callback message; do not include detailed medical history.' },
+          callback_window: CALLBACK_WINDOW_PARAMETER,
         },
         required: ['reason_category', 'message'],
       },

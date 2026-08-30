@@ -19,7 +19,7 @@ const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
 const { disclosureEvidenceHash, renderRecordingDisclosure } = await import('../lib/receptionist/privacyLifecycle');
-const { MAX_TENANT_ACTIVE_CALLS } = await import('../modules/receptionist/outbound');
+const { MAX_TENANT_ACTIVE_CALLS } = await import('../lib/receptionist/admissionPolicy');
 
 const KEY = 'retell-first-inbound-bootstrap-key';
 const originalKey = env.RETELL_API_KEY;
