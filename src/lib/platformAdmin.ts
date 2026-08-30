@@ -26,7 +26,11 @@ async function pf<T>(path: string, init?: RequestInit & { auth?: boolean }): Pro
 
 export interface PlatformMe { id: string; email: string | null; name: string; role: string; legacy: boolean; mfaEnabled: boolean; mfaRequired?: boolean }
 export interface TenantSummary {
-  tenant: { id: string; name: string; slug: string; status: string; createdAt: string; lastActivityAt: string } | null;
+  tenant: {
+    id: string; name: string; slug: string; status: string; createdAt: string; lastActivityAt: string;
+    /** demo | pilot | production. A demo workspace is refused at the call gates. */
+    mode: string; modeDescription: string; liveCallingAllowed: boolean;
+  } | null;
   subscription: { planKey: string; planName: string; status: string; trialEndsAt: string | null; addons: string[] } | null;
   activeUsers: number; branches: number; enabledFeatures: number; setupStatus: string; deepLinkTarget: string | null;
   entitlements?: Array<{ featureKey: string; enabled: boolean; source: string; limitValue: number | null }>;
@@ -150,6 +154,8 @@ export interface TenantCompany {
   mainPhone: string | null; website: string | null;
   primaryContactName: string | null; primaryContactEmail: string | null; primaryContactPhone: string | null;
   billingContactName: string | null; billingContactEmail: string | null;
+  /** Relationship facts. Dates come back as ISO strings. */
+  contractStartedAt: string | null; accountManager: string | null; baaSignedAt: string | null;
   accountNotes: string | null;
 }
 
@@ -198,6 +204,10 @@ export const platformAdmin = {
   updateCompany: (id: string, body: Partial<TenantCompany> & { reason: string }) =>
     pf<{ tenantId: string; company: TenantCompany; changed: string[] }>(`/v1/platform/tenants/${id}/company`, { method: 'PATCH', body: JSON.stringify(body) }),
   roster: (id: string) => pf<TenantRoster>(`/v1/platform/tenants/${id}/users`),
+  setTenantMode: (id: string, mode: string, reason: string) =>
+    pf<{ tenantId: string; mode: string; liveCallingAllowed: boolean }>(`/v1/platform/tenants/${id}/mode`, {
+      method: 'PATCH', body: JSON.stringify({ mode, reason }),
+    }),
   suspend: (id: string) => pf<{ status: string }>(`/v1/platform/tenants/${id}/suspend`, { method: 'POST' }),
   reactivate: (id: string) => pf<{ status: string }>(`/v1/platform/tenants/${id}/reactivate`, { method: 'POST' }),
   changePlan: (id: string, planKey: string) => pf<TenantSummary>(`/v1/platform/tenants/${id}/subscription/change-plan`, { method: 'POST', body: JSON.stringify({ planKey }) }),

@@ -571,6 +571,7 @@ function TenantDrawer({ tenant, canManage, onClose }: { tenant: TenantSummary; c
           {tab === 'overview' && (
             <div className="grid grid-cols-2 gap-3">
               <DCard label="Status" value={d.tenant!.status} />
+              <DCard label="Mode" value={d.tenant!.mode} />
               <DCard label="Setup status" value={d.setupStatus} />
               <DCard label="Active users" value={String(d.activeUsers)} />
               <DCard label="Branches" value={String(d.branches)} />
@@ -626,6 +627,7 @@ function TenantDrawer({ tenant, canManage, onClose }: { tenant: TenantSummary; c
 
           {tab === 'danger' && canManage && (
             <div className="space-y-3">
+              <ModeControl tid={tid} current={d.tenant!.mode} description={d.tenant!.modeDescription} onChanged={reload} />
               {d.tenant!.status === 'active' ? (
                 <DangerRow label="Suspend tenant" desc="Locks all features and blocks tenant login." action="Suspend" onConfirm={() => act(() => platformAdmin.suspend(tid))} busy={busy} />
               ) : d.tenant!.status === 'suspended' ? (
@@ -664,8 +666,19 @@ const COMPANY_GROUPS: Array<{ heading: string; fields: Array<{ k: keyof TenantCo
   { heading: 'Billing contact', fields: [
     { k: 'billingContactName', label: 'Name' }, { k: 'billingContactEmail', label: 'Email' },
   ] },
+  { heading: 'Relationship', fields: [
+    { k: 'contractStartedAt', label: 'Contract start (YYYY-MM-DD)' },
+    { k: 'accountManager', label: 'Account manager' },
+    { k: 'baaSignedAt', label: 'BAA signed (YYYY-MM-DD)' },
+  ] },
   { heading: 'Account notes', fields: [{ k: 'accountNotes', label: 'Notes', long: true }] },
 ];
+
+const MODE_BADGE: Record<string, string> = {
+  demo: 'badge badge-amber',
+  pilot: 'badge badge-blue',
+  production: 'badge badge-emerald',
+};
 
 function CompanyTab({ tid, account, error, canManage, onSaved }: {
   tid: string; account: TenantAccountRecord | null; error: string | null;
@@ -1107,6 +1120,67 @@ function SupportAccessRow({ tid }: { tid: string }) {
       onConfirm={async (reason) => { await platformAdmin.startSupport(tid, reason, 60); }} />
   );
 }
+/**
+ * Change what a workspace is allowed to do in the real world.
+ *
+ * It lives beside suspend rather than in the company record because it is a
+ * switch, not a fact: moving a workspace out of demo is what lets it place and
+ * accept real calls, so it carries a reason and is audited the same way.
+ */
+function ModeControl({ tid, current, description, onChanged }: {
+  tid: string; current: string; description: string; onChanged: () => Promise<void> | void;
+}) {
+  const [mode, setMode] = useState(current);
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ tone: 'ok' | 'bad'; text: string } | null>(null);
+
+  async function save() {
+    setBusy(true); setMsg(null);
+    try {
+      const result = await platformAdmin.setTenantMode(tid, mode, reason.trim());
+      setReason('');
+      setMsg({
+        tone: 'ok',
+        text: result.liveCallingAllowed
+          ? `Mode is ${result.mode}. This workspace can place and accept real calls.`
+          : `Mode is ${result.mode}. Live calls are refused, so nothing here can reach a real patient.`,
+      });
+      await onChanged();
+    } catch (e) {
+      setMsg({ tone: 'bad', text: e instanceof Error ? e.message : 'Could not change the mode' });
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-4 py-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-[13px] font-semibold text-t1">Operating mode</p>
+          <p className="text-[11px] text-t3">{description}</p>
+        </div>
+        <span className={MODE_BADGE[current] ?? 'badge badge-blue'}>{current}</span>
+      </div>
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <select aria-label="Operating mode" value={mode} onChange={e => setMode(e.target.value)}
+          className="rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-2.5 py-1.5 text-xs text-t1">
+          <option value="demo">demo — refuse live calls</option>
+          <option value="pilot">pilot — real clinic, attended</option>
+          <option value="production">production — real clinic, unattended</option>
+        </select>
+        <input value={reason} onChange={e => setReason(e.target.value)} placeholder="Reason (recorded)" aria-label="Reason for the mode change"
+          className="flex-1 min-w-[200px] rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-1.5 text-xs text-t1 outline-none" />
+        <button type="button" disabled={busy || reason.trim().length < 3 || mode === current}
+          onClick={() => void save()}
+          className="rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-[11px] font-semibold text-white disabled:opacity-50">
+          {busy ? '…' : 'Set mode'}
+        </button>
+      </div>
+      {msg && <p className={`mt-2 text-[11px] ${msg.tone === 'ok' ? 'text-emerald-v' : 'text-red-v'}`} role="status">{msg.text}</p>}
+    </div>
+  );
+}
+
 function DangerRow({ label, desc, action, tone = 'red', onConfirm, busy }: { label: string; desc: string; action: string; tone?: 'red' | 'emerald'; onConfirm: () => void; busy: boolean }) {
   const [confirm, setConfirm] = useState(false);
   const isRed = tone === 'red';
@@ -1579,6 +1653,10 @@ function TenantsTab({ canManage, onOpenTenant }: { canManage: boolean; onOpenTen
                 <div className="flex items-center gap-1.5 shrink-0">
                   <span className={`badge ${t.setupStatus === 'configured' ? 'badge-emerald' : 'badge-amber'}`} title="Stored setup status">setup: {t.setupStatus}</span>
                   <span className={`badge ${TENANT_STATUS_BADGE[t.tenant.status] ?? 'badge-blue'}`}>{t.tenant.status}</span>
+                  {/* Mode is shown for every tenant, not only demo: silence
+                      about which mode a clinic is in is how a demo ends up
+                      dialling a patient. */}
+                  <span className={MODE_BADGE[t.tenant.mode] ?? 'badge badge-blue'} title={t.tenant.modeDescription}>{t.tenant.mode}</span>
                   {t.subscription && <span className={`badge ${SUB_STATUS_BADGE[t.subscription.status] ?? 'badge-blue'}`}>{t.subscription.planKey} · {t.subscription.status.toLowerCase()}</span>}
                 </div>
               </div>

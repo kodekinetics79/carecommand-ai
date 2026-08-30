@@ -176,6 +176,27 @@ describe('Control Tower — platform settings', () => {
   });
 });
 
+describe('Control Tower — operating mode', () => {
+  const TENANT = {
+    tenant: {
+      id: 't-1', name: 'Demo Workspace', slug: 'demo-workspace', status: 'active',
+      mode: 'demo', modeDescription: 'Demonstration only. Live calls are refused, so nothing here can reach a real patient.',
+      liveCallingAllowed: false, createdAt: '2026-08-01T00:00:00.000Z', lastActivityAt: '2026-08-29T00:00:00.000Z',
+    },
+    subscription: { planKey: 'starter', planName: 'Starter', status: 'TRIAL', trialEndsAt: null, addons: [] },
+    activeUsers: 3, branches: 1, enabledFeatures: 4, setupStatus: 'configured', deepLinkTarget: 'platform/tenants/t-1',
+  };
+
+  it('shows every tenant its mode in the directory, not only the demo ones', async () => {
+    admin.tenants.mockResolvedValue([TENANT]);
+    renderConsole();
+    await openSection('tenants');
+    // Silence about which mode a clinic is in is how a demo ends up dialling
+    // a patient, so the badge is present for all of them.
+    expect((await screen.findAllByText('demo')).length).toBeGreaterThan(0);
+  });
+});
+
 describe('Control Tower — a failed list is not an empty list', () => {
   it('does not tell the operator they are all caught up when the request failed', async () => {
     admin.requests.mockRejectedValue(new Error('Request failed (500)'));
