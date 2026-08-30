@@ -28,6 +28,7 @@ import { AGENT_READINESS_REASONS } from '../lib/receptionist/agentReadiness';
 // browser cannot drift from the links the server sends people to.
 // ===========================================================================
 
+const STUDIO_TAB_SOURCE = 'src/lib/receptionistDeployment.ts';
 const STUDIO_PAGE = 'src/pages/ReceptionistStudio.tsx';
 
 /**
@@ -52,17 +53,29 @@ const CLINIC_ACTIVATION_BLOCKERS = unionMembers('server/lib/receptionist/activat
  * hand-copied list here would be one more place to drift.
  */
 function studioTabIds(): string[] {
-  const source = readFileSync(resolve(process.cwd(), STUDIO_PAGE), 'utf8');
-  const union = source.match(/^type Tab = ([^;]+);/m);
-  if (!union) throw new Error(`Could not read the Tab union from ${STUDIO_PAGE}`);
-  const ids = [...union[1].matchAll(/'([a-z_]+)'/g)].map(match => match[1]);
-  if (!ids.length) throw new Error(`The Tab union in ${STUDIO_PAGE} parsed to nothing`);
+  // The page used to declare the union inline; it now imports StudioTab from
+  // the client library, so parsing the page's `type Tab =` line found a type
+  // NAME and silently produced nothing — the guard passed for the wrong reason
+  // while it could no longer see anything. Read the ids where they now live,
+  // and read the aliases too: a remediation tab that only resolves through an
+  // alias is still reachable, and pretending otherwise would fail a working link.
+  const source = readFileSync(resolve(process.cwd(), STUDIO_TAB_SOURCE), 'utf8');
+  const idsBlock = source.match(/export const STUDIO_TAB_IDS = \[([^\]]+)\]/);
+  if (!idsBlock) throw new Error(`Could not read STUDIO_TAB_IDS from ${STUDIO_TAB_SOURCE}`);
+  const ids = [...idsBlock[1].matchAll(/'([a-z_-]+)'/g)].map(match => match[1]);
+  if (!ids.length) throw new Error(`STUDIO_TAB_IDS in ${STUDIO_TAB_SOURCE} parsed to nothing`);
 
-  // The union is the type; TABS is what `isTab` actually tests against. They
-  // must agree, or a link to a typed-but-unlisted tab still lands nowhere.
-  const listed = [...source.matchAll(/\{ id: '([a-z_]+)', label:/g)].map(match => match[1]);
-  expect([...listed].sort(), 'the TABS array and the Tab union must agree').toEqual([...ids].sort());
-  return ids;
+  const aliasBlock = source.match(/STUDIO_TAB_ALIASES: Record<string, StudioTab> = \{([^}]+)\}/);
+  const aliases = aliasBlock ? [...aliasBlock[1].matchAll(/'?([a-z_-]+)'?\s*:/g)].map(match => match[1]) : [];
+
+  // The page renders one button per tab id; a typed-but-unrendered tab is a
+  // link that lands nowhere just as surely as an unknown id.
+  const page = readFileSync(resolve(process.cwd(), STUDIO_PAGE), 'utf8');
+  const listed = [...page.matchAll(/\{ id: '([a-z_-]+)', label:/g)].map(match => match[1]);
+  if (listed.length) {
+    expect([...listed].sort(), 'every Studio tab id must be rendered as a tab').toEqual([...ids].sort());
+  }
+  return [...ids, ...aliases];
 }
 
 /** Routes outside Studio that a fix link is allowed to point at. */
@@ -75,7 +88,7 @@ const CONTEXT = {
 };
 
 describe('every remediation fix link lands on a screen that exists (B7)', () => {
-  it.fails('resolves every fixHref to a tab isTab() accepts (B7)', () => {
+  it('resolves every fixHref to a tab isTab() accepts (B7)', () => {
     const tabs = new Set(studioTabIds());
     const unreachable: Array<{ code: string; tab: string }> = [];
 
