@@ -73,7 +73,7 @@ describe('the readiness vocabulary is one vocabulary (E2)', () => {
 });
 
 describe('the Go-live card reads rows the server actually sends (E2)', () => {
-  it.fails('shows every step as done when the server reports every check passing', () => {
+  it('shows every step as done when the server reports every check passing', () => {
     const steps = goLiveSteps(readinessFixture(), 'DRAFT');
     const unevaluated = steps.filter(step => step.status === 'pending');
     // "Forward the public number to the DID" is the step the live audit found
@@ -209,7 +209,7 @@ describe('the body the browser sends is the body the route accepts (E1)', () => 
     expect(JSON.stringify(rejected.error?.issues)).toContain('patientId');
   });
 
-  it.fails('BookItDialog emits createPatient, not a nested patientId create', () => {
+  it('BookItDialog emits createPatient, not a nested patientId create', () => {
     const dialog = bookItDialogSource;
     const body = dialog.slice(dialog.indexOf('const body: BookRequestBody'), dialog.indexOf('const result = await booking.run'));
     expect(body.length, 'the submit body moved').toBeGreaterThan(0);
@@ -223,7 +223,7 @@ describe('the body the browser sends is the body the route accepts (E1)', () => 
     ).toBe(true);
   });
 
-  it.fails('BookRequestBody declares only fields the route accepts', () => {
+  it('BookRequestBody declares only fields the route accepts', () => {
     const { fields: serverKeys } = serverBookSchema();
     const client = frontDeskClientSource;
     const block = client.match(/export interface BookRequestBody \{([\s\S]*?)\n\}/);
