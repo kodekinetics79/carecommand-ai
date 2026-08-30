@@ -20,6 +20,12 @@ import {
 import { restrictCallToBasicAttributes } from '../retell';
 import { CONFIRMATION_OUTBOX_SOURCE, processAppointmentConfirmations } from './confirmationOutbox';
 import { lockDncDestinationFence } from './dncFence';
+import { resolveCallLocalePack, resolvedLocaleFormat } from './localePacks/resolve';
+import { renderPackMessage } from './localePacks/render';
+import { EMERGENCY_FALLBACK_NUMBER_FREE } from './localePacks/defaults';
+import { loadHoursSource } from './hoursSource';
+import { hoursConfigured, resolveEffectiveHours, spokenDate } from './clinicHours';
+import type { LocaleFormat } from './localePacks/types';
 
 // Real-time tools the AI receptionist invokes DURING a call (Retell custom
 // functions). Each returns a JSON result with a `message` the agent can speak.
@@ -405,13 +411,20 @@ export async function takeMessage(ctx: ToolContext, args: Record<string, unknown
 /** Creates a critical staff signal without delaying immediate emergency advice. */
 export async function reportEmergency(ctx: ToolContext, args: Record<string, unknown>) {
   const task = await createSafetyTask(ctx, 'emergency', args);
+  // The emergency number is jurisdictional: it comes from the call's approved
+  // locale pack. With no pack (and no country to fall back on) the agent says
+  // the number-free sentence rather than naming the wrong country's number.
+  const pack = await resolveCallLocalePack(db, { tenantId: ctx.tenantId, callId: ctx.callId, trustedProviderAgentId: ctx.trustedProviderAgentId });
+  const message = pack
+    ? renderPackMessage(pack.strings, 'tool.emergency.message', { emergency_number: pack.strings.emergencyNumber })
+    : EMERGENCY_FALLBACK_NUMBER_FREE;
   return {
     emergency_recorded: true,
     protocol_status: 'pending_provider_evidence',
     acknowledgment_pending: true,
     duplicate: task.duplicate,
     task_id: task.taskId,
-    message: 'If you may be experiencing an emergency, hang up and call 911 now, or go to the nearest emergency room. Do not wait for a callback from this office.',
+    message,
   };
 }
 
@@ -477,12 +490,19 @@ async function verifiedPatientForCall(ctx: ToolContext): Promise<string | null> 
   return patient && validPhone(patient.phone) === phone ? patient.id : null;
 }
 
-function localAppointmentLabel(startsAt: Date, timezone: string): string {
-  return new Intl.DateTimeFormat('en-US', {
+function localAppointmentLabel(startsAt: Date, timezone: string, locale?: LocaleFormat | null): string {
+  return new Intl.DateTimeFormat(locale?.language ?? 'en-US', {
     timeZone: timezone,
     weekday: 'short', month: 'short', day: 'numeric', year: 'numeric',
     hour: 'numeric', minute: '2-digit',
+    ...(locale ? { hour12: locale.timeStyle === '12h' } : {}),
   }).format(startsAt);
+}
+
+/** The call's LocaleFormat, or null when no pack can be resolved. */
+async function callLocaleFormat(ctx: ToolContext): Promise<LocaleFormat | null> {
+  const pack = await resolveCallLocalePack(db, { tenantId: ctx.tenantId, callId: ctx.callId, trustedProviderAgentId: ctx.trustedProviderAgentId });
+  return pack ? resolvedLocaleFormat(pack, pack.language) : null;
 }
 
 /** Return minimum-necessary upcoming appointments only after server-side identity proof. */
@@ -719,6 +739,29 @@ export async function checkAvailability(ctx: ToolContext, args: Record<string, u
   }
   const policy = await getSchedulingPolicy(ctx.tenantId);
   if (!policy.selfBookEnabled) return { available: false, needs_review: true, slots: [], message: 'This clinic requires staff review before offering self-booking times.' };
+
+  // The clinic's own hours and closures decide whether that date is offerable
+  // at all. Provider availability alone would happily offer a slot on a day
+  // the practice is shut.
+  const bundle = await loadHoursSource(db, { tenantId: ctx.tenantId, clinicId: trusted.clinicId });
+  const locationSource = bundle?.locations.find(location => location.id === trusted.locationId)?.source ?? bundle?.source ?? null;
+  const pack = await resolveCallLocalePack(db, { tenantId: ctx.tenantId, callId: ctx.callId, trustedProviderAgentId: ctx.trustedProviderAgentId });
+  const locale = pack ? resolvedLocaleFormat(pack, pack.language) : null;
+  if (locationSource && hoursConfigured(locationSource) && /^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    const day = resolveEffectiveHours(locationSource, date);
+    if (!day.open) {
+      const spokenDay = locale ? spokenDate(date, locale) : date;
+      const clinicName = bundle?.clinic.name ?? 'the practice';
+      const message = pack
+        ? day.closure
+          ? renderPackMessage(pack.strings, 'tool.availability.closed_reason', { clinic_name: clinicName, date: spokenDay, closure_reason: day.closure.reason })
+          : renderPackMessage(pack.strings, 'tool.availability.closed', { clinic_name: clinicName, date: spokenDay })
+        : `${clinicName} is closed on ${spokenDay}. Would a different day work?`;
+      await auditLive(ctx.tenantId, 'receptionist.availability.closed', trusted.branchId, { date, closureId: day.closure?.id ?? null });
+      return { available: false, reason: 'clinic_closed', slots: [], message };
+    }
+  }
+
   const slots = (await getOpenSlots(ctx.tenantId, trusted.branchId, date, service.durationMin, 6, providerProfileId))
     .filter(slot => {
       const startsAt = parseSlot(date, slot.time, trusted.branchTimezone!);

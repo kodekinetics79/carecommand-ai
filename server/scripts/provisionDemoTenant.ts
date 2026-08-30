@@ -125,6 +125,13 @@ interface ReadinessRow {
   inactive_90_180: number;
   never_visited: number;
   live_dispatch_activations: number;
+  receptionist_locale_packs_approved: number;
+  receptionist_clinics_with_hours: number;
+  receptionist_clinics_with_country: number;
+  receptionist_locations: number;
+  receptionist_knowledge_approved: number;
+  receptionist_after_hours_calls: number;
+  receptionist_bookable_services: number;
 }
 
 /**
@@ -177,7 +184,14 @@ async function verify(ownerUrl: string): Promise<ReadinessRow> {
            AND floor(extract(epoch from (now()::timestamp - p."lastVisitAt")) / 86400) >= 90
            AND floor(extract(epoch from (now()::timestamp - p."lastVisitAt")) / 86400) < 180)::int AS inactive_90_180,
         (SELECT count(*) FROM "Patient" p WHERE p."tenantId" = d.id AND p."deletedAt" IS NULL AND p."lastVisitAt" IS NULL)::int AS never_visited,
-        (SELECT count(*) FROM "CampaignLiveDispatchActivation")::int AS live_dispatch_activations
+        (SELECT count(*) FROM "CampaignLiveDispatchActivation")::int AS live_dispatch_activations,
+        (SELECT count(*) FROM "ReceptionistLocalePack" p WHERE p."tenantId" = d.id AND p.status = 'APPROVED')::int AS receptionist_locale_packs_approved,
+        (SELECT count(*) FROM "ReceptionistClinic" c WHERE c."tenantId" = d.id AND c."workingHours" IS NOT NULL)::int AS receptionist_clinics_with_hours,
+        (SELECT count(*) FROM "ReceptionistClinic" c WHERE c."tenantId" = d.id AND c.country IS NOT NULL)::int AS receptionist_clinics_with_country,
+        (SELECT count(*) FROM "ReceptionistLocation" l WHERE l."tenantId" = d.id)::int AS receptionist_locations,
+        (SELECT count(*) FROM "ReceptionistClinicKnowledge" k WHERE k."tenantId" = d.id AND k."approvedHash" IS NOT NULL)::int AS receptionist_knowledge_approved,
+        (SELECT count(*) FROM "ReceptionistCallLog" cl WHERE cl."tenantId" = d.id AND cl."outsideHours" = true)::int AS receptionist_after_hours_calls,
+        (SELECT count(*) FROM "ServiceCatalogItem" s WHERE s."tenantId" = d.id AND s."bookableByVoice")::int AS receptionist_bookable_services
       FROM demo d
     `);
     const row = rows[0];
@@ -205,6 +219,15 @@ function assertReady(row: ReadinessRow): string[] {
   if (row.consent_opted_out < 1) failures.push('no suppression evidence exists, so a preview cannot demonstrate suppression');
   if (row.campaign_attributions < 1) failures.push('no campaign attribution evidence exists, so every campaign shows zero outcomes');
   if (row.live_dispatch_activations !== 0) failures.push('live campaign dispatch is ACTIVATED; the demo must run on the mock provider path');
+  // The receptionist cannot be activated, and cannot answer a single question
+  // about the clinic, without these.
+  if (row.receptionist_locale_packs_approved < 2) failures.push('fewer than two approved locale packs exist; an en-GB or en-US clinic could not be activated');
+  if (row.receptionist_clinics_with_country < 1) failures.push('no receptionist clinic has a country, so activation is blocked and the emergency number is unknown');
+  if (row.receptionist_clinics_with_hours < 1) failures.push('no receptionist clinic has working hours, so the agent cannot answer "are you open"');
+  if (row.receptionist_locations < 1) failures.push('no receptionist location exists, so the prompt has no address or access notes to read');
+  if (row.receptionist_knowledge_approved < 1) failures.push('no approved clinic knowledge exists, so insurance/payment/FAQ answers are all "take a message"');
+  if (row.receptionist_after_hours_calls < 1) failures.push('no after-hours call evidence exists, so the front-desk after-hours card renders empty');
+  if (row.receptionist_bookable_services < 1) failures.push('no service is bookable by voice, so the agent can describe nothing and book nothing');
   return failures;
 }
 
