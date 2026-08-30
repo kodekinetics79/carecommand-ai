@@ -157,12 +157,18 @@ export default function Sidebar({ mobileOpen = false, onNavigate }: { mobileOpen
   // whole app). It is only fetched for a session that may read call artifacts,
   // and NOTHING is shown when the summary failed to load: a missing badge means
   // "not known", and a zero would be a claim nobody verified.
+  //
+  // The critical number is the server's real count, not the length of the
+  // capped preview (D7): a badge reading 5 beside nine open emergencies is
+  // worse than no badge at all. Where only the capped preview is available the
+  // badge reads "5+".
   const frontDeskSummary = useFrontDeskPoll({ enabled: !loading && hasPermission(user, 'receptionist:call-artifacts:read') });
   const frontDeskCounts = summarizeNeedsAction(frontDeskSummary.state === 'ready' ? frontDeskSummary.data : null);
+  const criticalBadge = frontDeskCounts.criticalExact ? frontDeskCounts.critical : `${frontDeskCounts.critical}+`;
   const frontDeskBadge: Pick<NavItem, 'badge' | 'badgeColor'> = frontDeskSummary.state !== 'ready'
     ? {}
     : frontDeskCounts.critical > 0
-      ? { badge: frontDeskCounts.critical, badgeColor: 'red' }
+      ? { badge: criticalBadge, badgeColor: 'red' }
       : frontDeskCounts.count > 0
         ? { badge: frontDeskCounts.count, badgeColor: 'amber' }
         : {};
