@@ -22,7 +22,7 @@ export type ReadinessBlocker =
   | 'agent_language_unsupported'
   | 'transfer_loops_to_agent';
 
-export type TransferReason = 'not_set' | 'not_e164' | 'loops_to_agent';
+export type TransferReason = 'missing' | 'not_e164' | 'loops_to_agent';
 
 export interface ClinicReadiness {
   transferReady: boolean;
@@ -38,6 +38,8 @@ export interface ClinicReadiness {
 /** A location row as the C2 API returns it: timezone derived from the branch, plus access notes. */
 export interface LocationRow extends Location {
   accessNotes?: string | null;
+  /** Where `timezone` came from: the linked branch, or the clinic for a branchless row. */
+  timezoneSource?: { kind: 'branch' | 'clinic'; name: string | null };
 }
 
 /**
@@ -294,21 +296,50 @@ export type LocalePackCreateInput = {
 
 // --- Hours status (GET /hours-status?at=) ----------------------------------
 
+export type DayKey = 'sunday' | 'monday' | 'tuesday' | 'wednesday' | 'thursday' | 'friday' | 'saturday';
+
+/**
+ * One resolved day from the hours engine. `source` says which layer decided
+ * it, and `unconfigured` is NOT "closed": it means the clinic has no hours,
+ * which is why the card refuses to count after-hours calls for it.
+ */
+export interface EffectiveDay {
+  date: string;
+  dayKey: DayKey;
+  timezone: string;
+  open: boolean;
+  windows: Array<{ start: string; end: string }>;
+  closure: { id: string; reason: string; allDay: boolean } | null;
+  source: 'location' | 'clinic' | 'unconfigured';
+}
+
+export interface HoursStatusLocation {
+  id: string;
+  name: string;
+  timezone: string;
+  configured: boolean;
+  isOpenNow: boolean;
+  /** Always a sentence — 'hours not configured' rather than null. */
+  todayHoursSpoken: string;
+}
+
 export interface HoursStatusClinic {
   clinicId: string;
   name: string;
   timezone: string;
+  country: string | null;
   configured: boolean;
   blockers: string[];
   isOpenNow: boolean;
-  today: unknown;
-  todayHoursSpoken: string | null;
-  nextOpening: { date: string; start: string; startsAt: string; spoken: string } | null;
+  today: EffectiveDay | null;
+  /** Always a sentence — 'hours not configured' rather than null. */
+  todayHoursSpoken: string;
+  nextOpening: { date: string; start: string; startsAt: string; spoken: string | null } | null;
   closureReason: string | null;
   afterHoursCalls: { last24Hours: number; last7Days: number; lastAt: string | null };
-  locations: Array<{ id: string; name: string; isOpenNow: boolean; todayHoursSpoken: string | null }>;
+  locations: HoursStatusLocation[];
   /** True when the clinic has no approved pack and the server formatted with a fallback locale. */
-  formatFallback?: boolean;
+  formatFallback: boolean;
 }
 
 export interface HoursStatusView {
@@ -334,6 +365,7 @@ export interface CatalogCountry {
   callingCode: string;
   defaultEmergencyNumber: string;
   defaultLanguages: string[];
+  currency: string;
 }
 
 export interface CatalogLanguage { id: string; label: string; provider: string }
@@ -344,6 +376,8 @@ export interface CatalogLocalePackStatus {
   status: 'APPROVED' | 'DRAFT' | 'MISSING';
   packId: string | null;
   hasPlatformDefault: boolean;
+  /** Version of the platform default behind this pair; null when there is none. */
+  platformDefaultVersion: number | null;
 }
 
 export interface CatalogVoices {
@@ -364,7 +398,7 @@ export interface Catalog {
   tones: string[];
   campaignTypes: string[];
   localePacks: CatalogLocalePackStatus[];
-  limits: { maxIntakeFields: number; faqMax: number; closureMaxDays: number; knowledgeTextMax: number };
+  limits: { maxIntakeFields: number; faqMax: number; payersMax: number; closureMaxDays: number; knowledgeTextMax: number; closureReasonMax: number; accessNotesMax: number };
 }
 
 // --- API -------------------------------------------------------------------
@@ -440,14 +474,14 @@ export function isE164(value: string | null | undefined): boolean {
  * so the badge never claims "ready" for a number the server would refuse.
  */
 export function transferReadinessOf(readiness: ClinicReadiness | undefined, fallbackNumber: string | null | undefined): { ready: boolean; reason: TransferReason | null } {
-  if (readiness) return { ready: readiness.transferReady, reason: readiness.transferReady ? null : readiness.transferReason ?? (fallbackNumber ? 'not_e164' : 'not_set') };
+  if (readiness) return { ready: readiness.transferReady, reason: readiness.transferReady ? null : readiness.transferReason ?? (fallbackNumber ? 'not_e164' : 'missing') };
   const trimmed = fallbackNumber?.trim() ?? '';
-  if (!trimmed) return { ready: false, reason: 'not_set' };
+  if (!trimmed) return { ready: false, reason: 'missing' };
   return isE164(trimmed) ? { ready: true, reason: null } : { ready: false, reason: 'not_e164' };
 }
 
 export const TRANSFER_REASON_COPY: Record<TransferReason, string> = {
-  not_set: 'Not set — callers will be offered a message instead of a transfer',
+  missing: 'Not set — callers will be offered a message instead of a transfer',
   not_e164: 'Not E.164 — transfer disabled',
   loops_to_agent: 'Same as a line the agent answers — a transfer would loop back to the agent',
 };

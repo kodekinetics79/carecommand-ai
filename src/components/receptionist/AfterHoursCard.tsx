@@ -54,10 +54,10 @@ function ClinicHoursRow({ clinic, studioHref }: { clinic: HoursStatusClinic; stu
         <p className="text-sm font-semibold text-t1">{clinic.name}</p>
         {clinic.isOpenNow
           ? <span className="badge badge-emerald">Open now</span>
-          : <span className="badge badge-amber">Closed{clinic.nextOpening ? ` — reopens ${clinic.nextOpening.spoken}` : ''}</span>}
+          : <span className="badge badge-amber">Closed{clinic.nextOpening?.spoken ? ` — reopens ${clinic.nextOpening.spoken}` : ''}</span>}
       </div>
       {clinic.closureReason && <p className="text-xs text-t2">Closure: {clinic.closureReason}</p>}
-      <p className="text-xs text-t2 inline-flex items-center gap-1"><Clock className="w-3 h-3" aria-hidden="true" /> Today: {clinic.todayHoursSpoken ?? 'closed all day'}</p>
+      <p className="text-xs text-t2 inline-flex items-center gap-1"><Clock className="w-3 h-3" aria-hidden="true" /> Today: {clinic.todayHoursSpoken}</p>
       <p className="text-xs text-t2">After-hours calls: <strong className="text-t1">{clinic.afterHoursCalls.last24Hours}</strong> in 24h · <strong className="text-t1">{clinic.afterHoursCalls.last7Days}</strong> in 7 days</p>
       {clinic.formatFallback && <p className="text-[10px] text-amber-v">Locale pack not approved — times shown in the fallback format.</p>}
     </div>

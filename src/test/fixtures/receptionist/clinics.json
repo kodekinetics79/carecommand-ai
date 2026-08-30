@@ -24,7 +24,7 @@
     "active": true,
     "updatedAt": "2026-08-29T12:00:00.000Z",
     "locations": [
-      { "id": "loc-1", "clinicId": "clinic-1", "branchId": "branch-1", "name": "Harley Street", "address": "12 Harley Street", "phone": null, "timezone": "Europe/London", "accessNotes": "Entrance on Queen Anne Street; step-free access.", "workingHours": null, "active": true }
+      { "id": "loc-1", "clinicId": "clinic-1", "branchId": "branch-1", "name": "Harley Street", "address": "12 Harley Street", "phone": null, "timezone": "Europe/London", "accessNotes": "Entrance on Queen Anne Street; step-free access.", "workingHours": null, "active": true, "timezoneSource": { "kind": "branch", "name": "Harley Street" } }
     ],
     "agents": [],
     "_count": { "campaigns": 1 },
@@ -34,7 +34,7 @@
       "country": "GB",
       "countryConfirmed": true,
       "hoursConfigured": true,
-      "localePack": { "language": "en-GB", "country": "GB", "status": "APPROVED", "packId": "pack-gb-1", "evidenceHash": "sha256:gb1" },
+      "localePack": { "language": "en-GB", "country": "GB", "status": "APPROVED", "packId": "pack-gb-1", "evidenceHash": "7d4594559ab4f78acdda5c22910f076c3d9c8a530438eb424ae58c466c285b9c" },
       "knowledge": { "status": "APPROVED", "approvedRevision": 3, "dirty": false },
       "blockers": []
     }
@@ -60,7 +60,7 @@
     "_count": { "campaigns": 1 },
     "readiness": {
       "transferReady": false,
-      "transferReason": "not_set",
+      "transferReason": "missing",
       "country": null,
       "countryConfirmed": false,
       "hoursConfigured": false,

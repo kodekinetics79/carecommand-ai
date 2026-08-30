@@ -123,12 +123,12 @@ describe('LocalePackPanel', () => {
     await waitFor(() => expect(approve).toBeEnabled());
     // The hash the reviewer is shown is the one that gets acknowledged; read it
     // off the screen before approving, because approving reloads the list.
-    expect(screen.getByTestId('pack-pack-gb-2').textContent).toContain('evidence sha256:gb2-draft');
+    expect(screen.getByTestId('pack-pack-gb-2').textContent).toContain('evidence 75d4c7a359836aa34f99bb29d634bcc0a26eb560b4ed7c86757052970b36036d');
     fireEvent.click(approve);
 
     await waitFor(() => expect(approved).not.toBeNull());
     expect(approved!.path).toBe('/v1/receptionist/locale-packs/pack-gb-2/approve');
-    expect(approved!.body).toEqual({ acknowledgedEvidenceHash: 'sha256:gb2-draft' });
+    expect(approved!.body).toEqual({ acknowledgedEvidenceHash: '75d4c7a359836aa34f99bb29d634bcc0a26eb560b4ed7c86757052970b36036d' });
   });
 
   it('disables approval for a non-owner and says why', async () => {

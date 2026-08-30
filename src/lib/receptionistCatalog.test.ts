@@ -72,13 +72,13 @@ describe('transferReadinessOf', () => {
   it('trusts the server readiness when it is present', () => {
     const clinics = receptionistFixtures.clinics();
     expect(transferReadinessOf(clinics[0].readiness, clinics[0].humanFallbackNumber)).toEqual({ ready: true, reason: null });
-    expect(transferReadinessOf(clinics[1].readiness, clinics[1].humanFallbackNumber)).toEqual({ ready: false, reason: 'not_set' });
+    expect(transferReadinessOf(clinics[1].readiness, clinics[1].humanFallbackNumber)).toEqual({ ready: false, reason: 'missing' });
   });
 
   it('applies the same E.164 rule locally when the server did not send readiness', () => {
     expect(transferReadinessOf(undefined, '+14155550100')).toEqual({ ready: true, reason: null });
     expect(transferReadinessOf(undefined, '(415) 555-0100')).toEqual({ ready: false, reason: 'not_e164' });
-    expect(transferReadinessOf(undefined, null)).toEqual({ ready: false, reason: 'not_set' });
+    expect(transferReadinessOf(undefined, null)).toEqual({ ready: false, reason: 'missing' });
   });
 });
 

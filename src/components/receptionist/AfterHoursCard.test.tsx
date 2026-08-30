@@ -66,7 +66,7 @@ describe('AfterHoursCard', () => {
 
     const row = await screen.findByTestId('after-hours-clinic-1');
     expect(row).toHaveTextContent('Closed — reopens Monday 31 August at 09:00');
-    expect(row).toHaveTextContent('Today: 09:00 to 17:00');
+    expect(row).toHaveTextContent('Today: 09:00 to 13:00');
     expect(row).toHaveTextContent('2');
     expect(row).toHaveTextContent('11');
   });
