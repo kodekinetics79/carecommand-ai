@@ -73,3 +73,28 @@ Accepted for the pilot, on two conditions: the limitation goes in the KNOWN LIMI
 
 ### Also fixed, and worth recording as a defect not a feature
 `emergency_path_reachable` was previously folded into `transfer_target_distinct` as a **warn** — and `warn` never blocks activation. A clinic with no human fallback number could therefore go live with its emergency path pointing at nothing but a 20-second in-app poll. It is now its own blocking check, because "would a transfer loop back to the agent" and "can an emergency reach a human today" are different questions and an operator deserves to see the second one asked.
+
+---
+
+## Decision 13 — MERGE BLOCKER: the merge button runs migrations on production (2026-08-30)
+
+Raised by the platform-plane session, verified independently here before recording.
+
+**The mechanism.** `render.yaml` sets `autoDeploy: true` on the customer-facing API, and its `buildCommand` is `npm ci && npm run db:generate && npm run db:deploy` — where `db:deploy` is a bare `prisma migrate deploy`. So merging this PR to `main` triggers an unattended production deploy that migrates the production Neon database, **bypassing `scripts/deploy-migrations.sh`** — the script that exists precisely to demand `RELEASE_MIGRATION_ACK` and prove the migration principal is neither `app_rls` nor `app_platform`.
+
+**Why it matters now, specifically.** Verified on this branch: **20 migrations** are unapplied relative to `main`, and **7 of them issue `GRANT … TO app_rls` or `TO app_platform`**. A GRANT to a role that does not exist aborts the run part-way. The result would be a half-migrated production database, produced by a merge button, with nobody watching.
+
+**The preflight, which only someone with Neon access can run:**
+```sql
+SELECT rolname, rolsuper, rolbypassrls FROM pg_roles
+WHERE rolname IN ('app_rls','app_platform');
+```
+Both present → the migration run is ordinary and the merge is safe. `app_platform` missing → **the merge breaks production.**
+
+**Do not merge until that query has been run and both roles are confirmed.** This is not a receptionist-specific risk; it applies to any PR carrying migrations, and it should be fixed structurally by pointing the Render build command at the ack-gated script rather than at raw `prisma migrate deploy`.
+
+### Correction to the record
+The runbook language "production is down, awaiting RLS cutover" describes the **Vercel** function, not Render. `server/index.ts` awaits `assertRlsRuntimeRole` before `app.listen`, and that guard THROWS in production for a role that bypasses RLS. Render reports `environment: production` and is serving. Therefore the live API is already on a restricted, non-bypassing role and the runtime-role cutover is effectively done for the service that actually serves traffic. Booting proves the role; it does not prove the catalog is fully migrated and policied across all 132 tables — that check is still worth running, but the alarming version of the statement is false.
+
+### Related finding, needs a product decision
+The customer-facing Render deployment runs `DEPLOYMENT_PROFILE=demo`, which means **mock payments, insurance and AI in production**. That is truthful for a demo blueprint and the file says so, but it must be decided deliberately before a real clinic is put on it.
