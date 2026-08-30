@@ -25,7 +25,9 @@ const auditCreate = vi.fn(async () => {
 });
 
 vi.mock('../lib/platformDb', () => ({
-  platformDb: { platformAuditEvent: { create: (...args: unknown[]) => auditCreate(...args) } },
+  // The arguments are irrelevant here: what is under test is that the call
+  // survives the write FAILING, not what we tried to write.
+  platformDb: { platformAuditEvent: { create: () => auditCreate() } },
   platformDatabaseConfigured: () => false,
   assertPlatformDatabaseRole: async () => ({ ok: true }),
 }));
