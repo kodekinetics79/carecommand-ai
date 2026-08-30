@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router';
-import { Bot, Building2, Plus, Sparkles, Phone, PhoneOff, Megaphone, ListChecks, Eye, Code2, Activity, Loader2, AlertCircle, PhoneOutgoing } from 'lucide-react';
-import { receptionistApi as api, type Clinic, type Campaign, type Overview } from '../lib/receptionist';
+import { Bot, Building2, Plus, Sparkles, Phone, PhoneOff, Megaphone, ListChecks, Eye, Code2, Activity, Loader2, AlertCircle, PhoneOutgoing, BookOpen } from 'lucide-react';
+import { receptionistApi as api, type Campaign, type Overview } from '../lib/receptionist';
+import { blockerLabel, receptionistClinicApi, type ClinicRow } from '../lib/receptionistClinic';
 import { describeFailure } from '../lib/resourceState';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
@@ -9,6 +10,9 @@ import FormDialog from '../components/workflow/FormDialog';
 import { formatEnumLabel } from '../components/receptionist/helpers';
 import { EmptyState } from '../components/receptionist/shared';
 import { ClinicPanel } from '../components/receptionist/ClinicPanel';
+import { CreateClinicDialog } from '../components/receptionist/CreateClinicDialog';
+import { KnowledgePanel } from '../components/receptionist/KnowledgePanel';
+import { LocalePackPanel } from '../components/receptionist/LocalePackPanel';
 import { CampaignPanel } from '../components/receptionist/CampaignPanel';
 import { IntakeBuilder } from '../components/receptionist/IntakeBuilder';
 import { PreviewPanel } from '../components/receptionist/PreviewPanel';
@@ -16,10 +20,11 @@ import { RetellPanel } from '../components/receptionist/RetellPanel';
 import { ActivityPanel } from '../components/receptionist/ActivityPanel';
 import { OutboundPanel } from '../components/receptionist/outbound/OutboundPanel';
 
-type Tab = 'clinic' | 'campaign' | 'intake' | 'preview' | 'retell' | 'outbound' | 'activity';
+type Tab = 'clinic' | 'knowledge' | 'campaign' | 'intake' | 'preview' | 'retell' | 'outbound' | 'activity';
 
 const TABS: Array<{ id: Tab; label: string; icon: React.ElementType }> = [
   { id: 'clinic', label: 'Clinic Profile', icon: Building2 },
+  { id: 'knowledge', label: 'Knowledge', icon: BookOpen },
   { id: 'campaign', label: 'Agent & Campaign', icon: Megaphone },
   { id: 'intake', label: 'Intake Builder', icon: ListChecks },
   { id: 'preview', label: 'Preview', icon: Eye },
@@ -34,7 +39,7 @@ function isTab(value: string | null): value is Tab {
 
 export default function ReceptionistStudio() {
   const [searchParams, setSearchParams] = useSearchParams();
-  const [clinics, setClinics] = useState<Clinic[]>([]);
+  const [clinics, setClinics] = useState<ClinicRow[]>([]);
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [overview, setOverview] = useState<Overview | null>(null);
   const [activeClinicId, setActiveClinicId] = useState<string>('');
@@ -59,7 +64,7 @@ export default function ReceptionistStudio() {
   const closeCreateDialog = useCallback(() => setCreateDialog(null), []);
 
   const loadClinics = useCallback(async () => {
-    const [rows, ov] = await Promise.all([api.listClinics(), api.overview().catch(() => null)]);
+    const [rows, ov] = await Promise.all([receptionistClinicApi.listClinics(), api.overview().catch(() => null)]);
     setClinics(rows);
     if (ov) setOverview(ov);
     setActiveClinicId(prev => (prev && rows.some(r => r.id === prev) ? prev : rows[0]?.id ?? ''));
@@ -134,17 +139,9 @@ export default function ReceptionistStudio() {
       )}
 
       {createDialog === 'clinic' && (
-        <FormDialog
-          title="Create clinic"
-          message="Add the clinic identity and trusted inbound number used by receptionist configuration. No live provider is contacted."
-          submitLabel="Create clinic"
-          fields={[
-            { name: 'name', label: 'Clinic name', required: true, placeholder: 'Example Health' },
-            { name: 'phone', label: 'Trusted inbound phone number', type: 'tel', required: true, placeholder: '+12125550100', pattern: '\\+[1-9][0-9]{7,14}', help: 'Use E.164 format, including the country code.' },
-          ]}
+        <CreateClinicDialog
           onClose={closeCreateDialog}
-          onSubmit={async values => {
-            const clinic = await api.createClinic({ name: values.name, phone: values.phone });
+          onCreated={async clinic => {
             await loadClinics();
             setActiveClinicId(clinic.id);
             selectTab('clinic');
@@ -217,6 +214,13 @@ export default function ReceptionistStudio() {
                   <div className="min-w-0">
                     <p className="text-xs font-semibold text-t1 truncate">{clinic.name}</p>
                     <p className="text-[10px] text-t3 truncate">{clinic.locations?.length ?? 0} location{(clinic.locations?.length ?? 0) === 1 ? '' : 's'} · {clinic._count?.campaigns ?? 0} campaign{(clinic._count?.campaigns ?? 0) === 1 ? '' : 's'}</p>
+                    {(clinic.readiness?.blockers?.length ?? 0) > 0 && (
+                      <p className="mt-1 flex flex-wrap gap-1" aria-label={`${clinic.name} activation blockers`}>
+                        {clinic.readiness!.blockers.map(blocker => (
+                          <span key={blocker} className="badge badge-amber text-[9px]">{blockerLabel(blocker)}</span>
+                        ))}
+                      </p>
+                    )}
                   </div>
                 </button>
               ))}
@@ -289,6 +293,11 @@ export default function ReceptionistStudio() {
             >
             {tab === 'clinic' && activeClinic && (
               <ClinicPanel key={activeClinic.id} clinic={activeClinic} onChanged={loadClinics} />
+            )}
+            {tab === 'knowledge' && (
+              activeClinic
+                ? <div key={activeClinic.id} className="space-y-4"><KnowledgePanel clinic={activeClinic} /><LocalePackPanel clinic={activeClinic} /></div>
+                : <EmptyState text="Create a clinic profile first to teach the agent what it may say." />
             )}
             {tab === 'campaign' && activeClinic && (
               activeCampaign ? (
