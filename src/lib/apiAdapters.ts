@@ -1,5 +1,6 @@
 import type { Appointment, Campaign, Doctor, Integration, InventoryItem, LabOrder, Lead, Opportunity, Patient, RevenueData, RevenueLeak } from '../types';
 import { apiRequest } from './api';
+import { isRestrictedView, receptionistViewFromMetadata, type ReceptionistTaskInfo, type TaskOutcomeCode } from './frontDesk';
 
 /**
  * Reads a list endpoint, accepting both shapes the API uses: a bare array and
@@ -197,10 +198,23 @@ export interface ApiStaffTask {
   assignedToId?: string | null;
   priority: string;
   dueAt?: string | null;
+  createdAt?: string;
   status: 'OPEN' | 'IN_PROGRESS' | 'COMPLETED' | 'CANCELED';
   branch?: { name: string } | null;
   assignedTo?: { displayName: string } | null;
   metadata?: Record<string, unknown> | null;
+  // C4 receptionist contract (design-C4 §1.5). Every field is optional so a
+  // pre-C4 row still maps; the receptionist view is then derived from metadata.
+  acknowledgedAt?: string | null;
+  acknowledgedBy?: { displayName: string } | null;
+  completedAt?: string | null;
+  outcomeCode?: TaskOutcomeCode | null;
+  outcomeNote?: string | null;
+  callLogId?: string | null;
+  patientId?: string | null;
+  patient?: { firstName: string; lastName: string; nextAppointmentAt?: string | null } | null;
+  clinic?: { id: string; name: string; timezone: string } | null;
+  receptionist?: ReceptionistTaskInfo | null;
 }
 
 /** Human label for the control that filed a hand-off task, or null for a task typed by hand. */
@@ -520,6 +534,7 @@ export function mapStaffTask(row: ApiStaffTask) {
   const dueAt = row.dueAt ? new Date(row.dueAt) : undefined;
   const status = row.status.toLowerCase().replace('_', '-') as 'open' | 'in-progress' | 'completed' | 'canceled';
   const workflow = typeof row.metadata?.workflow === 'string' ? row.metadata.workflow : null;
+  const receptionist = row.receptionist ?? receptionistViewFromMetadata(row.metadata, row.createdAt);
   return {
     id: row.id,
     title: row.title,
@@ -529,13 +544,27 @@ export function mapStaffTask(row: ApiStaffTask) {
     // is untouched.
     priority: row.priority.toLowerCase(),
     dueAt: dueAt ?? null,
+    createdAt: row.createdAt ?? null,
     // Only a live task can be overdue — a finished one is not work in arrears.
     overdue: Boolean(dueAt && dueAt < new Date() && (status === 'open' || status === 'in-progress')),
-    due: dueAt ? dueAt.toLocaleString() : 'No due date',
+    // No `due` string here: the page formats `dueAt` in the CLINIC's zone
+    // (`formatClinicDateTime(task.dueAt, task.clinic?.timezone)`), not the viewer's.
     assignedToId: row.assignedToId ?? null,
     assignee: row.assignedTo?.displayName ?? null,
     origin: workflow ? HANDOFF_ORIGIN_LABEL[workflow] ?? workflow.replace(/_/g, ' ') : null,
     status,
+    rawStatus: row.status,
+    acknowledgedAt: row.acknowledgedAt ?? null,
+    acknowledgedBy: row.acknowledgedBy?.displayName ?? null,
+    completedAt: row.completedAt ?? null,
+    outcomeCode: row.outcomeCode ?? null,
+    outcomeNote: row.outcomeNote ?? null,
+    callLogId: row.callLogId ?? (typeof row.metadata?.callLogId === 'string' ? row.metadata.callLogId : null),
+    patientId: row.patientId ?? null,
+    patient: row.patient ?? null,
+    clinic: row.clinic ?? null,
+    receptionist,
+    restricted: isRestrictedView(receptionist),
   };
 }
 

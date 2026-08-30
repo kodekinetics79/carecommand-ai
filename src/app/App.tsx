@@ -19,6 +19,7 @@ const ClinicRadar = lazy(() => import('../pages/ClinicRadar'));
 const Autopilot = lazy(() => import('../pages/Autopilot'));
 const CRM = lazy(() => import('../pages/CRM'));
 const AIReceptionist = lazy(() => import('../pages/AIReceptionist'));
+const FrontDesk = lazy(() => import('../pages/FrontDesk'));
 const ReceptionistStudio = lazy(() => import('../pages/ReceptionistStudio'));
 const Scheduling = lazy(() => import('../pages/Scheduling'));
 const Patients = lazy(() => import('../pages/Patients'));
@@ -172,6 +173,7 @@ export default function App() {
           <Route path="/benchmarking" element={<ClinicRadar />} />
           <Route path="/autopilot" element={<Autopilot />} />
           <Route path="/crm" element={<CRM />} />
+          <Route path="/front-desk" element={<FrontDesk />} />
           <Route path="/ai-receptionist" element={<AIReceptionist />} />
           <Route path="/receptionist-studio" element={<ReceptionistStudio />} />
           <Route path="/scheduling" element={<Scheduling />} />
