@@ -47,3 +47,29 @@ Package A escalated this rather than deciding it alone, which was right.
 **What it costs.** BYO becomes a configuration path, not a go-live path, for the pilot. Given decision 1 (CareCommand owns the deployment), that is the supported route anyway. If a customer needs BYO inbound later, the honest unlock is provider-side prompt attestation, not a downgraded check.
 
 **Not yet implemented** — one line in `campaignReadiness.ts` plus a remediation entry and a test. It is the only open item from the day-2 defect sweep.
+
+---
+
+## Decisions 10–12 — the caller-safety escalations (2026-08-30)
+
+The safety engineer escalated three calls rather than making them silently. All three are settled here.
+
+### 10. The closing AI disclosure is blocking for EVERY clinic, not only US ones — CONFIRMED
+The engineer went beyond the spec (which scoped it to California's AB 3030) and made `closing_disclosure_present` blocking universally. That is the right instinct and it stands. "You have been speaking with an AI, and here is how to reach a person" is not a Californian courtesy; it is the minimum a patient is owed by a line that just handled their health. A per-country gate is also a trap: it goes invisible on the day a group opens a Californian site, and nobody re-reads a readiness rule they have never seen fail.
+
+Cost, stated honestly: a UK-only pilot must re-approve its locale pack to satisfy a US statute. That is a thirty-second act, once. Accepted.
+
+Note the check has real teeth — it reads `backfilledKeys`, so a pack whose closing line arrived by platform backfill FAILS. The clinic's evidence hash would not cover words the clinic never approved, and an attestation that looks plausible without being real is exactly the class of defect this programme exists to remove.
+
+### 11. Repeat-caller detection counts calls minus bookings — CONFIRMED, thresholds provisional
+The spec said "three or more calls with no resolution". The engineer implemented count-minus-bookings because "resolution" has no definition the product can currently evaluate, and correctly refused to count a taken message as resolution — a message is not a resolution until somebody proves the callback happened, and counting it would hide the exact failure the detector exists to find.
+
+The three-calls-in-six-hours thresholds are provisional and must be checked against real pilot volumes before alarm fatigue sets in. Excluding calls that ended BOOKED is right: a family booking three appointments on one number in a morning is the product working.
+
+### 12. "Human only" requires a linked patient record — ACCEPTED as a known limitation
+A caller we cannot tie to a patient cannot be protected by the flag, and that is arguably the population most likely to need it. The alternative — a phone-number-scoped flag with no patient behind it — is a different object with its own retention and subject-access obligations, and inventing it at speed would be worse than naming the gap.
+
+Accepted for the pilot, on two conditions: the limitation goes in the KNOWN LIMITATIONS register rather than living only in a commit message, and the repeat-caller detector (decision 11) partially covers the unlinked case by routing to a human before anything is spoken. Revisit with the DPO before general availability.
+
+### Also fixed, and worth recording as a defect not a feature
+`emergency_path_reachable` was previously folded into `transfer_target_distinct` as a **warn** — and `warn` never blocks activation. A clinic with no human fallback number could therefore go live with its emergency path pointing at nothing but a 20-second in-app poll. It is now its own blocking check, because "would a transfer loop back to the agent" and "can an emergency reach a human today" are different questions and an operator deserves to see the second one asked.
