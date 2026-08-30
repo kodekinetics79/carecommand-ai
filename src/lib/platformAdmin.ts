@@ -205,6 +205,10 @@ export const platformAdmin = {
   removeAddon: (id: string, addonKey: string) => pf<TenantSummary>(`/v1/platform/tenants/${id}/addons/${addonKey}`, { method: 'DELETE' }),
   overrideEntitlement: (id: string, featureKey: string, enabled: boolean) => pf<unknown>(`/v1/platform/tenants/${id}/entitlements/${featureKey}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
   plans: () => pf<Array<{ key: string; name: string; monthlyPrice: number; features: string[] }>>(`/v1/platform/subscriptions/plans`),
+  setPlanPrice: (planKey: string, monthlyPrice: number | null, reason: string) =>
+    pf<{ key: string; monthlyPrice: number; tenantsRepriced: number }>(`/v1/platform/subscriptions/plans/${planKey}`, {
+      method: 'PATCH', body: JSON.stringify({ monthlyPrice, reason }),
+    }),
   addons: () => pf<Array<{ key: string; name: string; featureKey: string | null }>>(`/v1/platform/subscriptions/addons`),
   requests: (status?: string) => pf<Array<{ id: string; tenantName: string; requestType: string; status: string; requestedPlanKey: string | null; createdAt: string }>>(`/v1/platform/subscription-requests${status ? `?status=${status}` : ''}`),
   approveRequest: (id: string) => pf<{ status: string }>(`/v1/platform/subscription-requests/${id}/approve`, { method: 'POST' }),

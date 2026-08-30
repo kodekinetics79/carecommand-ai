@@ -136,7 +136,7 @@ export default function PlatformConsole() {
           {section === 'tenants' && <TenantsTab canManage={canManage} onOpenTenant={openTenant} />}
           {section === 'pilot' && <PlatformPilot />}
           {section === 'requests' && <RequestsTab />}
-          {section === 'plans' && <PlansSection />}
+          {section === 'plans' && <PlansSection canManage={canManage} />}
           {section === 'entitlements' && <TenantPicker title="Feature entitlements" subtitle={`Open a tenant to toggle any of the ${Object.keys(FEATURE_LABELS).length} premium features (platform override)`} hint="features" onOpenTenant={openTenant} />}
           {section === 'operators' && <UsersTab canManage={canManage} />}
           {section === 'health' && <SystemStatus expanded />}
@@ -188,19 +188,64 @@ function OverviewSection({ overview, onGo }: { overview: Overview | null; onGo: 
   );
 }
 
-function PlansSection() {
+function PlansSection({ canManage }: { canManage: boolean }) {
   const [plans, setPlans] = useState<Array<{ key: string; name: string; monthlyPrice: number; features: string[] }>>([]);
   const [addons, setAddons] = useState<Array<{ key: string; name: string; featureKey: string | null }>>([]);
+  const [editing, setEditing] = useState<string | null>(null);
+  const [price, setPrice] = useState('');
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ tone: 'ok' | 'bad'; text: string } | null>(null);
+
+  async function reloadPlans() { setPlans(await platformAdmin.plans().catch(() => [])); }
+  async function savePrice(planKey: string) {
+    setBusy(true); setMsg(null);
+    try {
+      const result = await platformAdmin.setPlanPrice(planKey, price.trim() === '' ? null : Number(price), reason.trim());
+      await reloadPlans();
+      setEditing(null); setPrice(''); setReason('');
+      setMsg({ tone: 'ok', text: result.tenantsRepriced > 0
+        ? `Saved. ${result.tenantsRepriced} tenant${result.tenantsRepriced === 1 ? '' : 's'} on this plan had their MRR updated.`
+        : 'Saved. No tenants are on this plan yet.' });
+    } catch (e) {
+      setMsg({ tone: 'bad', text: e instanceof Error ? e.message : 'Could not set the price' });
+    } finally { setBusy(false); }
+  }
   useEffect(() => { let a = true; void (async () => { const [p, ad] = await Promise.all([platformAdmin.plans().catch(() => []), platformAdmin.addons().catch(() => [])]); if (a) { setPlans(p); setAddons(ad); } })(); return () => { a = false; }; }, []);
   return (
     <div className="space-y-4">
-      <Panel title="Plans" subtitle="Subscription tiers and included features (catalog-driven)">
+      <Panel title="Plans" subtitle="Subscription tiers, their included features, and what they cost">
+        {msg && <p className={`mb-3 text-[12px] ${msg.tone === 'ok' ? 'text-emerald-v' : 'text-red-v'}`} role="status">{msg.text}</p>}
         <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3">
           {plans.map(p => (
             <div key={p.key} className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
-              <div className="flex items-center justify-between"><p className="text-sm font-bold text-t1">{p.name}</p><span className="text-[11px] font-semibold text-indigo">${p.monthlyPrice}/mo</span></div>
+              <div className="flex items-center justify-between">
+                <p className="text-sm font-bold text-t1">{p.name}</p>
+                {/* An unpriced plan says so. Rendering $0 made every tenant's
+                    MRR look like a real number that happened to be zero. */}
+                <span className={`text-[11px] font-semibold ${p.monthlyPrice > 0 ? 'text-indigo' : 'text-amber-v'}`}>
+                  {p.monthlyPrice > 0 ? `$${p.monthlyPrice}/mo` : 'no price set'}
+                </span>
+              </div>
               <p className="text-[10px] text-t3 mt-1">{p.features.length} features</p>
               <div className="mt-2 flex flex-wrap gap-1">{p.features.slice(0, 6).map(f => <span key={f} className="badge badge-blue text-[9px]">{FEATURE_LABELS[f] ?? f}</span>)}</div>
+              {canManage && (editing === p.key ? (
+                <div className="mt-3 space-y-2">
+                  <input aria-label={`Monthly price for ${p.name}`} value={price} onChange={e => setPrice(e.target.value.replace(/[^0-9.]/g, ''))} placeholder="0.00"
+                    className="w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-2 py-1 text-xs text-t1 outline-none" />
+                  <input aria-label={`Reason for repricing ${p.name}`} value={reason} onChange={e => setReason(e.target.value)} placeholder="Reason (recorded)"
+                    className="w-full rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-2 py-1 text-xs text-t1 outline-none" />
+                  <div className="flex gap-1.5">
+                    <button type="button" disabled={busy || reason.trim().length < 3} onClick={() => void savePrice(p.key)}
+                      className="rounded-lg bg-[var(--indigo)] px-2.5 py-1 text-[11px] font-semibold text-white disabled:opacity-50">{busy ? '…' : 'Save price'}</button>
+                    <button type="button" onClick={() => { setEditing(null); setReason(''); setPrice(''); }}
+                      className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-t2">Cancel</button>
+                  </div>
+                </div>
+              ) : (
+                <button type="button" onClick={() => { setEditing(p.key); setPrice(p.monthlyPrice ? String(p.monthlyPrice) : ''); setMsg(null); }}
+                  className="mt-3 text-[11px] font-semibold text-indigo hover:underline">Set price</button>
+              ))}
             </div>
           ))}
         </div>

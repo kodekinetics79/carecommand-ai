@@ -190,3 +190,105 @@ describe('platform tenant provisioning', () => {
     }, 60_000);
   });
 });
+
+/**
+ * The price book.
+ *
+ * SubscriptionPlan.monthlyPrice was never written by anything: the catalog
+ * migration deliberately refuses to own commercial terms, and no route set it.
+ * So every plan rendered $0/mo and every tenant's MRR and ARR were structurally
+ * zero across the whole book of business.
+ */
+describe('platform price book', () => {
+  let app: FastifyInstance;
+  const adminId = randomUUID();
+  const billingId = randomUUID();
+  const supportId = randomUUID();
+  const suffix = randomUUID().slice(0, 8);
+  const created: string[] = [];
+  let originalPrice: number | null = null;
+
+  const auth = (id: string, role: string) => ({
+    authorization: `Bearer ${signPlatformToken(app, { id, role })}`,
+    'content-type': 'application/json',
+  });
+
+  beforeAll(async () => {
+    app = await buildApp();
+    const hash = await generatePasswordHash('Price-book-password-2026!');
+    for (const [id, role] of [[adminId, 'PLATFORM_ADMIN'], [billingId, 'PLATFORM_BILLING'], [supportId, 'PLATFORM_SUPPORT']] as const) {
+      await db.platformUser.create({ data: { id, email: `price-${id.slice(0, 8)}@carecommand.test`, name: `Price ${role}`, passwordHash: hash, role, status: 'active' } });
+    }
+    originalPrice = (await db.subscriptionPlan.findUniqueOrThrow({ where: { key: 'starter' } })).monthlyPrice === null
+      ? null
+      : Number((await db.subscriptionPlan.findUniqueOrThrow({ where: { key: 'starter' } })).monthlyPrice);
+  }, 90_000);
+
+  afterAll(async () => {
+    await db.subscriptionPlan.updateMany({ where: { key: 'starter' }, data: { monthlyPrice: originalPrice } });
+    for (const tenantId of created) {
+      await db.tenant.updateMany({ where: { id: tenantId }, data: { status: 'cancelled', name: 'ZZ test fixture (price book)' } });
+    }
+    await db.platformAuditEvent.deleteMany({ where: { platformUserId: { in: [adminId, billingId, supportId] } } });
+    await db.platformUser.deleteMany({ where: { id: { in: [adminId, billingId, supportId] } } });
+    await app.close();
+  });
+
+  it('refuses a price change from a read-only role, and demands a reason', async () => {
+    const readOnly = await app.inject({
+      method: 'PATCH', url: '/v1/platform/subscriptions/plans/starter',
+      headers: auth(supportId, 'PLATFORM_SUPPORT'), payload: { monthlyPrice: 199, reason: 'Attempted by support' },
+    });
+    expect(readOnly.statusCode).toBe(403);
+
+    const noReason = await app.inject({
+      method: 'PATCH', url: '/v1/platform/subscriptions/plans/starter',
+      headers: auth(billingId, 'PLATFORM_BILLING'), payload: { monthlyPrice: 199 },
+    });
+    expect(noReason.statusCode).toBe(400);
+  });
+
+  it('404s for a plan that does not exist', async () => {
+    const res = await app.inject({
+      method: 'PATCH', url: '/v1/platform/subscriptions/plans/not-a-plan',
+      headers: auth(adminId, 'PLATFORM_ADMIN'), payload: { monthlyPrice: 10, reason: 'Testing an unknown plan' },
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('sets a price and moves the MRR of every tenant already on that plan', async () => {
+    const create = await app.inject({
+      method: 'POST', url: '/v1/platform/tenants', headers: auth(adminId, 'PLATFORM_ADMIN'),
+      payload: {
+        name: 'Priced Clinic', slug: `priced-${suffix}`,
+        ownerName: 'Dr Price', ownerEmail: `owner-price-${suffix}@clinic.test`,
+        ownerPassword: 'Price-book-password-2026!', planKey: 'starter',
+      },
+    });
+    expect(create.statusCode).toBe(201);
+    const tenantId = create.json().tenant.id as string;
+    created.push(tenantId);
+
+    // Materialise the billing row the way the console does.
+    const before = await app.inject({ method: 'GET', url: `/v1/platform/tenants/${tenantId}/billing`, headers: auth(adminId, 'PLATFORM_ADMIN') });
+    expect(before.statusCode).toBe(200);
+
+    const priced = await app.inject({
+      method: 'PATCH', url: '/v1/platform/subscriptions/plans/starter',
+      headers: auth(billingId, 'PLATFORM_BILLING'), payload: { monthlyPrice: 249, reason: 'Setting the published Starter price' },
+    });
+    expect(priced.statusCode).toBe(200);
+    expect(priced.json().monthlyPrice).toBe(249);
+    expect(priced.json().tenantsRepriced).toBeGreaterThan(0);
+
+    const after = await app.inject({ method: 'GET', url: `/v1/platform/tenants/${tenantId}/billing`, headers: auth(adminId, 'PLATFORM_ADMIN') });
+    expect(after.json().mrr).toBe(249);
+    expect(after.json().arr).toBe(249 * 12);
+  }, 60_000);
+
+  it('records who repriced it and why, without needing the console to remember', async () => {
+    const events = await db.platformAuditEvent.findMany({ where: { action: 'plan.price.changed', platformUserId: billingId } });
+    expect(events.length).toBeGreaterThan(0);
+    expect(JSON.stringify(events[0].metadata)).toMatch(/Starter price/i);
+  });
+});

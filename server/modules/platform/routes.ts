@@ -207,6 +207,11 @@ async function applySubscriptionChange(
     }
   }
   await recomputeEntitlements(tenantId, client);
+  // Move the money with the plan. The billing row copied a price once, lazily,
+  // on first read and was never touched again, so upgrading a tenant from
+  // Starter to Enterprise left the console reporting Starter's MRR forever.
+  const pricedPlan = await client.subscriptionPlan.findUnique({ where: { id: planId }, select: { monthlyPrice: true } });
+  await client.tenantBilling.updateMany({ where: { tenantId }, data: { mrr: Number(pricedPlan?.monthlyPrice ?? 0) } });
   return subscription;
 }
 
@@ -283,6 +288,52 @@ export const platformRoutes: FastifyPluginAsync = async app => {
   app.get('/subscriptions/plans', async () => {
     const plans = await db.subscriptionPlan.findMany({ orderBy: { monthlyPrice: 'asc' }, include: { features: true } });
     return plans.map(p => ({ key: p.key, name: p.name, monthlyPrice: Number(p.monthlyPrice ?? 0), features: p.features.map(f => f.featureKey) }));
+  });
+
+  /**
+   * Set a plan's price.
+   *
+   * The catalog migration deliberately never wrote `monthlyPrice` - reference
+   * data should not carry commercial terms - but nothing else wrote it either,
+   * so every plan rendered $0/mo and every tenant's MRR and ARR were
+   * structurally zero across the whole book of business. This is the missing
+   * write: platform-only, audited, and the one place a price is decided.
+   */
+  app.patch('/subscriptions/plans/:planKey', { preHandler: subscriptionManage }, async (request, reply) => {
+    const { planKey } = z.object({ planKey: z.string().min(1).max(40) }).parse(request.params);
+    const body = z.object({
+      monthlyPrice: z.number().min(0).max(1_000_000).nullable(),
+      reason: reasonSchema,
+    }).parse(request.body);
+
+    const plan = await db.subscriptionPlan.findUnique({ where: { key: planKey } });
+    if (!plan) return reply.code(404).send({ error: 'not_found', message: 'Unknown plan' });
+
+    const updated = await runPlatformAuditedMutation(request, {
+      action: 'plan.price.changed',
+      target: { type: 'plan', id: planKey },
+      metadata: { reason: body.reason, from: Number(plan.monthlyPrice ?? 0), to: body.monthlyPrice },
+    }, async tx => {
+      const saved = await tx.subscriptionPlan.update({ where: { key: planKey }, data: { monthlyPrice: body.monthlyPrice } });
+      // A price is only real once it reaches the tenants on that plan. Billing
+      // rows copied the price once, lazily, on first read and were never
+      // updated again - so a repriced plan left every existing customer's MRR
+      // reporting the old number forever.
+      const subscriptions = await tx.tenantSubscription.findMany({ where: { planId: saved.id }, select: { tenantId: true } });
+      if (subscriptions.length) {
+        await tx.tenantBilling.updateMany({
+          where: { tenantId: { in: subscriptions.map(row => row.tenantId) } },
+          data: { mrr: body.monthlyPrice ?? 0 },
+        });
+      }
+      return { saved, repriced: subscriptions.length };
+    });
+
+    return {
+      key: updated.saved.key,
+      monthlyPrice: Number(updated.saved.monthlyPrice ?? 0),
+      tenantsRepriced: updated.repriced,
+    };
   });
 
   app.get('/subscriptions/addons', async () => {
