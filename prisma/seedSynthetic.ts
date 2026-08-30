@@ -116,7 +116,12 @@ const callOutcomes = ['IN_PROGRESS', 'BOOKED', 'NOT_INTERESTED', 'NO_ANSWER', 'V
 async function seed(): Promise<void> {
   const existingTenantCount = await db.tenant.count();
   if (existingTenantCount !== 0) {
-    throw new Error(`Disposable target is not empty (${existingTenantCount} tenants); drop and recreate it instead of deleting audit history`);
+    throw new Error([
+      `Disposable target is not empty (${existingTenantCount} tenants); drop and recreate it instead of deleting audit history.`,
+      'If this came from demoReadiness.integration.test.ts: that suite seeds a whole database, so it needs one nothing else has',
+      'written to. Run it on its own — `npm run demo:verify` — rather than appended to a batch of integration suites that share',
+      'a single disposable database and leave their tenants behind.',
+    ].join(' '));
   }
 
   const passwordHash = deterministicPasswordHash('SyntheticOnly!2026');

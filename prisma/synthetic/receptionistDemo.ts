@@ -80,6 +80,47 @@ function intakeFields(campaignId: string, tenantId: string, stableUuid: (scope: 
   }));
 }
 
+/**
+ * One inbound call that reached a specific published deployment. The four
+ * `boundProvider*` columns are written together (a database CHECK enforces it)
+ * and are taken from the agent's verified provider evidence — exactly what the
+ * inbound webhook stamps when a real caller reaches the line.
+ */
+async function stampProvenTestCall(
+  db: PrismaClient,
+  input: { deploymentId: string; agentId: string; demoClock: Date },
+): Promise<void> {
+  const deployment = await db.receptionistAgentDeployment.findUnique({
+    where: { id: input.deploymentId },
+    select: { tenantId: true, clinicId: true, campaignId: true, publishedAt: true },
+  });
+  const agent = await db.receptionistAgent.findUnique({
+    where: { id: input.agentId },
+    select: { providerAgentId: true, providerVersion: true, providerConfigRevision: true, providerFingerprint: true },
+  });
+  if (!deployment || !agent?.providerAgentId || agent.providerVersion === null || !agent.providerFingerprint) return;
+  const at = new Date(Math.max((deployment.publishedAt ?? input.demoClock).getTime() + 60_000, input.demoClock.getTime() - 3_600_000));
+  await db.receptionistCallLog.create({
+    data: {
+      tenantId: deployment.tenantId,
+      clinicId: deployment.clinicId,
+      campaignId: deployment.campaignId,
+      direction: 'inbound',
+      callerName: 'Staff test call',
+      outcome: 'BOOKED',
+      durationSeconds: 38,
+      boundProviderAgentId: agent.providerAgentId,
+      boundProviderAgentVersion: agent.providerVersion,
+      boundProviderConfigRevision: agent.providerConfigRevision,
+      boundProviderFingerprint: agent.providerFingerprint,
+      startedAt: at,
+      endedAt: new Date(at.getTime() + 38_000),
+      createdAt: at,
+      updatedAt: at,
+    },
+  });
+}
+
 export async function seedReceptionistDemo(ctx: ReceptionistDemoContext): Promise<ReceptionistDemoCounts> {
   const { db, now, demoClock, stableUuid } = ctx;
   const counts: ReceptionistDemoCounts = {
@@ -153,13 +194,25 @@ export async function seedReceptionistDemo(ctx: ReceptionistDemoContext): Promis
     await db.receptionistIntakeField.createMany({ data: fields });
     counts.intakeFields += fields.length;
 
-    // Readiness requires the appointment type to be a real catalogue service.
+    // Readiness requires the appointment type to be a real catalogue service —
+    // and one the practice has marked BOOKABLE BY VOICE. The column defaults to
+    // false, and the deployed prompt says "Not bookable on this call: take a
+    // message instead" for everything that is not flagged, so a demo seeded
+    // without the flag is a demo of a receptionist that refuses every booking.
     const existingService = await db.serviceCatalogItem.findFirst({ where: { tenantId, name: APPOINTMENT_TYPE }, select: { id: true } });
-    if (!existingService) {
+    if (existingService) {
+      await db.serviceCatalogItem.update({
+        where: { id: existingService.id },
+        data: { active: true, bookableByVoice: true, voiceDurationMinutes: 30, updatedAt: now },
+      });
+    } else {
       await db.serviceCatalogItem.create({ data: {
         id: stableUuid('receptionist-service', index),
         tenantId, name: APPOINTMENT_TYPE, category: 'general',
-        defaultDurationMinutes: 30, active: true, createdAt: now, updatedAt: now,
+        defaultDurationMinutes: 30, voiceDurationMinutes: 30,
+        spokenDescription: 'A first visit, about half an hour, to talk through what you need.',
+        bookableByVoice: true, priceFrom: 95,
+        active: true, createdAt: now, updatedAt: now,
       } });
       counts.services += 1;
     }
@@ -265,6 +318,18 @@ export async function seedReceptionistDemo(ctx: ReceptionistDemoContext): Promis
         continue;
       }
       counts.verifiedAgents += 1;
+
+      // Proof the line works, recorded the way a real one is: AFTER the
+      // deployment published, stamped with the exact provider agent and
+      // version that answered, and with a duration that means somebody spoke.
+      // The historical rows above are call HISTORY for the front desk; this is
+      // the evidence `test_call_completed` is about, and it self-resets on the
+      // next deploy, which is what the Go-live card promises.
+      await stampProvenTestCall(db, {
+        deploymentId: result.deploy.deployment.id,
+        agentId: result.deploy.deployment.agentId,
+        demoClock,
+      });
 
       // Activation goes through the same readiness gate an operator hits, so a
       // demo tenant cannot be activated on configuration a real one could not.
