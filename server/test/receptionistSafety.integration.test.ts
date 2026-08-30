@@ -5,6 +5,7 @@ import { fixtureDb as db } from './helpers/fixtureDb';
 import { handleAgentTool } from '../lib/receptionist/liveTools';
 import { runWithWebhookTenantContext } from '../lib/tenantContext';
 import { buildRetellConfig, generateSystemPrompt, type PromptConfig } from '../modules/receptionist/promptService';
+import { PLATFORM_LOCALE_PACKS, platformLocalePackHash } from '../lib/receptionist/localePacks/defaults';
 import { promptFixture } from './fixtures/receptionistPromptConfigs';
 import { EN_US } from './fixtures/receptionistPackStrings';
 
@@ -21,6 +22,25 @@ async function makeTenant() {
   await db.tenant.create({ data: { id, name: `safety-${id.slice(0, 6)}`, slug: `safety-${id.slice(0, 8)}` } });
   const branch = await db.branch.create({ data: { tenantId: id, name: 'Main', location: 'Test', active: true } });
   return { id, branchId: branch.id };
+}
+
+/** A US call log with an approved en-US pack, so the tool can resolve wording. */
+async function registerUsCall(tenantId: string, callId: string) {
+  const platform = PLATFORM_LOCALE_PACKS.find(pack => pack.language === 'en-US' && pack.country === 'US')!;
+  const user = await db.user.create({ data: { tenantId, role: 'OWNER', active: true, email: `owner-${randomUUID().slice(0, 8)}@safety.test`, displayName: 'Owner' }, select: { id: true } });
+  const pack = await db.receptionistLocalePack.create({
+    data: {
+      tenantId, language: 'en-US', country: 'US', version: 1, status: 'APPROVED', source: 'platform_default',
+      baseDefaultVersion: platform.version, strings: platform.strings as never,
+      evidenceHash: platformLocalePackHash(platform), approvedByUserId: user.id, approvedAt: new Date(),
+    },
+    select: { id: true },
+  });
+  const clinic = await db.receptionistClinic.create({
+    data: { tenantId, name: `Safety clinic ${randomUUID().slice(0, 8)}`, phone: `+1${(BigInt(`0x${randomUUID().replace(/-/g, '').slice(0, 14)}`) % 10_000_000_000n).toString().padStart(10, '0')}`, country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' },
+    select: { id: true },
+  });
+  await db.receptionistCallLog.create({ data: { tenantId, clinicId: clinic.id, retellCallId: callId, direction: 'inbound', localePackId: pack.id, startedAt: new Date() } });
 }
 
 afterAll(async () => {
@@ -96,8 +116,12 @@ describe('AI receptionist safety workflows', () => {
 
   it('creates a critical operational signal and directs an emergency caller not to wait for staff', async () => {
     const tenant = await makeTenant();
+    // The emergency number is jurisdictional, so it is resolved from the pack
+    // bound to this call's clinic rather than assumed.
+    const callId = `call-${randomUUID()}`;
+    await registerUsCall(tenant.id, callId);
     const result = await trustedTool(
-      { tenantId: tenant.id, callId: `call-${randomUUID()}`, callerPhone: '+12125550166' },
+      { tenantId: tenant.id, callId, callerPhone: '+12125550166' },
       'report_emergency',
       { reason_category: 'possible_emergency', message: 'Caller described possible emergency symptoms.' },
     ) as Record<string, unknown>;

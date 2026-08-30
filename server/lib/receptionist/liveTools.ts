@@ -515,7 +515,8 @@ export async function listUpcomingAppointments(ctx: ToolContext) {
     select: { id: true, startsAt: true, service: true, branch: { select: { timezone: true } } },
   });
   await auditLive(ctx.tenantId, 'receptionist.appointments.listed', ctx.callId, { count: rows.length, via: 'verified_live_call' });
-  const appointments = rows.map(row => ({ appointment_id: row.id, service: row.service, starts_at: row.startsAt.toISOString(), spoken_time: localAppointmentLabel(row.startsAt, row.branch.timezone) }));
+  const locale = await callLocaleFormat(ctx);
+  const appointments = rows.map(row => ({ appointment_id: row.id, service: row.service, starts_at: row.startsAt.toISOString(), spoken_time: localAppointmentLabel(row.startsAt, row.branch.timezone, locale) }));
   return { verified: true, appointments, message: appointments.length ? `I found ${appointments.length} upcoming appointment${appointments.length === 1 ? '' : 's'}.` : 'I do not see an upcoming appointment that can be changed automatically.' };
 }
 
@@ -581,7 +582,7 @@ export async function prepareAppointmentChange(ctx: ToolContext, args: Record<st
     if (conflict) return { prepared: false, message: 'That time is no longer available. Please choose another.' };
     change.appointmentDate = appointmentDate;
     change.appointmentTime = appointmentTime;
-    spokenChange = `reschedule it to ${localAppointmentLabel(startsAt, appt.branch.timezone)}`;
+    spokenChange = `reschedule it to ${localAppointmentLabel(startsAt, appt.branch.timezone, await callLocaleFormat(ctx))}`;
   }
 
   const token = randomUUID();
@@ -679,7 +680,7 @@ export async function rescheduleAppointment(ctx: ToolContext, args: Record<strin
     appointment_id: appointmentId,
     starts_at: startsAt.toISOString(),
     deposit_review_pending: depositEvaluation === null,
-    message: `Your appointment is rescheduled to ${localAppointmentLabel(startsAt, appt.branch.timezone)}.${depositEvaluation === null ? ' Staff will review the deposit requirement separately.' : ''}`,
+    message: `Your appointment is rescheduled to ${localAppointmentLabel(startsAt, appt.branch.timezone, await callLocaleFormat(ctx))}.${depositEvaluation === null ? ' Staff will review the deposit requirement separately.' : ''}`,
   };
 }
 
@@ -1169,8 +1170,9 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
   if (result.kind === 'rejected') return { booked: false, needs_human: true, message: result.message };
   if (result.kind === 'review') return { booked: false, needs_review: true, duplicate: result.duplicate, appointment_request_id: result.requestId, message: result.message };
 
-  const localLabel = localAppointmentLabel(result.startsAt, result.timezone);
-  const timezoneLabel = new Intl.DateTimeFormat('en-US', {
+  const bookingLocale = await callLocaleFormat(ctx);
+  const localLabel = localAppointmentLabel(result.startsAt, result.timezone, bookingLocale);
+  const timezoneLabel = new Intl.DateTimeFormat(bookingLocale?.language ?? 'en-US', {
     timeZone: result.timezone,
     timeZoneName: 'long',
   }).formatToParts(result.startsAt).find(part => part.type === 'timeZoneName')?.value ?? result.timezone;

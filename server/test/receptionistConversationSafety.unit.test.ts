@@ -89,8 +89,9 @@ describe('AI receptionist conversation safety contract', () => {
   it('fails safely for unsupported insurance, payment, language, and accessibility requests', () => {
     const prompt = generateSystemPrompt(baseConfig);
 
-    expect(prompt).toMatch(/No insurance tool is available in this configuration/i);
-    expect(prompt).toMatch(/do not verify network status, eligibility, benefits, prior authorization, coverage, claim outcome, or patient responsibility/i);
+    expect(prompt).toMatch(/answer only from the accepted-plans list above/i);
+    expect(prompt).toMatch(/No insurance tool is available: do not verify eligibility/i);
+    expect(prompt).toMatch(/do not verify eligibility, benefits, network status, prior authorization, coverage, claim outcome, or patient responsibility/i);
     expect(prompt).toMatch(/no payment tool is available in this configuration/i);
     expect(prompt).toMatch(/Do not quote a balance as current, take a payment, create or send a payment link/i);
     expect(prompt).toMatch(/do not pretend fluency, translate clinical content yourself, or continue intake by guessing/i);

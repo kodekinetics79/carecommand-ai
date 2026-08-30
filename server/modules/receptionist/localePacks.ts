@@ -88,7 +88,7 @@ export const localePackRoutes: FastifyPluginAsync = async app => {
     const row = await runWithTenantContext(request.auth.tenantId, async tx => {
       await lockReceptionistConfiguration(tx, request.auth.tenantId);
       let base: LocalePackStrings;
-      let baseDefaultVersion: number | null = null;
+      let baseDefaultVersion: number | null;
       let source: 'platform_default' | 'tenant';
       if (input.from.kind === 'platform_default') {
         const platform = platformLocalePack(input.language, input.country);

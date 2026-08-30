@@ -7,6 +7,12 @@ import {
 import { buildRetellConfig, type PromptConfig } from '../modules/receptionist/promptService';
 import { promptFixture } from './fixtures/receptionistPromptConfigs';
 
+// A finished prompt still carries the runtime {{variables}} Retell substitutes
+// per call; only those are allowed to survive rendering.
+const RUNTIME_PLACEHOLDER = /\{\{\s*(is_open_now|hours_today|next_opening|closure_reason|emergency_number|known_first_name|human_fallback_number|admission_state|location_name|location_address|location_phone)\s*\}\}/g;
+const stripRuntimeVariables = (value: string) => value.replace(RUNTIME_PLACEHOLDER, '');
+
+
 const clinicId = '11111111-1111-4111-8111-111111111111';
 const campaignId = '22222222-2222-4222-8222-222222222222';
 const customId = '33333333-3333-4333-8333-333333333333';
@@ -136,7 +142,7 @@ describe('receptionist typed intake contract', () => {
     expect(exported.bookingFunction).toEqual(bookingTools[0]);
     expect(exported.intakeSchemaRevision).toBe(7);
     expect(exported.intakeToolFingerprint).toBe(bookAppointmentToolFingerprint(exported.bookingFunction));
-    expect(exported.systemPrompt).not.toMatch(/\{\{|\$\{/);
-    expect(JSON.stringify(exported)).not.toMatch(/\{\{|\$\{/);
+    expect(stripRuntimeVariables(exported.systemPrompt)).not.toMatch(/\{\{|\$\{/);
+    expect(stripRuntimeVariables(JSON.stringify(exported))).not.toMatch(/\{\{|\$\{/);
   });
 });
