@@ -1,9 +1,12 @@
 import type { Prisma } from '../../generated/prisma/client';
 import { isValidE164, toE164 } from '../campaigns';
+import { recordWorkflowEvent } from '../intelligence';
+import { runInTenantContext, runWithJobTenantContext } from '../tenantContext';
 import { agentReadinessReason } from './agentReadiness';
+import { clinicActivationState, type ClinicActivationBlocker } from './activationReadiness';
 import { confirmationChannelStatus } from './confirmationOutbox';
 import { campaignPromptConfig, deploymentChanges, planDeployment } from './retellDeploy';
-import { remediationFor, type ReadinessKey } from './remediation';
+import { remediationFor, READINESS_KEYS, type ReadinessKey } from './remediation';
 import { mandatoryOpeningDisclosure } from '../../modules/receptionist/promptService';
 import { retellConfigStatus } from '../retell';
 
@@ -18,6 +21,21 @@ import { retellConfigStatus } from '../retell';
 // Every check says what is wrong, and where to go and fix it. A check that
 // cannot be evaluated is `pending` and blocks — the receptionist does not go
 // live on a question mark.
+//
+// THE GATE INVARIANT (day-2 §6): no check may pass on a value CareCommand
+// itself wrote and never re-read. Check by check, what each one now reads:
+//   number_bound          a deployment row that actually bound the number, and
+//                         the number it bound. No deployment row, no pass —
+//                         a hand-linked agent is a `fail`, never a warn (B1).
+//   services_bookable     ServiceCatalogItem.bookableByVoice, the same column
+//                         the voice tool reads before it agrees to book (B2).
+//   provider_resolvable   the same "exactly one active provider at the branch"
+//                         rule `resolveSoleProvider` applies at call time (B3).
+//   test_call_completed   a call stamped with THIS deployment's agent and
+//                         version, placed after it published, that connected —
+//                         so it self-resets on every redeploy (B4).
+//   clinic_*/locale_pack  the clinic rows `clinicActivationState` reads, so the
+//                         activation 409s become guided checklist rows (B6).
 // ===========================================================================
 
 export type ReadinessStatus = 'pass' | 'fail' | 'warn' | 'pending';
@@ -30,6 +48,29 @@ export interface ReadinessCheck {
   title: string;
   detail: string;
   fixHref: string | null;
+  /**
+   * Whether a failure of this row gates activation. Exactly one list decides
+   * it (`NON_BLOCKING_READINESS_KEYS`), and `readiness.ready`,
+   * `actions.activate.allowed` and `transitionCampaign` all read that one list
+   * — so the badge, the button and the gate can no longer disagree (B5).
+   */
+  blocking: boolean;
+}
+
+/**
+ * B5 — the one gate.
+ *
+ * `intake_attested` is reported but does not gate. The attestation performed
+ * inside the ACTIVE transition IS that check, and it is strictly sharper: it
+ * separates unattested from mismatched from not-strict, where readiness can
+ * only say "not attested". It also cannot gate: the attested revision is
+ * written BY activation, so a campaign that has never been activated can never
+ * satisfy it, and counting it would make the first activation impossible.
+ */
+export const NON_BLOCKING_READINESS_KEYS: readonly ReadinessKey[] = ['intake_attested'];
+
+function gates(key: ReadinessKey): boolean {
+  return !NON_BLOCKING_READINESS_KEYS.includes(key);
 }
 
 export interface ReadinessActions {
@@ -49,6 +90,10 @@ export interface ReadinessResponse {
 }
 
 const LABELS: Record<ReadinessKey, string> = {
+  clinic_country_set: 'The clinic has a country',
+  clinic_hours_set: 'The clinic has opening hours',
+  locale_pack_approved: 'An approved locale pack covers this clinic',
+  agent_language_supported: 'The agent speaks a supported language',
   agent_linked: 'An agent is assigned',
   agent_verified: 'The agent is verified with Retell',
   deployment_current: 'The deployed prompt matches this campaign',
@@ -56,6 +101,7 @@ const LABELS: Record<ReadinessKey, string> = {
   location_mapped: 'A location is mapped to a scheduling branch',
   services_bookable: 'The appointment type is bookable',
   provider_availability: 'A provider has availability to offer',
+  provider_resolvable: 'The agent can tell which provider to book',
   intake_attested: 'The booking tool matches the intake fields',
   placeholders_absent: 'No placeholder text remains',
   disclosure_composed: 'The opening disclosure is composed',
@@ -81,6 +127,7 @@ function check(
     title: status === 'pass' ? LABELS[key] : remediation.title,
     detail,
     fixHref: status === 'pass' ? null : remediation.fixHref,
+    blocking: gates(key),
   };
 }
 
@@ -88,15 +135,65 @@ export interface ReadinessInput {
   tenantId: string;
   campaignId: string;
   now?: Date;
+  /**
+   * What the live voice tools can actually do. Readiness must describe the
+   * agent that exists today, not the one we intend to ship.
+   */
+  capabilities?: VoiceBookingCapabilities;
 }
 
-const TEST_CALL_WINDOW_MS = 30 * 24 * 60 * 60 * 1_000;
+export interface VoiceBookingCapabilities {
+  /**
+   * True once the booking tool can choose between several providers at one
+   * branch. `resolveSoleProvider` (`liveTools.ts`) returns null unless the
+   * branch has EXACTLY one active provider, and the agent then refuses to
+   * offer any time — so today this is false and `provider_resolvable` says so.
+   *
+   * Package C1 replaces that resolver with a slot union carrying
+   * `providerProfileId`. Flipping this one constant is the whole handover:
+   * the check keeps running, it just stops failing.
+   */
+  multiProviderBooking: boolean;
+}
+
+export const VOICE_BOOKING_CAPABILITIES: VoiceBookingCapabilities = {
+  multiProviderBooking: false,
+};
+
+/**
+ * B6 — the clinic prerequisites `transitionCampaign` used to throw AFTER
+ * readiness had already returned "ready". Each one is a checklist row now, so
+ * the first-run owner is guided instead of being handed a bare code.
+ * `transfer_loops_to_agent` is deliberately absent: `transfer_target_distinct`
+ * below is the same fact, and two rows for one problem is worse than one.
+ */
+const CLINIC_BLOCKER_KEYS = {
+  clinic_country_missing: 'clinic_country_set',
+  clinic_hours_missing: 'clinic_hours_set',
+  locale_pack_unapproved: 'locale_pack_approved',
+  agent_language_unsupported: 'agent_language_supported',
+} satisfies Record<Exclude<ClinicActivationBlocker, 'transfer_loops_to_agent'>, ReadinessKey>;
+
+type ClinicState = Awaited<ReturnType<typeof clinicActivationState>>;
+
+type ClinicReadinessKey = (typeof CLINIC_BLOCKER_KEYS)[keyof typeof CLINIC_BLOCKER_KEYS];
+
+/** A passing clinic row still says what it read, so nothing passes silently. */
+const CLINIC_PASS_DETAIL: Record<ClinicReadinessKey, (state: ClinicState) => string> = {
+  clinic_country_set: state => `The clinic is set to ${state.country}.`,
+  clinic_hours_set: () => 'Opening hours are configured, so the agent can say whether you are open.',
+  locale_pack_approved: state => state.localePack
+    ? `Approved ${state.localePack.language}/${state.localePack.country} pack, version ${state.localePack.version}.`
+    : 'An approved locale pack covers this clinic.',
+  agent_language_supported: state => `${state.language} is supported.`,
+};
 
 export async function evaluateCampaignReadiness(
   tx: Prisma.TransactionClient,
   input: ReadinessInput,
 ): Promise<ReadinessResponse | null> {
   const now = input.now ?? new Date();
+  const capabilities = input.capabilities ?? VOICE_BOOKING_CAPABILITIES;
   const campaign = await tx.receptionistCampaign.findFirst({
     where: { id: input.campaignId, tenantId: input.tenantId },
     include: {
@@ -110,12 +207,30 @@ export async function evaluateCampaignReadiness(
   const ctx = { clinicId: campaign.clinicId, campaignId: campaign.id, agentId: campaign.agentId };
   const checks: ReadinessCheck[] = [];
   const agent = campaign.agent;
+  // Hoisted: `test_call_completed` is scoped to this exact deployment (B4).
+  let deployment: Awaited<ReturnType<typeof tx.receptionistAgentDeployment.findFirst>> = null;
   // One assembly, shared with preview and deployment. Null means no locale
   // pack exists for the clinic's country and language, so nothing the caller
   // would hear can be rendered — the affected checks say exactly that rather
   // than passing on an unrenderable configuration.
   const promptConfig = await campaignPromptConfig(tx, campaign, input.tenantId);
   const NO_LOCALE_PACK = 'No locale pack is available for this clinic’s country and language, so the prompt cannot be rendered. Approve a locale pack for the clinic.';
+
+  // ---- Clinic prerequisites (B6) -------------------------------------------
+  // These were 409s thrown by `transitionCampaign` after readiness had already
+  // said "ready", so the owner's first activation produced "Something went
+  // wrong — report the code". Contract §6 always wanted them here.
+  const clinicState = await clinicActivationState(tx, {
+    tenantId: input.tenantId, clinicId: campaign.clinicId, agent,
+  }).catch(() => null);
+  const blockers = new Set<ClinicActivationBlocker>(clinicState?.blockers ?? []);
+  const CLINIC_UNREADABLE = 'The clinic record could not be read, so this cannot be evaluated.';
+  for (const [blocker, key] of Object.entries(CLINIC_BLOCKER_KEYS) as Array<[ClinicActivationBlocker, ClinicReadinessKey]>) {
+    if (!clinicState) { checks.push(check(key, 'pending', CLINIC_UNREADABLE, ctx)); continue; }
+    checks.push(blockers.has(blocker)
+      ? check(key, 'fail', remediationFor(blocker, ctx).action, ctx, blocker)
+      : check(key, 'pass', CLINIC_PASS_DETAIL[key](clinicState), ctx));
+  }
 
   // ---- Agent and deployment ------------------------------------------------
   if (!agent) {
@@ -132,7 +247,7 @@ export async function evaluateCampaignReadiness(
         ? `Verified with Retell; the attestation is valid until ${agent.providerVerificationExpiresAt.toISOString()}.`
         : 'Verified with Retell.', ctx));
 
-    const deployment = agent.currentDeploymentId
+    deployment = agent.currentDeploymentId
       ? await tx.receptionistAgentDeployment.findFirst({ where: { id: agent.currentDeploymentId, tenantId: input.tenantId } })
       : null;
     if (!deployment) {
@@ -141,8 +256,15 @@ export async function evaluateCampaignReadiness(
       checks.push(agent.providerAgentId
         ? check('deployment_current', 'warn', 'This agent was linked manually, so CareCommand cannot prove which prompt it runs. Deploy from Studio to take ownership of it.', ctx, 'deployment_current')
         : check('deployment_current', 'fail', 'This campaign has never been deployed to Retell.', ctx, 'deployment_current'));
-      checks.push(check('number_bound', agent.providerAgentId ? 'warn' : 'fail',
-        'Deploy from Studio so the receptionist number answers with this campaign’s agent.', ctx, 'number_bound'));
+      // B1 — contract §16 froze this as BLOCKING. It used to warn for a
+      // hand-linked agent, and a warn does not block, so a campaign went ACTIVE
+      // with the Retell number's inbound agent still None: patients called the
+      // advertised line and reached nothing, with the checklist green. There is
+      // no attestation row a hand-linked agent can present today, so the honest
+      // answer is fail — never a downgraded check.
+      checks.push(agent.providerAgentId
+        ? check('number_bound', 'fail', 'This agent was linked by hand, so no deployment ever bound the number and CareCommand cannot prove what the line answers with. Deploy from Studio.', ctx, 'number_binding_unattested')
+        : check('number_bound', 'fail', 'Deploy from Studio so the receptionist number answers with this campaign’s agent.', ctx, 'number_bound'));
     } else {
       const plan = promptConfig ? planDeployment(promptConfig, { mock: deployment.mock }) : null;
       const changed = plan ? deploymentChanges(plan, deployment) : [];
@@ -154,7 +276,9 @@ export async function evaluateCampaignReadiness(
           deployment.status === 'VERIFIED'
             ? `Version ${deployment.providerAgentVersion} is deployed and matches this campaign.`
             : 'The latest deployment published but has not been verified. Verify the agent.', ctx, 'deployment_current'));
-      checks.push(deployment.numberBound
+      // A binding is proved by the deployment row that made it AND the number
+      // it bound. `numberBound: true` with no number is a claim, not evidence.
+      checks.push(deployment.numberBound && deployment.boundPhoneNumber
         ? check('number_bound', 'pass', `${deployment.boundPhoneNumber} answers with version ${deployment.providerAgentVersion}.`, ctx)
         : check('number_bound', 'fail', 'The Retell number is not bound to this deployment, so a caller would not reach this agent. Deploy again.', ctx, 'number_bound'));
     }
@@ -169,13 +293,20 @@ export async function evaluateCampaignReadiness(
     : check('location_mapped', 'fail', 'No active location for this campaign is mapped to a scheduling branch, so a booking would have nowhere to land.', ctx));
 
   const branchIds = mappedLocations.map(location => location.branchId!).filter(Boolean);
-  const service = await tx.serviceCatalogItem.findFirst({
+  // B2 — the check used to match on name + active and never read
+  // `bookableByVoice`, which defaults to FALSE. A green campaign therefore went
+  // live with a receptionist whose own prompt says "Not bookable on this call:
+  // take a message instead" for every request it receives. That column is what
+  // the voice tool reads before it agrees to book, so it is what readiness reads.
+  const namedService = await tx.serviceCatalogItem.findFirst({
     where: { tenantId: input.tenantId, active: true, name: { equals: campaign.appointmentType, mode: 'insensitive' } },
-    select: { id: true, name: true },
+    select: { id: true, name: true, bookableByVoice: true },
   });
-  checks.push(service
-    ? check('services_bookable', 'pass', `“${service.name}” is in the service catalogue.`, ctx)
-    : check('services_bookable', 'fail', `“${campaign.appointmentType}” is not an active service in the catalogue, so the agent cannot book it.`, ctx));
+  checks.push(!namedService
+    ? check('services_bookable', 'fail', `“${campaign.appointmentType}” is not an active service in the catalogue, so the agent cannot book it.`, ctx)
+    : !namedService.bookableByVoice
+      ? check('services_bookable', 'fail', `“${namedService.name}” is in the catalogue but is not marked bookable by voice, so the agent would refuse every booking for it and take a message instead.`, ctx)
+      : check('services_bookable', 'pass', `“${namedService.name}” is in the service catalogue and is bookable by voice.`, ctx));
 
   // Contract §15: the demo tenant had twelve providers and zero availability
   // rows, so every slot search returned nothing. A count is enough here; slot
@@ -186,6 +317,38 @@ export async function evaluateCampaignReadiness(
   checks.push(availability > 0
     ? check('provider_availability', 'pass', `${availability} availability window(s) at the mapped branches.`, ctx)
     : check('provider_availability', 'fail', 'No provider has working hours at a mapped branch, so the agent could never offer an appointment time.', ctx));
+
+  // B3 — availability counts rows; the live tool needs a provider it can NAME.
+  // `resolveSoleProvider` (`liveTools.ts`) returns null unless a branch has
+  // exactly one active provider, and the agent then answers every booking
+  // request with "I need a team member to confirm the provider or service".
+  // A two-dentist practice went live fully green and silently degraded to
+  // message-taking. This says so until Package C1 removes the constraint.
+  const providersByBranch = branchIds.length
+    ? await tx.providerProfile.groupBy({
+      by: ['branchId'],
+      where: { tenantId: input.tenantId, active: true, branchId: { in: branchIds } },
+      _count: { _all: true },
+    })
+    : [];
+  const providerCount = new Map(providersByBranch.map(row => [row.branchId, row._count._all]));
+  const branchLabel = (branchId: string) =>
+    mappedLocations.find(location => location.branchId === branchId)?.name ?? 'a mapped branch';
+  const emptyBranches = branchIds.filter(branchId => (providerCount.get(branchId) ?? 0) === 0);
+  const ambiguousBranches = capabilities.multiProviderBooking
+    ? []
+    : branchIds.filter(branchId => (providerCount.get(branchId) ?? 0) > 1);
+  checks.push(!branchIds.length
+    ? check('provider_resolvable', 'pending', 'No location is mapped to a branch yet, so there is no provider to resolve.', ctx)
+    : emptyBranches.length
+      ? check('provider_resolvable', 'fail', `No active provider at ${emptyBranches.map(branchLabel).join(', ')}, so the agent has nobody to book with.`, ctx)
+      : ambiguousBranches.length
+        ? check('provider_resolvable', 'fail', `${ambiguousBranches
+          .map(branchId => `${branchLabel(branchId)} has ${providerCount.get(branchId)} active providers`)
+          .join('; ')}. The voice agent books only when a branch has exactly one active provider, so it would take a message instead of offering a time.`, ctx)
+        : check('provider_resolvable', 'pass', capabilities.multiProviderBooking
+          ? 'The agent can resolve a provider at every mapped branch.'
+          : 'Every mapped branch has exactly one active provider, so the agent knows who to book with.', ctx));
 
   // ---- Intake attestation ---------------------------------------------------
   const attested = campaign.intakeSchemaAttestedRevision === campaign.intakeSchemaRevision
@@ -239,24 +402,42 @@ export async function evaluateCampaignReadiness(
         : check('transfer_target_distinct', 'pass', 'Transfers reach a number distinct from the AI line.', ctx));
 
   // ---- Proof it works on a real phone --------------------------------------
-  const testCall = await tx.receptionistCallLog.count({
-    where: {
-      tenantId: input.tenantId,
-      clinicId: campaign.clinicId,
-      direction: 'inbound',
-      createdAt: { gt: new Date(now.getTime() - TEST_CALL_WINDOW_MS) },
-    },
-  });
-  checks.push(testCall > 0
-    ? check('test_call_completed', 'pass', `${testCall} inbound call(s) recorded on this line in the last 30 days.`, ctx)
-    : check('test_call_completed', 'fail', 'No inbound call has reached this clinic’s line yet. Call it once from a staff phone before going live.', ctx));
+  // B4 — this used to count ANY inbound row for the clinic in 30 days. Clinics
+  // already hold historical zero-second `not_connected` inbound rows, so the
+  // one check that proves the line works was pre-satisfied and stayed green
+  // across every redeploy for a month. A test call now has to be a call that
+  // reached THIS deployment: stamped with its agent and version, placed after
+  // it published, and connected for longer than zero seconds. Redeploying
+  // resets it, which is exactly what the Go-live card promises.
+  if (!deployment || !deployment.publishedAt || deployment.providerAgentVersion === null || !deployment.providerAgentId) {
+    checks.push(check('test_call_completed', 'fail',
+      'Deploy the campaign first. A test call only counts when it reaches the deployment that is live.', ctx));
+  } else {
+    const testCall = await tx.receptionistCallLog.count({
+      where: {
+        tenantId: input.tenantId,
+        clinicId: campaign.clinicId,
+        direction: 'inbound',
+        boundProviderAgentId: deployment.providerAgentId,
+        boundProviderAgentVersion: deployment.providerAgentVersion,
+        durationSeconds: { gt: 0 },
+        createdAt: { gt: deployment.publishedAt },
+      },
+    });
+    checks.push(testCall > 0
+      ? check('test_call_completed', 'pass', `${testCall} connected inbound call(s) reached version ${deployment.providerAgentVersion} since it was deployed.`, ctx)
+      : check('test_call_completed', 'fail', `No connected inbound call has reached version ${deployment.providerAgentVersion} since it was deployed. Call the receptionist number once from a staff phone.`, ctx));
+  }
 
   // Contract §6: the expected provider storage setting comes from the tenant
   // policy table. Until C3 ships it there is nothing to read, so the setting is
   // fixed at metadata-only and reported read-only rather than pretended about.
   checks.push(check('data_storage_setting', 'warn', 'No tenant transcript-retention policy exists yet, so the provider stores basic attributes only. This is read-only for the pilot.', ctx));
 
-  const blocking = checks.filter(item => item.status === 'fail' || item.status === 'pending');
+  // B5 — one gate. `ready`, `actions.activate.allowed` and `transitionCampaign`
+  // all read `activationBlockers`, so the badge, the button and the gate are
+  // the same evaluation rather than three that drifted apart.
+  const blocking = checks.filter(isActivationBlocker);
   const ready = blocking.length === 0;
   const blockingCodes = blocking.map(item => item.code ?? item.key);
 
@@ -292,4 +473,141 @@ export async function evaluateCampaignReadiness(
 /** Failing checks only — what a 409 carries so the screen can render the fix list. */
 export function failingChecks(readiness: ReadinessResponse): ReadinessCheck[] {
   return readiness.checks.filter(item => item.status === 'fail' || item.status === 'pending');
+}
+
+function isActivationBlocker(item: ReadinessCheck): boolean {
+  return item.blocking && (item.status === 'fail' || item.status === 'pending');
+}
+
+/**
+ * The single activation gate. `evaluateCampaignReadiness` uses it for `ready`
+ * and `actions.activate.allowed`; `transitionCampaign` uses it to refuse the
+ * ACTIVE transition. There is no second list (B5).
+ */
+export function activationBlockers(readiness: ReadinessResponse): ReadinessCheck[] {
+  return readiness.checks.filter(isActivationBlocker);
+}
+
+/**
+ * Every readiness key the evaluator emits, in checklist order. This is the
+ * published contract: Package E's client union must equal it exactly, and the
+ * assertion below keeps the label table from drifting out of it.
+ */
+export const READINESS_CHECK_KEYS = READINESS_KEYS;
+
+if (READINESS_CHECK_KEYS.some(key => !LABELS[key]) || Object.keys(LABELS).length !== READINESS_CHECK_KEYS.length) {
+  throw new Error('campaignReadiness: LABELS and READINESS_KEYS disagree');
+}
+
+// ===========================================================================
+// B8 — re-gating a live campaign.
+//
+// A campaign was gated once, on the ACTIVE transition, and never again. Unmap a
+// branch, deactivate the service, retire the locale pack and the campaign stays
+// ACTIVE with a checklist nobody re-runs: green to unable-to-book with no event
+// anywhere.
+//
+// These are pure functions so the hourly worker can call them: Package A owns
+// `server/workers/compliance.worker.ts` and `agentReverification.ts`, so B
+// exposes the work rather than scheduling it. Nothing here writes to the
+// campaign — an automatic pause would silence a line without a human deciding
+// to. It emits a business event, and `intelligence.ts` turns that into an
+// OperationalSignal that reaches /v1/briefing and the Front Desk banner.
+// ===========================================================================
+
+export interface ReadinessRegression {
+  campaignId: string;
+  campaignName: string;
+  clinicId: string;
+  agentId: string | null;
+  /** The blocking rows, so a banner can render the remediation copy verbatim. */
+  blockers: ReadinessCheck[];
+}
+
+/**
+ * Re-evaluate every ACTIVE campaign for the tenant and report the ones that no
+ * longer pass their own gate. Read-only; emitting is `emitReadinessRegressions`.
+ */
+export async function findActiveCampaignRegressions(
+  tx: Prisma.TransactionClient,
+  input: { tenantId: string; now?: Date; capabilities?: VoiceBookingCapabilities },
+): Promise<ReadinessRegression[]> {
+  const active = await tx.receptionistCampaign.findMany({
+    where: { tenantId: input.tenantId, status: 'ACTIVE' },
+    select: { id: true, name: true, clinicId: true, agentId: true },
+    orderBy: { createdAt: 'asc' },
+  });
+  const regressions: ReadinessRegression[] = [];
+  for (const campaign of active) {
+    const readiness = await evaluateCampaignReadiness(tx, {
+      tenantId: input.tenantId, campaignId: campaign.id, now: input.now, capabilities: input.capabilities,
+    });
+    if (!readiness || readiness.ready) continue;
+    regressions.push({
+      campaignId: campaign.id,
+      campaignName: campaign.name,
+      clinicId: campaign.clinicId,
+      agentId: campaign.agentId,
+      blockers: activationBlockers(readiness),
+    });
+  }
+  return regressions;
+}
+
+/**
+ * Emit one `receptionist.campaign.readiness_regressed` business event per
+ * regressed campaign. `recordWorkflowEvent` is best-effort by design, so this
+ * can never fail the job that calls it. The payload carries ids and codes only
+ * — never PHI, never caller-facing copy.
+ */
+export async function emitReadinessRegressions(
+  tenantId: string,
+  regressions: ReadinessRegression[],
+): Promise<void> {
+  for (const regression of regressions) {
+    await recordWorkflowEvent(tenantId, {
+      eventType: 'receptionist.campaign.readiness_regressed',
+      entityType: 'receptionistCampaign',
+      entityId: regression.campaignId,
+      sourceModule: 'receptionist',
+      payload: {
+        clinicId: regression.clinicId,
+        agentId: regression.agentId,
+        blockingCodes: regression.blockers.map(item => item.code ?? item.key),
+        blockingCount: regression.blockers.length,
+      },
+    });
+  }
+}
+
+/**
+ * The one call the hourly per-tenant job needs. Package A owns the worker, so
+ * B exposes the work rather than scheduling it; the wiring is one line inside
+ * the existing per-tenant switch in `compliance.worker.ts`:
+ *
+ *   case 'receptionist-campaign-recheck':
+ *     await recheckActiveCampaigns(tenantId);
+ *     break;
+ *
+ * It establishes its own tenant scope and opens its own short read transaction
+ * rather than borrowing the caller's, so it can never extend an interactive
+ * transaction across provider round trips — defect A3's failure mode. Call it
+ * from the job body, NOT from inside an already-open interactive transaction.
+ */
+export async function recheckActiveCampaigns(
+  tenantId: string,
+  options: { now?: Date; capabilities?: VoiceBookingCapabilities; actorId?: string } = {},
+): Promise<ReadinessRegression[]> {
+  const actorId = options.actorId ?? 'worker:receptionist-campaign-recheck';
+  return runInTenantContext({ tenantId, actorId, actorRole: 'WORKER', source: 'worker' }, async () => {
+    const regressions = await runWithJobTenantContext(
+      tenantId,
+      tx => findActiveCampaignRegressions(tx, { tenantId, now: options.now, capabilities: options.capabilities }),
+      actorId,
+    );
+    // Emitted outside the read transaction: intelligence bookkeeping must never
+    // hold a transaction open, and `recordWorkflowEvent` is best-effort anyway.
+    await emitReadinessRegressions(tenantId, regressions);
+    return regressions;
+  });
 }

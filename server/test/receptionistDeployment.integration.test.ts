@@ -325,7 +325,9 @@ describe('deploying a campaign to Retell', () => {
       const readiness = await app.inject({ method: 'GET', url: `/v1/receptionist/campaigns/${campaign.id}/readiness`, headers: auth(t) });
       const deploymentCurrent = readiness.json().checks.find((check: { key: string }) => check.key === 'deployment_current');
       expect(deploymentCurrent).toMatchObject({ status: 'fail', code: 'deployment_current' });
-      expect(deploymentCurrent.fixHref).toContain('tab=deploy');
+      // B7: `deploy` was never a Studio tab id. The go-live screen is `retell`
+      // (Package E relabels it "Go live"; the id stays).
+      expect(deploymentCurrent.fixHref).toContain('tab=retell');
     } finally {
       env.RETELL_API_KEY = originalRetell.apiKey;
       env.RETELL_FROM_NUMBER = originalRetell.fromNumber;

@@ -14,9 +14,9 @@ import { agentReadinessReason } from '../../lib/receptionist/agentReadiness';
 import { Prisma } from '../../generated/prisma/client';
 import { bookAppointmentToolFingerprint, fingerprintJson } from './intakeContract';
 import { uuid, idParam, writeRoles, receptionistRead, callArtifactRead, intakeConfigurationError, compileCampaignIntakeContract, isReceptionistDestinationConflict, lockReceptionistConfiguration, auditReceptionistMutation, FIELD_TYPES } from './shared';
-import { evaluateCampaignReadiness, failingChecks, type ReadinessResponse } from '../../lib/receptionist/campaignReadiness';
+import { activationBlockers, evaluateCampaignReadiness, type ReadinessResponse } from '../../lib/receptionist/campaignReadiness';
 import { confirmationChannelStatus } from '../../lib/receptionist/confirmationOutbox';
-import { remediationFor } from '../../lib/receptionist/remediation';
+import { remediationFor, type RemediationContext } from '../../lib/receptionist/remediation';
 import { generateSampleTranscripts, mandatoryOpeningDisclosure } from './promptService';
 import { findPlaceholders } from '../../lib/receptionist/placeholders';
 
@@ -72,12 +72,16 @@ export async function transitionCampaign(
   if (input.to === 'ACTIVE') {
     readiness = await evaluateCampaignReadiness(tx, { tenantId: input.tenantId, campaignId: input.campaignId, now: input.now });
     if (!readiness) throw new Error('campaign_not_found');
-    // `intake_attested` is deliberately excluded from the gate decision here.
-    // The attestation below IS that check, and it distinguishes unattested
-    // from mismatched from not-strict; readiness can only say "not attested".
-    // Checking the same thing twice, less precisely, would replace a specific
-    // error the operator can act on with a vague one.
-    const blocking = failingChecks(readiness).filter(item => item.key !== 'intake_attested');
+    // B5 — one gate, one list. `activationBlockers` is the same function
+    // `readiness.ready` and `actions.activate.allowed` are computed from, so a
+    // campaign the badge calls not-ready can no longer be activated, and a
+    // campaign the badge calls ready can no longer be refused here. The
+    // exclusion of `intake_attested` lives in that one list
+    // (`NON_BLOCKING_READINESS_KEYS`) rather than being re-decided at this
+    // call site: the attestation below IS that check, and it distinguishes
+    // unattested from mismatched from not-strict where readiness can only say
+    // "not attested".
+    const blocking = activationBlockers(readiness);
     if (blocking.length) throw new CampaignTransitionError('campaign_not_ready', blocking);
     // Readiness passing does not replace the attestation write: activation
     // still binds this campaign to the exact provider deployment evidence.
@@ -301,7 +305,14 @@ async function loadCampaign(tenantId: string, campaignId: string) {
  * list rather than a bare identifier. The body is sent directly because the
  * shared error handler keeps only error/message/requestId.
  */
-function campaignConflictBody(error: unknown): { status: 400 | 409; body: Record<string, unknown> } | null {
+function campaignConflictBody(
+  error: unknown,
+  // B7 — this used to call `remediationFor(code)` with no context, so every
+  // 409's `fixHref` carried no clinic or campaign id and the Fix link opened
+  // the Studio on whatever was already selected. Every call site knows at
+  // least the campaign; pass what it knows.
+  ctx: RemediationContext = {},
+): { status: 400 | 409; body: Record<string, unknown> } | null {
   const invalid = intakeConfigurationError(error);
   if (invalid) return { status: 400, body: { error: 'invalid_intake_configuration', message: invalid } };
   const code = error instanceof CampaignTransitionError ? error.code : campaignAssignmentError(error);
@@ -309,7 +320,7 @@ function campaignConflictBody(error: unknown): { status: 400 | 409; body: Record
     const message = error instanceof CampaignTransitionError
       ? error.message
       : `Campaign configuration is not deployable: ${code}.`;
-    const remediation = remediationFor(code);
+    const remediation = remediationFor(code, ctx);
     return {
       status: 409,
       body: {
@@ -420,7 +431,7 @@ export const campaignRoutes: FastifyPluginAsync = async app => {
       });
       return reply.code(201).send(row);
     } catch (error) {
-      const mapped = campaignConflictBody(error);
+      const mapped = campaignConflictBody(error, { clinicId: input.clinicId, agentId: input.agentId ?? null });
       if (mapped) return reply.code(mapped.status).send(mapped.body);
       throw error;
     }
@@ -478,7 +489,7 @@ export const campaignRoutes: FastifyPluginAsync = async app => {
         return row;
       });
     } catch (error) {
-      const mapped = campaignConflictBody(error);
+      const mapped = campaignConflictBody(error, { campaignId: id, agentId: input.agentId ?? null });
       if (mapped) return reply.code(mapped.status).send(mapped.body);
       throw error;
     }
@@ -549,7 +560,7 @@ export const campaignLifecycleRoutes: FastifyPluginAsync = async app => {
         return reply.code(200).send(result);
       } catch (error) {
         if (error instanceof Error && error.message === 'campaign_not_found') throw app.httpErrors.notFound('Campaign not found');
-        const mapped = campaignConflictBody(error);
+        const mapped = campaignConflictBody(error, { campaignId: id });
         if (mapped) return reply.code(mapped.status).send(mapped.body);
         throw error;
       }
