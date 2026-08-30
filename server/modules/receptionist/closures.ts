@@ -38,7 +38,7 @@ const selection = {
 
 // Partial-day closures are a pilot cut: the columns and the engine support
 // them, the API refuses them so the UI cannot create half-supported state.
-const closureBody = z.object({
+const closureFields = {
   locationId: uuid.optional().nullable(),
   startsOn: isoDate,
   endsOn: isoDate,
@@ -46,11 +46,20 @@ const closureBody = z.object({
   endTime: z.null().optional(),
   reason: promptText(CATALOG_LIMITS.closureReasonMax).pipe(z.string().min(2)),
   internalNote: z.string().trim().max(500).optional().nullable(),
-}).strict().superRefine((value, ctx) => {
-  if (value.endsOn < value.startsOn) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['endsOn'], message: 'The closure must end on or after it starts.' });
-  const span = (Date.parse(value.endsOn) - Date.parse(value.startsOn)) / 86_400_000;
-  if (span > CATALOG_LIMITS.closureMaxDays) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['endsOn'], message: `A closure cannot span more than ${CATALOG_LIMITS.closureMaxDays} days.` });
-});
+};
+
+// Zod refuses .partial() on an object that carries a superRefine, so the
+// cross-field range rules live here and are applied to both shapes.
+function rangeIssue(startsOn: string, endsOn: string): string | null {
+  if (endsOn < startsOn) return 'The closure must end on or after it starts.';
+  if ((Date.parse(endsOn) - Date.parse(startsOn)) / 86_400_000 > CATALOG_LIMITS.closureMaxDays) {
+    return `A closure cannot span more than ${CATALOG_LIMITS.closureMaxDays} days.`;
+  }
+  return null;
+}
+
+const closureBody = z.object(closureFields).strict();
+const closurePatchBody = z.object(closureFields).partial().strict();
 
 export const closureRoutes: FastifyPluginAsync = async app => {
   async function assertClinic(tenantId: string, clinicId: string) {
@@ -77,6 +86,8 @@ export const closureRoutes: FastifyPluginAsync = async app => {
   app.post('/clinics/:id/closures', { preHandler: writeRoles }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
     const input = closureBody.parse(request.body);
+    const invalidRange = rangeIssue(input.startsOn, input.endsOn);
+    if (invalidRange) throw app.httpErrors.badRequest(invalidRange);
     await assertClinic(request.auth.tenantId, id);
     const row = await runWithTenantContext(request.auth.tenantId, async tx => {
       await lockReceptionistConfiguration(tx, request.auth.tenantId);
@@ -109,17 +120,15 @@ export const closureRoutes: FastifyPluginAsync = async app => {
 
   app.patch('/closures/:id', { preHandler: writeRoles }, async request => {
     const { id } = idParam.parse(request.params);
-    const input = closureBody.partial().parse(request.body);
+    const input = closurePatchBody.parse(request.body);
     const row = await runWithTenantContext(request.auth.tenantId, async tx => {
       await lockReceptionistConfiguration(tx, request.auth.tenantId);
       const existing = await tx.receptionistClosure.findFirst({ where: { id, tenantId: request.auth.tenantId }, select: selection });
       if (!existing) throw app.httpErrors.notFound('Closure not found');
       const startsOn = input.startsOn ?? dateOnly(existing.startsOn);
       const endsOn = input.endsOn ?? dateOnly(existing.endsOn);
-      if (endsOn < startsOn) throw app.httpErrors.badRequest('The closure must end on or after it starts.');
-      if ((Date.parse(endsOn) - Date.parse(startsOn)) / 86_400_000 > CATALOG_LIMITS.closureMaxDays) {
-        throw app.httpErrors.badRequest(`A closure cannot span more than ${CATALOG_LIMITS.closureMaxDays} days.`);
-      }
+      const invalidRange = rangeIssue(startsOn, endsOn);
+      if (invalidRange) throw app.httpErrors.badRequest(invalidRange);
       if (input.locationId) {
         const location = await tx.receptionistLocation.findFirst({ where: { id: input.locationId, tenantId: request.auth.tenantId, clinicId: existing.clinicId }, select: { id: true } });
         if (!location) throw app.httpErrors.badRequest('location_not_in_clinic: that location belongs to a different clinic.');

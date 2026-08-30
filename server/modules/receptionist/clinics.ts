@@ -170,7 +170,7 @@ export const clinicRoutes: FastifyPluginAsync = async app => {
       if (isReceptionistDestinationConflict(error)) throw app.httpErrors.conflict('This inbound destination is already assigned to an active receptionist clinic.');
       throw error;
     }
-    return reply.code(201).send(row);
+    return reply.code(201).send({ ...row, readiness: await clinicReadiness(request.auth.tenantId, row) });
   });
 
   app.patch('/clinics/:id', { preHandler: writeRoles }, async (request, reply) => {
