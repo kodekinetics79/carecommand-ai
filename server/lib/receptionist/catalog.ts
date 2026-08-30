@@ -4,11 +4,18 @@ import { FIELD_TYPE_META, type ReceptionistFieldType } from '../../modules/recep
 import { MAX_INTAKE_FIELDS } from '../../modules/receptionist/intakeContract';
 import { KNOWLEDGE_LIMITS } from './knowledge';
 import { PLATFORM_LOCALE_PACKS } from './localePacks/defaults';
+import { tenantFacingVoices, voicesCatalogSection, type TenantFacingVoice } from './catalogVoices';
 
 // ===========================================================================
 // Server-served option catalog (M27/M52). The client renders what this returns
-// instead of compiling option lists into the bundle. C5 contributes `voices`
-// and `providerMode`; C2 does not touch server/lib/retell.ts.
+// instead of compiling option lists into the bundle. `voices` and
+// `providerMode` come from `catalogVoices`, which owns the one call into
+// server/lib/retell.ts.
+//
+// The voice section can never fail this read: `voicesCatalogSection()` resolves
+// to an empty list with a stated reason when the provider is unreachable, so a
+// voice-service outage costs the catalog its voices, never its countries,
+// timezones or locale packs.
 // ===========================================================================
 
 type Client = typeof DbClient | Prisma.TransactionClient;
@@ -114,16 +121,20 @@ export interface ReceptionistCatalog {
   campaignTypes: string[];
   localePacks: Array<{ language: string; country: string; status: 'APPROVED' | 'DRAFT' | 'MISSING'; packId: string | null; hasPlatformDefault: boolean; platformDefaultVersion: number | null }>;
   limits: typeof CATALOG_LIMITS;
+  /** Contract §7: the voice select is filled by this read, not by a second one. */
+  voices: TenantFacingVoice[];
+  providerMode: 'live' | 'mock' | 'unconfigured';
 }
 
 export async function buildReceptionistCatalog(client: Client, tenantId: string, now = new Date()): Promise<ReceptionistCatalog> {
-  const [branches, packs] = await Promise.all([
+  const [branches, packs, voices] = await Promise.all([
     client.branch.findMany({ where: { tenantId, active: true }, select: { timezone: true } }),
     client.receptionistLocalePack.findMany({
       where: { tenantId, status: { in: ['APPROVED', 'DRAFT'] } },
       select: { id: true, language: true, country: true, status: true, version: true },
       orderBy: [{ status: 'asc' }, { version: 'desc' }],
     }),
+    voicesCatalogSection(),
   ]);
   const pairs = new Map<string, { language: string; country: string; hasPlatformDefault: boolean; platformDefaultVersion: number | null }>();
   for (const pack of PLATFORM_LOCALE_PACKS) pairs.set(`${pack.language}:${pack.country}`, { language: pack.language, country: pack.country, hasPlatformDefault: true, platformDefaultVersion: pack.version });
@@ -158,5 +169,7 @@ export async function buildReceptionistCatalog(client: Client, tenantId: string,
     campaignTypes: [...CAMPAIGN_TYPES],
     localePacks,
     limits: CATALOG_LIMITS,
+    voices: tenantFacingVoices(voices.voices),
+    providerMode: voices.providerMode,
   };
 }

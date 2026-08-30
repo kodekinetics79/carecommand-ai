@@ -78,20 +78,38 @@ describe('goLiveSteps', () => {
 });
 
 describe('boundNumberOf', () => {
-  it('reads the dialable number only out of a passing number_bound row', () => {
+  it('reads the dialable number out of the field the server states it in', () => {
     expect(boundNumberOf(readinessOf([
-      { key: 'number_bound', label: 'Bound', status: 'pass', code: null, detail: '+14155550142 answers with version 4.', fixHref: null },
-    ]))).toBe('+14155550142');
+      { key: 'number_bound', label: 'Bound', status: 'pass', code: null, detail: 'The line is confirmed.', fixHref: null },
+    ], { boundNumber: '+14155550142' }))).toBe('+14155550142');
   });
 
-  it('never reports a number from a failing row, and never from prose without one', () => {
+  it('never reads a number out of the prose of a check, passing or failing', () => {
+    // The rail used to regex the number out of `detail`, so rewording one
+    // English sentence blanked the number an operator forwards their public
+    // line to — with nothing failing. Prose is not a source of truth for what
+    // to dial, even when it happens to contain a number.
+    expect(boundNumberOf(readinessOf([
+      { key: 'number_bound', label: 'Bound', status: 'pass', code: null, detail: '+14155550142 answers with version 4.', fixHref: null },
+    ]))).toBeNull();
     expect(boundNumberOf(readinessOf([
       { key: 'number_bound', label: 'Bound', status: 'fail', code: 'number_bound', detail: '+14155550142 is bound to another deployment.', fixHref: null },
-    ]))).toBeNull();
+    ], { boundNumber: null }))).toBeNull();
     expect(boundNumberOf(readinessOf([
       { key: 'number_bound', label: 'Bound', status: 'pass', code: null, detail: 'The clinic line answers with version 4.', fixHref: null },
     ]))).toBeNull();
     expect(boundNumberOf(null)).toBeNull();
+  });
+
+  it('reads a field the server really sends, and really only sets on a pass', () => {
+    // Same discipline as READINESS_KEYS above: the client's belief is checked
+    // against the server file, not against a hand-written fixture.
+    expect(campaignReadinessSource).toContain('boundNumber: string | null;');
+    expect(campaignReadinessSource).toMatch(/^ {4}boundNumber,$/m);
+    // Every assignment of the field comes from a NumberBoundResult, and the
+    // only two that are non-null sit in the two `'pass'` branches.
+    expect(campaignReadinessSource).toContain('boundNumber: dialable(deployment.boundPhoneNumber),');
+    expect(campaignReadinessSource).toContain('boundNumber: dialable(agent.providerInboundNumber),');
   });
 });
 
@@ -113,9 +131,9 @@ describe('goLiveRail', () => {
       readiness: readinessOf([
         { key: 'deployment_current', label: 'Deployed', status: 'pass', code: null, detail: '', fixHref: null },
         { key: 'agent_verified', label: 'Verified', status: 'pass', code: null, detail: '', fixHref: null },
-        { key: 'number_bound', label: 'Bound', status: 'pass', code: null, detail: '+14155550142 answers with version 4.', fixHref: null },
+        { key: 'number_bound', label: 'Bound', status: 'pass', code: null, detail: 'The line is confirmed.', fixHref: null },
         { key: 'test_call_completed', label: 'Test call', status: 'pass', code: null, detail: '', fixHref: null },
-      ], { ready: true }),
+      ], { ready: true, boundNumber: '+14155550142' }),
       campaignStatus: 'ACTIVE',
     });
 

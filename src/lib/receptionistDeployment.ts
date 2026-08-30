@@ -452,6 +452,8 @@ export interface ReadinessResponse {
   ready: boolean;
   /** Present since C5; absent from a pre-C5 server, in which case the badge is simply not shown. */
   providerMode?: ProviderMode;
+  /** The dialable line, set by the server only when `number_bound` passes. */
+  boundNumber?: string | null;
   checks: ReadinessCheck[];
   actions: { activate: ReadinessAction; pause: ReadinessAction; archive: ReadinessAction };
   evaluatedAt: string;
@@ -512,21 +514,20 @@ export function goLiveSteps(readiness: ReadinessResponse | null, campaignStatus:
 }
 
 /**
- * The dialable number, taken only from the passing `number_bound` row, which
- * is the one place the server states it in full (the deployment projection
- * masks it, and a masked number cannot be dialled or forwarded). Anything
- * that is not an unambiguous E.164 number yields null, and the rail then says
- * the number is not confirmed rather than printing a guess.
+ * The dialable number, read from the field the server states it in. The
+ * deployment projection masks the number and a masked number cannot be dialled
+ * or forwarded, so `readiness.boundNumber` is the one place it arrives in full.
  *
- * TODO(Package A/B): send it as a field — `readiness.boundNumber`, or
- * `boundPhoneNumber` on the deployment for roles allowed to see it — so this
- * stops depending on the wording of a sentence.
+ * It used to be recovered by running a regular expression over the English in
+ * the passing `number_bound` row's `detail`. That made the number an operator
+ * forwards their public line to depend on the wording of a sentence: reword the
+ * check and the rail silently stops showing a number, with nothing failing. The
+ * server now sets the field only when that row PASSES and only when the value
+ * is unambiguously E.164, so both rules are enforced where the fact lives.
  */
 export function boundNumberOf(readiness: ReadinessResponse | null): string | null {
-  const check = checkFor(readiness, 'number_bound');
-  if (!check || check.status !== 'pass') return null;
-  const match = /\+[1-9]\d{6,14}/.exec(check.detail);
-  return match ? match[0] : null;
+  const value = readiness?.boundNumber;
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
 /** A clinic-level prerequisite (country, hours, locale pack) promoted onto the rail. */

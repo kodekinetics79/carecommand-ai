@@ -661,7 +661,7 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
   // bridge_transfer, cancel_transfer and mcp. A webhook-backed tool is
   // `custom`; `function` is an OpenAI word Retell rejects with 400
   // invalid_request, which is exactly how the first live deploy died. The mock
-  // provider now enforces that same enum (server/lib/receptionist/retellMock.ts)
+  // provider now enforces that same enum (server/lib/receptionist/retellRequestContract.ts)
   // so this can never again be discovered on a real account.
   const fnUrl = expectedRetellToolUrl(clinic.id, options.webhookBaseUrl);
   // The bookable menu the caller may choose from. `bookableByVoice` is the

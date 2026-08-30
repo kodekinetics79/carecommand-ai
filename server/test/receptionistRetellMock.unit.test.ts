@@ -6,7 +6,7 @@ import {
   RETELL_GENERAL_TOOL_TYPES,
   retellAgentRequestIssues,
   retellLlmRequestIssues,
-} from '../lib/receptionist/retellMock';
+} from '../lib/receptionist/retellRequestContract';
 import { buildRetellConfig } from '../modules/receptionist/promptService';
 import { promptFixture } from './fixtures/receptionistPromptConfigs';
 

@@ -82,8 +82,10 @@ describe('GoLiveCard — the ordered path to answering a real call', () => {
   it('prints the dialable number once the server proves the line is bound, and says so plainly when it cannot', () => {
     const { rerender } = render(<MemoryRouter><GoLiveCard campaignStatus="ACTIVE" readiness={readiness([
       ...deployedAndVerified,
-      { key: 'number_bound', label: 'Bound', status: 'pass', code: null, detail: '+14155550142 answers with version 4.', fixHref: null },
-    ], { ready: true })} /></MemoryRouter>);
+      { key: 'number_bound', label: 'Bound', status: 'pass', code: null, detail: 'The line is confirmed.', fixHref: null },
+      // The number arrives as a field, not as a phrase inside `detail`: the
+      // card must not go looking for it in the server's English.
+    ], { ready: true, boundNumber: '+14155550142' })} /></MemoryRouter>);
 
     expect(within(screen.getByTestId('dial-this-number')).getByText('+14155550142')).toBeInTheDocument();
 

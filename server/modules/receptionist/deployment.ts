@@ -14,7 +14,7 @@ import {
   loadCampaignGraph,
   planDeployment,
 } from '../../lib/receptionist/retellDeploy';
-import { voicesCatalogSection } from '../../lib/receptionist/catalogVoices';
+import { tenantFacingVoices, voicesCatalogSection } from '../../lib/receptionist/catalogVoices';
 import { configurationReference, VOICE } from '../../../src/lib/receptionistVocabulary';
 import { uuid, idParam, writeRoles, callArtifactRead } from './shared';
 
@@ -308,21 +308,21 @@ export const deploymentRoutes: FastifyPluginAsync = async app => {
     email: confirmationChannelStatus('email'),
   }));
 
-  // Voice catalogue. C2 owns server/lib/receptionist/catalog.ts and the
-  // /catalog route; this is C5's section, exported separately so the two merge
-  // without either stream editing the other's file.
+  // Voice catalogue, with the cache/provider state the catalog read does not
+  // carry. GET /catalog serves the same list (contract §7); this route adds
+  // `source`, `fetchedAt` and `error`, which is what lets the client say WHY a
+  // voice select is empty rather than showing an unexplained blank. The client
+  // asks for it only when the catalog came back with no voices.
   //
-  // `provider` is dropped on the way out. The catalogue upstream tags each
-  // voice with the house that synthesised it, and the Studio's voice select
-  // printed it after a middot — so the dropdown where an owner names their
-  // receptionist also named two of our suppliers, five times over, on a screen
-  // nobody thinks of as an integration screen. Nothing chooses a voice on that
-  // field: gender and accent are what an owner picks on, and they stay.
+  // `provider` is dropped on the way out by `tenantFacingVoices`, the same
+  // helper the catalog uses. The catalogue upstream tags each voice with the
+  // house that synthesised it, and the Studio's voice select printed it after a
+  // middot — so the dropdown where an owner names their receptionist also named
+  // two of our suppliers, five times over, on a screen nobody thinks of as an
+  // integration screen. Nothing chooses a voice on that field: gender and
+  // accent are what an owner picks on, and they stay.
   app.get('/voices', { preHandler: callArtifactRead }, async () => {
     const section = await voicesCatalogSection();
-    return {
-      ...section,
-      voices: section.voices.map(({ voiceId, name, gender, accent, age, previewUrl }) => ({ voiceId, name, gender, accent, age, previewUrl })),
-    };
+    return { ...section, voices: tenantFacingVoices(section.voices) };
   });
 };

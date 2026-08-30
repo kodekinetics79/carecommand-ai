@@ -19,7 +19,7 @@ const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
 const { readyCampaignFixture, clinicFixtureData, proveTestCall } = await import('./helpers/receptionistFixtures');
 const { hashPrompt, llmRequestBody } = await import('../lib/retell');
-const { RETELL_GENERAL_TOOL_TYPES, retellLlmRequestIssues } = await import('../lib/receptionist/retellMock');
+const { RETELL_GENERAL_TOOL_TYPES, retellLlmRequestIssues } = await import('../lib/receptionist/retellRequestContract');
 
 // ===========================================================================
 // Deploying to Retell, end to end.

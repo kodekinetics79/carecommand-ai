@@ -1,49 +1,30 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { fingerprintJson, normalizeBookAppointmentToolContract } from '../../modules/receptionist/intakeContract';
-import type { MockDeploymentSnapshot, MockPhoneNumberBinding, PhoneNumberBinding, RetellAgentSnapshot, RetellProviderResult, RetellVoice } from '../retell';
-
 // ===========================================================================
-// Mock Retell provider (RETELL_API_KEY starting with "mock").
+// Retell's request contract: what the real provider accepts on
+// create/update-retell-llm and create/update-agent.
 //
-// Deliberately stateless: the only durable state a deployment has is the
-// ReceptionistAgentDeployment row CareCommand wrote, so the API process, the
-// worker, the demo seed and every test agree on what "the provider" holds.
-// Each function below answers from ids it mints or from the deployment
-// snapshot it is handed; none of them reads the database and none of them is
-// reachable with a real key (server/lib/retell.ts routes only the mock key
-// here). Every value it mints is prefixed `mock_`/`mock:` so it can never be
-// mistaken for provider evidence.
-// ===========================================================================
-
-const MOCK_LLM_MODEL = 'mock-llm';
-
-function mockId(prefix: string): string {
-  return `${prefix}_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
-}
-
-function digest(value: string): string {
-  return createHash('sha256').update(value).digest('hex');
-}
-
-// ===========================================================================
-// What Retell actually accepts.
+// This is not a test double. It is the schema half of the provider client,
+// pulled out of the request path so both the simulated demo provider and the
+// deploy suites can hold the payload we WOULD send against the rules the live
+// account enforces, without either of them re-describing those rules and
+// drifting from what ships.
 //
-// This mock used to answer `ok` to every payload, which meant the whole deploy
-// path had only ever been exercised against a provider that could not reject
-// anything. An attended deploy against a real Retell account then died at
-// ensure_llm with HTTP 400 invalid_request:
+// HOW WE LEARNED THESE RULES
+//
+// The simulated provider used to answer `ok` to every payload, which meant the
+// whole deploy path had only ever been exercised against a provider that could
+// not reject anything. An attended deploy against a real Retell account then
+// died at ensure_llm with HTTP 400 invalid_request:
 //
 //   general_tools/0/type must be equal to one of the allowed values:
 //   end_call, press_digit, custom, transfer_call, bridge_transfer,
 //   cancel_transfer, mcp ... must match exactly one schema in oneOf
 //
 // Eleven of our thirteen tools were declared `type: 'function'` — an OpenAI
-// word that is not in Retell's discriminator at all. A mock that cannot say no
-// is not a test double, it is a way of not testing. So the validators below
-// re-implement the request rules the real API enforces, and the mock refuses
-// exactly what the live account refuses, with the same mapped error the live
-// client returns for a 400 (`invalid_request`).
+// word that is not in Retell's discriminator at all. A simulator that cannot
+// say no is not a test double, it is a way of not testing. So the validators
+// below re-implement the request rules the real API enforces, and the simulated
+// provider refuses exactly what the live account refuses, with the same mapped
+// error the live client returns for a 400 (`invalid_request`).
 //
 // Two deliberate non-goals. This is a SCHEMA check, not a semantic one: it
 // says nothing about whether a URL is reachable or a voice id exists. And it
@@ -288,160 +269,4 @@ export function retellAgentRequestIssues(body: unknown): string[] {
     }
   }
   return issues;
-}
-
-/**
- * A rejection identical to what the live client produces for Retell's 400:
- * `mapRetellProviderStatus(400)` is `invalid_request`, and the deploy service
- * maps that to `provider_invalid_request` with no provider body surfaced. The
- * issues are printed once outside tests, because a mock that says only "no" is
- * a worse debugging experience than the real provider without being any more
- * honest than it.
- */
-function mockInvalidRequest<T>(operation: string, issues: string[]): RetellProviderResult<T> {
-  if (process.env.NODE_ENV !== 'test') {
-    console.error(`[retell-mock] ${operation} rejected: ${issues.join('; ')}`);
-  }
-  return { ok: false, error: 'invalid_request', status: 400, mock: true };
-}
-
-export function mockCreateLlm(body: unknown): RetellProviderResult<{ llmId: string; version: number }> {
-  const issues = retellLlmRequestIssues(body);
-  if (issues.length) return mockInvalidRequest('create-retell-llm', issues);
-  return { ok: true, value: { llmId: mockId('mock_llm'), version: 0 }, mock: true };
-}
-
-/** Mirrors Retell: an update is a new draft version of the same engine. */
-export function mockUpdateLlm(llmId: string, body: unknown, previousVersion = 0): RetellProviderResult<{ llmId: string; version: number }> {
-  const issues = retellLlmRequestIssues(body);
-  if (issues.length) return mockInvalidRequest('update-retell-llm', issues);
-  return { ok: true, value: { llmId, version: previousVersion + 1 }, mock: true };
-}
-
-export function mockCreateAgent(body: unknown): RetellProviderResult<{ agentId: string; version: number }> {
-  const issues = retellAgentRequestIssues(body);
-  if (issues.length) return mockInvalidRequest('create-agent', issues);
-  return { ok: true, value: { agentId: mockId('mock_agent'), version: 0 }, mock: true };
-}
-
-export function mockUpdateAgent(agentId: string, body: unknown, previousVersion = 0): RetellProviderResult<{ agentId: string; version: number }> {
-  const issues = retellAgentRequestIssues(body);
-  if (issues.length) return mockInvalidRequest('update-agent', issues);
-  return { ok: true, value: { agentId, version: previousVersion + 1 }, mock: true };
-}
-
-export function mockPublishAgent(_agentId: string, version: number): RetellProviderResult<{ version: number }> {
-  return { ok: true, value: { version }, mock: true };
-}
-
-/**
- * The mock's answer to "who answers this number?".
- *
- * It reads the deployment row CareCommand wrote — the same durable state every
- * other mock answer comes from — so a demo tenant exercises the real read-back
- * path in `verifyAgentProvider` instead of routing around it. Three honest
- * negatives it must be able to give, because each one is a real failure the
- * live provider produces and readiness has to be able to see:
- *
- *   - no deployment evidence at all            → nothing is bound
- *   - the deploy's bind step did not succeed   → nothing is bound
- *   - the read is for a DIFFERENT number       → nothing is bound on THAT one
- *
- * It never invents a binding, and it never answers for a number the deployment
- * did not target.
- */
-export function mockPhoneNumberBinding(
-  phoneNumber: string,
-  binding: MockPhoneNumberBinding | null,
-): RetellProviderResult<PhoneNumberBinding> {
-  const unbound = { ok: true as const, value: { phoneNumber, inboundAgentId: null, inboundAgentVersion: null }, mock: true };
-  if (!binding || !binding.numberBound) return unbound;
-  if (binding.boundPhoneNumber !== phoneNumber) return unbound;
-  if (!binding.providerAgentId || binding.providerAgentVersion === null) return unbound;
-  return {
-    ok: true,
-    value: { phoneNumber, inboundAgentId: binding.providerAgentId, inboundAgentVersion: binding.providerAgentVersion },
-    mock: true,
-  };
-}
-
-let cachedMockVoices: RetellVoice[] | null = null;
-
-/**
- * The fixture is a JSON file so the catalogue can be reviewed without reading
- * code. It is read from the source tree (mock mode is a demo/test posture and
- * is refused at boot for pilot/enterprise); a missing file is an explicit
- * error rather than an empty voice list.
- */
-export function mockListVoices(): RetellVoice[] {
-  if (!cachedMockVoices) {
-    const raw = readFileSync(new URL('./fixtures/retellVoices.mock.json', import.meta.url), 'utf8');
-    const parsed = JSON.parse(raw) as unknown;
-    if (!Array.isArray(parsed)) throw new Error('retell_mock_voice_fixture_invalid');
-    cachedMockVoices = parsed as RetellVoice[];
-  }
-  return cachedMockVoices.map(voice => ({ ...voice }));
-}
-
-export function mockLlmModel(): string {
-  return MOCK_LLM_MODEL;
-}
-
-/**
- * A provider snapshot that satisfies every readiness and intake-evidence rule
- * for the deployment it was built from. The fingerprints are derived from the
- * deployment row so a later prompt edit in Studio still reads as
- * "deployment stale" while the provider side stays internally consistent.
- */
-export function buildMockAgentSnapshot(input: {
-  agentId: string;
-  versionTag: string;
-  deployment: MockDeploymentSnapshot;
-  webhookUrl: string;
-}): RetellAgentSnapshot {
-  const { deployment } = input;
-  const tools = Array.isArray(deployment.toolsJson) ? deployment.toolsJson as unknown[] : [];
-  const bookingTools = tools.filter((tool): tool is Record<string, unknown> =>
-    Boolean(tool) && typeof tool === 'object' && (tool as Record<string, unknown>).name === 'book_appointment');
-  const bookToolSchema = bookingTools.length === 1 ? normalizeBookAppointmentToolContract(bookingTools[0]!) : null;
-  const graphFingerprint = fingerprintJson({
-    mock: true,
-    llmId: deployment.providerLlmId,
-    version: deployment.providerLlmVersion,
-    promptHash: deployment.promptHash,
-    toolFingerprint: deployment.toolFingerprint,
-  });
-  const bookToolFingerprint = bookToolSchema
-    ? fingerprintJson({
-      tool: bookToolSchema,
-      engine: { type: 'retell-llm', id: deployment.providerLlmId, version: deployment.providerLlmVersion, graphFingerprint },
-    })
-    : null;
-  return {
-    agentId: input.agentId,
-    version: deployment.providerAgentVersion,
-    assignedTags: [input.versionTag],
-    published: true,
-    voiceId: deployment.voiceId,
-    language: deployment.language,
-    webhookUrl: input.webhookUrl,
-    webhookEvents: ['call_analyzed', 'call_ended', 'call_started'],
-    dataStorageSetting: 'basic_attributes_only',
-    signedUrl: true,
-    responseEngineType: 'retell-llm',
-    responseEngineId: deployment.providerLlmId,
-    responseEngineVersion: deployment.providerLlmVersion,
-    responseEngineGraphFingerprint: graphFingerprint,
-    bookToolProbeStatus: 'SUCCEEDED',
-    bookToolSchema: bookToolSchema as unknown as Record<string, unknown> | null,
-    bookToolFingerprint,
-    toolCallStrictMode: true,
-    effectiveDynamicVariables: {},
-    lastModifiedAt: null,
-    fingerprint: digest(`mock:${input.agentId}|${input.versionTag}|${deployment.providerAgentVersion}|${deployment.promptHash}`),
-    promptHash: deployment.promptHash,
-    beginMessageHash: deployment.beginMessageHash,
-    toolsFingerprint: deployment.toolFingerprint,
-    mock: true,
-  };
 }

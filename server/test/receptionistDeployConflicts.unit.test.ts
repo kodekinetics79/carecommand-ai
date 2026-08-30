@@ -10,7 +10,7 @@ import {
   isProviderDeploymentConflict,
   isReceptionistDestinationConflict,
 } from '../modules/receptionist/shared';
-import { mockPhoneNumberBinding } from '../lib/receptionist/retellMock';
+import { SIMULATED_RETELL_PROVIDER } from '../lib/receptionist/retellSimulatedProvider';
 import { clinicInboundNumber } from '../lib/receptionist/retellDeploy';
 
 // ===========================================================================
@@ -102,23 +102,23 @@ describe('the mock provider answers the binding question honestly', () => {
   const deployed = { boundPhoneNumber: '+15550100001', numberBound: true, providerAgentId: 'mock_agent_1', providerAgentVersion: 2 };
 
   it('reports the deployment that actually bound the number', () => {
-    const answer = mockPhoneNumberBinding('+15550100001', deployed);
+    const answer = SIMULATED_RETELL_PROVIDER.phoneNumberBinding('+15550100001', deployed);
     expect(answer).toMatchObject({ ok: true, mock: true, value: { inboundAgentId: 'mock_agent_1', inboundAgentVersion: 2 } });
   });
 
   it('reports nothing bound when the bind step never succeeded', () => {
-    const answer = mockPhoneNumberBinding('+15550100001', { ...deployed, numberBound: false });
+    const answer = SIMULATED_RETELL_PROVIDER.phoneNumberBinding('+15550100001', { ...deployed, numberBound: false });
     expect(answer).toMatchObject({ ok: true, value: { inboundAgentId: null, inboundAgentVersion: null } });
   });
 
   it('refuses to answer for a number this deployment never targeted', () => {
     // A mock that answered "yes, that is mine" for any number asked would put
     // the demo straight back to certifying a binding nobody made.
-    const answer = mockPhoneNumberBinding('+15550100999', deployed);
+    const answer = SIMULATED_RETELL_PROVIDER.phoneNumberBinding('+15550100999', deployed);
     expect(answer).toMatchObject({ ok: true, value: { inboundAgentId: null } });
   });
 
   it('reports nothing bound when there is no deployment evidence at all', () => {
-    expect(mockPhoneNumberBinding('+15550100001', null)).toMatchObject({ ok: true, value: { inboundAgentId: null } });
+    expect(SIMULATED_RETELL_PROVIDER.phoneNumberBinding('+15550100001', null)).toMatchObject({ ok: true, value: { inboundAgentId: null } });
   });
 });

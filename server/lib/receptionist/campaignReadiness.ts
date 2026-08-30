@@ -85,6 +85,15 @@ export interface ReadinessResponse {
   status: string;
   ready: boolean;
   providerMode: 'live' | 'mock' | 'unconfigured';
+  /**
+   * The dialable line, stated as a field. It is set only when `number_bound`
+   * PASSES — i.e. the provider itself named this number — and is null in every
+   * other state. The Go-live rail used to recover it by running a regular
+   * expression over the English in `number_bound`'s `detail`, which made a
+   * rewording of one sentence silently blank the number an operator forwards
+   * their public line to.
+   */
+  boundNumber: string | null;
   checks: ReadinessCheck[];
   actions: ReadinessActions;
   evaluatedAt: string;
@@ -163,6 +172,21 @@ function clinicInboundLine(clinic: { inboundNumber: string | null; phone: string
   return clinic.inboundNumber?.trim() || clinic.phone?.trim() || null;
 }
 
+/**
+ * A number is only reported as dialable when it is unambiguously E.164. The
+ * clinic's advertised `phone` is free text, so a BYO line that has never been
+ * normalised must not be printed as something to forward a public number to.
+ */
+const DIALABLE_E164 = /^\+[1-9]\d{6,14}$/;
+
+function dialable(number: string | null | undefined): string | null {
+  const value = (number ?? '').trim();
+  return DIALABLE_E164.test(value) ? value : null;
+}
+
+/** A `number_bound` row plus the line it proved, which only a passing row has. */
+interface NumberBoundResult { check: ReadinessCheck; boundNumber: string | null }
+
 /** An attestation ages out on the same TTL as the agent's own verification. */
 function attestationIsFresh(at: Date | null, now: Date): boolean {
   return at !== null && now.getTime() - at.getTime() < RETELL_AGENT_VERIFICATION_TTL_MS;
@@ -172,28 +196,32 @@ function deployedNumberBoundCheck(
   deployment: { numberBound: boolean; boundPhoneNumber: string | null; providerAgentVersion: number | null; numberBindingVerifiedAt: Date | null; numberBindingErrorCode: string | null; numberBindingAgentId: string | null },
   ctx: { clinicId?: string | null; campaignId?: string | null; agentId?: string | null },
   now: Date,
-): ReadinessCheck {
+): NumberBoundResult {
+  const unbound = (row: ReadinessCheck): NumberBoundResult => ({ check: row, boundNumber: null });
   if (deployment.numberBindingErrorCode === 'number_bound_elsewhere') {
-    return check('number_bound', 'fail',
+    return unbound(check('number_bound', 'fail',
       `Retell reports ${deployment.boundPhoneNumber ?? 'this number'} answering with ${deployment.numberBindingAgentId ? 'a different agent' : 'no agent at all'}, not this deployment. A caller would not reach this campaign. Deploy again to bind it back.`,
-      ctx, 'number_bound_elsewhere');
+      ctx, 'number_bound_elsewhere'));
   }
   if (attestationIsFresh(deployment.numberBindingVerifiedAt, now) && deployment.boundPhoneNumber) {
-    return check('number_bound', 'pass',
-      `Retell confirms ${deployment.boundPhoneNumber} answers with version ${deployment.providerAgentVersion}.`, ctx);
+    return {
+      check: check('number_bound', 'pass',
+        `Retell confirms ${deployment.boundPhoneNumber} answers with version ${deployment.providerAgentVersion}.`, ctx),
+      boundNumber: dialable(deployment.boundPhoneNumber),
+    };
   }
   // A binding is proved by the provider's answer, never by the column we wrote.
   // A deploy that claimed the bind but has not been re-read is exactly the
   // stored claim this check stopped trusting.
   if (deployment.numberBound && deployment.boundPhoneNumber) {
-    return check('number_bound', 'pending',
+    return unbound(check('number_bound', 'pending',
       deployment.numberBindingErrorCode
         ? `CareCommand could not ask Retell who answers ${deployment.boundPhoneNumber} (${deployment.numberBindingErrorCode}), so the binding is unproven. Verify the agent again.`
         : `The deployment bound ${deployment.boundPhoneNumber}, but nothing has re-read that from Retell yet. Verify the agent to prove it.`,
-      ctx, 'number_bound');
+      ctx, 'number_bound'));
   }
-  return check('number_bound', 'fail',
-    'The Retell number is not bound to this deployment, so a caller would not reach this agent. Deploy again.', ctx, 'number_bound');
+  return unbound(check('number_bound', 'fail',
+    'The Retell number is not bound to this deployment, so a caller would not reach this agent. Deploy again.', ctx, 'number_bound'));
 }
 
 function byoNumberBoundCheck(
@@ -201,26 +229,30 @@ function byoNumberBoundCheck(
   clinicLine: string | null,
   ctx: { clinicId?: string | null; campaignId?: string | null; agentId?: string | null },
   now: Date,
-): ReadinessCheck {
+): NumberBoundResult {
+  const unbound = (row: ReadinessCheck): NumberBoundResult => ({ check: row, boundNumber: null });
   if (agent.providerInboundNumberErrorCode === 'number_bound_elsewhere') {
-    return check('number_bound', 'fail',
+    return unbound(check('number_bound', 'fail',
       `Retell reports ${clinicLine ?? 'this clinic’s line'} answering with a different agent. A caller would not reach this campaign.`,
-      ctx, 'number_bound_elsewhere');
+      ctx, 'number_bound_elsewhere'));
   }
   if (attestationIsFresh(agent.providerInboundNumberVerifiedAt, now)
     && agent.providerInboundNumber
     && agent.providerInboundNumber === clinicLine) {
-    return check('number_bound', 'pass',
-      `Retell confirms ${agent.providerInboundNumber} answers with this hand-linked agent.`, ctx);
+    return {
+      check: check('number_bound', 'pass',
+        `Retell confirms ${agent.providerInboundNumber} answers with this hand-linked agent.`, ctx),
+      boundNumber: dialable(agent.providerInboundNumber),
+    };
   }
   if (agent.providerInboundNumberErrorCode) {
-    return check('number_bound', 'pending',
+    return unbound(check('number_bound', 'pending',
       `CareCommand could not ask Retell who answers ${clinicLine ?? 'this clinic’s line'} (${agent.providerInboundNumberErrorCode}), so the binding is unproven. Verify the agent again.`,
-      ctx, 'number_bound');
+      ctx, 'number_bound'));
   }
-  return check('number_bound', 'fail',
+  return unbound(check('number_bound', 'fail',
     'This agent was linked by hand and nothing has read back what its clinic’s line answers with. Verify the agent, or deploy from Studio, which binds the number itself.',
-    ctx, 'number_binding_unattested');
+    ctx, 'number_binding_unattested'));
 }
 
 export interface ReadinessInput {
@@ -298,6 +330,9 @@ export async function evaluateCampaignReadiness(
 
   const ctx = { clinicId: campaign.clinicId, campaignId: campaign.id, agentId: campaign.agentId };
   const checks: ReadinessCheck[] = [];
+  // Set only by a PASSING `number_bound` row; stays null in every other state,
+  // including a campaign with no agent at all.
+  let boundNumber: string | null = null;
   const agent = campaign.agent;
   // Hoisted: `test_call_completed` is scoped to this exact deployment (B4).
   let deployment: Awaited<ReturnType<typeof tx.receptionistAgentDeployment.findFirst>> = null;
@@ -361,9 +396,11 @@ export async function evaluateCampaignReadiness(
       // is judged on the provider's word like everything else. What BYO still
       // cannot prove is the PROMPT, and that is `deployment_current`'s question
       // above, not this one.
-      checks.push(agent.providerAgentId
+      const byoBinding = agent.providerAgentId
         ? byoNumberBoundCheck(agent, clinicInboundLine(campaign.clinic), ctx, now)
-        : check('number_bound', 'fail', 'Deploy from Studio so the receptionist number answers with this campaign’s agent.', ctx, 'number_bound'));
+        : { check: check('number_bound', 'fail', 'Deploy from Studio so the receptionist number answers with this campaign’s agent.', ctx, 'number_bound'), boundNumber: null };
+      checks.push(byoBinding.check);
+      boundNumber = byoBinding.boundNumber;
     } else {
       const plan = promptConfig ? planDeployment(promptConfig, { mock: deployment.mock }) : null;
       const changed = plan ? deploymentChanges(plan, deployment) : [];
@@ -375,7 +412,9 @@ export async function evaluateCampaignReadiness(
           deployment.status === 'VERIFIED'
             ? `Version ${deployment.providerAgentVersion} is deployed and matches this campaign.`
             : 'The latest deployment published but has not been verified. Verify the agent.', ctx, 'deployment_current'));
-      checks.push(deployedNumberBoundCheck(deployment, ctx, now));
+      const deployedBinding = deployedNumberBoundCheck(deployment, ctx, now);
+      checks.push(deployedBinding.check);
+      boundNumber = deployedBinding.boundNumber;
     }
   }
 
@@ -617,6 +656,7 @@ export async function evaluateCampaignReadiness(
     status: campaign.status,
     ready,
     providerMode: retellConfigStatus().configured ? (retellConfigStatus().mock ? 'mock' : 'live') : 'unconfigured',
+    boundNumber,
     checks,
     actions: {
       activate: {

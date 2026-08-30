@@ -6,21 +6,12 @@ import {
   normalizeBookAppointmentToolContract,
 } from '../modules/receptionist/intakeContract';
 import { isRuntimeDynamicVariable } from './receptionist/runtimeVariables';
-import {
-  buildMockAgentSnapshot,
-  mockCreateAgent,
-  mockCreateLlm,
-  mockListVoices,
-  mockPhoneNumberBinding,
-  mockPublishAgent,
-  mockUpdateAgent,
-  mockUpdateLlm,
-} from './receptionist/retellMock';
 
 // ===========================================================================
 // Retell outbound dial trigger. Real Retell API when credentials are present;
-// a clearly-marked mock path (RETELL_API_KEY starting with "mock") for local
-// testing. Never fabricates a successful call for real configuration.
+// a clearly-marked rehearsal path (RETELL_API_KEY starting with "mock", and
+// only under DEPLOYMENT_PROFILE=demo) for local testing and the demo. Never
+// fabricates a successful call for real configuration.
 // ===========================================================================
 
 export interface RetellConfigStatus { configured: boolean; mock: boolean; missing: string[] }
@@ -40,12 +31,80 @@ export function retellCredentials(): { apiKey: string | undefined; fromNumber: s
   };
 }
 
+/**
+ * The one gate on the simulated provider, and the only place a "mock" key is
+ * turned into a mode this module will act on.
+ *
+ * A key beginning with `mock` is a REHEARSAL key: it makes the provider client
+ * mint plausible agent ids, publish "successfully" and confirm number bindings
+ * that no telephone network knows about. That is exactly right for the demo
+ * deployment and catastrophic anywhere a patient might dial the line, so it is
+ * fenced to `DEPLOYMENT_PROFILE=demo` here as well as at boot.
+ *
+ * `server/config/env.ts` already refuses to start a `pilot`/`enterprise`
+ * process whose RETELL_API_KEY starts with `mock`. This is the second lock, not
+ * a duplicate of the first: boot validation guards the configuration, and this
+ * guards the twelve call sites — every one of which now resolves its
+ * credentials through `retellCredentials()` in this file, so one unfenced `mock`
+ * read here would be reachable from every provider call the product makes. If a
+ * rehearsal key ever reaches a real profile, the calls below take the LIVE path
+ * with a key the provider will reject, and the deploy fails honestly with
+ * `unauthorized` instead of silently succeeding against nothing.
+ */
 export function retellConfigStatus(): RetellConfigStatus {
   const { apiKey, fromNumber } = retellCredentials();
   const missing: string[] = [];
   if (!apiKey) missing.push('RETELL_API_KEY');
   if (!fromNumber) missing.push('RETELL_FROM_NUMBER');
-  return { configured: missing.length === 0, mock: (apiKey ?? '').startsWith('mock'), missing };
+  const rehearsalKey = (apiKey ?? '').startsWith('mock');
+  return { configured: missing.length === 0, mock: rehearsalKey && env.DEPLOYMENT_PROFILE === 'demo', missing };
+}
+
+// ---------------------------------------------------------------------------
+// The gate on the simulated (rehearsal) provider.
+//
+// The simulation lives in ./receptionist/retellSimulatedProvider and is reached
+// ONLY through here, by a dynamic import that is never evaluated unless
+// `retellConfigStatus().mock` is true — which requires both a rehearsal key and
+// DEPLOYMENT_PROFILE=demo. In a pilot or enterprise process the module is not
+// loaded at all, so a provider that fabricates successful deployments is not in
+// the image rather than merely guarded by an `if`.
+// ---------------------------------------------------------------------------
+
+/** The operations the simulation stands in for. Implemented in the demo-only module. */
+export interface SimulatedRetellProvider {
+  createLlm(body: unknown): RetellProviderResult<{ llmId: string; version: number }>;
+  updateLlm(llmId: string, body: unknown, previousVersion?: number): RetellProviderResult<{ llmId: string; version: number }>;
+  createAgent(body: unknown): RetellProviderResult<{ agentId: string; version: number }>;
+  updateAgent(agentId: string, body: unknown, previousVersion?: number): RetellProviderResult<{ agentId: string; version: number }>;
+  publishAgent(agentId: string, version: number): RetellProviderResult<{ version: number }>;
+  phoneNumberBinding(phoneNumber: string, binding: MockPhoneNumberBinding | null): RetellProviderResult<PhoneNumberBinding>;
+  listVoices(): RetellVoice[];
+  agentSnapshot(input: { agentId: string; versionTag: string; deployment: MockDeploymentSnapshot; webhookUrl: string }): RetellAgentSnapshot;
+}
+
+let simulatedProviderLoad: Promise<SimulatedRetellProvider> | null = null;
+
+/**
+ * Whether this process has ever loaded the simulation. Exported so a test can
+ * prove the module is absent from a pilot/enterprise image rather than merely
+ * unreached — the assertion that makes the fence a structural claim instead of
+ * a well-behaved `if`.
+ */
+export function simulatedProviderWasLoaded(): boolean {
+  return simulatedProviderLoad !== null;
+}
+
+/**
+ * The simulation, or null. Null is the answer for a real key, for no key at
+ * all, and — the case this exists for — for a rehearsal key in any profile but
+ * `demo`. Every branch below that would answer from the simulation asks here
+ * first, so there is one fence to reason about and one fence to test.
+ */
+export async function simulatedRetellProvider(): Promise<SimulatedRetellProvider | null> {
+  if (!retellConfigStatus().mock) return null;
+  simulatedProviderLoad ??= import('./receptionist/retellSimulatedProvider').then(module => module.SIMULATED_RETELL_PROVIDER);
+  return simulatedProviderLoad;
 }
 
 export type RetellProviderMode = 'live' | 'mock' | 'unconfigured';
@@ -924,12 +983,16 @@ export async function probeRetellAgent(agentId: string, versionTag: string, opti
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(agentId) || !isValidRetellVersionTag(versionTag)) {
     return { ok: false, error: 'invalid_response' };
   }
-  if (apiKey.startsWith('mock')) {
-    // The fixture answers only from a deployment CareCommand itself made; a
-    // manually linked agent under a mock key is honestly unverifiable.
+  // Deliberately the fenced gate and not `apiKey.startsWith('mock')`: read the
+  // raw key here and this probe would answer from the simulation in a profile
+  // where every other call site had already refused to.
+  const simulated = await simulatedRetellProvider();
+  if (simulated) {
+    // The simulation answers only from a deployment CareCommand itself made; a
+    // manually linked agent under a rehearsal key is honestly unverifiable.
     const deployment = options.mockDeployment;
     if (!deployment || deployment.providerAgentId !== agentId) return { ok: false, error: 'not_found' };
-    return { ok: true, snapshot: buildMockAgentSnapshot({ agentId, versionTag, deployment, webhookUrl: expectedRetellAgentWebhookUrl() }) };
+    return { ok: true, snapshot: simulated.agentSnapshot({ agentId, versionTag, deployment, webhookUrl: expectedRetellAgentWebhookUrl() }) };
   }
   const pinnedVersion = typeof options.pinnedVersion === 'number' && Number.isSafeInteger(options.pinnedVersion) && options.pinnedVersion >= 0
     ? options.pinnedVersion
@@ -1121,8 +1184,8 @@ export async function deleteCallData(callId: string): Promise<RetellMutationResu
 
 // ===========================================================================
 // Deployment client. Every function below is a thin, body-free mapping over
-// the public Retell API; the mock key routes to the fixture in
-// receptionist/retellMock.ts and a real key never touches it.
+// the public Retell API; a rehearsal key routes to the demo-only simulation
+// behind `simulatedRetellProvider()` and a real key never touches it.
 //
 // Provider facts pinned here (docs.retellai.com, 2026-08-29):
 //   - create/update-retell-llm return { llm_id, version, is_published }.
@@ -1205,7 +1268,8 @@ export async function createRetellLlm(spec: RetellLlmSpec): Promise<RetellProvid
   // it the way Retell does, so a payload the provider would reject fails
   // identically in both modes instead of only on somebody's real account.
   const body = llmRequestBody(spec);
-  if (retellConfigStatus().mock) return mockCreateLlm(body);
+  const simulated = await simulatedRetellProvider();
+  if (simulated) return simulated.createLlm(body);
   const result = await providerRequest('/create-retell-llm', { method: 'POST', body });
   return result.ok ? parseLlmResponse(result.value) : result;
 }
@@ -1213,7 +1277,8 @@ export async function createRetellLlm(spec: RetellLlmSpec): Promise<RetellProvid
 export async function updateRetellLlm(llmId: string, spec: RetellLlmSpec, previousVersion = 0): Promise<RetellProviderResult<{ llmId: string; version: number }>> {
   if (!retellCredentials().apiKey) return { ok: false, error: 'setup_required', mock: false };
   const body = llmRequestBody(spec);
-  if (retellConfigStatus().mock) return mockUpdateLlm(llmId, body, previousVersion);
+  const simulated = await simulatedRetellProvider();
+  if (simulated) return simulated.updateLlm(llmId, body, previousVersion);
   const result = await providerRequest(`/update-retell-llm/${encodeURIComponent(llmId)}`, { method: 'PATCH', body });
   return result.ok ? parseLlmResponse(result.value, llmId) : result;
 }
@@ -1221,7 +1286,8 @@ export async function updateRetellLlm(llmId: string, spec: RetellLlmSpec, previo
 export async function createRetellAgent(spec: RetellAgentSpec): Promise<RetellProviderResult<{ agentId: string; version: number }>> {
   if (!retellCredentials().apiKey) return { ok: false, error: 'setup_required', mock: false };
   const body = agentRequestBody(spec);
-  if (retellConfigStatus().mock) return mockCreateAgent(body);
+  const simulated = await simulatedRetellProvider();
+  if (simulated) return simulated.createAgent(body);
   const result = await providerRequest('/create-agent', { method: 'POST', body });
   return result.ok ? parseAgentResponse(result.value) : result;
 }
@@ -1229,7 +1295,8 @@ export async function createRetellAgent(spec: RetellAgentSpec): Promise<RetellPr
 export async function updateRetellAgent(agentId: string, spec: RetellAgentSpec, previousVersion = 0): Promise<RetellProviderResult<{ agentId: string; version: number }>> {
   if (!retellCredentials().apiKey) return { ok: false, error: 'setup_required', mock: false };
   const body = agentRequestBody(spec);
-  if (retellConfigStatus().mock) return mockUpdateAgent(agentId, body, previousVersion);
+  const simulated = await simulatedRetellProvider();
+  if (simulated) return simulated.updateAgent(agentId, body, previousVersion);
   const result = await providerRequest(`/update-agent/${encodeURIComponent(agentId)}`, { method: 'PATCH', body });
   return result.ok ? parseAgentResponse(result.value, agentId) : result;
 }
@@ -1242,7 +1309,8 @@ export async function publishRetellAgent(agentId: string, version: number): Prom
   if (!retellCredentials().apiKey) return { ok: false, error: 'setup_required', mock: false };
   const status = retellConfigStatus();
   if (!Number.isSafeInteger(version) || version < 0) return { ok: false, error: 'invalid_request', mock: status.mock };
-  if (status.mock) return mockPublishAgent(agentId, version);
+  const simulated = await simulatedRetellProvider();
+  if (simulated) return simulated.publishAgent(agentId, version);
   const result = await providerRequest(`/publish-agent-version/${encodeURIComponent(agentId)}`, { method: 'POST', body: { version } });
   return result.ok ? { ok: true, value: { version }, mock: false } : result;
 }
@@ -1311,7 +1379,8 @@ export async function getPhoneNumberBinding(
   options: { mockBinding?: MockPhoneNumberBinding | null } = {},
 ): Promise<RetellProviderResult<PhoneNumberBinding>> {
   if (!retellCredentials().apiKey) return { ok: false, error: 'setup_required', mock: false };
-  if (retellConfigStatus().mock) return mockPhoneNumberBinding(phoneNumber, options.mockBinding ?? null);
+  const simulated = await simulatedRetellProvider();
+  if (simulated) return simulated.phoneNumberBinding(phoneNumber, options.mockBinding ?? null);
   const result = await providerRequest(`/get-phone-number/${encodeURIComponent(phoneNumber)}`, { method: 'GET' });
   if (!result.ok) return result;
   return { ok: true, value: parsePhoneNumberBinding(phoneNumber, result.value), mock: false };
@@ -1329,7 +1398,8 @@ export interface RetellVoice {
 
 export async function listRetellVoices(): Promise<RetellProviderResult<RetellVoice[]>> {
   if (!retellCredentials().apiKey) return { ok: false, error: 'setup_required', mock: false };
-  if (retellConfigStatus().mock) return { ok: true, value: mockListVoices(), mock: true };
+  const simulated = await simulatedRetellProvider();
+  if (simulated) return { ok: true, value: simulated.listVoices(), mock: true };
   try {
     const response = await fetchWithTimeout(`${env.RETELL_BASE_URL}/list-voices`, {
       headers: { Authorization: `Bearer ${retellCredentials().apiKey}` },
