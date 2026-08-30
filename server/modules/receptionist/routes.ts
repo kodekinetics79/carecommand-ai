@@ -6,6 +6,11 @@ import { agentRoutes } from './agents';
 import { campaignRoutes, campaignExportRoutes } from './campaigns';
 import { intakeRoutes } from './intake';
 import { activityRoutes } from './activity';
+import { closureRoutes } from './closures';
+import { knowledgeRoutes } from './knowledge';
+import { localePackRoutes } from './localePacks';
+import { catalogRoutes } from './catalog';
+import { hoursStatusRoutes } from './hoursStatus';
 
 export { receptionistWebhookRoutes, verifyRetellSignature } from './webhooks';
 
@@ -16,6 +21,21 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
 
   // ===== Clinics + locations ==============================================
   await app.register(clinicRoutes);
+
+  // ===== Planned closures =================================================
+  await app.register(closureRoutes);
+
+  // ===== Clinic knowledge (draft + approved snapshot) =====================
+  await app.register(knowledgeRoutes);
+
+  // ===== Locale packs (caller-facing wording) =============================
+  await app.register(localePackRoutes);
+
+  // ===== Server-served option catalog =====================================
+  await app.register(catalogRoutes);
+
+  // ===== Live open/closed state ===========================================
+  await app.register(hoursStatusRoutes);
 
   // ===== Agents ===========================================================
   await app.register(agentRoutes);

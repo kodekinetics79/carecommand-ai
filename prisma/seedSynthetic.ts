@@ -5,6 +5,8 @@ import { Prisma, PrismaClient } from '../server/generated/prisma/client';
 import { syntheticProfiles } from './synthetic/profileManifest';
 import { assertSyntheticSeedTarget } from './synthetic/seedSafety';
 import { seedGrowthDemo } from './synthetic/growthDemo';
+import { PLATFORM_LOCALE_PACKS, platformLocalePackHash } from '../server/lib/receptionist/localePacks/defaults';
+import { knowledgeHash, type KnowledgeDocument } from '../server/lib/receptionist/knowledge';
 
 const target = assertSyntheticSeedTarget({
   nodeEnv: process.env.NODE_ENV,
@@ -55,7 +57,42 @@ function phoneFor(scope: number, index: number): string {
   return `+1555${String(scope).padStart(2, '0')}${String(index).padStart(5, '0')}`;
 }
 
+function syntheticKnowledgeDocument(index: number): KnowledgeDocument {
+  return {
+    acceptedPayers: [
+      { id: stableUuid('receptionist-payer', index * 3), name: 'Delta Dental', plans: ['PPO', 'Premier'], source: 'manual' },
+      { id: stableUuid('receptionist-payer', index * 3 + 1), name: 'Cigna', source: 'manual' },
+      { id: stableUuid('receptionist-payer', index * 3 + 2), name: 'Aetna', plans: ['DMO'], source: 'manual' },
+    ],
+    paymentPolicy: 'Payment is due at the time of service. We accept card and bank transfer, and we can split a treatment plan across visits.',
+    newPatientPolicy: 'New patients should arrive ten minutes early with photo ID and any insurance details.',
+    urgentCare: {
+      whatCountsAsUrgent: 'Swelling, a lost filling or crown, or pain that stops you sleeping.',
+      sameDayPolicy: 'We hold two same-day slots each morning for urgent problems.',
+      onCallNumber: phoneFor(95, index),
+    },
+    faq: [
+      { id: stableUuid('receptionist-faq', index * 4), question: 'Do you have parking?', answer: 'Yes, there is a free lot behind the building.' },
+      { id: stableUuid('receptionist-faq', index * 4 + 1), question: 'Do you see children?', answer: 'Yes, we see patients from age three upwards.' },
+      { id: stableUuid('receptionist-faq', index * 4 + 2), question: 'Is the practice step-free?', answer: 'Yes, there is a step-free entrance at the side door.' },
+      { id: stableUuid('receptionist-faq', index * 4 + 3), question: 'How early should I arrive?', answer: 'Ten minutes early for a first visit, five minutes for a routine appointment.' },
+    ],
+  };
+}
+
 const userRoles = ['OWNER', 'ADMIN', 'MANAGER', 'BILLING', 'PROVIDER', 'FRONT_DESK', 'ANALYST', 'COMPLIANCE_OFFICER', 'AUDITOR'] as const;
+
+// Mon-Fri 09:00-17:00 plus a Saturday morning: enough for the hours engine to
+// show an open day, a half day and a closed day in one demo.
+const WEEKLY_HOURS = {
+  monday: { open: true, start: '09:00', end: '17:00' },
+  tuesday: { open: true, start: '09:00', end: '17:00' },
+  wednesday: { open: true, start: '09:00', end: '17:00' },
+  thursday: { open: true, start: '09:00', end: '17:00' },
+  friday: { open: true, start: '09:00', end: '17:00' },
+  saturday: { open: true, start: '09:00', end: '13:00' },
+  sunday: { open: false },
+} as const;
 const lifecycleStages = ['NEW', 'ACTIVE', 'AT_RISK', 'INACTIVE', 'RETAINED'] as const;
 const appointmentStatuses = ['CONFIRMED', 'RISKY', 'ARRIVED', 'NO_SHOW', 'CANCELED', 'COMPLETED', 'WAITLIST'] as const;
 const callOutcomes = ['IN_PROGRESS', 'BOOKED', 'NOT_INTERESTED', 'NO_ANSWER', 'VOICEMAIL', 'ESCALATED', 'OPTED_OUT', 'FAILED'] as const;
@@ -111,6 +148,7 @@ async function seed(): Promise<void> {
 
   const branches: Prisma.BranchCreateManyInput[] = [];
   const clinics: Prisma.ReceptionistClinicCreateManyInput[] = [];
+  const clinicCountries: string[] = [];
   for (let index = 0; index < profile.clinics; index += 1) {
     const tenantIndex = index % tenantIds.length;
     const branchId = stableUuid('branch', index);
@@ -118,12 +156,15 @@ async function seed(): Promise<void> {
     branchIds.push(branchId);
     receptionistClinicIds.push(clinicId);
     branchTenant.push(tenantIds[tenantIndex]);
+    const isUs = index % 2 === 0;
+    const clinicTimezone = isUs ? 'America/New_York' : 'Europe/London';
+    clinicCountries.push(isUs ? 'US' : 'GB');
     branches.push({
       id: branchId,
       tenantId: tenantIds[tenantIndex],
       name: `Synthetic Clinic ${index + 1}`,
       location: `${100 + index} Example Avenue, Test City, NY 10001`,
-      timezone: index % 2 === 0 ? 'America/New_York' : 'America/Chicago',
+      timezone: clinicTimezone,
       active: true,
       createdAt: now,
       updatedAt: now,
@@ -135,8 +176,11 @@ async function seed(): Promise<void> {
       phone: phoneFor(10, index),
       website: `https://clinic-${index + 1}.example.test`,
       addressLine: `${100 + index} Example Avenue, Test City, NY 10001`,
-      timezone: index % 2 === 0 ? 'America/New_York' : 'America/Chicago',
+      country: isUs ? 'US' : 'GB',
+      timezone: clinicTimezone,
+      defaultLanguage: isUs ? 'en-US' : 'en-GB',
       humanFallbackNumber: phoneFor(90, index),
+      workingHours: WEEKLY_HOURS,
       active: true,
       createdAt: now,
       updatedAt: now,
@@ -144,6 +188,40 @@ async function seed(): Promise<void> {
   }
   await db.branch.createMany({ data: branches });
   await db.receptionistClinic.createMany({ data: clinics });
+
+  // One location per clinic, bound to its branch, so the hours engine and the
+  // prompt have a real place to describe.
+  await db.receptionistLocation.createMany({
+    data: receptionistClinicIds.map((clinicId, index) => ({
+      id: stableUuid('receptionist-location', index),
+      tenantId: branchTenant[index],
+      clinicId,
+      branchId: branchIds[index],
+      name: `Synthetic Location ${index + 1}`,
+      address: `${100 + index} Example Avenue, Test City`,
+      phone: phoneFor(11, index),
+      accessNotes: 'Street parking outside; step-free entrance at the side door.',
+      active: true,
+      createdAt: now,
+      updatedAt: now,
+    })),
+  });
+
+  // A closure ten days out proves the closure branch of the hours engine and
+  // the "upcoming closures" prompt line.
+  await db.receptionistClosure.createMany({
+    data: receptionistClinicIds.map((clinicId, index) => ({
+      id: stableUuid('receptionist-closure', index),
+      tenantId: branchTenant[index],
+      clinicId,
+      locationId: null,
+      startsOn: new Date(new Date(now.getTime() + 10 * day).toISOString().slice(0, 10)),
+      endsOn: new Date(new Date(now.getTime() + 10 * day).toISOString().slice(0, 10)),
+      reason: 'Staff training day',
+      createdAt: now,
+      updatedAt: now,
+    })),
+  });
 
   const users: Prisma.UserCreateManyInput[] = [];
   for (let index = 0; index < profile.users; index += 1) {
@@ -181,6 +259,73 @@ async function seed(): Promise<void> {
     data: userIds.map((userId, index) => ({
       id: stableUuid('user-clinic', index), tenantId: userTenant[index], userId, branchId: userBranch[index], isPrimary: true, createdAt: now,
     })),
+  });
+
+  // Approved locale packs and knowledge: both carry an approver, so they are
+  // created after the users exist. Without them a clinic cannot be activated.
+  const ownerByTenant = new Map<string, string>();
+  userIds.forEach((userId, index) => {
+    if (users[index].role === 'OWNER' && !ownerByTenant.has(userTenant[index])) ownerByTenant.set(userTenant[index], userId);
+  });
+
+  const localePacks: Prisma.ReceptionistLocalePackCreateManyInput[] = [];
+  let packIndex = 0;
+  for (const tenantId of tenantIds) {
+    const approver = ownerByTenant.get(tenantId);
+    if (!approver) continue;
+    for (const platform of PLATFORM_LOCALE_PACKS) {
+      localePacks.push({
+        id: stableUuid('receptionist-locale-pack', packIndex),
+        tenantId,
+        language: platform.language,
+        country: platform.country,
+        version: platform.version,
+        status: 'APPROVED',
+        source: 'platform_default',
+        baseDefaultVersion: platform.version,
+        strings: platform.strings as unknown as Prisma.InputJsonValue,
+        evidenceHash: platformLocalePackHash(platform),
+        approvedByUserId: approver,
+        approvedAt: now,
+        createdByUserId: approver,
+        createdAt: now,
+        updatedAt: now,
+      });
+      packIndex += 1;
+    }
+  }
+  await db.receptionistLocalePack.createMany({ data: localePacks });
+
+  const knowledgeRows: Prisma.ReceptionistClinicKnowledgeCreateManyInput[] = [];
+  receptionistClinicIds.forEach((clinicId, index) => {
+    const tenantId = branchTenant[index];
+    const approver = ownerByTenant.get(tenantId);
+    if (!approver) return;
+    const document = syntheticKnowledgeDocument(index);
+    knowledgeRows.push({
+      id: stableUuid('receptionist-knowledge', index),
+      tenantId,
+      clinicId,
+      draft: document as unknown as Prisma.InputJsonValue,
+      draftRevision: 1,
+      approved: document as unknown as Prisma.InputJsonValue,
+      approvedRevision: 1,
+      approvedHash: knowledgeHash(document),
+      approvedByUserId: approver,
+      approvedAt: now,
+      updatedByUserId: approver,
+      createdAt: now,
+      updatedAt: now,
+    });
+  });
+  await db.receptionistClinicKnowledge.createMany({ data: knowledgeRows });
+
+  // Services are catalog rows, and the voice columns are what the prompt reads.
+  await db.serviceCatalogItem.createMany({
+    data: tenantIds.flatMap((tenantId, tenantIndex) => [
+      { id: stableUuid('service-catalog', tenantIndex * 2), tenantId, name: 'Consultation', category: 'general', defaultDurationMinutes: 30, defaultAppointmentValue: 95, spokenDescription: 'A first visit to talk through your options.', bookableByVoice: true, voiceDurationMinutes: 30, priceFrom: 95, active: true, createdAt: now, updatedAt: now },
+      { id: stableUuid('service-catalog', tenantIndex * 2 + 1), tenantId, name: 'Hygiene visit', category: 'general', defaultDurationMinutes: 45, defaultAppointmentValue: 120, spokenDescription: 'A routine clean with one of our hygienists.', bookableByVoice: true, voiceDurationMinutes: 45, priceFrom: 120, active: true, createdAt: now, updatedAt: now },
+    ]),
   });
 
   const patients: Prisma.PatientCreateManyInput[] = [];
@@ -288,6 +433,9 @@ async function seed(): Promise<void> {
       callerName: `Synthetic Caller ${index + 1}`, callerPhone: phoneFor(40 + (index % 10), index),
       direction: index % 3 === 0 ? 'inbound' : 'outbound', outcome: callOutcomes[index % callOutcomes.length],
       durationSeconds: 30 + (index % 300),
+      // Every third inbound call lands outside hours so the front-desk
+      // after-hours card and the after_hours_call signal have real evidence.
+      outsideHours: index % 3 === 0 ? index % 9 === 0 : null,
       startedAt: new Date(now.getTime() - (index % 30) * day), endedAt: new Date(now.getTime() - (index % 30) * day + 120_000),
       createdAt: new Date(now.getTime() - (index % 30) * day), updatedAt: now,
     });

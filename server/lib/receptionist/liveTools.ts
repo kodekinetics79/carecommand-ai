@@ -20,7 +20,16 @@ import {
 import { restrictCallToBasicAttributes } from '../retell';
 import { CONFIRMATION_OUTBOX_SOURCE, processAppointmentConfirmations } from './confirmationOutbox';
 import { lockDncDestinationFence } from './dncFence';
+<<<<<<< HEAD
 import { createSafetyTask } from './frontDeskTask';
+=======
+import { resolveCallLocalePack, resolvedLocaleFormat } from './localePacks/resolve';
+import { renderPackMessage } from './localePacks/render';
+import { EMERGENCY_FALLBACK_NUMBER_FREE } from './localePacks/defaults';
+import { loadHoursSource } from './hoursSource';
+import { hoursConfigured, resolveEffectiveHours, spokenDate } from './clinicHours';
+import type { LocaleFormat } from './localePacks/types';
+>>>>>>> worktree-agent-a44bea0988522c2a1
 
 // Real-time tools the AI receptionist invokes DURING a call (Retell custom
 // functions). Each returns a JSON result with a `message` the agent can speak.
@@ -304,6 +313,13 @@ export async function takeMessage(ctx: ToolContext, args: Record<string, unknown
 /** Creates a critical staff signal without delaying immediate emergency advice. */
 export async function reportEmergency(ctx: ToolContext, args: Record<string, unknown>) {
   const task = await createSafetyTask(ctx, 'emergency', args);
+  // The emergency number is jurisdictional: it comes from the call's approved
+  // locale pack. With no pack (and no country to fall back on) the agent says
+  // the number-free sentence rather than naming the wrong country's number.
+  const pack = await resolveCallLocalePack(db, { tenantId: ctx.tenantId, callId: ctx.callId, trustedProviderAgentId: ctx.trustedProviderAgentId });
+  const message = pack
+    ? renderPackMessage(pack.strings, 'tool.emergency.message', { emergency_number: pack.strings.emergencyNumber })
+    : EMERGENCY_FALLBACK_NUMBER_FREE;
   return {
     emergency_recorded: true,
     protocol_status: 'pending_provider_evidence',
@@ -311,7 +327,7 @@ export async function reportEmergency(ctx: ToolContext, args: Record<string, unk
     duplicate: task.duplicate,
     appended: task.appended,
     task_id: task.taskId,
-    message: 'If you may be experiencing an emergency, hang up and call 911 now, or go to the nearest emergency room. Do not wait for a callback from this office.',
+    message,
   };
 }
 
@@ -377,12 +393,19 @@ async function verifiedPatientForCall(ctx: ToolContext): Promise<string | null> 
   return patient && validPhone(patient.phone) === phone ? patient.id : null;
 }
 
-function localAppointmentLabel(startsAt: Date, timezone: string): string {
-  return new Intl.DateTimeFormat('en-US', {
+function localAppointmentLabel(startsAt: Date, timezone: string, locale?: LocaleFormat | null): string {
+  return new Intl.DateTimeFormat(locale?.language ?? 'en-US', {
     timeZone: timezone,
     weekday: 'short', month: 'short', day: 'numeric', year: 'numeric',
     hour: 'numeric', minute: '2-digit',
+    ...(locale ? { hour12: locale.timeStyle === '12h' } : {}),
   }).format(startsAt);
+}
+
+/** The call's LocaleFormat, or null when no pack can be resolved. */
+async function callLocaleFormat(ctx: ToolContext): Promise<LocaleFormat | null> {
+  const pack = await resolveCallLocalePack(db, { tenantId: ctx.tenantId, callId: ctx.callId, trustedProviderAgentId: ctx.trustedProviderAgentId });
+  return pack ? resolvedLocaleFormat(pack, pack.language) : null;
 }
 
 /** Return minimum-necessary upcoming appointments only after server-side identity proof. */
@@ -395,7 +418,8 @@ export async function listUpcomingAppointments(ctx: ToolContext) {
     select: { id: true, startsAt: true, service: true, branch: { select: { timezone: true } } },
   });
   await auditLive(ctx.tenantId, 'receptionist.appointments.listed', ctx.callId, { count: rows.length, via: 'verified_live_call' });
-  const appointments = rows.map(row => ({ appointment_id: row.id, service: row.service, starts_at: row.startsAt.toISOString(), spoken_time: localAppointmentLabel(row.startsAt, row.branch.timezone) }));
+  const locale = await callLocaleFormat(ctx);
+  const appointments = rows.map(row => ({ appointment_id: row.id, service: row.service, starts_at: row.startsAt.toISOString(), spoken_time: localAppointmentLabel(row.startsAt, row.branch.timezone, locale) }));
   return { verified: true, appointments, message: appointments.length ? `I found ${appointments.length} upcoming appointment${appointments.length === 1 ? '' : 's'}.` : 'I do not see an upcoming appointment that can be changed automatically.' };
 }
 
@@ -461,7 +485,7 @@ export async function prepareAppointmentChange(ctx: ToolContext, args: Record<st
     if (conflict) return { prepared: false, message: 'That time is no longer available. Please choose another.' };
     change.appointmentDate = appointmentDate;
     change.appointmentTime = appointmentTime;
-    spokenChange = `reschedule it to ${localAppointmentLabel(startsAt, appt.branch.timezone)}`;
+    spokenChange = `reschedule it to ${localAppointmentLabel(startsAt, appt.branch.timezone, await callLocaleFormat(ctx))}`;
   }
 
   const token = randomUUID();
@@ -559,7 +583,7 @@ export async function rescheduleAppointment(ctx: ToolContext, args: Record<strin
     appointment_id: appointmentId,
     starts_at: startsAt.toISOString(),
     deposit_review_pending: depositEvaluation === null,
-    message: `Your appointment is rescheduled to ${localAppointmentLabel(startsAt, appt.branch.timezone)}.${depositEvaluation === null ? ' Staff will review the deposit requirement separately.' : ''}`,
+    message: `Your appointment is rescheduled to ${localAppointmentLabel(startsAt, appt.branch.timezone, await callLocaleFormat(ctx))}.${depositEvaluation === null ? ' Staff will review the deposit requirement separately.' : ''}`,
   };
 }
 
@@ -619,6 +643,29 @@ export async function checkAvailability(ctx: ToolContext, args: Record<string, u
   }
   const policy = await getSchedulingPolicy(ctx.tenantId);
   if (!policy.selfBookEnabled) return { available: false, needs_review: true, slots: [], message: 'This clinic requires staff review before offering self-booking times.' };
+
+  // The clinic's own hours and closures decide whether that date is offerable
+  // at all. Provider availability alone would happily offer a slot on a day
+  // the practice is shut.
+  const bundle = await loadHoursSource(db, { tenantId: ctx.tenantId, clinicId: trusted.clinicId });
+  const locationSource = bundle?.locations.find(location => location.id === trusted.locationId)?.source ?? bundle?.source ?? null;
+  const pack = await resolveCallLocalePack(db, { tenantId: ctx.tenantId, callId: ctx.callId, trustedProviderAgentId: ctx.trustedProviderAgentId });
+  const locale = pack ? resolvedLocaleFormat(pack, pack.language) : null;
+  if (locationSource && hoursConfigured(locationSource) && /^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    const day = resolveEffectiveHours(locationSource, date);
+    if (!day.open) {
+      const spokenDay = locale ? spokenDate(date, locale) : date;
+      const clinicName = bundle?.clinic.name ?? 'the practice';
+      const message = pack
+        ? day.closure
+          ? renderPackMessage(pack.strings, 'tool.availability.closed_reason', { clinic_name: clinicName, date: spokenDay, closure_reason: day.closure.reason })
+          : renderPackMessage(pack.strings, 'tool.availability.closed', { clinic_name: clinicName, date: spokenDay })
+        : `${clinicName} is closed on ${spokenDay}. Would a different day work?`;
+      await auditLive(ctx.tenantId, 'receptionist.availability.closed', trusted.branchId, { date, closureId: day.closure?.id ?? null });
+      return { available: false, reason: 'clinic_closed', slots: [], message };
+    }
+  }
+
   const slots = (await getOpenSlots(ctx.tenantId, trusted.branchId, date, service.durationMin, 6, providerProfileId))
     .filter(slot => {
       const startsAt = parseSlot(date, slot.time, trusted.branchTimezone!);
@@ -1026,8 +1073,9 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
   if (result.kind === 'rejected') return { booked: false, needs_human: true, message: result.message };
   if (result.kind === 'review') return { booked: false, needs_review: true, duplicate: result.duplicate, appointment_request_id: result.requestId, message: result.message };
 
-  const localLabel = localAppointmentLabel(result.startsAt, result.timezone);
-  const timezoneLabel = new Intl.DateTimeFormat('en-US', {
+  const bookingLocale = await callLocaleFormat(ctx);
+  const localLabel = localAppointmentLabel(result.startsAt, result.timezone, bookingLocale);
+  const timezoneLabel = new Intl.DateTimeFormat(bookingLocale?.language ?? 'en-US', {
     timeZone: result.timezone,
     timeZoneName: 'long',
   }).formatToParts(result.startsAt).find(part => part.type === 'timeZoneName')?.value ?? result.timezone;

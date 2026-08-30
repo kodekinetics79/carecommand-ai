@@ -3,12 +3,18 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { env } from '../../config/env';
-import { generateSystemPrompt, generateSamples, buildRetellConfig, type PromptConfig, type PromptIntakeField, type PromptBookingRules } from './promptService';
+import { generateSystemPrompt, generateSamples, buildRetellConfig, promptHash, type PromptConfig, type PromptIntakeField, type PromptBookingRules, type PromptService } from './promptService';
+import { hoursHash, hoursSummarySpoken, upcomingClosuresSpoken } from '../../lib/receptionist/clinicHours';
+import { loadHoursSource } from '../../lib/receptionist/hoursSource';
+import { knowledgeHash, parseKnowledgeDocument, type KnowledgeDocument } from '../../lib/receptionist/knowledge';
+import { resolveLocalePackWithFallback } from '../../lib/receptionist/localePacks/resolve';
+import { localeFormatOf } from '../../lib/receptionist/localePacks/render';
+import { clinicActivationState, isClinicActivationBlocker } from '../../lib/receptionist/activationReadiness';
 import { runWithTenantContext } from '../../lib/tenantContext';
 import { agentReadinessReason } from '../../lib/receptionist/agentReadiness';
 import { Prisma } from '../../generated/prisma/client';
 import { bookAppointmentToolFingerprint, fingerprintJson } from './intakeContract';
-import { uuid, idParam, writeRoles, intakeConfigurationError, compileCampaignIntakeContract, isReceptionistDestinationConflict, lockReceptionistConfiguration, auditReceptionistMutation, FIELD_TYPES } from './shared';
+import { uuid, idParam, writeRoles, receptionistRead, intakeConfigurationError, compileCampaignIntakeContract, isReceptionistDestinationConflict, lockReceptionistConfiguration, auditReceptionistMutation, FIELD_TYPES } from './shared';
 
 async function assertCampaignAgent(
   tx: Prisma.TransactionClient,
@@ -46,9 +52,26 @@ async function assertCampaignLocations(
 function campaignAssignmentError(error: unknown) {
   const code = error instanceof Error ? error.message : '';
   if (code.includes('active_intake_contract_immutable')) return 'active_intake_contract_immutable';
+  // Clinic-level activation blockers (C2). C5's evaluateCampaignReadiness will
+  // replace this call site with readiness rows; until then a blocked clinic
+  // must not be able to reach a live provider deployment.
+  if (isClinicActivationBlocker(code)) return code;
   return ['agent_unlinked', 'agent_scope_mismatch', 'agent_inactive', 'agent_unverified', 'agent_configuration_changed', 'agent_verification_stale', 'location_scope_mismatch', 'intake_schema_unattested', 'intake_schema_mismatch', 'intake_schema_not_strict', 'active_intake_contract_immutable', 'active_provider_deployment_conflict'].includes(code)
     ? code
     : null;
+}
+
+/**
+ * Clinic configuration that must hold before a campaign may go ACTIVE, and the
+ * locale pack the activation binds itself to.
+ */
+async function assertClinicActivationReadiness(
+  tx: Prisma.TransactionClient,
+  input: { tenantId: string; clinicId: string; agent: { language: string } | null },
+) {
+  const state = await clinicActivationState(tx, input);
+  if (state.blockers.length) throw new Error(state.blockers[0]);
+  return state.localePack;
 }
 
 async function attestCampaignIntakeContract(
@@ -134,9 +157,9 @@ type CampaignWithRelations = {
   agentId: string | null;
   clinic: {
     id: string; name: string; phone: string; website: string | null; addressLine: string | null;
-    timezone: string; defaultLanguage: string; complianceDisclosure: string;
-    humanFallbackNumber: string | null; doNotContactPolicy: string; workingHours: unknown;
-    locations: Array<{ id: string; name: string; address: string; phone: string | null }>;
+    country: string | null; timezone: string; defaultLanguage: string; complianceDisclosure: string | null;
+    humanFallbackNumber: string | null; doNotContactPolicy: string | null; workingHours: unknown;
+    locations: Array<{ id: string; name: string; address: string; phone: string | null; accessNotes: string | null }>;
   };
   agent: {
     name: string; voice: string; tone: string; language: string;
@@ -149,26 +172,72 @@ type CampaignWithRelations = {
   }>;
 };
 
-function toPromptConfig(campaign: CampaignWithRelations): PromptConfig {
-  const agent = campaign.agent ?? {
-    name: 'Riley', voice: '11labs-Adrian', tone: 'Warm and professional',
-    language: campaign.clinic.defaultLanguage, persona: null, greetingOverride: null,
-  };
-  return {
+export type PromptConfigResult =
+  | { ok: true; config: PromptConfig; localePackId: string | null; evidenceHash: string }
+  | { ok: false; reason: 'locale_pack_unavailable' };
+
+/**
+ * Assemble the full prompt configuration: clinic facts, hours, approved
+ * knowledge, catalog services and the locale pack. Every caller-facing string
+ * the prompt speaks comes from the pack, so a configuration without one cannot
+ * be rendered at all rather than falling back to invented wording.
+ */
+export async function promptConfigForCampaign(campaign: CampaignWithRelations, tenantId: string): Promise<PromptConfigResult> {
+  const agent = campaign.agent;
+  const language = agent?.language ?? campaign.clinic.defaultLanguage;
+  const [bundle, knowledgeRow, services, resolvedPack] = await Promise.all([
+    loadHoursSource(db, { tenantId, clinicId: campaign.clinic.id }),
+    db.receptionistClinicKnowledge.findFirst({ where: { tenantId, clinicId: campaign.clinic.id }, select: { approved: true } }),
+    db.serviceCatalogItem.findMany({
+      where: { tenantId, active: true },
+      orderBy: { name: 'asc' },
+      select: { id: true, name: true, spokenDescription: true, bookableByVoice: true, voiceDurationMinutes: true, defaultDurationMinutes: true, priceFrom: true },
+    }),
+    resolveLocalePackWithFallback(db, { tenantId, language, country: campaign.clinic.country }),
+  ]);
+  if (!resolvedPack) return { ok: false, reason: 'locale_pack_unavailable' };
+  const locale = localeFormatOf(resolvedPack.strings, resolvedPack.language);
+  const now = new Date();
+  const knowledge: KnowledgeDocument | null = knowledgeRow?.approved ? parseKnowledgeDocument(knowledgeRow.approved) : null;
+  const promptServices: PromptService[] = services.map(item => ({
+    id: item.id,
+    name: item.name,
+    spokenDescription: item.spokenDescription,
+    voiceDurationMinutes: item.voiceDurationMinutes ?? item.defaultDurationMinutes,
+    priceFrom: item.priceFrom === null || item.priceFrom === undefined ? null : Number(item.priceFrom),
+    bookableByVoice: item.bookableByVoice,
+  }));
+  const config: PromptConfig = {
     clinic: {
       id: campaign.clinic.id,
       name: campaign.clinic.name,
       phone: campaign.clinic.phone,
       website: campaign.clinic.website,
       addressLine: campaign.clinic.addressLine,
+      country: campaign.clinic.country,
       timezone: campaign.clinic.timezone,
       defaultLanguage: campaign.clinic.defaultLanguage,
       complianceDisclosure: campaign.clinic.complianceDisclosure,
       humanFallbackNumber: campaign.clinic.humanFallbackNumber,
       doNotContactPolicy: campaign.clinic.doNotContactPolicy,
-      workingHours: campaign.clinic.workingHours,
     },
-    agent,
+    agent: agent ?? {
+      name: campaign.clinic.name, voice: '', tone: 'Warm and professional',
+      language, persona: null, greetingOverride: null,
+    },
+    knowledge,
+    services: promptServices,
+    hours: bundle
+      ? {
+        clinicSummary: hoursSummarySpoken(bundle.source, locale),
+        perLocation: bundle.locations.map(location => ({
+          id: location.id,
+          summary: hoursSummarySpoken(location.source, locale),
+          closures: upcomingClosuresSpoken(location.source, now, 60, locale),
+        })),
+      }
+      : null,
+    localePack: { id: resolvedPack.id, strings: resolvedPack.strings, evidenceHash: resolvedPack.evidenceHash },
     campaign: {
       id: campaign.id,
       name: campaign.name,
@@ -185,6 +254,20 @@ function toPromptConfig(campaign: CampaignWithRelations): PromptConfig {
     },
     locations: campaign.clinic.locations,
     intakeFields: campaign.intakeFields as PromptIntakeField[],
+  };
+  return { ok: true, config, localePackId: resolvedPack.id, evidenceHash: resolvedPack.evidenceHash };
+}
+
+/** Hours + knowledge evidence for the export routes and C5's deployment attestation. */
+async function configurationHashes(tenantId: string, clinicId: string) {
+  const [bundle, knowledgeRow] = await Promise.all([
+    loadHoursSource(db, { tenantId, clinicId }),
+    db.receptionistClinicKnowledge.findFirst({ where: { tenantId, clinicId }, select: { approved: true, approvedHash: true } }),
+  ]);
+  const approved = knowledgeRow?.approved ? parseKnowledgeDocument(knowledgeRow.approved) : null;
+  return {
+    hoursHash: bundle ? hoursHash(bundle.source) : null,
+    knowledgeHash: knowledgeRow?.approvedHash ?? (approved ? knowledgeHash(approved) : null),
   };
 }
 
@@ -220,7 +303,7 @@ export const campaignRoutes: FastifyPluginAsync = async app => {
   });
   const campaignUpdate = campaignCreate.partial().omit({ clinicId: true });
 
-  app.get('/campaigns', { preHandler: writeRoles }, async request => {
+  app.get('/campaigns', { preHandler: receptionistRead }, async request => {
     const query = z.object({ clinicId: uuid.optional() }).parse(request.query);
     return db.receptionistCampaign.findMany({
       where: { tenantId: request.auth.tenantId, ...(query.clinicId ? { clinicId: query.clinicId } : {}) },
@@ -234,7 +317,7 @@ export const campaignRoutes: FastifyPluginAsync = async app => {
     });
   });
 
-  app.get('/campaigns/:id', { preHandler: writeRoles }, async request => {
+  app.get('/campaigns/:id', { preHandler: receptionistRead }, async request => {
     const { id } = idParam.parse(request.params);
     const campaign = await loadCampaign(request.auth.tenantId, id);
     if (!campaign) throw app.httpErrors.notFound('Campaign not found');
@@ -264,8 +347,17 @@ export const campaignRoutes: FastifyPluginAsync = async app => {
           },
         });
         if (status === 'ACTIVE') {
+          const localePack = await assertClinicActivationReadiness(tx, { tenantId: request.auth.tenantId, clinicId: input.clinicId, agent });
           const attestation = await attestCampaignIntakeContract(tx, created, agent);
-          created = await tx.receptionistCampaign.update({ where: { id: created.id }, data: { ...attestation, status: 'ACTIVE' } });
+          created = await tx.receptionistCampaign.update({
+            where: { id: created.id },
+            data: {
+              ...attestation,
+              status: 'ACTIVE',
+              attestedLocalePackId: localePack?.id ?? null,
+              attestedLocalePackHash: localePack?.evidenceHash ?? null,
+            },
+          });
         }
         await auditReceptionistMutation(tx, request, {
           action: 'receptionistCampaign.created', resource: 'receptionistCampaign', resourceId: created.id,
@@ -314,8 +406,17 @@ export const campaignRoutes: FastifyPluginAsync = async app => {
           },
         });
         if (nextStatus === 'ACTIVE' && existing.status !== 'ACTIVE') {
+          const localePack = await assertClinicActivationReadiness(tx, { tenantId: request.auth.tenantId, clinicId: existing.clinicId, agent });
           const attestation = await attestCampaignIntakeContract(tx, row, agent);
-          row = await tx.receptionistCampaign.update({ where: { id }, data: { ...attestation, status: 'ACTIVE' } });
+          row = await tx.receptionistCampaign.update({
+            where: { id },
+            data: {
+              ...attestation,
+              status: 'ACTIVE',
+              attestedLocalePackId: localePack?.id ?? null,
+              attestedLocalePackHash: localePack?.evidenceHash ?? null,
+            },
+          });
         }
         await auditReceptionistMutation(tx, request, {
           action: 'receptionistCampaign.updated', resource: 'receptionistCampaign', resourceId: id,
@@ -372,10 +473,11 @@ function configurationConflict(app: Parameters<FastifyPluginAsync>[0], error: Er
 
 export const campaignExportRoutes: FastifyPluginAsync = async app => {
   // ===== Prompt generation + RetellAI export ==============================
-  app.get('/campaigns/:id/prompt', { preHandler: writeRoles }, async request => {
+  app.get('/campaigns/:id/prompt', { preHandler: receptionistRead }, async request => {
     const { id } = idParam.parse(request.params);
     const campaign = await loadCampaign(request.auth.tenantId, id);
     if (!campaign) throw app.httpErrors.notFound('Campaign not found');
+<<<<<<< HEAD
     try {
       const config = toPromptConfig(campaign as unknown as CampaignWithRelations);
       return {
@@ -386,12 +488,31 @@ export const campaignExportRoutes: FastifyPluginAsync = async app => {
       if (isConfigurationError(error)) throw configurationConflict(app, error);
       throw error;
     }
+=======
+    const prepared = await promptConfigForCampaign(campaign as unknown as CampaignWithRelations, request.auth.tenantId);
+    if (!prepared.ok) {
+      throw app.httpErrors.conflict('No approved locale pack is available for this clinic language and country. Approve one before previewing the prompt.');
+    }
+    const systemPrompt = generateSystemPrompt(prepared.config);
+    const hashes = await configurationHashes(request.auth.tenantId, campaign.clinicId);
+    return {
+      systemPrompt,
+      samples: generateSamples(prepared.config),
+      promptHash: promptHash(systemPrompt),
+      localePack: { id: prepared.localePackId, evidenceHash: prepared.evidenceHash },
+      ...hashes,
+      drift: campaign.status === 'ACTIVE'
+        ? { localePack: campaign.attestedLocalePackHash !== null && campaign.attestedLocalePackHash !== prepared.evidenceHash }
+        : { localePack: false },
+    };
+>>>>>>> worktree-agent-a44bea0988522c2a1
   });
 
-  app.get('/campaigns/:id/retell-config', { preHandler: writeRoles }, async request => {
+  app.get('/campaigns/:id/retell-config', { preHandler: receptionistRead }, async request => {
     const { id } = idParam.parse(request.params);
     const campaign = await loadCampaign(request.auth.tenantId, id);
     if (!campaign) throw app.httpErrors.notFound('Campaign not found');
+<<<<<<< HEAD
     try {
       const config = toPromptConfig(campaign as unknown as CampaignWithRelations);
       return buildRetellConfig(config, { webhookBaseUrl: env.PUBLIC_API_URL });
@@ -399,5 +520,19 @@ export const campaignExportRoutes: FastifyPluginAsync = async app => {
       if (isConfigurationError(error)) throw configurationConflict(app, error);
       throw error;
     }
+=======
+    const prepared = await promptConfigForCampaign(campaign as unknown as CampaignWithRelations, request.auth.tenantId);
+    if (!prepared.ok) {
+      throw app.httpErrors.conflict('No approved locale pack is available for this clinic language and country. Approve one before exporting the agent configuration.');
+    }
+    const built = buildRetellConfig(prepared.config, { webhookBaseUrl: env.PUBLIC_API_URL });
+    const hashes = await configurationHashes(request.auth.tenantId, campaign.clinicId);
+    return {
+      ...built,
+      promptHash: promptHash(built.systemPrompt),
+      localePack: { id: prepared.localePackId, evidenceHash: prepared.evidenceHash },
+      ...hashes,
+    };
+>>>>>>> worktree-agent-a44bea0988522c2a1
   });
 };

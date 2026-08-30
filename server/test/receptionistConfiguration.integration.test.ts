@@ -19,6 +19,7 @@ const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
 const { compileIntakeContract } = await import('../modules/receptionist/intakeContract');
+const { PLATFORM_LOCALE_PACKS, platformLocalePackHash } = await import('../lib/receptionist/localePacks/defaults');
 
 type Role = 'OWNER' | 'MANAGER' | 'BILLING';
 type TenantFixture = { id: string; users: Record<Role, string>; branchId: string };
@@ -70,17 +71,43 @@ async function tenant(): Promise<TenantFixture> {
     data: { tenantId: id, name: 'Main scheduling branch', location: '1 Main Street', timezone: 'America/New_York', active: true },
     select: { id: true },
   });
-  return { id, users, branchId: branch.id };
+  const fixture = { id, users, branchId: branch.id };
+  // Every tenant in this suite is expected to reach activation, so it starts
+  // with the approved wording C2 requires.
+  await approveLocalePack(fixture);
+  return fixture;
 }
 
 function auth(t: TenantFixture, role: Role) {
   return { authorization: `Bearer ${app.jwt.sign({ userId: t.users[role], tenantId: t.id, role, type: 'access' })}` };
 }
 
+// Since C2 a campaign cannot go ACTIVE while its clinic has no hours and its
+// tenant has no approved locale pack. Suites that exercise later gates give
+// their clinics both by default.
+const ACTIVATION_READY_HOURS = {
+  monday: { open: true, start: '09:00', end: '17:00' },
+  tuesday: { open: true, start: '09:00', end: '17:00' },
+  wednesday: { open: true, start: '09:00', end: '17:00' },
+  thursday: { open: true, start: '09:00', end: '17:00' },
+  friday: { open: true, start: '09:00', end: '17:00' },
+};
+
+async function approveLocalePack(t: TenantFixture, language = 'en-US', country = 'US') {
+  const platform = PLATFORM_LOCALE_PACKS.find(pack => pack.language === language && pack.country === country)!;
+  await db.receptionistLocalePack.create({
+    data: {
+      tenantId: t.id, language, country, version: 1, status: 'APPROVED', source: 'platform_default',
+      baseDefaultVersion: platform.version, strings: platform.strings as never,
+      evidenceHash: platformLocalePackHash(platform), approvedByUserId: t.users.OWNER, approvedAt: new Date(),
+    },
+  });
+}
+
 async function createClinic(t: TenantFixture, input: Record<string, unknown> = {}) {
   return app.inject({
     method: 'POST', url: '/v1/receptionist/clinics', headers: auth(t, 'OWNER'),
-    payload: { name: `Clinic ${randomUUID().slice(0, 8)}`, phone: phone(), ...input },
+    payload: { name: `Clinic ${randomUUID().slice(0, 8)}`, phone: phone(), country: 'US', timezone: 'America/New_York', workingHours: ACTIVATION_READY_HOURS, ...input },
   });
 }
 
@@ -103,7 +130,7 @@ describe('AI receptionist trusted configuration', () => {
     for (const malformed of ['+1 (212) 555-0100 ext 4', '+1212ABC5550100']) {
       await expect(db.$transaction(async tx => {
         await tx.$executeRawUnsafe('ALTER TABLE "ReceptionistClinic" DROP CONSTRAINT "ReceptionistClinic_phone_e164_check"');
-        await tx.receptionistClinic.create({ data: { tenantId: t.id, name: `Malformed ${randomUUID()}`, phone: malformed } });
+        await tx.receptionistClinic.create({ data: { tenantId: t.id, name: `Malformed ${randomUUID()}`, phone: malformed, country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' } });
         await tx.$executeRawUnsafe(migrationPreflight!);
       })).rejects.toThrow(/receptionist_destination_invalid_e164/);
     }
@@ -112,7 +139,7 @@ describe('AI receptionist trusted configuration', () => {
     const formatted = `+${canonical.slice(1, 2)} (${canonical.slice(2, 5)}) ${canonical.slice(5, 8)}-${canonical.slice(8)}`;
     await expect(db.$transaction(async tx => {
       await tx.$executeRawUnsafe('ALTER TABLE "ReceptionistClinic" DROP CONSTRAINT "ReceptionistClinic_phone_e164_check"');
-      const row = await tx.receptionistClinic.create({ data: { tenantId: t.id, name: `Formatted ${randomUUID()}`, phone: formatted } });
+      const row = await tx.receptionistClinic.create({ data: { tenantId: t.id, name: `Formatted ${randomUUID()}`, phone: formatted, country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' } });
       await tx.$executeRawUnsafe(migrationPreflight!);
       await tx.$executeRawUnsafe(migrationCanonicalization!);
       expect((await tx.receptionistClinic.findUniqueOrThrow({ where: { id: row.id } })).phone).toBe(canonical);
@@ -124,7 +151,7 @@ describe('AI receptionist trusted configuration', () => {
     const t = await tenant();
     const denied = await app.inject({
       method: 'POST', url: '/v1/receptionist/clinics', headers: auth(t, 'BILLING'),
-      payload: { name: 'Denied clinic', phone: phone() },
+      payload: { name: 'Denied clinic', phone: phone(), country: 'US', timezone: 'America/New_York' },
     });
     expect(denied.statusCode).toBe(403);
     expect((await app.inject({ method: 'GET', url: '/v1/receptionist/clinics', headers: auth(t, 'BILLING') })).statusCode).toBe(403);
@@ -151,7 +178,7 @@ describe('AI receptionist trusted configuration', () => {
       method: 'POST', url: '/v1/receptionist/clinics', headers: auth(t, 'MANAGER'),
       payload: {
         name: 'Valid clinic', phone: `+1 (${basePhone.slice(2, 5)}) ${basePhone.slice(5, 8)}-${basePhone.slice(8)}`,
-        timezone: 'America/New_York',
+        country: 'US', timezone: 'America/New_York',
         humanFallbackNumber: `+1 (${basePhone.slice(2, 5)}) ${basePhone.slice(5, 8)}-${basePhone.slice(8)}`,
         workingHours: { monday: { open: true, start: '09:00', end: '17:00' }, sunday: { open: false } },
       },
@@ -189,7 +216,7 @@ describe('AI receptionist trusted configuration', () => {
     const [owner, foreign] = await Promise.all([tenant(), tenant()]);
     const clinicResponse = await createClinic(owner, { name: 'Mapped clinic' });
     const clinicId = clinicResponse.json().id as string;
-    const base = { clinicId, name: 'Downtown', address: '1 Main Street', timezone: 'America/New_York' };
+    const base = { clinicId, name: 'Downtown', address: '1 Main Street' };
 
     const missing = await app.inject({ method: 'POST', url: '/v1/receptionist/locations', headers: auth(owner, 'OWNER'), payload: base });
     expect(missing.statusCode).toBe(400);
@@ -230,7 +257,7 @@ describe('AI receptionist trusted configuration', () => {
       data: { tenantId: owner.id, clinicId, branchId: foreign.branchId, name: 'DB bypass', address: 'Foreign' },
     })).rejects.toMatchObject({ code: 'P2003' });
     await expect(db.receptionistClinic.create({
-      data: { tenantId: owner.id, name: 'Invalid DB phone', phone: '2125550198' },
+      data: { tenantId: owner.id, name: 'Invalid DB phone', phone: '2125550198', country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' },
     })).rejects.toThrow();
     expect(await db.receptionistClinic.count({ where: { tenantId: owner.id, name: 'Invalid DB phone' } })).toBe(0);
   });

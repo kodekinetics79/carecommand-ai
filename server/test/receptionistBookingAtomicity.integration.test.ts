@@ -99,7 +99,7 @@ async function fixture(fields: Field[] = []) {
     data: { tenantId, name: 'Consultation', category: 'general', defaultDurationMinutes: 30, active: true },
   });
   const clinic = await db.receptionistClinic.create({
-    data: { tenantId, name: 'Atomic clinic', phone: `+1${tenantId.replaceAll('-', '').slice(0, 10).replace(/[a-f]/g, '7')}` },
+    data: { tenantId, name: 'Atomic clinic', phone: `+1${tenantId.replaceAll('-', '').slice(0, 10).replace(/[a-f]/g, '7')}`, country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' },
   });
   const location = await db.receptionistLocation.create({
     data: { tenantId, clinicId: clinic.id, branchId: branch.id, name: 'Main', address: '1 Test Way', active: true },

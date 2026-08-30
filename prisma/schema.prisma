@@ -210,6 +210,9 @@ model Tenant {
   receptionistCallTargets             ReceptionistCallTarget[]
   appointmentRequests                 AppointmentRequest[]
   serviceCatalogItems                 ServiceCatalogItem[]
+  receptionistClosures                ReceptionistClosure[]
+  receptionistClinicKnowledge         ReceptionistClinicKnowledge[]
+  receptionistLocalePacks             ReceptionistLocalePack[]
   businessEvents                      BusinessEvent[]
   operationalSignals                  OperationalSignal[]
   aiRecommendations                   AIRecommendation[]
@@ -291,8 +294,16 @@ model User {
   eligibilityExecutions          EligibilityExecution[]          @relation("EligibilityExecutionActor")
   eligibilityReconciliationsVerified EligibilityExecution[]      @relation("EligibilityReconciliationVerifier")
   leadActivities                 LeadActivity[]                  @relation("LeadActivityActor")
+<<<<<<< HEAD
   acknowledgedStaffTasks         StaffTask[]                     @relation("StaffTaskAcknowledgedBy")
   appointmentNotes               AppointmentNote[]               @relation("AppointmentNoteActor")
+=======
+  receptionistClosuresCreated    ReceptionistClosure[]           @relation("ReceptionistClosureCreator")
+  receptionistKnowledgeApproved  ReceptionistClinicKnowledge[]   @relation("ReceptionistKnowledgeApprover")
+  receptionistKnowledgeEdited    ReceptionistClinicKnowledge[]   @relation("ReceptionistKnowledgeEditor")
+  receptionistLocalePacksApproved ReceptionistLocalePack[]       @relation("ReceptionistLocalePackApprover")
+  receptionistLocalePacksCreated ReceptionistLocalePack[]        @relation("ReceptionistLocalePackCreator")
+>>>>>>> worktree-agent-a44bea0988522c2a1
 
   @@unique([tenantId, email])
   @@unique([tenantId, id])
@@ -1894,11 +1905,17 @@ model ReceptionistClinic {
   phone                String
   website              String?
   addressLine          String?
-  timezone             String                           @default("America/New_York")
-  defaultLanguage      String                           @default("en-US")
-  complianceDisclosure String                           @default("Hi, this is your AI assistant calling on behalf of the clinic.")
+  // ISO-3166-1 alpha-2, uppercase (CHECK in migration). Never inferred: a null
+  // country blocks activation until a human confirms it in Studio.
+  country              String?
+  timezone             String
+  defaultLanguage      String
+  // Supplemental clinic/jurisdiction sentence only; the disclosure baseline,
+  // emergency wording and DNC lines come from the approved locale pack.
+  complianceDisclosure String?
+  // Stored in canonical E.164 (CHECK in migration); null = no transfer target.
   humanFallbackNumber  String?
-  doNotContactPolicy   String                           @default("If the person asks not to be contacted again, confirm politely and mark them do-not-contact.")
+  doNotContactPolicy   String?
   workingHours         Json?
   // Front desk SLA policy (C4): { sla: { <kind>: { dueMinutes, priority } } }; merged over code defaults.
   frontDeskPolicy      Json?
@@ -1912,6 +1929,8 @@ model ReceptionistClinic {
   callLogs             ReceptionistCallLog[]
   optOuts              ReceptionistOptOut[]
   outboundCampaigns    ReceptionistOutboundCampaign[]
+  closures             ReceptionistClosure[]
+  knowledge            ReceptionistClinicKnowledge?
 
   @@unique([tenantId, name])
   @@unique([tenantId, id])
@@ -1928,7 +1947,10 @@ model ReceptionistLocation {
   name         String
   address      String
   phone        String?
-  timezone     String?
+  // Parking / entrance / transit guidance spoken to callers who ask.
+  accessNotes  String?
+  // Per-day override of the clinic hours; null = inherit the clinic schedule.
+  // The location timezone is derived from branch.timezone and never stored.
   workingHours Json?
   active       Boolean            @default(true)
   createdAt    DateTime           @default(now())
@@ -1936,9 +1958,102 @@ model ReceptionistLocation {
   tenant       Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   clinic       ReceptionistClinic @relation(fields: [clinicId], references: [id], onDelete: Cascade)
   branch       Branch?            @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  closures     ReceptionistClosure[]
 
+  @@unique([tenantId, id])
   @@index([tenantId, clinicId, active])
   @@index([tenantId, branchId, active])
+}
+
+// Planned closures (holidays, training days). Ranges are clinic-local calendar
+// dates; a null locationId closes every location of the clinic. Partial-day
+// columns are reserved (CHECK: both or neither) but the API rejects them.
+model ReceptionistClosure {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  clinicId        String   @db.Uuid
+  locationId      String?  @db.Uuid
+  startsOn        DateTime @db.Date
+  endsOn          DateTime @db.Date
+  startTime       String?
+  endTime         String?
+  reason          String
+  internalNote    String?
+  createdByUserId String?  @db.Uuid
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  tenant          Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clinic          ReceptionistClinic    @relation(fields: [tenantId, clinicId], references: [tenantId, id], onDelete: Cascade, map: "ReceptionistClosure_clinic_scope_fkey")
+  location        ReceptionistLocation? @relation(fields: [tenantId, locationId], references: [tenantId, id], onDelete: Cascade, map: "ReceptionistClosure_location_scope_fkey")
+  createdBy       User?                 @relation("ReceptionistClosureCreator", fields: [tenantId, createdByUserId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistClosure_creator_scope_fkey")
+
+  @@unique([tenantId, id])
+  @@index([tenantId, clinicId, startsOn, endsOn])
+}
+
+// One knowledge document per clinic: an editable draft plus the approved
+// snapshot the prompt renders. Approval is a set-level governance act that
+// produces one hash and one approver.
+model ReceptionistClinicKnowledge {
+  id               String    @id @default(uuid()) @db.Uuid
+  tenantId         String    @db.Uuid
+  clinicId         String    @db.Uuid
+  draft            Json
+  draftRevision    Int       @default(1)
+  approved         Json?
+  approvedRevision Int?
+  approvedHash     String?
+  approvedByUserId String?   @db.Uuid
+  approvedAt       DateTime?
+  updatedByUserId  String?   @db.Uuid
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  tenant           Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clinic           ReceptionistClinic @relation(fields: [tenantId, clinicId], references: [tenantId, id], onDelete: Cascade, map: "ReceptionistClinicKnowledge_clinic_scope_fkey")
+  approvedBy       User?              @relation("ReceptionistKnowledgeApprover", fields: [tenantId, approvedByUserId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistClinicKnowledge_approver_scope_fkey")
+  updatedBy        User?              @relation("ReceptionistKnowledgeEditor", fields: [tenantId, updatedByUserId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistClinicKnowledge_editor_scope_fkey")
+
+  @@unique([tenantId, clinicId])
+  @@unique([tenantId, id])
+}
+
+enum ReceptionistLocalePackStatus {
+  DRAFT
+  APPROVED
+  RETIRED
+}
+
+// Tenant-owned caller-facing wording per (language, country). Platform
+// defaults live in code (server/lib/receptionist/localePacks/defaults.ts); a
+// tenant adopts one as a DRAFT and an OWNER/ADMIN approves it. Approved
+// content is immutable at the application layer (409 PACK_IMMUTABLE); a change
+// is a new version. Exactly one APPROVED pack per (tenant, language, country)
+// is enforced by a partial unique index in the migration.
+model ReceptionistLocalePack {
+  id                 String                       @id @default(uuid()) @db.Uuid
+  tenantId           String                       @db.Uuid
+  language           String
+  country            String
+  version            Int
+  status             ReceptionistLocalePackStatus @default(DRAFT)
+  source             String
+  baseDefaultVersion Int?
+  strings            Json
+  evidenceHash       String
+  approvedByUserId   String?                      @db.Uuid
+  approvedAt         DateTime?
+  retiredAt          DateTime?
+  createdByUserId    String?                      @db.Uuid
+  createdAt          DateTime                     @default(now())
+  updatedAt          DateTime                     @updatedAt
+  tenant             Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  approvedBy         User?                 @relation("ReceptionistLocalePackApprover", fields: [tenantId, approvedByUserId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistLocalePack_approver_scope_fkey")
+  createdBy          User?                 @relation("ReceptionistLocalePackCreator", fields: [tenantId, createdByUserId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistLocalePack_creator_scope_fkey")
+  callLogs           ReceptionistCallLog[]
+
+  @@unique([tenantId, language, country, version])
+  @@unique([tenantId, id])
+  @@index([tenantId, language, country, status])
 }
 
 model ReceptionistAgent {
@@ -2027,6 +2142,10 @@ model ReceptionistCampaign {
   intakeSchemaProviderVersion       Int?
   intakeSchemaResponseEngineId      String?
   intakeSchemaResponseEngineVersion Int?
+  // Locale pack bound at activation; the retire guard reads it. Prompt, hours
+  // and knowledge hashes are attested on the agent deployment row (C5).
+  attestedLocalePackId              String?   @db.Uuid
+  attestedLocalePackHash            String?
   createdAt           DateTime                         @default(now())
   updatedAt           DateTime                         @updatedAt
   tenant              Tenant                           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
@@ -2105,6 +2224,12 @@ model ReceptionistCallLog {
   sentiment                    String?
   startedAt                    DateTime?
   endedAt                      DateTime?
+  // Stamped once from the clinic hours engine when the call is first seen;
+  // null = hours were not configured at call time (never "false").
+  outsideHours                 Boolean?
+  // 'connected' | 'unknown' from the provider disconnection reason at call end.
+  transferOutcome              String?
+  localePackId                 String?                              @db.Uuid
   outboundCampaignId           String?                              @db.Uuid
   targetId                     String?                              @db.Uuid
   // Caller identity (C4): linked only from a verified identity or a single canonical phone match.
@@ -2123,6 +2248,7 @@ model ReceptionistCallLog {
   legalHolds                   ReceptionistCallLegalHold[]
   reviewedBy                   User?                                @relation("ReceptionistCallReviewer", fields: [tenantId, reviewedByUserId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallLog_reviewer_scope_fkey")
   signedOffBy                  User?                                @relation("ReceptionistCallSignoff", fields: [tenantId, signedOffByUserId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallLog_signoff_scope_fkey")
+  localePack                   ReceptionistLocalePack?              @relation(fields: [tenantId, localePackId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallLog_locale_pack_scope_fkey")
   appointmentRequests          AppointmentRequest[]               @relation("AppointmentRequestSourceCall")
   appointments                 Appointment[]                      @relation("AppointmentSourceCall")
   patient                      Patient?                             @relation("ReceptionistCallLogPatient", fields: [tenantId, patientId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallLog_patient_scope_fkey")
@@ -2942,6 +3068,13 @@ model ServiceCatalogItem {
   defaultDurationMinutes  Int           @default(30)
   defaultAppointmentValue Decimal?      @db.Decimal(12, 2)
   depositRuleId           String?       @db.Uuid
+  // Voice-receptionist facts (one source of truth for services): what the
+  // agent may say about the service, whether it can be booked by phone, and
+  // the spoken duration / starting price when they differ from the defaults.
+  spokenDescription       String?
+  bookableByVoice         Boolean       @default(false)
+  voiceDurationMinutes    Int?
+  priceFrom               Decimal?      @db.Decimal(12, 2)
   active                  Boolean       @default(true)
   createdAt               DateTime      @default(now())
   updatedAt               DateTime      @updatedAt

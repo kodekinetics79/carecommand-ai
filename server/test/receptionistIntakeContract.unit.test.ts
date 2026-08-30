@@ -5,6 +5,13 @@ import {
   validateIntakeFieldConfiguration,
 } from '../modules/receptionist/intakeContract';
 import { buildRetellConfig, type PromptConfig } from '../modules/receptionist/promptService';
+import { promptFixture } from './fixtures/receptionistPromptConfigs';
+
+// A finished prompt still carries the runtime {{variables}} Retell substitutes
+// per call; only those are allowed to survive rendering.
+const RUNTIME_PLACEHOLDER = /\{\{\s*(is_open_now|hours_today|next_opening|closure_reason|emergency_number|known_first_name|human_fallback_number|admission_state|location_name|location_address|location_phone)\s*\}\}/g;
+const stripRuntimeVariables = (value: string) => value.replace(RUNTIME_PLACEHOLDER, '');
+
 
 const clinicId = '11111111-1111-4111-8111-111111111111';
 const campaignId = '22222222-2222-4222-8222-222222222222';
@@ -119,18 +126,14 @@ describe('receptionist typed intake contract', () => {
   });
 
   it('exports the compatibility alias and tools array from the same executable object', () => {
+    const base = promptFixture('us-full');
     const config: PromptConfig = {
-      clinic: {
-        id: clinicId, name: 'Example Clinic', phone: '+12125550100', timezone: 'America/New_York',
-        defaultLanguage: 'en-US', complianceDisclosure: 'Approved disclosure.', doNotContactPolicy: 'Record opt out.',
-      },
-      agent: { name: 'Avery', voice: 'voice', tone: 'warm', language: 'en-US' },
-      campaign: {
-        id: campaignId, name: 'Pilot', campaignType: 'inbound', offerTitle: 'Care', offerDescription: 'Schedule care',
-        offerScript: 'Would you like to schedule?', appointmentType: 'Consultation', eligibleLocationIds: [clinicId],
-        smsConfirmation: true, emailConfirmation: false, intakeSchemaRevision: 7,
-      },
+      ...base,
+      clinic: { ...base.clinic, id: clinicId, complianceDisclosure: 'Approved disclosure.', doNotContactPolicy: 'Record opt out.' },
+      agent: { ...base.agent, voice: 'voice' },
+      campaign: { ...base.campaign, id: campaignId, name: 'Pilot', offerTitle: 'Care', offerDescription: 'Schedule care', offerScript: 'Would you like to schedule?', eligibleLocationIds: [clinicId], intakeSchemaRevision: 7 },
       locations: [{ id: clinicId, name: 'Main', address: '1 Main Street' }],
+      hours: { clinicSummary: base.hours!.clinicSummary, perLocation: [{ id: clinicId, summary: base.hours!.clinicSummary, closures: [] }] },
       intakeFields: fields(),
     };
     const exported = buildRetellConfig(config, { webhookBaseUrl: 'https://api.example.test' });
@@ -139,7 +142,7 @@ describe('receptionist typed intake contract', () => {
     expect(exported.bookingFunction).toEqual(bookingTools[0]);
     expect(exported.intakeSchemaRevision).toBe(7);
     expect(exported.intakeToolFingerprint).toBe(bookAppointmentToolFingerprint(exported.bookingFunction));
-    expect(exported.systemPrompt).not.toMatch(/\{\{|\$\{/);
-    expect(JSON.stringify(exported)).not.toMatch(/\{\{|\$\{/);
+    expect(stripRuntimeVariables(exported.systemPrompt)).not.toMatch(/\{\{|\$\{/);
+    expect(stripRuntimeVariables(JSON.stringify(exported))).not.toMatch(/\{\{|\$\{/);
   });
 });

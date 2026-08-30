@@ -660,6 +660,13 @@ export class RlsBehaviorHarness {
     // AppointmentNote CHECKs its actor vocabulary; the generic string synthesizer
     // would not satisfy it.
     if (table === 'AppointmentNote') values.set('actorType', 'system');
+    // ISO-2 country and the source enum are CHECK-constrained text columns;
+    // the generic synthetic scalar would violate both.
+    if (table === 'ReceptionistLocalePack') {
+      values.set('country', 'US');
+      values.set('language', 'en-US');
+      values.set('source', 'platform_default');
+    }
     if (table === 'ConversationReplyAttempt') {
       values.set('phase', 'INTENT');
       values.set('status', 'authorized');

@@ -11,6 +11,7 @@ export const RECEPTIONIST_PERMISSIONS = {
   CALL_ARTIFACTS_READ: 'receptionist:call-artifacts:read',
   RECORDINGS_READ: 'receptionist:recordings:read',
   MANAGE: 'receptionist:manage',
+  READ: 'receptionist:read',
   BOOKING_REVIEW: 'receptionist:booking-review',
 } as const;
 
