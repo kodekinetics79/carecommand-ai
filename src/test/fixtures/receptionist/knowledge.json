@@ -1,0 +1,38 @@
+{
+  "clinicId": "clinic-1",
+  "draft": {
+    "acceptedPayers": [
+      { "id": "payer-1", "name": "Bupa", "plans": ["Bupa Select", "Bupa Complete"], "note": "Pre-authorisation required for MRI", "source": "manual" },
+      { "id": "payer-2", "name": "AXA Health", "plans": [], "source": "manual" }
+    ],
+    "paymentPolicy": "We accept card and bank transfer. Payment is due on the day of the appointment.",
+    "newPatientPolicy": "New patients are welcome. Please arrive ten minutes early with photo ID.",
+    "urgentCare": {
+      "whatCountsAsUrgent": "Severe pain, a lost filling with pain, or swelling that is getting worse.",
+      "sameDayPolicy": "We keep two same-day slots each morning for urgent cases.",
+      "onCallNumber": "+442071234570"
+    },
+    "faq": [
+      { "id": "faq-1", "question": "Is there parking?", "answer": "There is metered street parking on Harley Street and a car park on Weymouth Mews." },
+      { "id": "faq-2", "question": "Do you offer sedation?", "answer": "" }
+    ]
+  },
+  "draftRevision": 4,
+  "approved": {
+    "acceptedPayers": [
+      { "id": "payer-1", "name": "Bupa", "plans": ["Bupa Select"], "source": "manual" }
+    ],
+    "paymentPolicy": "We accept card and bank transfer.",
+    "newPatientPolicy": "New patients are welcome.",
+    "urgentCare": { "whatCountsAsUrgent": "Severe pain or swelling.", "sameDayPolicy": "Two same-day slots each morning.", "onCallNumber": null },
+    "faq": [
+      { "id": "faq-1", "question": "Is there parking?", "answer": "Metered street parking on Harley Street.", "approvedByUserId": "user-owner", "approvedAt": "2026-08-28T09:00:00.000Z" }
+    ]
+  },
+  "approvedRevision": 3,
+  "approvedHash": "sha256:knowledge-rev3",
+  "approvedAt": "2026-08-28T09:00:00.000Z",
+  "approvedBy": { "id": "user-owner", "displayName": "Jane Okafor" },
+  "dirty": true,
+  "validation": { "ok": false, "issues": [{ "path": "faq.1.answer", "message": "Answer is required" }] }
+}

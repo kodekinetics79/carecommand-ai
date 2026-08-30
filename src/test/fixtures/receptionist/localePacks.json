@@ -1,0 +1,94 @@
+{
+  "packs": [
+    {
+      "id": "pack-gb-1",
+      "language": "en-GB",
+      "country": "GB",
+      "version": 1,
+      "status": "APPROVED",
+      "source": "platform_default",
+      "baseDefaultVersion": 1,
+      "strings": {
+        "emergencyNumber": "999",
+        "timeStyle": "24h",
+        "dateStyle": "weekday-day-month",
+        "messages": {
+          "disclosure.recording": "Hi, I'm {{agent_name}}, an AI assistant for {{clinic_name}}. This call may be recorded or monitored for quality and training purposes.{{clinic_disclosure}} Is that okay?",
+          "emergency.instruction": "If this may be an emergency, please hang up and call {{emergency_number}} now, or go to your nearest A&E.",
+          "after_hours.line": "{{clinic_name}} is closed at the moment. We reopen {{next_opening}}.",
+          "voicemail.script": "Hello, this is {{agent_name}} from {{clinic_name}}. Please call us back on {{clinic_phone}}."
+        }
+      },
+      "evidenceHash": "sha256:gb1",
+      "approvedAt": "2026-08-28T09:00:00.000Z",
+      "approvedBy": { "id": "user-owner", "displayName": "Jane Okafor" },
+      "retiredAt": null,
+      "createdAt": "2026-08-27T09:00:00.000Z",
+      "updatedAt": "2026-08-28T09:00:00.000Z",
+      "boundActiveCampaigns": 1
+    },
+    {
+      "id": "pack-gb-2",
+      "language": "en-GB",
+      "country": "GB",
+      "version": 2,
+      "status": "DRAFT",
+      "source": "tenant",
+      "baseDefaultVersion": 1,
+      "strings": {
+        "emergencyNumber": "999",
+        "timeStyle": "24h",
+        "dateStyle": "weekday-day-month",
+        "messages": {
+          "disclosure.recording": "Hi, I'm {{agent_name}}, an AI assistant for {{clinic_name}}. This call may be recorded.{{clinic_disclosure}} Is that okay?",
+          "emergency.instruction": "If this may be an emergency, please hang up and call {{emergency_number}} now.",
+          "after_hours.line": "{{clinic_name}} is closed right now. We reopen {{next_opening}}.",
+          "voicemail.script": "Hello, this is {{agent_name}} from {{clinic_name}}. Please call us back on {{clinic_phone}}."
+        }
+      },
+      "evidenceHash": "sha256:gb2-draft",
+      "approvedAt": null,
+      "approvedBy": null,
+      "retiredAt": null,
+      "createdAt": "2026-08-29T09:00:00.000Z",
+      "updatedAt": "2026-08-29T10:00:00.000Z",
+      "boundActiveCampaigns": 0
+    }
+  ],
+  "defaults": [
+    {
+      "language": "en-US",
+      "country": "US",
+      "version": 1,
+      "strings": {
+        "emergencyNumber": "911",
+        "timeStyle": "12h",
+        "dateStyle": "weekday-month-day",
+        "messages": {
+          "disclosure.recording": "Hi, this is {{agent_name}}, an AI assistant calling on behalf of {{clinic_name}}. This call may be recorded for quality and training.{{clinic_disclosure}} Is that okay?",
+          "emergency.instruction": "If this may be an emergency, please hang up and call {{emergency_number}} now, or go to the nearest emergency room.",
+          "after_hours.line": "{{clinic_name}} is currently closed. We reopen {{next_opening}}.",
+          "voicemail.script": "Hi, this is {{agent_name}} from {{clinic_name}}. Please call us back at {{clinic_phone}}."
+        }
+      },
+      "evidenceHash": "sha256:us-default-1"
+    },
+    {
+      "language": "en-GB",
+      "country": "GB",
+      "version": 1,
+      "strings": {
+        "emergencyNumber": "999",
+        "timeStyle": "24h",
+        "dateStyle": "weekday-day-month",
+        "messages": {
+          "disclosure.recording": "Hi, I'm {{agent_name}}, an AI assistant for {{clinic_name}}. This call may be recorded or monitored for quality and training purposes.{{clinic_disclosure}} Is that okay?",
+          "emergency.instruction": "If this may be an emergency, please hang up and call {{emergency_number}} now, or go to your nearest A&E.",
+          "after_hours.line": "{{clinic_name}} is closed at the moment. We reopen {{next_opening}}.",
+          "voicemail.script": "Hello, this is {{agent_name}} from {{clinic_name}}. Please call us back on {{clinic_phone}}."
+        }
+      },
+      "evidenceHash": "sha256:gb1"
+    }
+  ]
+}

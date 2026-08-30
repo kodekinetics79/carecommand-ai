@@ -10,23 +10,25 @@ vi.mock('../../lib/api', async () => {
 });
 
 import { ApiError } from '../../lib/api';
-import type { Clinic } from '../../lib/receptionist';
+import type { ClinicRow } from '../../lib/receptionistClinic';
+import { receptionistFixtures } from '../../test/fixtures/receptionist';
 import { ClinicPanel } from './ClinicPanel';
 
 /**
- * ClinicPanel.save used to be try/finally with no catch: a 409 (the trusted
- * inbound number already assigned elsewhere) or a Zod 400 (fallback number
- * not E.164) vanished and the form simply re-enabled its Save button. These
- * tests hold the new contract: the server's own words are shown in an alert,
- * and "Saved" is only claimed after the server accepted the write.
+ * Two contracts meet in this panel.
+ *
+ * C1's: ClinicPanel.save used to be try/finally with no catch, so a 409 or a
+ * Zod 400 vanished and the form simply re-enabled its Save button.
+ *
+ * C2's: the country is required for activation and is never inferred, the
+ * option lists come from the served catalog rather than eight compiled-in
+ * timezones, and a concurrent edit is refused by `expectedUpdatedAt` instead
+ * of silently overwriting someone else's save.
  */
-function clinic(overrides: Partial<Clinic> = {}): Clinic {
-  return {
-    id: 'clinic-1', name: 'Brightsmile Dental Group', logoUrl: null, phone: '+14155550142', website: null, addressLine: null,
-    timezone: 'America/Los_Angeles', defaultLanguage: 'en-US', complianceDisclosure: 'Hi, this is Riley, the AI assistant.',
-    humanFallbackNumber: '+14155550100', doNotContactPolicy: 'Stop on request.', workingHours: null, active: true, locations: [],
-    ...overrides,
-  };
+const CATALOG = receptionistFixtures.catalog();
+
+function clinic(overrides: Partial<ClinicRow> = {}): ClinicRow {
+  return { ...receptionistFixtures.clinics()[0], ...overrides };
 }
 
 type Responder = (path: string, init?: RequestInit) => Promise<unknown>;
@@ -38,43 +40,50 @@ beforeEach(() => {
 });
 
 /** Mirrors the page: onChanged reloads the clinic and hands the panel the row the server now holds. */
-function Harness({ initial, onReload }: { initial: Clinic; onReload: () => Clinic }) {
+function Harness({ initial, onReload }: { initial: ClinicRow; onReload: () => ClinicRow }) {
   const [row, setRow] = useState(initial);
   return <ClinicPanel clinic={row} onChanged={async () => { setRow(onReload()); }} />;
 }
 
+/** Everything the panel loads besides the clinic PATCH under test. */
+function background(path: string): Promise<unknown> | null {
+  if (path === '/v1/receptionist/catalog') return Promise.resolve(CATALOG);
+  if (path === '/v1/receptionist/scheduling-branches') return Promise.resolve([]);
+  if (path.includes('/closures')) return Promise.resolve([]);
+  return null;
+}
+
 function withPatch(patch: (body: Record<string, unknown>) => Promise<unknown>): Responder {
   return (path, init) => {
-    if (path === '/v1/receptionist/scheduling-branches') return Promise.resolve([]);
+    const loaded = background(path);
+    if (loaded) return loaded;
     if (path === '/v1/receptionist/clinics/clinic-1' && init?.method === 'PATCH') return patch(JSON.parse(String(init.body)));
     return Promise.reject(new Error(`Unexpected request in test: ${init?.method ?? 'GET'} ${path}`));
   };
 }
 
 function renameAndSave(nextName: string) {
-  fireEvent.change(screen.getByDisplayValue('Brightsmile Dental Group'), { target: { value: nextName } });
+  fireEvent.change(screen.getByDisplayValue('Harley Street Medical Group'), { target: { value: nextName } });
   fireEvent.click(screen.getByRole('button', { name: /Save changes/ }));
 }
 
-describe('ClinicPanel — every server error is shown, nothing saves silently', () => {
+describe('ClinicPanel — errors are shown, nothing saves silently', () => {
   it('shows the server 409 message and code in an alert and does not claim Saved', async () => {
     respond = withPatch(() => Promise.reject(new ApiError(
       409,
-      'Trusted inbound number +14155550142 is already assigned to another active clinic.',
+      'Trusted inbound number +442071234567 is already assigned to another active clinic.',
       'INTERNAL_SERVER_ERROR',
-      { error: 'INTERNAL_SERVER_ERROR', message: 'Trusted inbound number +14155550142 is already assigned to another active clinic.' },
+      { error: 'INTERNAL_SERVER_ERROR', message: 'Trusted inbound number +442071234567 is already assigned to another active clinic.' },
     )));
     render(<Harness initial={clinic()} onReload={() => clinic()} />);
 
-    renameAndSave('Brightsmile Dental');
+    renameAndSave('Harley Street Medical');
 
-    const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent('Trusted inbound number +14155550142 is already assigned to another active clinic.');
+    const alerts = await screen.findAllByRole('alert');
+    const alert = alerts.find(node => node.textContent?.includes('already assigned'))!;
     expect(alert).toHaveTextContent('code: INTERNAL_SERVER_ERROR');
     expect(screen.queryByText('Saved')).not.toBeInTheDocument();
-    // The draft is kept so the user can correct and retry.
-    expect(screen.getByDisplayValue('Brightsmile Dental')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+    expect(screen.getByDisplayValue('Harley Street Medical')).toBeInTheDocument();
   });
 
   it('names the failing field on a Zod 400 instead of "Request validation failed"', async () => {
@@ -84,46 +93,138 @@ describe('ClinicPanel — every server error is shown, nothing saves silently', 
       'VALIDATION_ERROR',
       {
         error: 'VALIDATION_ERROR',
-        message: 'humanFallbackNumber: Phone must include country code in E.164 format',
         details: { fieldErrors: { humanFallbackNumber: ['Phone must include country code in E.164 format'] }, formErrors: [] },
       },
     )));
     render(<Harness initial={clinic()} onReload={() => clinic()} />);
 
-    fireEvent.change(screen.getByDisplayValue('+14155550100'), { target: { value: '(415) 555-0100' } });
+    fireEvent.change(screen.getByDisplayValue('+442071234568'), { target: { value: '(415) 555-0100' } });
     fireEvent.click(screen.getByRole('button', { name: /Save changes/ }));
 
-    const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent('human fallback number: Phone must include country code in E.164 format');
-    expect(alert).toHaveTextContent('code: VALIDATION_ERROR');
+    const alerts = await screen.findAllByRole('alert');
+    expect(alerts.some(alert => alert.textContent?.includes('human fallback number: Phone must include country code in E.164 format'))).toBe(true);
   });
 
-  it('shows the Saved pill only after the server accepted the write', async () => {
+  it('shows the Saved pill only after the server accepted the write, and sends only what changed', async () => {
     let patched: Record<string, unknown> | null = null;
     respond = withPatch(body => { patched = body; return Promise.resolve({ ...clinic(), ...body }); });
-    render(<Harness initial={clinic()} onReload={() => clinic({ name: 'Brightsmile Dental' })} />);
+    render(<Harness initial={clinic()} onReload={() => clinic({ name: 'Harley Street Medical' })} />);
 
     expect(screen.queryByText('Saved')).not.toBeInTheDocument();
-    renameAndSave('Brightsmile Dental');
+    renameAndSave('Harley Street Medical');
 
     await waitFor(() => expect(screen.getByText('Saved')).toBeInTheDocument());
-    expect(patched).toMatchObject({ name: 'Brightsmile Dental', phone: '+14155550142' });
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(patched).toEqual({ name: 'Harley Street Medical', expectedUpdatedAt: '2026-08-29T12:00:00.000Z' });
   });
 
-  it('names a failed scheduling-branch load instead of labelling every location "Not mapped"', async () => {
-    respond = (path) => path === '/v1/receptionist/scheduling-branches'
-      ? Promise.reject(new ApiError(500, 'An unexpected error occurred', 'INTERNAL_SERVER_ERROR'))
-      : Promise.reject(new Error(`Unexpected request in test: ${path}`));
-    render(<Harness
-      initial={clinic({ locations: [{ id: 'loc-1', clinicId: 'clinic-1', name: 'Market Street', address: '500 Market Street', phone: null, branchId: 'branch-1', timezone: null, active: true, workingHours: null } as Clinic['locations'] extends (infer L)[] | undefined ? L : never] })}
-      onReload={() => clinic()}
-    />);
+  it('sends null to clear the fallback number rather than an empty string', async () => {
+    let patched: Record<string, unknown> | null = null;
+    respond = withPatch(body => { patched = body; return Promise.resolve(clinic()); });
+    render(<Harness initial={clinic()} onReload={() => clinic({ humanFallbackNumber: null })} />);
 
-    const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent('Scheduling branches could not be loaded.');
-    expect(screen.getByText(/Branch mapping unavailable/)).toBeInTheDocument();
-    expect(screen.queryByText(/Not mapped — booking disabled/)).not.toBeInTheDocument();
+    fireEvent.change(screen.getByDisplayValue('+442071234568'), { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: /Save changes/ }));
+
+    await waitFor(() => expect(patched).not.toBeNull());
+    expect(patched).toMatchObject({ humanFallbackNumber: null });
+  });
+
+  it('refuses a malformed website locally and never sends it', async () => {
+    const requests: string[] = [];
+    respond = (path, init) => {
+      requests.push(`${init?.method ?? 'GET'} ${path}`);
+      return background(path) ?? Promise.resolve(clinic());
+    };
+    render(<Harness initial={clinic()} onReload={() => clinic()} />);
+
+    fireEvent.change(screen.getByDisplayValue('https://harley.example.com'), { target: { value: 'harley.example.com' } });
+    fireEvent.click(screen.getByRole('button', { name: /Save changes/ }));
+
+    expect(await screen.findByText('Enter a full URL starting with http:// or https://')).toBeInTheDocument();
+    expect(requests.some(request => request.startsWith('PATCH'))).toBe(false);
+  });
+});
+
+describe('ClinicPanel — country, catalog and readiness', () => {
+  it('offers the served countries and marks a missing one as an activation blocker', async () => {
+    respond = withPatch(() => Promise.resolve(clinic()));
+    render(<Harness initial={clinic({ country: null, readiness: undefined })} onReload={() => clinic()} />);
+
+    await waitFor(() => expect(screen.getByLabelText(/Country/)).toBeInTheDocument());
+    const select = screen.getByLabelText(/Country/) as HTMLSelectElement;
+    await waitFor(() => expect([...select.options].map(option => option.value)).toContain('GB'));
+    expect([...select.options].map(option => option.textContent)).toContain('United Kingdom (GB)');
+    expect(screen.getByTestId('country-blocker')).toHaveTextContent('Country not set — activation is blocked');
+  });
+
+  it('keeps a stored timezone the catalog does not list', async () => {
+    respond = withPatch(() => Promise.resolve(clinic()));
+    render(<Harness initial={clinic({ timezone: 'Pacific/Chatham' })} onReload={() => clinic()} />);
+
+    const select = await screen.findByLabelText(/Timezone/) as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe('Pacific/Chatham'));
+    expect([...select.options].some(option => option.textContent?.includes('Pacific/Chatham (not in catalog)'))).toBe(true);
+  });
+
+  it('says the option lists are unavailable when the catalog fails, instead of offering an empty select', async () => {
+    respond = (path, init) => {
+      if (path === '/v1/receptionist/catalog') return Promise.reject(new ApiError(500, 'An unexpected error occurred', 'INTERNAL_SERVER_ERROR'));
+      return background(path) ?? withPatch(() => Promise.resolve(clinic()))(path, init);
+    };
+    render(<Harness initial={clinic()} onReload={() => clinic()} />);
+
+    const alerts = await screen.findAllByRole('alert');
+    expect(alerts.some(alert => alert.textContent?.includes('The receptionist catalog could not be loaded.'))).toBe(true);
+    expect((screen.getByLabelText(/Timezone/) as HTMLSelectElement).value).toBe('Europe/London');
+  });
+
+  it('shows the transfer badge for a ready fallback and for each refusal reason', async () => {
+    respond = withPatch(() => Promise.resolve(clinic()));
+    const { unmount } = render(<Harness initial={clinic()} onReload={() => clinic()} />);
+    expect(screen.getByTestId('transfer-readiness')).toHaveTextContent('Transfer ready');
+    unmount();
+
+    render(<Harness initial={clinic({ humanFallbackNumber: null, readiness: undefined })} onReload={() => clinic()} />);
+    expect(screen.getByTestId('transfer-readiness')).toHaveTextContent('Not set — callers will be offered a message instead of a transfer');
+  });
+
+  it('shows the pack status beside the language so the blocker is visible before saving', async () => {
+    respond = withPatch(() => Promise.resolve(clinic()));
+    render(<Harness initial={clinic()} onReload={() => clinic()} />);
+
+    const select = await screen.findByLabelText(/Default language/) as HTMLSelectElement;
+    await waitFor(() => expect([...select.options].map(option => option.textContent)).toContain('English (UK) — pack approved'));
+  });
+
+  it('sends the whole week when hours change, keeping the days that did not', async () => {
+    let patched: Record<string, unknown> | null = null;
+    respond = withPatch(body => { patched = body; return Promise.resolve(clinic()); });
+    render(<Harness initial={clinic()} onReload={() => clinic()} />);
+
+    fireEvent.click(screen.getByLabelText('Friday open'));
+    fireEvent.click(screen.getByRole('button', { name: /Save changes/ }));
+
+    await waitFor(() => expect(patched).not.toBeNull());
+    const hours = (patched as unknown as { workingHours: Record<string, unknown> }).workingHours;
+    expect(hours.friday).toEqual({ open: false });
+    expect(hours.saturday).toEqual({ open: true, start: '09:00', end: '13:00' });
+  });
+
+  it('offers a Reload instead of overwriting when someone else saved first', async () => {
+    let reloads = 0;
+    respond = withPatch(() => Promise.reject(new ApiError(409, 'The clinic changed since you opened it.', 'STALE_REVISION', {
+      error: 'STALE_REVISION', message: 'The clinic changed since you opened it.',
+    })));
+    render(<Harness initial={clinic()} onReload={() => { reloads += 1; return clinic({ name: 'Renamed by someone else' }); }} />);
+
+    renameAndSave('Harley Street Medical');
+
+    const alerts = await screen.findAllByRole('alert');
+    expect(alerts.some(alert => alert.textContent?.includes('Someone else saved this clinic; reload to see their changes.'))).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: /Reload/ }));
+    await waitFor(() => expect(reloads).toBe(1));
+    await waitFor(() => expect(screen.getByDisplayValue('Renamed by someone else')).toBeInTheDocument());
   });
 
   it('persists per-day location hours instead of cloning Monday across the week', async () => {

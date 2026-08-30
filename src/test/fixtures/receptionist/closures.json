@@ -1,0 +1,4 @@
+[
+  { "id": "closure-1", "clinicId": "clinic-1", "locationId": null, "startsOn": "2026-09-08", "endsOn": "2026-09-08", "startTime": null, "endTime": null, "reason": "Staff training day", "internalNote": "All-hands offsite", "createdAt": "2026-08-20T10:00:00.000Z", "updatedAt": "2026-08-20T10:00:00.000Z" },
+  { "id": "closure-2", "clinicId": "clinic-1", "locationId": "loc-1", "startsOn": "2026-12-24", "endsOn": "2026-12-26", "startTime": null, "endTime": null, "reason": "Christmas closure", "internalNote": null, "createdAt": "2026-08-20T10:00:00.000Z", "updatedAt": "2026-08-20T10:00:00.000Z" }
+]

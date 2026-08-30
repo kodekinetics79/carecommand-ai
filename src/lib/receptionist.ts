@@ -713,6 +713,14 @@ export interface OutboundCampaignInput {
 }
 
 // --- Field catalog (UI metadata) -------------------------------------------
+//
+// These lists are being retired in favour of GET /v1/receptionist/catalog
+// (see src/lib/receptionistCatalog.ts): a compiled-in list cannot describe a
+// tenant's own timezones, and silently rendered the first option whenever the
+// stored value was not one of them. TIMEZONE_OPTIONS is gone — ClinicPanel,
+// LocationsEditor and the create dialog read the catalog. The five below are
+// still imported by AgentEditor, CampaignPanel and IntakeBuilder, which other
+// packages own this wave; they go when those panels move to the catalog.
 
 export const FIELD_CATALOG: Array<{ type: FieldType; label: string; question: string; group: string; hasOptions?: boolean }> = [
   { type: 'FIRST_NAME', label: 'First name', question: 'Can I start with your first name?', group: 'Identity' },
@@ -762,11 +770,6 @@ export const LANGUAGE_OPTIONS = [
 ];
 
 export const CAMPAIGN_TYPES = ['Reactivation', 'New patient', 'Recall / Recare', 'Promotion', 'Waitlist fill', 'Post-op follow-up', 'Survey'];
-
-export const TIMEZONE_OPTIONS = [
-  'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles',
-  'America/Phoenix', 'Europe/London', 'Europe/Paris', 'Australia/Sydney',
-];
 
 // --- API helpers -----------------------------------------------------------
 

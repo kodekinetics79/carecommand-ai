@@ -106,8 +106,56 @@ export function clinicDayRangeUtc(dateISO: string, timeZone: string): { from: Da
   };
 }
 
-/** Short weekday-and-day label for a date, read in the clinic's zone. */
-export function clinicDateLabel(dateISO: string, timeZone: string, options: Intl.DateTimeFormatOptions): string {
-  return new Intl.DateTimeFormat('en-US', { timeZone, ...options })
+/**
+ * Short weekday-and-day label for a date, read in the clinic's zone.
+ *
+ * `locale` defaults to 'en-US' so every existing caller renders unchanged; a
+ * clinic whose approved pack is en-GB passes its own language so "Mon, 31 Aug"
+ * reads the way the receptionist would say it.
+ */
+export function clinicDateLabel(dateISO: string, timeZone: string, options: Intl.DateTimeFormatOptions, locale = 'en-US'): string {
+  return new Intl.DateTimeFormat(resolveLocale(locale), { timeZone, ...options })
     .format(clinicTimeToUtc(dateISO, '12:00:00', timeZone));
+}
+
+/** A stored language tag the engine rejects must not take the screen down. */
+export function resolveLocale(candidate: string | null | undefined): string {
+  const trimmed = candidate?.trim();
+  if (trimmed) {
+    try {
+      new Intl.DateTimeFormat(trimmed);
+      return trimmed;
+    } catch {
+      // fall through
+    }
+  }
+  return 'en-US';
+}
+
+export type TimeStyle = '12h' | '24h';
+
+const HH_MM = /^(\d{1,2}):(\d{2})$/;
+
+/**
+ * A wall-clock time the way the agent will SAY it — the same wording the
+ * server's hours engine produces for `hours_today`, so the editor preview and
+ * the spoken line cannot drift apart. 24h keeps the stored "HH:mm"; 12h says
+ * "9 AM", "9:30 AM", "12 PM", "5 PM".
+ */
+export function formatSpokenTime(time: string, timeStyle: TimeStyle): string {
+  const match = HH_MM.exec(time.trim());
+  if (!match) return time;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (!Number.isInteger(hours) || hours < 0 || hours > 24 || minutes < 0 || minutes > 59) return time;
+  if (timeStyle === '24h') return `${String(hours % 24).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+  const suffix = hours % 24 < 12 ? 'AM' : 'PM';
+  const twelve = hours % 12 === 0 ? 12 : hours % 12;
+  return minutes === 0 ? `${twelve} ${suffix}` : `${twelve}:${String(minutes).padStart(2, '0')} ${suffix}`;
+}
+
+/** "9 AM to 5 PM" / "09:00 to 17:00" for an hours row preview. */
+export function formatSpokenWindow(start: string | undefined, end: string | undefined, timeStyle: TimeStyle): string {
+  if (!start || !end) return 'Closed';
+  return `${formatSpokenTime(start, timeStyle)} to ${formatSpokenTime(end, timeStyle)}`;
 }
