@@ -7,6 +7,16 @@
  * a composite foreign key that prevents cross-tenant attachment has quietly
  * gone. This pins WHICH ones exist, so any disappearance is named.
  *
+ * WHEN THIS MOVES: only when a migration adds a tenant-scoped MODEL. The
+ * composite-FK and supporting-index generation fires for tenant-scoped
+ * parent/child pairs, so a migration that adds columns, an index of its own, or
+ * a table with no tenantId changes nothing here - verified empirically against
+ * three such migrations, which moved none of the 273. Adding a tenant-scoped
+ * model moves three pins together: this list, the adapter count in
+ * rlsBehavioralCoverage.integration.test.ts, and docs/security/RLS_COVERAGE_MATRIX.md
+ * (npm run rls:docs). Regenerating after a column-only migration is wasted work;
+ * skipping it after a new model is the failure this exists to prevent.
+ *
  * Generated from a database built FROM EMPTY - never from a long-lived local
  * one, which can carry a shape no fresh build produces:
  *
