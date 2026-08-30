@@ -718,64 +718,9 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
   });
 
   // ----- Retell setup status (no secrets exposed) -------------------------
-  app.get('/retell-status', async request => {
-    const status = retellConfigStatus();
-    const linkedAgents = await db.receptionistAgent.findMany({
-      where: { tenantId: request.auth.tenantId, active: true },
-      select: {
-        active: true, providerAgentId: true, providerVersion: true, providerStatus: true,
-        providerConfigRevision: true, providerVerifiedRevision: true, providerVerifiedAt: true,
-        providerVerificationExpiresAt: true,
-      },
-    });
-    const readyAgents = linkedAgents.filter(agent => !agentReadinessReason(agent)).length;
-    const liveTest = liveCallUatStatus(new Date(), request.auth.tenantId);
-    const liveScope = liveCallUatScope();
-    const liveAttempts = liveScope
-      ? await db.idempotencyKey.findMany({
-        where: { tenantId: request.auth.tenantId, scope: liveScope },
-        select: { resultId: true },
-        take: Math.max(20, liveTest.maxCalls + 1),
-      })
-      : [];
-    const liveCallIds = liveAttempts
-      .map(attempt => attempt.resultId)
-      .filter((value): value is string => Boolean(value && !value.startsWith('blocked:') && value !== 'dispatching'));
-    const liveCalls = liveCallIds.length
-      ? await db.receptionistCallLog.findMany({
-        where: { tenantId: request.auth.tenantId, id: { in: liveCallIds } },
-        select: { durationSeconds: true, endedAt: true, outcome: true },
-      })
-      : [];
-    const connectedSeconds = liveCalls.reduce((sum, call) => sum + call.durationSeconds, 0);
-    const liveAdmission = evaluateLiveCallAdmission({
-      attemptsUsed: liveAttempts.length,
-      connectedSeconds,
-      activeCalls: liveCalls.filter(call => !call.endedAt && call.outcome === 'IN_PROGRESS').length,
-    }, new Date(), request.auth.tenantId);
-    return {
-      configured: status.configured && readyAgents > 0,
-      mock: status.mock,
-      missing: [...status.missing, ...(readyAgents ? [] : ['AGENT_DEPLOYMENT'])],
-      readyAgents,
-      adhocTestCallsAllowed: status.mock && env.NODE_ENV !== 'production',
-      liveTest: {
-        ...liveTest,
-        attemptsUsed: liveAttempts.length,
-        callsRemaining: Math.max(0, liveTest.maxCalls - liveAttempts.length),
-        minutesUsed: Math.ceil(connectedSeconds / 60),
-        minutesRemaining: Math.max(0, liveTest.maxTotalMinutes - Math.ceil(connectedSeconds / 60)),
-        activeCalls: liveCalls.filter(call => !call.endedAt && call.outcome === 'IN_PROGRESS').length,
-        admissionReason: liveAdmission.allowed ? null : liveAdmission.reason,
-      },
-      checklist: [
-        { key: 'RETELL_API_KEY', label: 'Retell API key', set: !status.missing.includes('RETELL_API_KEY') },
-        { key: 'RETELL_FROM_NUMBER', label: 'Outbound caller number', set: !status.missing.includes('RETELL_FROM_NUMBER') },
-        { key: 'AGENT_DEPLOYMENT', label: 'Published agent deployment', set: readyAgents > 0 },
-        { key: 'LIVE_TEST_CALLS_AUTHORIZED', label: 'Attended live-test authorization', set: liveTest.active },
-      ],
-    };
-  });
+  // GET /retell-status moved to modules/receptionist/deployment.ts in C5: the
+  // tenant-wide checklist could not answer "can THIS campaign take a call?",
+  // and it belongs with deployment rather than with outbound dialling.
 
   // ----- Outbound campaigns ----------------------------------------------
   const campaignCreate = z.object({

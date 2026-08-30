@@ -3,53 +3,20 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { env } from '../../config/env';
 import { runWithTenantContext } from '../../lib/tenantContext';
-import { evaluateRetellAgentReadiness, isValidRetellVersionTag, probeRetellAgent, RETELL_AGENT_VERIFICATION_TTL_MS, type RetellAgentSnapshot } from '../../lib/retell';
+import { isValidRetellVersionTag, listRetellVoices, retellProviderMode } from '../../lib/retell';
 import { Prisma } from '../../generated/prisma/client';
-import { uuid, idParam, writeRoles, isReceptionistDestinationConflict, lockReceptionistConfiguration, auditReceptionistMutation } from './shared';
+import { uuid, idParam, writeRoles, callArtifactRead, isReceptionistDestinationConflict, lockReceptionistConfiguration, auditReceptionistMutation } from './shared';
+import { verifyAgentProvider, type VerifyActor } from '../../lib/receptionist/agentVerification';
+import { agentReadinessReason } from '../../lib/receptionist/agentReadiness';
+import { remediationFor } from '../../lib/receptionist/remediation';
+import { confirmationChannelStatus } from '../../lib/receptionist/confirmationOutbox';
+import { liveCallUatScope, liveCallUatStatus, evaluateLiveCallAdmission } from '../../lib/receptionist/liveCallUat';
 
 const providerAgentIdInput = z.string().trim().regex(/^[A-Za-z0-9_-]{1,128}$/).optional().nullable();
 
 const providerVersionTagInput = z.string().trim().refine(isValidRetellVersionTag, {
   message: 'Deployment tag must start lowercase, use at most 20 lowercase letters, digits, hyphens or underscores, and cannot be latest, latest_published, or v<number>.',
 }).optional();
-
-function expectedRetellAgentWebhookUrl() {
-  return `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`;
-}
-
-function providerSnapshotData(snapshot: RetellAgentSnapshot) {
-  return {
-    providerVersion: snapshot.version,
-    providerPublished: snapshot.published,
-    providerAssignedTags: snapshot.assignedTags,
-    providerVoiceId: snapshot.voiceId,
-    providerLanguage: snapshot.language,
-    providerWebhookUrl: snapshot.webhookUrl,
-    providerWebhookEvents: snapshot.webhookEvents,
-    providerDataStorageSetting: snapshot.dataStorageSetting,
-    providerSignedUrl: snapshot.signedUrl,
-    providerResponseEngineType: snapshot.responseEngineType,
-    providerResponseEngineId: snapshot.responseEngineId,
-    providerResponseEngineVersion: snapshot.responseEngineVersion,
-    providerLastModifiedAt: snapshot.lastModifiedAt,
-    providerFingerprint: snapshot.fingerprint,
-    providerResponseEngineGraphFingerprint: snapshot.responseEngineGraphFingerprint,
-    providerEffectiveDynamicVariables: snapshot.effectiveDynamicVariables as Prisma.InputJsonValue,
-    providerBookToolSchema: snapshot.bookToolSchema as Prisma.InputJsonValue,
-    providerBookToolFingerprint: snapshot.bookToolFingerprint,
-    providerToolCallStrictMode: snapshot.toolCallStrictMode,
-  };
-}
-
-function providerIntakeEvidenceFailure(snapshot: RetellAgentSnapshot): string | null {
-  if (snapshot.bookToolProbeStatus === 'UNAVAILABLE') return 'provider_response_engine_unavailable';
-  if (snapshot.bookToolProbeStatus === 'UNSUPPORTED') return 'provider_response_engine_unsupported';
-  if (!snapshot.responseEngineGraphFingerprint || !snapshot.bookToolSchema || !snapshot.bookToolFingerprint) {
-    return 'provider_intake_contract_unattested';
-  }
-  if (snapshot.toolCallStrictMode !== true) return 'provider_intake_contract_not_strict';
-  return null;
-}
 
 export const agentRoutes: FastifyPluginAsync = async app => {
   // ===== Agents ===========================================================
@@ -67,12 +34,23 @@ export const agentRoutes: FastifyPluginAsync = async app => {
   });
   const agentUpdate = agentCreate.partial().omit({ clinicId: true });
 
-  app.get('/agents', { preHandler: writeRoles }, async request => {
+  app.get('/agents', { preHandler: callArtifactRead }, async request => {
     const query = z.object({ clinicId: uuid.optional() }).parse(request.query);
-    return db.receptionistAgent.findMany({
+    const rows = await db.receptionistAgent.findMany({
       where: { tenantId: request.auth.tenantId, ...(query.clinicId ? { clinicId: query.clinicId } : {}) },
       orderBy: { createdAt: 'asc' },
     });
+    // Surface a verified provider that disagrees with the local copy rather
+    // than letting Studio display a voice the caller will never hear.
+    return rows.map(agent => ({
+      ...agent,
+      providerMismatch: agent.providerStatus === 'VERIFIED' && (agent.providerVoiceId || agent.providerLanguage)
+        ? {
+          voice: Boolean(agent.providerVoiceId && agent.providerVoiceId !== agent.voice),
+          language: Boolean(agent.providerLanguage && agent.providerLanguage !== agent.language),
+        }
+        : null,
+    }));
   });
 
   app.post('/agents', { preHandler: writeRoles }, async (request, reply) => {
@@ -164,125 +142,78 @@ export const agentRoutes: FastifyPluginAsync = async app => {
     }
   });
 
-  app.post('/agents/:id/verify-provider', { preHandler: writeRoles }, async (request, reply) => {
+  // Thin adapter over the shared verification service. The provider probe runs
+  // outside any transaction (a Retell round trip inside `runWithTenantContext`
+  // would hold the tenant-wide advisory lock and hit Prisma's transaction
+  // timeout); the service commits agent, deployment and audit together.
+  app.post('/agents/:id/verify-provider', {
+    preHandler: writeRoles,
+    config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+  }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
-    const before = await db.receptionistAgent.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-    if (!before) throw app.httpErrors.notFound('Agent not found');
-    if (!before.providerAgentId) throw app.httpErrors.conflict('Link a Retell agent before verification.');
-
-    const attemptedAt = new Date();
-    const probe = await probeRetellAgent(before.providerAgentId, before.providerVersionTag);
-    const permanentProbeFailure = !probe.ok && ['not_found', 'invalid_request', 'invalid_response'].includes(probe.error);
-    const readinessFailure = probe.ok
-      ? evaluateRetellAgentReadiness(probe.snapshot, { versionTag: before.providerVersionTag, webhookUrl: expectedRetellAgentWebhookUrl() })
-      : null;
-    const intakeEvidenceFailure = probe.ok ? providerIntakeEvidenceFailure(probe.snapshot) : null;
-    const safeError = probe.ok ? readinessFailure ?? intakeEvidenceFailure : probe.error;
-
+    const actor: VerifyActor = { userId: request.auth.userId, source: 'USER', requestId: request.id, ip: request.ip };
     try {
-      const updated = await runWithTenantContext(request.auth.tenantId, async tx => {
-        await lockReceptionistConfiguration(tx, request.auth.tenantId);
-        const current = await tx.receptionistAgent.findFirst({ where: { id, tenantId: request.auth.tenantId } });
-        if (!current) throw app.httpErrors.notFound('Agent not found');
-        if (current.providerConfigRevision !== before.providerConfigRevision
-          || current.providerAgentId !== before.providerAgentId
-          || current.providerVersionTag !== before.providerVersionTag) {
+      const outcome = await verifyAgentProvider({ tenantId: request.auth.tenantId, agentId: id, actor });
+      switch (outcome.kind) {
+        case 'not_found':
+          throw app.httpErrors.notFound('Agent not found');
+        case 'unlinked':
+          throw app.httpErrors.conflict('Link a Retell agent before verification.');
+        case 'concurrent_change':
           throw app.httpErrors.conflict('Agent configuration changed while provider verification was in progress. Retry verification.');
-        }
-
-        const success = probe.ok && !readinessFailure && !intakeEvidenceFailure;
-        const failedCandidateChanged = probe.ok && current.providerStatus === 'VERIFIED'
-          && (
-            current.providerVersion !== probe.snapshot.version
-            || current.providerFingerprint !== probe.snapshot.fingerprint
-            || current.providerResponseEngineType !== probe.snapshot.responseEngineType
-            || current.providerResponseEngineId !== probe.snapshot.responseEngineId
-            || current.providerResponseEngineVersion !== probe.snapshot.responseEngineVersion
-          );
-        const deploymentChanged = success && current.providerStatus === 'VERIFIED'
-          && (
-            current.providerVersion !== probe.snapshot.version
-            || current.providerFingerprint !== probe.snapshot.fingerprint
-            || (probe.snapshot.bookToolProbeStatus === 'SUCCEEDED'
-              && (current.providerResponseEngineGraphFingerprint !== probe.snapshot.responseEngineGraphFingerprint
-                || current.providerBookToolFingerprint !== probe.snapshot.bookToolFingerprint))
-          );
-        if (deploymentChanged) {
-          const [studioReference, outboundReference] = await Promise.all([
-            tx.receptionistCampaign.findFirst({ where: { tenantId: request.auth.tenantId, agentId: id, status: 'ACTIVE' }, select: { id: true } }),
-            tx.receptionistOutboundCampaign.findFirst({ where: { tenantId: request.auth.tenantId, agentId: id, status: { in: ['SCHEDULED', 'RUNNING'] } }, select: { id: true } }),
-          ]);
-          if (studioReference || outboundReference) {
-            const row = await tx.receptionistAgent.update({
-              where: { id },
-              data: {
-                providerLastAttemptAt: attemptedAt,
-                providerLastAttemptStatus: 'FAILED',
-                providerLastErrorCode: 'provider_deployment_drift',
-              },
-            });
-            await auditReceptionistMutation(tx, request, {
-              action: 'receptionistAgent.providerDeploymentDriftDetected',
-              resource: 'receptionistAgent',
-              resourceId: id,
-              metadata: {
-                pinnedVersion: current.providerVersion,
-                detectedVersion: probe.snapshot.version,
-                studioCampaignActive: Boolean(studioReference),
-                outboundCampaignRunnable: Boolean(outboundReference),
-              },
-            });
-            return { row, driftBlocked: true };
-          }
-        }
-        const data: Prisma.ReceptionistAgentUpdateInput = {
-          providerLastAttemptAt: attemptedAt,
-          providerLastAttemptStatus: success ? 'SUCCEEDED' : 'FAILED',
-          providerLastErrorCode: safeError,
-          ...(success ? providerSnapshotData(probe.snapshot) : {}),
-          ...(success ? {
-            providerStatus: 'VERIFIED' as const,
-            providerVerifiedRevision: current.providerConfigRevision,
-            providerVerifiedAt: attemptedAt,
-            providerVerificationExpiresAt: new Date(attemptedAt.getTime() + RETELL_AGENT_VERIFICATION_TTL_MS),
-          } : (permanentProbeFailure || (probe.ok && (current.providerStatus !== 'VERIFIED' || failedCandidateChanged))) ? {
-            providerStatus: 'INVALID' as const,
-            providerVerifiedRevision: null,
-            providerVerifiedAt: null,
-            providerVerificationExpiresAt: null,
-          } : {}),
-        };
-        const row = await tx.receptionistAgent.update({ where: { id }, data });
-        await auditReceptionistMutation(tx, request, {
-          action: success
-            ? deploymentChanged ? 'receptionistAgent.providerDeploymentUpdated' : 'receptionistAgent.providerVerified'
-            : 'receptionistAgent.providerVerificationFailed',
-          resource: 'receptionistAgent', resourceId: id,
-          metadata: {
-            providerStatus: row.providerStatus,
-            providerVersion: row.providerVersion,
-            providerVersionTag: row.providerVersionTag,
-            deploymentChanged,
-            reason: safeError,
-          },
-        });
-        return { row, driftBlocked: false };
-      });
-      if (updated.driftBlocked) {
-        return reply.code(409).send({
-          ...updated.row,
-          code: 'provider_deployment_drift',
-          message: 'Provider deployment drift detected. Pause active and runnable campaigns before approving the new immutable version.',
-        });
+        case 'cooldown':
+          return reply.code(429).send({
+            code: 'cooldown',
+            message: remediationFor('cooldown').action,
+            retryAfterSeconds: outcome.retryAfterSeconds,
+            agent: null,
+          });
+        case 'drift_blocked':
+          return reply.code(409).send({
+            code: outcome.code,
+            message: 'Provider deployment drift detected. Pause active and runnable campaigns before approving the new immutable version.',
+            agent: outcome.agent,
+          });
+        case 'failed':
+          return reply.code(outcome.httpStatus).send({
+            code: outcome.code,
+            message: remediationFor(outcome.code, { agentId: id, clinicId: outcome.agent.clinicId }).action,
+            agent: outcome.agent,
+          });
+        case 'verified':
+          return reply.code(200).send({ code: null, message: null, agent: outcome.agent });
       }
-      if ((!probe.ok && !permanentProbeFailure) || intakeEvidenceFailure === 'provider_response_engine_unavailable') {
-        return reply.code(503).send(updated.row);
-      }
-      return reply.code(200).send(updated.row);
     } catch (error) {
       if (isReceptionistDestinationConflict(error)) throw app.httpErrors.conflict('This active provider deployment is already assigned to another agent.');
       throw error;
     }
+  });
+
+  // Adopt what the provider actually reports for voice and language. Deploy
+  // makes this moot by construction; it exists for an agent linked by hand,
+  // where the provider is the source of truth and Studio is the copy.
+  app.post('/agents/:id/adopt-provider-values', { preHandler: writeRoles }, async request => {
+    const { id } = idParam.parse(request.params);
+    return runWithTenantContext(request.auth.tenantId, async tx => {
+      await lockReceptionistConfiguration(tx, request.auth.tenantId);
+      const agent = await tx.receptionistAgent.findFirst({ where: { id, tenantId: request.auth.tenantId } });
+      if (!agent) throw app.httpErrors.notFound('Agent not found');
+      if (!agent.providerVoiceId && !agent.providerLanguage) {
+        throw app.httpErrors.conflict('This agent has no verified provider values to adopt. Verify it first.');
+      }
+      const row = await tx.receptionistAgent.update({
+        where: { id },
+        data: {
+          ...(agent.providerVoiceId ? { voice: agent.providerVoiceId } : {}),
+          ...(agent.providerLanguage ? { language: agent.providerLanguage } : {}),
+        },
+      });
+      await auditReceptionistMutation(tx, request, {
+        action: 'receptionistAgent.adoptedProviderValues', resource: 'receptionistAgent', resourceId: id,
+        metadata: { voice: row.voice, language: row.language },
+      });
+      return row;
+    });
   });
 
   app.delete('/agents/:id', { preHandler: writeRoles }, async (request, reply) => {
