@@ -39,11 +39,11 @@ behaves as if nothing happened.
 
 | # | Finding | Evidence | Status |
 |---|---|---|---|
-| V1 | **The integration credential vault is inert.** `PlatformIntegration` is referenced only inside `platform/routes.ts`. Every runtime sender reads `process.env` directly. An operator rotating a leaked Twilio token sees `connected · via db` and `test ok` while every SMS still goes out on the old key. | writers `routes.ts:964-985`; consumers `lib/retell.ts:18`, `lib/commsProvider.ts:64-66,82-83`, `lib/deposits.ts:40`, `revenue-protection.ts:735,763,967,982` | OPEN — P0 |
-| V2 | "Test connection" does no network call for voice/email/insurance/payment-webhook — `status` is initialised `'ok'`. **"Retell · test ok" means "two env vars are non-empty."** | `routes.ts:1005,1017` | OPEN |
+| V1 | FIXED in `4261e11`. **The integration credential vault was inert.** `PlatformIntegration` is referenced only inside `platform/routes.ts`. Every runtime sender reads `process.env` directly. An operator rotating a leaked Twilio token sees `connected · via db` and `test ok` while every SMS still goes out on the old key. | writers `routes.ts:964-985`; consumers `lib/retell.ts:18`, `lib/commsProvider.ts:64-66,82-83`, `lib/deposits.ts:40`, `revenue-protection.ts:735,763,967,982` | OPEN — P0 |
+| V2 | FIXED in `4261e11`. "Test connection" did no network call for voice/email/insurance/payment-webhook — `status` is initialised `'ok'`. **"Retell · test ok" means "two env vars are non-empty."** | `routes.ts:1005,1017` | OPEN |
 | V3 | `modelTier` and `aiCreditsLimit` persist to columns with no reader. `aiCreditsUsed`, `campaignGenerations`, `reportGenerations` have no writer — three permanently-zero cards. | `routes.ts:684-688` vs grep | OPEN |
 | V4 | 6 of 7 usage counters are frozen: `used` is seeded once at row creation and only `voice_minutes` is ever incremented. `seats: 3/25` was true the day the row was created. Device Usage is structurally 0. | `routes.ts:652-655` | OPEN |
-| V5 | MRR/ARR are structurally $0: the catalog migration deliberately never writes `monthlyPrice`, and `ensureBilling` copies it once, lazily, then `change-plan` never updates it. | `routes.ts:606`, `20260828120000…/migration.sql:29-33` | OPEN |
+| V5 | FIXED in `321b37c`. MRR/ARR were structurally $0: the catalog migration deliberately never writes `monthlyPrice`, and `ensureBilling` copies it once, lazily, then `change-plan` never updates it. | `routes.ts:606`, `20260828120000…/migration.sql:29-33` | OPEN |
 | V6 | Announcements have zero consumers outside the platform routes; `audience` isn't settable in the form. | grep across `server/` + `src/` | OPEN |
 | V7 | "Retry failed jobs" covers 1 of 5 queues under a generic "Failed background jobs" label. | `routes.ts:810-836` vs `workers/queues.ts` | OPEN |
 | V8 | `ipAllowlist` is stored and never enforced (honestly labelled in the UI), and has no editor. `passwordExpiryDays` is enforced but has no control. | `PlatformConsole.tsx:1012` | OPEN |
@@ -52,7 +52,7 @@ behaves as if nothing happened.
 
 | # | Finding | Evidence | Status |
 |---|---|---|---|
-| L1 | **The voice meter never resets.** `TenantUsageLimit.used` and `TenantAiUsage.receptionistMinutes` are lifetime counters — only `{increment}` exists, no period key, no reset job. The first pilot clinic hard-stops at 500 *lifetime* minutes with a 402 on inbound patient calls, mid-month-two, silently. | `receptionist/webhooks.ts:615-631,324-345`; no `BillingPeriod`/`UsageEvent` model in 4,049 lines of schema | OPEN — P0 |
+| L1 | FIXED in `7046b27`. **The voice meter never reset.** `TenantUsageLimit.used` and `TenantAiUsage.receptionistMinutes` are lifetime counters — only `{increment}` exists, no period key, no reset job. The first pilot clinic hard-stops at 500 *lifetime* minutes with a 402 on inbound patient calls, mid-month-two, silently. | `receptionist/webhooks.ts:615-631,324-345`; no `BillingPeriod`/`UsageEvent` model in 4,049 lines of schema | OPEN — P0 |
 | L2 | **An expired trial keeps working forever.** `ENTITLED_STATUSES` includes TRIAL/ACTIVE/PAST_DUE, entitlements recompute only on platform mutations, and no job ever expires a trial or rolls a period. | `subscriptions/catalog.ts:75`; `workers/index.ts:60-66` | OPEN |
 | L3 | **`overageAllowed` is uncapped and unbilled.** It removes the voice cap entirely while nothing meters or prices the overage. | `webhooks.ts:341`, `outbound.ts:1653` | OPEN |
 | L4 | A platform entitlement override was silently wiped by any plan change, add-on edit, suspend or reactivate — while the console claimed the opposite. | `entitlements.ts:46-52` vs `PlatformConsole.tsx:1428` | FIXED |
@@ -136,6 +136,10 @@ transacts on a single platform-owned account per provider, read from `process.en
 | `d65aa01` | C10-C13, C15, C16 - failed lists no longer render as reassuring empty states, per-tenant audit fetch, dead quick-action cards, dev note, hardcoded /15, read-only role respected |
 | `f48121c` | H2, H3, H4 - role-escalation guard, URL redaction in logs (plus Fastify's 404 handler, which leaked the same URLs), permission gates + audit on the advisory PHI endpoints |
 | `5349c92` | H1 - break-glass required before platform staff read or write clinic data |
+| `7046b27` | L1 - voice minutes metered per BILLING PERIOD (append-only, dedupe-keyed `UsageEvent`); both admission gates read the current period; the Usage tab reports the period and says "not measured" where no meter exists |
+| `4261e11` | V1 + V2 - the credential vault is now the credential the product uses (complete-save > env > unset, one catalog, snapshot refreshed at boot and on write); "test ok" no longer claims success it has not earned |
+| `1369246` | Operators can change their own password (exact revocation via `sessionEpoch`), and MFA became `PlatformConfig.requireOperatorMfa` - the owner's audited decision instead of a hardcoded rule |
+| `321b37c` | V5 - a real price book: column-scoped grant, audited reprice, and MRR that moves with both a reprice and a plan change |
 
 ### A defect found while fixing H1
 
@@ -145,6 +149,17 @@ its actor GUCs and was **silently denied by RLS** rather than erroring. Fixed in
 it is what made the support-session lookup - and the plugin's own platform audit writes -
 work at all. Worth a lint or a plugin-level assertion: a platform-plane query outside the
 scope should fail loudly, not return nothing.
+
+## 7b. What remains open after this session
+
+| # | Still open | Why it was not done here |
+|---|---|---|
+| H5 | **Production RLS cutover unverified** - the single highest-value item left | Needs production credentials and an ops window; `npm run rls:verify` must run against prod and its output captured |
+| L2 | An expired trial never expires: no job rolls a period or moves TRIAL -> PAST_DUE | Needs the worker schedule + a decision on grace behaviour |
+| L3 | `overageAllowed` still removes the voice cap entirely; the meter now exists to price it | Pricing inputs (Retell per-minute, Twilio per-SMS, infra per tenant) are not in the repo |
+| L5 | `multi_location` limits and seats are still sold and not enforced | Small, but it changes what an existing tenant can do - wants a decision first |
+| L6 | `TenantSecurityPolicy` is still written by both planes; the floor is applied at provisioning but not resolved as `max(floor, tenant)` at read time | Touches the tenant compliance centre as well as the platform plane |
+| — | Pilot-import idempotency, removed by revert `2bdffe6` | See below |
 
 ## 8. Known-failing tests (pre-existing, deliberately left failing)
 
