@@ -4,6 +4,7 @@ import {
   fingerprintJson,
   normalizeBookAppointmentToolContract,
 } from '../modules/receptionist/intakeContract';
+import { isRuntimeDynamicVariable } from './receptionist/runtimeVariables';
 import {
   buildMockAgentSnapshot,
   mockCreateAgent,
@@ -453,8 +454,30 @@ function emptyProviderDynamicVariables(value: unknown): Record<string, string> |
   return values && Object.keys(values).length === 0 ? {} : null;
 }
 
+/**
+ * Template syntax the provider must not be running.
+ *
+ * This check used to reject `{{anything}}` outright, which was correct when
+ * every value was resolved at deploy time. It is not correct now: the deployed
+ * prompt legitimately carries the runtime dynamic variables from contract §3
+ * (`{{is_open_now}}`, `{{known_first_name}}`, …) because only Retell can fill
+ * those in, per call. Rejecting them made verification fail forever — deploy
+ * would succeed, attestation would always report the booking tool unattested,
+ * and the campaign could never be activated.
+ *
+ * So the rule is specific rather than absolute: the approved runtime variables
+ * pass, and everything else is still refused — an unknown `{{name}}` (an
+ * unrendered value a caller would hear read aloud, or text somebody injected
+ * hoping for interpolation), `${…}`, and `{%…%}` control syntax.
+ */
 function containsProviderTemplateSyntax(value: unknown): boolean {
-  if (typeof value === 'string') return /\{\{[^{}]+\}\}|\$\{[^{}]+\}/.test(value);
+  if (typeof value === 'string') {
+    if (/\$\{[^{}]*\}|\{%[\s\S]*?%\}/.test(value)) return true;
+    for (const match of value.matchAll(/\{\{([^{}]*)\}\}/g)) {
+      if (!isRuntimeDynamicVariable(match[1] ?? '')) return true;
+    }
+    return false;
+  }
   if (Array.isArray(value)) return value.some(containsProviderTemplateSyntax);
   const valueRecord = record(value);
   return valueRecord ? Object.values(valueRecord).some(containsProviderTemplateSyntax) : false;

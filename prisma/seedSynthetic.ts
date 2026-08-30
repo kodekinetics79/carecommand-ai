@@ -25,6 +25,14 @@ const { connectionString, databaseName } = target;
 // client explicitly.
 process.env.DATABASE_URL = connectionString;
 
+// The receptionist demo layer deploys through the PRODUCTION deploy path, which
+// refuses to run with no voice provider configured — correctly. A synthetic
+// seed is a rehearsal by definition, so default to the mock provider unless the
+// caller supplied its own. The env schema refuses a mock Retell key outside the
+// demo profile, so this cannot leak into a pilot.
+process.env.RETELL_API_KEY ??= `mock_synthetic_${databaseName}`.slice(0, 60);
+process.env.RETELL_FROM_NUMBER ??= '+15550100000';
+
 // Inactivity windows are evaluated against the API's wall clock, so a
 // `lastVisitAt` pinned to the controlled clock would fall out of the 30-60 /
 // 60-90 / 90-180 bands as soon as real time moved past it. Window-relative
@@ -372,7 +380,7 @@ async function seed(): Promise<void> {
   // verify and activate through the production paths, so a demo tenant opens
   // Studio on a working front desk rather than four empty states.
   const receptionist = await seedReceptionistDemo({
-    db, now, stableUuid,
+    db, now, demoClock, stableUuid,
     clinicIds: receptionistClinicIds, branchIds, branchTenant, userIds, userTenant,
   });
 

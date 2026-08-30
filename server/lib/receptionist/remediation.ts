@@ -85,6 +85,7 @@ export type RemediationCode =
   | 'campaign_not_ready'
   | 'campaign_not_active'
   | 'campaign_active_pause_first'
+  | 'campaign_transition_not_allowed'
   | 'campaign_referenced_by_outbound'
   | 'confirmation_channel_unconfigured'
   | 'tag_assignment_unavailable';
@@ -172,6 +173,7 @@ const CATALOGUE = {
   // ---- Transitions --------------------------------------------------------
   campaign_not_ready: { title: 'The campaign is not ready to activate', action: 'Clear the listed checks, then activate.', scope: 'campaign', severity: 'blocking', fixTab: 'campaign', retryable: false },
   campaign_not_active: { title: 'The campaign is not active', action: 'Only an active campaign can be paused.', scope: 'campaign', severity: 'blocking', fixTab: 'campaign', retryable: false },
+  campaign_transition_not_allowed: { title: 'That status change is not allowed', action: 'A campaign moves draft or paused to active, active to paused, and draft or paused to archived. An archived campaign is final.', scope: 'campaign', severity: 'blocking', fixTab: 'campaign', retryable: false },
   campaign_active_pause_first: { title: 'Pause the campaign before archiving it', action: 'An active campaign is answering calls. Pause it first, then archive.', scope: 'campaign', severity: 'blocking', fixTab: 'campaign', retryable: false },
   campaign_referenced_by_outbound: { title: 'A runnable outbound campaign still uses this campaign', action: 'Pause or complete the outbound campaigns listed before archiving this one.', scope: 'campaign', severity: 'blocking', fixTab: 'campaign', retryable: false },
 } satisfies Record<RemediationCode, Omit<Remediation, 'code'>>;

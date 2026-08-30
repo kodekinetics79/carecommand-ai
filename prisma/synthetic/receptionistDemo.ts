@@ -23,6 +23,14 @@ import type { PrismaClient } from '../../server/generated/prisma/client';
 export interface ReceptionistDemoContext {
   db: PrismaClient;
   now: Date;
+  /**
+   * Wall-clock anchor, same reasoning as growthDemo's TIME ANCHORING note.
+   * Readiness asks whether a test call reached this line RECENTLY, evaluated
+   * against the API's clock at request time, so a call pinned to the
+   * controlled clock would age out of the window and the demo would go
+   * unready on its own.
+   */
+  demoClock: Date;
   stableUuid: (scope: string, index: number) => string;
   /** Receptionist clinic ids, aligned by index with branchIds/branchTenant. */
   clinicIds: string[];
@@ -73,7 +81,7 @@ function intakeFields(campaignId: string, tenantId: string, stableUuid: (scope: 
 }
 
 export async function seedReceptionistDemo(ctx: ReceptionistDemoContext): Promise<ReceptionistDemoCounts> {
-  const { db, now, stableUuid } = ctx;
+  const { db, now, demoClock, stableUuid } = ctx;
   const counts: ReceptionistDemoCounts = {
     locations: 0, agents: 0, campaigns: 0, intakeFields: 0, services: 0,
     providerAvailability: 0, deployedCampaigns: 0, verifiedAgents: 0, activeCampaigns: 0, notes: [],
@@ -145,14 +153,62 @@ export async function seedReceptionistDemo(ctx: ReceptionistDemoContext): Promis
       counts.services += 1;
     }
 
+    // Calls this line has already taken. Readiness requires proof the number
+    // actually reaches the agent (`test_call_completed`), and a demo of a
+    // front desk with no call history is not a demo of a front desk.
+    await db.receptionistCallLog.createMany({ data: [
+      {
+        id: stableUuid('receptionist-inbound-call', index * 2),
+        tenantId, clinicId, campaignId: campaign.id, direction: 'inbound',
+        callerName: 'Alex Morgan', outcome: 'BOOKED', durationSeconds: 96,
+        startedAt: new Date(demoClock.getTime() - 3 * 86_400_000), endedAt: new Date(demoClock.getTime() - 3 * 86_400_000 + 96_000),
+        createdAt: new Date(demoClock.getTime() - 3 * 86_400_000), updatedAt: demoClock,
+      },
+      {
+        id: stableUuid('receptionist-inbound-call', index * 2 + 1),
+        tenantId, clinicId, campaignId: campaign.id, direction: 'inbound',
+        callerName: 'Sam Rivera', outcome: 'ESCALATED', durationSeconds: 54,
+        startedAt: new Date(demoClock.getTime() - 86_400_000), endedAt: new Date(demoClock.getTime() - 86_400_000 + 54_000),
+        createdAt: new Date(demoClock.getTime() - 86_400_000), updatedAt: demoClock,
+      },
+    ] });
+
     const owner = ctx.userIds.find((userId, userIndex) => ctx.userTenant[userIndex] === tenantId);
     if (owner) campaignsToDeploy.push({ tenantId, campaignId: campaign.id, ownerId: owner });
   }
 
-  // Provider availability. Peer sessions found the live demo tenant had twelve
-  // providers and zero availability rows, so every slot search returned nothing
-  // and the receptionist could never offer a time. Readiness now catches that;
-  // the seed makes sure it passes for a real reason.
+  // Providers, and then their hours. Peer sessions found the live demo tenant
+  // with twelve providers and zero availability rows: every slot search
+  // returned nothing, so the receptionist could never offer an appointment
+  // however well configured it looked. Readiness now catches that; the seed
+  // makes sure it passes for a real reason rather than by exemption.
+  for (const [index, branchId] of ctx.branchIds.entries()) {
+    const tenantId = ctx.branchTenant[index];
+    if (!tenantId) continue;
+    const existing = await db.providerProfile.count({ where: { tenantId, branchId, active: true } });
+    if (existing > 0) continue;
+    // Every branch needs somebody bookable, not just the branches that happened
+    // to get a PROVIDER-role user from the round-robin above.
+    const candidate = await db.user.findFirst({
+      where: { tenantId, active: true, role: 'PROVIDER', providerProfile: { is: null } },
+      select: { id: true },
+    }) ?? await db.user.create({
+      data: {
+        id: stableUuid('receptionist-provider-user', index),
+        tenantId, role: 'PROVIDER', active: true,
+        email: `synthetic.receptionist.provider.${index + 1}@example.test`,
+        displayName: `Synthetic Provider ${index + 1}`,
+        createdAt: now, updatedAt: now,
+      },
+      select: { id: true },
+    });
+    await db.providerProfile.create({ data: {
+      id: stableUuid('receptionist-provider', index),
+      tenantId, branchId, userId: candidate.id, specialty: 'General practice', active: true,
+      createdAt: now, updatedAt: now,
+    } });
+  }
+
   const providers = await db.providerProfile.findMany({ where: { active: true }, select: { id: true, tenantId: true, branchId: true } });
   const availability = providers.flatMap(provider =>
     [1, 2, 3, 4, 5].flatMap(dayOfWeek => AVAILABILITY_WINDOWS.map(window => ({
@@ -208,7 +264,11 @@ export async function seedReceptionistDemo(ctx: ReceptionistDemoContext): Promis
         );
         counts.activeCampaigns += 1;
       } catch (error) {
-        counts.notes.push(`campaign ${target.campaignId} could not activate: ${error instanceof Error ? error.message : 'unknown'}`);
+        // Name the checks, not just the refusal: whoever runs the seed needs to
+        // know WHAT is unconfigured, which is the same thing the operator sees.
+        const reasons = (error as { reasons?: Array<{ key?: string }> }).reasons ?? [];
+        const detail = reasons.length ? reasons.map(reason => reason.key).join(', ') : (error instanceof Error ? error.message : 'unknown');
+        counts.notes.push(`campaign ${target.campaignId} could not activate: ${detail}`);
       }
     }
   }

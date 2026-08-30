@@ -125,6 +125,10 @@ interface ReadinessRow {
   inactive_90_180: number;
   never_visited: number;
   live_dispatch_activations: number;
+  receptionist_verified_agents: number;
+  receptionist_active_campaigns: number;
+  receptionist_bound_deployments: number;
+  branches_without_bookable_provider: number;
 }
 
 /**
@@ -177,7 +181,20 @@ async function verify(ownerUrl: string): Promise<ReadinessRow> {
            AND floor(extract(epoch from (now()::timestamp - p."lastVisitAt")) / 86400) >= 90
            AND floor(extract(epoch from (now()::timestamp - p."lastVisitAt")) / 86400) < 180)::int AS inactive_90_180,
         (SELECT count(*) FROM "Patient" p WHERE p."tenantId" = d.id AND p."deletedAt" IS NULL AND p."lastVisitAt" IS NULL)::int AS never_visited,
-        (SELECT count(*) FROM "CampaignLiveDispatchActivation")::int AS live_dispatch_activations
+        (SELECT count(*) FROM "CampaignLiveDispatchActivation")::int AS live_dispatch_activations,
+        (SELECT count(*) FROM "ReceptionistAgent" a WHERE a."tenantId" = d.id AND a."providerStatus" = 'VERIFIED' AND a.active)::int AS receptionist_verified_agents,
+        (SELECT count(*) FROM "ReceptionistCampaign" c WHERE c."tenantId" = d.id AND c.status = 'ACTIVE')::int AS receptionist_active_campaigns,
+        (SELECT count(*) FROM "ReceptionistAgentDeployment" dep WHERE dep."tenantId" = d.id AND dep.status = 'VERIFIED' AND dep."numberBound")::int AS receptionist_bound_deployments,
+        -- A branch a campaign can book into, with nobody bookable in it, is the
+        -- state that made twelve providers mean zero available appointments.
+        (SELECT count(*) FROM "Branch" b
+          WHERE b."tenantId" = d.id AND b.active
+            AND EXISTS (SELECT 1 FROM "ReceptionistLocation" l WHERE l."tenantId" = d.id AND l."branchId" = b.id AND l.active)
+            AND NOT EXISTS (
+              SELECT 1 FROM "ProviderAvailability" pa
+              JOIN "ProviderProfile" pp ON pp.id = pa."providerProfileId" AND pp.active
+              WHERE pa."tenantId" = d.id AND pa."branchId" = b.id AND pa.active
+            ))::int AS branches_without_bookable_provider
       FROM demo d
     `);
     const row = rows[0];
@@ -205,6 +222,15 @@ function assertReady(row: ReadinessRow): string[] {
   if (row.consent_opted_out < 1) failures.push('no suppression evidence exists, so a preview cannot demonstrate suppression');
   if (row.campaign_attributions < 1) failures.push('no campaign attribution evidence exists, so every campaign shows zero outcomes');
   if (row.live_dispatch_activations !== 0) failures.push('live campaign dispatch is ACTIVATED; the demo must run on the mock provider path');
+  // The receptionist is the module a buyer asks to see answer a call. A demo
+  // where it is configured but not deployed, or deployed but not bound to a
+  // number, cannot demonstrate the one thing it is for.
+  if (row.receptionist_verified_agents < 1) failures.push('no receptionist agent is VERIFIED; Studio would show an unconfigured front desk');
+  if (row.receptionist_active_campaigns < 1) failures.push('no receptionist campaign is ACTIVE; nothing would answer an inbound call');
+  if (row.receptionist_bound_deployments < 1) failures.push('no verified deployment is bound to a phone number; publishing an agent changes nothing about who answers');
+  if (row.branches_without_bookable_provider > 0) {
+    failures.push(`${row.branches_without_bookable_provider} bookable branch(es) have no provider availability; the agent could never offer an appointment time`);
+  }
   return failures;
 }
 
@@ -250,6 +276,11 @@ export async function provisionDemoTenant(): Promise<ReadinessRow> {
     SYNTHETIC_DATABASE_URL: plan.ownerUrl,
     DATABASE_MIGRATION_URL: plan.ownerUrl,
     CONFIRM_SYNTHETIC_DATABASE: plan.databaseName,
+    // The receptionist demo deploys through the production deploy path, which
+    // refuses to run with no voice provider. Mock is the honest rehearsal
+    // posture, and the env schema refuses a mock key outside the demo profile.
+    RETELL_API_KEY: process.env.RETELL_API_KEY ?? `mock_demo_${plan.databaseName}`.slice(0, 60),
+    RETELL_FROM_NUMBER: process.env.RETELL_FROM_NUMBER ?? '+15550100000',
   });
 
   console.log('[demo] verifying');
@@ -271,6 +302,12 @@ export async function provisionDemoTenant(): Promise<ReadinessRow> {
   console.log('');
   console.log('  Start the app against it with:');
   console.log(`    DATABASE_URL='${plan.runtimeUrl}' DATABASE_MIGRATION_URL='${plan.ownerUrl}' npm run dev:all`);
+  console.log('');
+  console.log(`  receptionist    ${readiness.receptionist_verified_agents} verified agent(s), ${readiness.receptionist_active_campaigns} active campaign(s)`);
+  console.log('');
+  console.log('  The receptionist runs on the MOCK voice provider. Set');
+  console.log(`    RETELL_API_KEY='mock_demo_${plan.databaseName}' RETELL_FROM_NUMBER='+15550100000'`);
+  console.log('  on the API and worker too, or Studio will report the provider as unconfigured.');
   console.log('');
   console.log('  Live campaign dispatch is OFF (no CampaignLiveDispatchActivation row).');
   console.log('  Outreach demonstrates on the dev mock provider path; nothing is contacted.');

@@ -481,7 +481,17 @@ describe('Retell agent provider contract', () => {
   it.each([
     ['LLM prompt placeholder', 'retell-llm', {
       llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+      // `first_name` is NOT a runtime dynamic variable: nothing substitutes it,
+      // so a caller would hear the braces read aloud.
       general_prompt: 'Welcome {{first_name}}', general_tools: [bookingTool()],
+    }],
+    ['LLM control syntax', 'retell-llm', {
+      llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+      general_prompt: 'Welcome {% if vip %}back{% endif %}', general_tools: [bookingTool()],
+    }],
+    ['LLM shell-style interpolation', 'retell-llm', {
+      llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+      general_prompt: 'Welcome ${caller}', general_tools: [bookingTool()],
     }],
     ['LLM default variable', 'retell-llm', {
       llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
@@ -502,6 +512,47 @@ describe('Retell agent provider contract', () => {
           : { type: engineType, conversation_flow_id: 'flow_pilot', version: 4 } }),
     ), { status: 200 })));
     const result = await probeRetellAgent('agent_pilot', 'prod');
+    expect(result).toMatchObject({ ok: true, snapshot: { bookToolSchema: null, bookToolFingerprint: null } });
+  });
+
+  it('accepts the runtime dynamic variables the deployed prompt is REQUIRED to carry', async () => {
+    // Contract §3: Retell substitutes these per call, so they cannot be
+    // resolved at deploy time and must survive into the published prompt.
+    // Rejecting them made verification fail forever — the deploy succeeded,
+    // attestation always reported the booking tool unattested, and the
+    // campaign could never be activated.
+    env.RETELL_API_KEY = 'real-key';
+    vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(String(url).includes('/get-retell-llm/')
+      ? {
+        llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+        general_prompt: [
+          'We are {{is_open_now}} right now. Today: {{hours_today}}; next open {{next_opening}}.',
+          'Closure reason: {{closure_reason}}. Emergencies: {{emergency_number}}.',
+          'Caller: {{known_first_name}} ({{admission_state}}). Staff line {{human_fallback_number}}.',
+          'Location {{location_name}}, {{location_address}}, {{location_phone}}.',
+        ].join('\n'),
+        general_tools: [bookingTool()],
+      }
+      : providerAgentApiBody(url)), { status: 200 })));
+    const result = await probeRetellAgent('agent_pilot', 'prod');
+    // Attested, with a real booking tool and strict mode — not waved through.
+    expect(result).toMatchObject({ ok: true, snapshot: { toolCallStrictMode: true } });
+    if (!result.ok) throw new Error('expected an attested snapshot');
+    expect(result.snapshot.bookToolFingerprint).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('still rejects an unapproved variable sitting beside approved ones', async () => {
+    env.RETELL_API_KEY = 'real-key';
+    vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(String(url).includes('/get-retell-llm/')
+      ? {
+        llm_id: 'llm_pilot', version: 9, is_published: true, tool_call_strict_mode: true,
+        general_prompt: 'We are {{is_open_now}}. Your balance is {{account_balance}}.',
+        general_tools: [bookingTool()],
+      }
+      : providerAgentApiBody(url)), { status: 200 })));
+    const result = await probeRetellAgent('agent_pilot', 'prod');
+    // One unknown placeholder is enough: it is either an unrendered value or
+    // text somebody injected hoping the provider would interpolate it.
     expect(result).toMatchObject({ ok: true, snapshot: { bookToolSchema: null, bookToolFingerprint: null } });
   });
 

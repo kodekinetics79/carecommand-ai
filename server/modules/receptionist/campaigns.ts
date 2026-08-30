@@ -26,11 +26,14 @@ export class CampaignTransitionError extends Error {
 
 type CampaignStatus = 'DRAFT' | 'ACTIVE' | 'PAUSED' | 'ARCHIVED';
 
+// Self-transitions are deliberately absent: pausing an already-paused campaign
+// is a mistake worth reporting, not a silent success. PATCH only calls this
+// when the status actually changes, so an unchanged status is still a no-op.
 const ALLOWED_TRANSITIONS: Record<CampaignStatus, CampaignStatus[]> = {
-  DRAFT: ['ACTIVE', 'ARCHIVED', 'DRAFT'],
-  PAUSED: ['ACTIVE', 'ARCHIVED', 'PAUSED'],
-  ACTIVE: ['PAUSED', 'ACTIVE'],
-  ARCHIVED: ['ARCHIVED'],
+  DRAFT: ['ACTIVE', 'ARCHIVED'],
+  PAUSED: ['ACTIVE', 'ARCHIVED', 'DRAFT'],
+  ACTIVE: ['PAUSED'],
+  ARCHIVED: [],
 };
 
 /**
@@ -45,10 +48,9 @@ export async function transitionCampaign(
   const existing = await tx.receptionistCampaign.findFirst({ where: { id: input.campaignId, tenantId: input.tenantId } });
   if (!existing) throw new Error('campaign_not_found');
   const from = existing.status as CampaignStatus;
-  if (from === input.to) return { campaign: existing, readiness: null };
   if (!ALLOWED_TRANSITIONS[from].includes(input.to)) {
     if (input.to === 'PAUSED') throw new CampaignTransitionError('campaign_not_active');
-    if (input.to === 'ARCHIVED') throw new CampaignTransitionError('campaign_active_pause_first');
+    if (input.to === 'ARCHIVED' && from === 'ACTIVE') throw new CampaignTransitionError('campaign_active_pause_first');
     throw new CampaignTransitionError('campaign_transition_not_allowed');
   }
 
