@@ -5,7 +5,7 @@ import { findPlaceholders } from '../lib/receptionist/placeholders';
 import { REMEDIATION_CODES, isKnownRemediationCode, remediationFor } from '../lib/receptionist/remediation';
 import { DEGRADED_SAFE_TOOLS, inboundDegradePolicy } from '../lib/receptionist/agentReadiness';
 import type { PromptConfig } from '../modules/receptionist/promptService';
-import { generateSampleTranscripts } from '../modules/receptionist/promptService';
+import { buildRetellConfig, generateSampleTranscripts } from '../modules/receptionist/promptService';
 import { promptFixture } from './fixtures/receptionistPromptConfigs';
 
 // C2 made hours, approved knowledge, catalog services and the locale pack part
@@ -139,11 +139,30 @@ describe('inbound degrade policy', () => {
 });
 
 describe('sample transcripts', () => {
+  // C3/C13 — until now the prompt ended the call on a recording refusal and
+  // the preview never showed that branch at all.
+  it('previews the recording-refusal branch as a call that keeps going', () => {
+    const transcripts = generateSampleTranscripts(baseConfig);
+    expect(transcripts.recordingRefusedSample.length).toBeGreaterThan(0);
+    const spoken = transcripts.recordingRefusedSample.filter(turn => turn.speaker === 'agent').map(turn => turn.text);
+    expect(spoken).toContain(baseConfig.localePack.strings.messages['consent.refused.continue']);
+    expect(spoken.join(' ')).not.toMatch(/cannot continue|end the call/i);
+    // The caller goes on to be helped, not shown the door.
+    expect(transcripts.recordingRefusedSample.some(turn => turn.speaker === 'caller' && /still need/i.test(turn.text))).toBe(true);
+  });
+
   it('opens with the mandatory disclosure and records consent before anything else', () => {
     const transcripts = generateSampleTranscripts(baseConfig);
     expect(transcripts.openingSequence[0].speaker).toBe('agent');
+    // C13 — the preview turn IS the deployed begin message, not a paraphrase.
+    expect(transcripts.openingSequence[0].text)
+      .toBe(buildRetellConfig(baseConfig, { webhookBaseUrl: 'https://api.example.test' }).beginMessage);
     expect(transcripts.openingSequence[0].text).toMatch(/recorded or monitored/i);
-    expect(transcripts.openingSequence.at(-1)?.text).toContain('record_recording_preference');
+    expect(transcripts.openingSequence.some(turn => turn.text.includes('record_recording_preference'))).toBe(true);
+    // ...and the turn after consent is the pack's own line, so the preview
+    // cannot drift towards whatever flatters a demo.
+    expect(transcripts.openingSequence.at(-1)?.text)
+      .toBe(baseConfig.localePack.strings.messages['consent.granted.ack']);
     // Intake only ever follows consent.
     const consentIndex = transcripts.inboundSample.findIndex(turn => turn.text.includes('record_recording_preference'));
     const intakeIndex = transcripts.inboundSample.findIndex(turn => turn.text.includes('your first name'));
@@ -157,6 +176,15 @@ describe('sample transcripts', () => {
 
   it('says it cannot book when no intake field is configured', () => {
     const noIntake = { ...baseConfig, intakeFields: [] };
-    expect(generateSampleTranscripts(noIntake).inboundSample.some(turn => /take a message/i.test(turn.text))).toBe(true);
+    expect(generateSampleTranscripts(noIntake).inboundSample.some(turn => /written down for/i.test(turn.text))).toBe(true);
+    // Every agent turn in the preview traces back to a rendered artefact: the
+    // deployed begin message, a locale-pack key, or a configured value.
+    const packLines = new Set(Object.values(noIntake.localePack.strings.messages));
+    const opening = buildRetellConfig(noIntake, { webhookBaseUrl: 'https://api.example.test' }).beginMessage;
+    for (const turn of generateSampleTranscripts(noIntake).inboundSample) {
+      if (turn.speaker !== 'agent') continue;
+      const fromPack = [...packLines].some(line => turn.text === line || line.includes('{{'));
+      expect(turn.text === opening || fromPack, turn.text).toBe(true);
+    }
   });
 });

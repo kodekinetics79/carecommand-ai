@@ -13,14 +13,24 @@ import { resolveIngressTenant } from '../../lib/tenantIngressResolvers';
 import { isFeatureEnabled } from '../../lib/entitlements';
 import { platformDb } from '../../lib/platformDb';
 import { stopPhoneCall } from '../../lib/retell';
-import { agentReadinessReason } from '../../lib/receptionist/agentReadiness';
+import {
+  agentReadinessReason,
+  inboundDegradePolicy,
+  type InboundDegradePolicy,
+  type InboundDegradeReason,
+} from '../../lib/receptionist/agentReadiness';
+import { resolveCallLocalePack, resolveLocalePackWithFallback } from '../../lib/receptionist/localePacks/resolve';
+import { renderPackMessage } from '../../lib/receptionist/localePacks/render';
+import type { LocalePackMessageKey } from '../../lib/receptionist/localePacks/types';
+import { TENANT_MODE_DEMO_BLOCK } from '../../lib/tenantMode';
 import { lockDncDestinationFence } from '../../lib/receptionist/dncFence';
+import { markTransferOutcome } from '../../lib/receptionist/frontDeskTask';
 import { enforceInvalidRetellSignatureRateLimit, enforceVerifiedRetellRateLimit } from '../../lib/receptionist/providerRateLimit';
 import { recoverOutboundProviderIntent } from '../../lib/receptionist/providerIntentRecovery';
 import { retellRateStore } from '../../lib/receptionist/retellRateStore';
 import { fingerprintJson, type IntakeContractSnapshot } from './intakeContract';
 import { callHoursStamp } from '../../lib/receptionist/hoursSource';
-import { recordWorkflowEvent } from '../../lib/intelligence';
+import { recordWorkflowEvent, upsertSignal } from '../../lib/intelligence';
 import { uuid } from './shared';
 
 /**
@@ -85,6 +95,14 @@ function canonicalRetellDestination(value: string | undefined): string | null {
   return /^\+[1-9]\d{7,14}$/.test(normalized) ? normalized : null;
 }
 
+// Tools that may only run against a currently verified deployment, because
+// each of them reads or writes a patient record.
+//
+// C6: `take_message` used to be in this set, which meant a lapsed verification
+// left the caller with no tool at all — and the handler then hung up on them.
+// Taking a message touches no patient record; it is the floor the receptionist
+// degrades to, and it is deliberately NOT bound. `DEGRADED_SAFE_TOOLS` in
+// agentReadiness.ts is the same list from the other side.
 const INBOUND_DEPLOYMENT_BOUND_TOOLS = new Set([
   'record_recording_preference',
   'verify_patient_identity',
@@ -93,7 +111,6 @@ const INBOUND_DEPLOYMENT_BOUND_TOOLS = new Set([
   'cancel_appointment',
   'reschedule_appointment',
   'book_appointment',
-  'take_message',
 ]);
 
 type VerifiedInboundDeployment = {
@@ -150,6 +167,102 @@ async function resolveVerifiedInboundDeployment(input: {
     },
     reason: null,
   };
+}
+
+/**
+ * The words a caller hears when something below the conversation has gone
+ * wrong. Resolved from the call's own approved locale pack where one exists,
+ * then from the clinic's language and country, and only then from the English
+ * fallback passed in. A caller is never left with silence, and never with a
+ * jurisdiction's wording that is not theirs.
+ */
+async function spokenLine(input: {
+  tenantId: string;
+  providerCallId?: string | null;
+  clinicId?: string | null;
+  key: LocalePackMessageKey;
+  fallback: string;
+}): Promise<string> {
+  try {
+    const byCall = input.providerCallId
+      ? await resolveCallLocalePack(db, { tenantId: input.tenantId, callId: input.providerCallId })
+      : null;
+    if (byCall) return renderPackMessage(byCall.strings, input.key);
+    const clinic = input.clinicId
+      ? await db.receptionistClinic.findFirst({ where: { id: input.clinicId, tenantId: input.tenantId }, select: { country: true, defaultLanguage: true } })
+      : null;
+    if (clinic) {
+      const byClinic = await resolveLocalePackWithFallback(db, { tenantId: input.tenantId, language: clinic.defaultLanguage, country: clinic.country });
+      if (byClinic) return renderPackMessage(byClinic.strings, input.key);
+    }
+  } catch {
+    // A pack that cannot be resolved or rendered must not become a dropped
+    // call. Fall through to the English line below.
+  }
+  return input.fallback;
+}
+
+/**
+ * C6 — the inbound degrade path, which was written, tested and then never
+ * called.
+ *
+ * Verification lapses after 24h and is renewed by an hourly worker. A worker
+ * outage past ~18h therefore used to silence every clinic at once: the handler
+ * called `stopPhoneCall` and the patient's line went dead, while the alarm was
+ * raised by the same dead worker. Nothing here ends a call. The receptionist
+ * keeps the tools that touch no patient record — message, handoff, emergency,
+ * do-not-call, consent — says so in the caller's own words, and files the
+ * staleness as a business event and an open operational signal so a human hears
+ * about it from us rather than from a patient.
+ */
+async function degradeInbound(input: {
+  tenantId: string;
+  providerCallId: string;
+  clinicId?: string | null;
+  reason: InboundDegradeReason;
+}): Promise<InboundDegradePolicy & { message: string }> {
+  const policy = inboundDegradePolicy(input.reason);
+  const message = await spokenLine({
+    tenantId: input.tenantId,
+    providerCallId: input.providerCallId,
+    clinicId: input.clinicId,
+    key: policy.messageKey as LocalePackMessageKey,
+    fallback: "I can't reach the appointment system on this call, so I won't guess at a time. I can take a message for the front desk right now, or put you through to someone. Which would you prefer?",
+  });
+  await recordInboundDegradation(input.tenantId, input.clinicId ?? null, policy);
+  return { ...policy, message };
+}
+
+/**
+ * The alarm, raised from the live call path rather than from the worker whose
+ * failure is the usual cause. Best-effort: intelligence bookkeeping must never
+ * be the reason a caller loses the line.
+ */
+async function recordInboundDegradation(tenantId: string, clinicId: string | null, policy: InboundDegradePolicy) {
+  try {
+    await db.businessEvent.create({
+      data: {
+        tenantId,
+        eventType: 'receptionist.agent.degraded',
+        entityType: 'receptionistClinic',
+        entityId: clinicId ?? undefined,
+        sourceModule: 'receptionist',
+        payload: { reason: policy.reason, allowedTools: [...policy.allowedTools], messageKey: policy.messageKey },
+      },
+    });
+    if (clinicId) {
+      await upsertSignal(tenantId, {
+        signalType: 'receptionist_agent_degraded',
+        entityType: 'receptionistClinic',
+        entityId: clinicId,
+        severity: 'high',
+        score: 80,
+        reason: `A live caller reached this clinic while the receptionist was degraded (${policy.reason}). Message-taking and handoff still work; booking does not.`,
+      });
+    }
+  } catch {
+    // Deliberately swallowed. See above.
+  }
 }
 
 function callMatchesInboundDeployment(
@@ -372,6 +485,43 @@ async function admitInboundReceptionist(tenantId: string, providerCallId: string
 
 async function flagInboundAdmissionDenied(tenantId: string, providerCallId: string, reason: string) {
   await flagRetellIngressReview(tenantId, providerCallId, `Inbound receptionist admission denied: ${reason}`);
+}
+
+/**
+ * `resolveVerifiedInboundDeployment` speaks in rejection reasons; the degrade
+ * contract speaks in degrade reasons. One map between them, so a new rejection
+ * reason cannot silently fall back to the vaguest spoken line.
+ */
+const DEGRADE_REASONS: Record<string, InboundDegradeReason> = {
+  clinic_binding_missing: 'provider_deployment_evidence_missing',
+  provider_deployment_evidence_missing: 'provider_deployment_evidence_missing',
+  provider_deployment_ambiguous: 'provider_deployment_ambiguous',
+  provider_deployment_unverified_or_stale: 'provider_deployment_unverified_or_stale',
+};
+
+/**
+ * What a denied caller hears. Every branch offers a person, because a denial is
+ * our problem and the caller still has theirs. `tenant_mode_demo` is the one
+ * branch that does NOT offer this line's staff, since a demonstration workspace
+ * has no real front desk behind it.
+ */
+async function admissionDeniedLine(
+  tenantId: string,
+  providerCallId: string,
+  clinicId: string | null | undefined,
+  reason: string,
+): Promise<string> {
+  const key: LocalePackMessageKey = reason === TENANT_MODE_DEMO_BLOCK
+    ? 'admission.denied.demo'
+    : reason === 'concurrency_limit_reached'
+      ? 'admission.denied.capacity'
+      : 'admission.denied.unavailable';
+  const fallback = reason === TENANT_MODE_DEMO_BLOCK
+    ? "Thanks for calling. This line is set up for demonstration only and isn't taking patient calls, so I won't take your details here. Please call the practice on its main number."
+    : reason === 'concurrency_limit_reached'
+      ? "We're taking more calls than usual right now, so rather than keep you waiting I'll put you through to the front desk."
+      : "I'm sorry, the automated line isn't available right now. Let me put you through to the front desk instead.";
+  return spokenLine({ tenantId, providerCallId, clinicId, key, fallback });
 }
 
 // ===== Public webhook (no JWT — Retell posts events here) =================
@@ -649,6 +799,19 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
             endedAt: ended ? new Date() : undefined,
           },
         });
+      // C12 — the handoff task is closed by provider evidence, in the same
+      // transaction as the call row that proves it. Contract section 5 named
+      // this webhook the single call site for markTransferOutcome; until now
+      // nothing called it, so every warm transfer left an open "nobody has
+      // acknowledged this" task behind a caller who had already been helped.
+      if (transferOutcome && current && current.transferOutcome === null) {
+        await markTransferOutcome(tx, {
+          tenantId,
+          callLogId: row.id,
+          outcome: transferOutcome,
+          retellCallId: providerCallId,
+        });
+      }
       if (ended) {
         const priorMinutes = current ? Math.ceil(current.durationSeconds / 60) : 0;
         const finalMinutes = Math.ceil(row.durationSeconds / 60);
@@ -989,17 +1152,27 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         providerAgentVersion: body.call?.agent_version,
       });
       if (!deploymentResult.deployment) {
-        const stopped = await stopPhoneCall(providerCallId);
+        // C6 — degrade, never hang up. The patient-data tool is refused; the
+        // call, the message, the handoff and the emergency path all survive.
+        const degraded = await degradeInbound({
+          tenantId,
+          providerCallId,
+          clinicId: trustedClinicId,
+          reason: DEGRADE_REASONS[deploymentResult.reason ?? ''] ?? 'provider_deployment_evidence_missing',
+        });
         await flagRetellIngressReview(
           tenantId,
           providerCallId,
-          `Inbound patient-data tool rejected: ${deploymentResult.reason}; provider_stop_applied=${stopped.applied}`,
+          `Inbound patient-data tool degraded: ${deploymentResult.reason}; call continued on ${degraded.allowedTools.join(', ')}`,
         );
         return reply.code(202).send({
           allowed: false,
           needs_human: true,
-          message: "I'm sorry, this call is not using the clinic's verified receptionist configuration. I cannot access or change patient information.",
-          providerStopApplied: stopped.applied,
+          degraded: true,
+          degrade_reason: degraded.reason,
+          allowed_tools: [...degraded.allowedTools],
+          providerStopApplied: false,
+          message: degraded.message,
         });
       }
       trustedInboundDeployment = deploymentResult.deployment;
@@ -1010,7 +1183,12 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       if (!admission.allowed) {
         const stopped = await stopPhoneCall(providerCallId);
         await flagInboundAdmissionDenied(tenantId, providerCallId, `${admission.reason}; provider_stop_applied=${stopped.applied}`);
-        return reply.code(202).send({ message: "I'm sorry, this clinic's AI receptionist is unavailable right now. I can only direct you to staff.", providerStopApplied: stopped.applied });
+        return reply.code(202).send({
+          admission_denied: true,
+          denial_reason: admission.reason,
+          message: await admissionDeniedLine(tenantId, providerCallId, trustedClinicId, admission.reason),
+          providerStopApplied: stopped.applied,
+        });
       }
     }
 
@@ -1085,13 +1263,20 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     });
 
     if (!activeCall) {
-      const stopped = await stopPhoneCall(providerCallId);
-      await flagRetellIngressReview(tenantId, providerCallId, `Inbound patient-data tool rejected: persisted provider deployment binding mismatch; provider_stop_applied=${stopped.applied}`);
+      // The deployment changed underneath a live call. That is a real reason to
+      // refuse the patient-data tool and a bad reason to drop the patient.
+      const degraded = await degradeInbound({
+        tenantId, providerCallId, clinicId: trustedClinicId, reason: 'provider_deployment_drift',
+      });
+      await flagRetellIngressReview(tenantId, providerCallId, 'Inbound patient-data tool degraded: persisted provider deployment binding mismatch; call continued');
       return reply.code(202).send({
         allowed: false,
         needs_human: true,
-        message: "I'm sorry, the verified receptionist configuration changed for this call. I cannot access or change patient information.",
-        providerStopApplied: stopped.applied,
+        degraded: true,
+        degrade_reason: degraded.reason,
+        allowed_tools: [...degraded.allowedTools],
+        providerStopApplied: false,
+        message: degraded.message,
       });
     }
 

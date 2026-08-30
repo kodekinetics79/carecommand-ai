@@ -18,15 +18,16 @@ import {
   renderRecordingDisclosure,
 } from './privacyLifecycle';
 import { restrictCallToBasicAttributes } from '../retell';
+import { transferReadiness } from './transferReadiness';
 import { CONFIRMATION_OUTBOX_SOURCE, processAppointmentConfirmations } from './confirmationOutbox';
 import { lockDncDestinationFence } from './dncFence';
 import { createSafetyTask } from './frontDeskTask';
-import { resolveCallLocalePack, resolvedLocaleFormat } from './localePacks/resolve';
+import { resolveCallLocalePack, resolvedLocaleFormat, type ResolvedLocalePack } from './localePacks/resolve';
 import { renderPackMessage } from './localePacks/render';
 import { EMERGENCY_FALLBACK_NUMBER_FREE } from './localePacks/defaults';
 import { loadHoursSource } from './hoursSource';
 import { hoursConfigured, resolveEffectiveHours, spokenDate } from './clinicHours';
-import type { LocaleFormat } from './localePacks/types';
+import type { LocaleFormat, LocalePackMessageKey } from './localePacks/types';
 
 // Real-time tools the AI receptionist invokes DURING a call (Retell custom
 // functions). Each returns a JSON result with a `message` the agent can speak.
@@ -143,10 +144,39 @@ async function patientsByCanonicalPhone(
     LIMIT 2
   `;
 }
-function speakList(times: string[]): string {
-  const labels = times.map(speakTime);
+function speakList(times: string[], locale?: LocaleFormat | null): string {
+  const labels = times.map(time => speakTime(time, locale));
   if (labels.length <= 2) return labels.join(' or ');
   return `${labels.slice(0, -1).join(', ')}, or ${labels.slice(-1)}`;
+}
+
+/** The call's approved locale pack, or null when none can be resolved. */
+async function callPack(ctx: ToolContext): Promise<ResolvedLocalePack | null> {
+  return resolveCallLocalePack(db, { tenantId: ctx.tenantId, callId: ctx.callId, trustedProviderAgentId: ctx.trustedProviderAgentId });
+}
+
+/**
+ * Render one caller-facing line from the call's pack.
+ *
+ * `fallback` is the pre-C10 en-US wording and is reached only when no pack and
+ * no country could be resolved for the call at all. A key merely absent from an
+ * older approved pack is filled by resolve.ts from the platform default, so the
+ * fallback is a last resort, not the normal path. It exists because the one
+ * thing worse than US phrasing on a GB call is a thrown renderer, which reaches
+ * the caller as silence.
+ */
+function speak(
+  pack: ResolvedLocalePack | null,
+  key: LocalePackMessageKey,
+  vars: Record<string, string>,
+  fallback: string,
+): string {
+  if (!pack) return fallback;
+  try {
+    return renderPackMessage(pack.strings, key, vars);
+  } catch {
+    return fallback;
+  }
 }
 
 type ContractValidation =
@@ -278,22 +308,54 @@ function validateAttestedBookingArgs(snapshot: IntakeContractSnapshot, args: Rec
 // message on the same live call, and files the audit/business events.
 export { createSafetyTask } from './frontDeskTask';
 
-/** Records an acknowledgment-required handoff before Retell attempts transfer. */
+/**
+ * Records an acknowledgment-required handoff before Retell attempts transfer.
+ *
+ * C12: this is the "I want a human" turn, and one of the two moments a
+ * receptionist is judged on. Everything durable — that a task exists, that no
+ * human has acknowledged it, that no transfer has happened — stays in the
+ * structured fields below, where the front desk and the audit trail read it.
+ * The caller hears one sentence, from the pack, and never our queue mechanics.
+ */
 export async function requestHumanHandoff(ctx: ToolContext, args: Record<string, unknown>) {
   const task = await createSafetyTask(ctx, 'human_handoff', args);
+  const [pack, transfer] = await Promise.all([callPack(ctx), callTransferReadiness(ctx)]);
   return {
     handoff_recorded: true,
+    // Structured evidence. `message` never restates any of it.
+    staff_acknowledged: false,
+    transfer_attempted: false,
     transfer_completed: false,
+    transfer_available: transfer.ready,
+    queue: 'front_desk',
     duplicate: task.duplicate,
     appended: task.appended,
     task_id: task.taskId,
-    message: 'I created a request in the front desk queue. Staff have not acknowledged it yet. If a transfer option is available, I can try it next; no transfer has occurred yet, and the callback request remains open.',
+    message: transfer.ready
+      ? speak(pack, 'handoff.spoken', {}, "Of course. I've passed this to the front desk with your number, so it won't be lost. Let me see if someone is free to pick up now.")
+      : speak(pack, 'handoff.no_transfer', {}, "Of course. I've passed this to the front desk with your number, so it won't be lost, and someone will get back to you. Is there anything you'd like me to add for them?"),
   };
+}
+
+/**
+ * Can this call actually be handed to a person? The same predicate the prompt
+ * and buildRetellConfig use, so the spoken line can never promise a transfer
+ * the configuration cannot perform.
+ */
+async function callTransferReadiness(ctx: ToolContext): Promise<{ ready: boolean }> {
+  if (!ctx.callId) return { ready: false };
+  const call = await db.receptionistCallLog.findFirst({
+    where: { tenantId: ctx.tenantId, retellCallId: ctx.callId },
+    select: { clinic: { select: { humanFallbackNumber: true, phone: true, locations: { select: { phone: true } } } } },
+  });
+  if (!call?.clinic) return { ready: false };
+  return { ready: transferReadiness(call.clinic, { inboundLineNumbers: call.clinic.locations.map(location => location.phone) }).ready };
 }
 
 /** Persists a bounded callback message as a staff task with explicit acknowledgment status. */
 export async function takeMessage(ctx: ToolContext, args: Record<string, unknown>) {
   const task = await createSafetyTask(ctx, 'message', args);
+  const pack = await callPack(ctx);
   return {
     // True only when a task was created or a message appended on this call.
     message_recorded: !task.duplicate,
@@ -302,8 +364,8 @@ export async function takeMessage(ctx: ToolContext, args: Record<string, unknown
     appended: task.appended,
     task_id: task.taskId,
     message: task.appended
-      ? 'Thank you. I added that to your callback request for the front desk. A team member still needs to review and acknowledge it.'
-      : 'Thank you. I have recorded a callback request for the front desk. A team member still needs to review and acknowledge it.',
+      ? speak(pack, 'tool.message.appended', {}, "Thank you. I've added that to the same note for the front desk. Someone will pick it up and get back to you; I can't promise exactly when.")
+      : speak(pack, 'tool.message.recorded', {}, "Thank you. That's written down for the front desk with your number. Someone will pick it up and get back to you; I can't promise exactly when."),
   };
 }
 
@@ -313,7 +375,7 @@ export async function reportEmergency(ctx: ToolContext, args: Record<string, unk
   // The emergency number is jurisdictional: it comes from the call's approved
   // locale pack. With no pack (and no country to fall back on) the agent says
   // the number-free sentence rather than naming the wrong country's number.
-  const pack = await resolveCallLocalePack(db, { tenantId: ctx.tenantId, callId: ctx.callId, trustedProviderAgentId: ctx.trustedProviderAgentId });
+  const pack = await callPack(ctx);
   const message = pack
     ? renderPackMessage(pack.strings, 'tool.emergency.message', { emergency_number: pack.strings.emergencyNumber })
     : EMERGENCY_FALLBACK_NUMBER_FREE;
@@ -401,7 +463,7 @@ function localAppointmentLabel(startsAt: Date, timezone: string, locale?: Locale
 
 /** The call's LocaleFormat, or null when no pack can be resolved. */
 async function callLocaleFormat(ctx: ToolContext): Promise<LocaleFormat | null> {
-  const pack = await resolveCallLocalePack(db, { tenantId: ctx.tenantId, callId: ctx.callId, trustedProviderAgentId: ctx.trustedProviderAgentId });
+  const pack = await callPack(ctx);
   return pack ? resolvedLocaleFormat(pack, pack.language) : null;
 }
 
@@ -636,7 +698,14 @@ export async function checkAvailability(ctx: ToolContext, args: Record<string, u
   const service = await resolveSchedulingService({ tenantId: ctx.tenantId, service: requestedService, fallbackDurationMin: SLOT_MIN });
   if (!providerProfileId || !service) {
     await auditLive(ctx.tenantId, 'receptionist.availability.needsReview', trusted.branchId, { reason: !providerProfileId ? 'provider_ambiguous' : 'service_ambiguous' });
-    return { available: false, needs_review: true, slots: [], message: "I need a team member to confirm the provider or service before I offer a time." };
+    return {
+      available: false, needs_review: true, slots: [],
+      // Which of the two is ambiguous is staff evidence, and it is already in
+      // the audit row above. The caller hears why they cannot be given a time
+      // and what happens instead.
+      review_reason: !providerProfileId ? 'provider_ambiguous' : 'service_ambiguous',
+      message: speak(await callPack(ctx), 'tool.availability.needs_review', {}, "I can't confirm the right clinician for that on this call. I can take a message so the front desk can call you back with times."),
+    };
   }
   const policy = await getSchedulingPolicy(ctx.tenantId);
   if (!policy.selfBookEnabled) return { available: false, needs_review: true, slots: [], message: 'This clinic requires staff review before offering self-booking times.' };
@@ -646,12 +715,14 @@ export async function checkAvailability(ctx: ToolContext, args: Record<string, u
   // the practice is shut.
   const bundle = await loadHoursSource(db, { tenantId: ctx.tenantId, clinicId: trusted.clinicId });
   const locationSource = bundle?.locations.find(location => location.id === trusted.locationId)?.source ?? bundle?.source ?? null;
-  const pack = await resolveCallLocalePack(db, { tenantId: ctx.tenantId, callId: ctx.callId, trustedProviderAgentId: ctx.trustedProviderAgentId });
+  const pack = await callPack(ctx);
   const locale = pack ? resolvedLocaleFormat(pack, pack.language) : null;
+  // One spoken form of the date for every branch below. The ISO string is the
+  // machine's word for a day, never the caller's.
+  const spokenDay = locale && /^\d{4}-\d{2}-\d{2}$/.test(date) ? spokenDate(date, locale) : date;
   if (locationSource && hoursConfigured(locationSource) && /^\d{4}-\d{2}-\d{2}$/.test(date)) {
     const day = resolveEffectiveHours(locationSource, date);
     if (!day.open) {
-      const spokenDay = locale ? spokenDate(date, locale) : date;
       const clinicName = bundle?.clinic.name ?? 'the practice';
       const message = pack
         ? day.closure
@@ -670,11 +741,17 @@ export async function checkAvailability(ctx: ToolContext, args: Record<string, u
         && startsAt.getTime() <= Date.now() + policy.maxHorizonDays * 86_400_000;
     });
   await auditLive(ctx.tenantId, 'receptionist.availability.checked', trusted.branchId, { date, count: slots.length, campaignId: trusted.campaignId });
-  if (slots.length === 0) return { available: false, slots: [], message: `I don't see any openings on ${date}. Would a different day work?` };
+  if (slots.length === 0) {
+    return {
+      available: false, slots: [],
+      message: speak(pack, 'tool.availability.none', { date: spokenDay }, `I don't have any openings on ${spokenDay}. Would a different day work?`),
+    };
+  }
+  const times = speakList(slots.map(slot => slot.time), locale);
   return {
     available: true,
-    slots: slots.map(s => ({ time: s.time, label: speakTime(s.time) })),
-    message: `On ${date} I have ${speakList(slots.map(s => s.time))}. Which works best for you?`,
+    slots: slots.map(slot => ({ time: slot.time, label: speakTime(slot.time, locale) })),
+    message: speak(pack, 'tool.availability.offer', { date: spokenDay, times }, `On ${spokenDay} I have ${times}. Which works best for you?`),
   };
 }
 
@@ -1070,7 +1147,8 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
   if (result.kind === 'rejected') return { booked: false, needs_human: true, message: result.message };
   if (result.kind === 'review') return { booked: false, needs_review: true, duplicate: result.duplicate, appointment_request_id: result.requestId, message: result.message };
 
-  const bookingLocale = await callLocaleFormat(ctx);
+  const bookingPack = await callPack(ctx);
+  const bookingLocale = bookingPack ? resolvedLocaleFormat(bookingPack, bookingPack.language) : null;
   const localLabel = localAppointmentLabel(result.startsAt, result.timezone, bookingLocale);
   const timezoneLabel = new Intl.DateTimeFormat(bookingLocale?.language ?? 'en-US', {
     timeZone: result.timezone,
@@ -1101,9 +1179,17 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
     provider_name: result.providerName, service: result.service,
     sms_sent: false, sms_accepted: confirmations.sms.acceptedNow, sms_status: confirmations.sms.status,
     email_sent: false, email_accepted: confirmations.email.acceptedNow, email_status: confirmations.email.status,
-    message: result.duplicate
-      ? `You're already booked for ${spokenBooking}.${acceptedNow ? ' A pending confirmation was accepted by the messaging provider.' : ''}`
-      : `Perfect, ${result.firstName} — you're booked for ${spokenBooking}.${acceptedNow ? ' A confirmation was accepted by the messaging provider.' : ''}`,
+    message: (() => {
+      // Acceptance by the messaging provider is not delivery, and the pack line
+      // says so in the caller's own words. The exact per-channel status stays in
+      // sms_status / email_status above for staff and for the audit trail.
+      const confirmation = acceptedNow
+        ? ` ${speak(bookingPack, 'tool.booking.confirmation_accepted', {}, "I've sent your confirmation; I can't confirm it has arrived yet.")}`
+        : '';
+      return result.duplicate
+        ? speak(bookingPack, 'tool.booking.already', { booking: spokenBooking, confirmation }, `You're already booked for ${spokenBooking}.${confirmation}`)
+        : speak(bookingPack, 'tool.booking.confirmed', { first_name: result.firstName, booking: spokenBooking, confirmation }, `Perfect, ${result.firstName}. You're booked for ${spokenBooking}.${confirmation}`);
+    })(),
   };
 }
 
@@ -1143,11 +1229,26 @@ export async function handleAgentTool(ctx: ToolContext, name: string, args: Reco
     if (configuredAgents.length !== 1) {
       return { recorded: false, message: 'I could not bind that preference to one configured receptionist disclosure. I will keep this call metadata-only and connect you with staff.' };
     }
-    const disclosureText = renderRecordingDisclosure({
+    // C10 — the consent artefact must record the words that were SPOKEN.
+    // `renderRecordingDisclosure` is the en-US baseline; an en-GB caller heard
+    // their pack's "quality and training purposes" and, before this, we hashed
+    // wording they had never been read. Hash the pack-rendered disclosure, and
+    // fall back to the baseline only when no pack (and no country) resolves at
+    // all — which is also the only case where the baseline is what was said.
+    const consentPack = await callPack(ctx);
+    const baselineDisclosure = renderRecordingDisclosure({
       agentName: configuredAgents[0].name,
       clinicName: call.clinic.name,
       clinicDisclosure: call.clinic.complianceDisclosure,
     });
+    const supplemental = call.clinic.complianceDisclosure?.trim();
+    const disclosureText = speak(consentPack, 'disclosure.recording', {
+      agent_name: configuredAgents[0].name,
+      clinic_name: call.clinic.name,
+      // The supplemental sentence carries its own leading space, exactly as
+      // mandatoryOpeningDisclosure composes it for the deployed prompt.
+      clinic_disclosure: supplemental ? ` ${supplemental}` : '',
+    }, baselineDisclosure);
     let restriction = null;
     if (decision !== 'GRANTED') restriction = await restrictCallToBasicAttributes(ctx.callId);
     await recordRecordingConsent({
@@ -1162,15 +1263,25 @@ export async function handleAgentTool(ctx: ToolContext, name: string, args: Reco
         clinicId: call.clinic.id,
         providerRestrictionApplied: restriction?.applied ?? false,
         providerRestrictionOk: restriction?.ok ?? true,
+        // Which pack the hashed wording came from, so the artefact can be
+        // reproduced years later without guessing the locale.
+        disclosureLocalePackId: consentPack?.id ?? null,
+        disclosureLocale: consentPack ? `${consentPack.language}/${consentPack.country}` : null,
+        disclosureSource: consentPack ? consentPack.source : 'baseline_template',
       },
     });
     return {
       recorded: true,
       decision,
+      // Retention posture is staff/compliance evidence, and it stays here. It
+      // was previously read aloud to a patient as the second thing they heard.
       metadata_only: true,
+      // C3 — a refusal restricts the recording, never the service. This field
+      // is what the front desk and the prompt both key off.
+      service_continues: true,
       message: decision === 'GRANTED'
-        ? 'Thank you. Your preference is recorded. This pilot remains metadata-only unless the approved retention workflow applies.'
-        : 'Your preference is recorded. I will not retain call recording or transcript artifacts. I can connect you with staff instead.',
+        ? speak(consentPack, 'consent.granted.ack', {}, 'Thank you. So, how can I help you today?')
+        : speak(consentPack, 'consent.refused.recorded', {}, "That's recorded. This call won't be recorded or transcribed, and I can still help you here."),
     };
   }
   if (name === 'verify_patient_identity') return verifyPatientIdentity(ctx, args);

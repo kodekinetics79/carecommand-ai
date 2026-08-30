@@ -1,6 +1,7 @@
 import { db } from '../db';
 import type { Prisma } from '../../generated/prisma/client';
 import { computeProviderSlots, findSlotConflict, parseClinicSlot, resolveProviderSchedulingContext } from '../scheduling';
+import type { LocaleFormat } from './localePacks/types';
 
 type Client = typeof db | Prisma.TransactionClient;
 export const SLOT_MIN = 30;
@@ -34,10 +35,17 @@ export function parseSlot(dateISO: string, time: string, timezone = 'UTC'): Date
   return parseClinicSlot(dateISO, time, timezone);
 }
 
-export function speakTime(time: string): string {
+/**
+ * How a slot is said out loud. The clock is a property of the caller's locale
+ * pack, not of this file: an en-GB caller offered "2:30 PM" is being read a
+ * foreign clock by their own practice. With no resolved locale the caller's
+ * pack is unknown, so the pre-C10 12-hour form is kept rather than guessing.
+ */
+export function speakTime(time: string, locale?: LocaleFormat | null): string {
   const tm = /^(\d{1,2}):(\d{2})$/.exec(time);
   if (!tm) return time;
-  let h = Number(tm[1]); const m = tm[2];
-  const ap = h >= 12 ? 'PM' : 'AM'; h = h % 12 || 12;
-  return `${h}:${m} ${ap}`;
+  const h24 = Number(tm[1]); const m = tm[2];
+  if (locale?.timeStyle === '24h') return `${String(h24).padStart(2, '0')}:${m}`;
+  const ap = h24 >= 12 ? 'PM' : 'AM';
+  return `${h24 % 12 || 12}:${m} ${ap}`;
 }

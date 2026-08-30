@@ -20,6 +20,9 @@ const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
 const { disclosureEvidenceHash, renderRecordingDisclosure } = await import('../lib/receptionist/privacyLifecycle');
 const { MAX_TENANT_ACTIVE_CALLS } = await import('../modules/receptionist/outbound');
+const { DEGRADED_SAFE_TOOLS } = await import('../lib/receptionist/agentReadiness');
+const { platformLocalePack } = await import('../lib/receptionist/localePacks/defaults');
+const { renderPackMessage } = await import('../lib/receptionist/localePacks/render');
 
 const KEY = 'retell-first-inbound-bootstrap-key';
 const originalKey = env.RETELL_API_KEY;
@@ -30,16 +33,28 @@ function randomE164() {
   return `+1212${suffix}`;
 }
 
-async function tenant(phone = randomE164(), entitled = true) {
+interface TenantOptions {
+  entitled?: boolean;
+  /** Clinic jurisdiction. Drives which locale pack a live caller is spoken to from. */
+  locale?: { country: string; language: string; timezone: string };
+  /** How stale the agent's verification is, in hours. 0 keeps it verified. */
+  verificationAgeHours?: number;
+}
+
+async function tenant(phone = randomE164(), options: TenantOptions | boolean = {}) {
+  const opts: TenantOptions = typeof options === 'boolean' ? { entitled: options } : options;
+  const entitled = opts.entitled ?? true;
+  const locale = opts.locale ?? { country: 'US', language: 'en-US', timezone: 'America/New_York' };
   const id = randomUUID();
   tenantIds.push(id);
   await db.tenant.create({ data: { id, name: `Inbound ${id.slice(0, 8)}`, slug: `inbound-${id.slice(0, 8)}` } });
   await db.tenantFeatureEntitlement.create({ data: { tenantId: id, featureKey: 'ai_receptionist', enabled: entitled, source: 'test' } });
-  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Trusted destination', phone, active: true, country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' } });
+  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Trusted destination', phone, active: true, country: locale.country, timezone: locale.timezone, defaultLanguage: locale.language } });
   const providerAgentId = `agent_${id.replaceAll('-', '')}`;
   const providerAgentVersion = 3;
   const providerFingerprint = 'a'.repeat(64);
-  const verifiedAt = new Date();
+  const ageMs = (opts.verificationAgeHours ?? 0) * 3_600_000;
+  const verifiedAt = new Date(Date.now() - ageMs);
   await db.receptionistAgent.create({ data: {
     tenantId: id, clinicId: clinic.id, name: 'Avery', active: true,
     providerAgentId, providerVersionTag: 'prod', providerVersion: providerAgentVersion, providerStatus: 'VERIFIED',
@@ -50,7 +65,9 @@ async function tenant(phone = randomE164(), entitled = true) {
     providerResponseEngineType: 'retell-llm', providerResponseEngineId: `llm_${id.replaceAll('-', '')}`,
     providerResponseEngineVersion: 1,
     providerFingerprint, providerConfigRevision: 1, providerVerifiedRevision: 1,
-    providerVerifiedAt: verifiedAt, providerVerificationExpiresAt: new Date(verifiedAt.getTime() + 60 * 60_000),
+    providerVerifiedAt: verifiedAt,
+    // The 24h TTL the hourly re-verify worker is supposed to renew.
+    providerVerificationExpiresAt: new Date(verifiedAt.getTime() + 24 * 3_600_000),
   } });
   return { id, clinicId: clinic.id, phone, providerAgentId, providerAgentVersion, providerFingerprint };
 }
@@ -144,7 +161,7 @@ describe('Retell first-ever inbound trusted destination bootstrap', () => {
   });
 
   it('persists a safe denial signal when entitlement or the tenant kill switch blocks inbound tools', async () => {
-    const locked = await tenant(randomE164(), false);
+    const locked = await tenant(randomE164(), { entitled: false });
     const lockedCall = `feature-locked-${randomUUID()}`;
     const lockedResponse = await signedInject('/v1/receptionist/webhooks/retell/fn', {
       name: 'check_availability', args: { appointment_date: '2030-01-02', service: 'Consultation' },
@@ -210,7 +227,12 @@ describe('Retell first-ever inbound trusted destination bootstrap', () => {
     }
   });
 
-  it('rejects missing or drifted provider deployment evidence before patient-data tools', async () => {
+  // C6 — a lapsed, missing or drifted deployment used to call stopPhoneCall and
+  // drop the patient, while `take_message` was itself deployment-bound so they
+  // could not even leave a message. Verification lapses after 24h and is renewed
+  // by an hourly worker, so a worker outage past ~18h silenced every clinic at
+  // once. Patient-data tools are still refused; the call is not.
+  it('degrades to the safe tools instead of hanging up when deployment evidence is missing or drifted', async () => {
     const t = await tenant();
     const missingCallId = `missing-deployment-${randomUUID()}`;
     const missing = await signedInject('/v1/receptionist/webhooks/retell/fn', {
@@ -218,7 +240,12 @@ describe('Retell first-ever inbound trusted destination bootstrap', () => {
       call: { call_id: missingCallId, direction: 'inbound', to_number: t.phone, from_number: '+12125550021' },
     });
     expect(missing.statusCode).toBe(202);
-    expect(missing.json()).toMatchObject({ allowed: false, needs_human: true });
+    expect(missing.json()).toMatchObject({ allowed: false, needs_human: true, degraded: true, providerStopApplied: false });
+    // The caller is told something, in words from the pack, and is offered a
+    // message and a person. Silence is never an acceptable answer.
+    const missingBody = missing.json() as { message: string; allowed_tools: string[] };
+    expect(missingBody.message).toMatch(/take a message|put you through/i);
+    expect(missingBody.allowed_tools).toEqual([...DEGRADED_SAFE_TOOLS]);
     expect(await db.receptionistRecordingConsentEvent.count({ where: { tenantId: t.id } })).toBe(0);
 
     const callId = `deployment-drift-${randomUUID()}`;
@@ -246,19 +273,127 @@ describe('Retell first-ever inbound trusted destination bootstrap', () => {
       providerFingerprint: 'b'.repeat(64), providerConfigRevision: 1, providerVerifiedRevision: 1,
       providerVerifiedAt: verifiedAt, providerVerificationExpiresAt: new Date(verifiedAt.getTime() + 60 * 60_000),
     } });
+    // A patient-data tool on drifted evidence is still refused — but as a
+    // degrade, with words and with the safe tools named, not as a hang-up.
     const drifted = await signedInject('/v1/receptionist/webhooks/retell/fn', {
-      name: 'take_message', args: { message: 'Please call me back.' },
+      name: 'verify_patient_identity', args: { date_of_birth: '1990-01-01' },
       call: {
         call_id: callId, agent_id: alternateId, agent_version: 8,
         direction: 'inbound', to_number: t.phone, from_number: '+12125550022',
       },
     });
     expect(drifted.statusCode).toBe(202);
-    expect(drifted.json()).toMatchObject({ allowed: false, needs_human: true });
-    expect(await db.staffTask.count({ where: { tenantId: t.id } })).toBe(0);
+    expect(drifted.json()).toMatchObject({ allowed: false, needs_human: true, degraded: true, providerStopApplied: false });
+    expect((drifted.json() as { allowed_tools: string[] }).allowed_tools).toContain('take_message');
+
+    // ...and this is the whole point: the caller can still leave a message on
+    // the very same drifted call. `take_message` touches no patient record and
+    // is no longer deployment-bound, so the receptionist has a floor to degrade
+    // to instead of a dial tone.
+    const message = await signedInject('/v1/receptionist/webhooks/retell/fn', {
+      name: 'take_message', args: { message: 'Please call me back.', caller_name: 'Sam', callback_phone: '+12125550022' },
+      call: {
+        call_id: callId, agent_id: alternateId, agent_version: 8,
+        direction: 'inbound', to_number: t.phone, from_number: '+12125550022',
+      },
+    });
+    expect(message.statusCode).toBe(200);
+    expect(message.json()).toMatchObject({ message_recorded: true });
+    expect(await db.staffTask.count({ where: { tenantId: t.id } })).toBe(1);
+
+    // The staleness raises its own alarm from the live call path, because the
+    // worker that would otherwise raise it is the usual thing that has failed.
+    expect(await db.businessEvent.count({
+      where: { tenantId: t.id, eventType: 'receptionist.agent.degraded' },
+    })).toBeGreaterThanOrEqual(1);
+    expect(await db.operationalSignal.count({
+      where: { tenantId: t.id, signalType: 'receptionist_agent_degraded', status: 'open' },
+    })).toBe(1);
     expect(await db.operationalSignal.count({
       where: { tenantId: t.id, signalType: 'RECEPTIONIST_INGRESS_REVIEW' },
     })).toBe(2);
+  });
+
+  // C6 — THE scenario. Verification lapses after 24h and is renewed by the
+  // hourly worker; a worker outage past ~18h therefore used to take every
+  // clinic off the air at once, with the alarm raised by the same dead worker.
+  // A patient calling into that window must still be able to leave a message.
+  it('leaves a stale verification with a callable message path instead of a hang-up', async () => {
+    // 30 hours since the last successful verification: expired, exactly as an
+    // overnight worker outage leaves it.
+    const t = await tenant(randomE164(), { verificationAgeHours: 30 });
+    const callId = `stale-verification-${randomUUID()}`;
+    const call = {
+      call_id: callId, agent_id: t.providerAgentId, agent_version: t.providerAgentVersion,
+      direction: 'inbound', to_number: t.phone, from_number: '+12125550033',
+    };
+
+    // A patient-data tool is still refused — but the caller is told so, in
+    // words, and is told what they can do instead.
+    const booking = await signedInject('/v1/receptionist/webhooks/retell/fn', {
+      name: 'verify_patient_identity', args: { date_of_birth: '1988-04-02' }, call,
+    });
+    expect(booking.statusCode).toBe(202);
+    const degraded = booking.json() as { degraded: boolean; degrade_reason: string; message: string; allowed_tools: string[]; providerStopApplied: boolean };
+    expect(degraded.degraded).toBe(true);
+    expect(degraded.degrade_reason).toBe('provider_deployment_unverified_or_stale');
+    // The old behaviour: stopPhoneCall. The whole point of C6 is that this is
+    // false, and that the caller is still on the line to hear the next line.
+    expect(degraded.providerStopApplied).toBe(false);
+    expect(degraded.message.length).toBeGreaterThan(0);
+    expect(degraded.allowed_tools).toContain('take_message');
+
+    // And the message actually goes through, on the same stale call.
+    const message = await signedInject('/v1/receptionist/webhooks/retell/fn', {
+      name: 'take_message',
+      args: { message: 'My crown came off, please call me.', caller_name: 'Alex', callback_phone: '+12125550033' },
+      call,
+    });
+    expect(message.statusCode).toBe(200);
+    expect(message.json()).toMatchObject({ message_recorded: true });
+    expect(await db.staffTask.count({ where: { tenantId: t.id } })).toBe(1);
+
+    // A human hears about the outage from us, not from a patient.
+    expect(await db.businessEvent.count({ where: { tenantId: t.id, eventType: 'receptionist.agent.degraded' } })).toBe(1);
+    const signal = await db.operationalSignal.findFirstOrThrow({
+      where: { tenantId: t.id, signalType: 'receptionist_agent_degraded' },
+    });
+    expect(signal).toMatchObject({ status: 'open', severity: 'high', entityId: t.clinicId });
+  });
+
+  // C10 — the consent artefact must record the words the caller actually
+  // heard. An en-GB pack says "quality and training purposes"; the evidence
+  // template says "quality and documentation". Hashing the template recorded
+  // wording that caller was never read.
+  it('hashes the disclosure the caller actually heard, in their own locale', async () => {
+    const t = await tenant(randomE164(), { locale: { country: 'GB', language: 'en-GB', timezone: 'Europe/London' } });
+    const callId = `gb-consent-${randomUUID()}`;
+    const granted = await signedInject('/v1/receptionist/webhooks/retell/fn', {
+      name: 'record_recording_preference', args: { recording_decision: 'GRANTED' },
+      call: {
+        call_id: callId, agent_id: t.providerAgentId, agent_version: t.providerAgentVersion,
+        direction: 'inbound', to_number: t.phone, from_number: '+442071234567',
+      },
+    });
+    expect(granted.statusCode).toBe(200);
+
+    const clinic = await db.receptionistClinic.findUniqueOrThrow({ where: { id: t.clinicId }, select: { name: true, complianceDisclosure: true } });
+    const gbPack = platformLocalePack('en-GB', 'GB')!;
+    const spoken = renderPackMessage(gbPack.strings, 'disclosure.recording', {
+      agent_name: 'Avery',
+      clinic_name: clinic.name,
+      clinic_disclosure: clinic.complianceDisclosure?.trim() ? ` ${clinic.complianceDisclosure.trim()}` : '',
+    });
+    const evidence = await db.receptionistRecordingConsentEvent.findFirstOrThrow({
+      where: { tenantId: t.id }, orderBy: { createdAt: 'desc' },
+    });
+    expect(spoken).toContain('quality and training purposes');
+    expect(evidence.disclosureTextHash).toBe(disclosureEvidenceHash(spoken));
+    // The pre-C10 behaviour hashed the en-US template, which this caller was
+    // never read. That hash must NOT be what we stored.
+    expect(evidence.disclosureTextHash).not.toBe(disclosureEvidenceHash(renderRecordingDisclosure({
+      agentName: 'Avery', clinicName: clinic.name, clinicDisclosure: clinic.complianceDisclosure,
+    })));
   });
 
   it('expires stale in-progress call leases before reserving new inbound capacity', async () => {
