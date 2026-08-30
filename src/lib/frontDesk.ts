@@ -37,13 +37,26 @@ const receptionistBase = '/v1/receptionist';
 export const RECEPTIONIST_TASK_KINDS = [
   'message', 'human_handoff', 'emergency', 'missed_call',
   'call_denied', 'ai_declined', 'tool_failure', 'identity_locked', 'booking_review',
+  // D9: "your receptionist is off the air". Package D files this through
+  // `createSafetyTask` on the receptionist_safety workflow; until it lands the
+  // hourly re-verify worker still files the same facts under the separate
+  // `receptionist_deployment` workflow, which `parseReceptionistTask` rejects.
+  // Both shapes are recognised below so the Service status lane is populated
+  // either way — this task must never be the one the board cannot show.
+  'deployment_attention',
 ] as const;
 export type ReceptionistTaskKind = typeof RECEPTIONIST_TASK_KINDS[number];
+
+/** The workflow the pre-D re-verify worker files deployment attention under. */
+export const RECEPTIONIST_DEPLOYMENT_WORKFLOW = 'receptionist_deployment';
+/** The workflow every caller-facing receptionist task is filed under. */
+export const RECEPTIONIST_SAFETY_WORKFLOW = 'receptionist_safety';
 
 export const TASK_KIND_LABEL: Record<ReceptionistTaskKind, string> = {
   message: 'Message', human_handoff: 'Human handoff', emergency: 'Emergency', missed_call: 'Missed call',
   call_denied: 'Call refused', ai_declined: 'Declined the AI', tool_failure: 'Tool failure',
   identity_locked: 'Identity locked', booking_review: 'Booking review',
+  deployment_attention: 'Service status',
 };
 
 export const TASK_OUTCOME_CODES = [
@@ -62,6 +75,13 @@ export type TaskStatus = 'OPEN' | 'IN_PROGRESS' | 'COMPLETED' | 'CANCELED';
 export type TransferStatus = 'not_attempted' | 'attempted' | 'connected' | 'failed' | 'unknown';
 
 export interface TaskMessage { text: string; recordedAt: string }
+/**
+ * The remediation sentence the server already writes on a deployment-attention
+ * task (`remediationFor(code)` → title/action/fixHref). It is the only thing on
+ * that card worth reading, so it is carried as a first-class field rather than
+ * left in the raw metadata blob.
+ */
+export interface TaskRemediation { code: string | null; title: string | null; action: string | null; fixHref: string | null }
 export interface TaskStaffNote { text: string; at: string; byUserId: string; byDisplayName?: string | null }
 export interface CallbackWindow { start: string; end: string; timezone: string; clippedToHours?: boolean }
 
@@ -87,6 +107,10 @@ export interface ReceptionistTaskView {
   staffNotes: TaskStaffNote[];
   source: string | null;
   requiresAcknowledgement: boolean;
+  /** Present on `deployment_attention` only. Null on every caller task. */
+  remediation: TaskRemediation | null;
+  /** Metadata clinic scope, when the task carries one (D14 / the clinic selector). */
+  clinicId: string | null;
 }
 
 /** What a caller WITHOUT receptionist:call-artifacts:read sees of a receptionist task. */
@@ -128,11 +152,43 @@ export interface FrontDeskTaskDetail extends FrontDeskTaskRow {
   contact: { callbackPhone: string | null; verifiedPhone: string | null; requestedCallbackPhone: string | null; callerName: string | null } | null;
 }
 
+/**
+ * One unacknowledged critical task in the banner's preview.
+ *
+ * `workflow`/`kind` are what D8 adds so the front desk can tell a clinical
+ * emergency from a critical ops or insurance task that happens to share the
+ * `critical` priority. They are optional because a pre-D server sends neither;
+ * a row that carries NO workflow is kept (never hide a possible emergency),
+ * a row that carries a foreign one is dropped.
+ */
+export interface UnacknowledgedCriticalRow {
+  id: string;
+  title: string;
+  createdAt: string;
+  clinicName: string | null;
+  workflow?: string | null;
+  kind?: ReceptionistTaskKind | string | null;
+}
+
 export interface TaskSummary {
+  /** Receptionist-scoped: counted over the receptionist_safety workflow only. */
   openByKind: Partial<Record<ReceptionistTaskKind, number>>;
+  /** Receptionist-scoped total. Absent on a pre-D server; derived from openByKind then. */
+  openNeedsAction?: number;
+  /** TENANT-WIDE (D8): every open task, not only receptionist work. Never mixed with the lane counts. */
   overdue: number;
-  unacknowledgedCritical: Array<{ id: string; title: string; createdAt: string; clinicName: string | null }>;
+  /** The first few unacknowledged criticals — a PREVIEW, capped server-side. */
+  unacknowledgedCritical: UnacknowledgedCriticalRow[];
+  /**
+   * D7: the real `count()`, uncapped. The preview's length is only a floor —
+   * nine emergencies used to read as five because the page derived the count
+   * from `.length`. Optional until D lands; `criticalSignal` says so out loud
+   * rather than printing a number nobody verified.
+   */
+  unacknowledgedCriticalCount?: number;
+  /** TENANT-WIDE (D8). */
   mine: number;
+  /** TENANT-WIDE (D8). */
   dueWithin30m: number;
   generatedAt: string;
 }
@@ -232,6 +288,7 @@ export interface CallStaffTaskRef {
 
 /** Detail = today's CallLog plus the C4 additions. `handoffReferences` stays as a one-cycle alias of `staffTasks`. */
 export interface CallLogDetail extends CallLog {
+  recordingConsentStatus?: RecordingConsentStatus | null;
   patient?: { id: string; firstName: string; lastName: string } | null;
   staffTasks?: CallStaffTaskRef[];
   appointments?: Array<{ id: string; service: string; startsAt: string; status: string; noteEntries?: AppointmentNote[] }>;
@@ -270,8 +327,14 @@ export interface AppointmentRequestRow {
   createdAt: string;
 }
 
+/**
+ * The detail route is gated on `receptionist:call-artifacts:read` and audited,
+ * so it — and only it — carries the caller's unmasked number. Reading it is the
+ * same deliberate, logged act as revealing a callback number on a task card.
+ */
 export interface AppointmentRequestDetail extends AppointmentRequestRow {
   rawCollectedFields: Record<string, unknown> | null;
+  collectedPhone?: string | null;
 }
 
 export interface AppointmentRequestQuery {
@@ -284,12 +347,22 @@ export interface AppointmentRequestQuery {
   limit?: number;
 }
 
+/**
+ * E1. The route's schema is `.strict()` and takes `patientId` (a uuid) OR a
+ * sibling `createPatient` object — exactly one of the two. The old shape here
+ * (`patientId: { create: … }`) could never parse, so every booking for a caller
+ * with no patient record 400'd with a raw Zod string. `branchId` is NOT a field
+ * of `createPatient`: the server takes the branch from the chosen provider, and
+ * sending it is a 400 under `.strict()`.
+ */
 export interface BookRequestBody {
-  patientId: string | { create: { firstName: string; lastName: string; phone?: string; email?: string; branchId: string } };
+  patientId?: string;
+  createPatient?: { firstName: string; lastName: string; phone?: string; email?: string };
   providerProfileId: string;
   startsAt: string;
   serviceCatalogItemId?: string;
   service: string;
+  channel?: 'WHATSAPP' | 'SMS' | 'EMAIL' | 'PUSH' | 'CALL' | 'VIDEO';
   acknowledgeRequestDifferences: true;
   outcomeReason?: string;
 }
@@ -307,7 +380,7 @@ export type OverviewPeriod = 'today' | '7d' | '30d' | 'custom';
 export interface OverviewKpis {
   period: { from: string; to: string; timezone: string };
   counts: {
-    inbound: number; outbound: number; booked: number; escalated: number; optedOut: number;
+    inbound: number; outbound: number; answeredInbound: number; booked: number; escalated: number; optedOut: number;
     pendingRequests: number; openHandoffs: number; activeCampaigns: number; clinics: number;
   };
   /** null = undefined (no denominator), never a fake 0. */
@@ -329,6 +402,17 @@ export interface BookableProvider {
 }
 
 export interface ProviderSlot { startsAt: string; endsAt: string }
+
+/** `GET /v1/services` (ServiceCatalogItem). The voice columns are absent on a pre-C2 server. */
+export interface ServiceCatalogRow {
+  id: string;
+  name: string;
+  category: string;
+  active: boolean;
+  defaultDurationMinutes: number;
+  bookableByVoice?: boolean;
+  voiceDurationMinutes?: number | null;
+}
 
 export interface PatientMatch { id: string; firstName: string; lastName: string; branchId: string; phone?: string | null }
 
@@ -412,6 +496,7 @@ export const frontDeskApi = {
     apiRequest<{ providerId: string; date: string; slots: ProviderSlot[] }>(`/v1/scheduling/providers/${providerId}/slots${qs({ date, service })}`),
   searchPatients: async (search: string) =>
     pageOf(await apiRequest<PatientMatch[] | Page<PatientMatch>>(`/v1/patients${qs({ search, limit: 10 })}`)).data,
+  listServices: () => apiRequest<ServiceCatalogRow[]>('/v1/services'),
 };
 
 /** Client-side mask for a phone that reached the client unmasked (pre-C4 metadata). Never renders more than the last four digits. */
@@ -428,6 +513,50 @@ function asString(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value : null;
 }
 
+/** The server's remediation copy, wherever the task carries it. Null when it carries none. */
+export function remediationFromMetadata(metadata: Record<string, unknown> | null | undefined): TaskRemediation | null {
+  if (!metadata) return null;
+  const code = asString(metadata.code);
+  const title = asString(metadata.title);
+  const action = asString(metadata.action);
+  const fixHref = asString(metadata.fixHref);
+  if (!code && !title && !action && !fixHref) return null;
+  return { code, title, action, fixHref };
+}
+
+/**
+ * A deployment-attention task has no caller: no message, no callback number,
+ * no transfer. Everything worth reading is the remediation sentence, so the
+ * caller-shaped fields are null rather than invented.
+ */
+function deploymentAttentionView(metadata: Record<string, unknown>): ReceptionistTaskView {
+  return {
+    kind: 'deployment_attention',
+    callerName: null,
+    callbackPhoneMasked: null,
+    verifiedPhoneMasked: null,
+    requestedPhoneMasked: null,
+    hasRequestedPhone: false,
+    messages: [],
+    messageCount: 0,
+    reasonCategory: null,
+    callbackWindow: null,
+    transferStatus: 'not_attempted',
+    transferUpdatedAt: null,
+    toolName: null,
+    denialReason: null,
+    appointmentRequestId: null,
+    appointmentId: null,
+    staffNotes: [],
+    source: asString(metadata.source) ?? 'system',
+    // The AI is off the air until a person acts, so it is always an
+    // acknowledgement-first task regardless of the priority it was filed with.
+    requiresAcknowledgement: true,
+    remediation: remediationFromMetadata(metadata),
+    clinicId: asString(metadata.clinicId),
+  };
+}
+
 /**
  * The receptionist view for a row that carries only the legacy metadata
  * (pre-C4 backend, or a serializer that omitted `receptionist`). Phones in
@@ -435,7 +564,17 @@ function asString(value: unknown): string | null {
  * whole from a list row.
  */
 export function receptionistViewFromMetadata(metadata: Record<string, unknown> | null | undefined, createdAt: string | undefined): ReceptionistTaskInfo | null {
-  if (!metadata || metadata.workflow !== 'receptionist_safety') return null;
+  if (!metadata) return null;
+  const workflow = asString(metadata.workflow);
+  // The pre-D re-verify worker files deployment attention under its own
+  // workflow with no `kind` at all. Read it as the `deployment_attention` kind
+  // so one lane renders both shapes; once D files it through `createSafetyTask`
+  // the row arrives on the safety workflow already carrying the kind.
+  if (workflow === RECEPTIONIST_DEPLOYMENT_WORKFLOW) {
+    return deploymentAttentionView(metadata);
+  }
+  if (workflow !== RECEPTIONIST_SAFETY_WORKFLOW) return null;
+  if (asString(metadata.kind) === 'deployment_attention') return deploymentAttentionView(metadata);
   const rawKind = asString(metadata.kind);
   const requiresAcknowledgement = metadata.requiresAcknowledgement === true;
   if (metadata.restricted === true) {
@@ -483,6 +622,8 @@ export function receptionistViewFromMetadata(metadata: Record<string, unknown> |
       : [],
     source: asString(metadata.source),
     requiresAcknowledgement,
+    remediation: null,
+    clinicId: asString(metadata.clinicId),
   };
 }
 
@@ -532,10 +673,96 @@ export function needsAcknowledgement(view: ReceptionistTaskInfo | null | undefin
   return view.kind === 'emergency' || view.kind === 'human_handoff';
 }
 
+/** How many rows the server's unacknowledged-critical PREVIEW carries at most. */
+export const CRITICAL_PREVIEW_LIMIT = 5;
+
+export interface CriticalSignal {
+  /** The preview rows, already scoped to genuine receptionist emergencies. */
+  rows: UnacknowledgedCriticalRow[];
+  /** How many unacknowledged emergencies there are. */
+  count: number;
+  /**
+   * False when `count` came from a capped preview rather than a real count()
+   * — the number is then a FLOOR ("5 or more"), and every surface says so
+   * instead of printing 5 as if it were the total.
+   */
+  exact: boolean;
+  /** Rows beyond the preview: `count - rows.length` when that is knowable. */
+  hidden: number;
+}
+
+/**
+ * D7 + D8, read as one fact.
+ *
+ * D7: nine unacknowledged emergencies used to read as five, because the count
+ * was `preview.length` and the preview is `take: 5`. `unacknowledgedCriticalCount`
+ * is the real count; when it is absent the preview length is reported as a
+ * floor, never as the total.
+ *
+ * D8: the preview query is tenant-wide, so a critical insurance or ops task
+ * could be announced to the front desk as a clinical emergency. A row that
+ * declares a workflow that is not the receptionist's is dropped here.
+ */
+export function criticalSignal(summary: TaskSummary | null): CriticalSignal {
+  if (!summary) return { rows: [], count: 0, exact: true, hidden: 0 };
+  const all = summary.unacknowledgedCritical ?? [];
+  const rows = all.filter(row => {
+    // No workflow declared (pre-D server) ⇒ keep it: never hide a task that
+    // might be an emergency. A foreign workflow ⇒ drop it: the emergency banner
+    // is the one alert staff must never learn to ignore.
+    if (row.workflow != null && row.workflow !== RECEPTIONIST_SAFETY_WORKFLOW) return false;
+    return row.kind == null || row.kind !== 'deployment_attention';
+  });
+  const dropped = all.length - rows.length;
+  const reported = summary.unacknowledgedCriticalCount;
+  if (typeof reported === 'number' && Number.isFinite(reported)) {
+    // The server's count is over the same scope as the preview it sent, so any
+    // row this client dropped has to come off the total too.
+    const count = Math.max(rows.length, reported - dropped);
+    return { rows, count, exact: true, hidden: Math.max(0, count - rows.length) };
+  }
+  // No real count: the preview length is all we have. It is exact only while it
+  // sits below the cap.
+  const exact = all.length < CRITICAL_PREVIEW_LIMIT;
+  return { rows, count: rows.length, exact, hidden: 0 };
+}
+
 /** Sidebar / header badge from the summary. Nothing (never a zero) unless the summary loaded. */
-export function summarizeNeedsAction(summary: TaskSummary | null): { count: number; critical: number } {
-  if (!summary) return { count: 0, critical: 0 };
+export function summarizeNeedsAction(summary: TaskSummary | null): { count: number; critical: number; criticalExact: boolean } {
+  if (!summary) return { count: 0, critical: 0, criticalExact: true };
   const byKind = summary.openByKind ?? {};
-  const count = Object.values(byKind).reduce((sum, value) => sum + (value ?? 0), 0);
-  return { count, critical: summary.unacknowledgedCritical?.length ?? 0 };
+  const count = typeof summary.openNeedsAction === 'number'
+    ? summary.openNeedsAction
+    : Object.values(byKind).reduce((sum, value) => sum + (value ?? 0), 0);
+  const critical = criticalSignal(summary);
+  return { count, critical: critical.count, criticalExact: critical.exact };
+}
+
+/** Open tasks of one kind, from the summary — the single source for a lane's tile. */
+export function openCountOf(summary: TaskSummary | null, kinds: readonly ReceptionistTaskKind[]): number | null {
+  if (!summary?.openByKind) return null;
+  return kinds.reduce((sum, kind) => sum + (summary.openByKind[kind] ?? 0), 0);
+}
+
+// --- KPI presentation (kpi-v2, SF-2) ---------------------------------------
+
+/** What a KPI with no denominator reads as. Never "0" and never "0%". */
+export const KPI_UNAVAILABLE = 'Unavailable';
+
+/** A kpi-v2 rate (0..1) as a percentage, or UNAVAILABLE when the denominator was empty. */
+export function formatKpiRate(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return KPI_UNAVAILABLE;
+  return `${Math.round(value * 100)}%`;
+}
+
+/** A kpi-v2 count. Zero is a real answer for a count, so 0 is shown; absence is not. */
+export function formatKpiCount(value: number | null | undefined): string {
+  return typeof value === 'number' && Number.isFinite(value) ? String(value) : KPI_UNAVAILABLE;
+}
+
+/** Average handle time in seconds, or UNAVAILABLE when no call could be averaged. */
+export function formatKpiDuration(seconds: number | null | undefined): string {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) return KPI_UNAVAILABLE;
+  const whole = Math.round(seconds);
+  return `${Math.floor(whole / 60)}m ${String(whole % 60).padStart(2, '0')}s`;
 }

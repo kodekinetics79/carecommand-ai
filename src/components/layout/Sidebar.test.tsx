@@ -73,6 +73,35 @@ describe('Sidebar Front Desk entry', () => {
     expect(badge.className).toContain('badge-amber');
   });
 
+  /**
+   * D7. The preview is capped at five server-side. A badge that prints the
+   * preview's length reads "5" beside nine open emergencies, which is worse
+   * than no badge: it is a number staff will act on.
+   */
+  it('badges the real emergency count, not the length of the capped preview', async () => {
+    apiRequestMock.mockResolvedValue(summary({
+      unacknowledgedCriticalCount: 9,
+      unacknowledgedCritical: [1, 2, 3, 4, 5].map(index => ({
+        id: `c${index}`, title: `Emergency ${index}`, createdAt: '2026-08-29T17:00:00.000Z',
+        clinicName: 'Brightsmile', workflow: 'receptionist_safety', kind: 'emergency',
+      })),
+    }));
+    renderSidebar();
+    const badge = await within(frontDeskLink()).findByText('9');
+    expect(badge.className).toContain('badge-red');
+  });
+
+  it('badges a capped preview as "5+" rather than claiming the total is 5', async () => {
+    apiRequestMock.mockResolvedValue(summary({
+      unacknowledgedCritical: [1, 2, 3, 4, 5].map(index => ({
+        id: `c${index}`, title: `Emergency ${index}`, createdAt: '2026-08-29T17:00:00.000Z', clinicName: 'Brightsmile',
+      })),
+    }));
+    renderSidebar();
+    const badge = await within(frontDeskLink()).findByText('5+');
+    expect(badge.className).toContain('badge-red');
+  });
+
   it('badges an unacknowledged emergency in red, and counts the emergencies', async () => {
     apiRequestMock.mockResolvedValue(summary({
       unacknowledgedCritical: [{ id: 't1', title: 'Emergency', createdAt: '2026-08-29T17:00:00.000Z', clinicName: 'Brightsmile' }],

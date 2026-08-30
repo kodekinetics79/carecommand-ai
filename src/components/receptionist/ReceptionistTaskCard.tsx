@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { CheckCircle2, MessageSquarePlus, Phone, PhoneCall, CalendarPlus, ExternalLink, Siren, UserRound } from 'lucide-react';
+import { CheckCircle2, Copy, MessageSquarePlus, Phone, PhoneCall, CalendarPlus, ExternalLink, Siren, UserRound, Wrench } from 'lucide-react';
 import {
   frontDeskApi, isLiveTask, isRestrictedView, needsAcknowledgement,
   TASK_KIND_LABEL, TASK_OUTCOME_CODES, TASK_OUTCOME_LABEL,
@@ -50,10 +50,13 @@ const transferLabel: Record<ReceptionistTaskView['transferStatus'], string | nul
  * One receptionist task (message, handoff, emergency, …) as the front desk
  * works it. Used on the Front Desk lanes and in the Staff Tasks queue.
  *
- * Phones: the card only ever renders the MASKED numbers the list carries.
- * "Call back" fetches the task detail (the audited reveal for
- * receptionist:call-artifacts:read holders) and offers a `tel:` link whose
- * visible text is still the masked number.
+ * Phones: the list projection only ever carries MASKED numbers, and that is
+ * all the card renders until a person asks for the number. "Call back" fetches
+ * the task detail — the audited reveal for receptionist:call-artifacts:read
+ * holders — and from that point the digits are shown in full with a copy
+ * button (E6). A desk on a physical handset has to be able to READ the number;
+ * withholding it after the disclosure has already been spent protects nothing
+ * and blocks the primary action on the primary card.
  */
 export function ReceptionistTaskCard({ task, timezone, can, variant = 'full', onChanged, onBookIt, onOpenCall, now = new Date() }: ReceptionistTaskCardProps) {
   const view = task.receptionist;
@@ -70,8 +73,9 @@ export function ReceptionistTaskCard({ task, timezone, can, variant = 'full', on
   const [outcomeCode, setOutcomeCode] = useState<TaskOutcomeCode | ''>('');
   const [outcomeNote, setOutcomeNote] = useState('');
   const [earlierOpen, setEarlierOpen] = useState(false);
-  const [dial, setDial] = useState<{ href: string; masked: string } | null>(null);
+  const [dial, setDial] = useState<{ href: string; plain: string } | null>(null);
   const [dialNotice, setDialNotice] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const due = formatRelativeDue(task.dueAt, now);
   const callerName = full?.callerName ?? null;
@@ -81,6 +85,9 @@ export function ReceptionistTaskCard({ task, timezone, can, variant = 'full', on
   const latest = full?.messages.length ? full.messages[full.messages.length - 1] : null;
   const earlier = full && full.messages.length > 1 ? full.messages.slice(0, -1) : [];
   const ackNeeded = needsAcknowledgement(view) && !task.acknowledgedAt && live;
+  // A deployment-attention task has no caller — the subject IS the deployment,
+  // so the title stands in for a name rather than rendering "Unknown caller".
+  const isDeployment = full?.kind === 'deployment_attention';
   const ariaSubject = callerName ?? task.title;
 
   async function acknowledge() {
@@ -95,7 +102,19 @@ export function ReceptionistTaskCard({ task, timezone, can, variant = 'full', on
     const number = detail.contact?.callbackPhone ?? detail.contact?.requestedCallbackPhone ?? detail.contact?.verifiedPhone ?? null;
     if (!number) { setDialNotice('No callback number is on record for this task.'); return; }
     const digits = number.replace(/[^\d+]/g, '');
-    setDial({ href: `tel:${digits}`, masked: full?.callbackPhoneMasked ?? `***-***-${digits.slice(-4)}` });
+    setDial({ href: `tel:${digits}`, plain: digits });
+  }
+
+  async function copyNumber() {
+    if (!dial) return;
+    try {
+      await navigator.clipboard?.writeText(dial.plain);
+      setCopied(true);
+    } catch {
+      // A refused clipboard must not read as a successful copy; the digits are
+      // on screen either way, so say what happened and let the user select them.
+      setDialNotice('The clipboard was not available. The number is shown above — select it to copy.');
+    }
   }
 
   async function addNote() {
@@ -124,9 +143,9 @@ export function ReceptionistTaskCard({ task, timezone, can, variant = 'full', on
         <div className="min-w-0">
           <p className="text-sm font-bold text-t1 truncate flex items-center gap-1.5">
             {isEmergency && <Siren className="h-4 w-4 text-red-v shrink-0" aria-hidden="true" />}
-            {restricted ? task.title : (callerName ?? 'Unknown caller')}
+            {restricted || isDeployment ? task.title : (callerName ?? 'Unknown caller')}
           </p>
-          {!restricted && callerName && <p className="text-[11px] text-t3 truncate">{task.title}</p>}
+          {!restricted && !isDeployment && callerName && <p className="text-[11px] text-t3 truncate">{task.title}</p>}
           <div className="mt-1 flex flex-wrap items-center gap-1.5">
             {kindLabel && <span className={isEmergency ? 'badge badge-red' : 'badge badge-indigo'}>{isUrgentClinical ? 'Urgent (clinical)' : kindLabel}</span>}
             {full?.reasonCategory && !isUrgentClinical && <span className="badge badge-amber">{formatEnumLabel(full.reasonCategory)}</span>}
@@ -138,7 +157,7 @@ export function ReceptionistTaskCard({ task, timezone, can, variant = 'full', on
           </div>
         </div>
         <div className="text-right shrink-0 space-y-1">
-          {!restricted && (
+          {!restricted && !isDeployment && (
             <span className={`inline-flex items-center gap-1 text-[10px] font-semibold ${task.patient ? 'text-emerald-v' : 'text-t3'}`}>
               <UserRound className="h-3 w-3" aria-hidden="true" />
               {task.patient ? `Known patient · ${task.patient.firstName} ${task.patient.lastName}` : 'Not linked to a patient'}
@@ -153,9 +172,27 @@ export function ReceptionistTaskCard({ task, timezone, can, variant = 'full', on
         </div>
       </header>
 
+      {!restricted && full?.remediation && (
+        <div className="space-y-1.5 rounded-xl border border-amber-v/40 bg-[var(--amber-soft)] px-3 py-2.5">
+          <p className="text-xs font-bold text-t1 inline-flex items-center gap-1.5">
+            <Wrench className="h-3.5 w-3.5 text-amber-v" aria-hidden="true" />
+            {full.remediation.title ?? 'This deployment needs attention'}
+          </p>
+          {full.remediation.action && <p className="text-[11px] text-t2">{full.remediation.action}</p>}
+          <div className="flex flex-wrap items-center gap-2">
+            {full.remediation.fixHref && (
+              <a href={full.remediation.fixHref} className="inline-flex items-center gap-1 rounded-lg bg-amber-v px-2.5 py-1 text-[11px] font-semibold text-white hover:opacity-90">
+                Fix this
+              </a>
+            )}
+            {full.remediation.code && <span className="text-[10px] text-t3">Code: {full.remediation.code}</span>}
+          </div>
+        </div>
+      )}
+
       {restricted ? (
         <p className="text-xs text-t3">Details restricted to front-desk roles.</p>
-      ) : full && (
+      ) : full && full.kind !== 'deployment_attention' && (
         <div className="space-y-1.5 text-xs text-t2">
           {latest ? (
             <p className="text-t1">“{latest.text}”{latest.recordedAt && <span className="text-t3"> · {formatClinicTime(latest.recordedAt, tz)}</span>}</p>
@@ -211,12 +248,19 @@ export function ReceptionistTaskCard({ task, timezone, can, variant = 'full', on
               <CheckCircle2 className="h-3 w-3" aria-hidden="true" /> Acknowledge
             </button>
           )}
-          {!restricted && can.readArtifacts && (
+          {!restricted && !isDeployment && can.readArtifacts && (
             dial ? (
-              <a href={dial.href} aria-label={`Dial ${ariaSubject} on ${dial.masked}`}
-                className="inline-flex items-center gap-1 rounded-lg bg-emerald-v px-2.5 py-1 text-[11px] font-semibold text-white hover:opacity-90">
-                <PhoneCall className="h-3 w-3" aria-hidden="true" /> Dial {dial.masked}
-              </a>
+              <span className="inline-flex items-center gap-1.5">
+                <a href={dial.href} aria-label={`Dial ${ariaSubject} on ${dial.plain}`}
+                  className="inline-flex items-center gap-1 rounded-lg bg-emerald-v px-2.5 py-1 text-[11px] font-semibold text-white hover:opacity-90">
+                  <PhoneCall className="h-3 w-3" aria-hidden="true" /> Dial <span className="font-mono">{dial.plain}</span>
+                </a>
+                <button type="button" onClick={() => void copyNumber()} aria-label={`Copy ${ariaSubject}'s number`}
+                  className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2 py-1 text-[11px] font-semibold text-t2 hover:bg-[var(--s3)]">
+                  <Copy className="h-3 w-3" aria-hidden="true" /> {copied ? 'Copied' : 'Copy'}
+                </button>
+                <span className="text-[10px] text-t3">revealed and logged</span>
+              </span>
             ) : (
               <button type="button" disabled={busy} onClick={() => void revealAndDial()} aria-label={`Call back ${ariaSubject}`}
                 className="inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-t2 hover:bg-[var(--s3)] disabled:opacity-50">

@@ -1,5 +1,6 @@
 import { useCallback, useSyncExternalStore } from 'react';
 import { frontDeskApi, type TaskSummary } from '../lib/frontDesk';
+import { authEventName } from '../lib/session';
 import { describeFailure, type ResourceFailure } from '../lib/resourceState';
 
 // ===========================================================================
@@ -26,32 +27,67 @@ export interface FrontDeskPollSnapshot {
 
 type Listener = (snapshot: FrontDeskPollSnapshot) => void;
 
-let snapshot: FrontDeskPollSnapshot = { data: null, state: 'loading', error: null };
+const EMPTY_SNAPSHOT: FrontDeskPollSnapshot = { data: null, state: 'loading', error: null };
+
+let snapshot: FrontDeskPollSnapshot = EMPTY_SNAPSHOT;
 const listeners = new Set<Listener>();
 let timer: ReturnType<typeof setInterval> | null = null;
 let inFlight: Promise<void> | null = null;
 let visibilityBound = false;
+let authBound = false;
+/**
+ * Bumped by every reset. A response that started before the reset carries the
+ * previous session's (or previous tenant's) counts, so it is dropped on arrival
+ * instead of being published as live.
+ */
+let generation = 0;
+/** Set when a mutation lands while a poll is already in flight — see fetchSummary. */
+let refetchQueued = false;
 
 function publish(next: FrontDeskPollSnapshot) {
   snapshot = next;
   listeners.forEach(listener => listener(snapshot));
 }
 
-async function fetchSummary(): Promise<void> {
-  if (inFlight) return inFlight;
+/**
+ * One request at a time. A caller that arrives while a request is in flight
+ * normally joins it — but a caller that has just CHANGED something must not:
+ * the in-flight response was issued before the mutation and would repaint the
+ * acknowledged emergency as still open for another 20 s. Those callers queue a
+ * follow-up fetch instead (`fresh`).
+ */
+async function fetchSummary(options: { fresh?: boolean } = {}): Promise<void> {
+  if (inFlight) {
+    if (options.fresh) refetchQueued = true;
+    return inFlight;
+  }
+  const startedAt = generation;
   inFlight = (async () => {
     try {
       const data = await frontDeskApi.taskSummary();
-      publish({ data, state: 'ready', error: null });
+      if (startedAt === generation) publish({ data, state: 'ready', error: null });
     } catch (error) {
       // Keep the last good data so the page can still render it as stale, but
       // the state is 'error' so no badge is shown from it (never a fake zero).
-      publish({ data: snapshot.data, state: 'error', error: describeFailure(error) });
+      if (startedAt === generation) publish({ data: snapshot.data, state: 'error', error: describeFailure(error) });
     } finally {
       inFlight = null;
     }
   })();
-  return inFlight;
+  await inFlight;
+  if (refetchQueued) {
+    refetchQueued = false;
+    if (listeners.size > 0) await fetchSummary();
+  }
+}
+
+/**
+ * The session changed (sign-in, sign-out, token cleared). Counts belong to the
+ * session that fetched them: showing the previous tenant's numbers as live
+ * after a switch is the same class of lie as showing a stale zero.
+ */
+function onAuthChange() {
+  resetFrontDeskPoll();
 }
 
 function onVisibilityChange() {
@@ -80,6 +116,10 @@ function subscribe(listener: Listener): () => void {
       document.addEventListener('visibilitychange', onVisibilityChange);
       visibilityBound = true;
     }
+    if (typeof window !== 'undefined' && !authBound) {
+      window.addEventListener(authEventName, onAuthChange);
+      authBound = true;
+    }
     void fetchSummary();
     if (typeof document === 'undefined' || !document.hidden) startTimer();
   }
@@ -91,24 +131,55 @@ function subscribe(listener: Listener): () => void {
         document.removeEventListener('visibilitychange', onVisibilityChange);
         visibilityBound = false;
       }
+      if (typeof window !== 'undefined' && authBound) {
+        window.removeEventListener(authEventName, onAuthChange);
+        authBound = false;
+      }
     }
   };
 }
 
 /** Call after any task mutation (acknowledge, status, note, book) so every subscriber refreshes at once. */
 export function notifyFrontDeskMutated(): void {
-  if (listeners.size > 0) void fetchSummary();
+  if (listeners.size > 0) void fetchSummary({ fresh: true });
 }
 
-/** Test seam: forget the shared snapshot between tests. Not for product code. */
+/**
+ * Discard the shared snapshot and, if anything is still subscribed, fetch a new
+ * one. Called on every auth change; also the test seam.
+ *
+ * The snapshot is module state, so without this a sign-out leaves the previous
+ * session's counts in memory and the sidebar renders them as live for the first
+ * paint of the next session.
+ */
+export function resetFrontDeskPoll(): void {
+  generation += 1;
+  inFlight = null;
+  refetchQueued = false;
+  publish(EMPTY_SNAPSHOT);
+  if (listeners.size > 0) {
+    void fetchSummary();
+    if (typeof document === 'undefined' || !document.hidden) startTimer();
+  } else {
+    stopTimer();
+  }
+}
+
+/** Test seam: forget the shared snapshot AND every subscriber between tests. Not for product code. */
 export function resetFrontDeskPollForTests(): void {
   stopTimer();
   listeners.clear();
+  generation += 1;
   inFlight = null;
-  snapshot = { data: null, state: 'loading', error: null };
+  refetchQueued = false;
+  snapshot = EMPTY_SNAPSHOT;
   if (typeof document !== 'undefined' && visibilityBound) {
     document.removeEventListener('visibilitychange', onVisibilityChange);
     visibilityBound = false;
+  }
+  if (typeof window !== 'undefined' && authBound) {
+    window.removeEventListener(authEventName, onAuthChange);
+    authBound = false;
   }
 }
 
@@ -116,7 +187,7 @@ function getSnapshot(): FrontDeskPollSnapshot {
   return snapshot;
 }
 
-const DISABLED_SNAPSHOT: FrontDeskPollSnapshot = { data: null, state: 'loading', error: null };
+const DISABLED_SNAPSHOT: FrontDeskPollSnapshot = EMPTY_SNAPSHOT;
 function subscribeDisabled(): () => void { return () => {}; }
 function getDisabledSnapshot(): FrontDeskPollSnapshot { return DISABLED_SNAPSHOT; }
 
