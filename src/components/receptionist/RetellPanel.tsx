@@ -13,7 +13,7 @@ import { DeployPanel } from './DeployPanel';
 // status; everything below it is the unchanged export + BYO fallback, which
 // stays because an operator must always be able to finish in the console.
 
-export function RetellPanel({ campaignId }: { campaignId: string }) {
+export function RetellPanel({ campaignId, onConfigure }: { campaignId: string; onConfigure?: () => void }) {
   const loadConfig = useCallback(() => api.getRetellConfig(campaignId), [campaignId]);
   const { state, reload } = useResource<RetellConfig>(loadConfig);
   const config = receivedData(state);
@@ -25,8 +25,13 @@ export function RetellPanel({ campaignId }: { campaignId: string }) {
       <DeployPanel campaignId={campaignId} config={config} />
 
       {state.status === 'error' && (
-        <div className="cc-card p-6">
+        <div className="cc-card p-6 space-y-2">
           <LoadFailureNotice what="The RetellAI export configuration" message={state.failure.message} onRetry={reload} />
+          {onConfigure && (
+            // A 409 here is a configuration step, not a dead end: send the
+            // operator to the settings that produce a valid export.
+            <button type="button" onClick={onConfigure} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)]">Open campaign settings</button>
+          )}
         </div>
       )}
       {!config && state.status !== 'error' && (
