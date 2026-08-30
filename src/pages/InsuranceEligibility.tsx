@@ -201,7 +201,7 @@ export default function InsuranceEligibility() {
 
       <div className="grid gap-3 xl:grid-cols-[1fr_1fr] items-start">
         {/* Check form */}
-        <BentoCard title="Request Eligibility Response" subtitle="A point-in-time payer response — not a guarantee of coverage or payment" headerRight={<BadgeCheck className="w-4 h-4 text-t3" />}>
+        <BentoCard title="Request Eligibility Response" subtitle="Eligibility is a point-in-time response, not a coverage or payment guarantee" headerRight={<BadgeCheck className="w-4 h-4 text-t3" />}>
           {!canCheck && !loading && (
             <div className="rounded-lg border border-[var(--b1)] bg-[var(--amber-soft)] p-3 text-[12px] text-[#9A3412] mb-3">
               {capability?.detail ?? 'We could not read whether eligibility checks are available, so nothing has been run.'}
