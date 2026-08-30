@@ -5,6 +5,9 @@ import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { env } from '../../config/env';
 import { retellConfigStatus, createPhoneCall, getPhoneCall, stopPhoneCall } from '../../lib/retell';
+import { buildHoursDynamicVariables, hoursStatus } from '../../lib/receptionist/clinicHours';
+import { loadHoursSource } from '../../lib/receptionist/hoursSource';
+import { resolveLocalePackWithFallback, resolvedLocaleFormat } from '../../lib/receptionist/localePacks/resolve';
 import { isDestinationOptedOut, isSuppressed, isValidE164, toE164 } from '../../lib/campaigns';
 import { requireRoles } from '../../plugins/roles';
 import {
@@ -720,64 +723,9 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
   });
 
   // ----- Retell setup status (no secrets exposed) -------------------------
-  app.get('/retell-status', async request => {
-    const status = retellConfigStatus();
-    const linkedAgents = await db.receptionistAgent.findMany({
-      where: { tenantId: request.auth.tenantId, active: true },
-      select: {
-        active: true, providerAgentId: true, providerVersion: true, providerStatus: true,
-        providerConfigRevision: true, providerVerifiedRevision: true, providerVerifiedAt: true,
-        providerVerificationExpiresAt: true,
-      },
-    });
-    const readyAgents = linkedAgents.filter(agent => !agentReadinessReason(agent)).length;
-    const liveTest = liveCallUatStatus(new Date(), request.auth.tenantId);
-    const liveScope = liveCallUatScope();
-    const liveAttempts = liveScope
-      ? await db.idempotencyKey.findMany({
-        where: { tenantId: request.auth.tenantId, scope: liveScope },
-        select: { resultId: true },
-        take: Math.max(20, liveTest.maxCalls + 1),
-      })
-      : [];
-    const liveCallIds = liveAttempts
-      .map(attempt => attempt.resultId)
-      .filter((value): value is string => Boolean(value && !value.startsWith('blocked:') && value !== 'dispatching'));
-    const liveCalls = liveCallIds.length
-      ? await db.receptionistCallLog.findMany({
-        where: { tenantId: request.auth.tenantId, id: { in: liveCallIds } },
-        select: { durationSeconds: true, endedAt: true, outcome: true },
-      })
-      : [];
-    const connectedSeconds = liveCalls.reduce((sum, call) => sum + call.durationSeconds, 0);
-    const liveAdmission = evaluateLiveCallAdmission({
-      attemptsUsed: liveAttempts.length,
-      connectedSeconds,
-      activeCalls: liveCalls.filter(call => !call.endedAt && call.outcome === 'IN_PROGRESS').length,
-    }, new Date(), request.auth.tenantId);
-    return {
-      configured: status.configured && readyAgents > 0,
-      mock: status.mock,
-      missing: [...status.missing, ...(readyAgents ? [] : ['AGENT_DEPLOYMENT'])],
-      readyAgents,
-      adhocTestCallsAllowed: status.mock && env.NODE_ENV !== 'production',
-      liveTest: {
-        ...liveTest,
-        attemptsUsed: liveAttempts.length,
-        callsRemaining: Math.max(0, liveTest.maxCalls - liveAttempts.length),
-        minutesUsed: Math.ceil(connectedSeconds / 60),
-        minutesRemaining: Math.max(0, liveTest.maxTotalMinutes - Math.ceil(connectedSeconds / 60)),
-        activeCalls: liveCalls.filter(call => !call.endedAt && call.outcome === 'IN_PROGRESS').length,
-        admissionReason: liveAdmission.allowed ? null : liveAdmission.reason,
-      },
-      checklist: [
-        { key: 'RETELL_API_KEY', label: 'Retell API key', set: !status.missing.includes('RETELL_API_KEY') },
-        { key: 'RETELL_FROM_NUMBER', label: 'Outbound caller number', set: !status.missing.includes('RETELL_FROM_NUMBER') },
-        { key: 'AGENT_DEPLOYMENT', label: 'Published agent deployment', set: readyAgents > 0 },
-        { key: 'LIVE_TEST_CALLS_AUTHORIZED', label: 'Attended live-test authorization', set: liveTest.active },
-      ],
-    };
-  });
+  // GET /retell-status moved to modules/receptionist/deployment.ts in C5: the
+  // tenant-wide checklist could not answer "can THIS campaign take a call?",
+  // and it belongs with deployment rather than with outbound dialling.
 
   // ----- Outbound campaigns ----------------------------------------------
   // The Studio form binds every optional field to a text input, so "unset"
@@ -1407,7 +1355,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     const campaign = await db.receptionistOutboundCampaign.findFirst({
       where: { id, tenantId: request.auth.tenantId },
       include: {
-        clinic: { select: { name: true, complianceDisclosure: true, timezone: true } },
+        clinic: { select: { id: true, name: true, complianceDisclosure: true, timezone: true, country: true, defaultLanguage: true } },
         agent: true,
         receptionistCampaign: { select: { id: true, offerScript: true, appointmentType: true } },
       },
@@ -2015,17 +1963,38 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         trackingDegraded,
       });
     }
+    // A campaign with no linked agent has no name to introduce itself with.
+    // Substituting one would put a fabricated identity on a real call, so the
+    // dial is refused instead (readiness already blocks this earlier).
+    if (!campaign.agent?.name) {
+      await releaseReservedAttempt('AGENT_REQUIRED');
+      await audit(request, { action: 'receptionist.call.blocked', resource: 'receptionistOutboundCampaign', resourceId: campaign.id, metadata: { reason: 'agent_required' } });
+      return reply.code(409).send({ status: 'blocked', reason: 'agent_required', callLogId: callLog.id });
+    }
+
+    // Call-time truth for the hours and emergency variables: what the agent
+    // says about "are you open" must be resolved now, not at export time.
+    const dialBundle = await loadHoursSource(db, { tenantId: request.auth.tenantId, clinicId: campaign.clinic.id });
+    const dialPack = await resolveLocalePackWithFallback(db, {
+      tenantId: request.auth.tenantId,
+      language: campaign.agent.language ?? campaign.clinic.defaultLanguage,
+      country: campaign.clinic.country,
+    });
+    const dialLocale = resolvedLocaleFormat(dialPack, campaign.clinic.defaultLanguage);
+    const dialStatus = dialBundle ? hoursStatus(dialBundle.source, new Date(), dialLocale) : null;
+
     const result = await createPhoneCall({
       toNumber: canonicalDialDestination,
       agentId: authorizedCampaign.agent!.providerAgentId!,
       agentVersion: authorizedCampaign.agent!.providerVersion!,
       webhookUrl: `${env.PUBLIC_API_URL}/v1/receptionist/webhooks/retell?clinicId=${campaign.clinicId}&campaignId=${campaign.receptionistCampaignId ?? ''}`,
       dynamicVariables: {
+        ...buildHoursDynamicVariables({ status: dialStatus, strings: dialPack?.strings ?? null }),
         clinic_name: campaign.clinic.name,
-        agent_name: campaign.agent?.name ?? 'Riley',
+        agent_name: campaign.agent.name,
         disclosure: liveTest
           ? liveCallUatDisclosure(campaign.clinic.complianceDisclosure)
-          : campaign.clinic.complianceDisclosure,
+          : campaign.clinic.complianceDisclosure ?? '',
         live_test_disclosure: liveTest ? liveCallUatDisclosure(null) : '',
         consent_text: campaign.consentText ?? '',
         human_handoff: campaign.humanHandoffInstruction ?? '',

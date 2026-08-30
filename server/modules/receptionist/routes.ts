@@ -3,9 +3,15 @@ import { requireFeature } from '../../lib/entitlements';
 import { outboundRoutes } from './outbound';
 import { clinicRoutes } from './clinics';
 import { agentRoutes } from './agents';
-import { campaignRoutes, campaignExportRoutes } from './campaigns';
+import { campaignRoutes, campaignExportRoutes, campaignLifecycleRoutes } from './campaigns';
+import { deploymentRoutes } from './deployment';
 import { intakeRoutes } from './intake';
 import { activityRoutes } from './activity';
+import { closureRoutes } from './closures';
+import { knowledgeRoutes } from './knowledge';
+import { localePackRoutes } from './localePacks';
+import { catalogRoutes } from './catalog';
+import { hoursStatusRoutes } from './hoursStatus';
 
 export { receptionistWebhookRoutes, verifyRetellSignature } from './webhooks';
 
@@ -17,17 +23,36 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
   // ===== Clinics + locations ==============================================
   await app.register(clinicRoutes);
 
+  // ===== Planned closures =================================================
+  await app.register(closureRoutes);
+
+  // ===== Clinic knowledge (draft + approved snapshot) =====================
+  await app.register(knowledgeRoutes);
+
+  // ===== Locale packs (caller-facing wording) =============================
+  await app.register(localePackRoutes);
+
+  // ===== Server-served option catalog =====================================
+  await app.register(catalogRoutes);
+
+  // ===== Live open/closed state ===========================================
+  await app.register(hoursStatusRoutes);
+
   // ===== Agents ===========================================================
   await app.register(agentRoutes);
 
   // ===== Campaigns ========================================================
   await app.register(campaignRoutes);
+  await app.register(campaignLifecycleRoutes);
 
   // ===== Intake fields ====================================================
   await app.register(intakeRoutes);
 
   // ===== Prompt generation + RetellAI export ==============================
   await app.register(campaignExportRoutes);
+
+  // ===== Deployment, provider status, voice catalogue =====================
+  await app.register(deploymentRoutes);
 
   // ===== Appointment requests, reconciliations, call logs, opt-outs, overview
   await app.register(activityRoutes);

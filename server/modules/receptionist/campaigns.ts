@@ -3,12 +3,100 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { env } from '../../config/env';
-import { generateSystemPrompt, generateSamples, buildRetellConfig, type PromptConfig, type PromptIntakeField, type PromptBookingRules } from './promptService';
+import { generateSystemPrompt, generateSamples, buildRetellConfig, promptHash } from './promptService';
+import { hoursHash } from '../../lib/receptionist/clinicHours';
+import { loadHoursSource } from '../../lib/receptionist/hoursSource';
+import { knowledgeHash, parseKnowledgeDocument } from '../../lib/receptionist/knowledge';
+import { assemblePromptConfig, type PromptConfigResult } from '../../lib/receptionist/promptAssembly';
+import { clinicActivationState, isClinicActivationBlocker } from '../../lib/receptionist/activationReadiness';
 import { runWithTenantContext } from '../../lib/tenantContext';
 import { agentReadinessReason } from '../../lib/receptionist/agentReadiness';
 import { Prisma } from '../../generated/prisma/client';
 import { bookAppointmentToolFingerprint, fingerprintJson } from './intakeContract';
-import { uuid, idParam, writeRoles, intakeConfigurationError, compileCampaignIntakeContract, isReceptionistDestinationConflict, lockReceptionistConfiguration, auditReceptionistMutation, FIELD_TYPES } from './shared';
+import { uuid, idParam, writeRoles, receptionistRead, callArtifactRead, intakeConfigurationError, compileCampaignIntakeContract, isReceptionistDestinationConflict, lockReceptionistConfiguration, auditReceptionistMutation, FIELD_TYPES } from './shared';
+import { evaluateCampaignReadiness, failingChecks, type ReadinessResponse } from '../../lib/receptionist/campaignReadiness';
+import { confirmationChannelStatus } from '../../lib/receptionist/confirmationOutbox';
+import { remediationFor } from '../../lib/receptionist/remediation';
+import { generateSampleTranscripts, mandatoryOpeningDisclosure } from './promptService';
+import { findPlaceholders } from '../../lib/receptionist/placeholders';
+
+// The legacy 409 body is load-bearing: existing clients and suites read
+// `message` as `Campaign configuration is not deployable: <code>.`. Readiness
+// adds `reasons` alongside it rather than replacing it.
+export class CampaignTransitionError extends Error {
+  constructor(readonly code: string, readonly reasons: unknown[] = []) {
+    super(`Campaign configuration is not deployable: ${code}.`);
+  }
+}
+
+type CampaignStatus = 'DRAFT' | 'ACTIVE' | 'PAUSED' | 'ARCHIVED';
+
+// Self-transitions are deliberately absent: pausing an already-paused campaign
+// is a mistake worth reporting, not a silent success. PATCH only calls this
+// when the status actually changes, so an unchanged status is still a no-op.
+const ALLOWED_TRANSITIONS: Record<CampaignStatus, CampaignStatus[]> = {
+  DRAFT: ['ACTIVE', 'ARCHIVED'],
+  PAUSED: ['ACTIVE', 'ARCHIVED', 'DRAFT'],
+  ACTIVE: ['PAUSED'],
+  ARCHIVED: [],
+};
+
+/**
+ * The one state machine for a campaign's status, and the one activation gate.
+ * PATCH /campaigns/:id delegates here, so a status set through the generic
+ * update cannot bypass readiness — there is no second door.
+ */
+export async function transitionCampaign(
+  tx: Prisma.TransactionClient,
+  input: { tenantId: string; campaignId: string; to: CampaignStatus; now?: Date },
+): Promise<{ campaign: Prisma.ReceptionistCampaignGetPayload<Record<string, never>>; readiness: ReadinessResponse | null }> {
+  const existing = await tx.receptionistCampaign.findFirst({ where: { id: input.campaignId, tenantId: input.tenantId } });
+  if (!existing) throw new Error('campaign_not_found');
+  const from = existing.status as CampaignStatus;
+  if (!ALLOWED_TRANSITIONS[from].includes(input.to)) {
+    if (input.to === 'PAUSED') throw new CampaignTransitionError('campaign_not_active');
+    if (input.to === 'ARCHIVED' && from === 'ACTIVE') throw new CampaignTransitionError('campaign_active_pause_first');
+    throw new CampaignTransitionError('campaign_transition_not_allowed');
+  }
+
+  if (input.to === 'ARCHIVED') {
+    const outbound = await tx.receptionistOutboundCampaign.findMany({
+      where: { tenantId: input.tenantId, receptionistCampaignId: input.campaignId, status: { in: ['SCHEDULED', 'RUNNING'] } },
+      select: { id: true, name: true },
+    });
+    if (outbound.length) throw new CampaignTransitionError('campaign_referenced_by_outbound', outbound);
+  }
+
+  let readiness: ReadinessResponse | null = null;
+  let data: Prisma.ReceptionistCampaignUpdateInput = { status: input.to };
+  if (input.to === 'ACTIVE') {
+    readiness = await evaluateCampaignReadiness(tx, { tenantId: input.tenantId, campaignId: input.campaignId, now: input.now });
+    if (!readiness) throw new Error('campaign_not_found');
+    // `intake_attested` is deliberately excluded from the gate decision here.
+    // The attestation below IS that check, and it distinguishes unattested
+    // from mismatched from not-strict; readiness can only say "not attested".
+    // Checking the same thing twice, less precisely, would replace a specific
+    // error the operator can act on with a vague one.
+    const blocking = failingChecks(readiness).filter(item => item.key !== 'intake_attested');
+    if (blocking.length) throw new CampaignTransitionError('campaign_not_ready', blocking);
+    // Readiness passing does not replace the attestation write: activation
+    // still binds this campaign to the exact provider deployment evidence.
+    const campaign = await tx.receptionistCampaign.findFirstOrThrow({ where: { id: input.campaignId, tenantId: input.tenantId }, include: { agent: true } });
+    // C2's clinic-side gate: hours/knowledge/transfer target must be usable and
+    // a locale pack must exist for the agent's language. Activation records the
+    // pack it was attested against, so a later pack edit is detectable.
+    const localePack = await assertClinicActivationReadiness(tx, { tenantId: input.tenantId, clinicId: campaign.clinicId, agent: campaign.agent });
+    const attestation = await attestCampaignIntakeContract(tx, campaign, campaign.agent);
+    data = {
+      ...attestation,
+      status: 'ACTIVE',
+      attestedLocalePackId: localePack?.id ?? null,
+      attestedLocalePackHash: localePack?.evidenceHash ?? null,
+    };
+  }
+  const campaign = await tx.receptionistCampaign.update({ where: { id: input.campaignId }, data });
+  return { campaign, readiness };
+}
 
 async function assertCampaignAgent(
   tx: Prisma.TransactionClient,
@@ -46,9 +134,26 @@ async function assertCampaignLocations(
 function campaignAssignmentError(error: unknown) {
   const code = error instanceof Error ? error.message : '';
   if (code.includes('active_intake_contract_immutable')) return 'active_intake_contract_immutable';
+  // Clinic-level activation blockers (C2). C5's evaluateCampaignReadiness will
+  // replace this call site with readiness rows; until then a blocked clinic
+  // must not be able to reach a live provider deployment.
+  if (isClinicActivationBlocker(code)) return code;
   return ['agent_unlinked', 'agent_scope_mismatch', 'agent_inactive', 'agent_unverified', 'agent_configuration_changed', 'agent_verification_stale', 'location_scope_mismatch', 'intake_schema_unattested', 'intake_schema_mismatch', 'intake_schema_not_strict', 'active_intake_contract_immutable', 'active_provider_deployment_conflict'].includes(code)
     ? code
     : null;
+}
+
+/**
+ * Clinic configuration that must hold before a campaign may go ACTIVE, and the
+ * locale pack the activation binds itself to.
+ */
+async function assertClinicActivationReadiness(
+  tx: Prisma.TransactionClient,
+  input: { tenantId: string; clinicId: string; agent: { language: string } | null },
+) {
+  const state = await clinicActivationState(tx, input);
+  if (state.blockers.length) throw new Error(state.blockers[0]);
+  return state.localePack;
 }
 
 async function attestCampaignIntakeContract(
@@ -134,9 +239,9 @@ type CampaignWithRelations = {
   agentId: string | null;
   clinic: {
     id: string; name: string; phone: string; website: string | null; addressLine: string | null;
-    timezone: string; defaultLanguage: string; complianceDisclosure: string;
-    humanFallbackNumber: string | null; doNotContactPolicy: string; workingHours: unknown;
-    locations: Array<{ id: string; name: string; address: string; phone: string | null }>;
+    country: string | null; timezone: string; defaultLanguage: string; complianceDisclosure: string | null;
+    humanFallbackNumber: string | null; doNotContactPolicy: string | null; workingHours: unknown;
+    locations: Array<{ id: string; name: string; address: string; phone: string | null; accessNotes: string | null }>;
   };
   agent: {
     name: string; voice: string; tone: string; language: string;
@@ -149,42 +254,27 @@ type CampaignWithRelations = {
   }>;
 };
 
-function toPromptConfig(campaign: CampaignWithRelations): PromptConfig {
-  const agent = campaign.agent ?? {
-    name: 'Riley', voice: '11labs-Adrian', tone: 'Warm and professional',
-    language: campaign.clinic.defaultLanguage, persona: null, greetingOverride: null,
-  };
+export type { PromptConfigResult } from '../../lib/receptionist/promptAssembly';
+
+/**
+ * The export routes' entry point into the one shared prompt assembly
+ * (`lib/receptionist/promptAssembly.ts`), which deployment and readiness also
+ * use — so preview, deploy and readiness can never render different prompts.
+ */
+export async function promptConfigForCampaign(campaign: CampaignWithRelations, tenantId: string): Promise<PromptConfigResult> {
+  return assemblePromptConfig(db, campaign, tenantId);
+}
+
+/** Hours + knowledge evidence for the export routes and C5's deployment attestation. */
+async function configurationHashes(tenantId: string, clinicId: string) {
+  const [bundle, knowledgeRow] = await Promise.all([
+    loadHoursSource(db, { tenantId, clinicId }),
+    db.receptionistClinicKnowledge.findFirst({ where: { tenantId, clinicId }, select: { approved: true, approvedHash: true } }),
+  ]);
+  const approved = knowledgeRow?.approved ? parseKnowledgeDocument(knowledgeRow.approved) : null;
   return {
-    clinic: {
-      id: campaign.clinic.id,
-      name: campaign.clinic.name,
-      phone: campaign.clinic.phone,
-      website: campaign.clinic.website,
-      addressLine: campaign.clinic.addressLine,
-      timezone: campaign.clinic.timezone,
-      defaultLanguage: campaign.clinic.defaultLanguage,
-      complianceDisclosure: campaign.clinic.complianceDisclosure,
-      humanFallbackNumber: campaign.clinic.humanFallbackNumber,
-      doNotContactPolicy: campaign.clinic.doNotContactPolicy,
-      workingHours: campaign.clinic.workingHours,
-    },
-    agent,
-    campaign: {
-      id: campaign.id,
-      name: campaign.name,
-      campaignType: campaign.campaignType,
-      offerTitle: campaign.offerTitle,
-      offerDescription: campaign.offerDescription,
-      offerScript: campaign.offerScript,
-      appointmentType: campaign.appointmentType,
-      bookingRules: (campaign.bookingRules as PromptBookingRules | null) ?? null,
-      eligibleLocationIds: campaign.eligibleLocationIds,
-      smsConfirmation: campaign.smsConfirmation,
-      emailConfirmation: campaign.emailConfirmation,
-      intakeSchemaRevision: campaign.intakeSchemaRevision,
-    },
-    locations: campaign.clinic.locations,
-    intakeFields: campaign.intakeFields as PromptIntakeField[],
+    hoursHash: bundle ? hoursHash(bundle.source) : null,
+    knowledgeHash: knowledgeRow?.approvedHash ?? (approved ? knowledgeHash(approved) : null),
   };
 }
 
@@ -199,6 +289,52 @@ async function loadCampaign(tenantId: string, campaignId: string) {
     where: { id: campaignId, tenantId },
     include: campaignInclude,
   });
+}
+
+
+/**
+ * One error mapping for every campaign mutation.
+ *
+ * The legacy 409 message is preserved verbatim — clients and suites read
+ * `Campaign configuration is not deployable: <code>.` — and `code`, `reasons`
+ * and the remediation copy are added beside it, so a screen can render the fix
+ * list rather than a bare identifier. The body is sent directly because the
+ * shared error handler keeps only error/message/requestId.
+ */
+function campaignConflictBody(error: unknown): { status: 400 | 409; body: Record<string, unknown> } | null {
+  const invalid = intakeConfigurationError(error);
+  if (invalid) return { status: 400, body: { error: 'invalid_intake_configuration', message: invalid } };
+  const code = error instanceof CampaignTransitionError ? error.code : campaignAssignmentError(error);
+  if (code) {
+    const message = error instanceof CampaignTransitionError
+      ? error.message
+      : `Campaign configuration is not deployable: ${code}.`;
+    const remediation = remediationFor(code);
+    return {
+      status: 409,
+      body: {
+        error: 'conflict',
+        code,
+        message,
+        reasons: error instanceof CampaignTransitionError ? error.reasons : [],
+        title: remediation.title,
+        action: remediation.action,
+        fixHref: remediation.fixHref,
+      },
+    };
+  }
+  if (isReceptionistDestinationConflict(error)) {
+    return {
+      status: 409,
+      body: {
+        error: 'conflict',
+        code: 'active_provider_deployment_conflict',
+        message: 'This provider deployment already owns an active Studio campaign for the tenant.',
+        reasons: [],
+      },
+    };
+  }
+  return null;
 }
 
 export const campaignRoutes: FastifyPluginAsync = async app => {
@@ -220,7 +356,7 @@ export const campaignRoutes: FastifyPluginAsync = async app => {
   });
   const campaignUpdate = campaignCreate.partial().omit({ clinicId: true });
 
-  app.get('/campaigns', { preHandler: writeRoles }, async request => {
+  app.get('/campaigns', { preHandler: receptionistRead }, async request => {
     const query = z.object({ clinicId: uuid.optional() }).parse(request.query);
     return db.receptionistCampaign.findMany({
       where: { tenantId: request.auth.tenantId, ...(query.clinicId ? { clinicId: query.clinicId } : {}) },
@@ -229,12 +365,12 @@ export const campaignRoutes: FastifyPluginAsync = async app => {
         agent: { select: { id: true, name: true, voice: true } },
         clinic: { select: { id: true, name: true } },
         intakeFields: { orderBy: { sortOrder: 'asc' } },
-        _count: { select: { callLogs: true, appointmentRequests: true } },
+        _count: { select: { callLogs: true } },
       },
     });
   });
 
-  app.get('/campaigns/:id', { preHandler: writeRoles }, async request => {
+  app.get('/campaigns/:id', { preHandler: receptionistRead }, async request => {
     const { id } = idParam.parse(request.params);
     const campaign = await loadCampaign(request.auth.tenantId, id);
     if (!campaign) throw app.httpErrors.notFound('Campaign not found');
@@ -264,8 +400,17 @@ export const campaignRoutes: FastifyPluginAsync = async app => {
           },
         });
         if (status === 'ACTIVE') {
+          const localePack = await assertClinicActivationReadiness(tx, { tenantId: request.auth.tenantId, clinicId: input.clinicId, agent });
           const attestation = await attestCampaignIntakeContract(tx, created, agent);
-          created = await tx.receptionistCampaign.update({ where: { id: created.id }, data: { ...attestation, status: 'ACTIVE' } });
+          created = await tx.receptionistCampaign.update({
+            where: { id: created.id },
+            data: {
+              ...attestation,
+              status: 'ACTIVE',
+              attestedLocalePackId: localePack?.id ?? null,
+              attestedLocalePackHash: localePack?.evidenceHash ?? null,
+            },
+          });
         }
         await auditReceptionistMutation(tx, request, {
           action: 'receptionistCampaign.created', resource: 'receptionistCampaign', resourceId: created.id,
@@ -275,16 +420,13 @@ export const campaignRoutes: FastifyPluginAsync = async app => {
       });
       return reply.code(201).send(row);
     } catch (error) {
-      const invalid = intakeConfigurationError(error);
-      if (invalid) throw app.httpErrors.badRequest(invalid);
-      const reason = campaignAssignmentError(error);
-      if (reason) throw app.httpErrors.conflict(`Campaign configuration is not deployable: ${reason}.`);
-      if (isReceptionistDestinationConflict(error)) throw app.httpErrors.conflict('This provider deployment already owns an active Studio campaign for the tenant.');
+      const mapped = campaignConflictBody(error);
+      if (mapped) return reply.code(mapped.status).send(mapped.body);
       throw error;
     }
   });
 
-  app.patch('/campaigns/:id', { preHandler: writeRoles }, async request => {
+  app.patch('/campaigns/:id', { preHandler: writeRoles }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
     const input = campaignUpdate.parse(request.body);
     try {
@@ -299,23 +441,35 @@ export const campaignRoutes: FastifyPluginAsync = async app => {
           || (input.appointmentType !== undefined && input.appointmentType !== existing.appointmentType)
           || (input.eligibleLocationIds !== undefined && JSON.stringify(input.eligibleLocationIds) !== JSON.stringify(existing.eligibleLocationIds));
         if (existing.status === 'ACTIVE' && nextStatus === 'ACTIVE' && schemaRelevantChange) throw new Error('active_intake_contract_immutable');
-        const agent = await assertCampaignAgent(tx, {
+        await assertCampaignAgent(tx, {
           tenantId: request.auth.tenantId, clinicId: existing.clinicId, agentId: nextAgentId,
           requireReady: nextStatus === 'ACTIVE',
         });
         await assertCampaignLocations(tx, { tenantId: request.auth.tenantId, clinicId: existing.clinicId, locationIds: nextLocations });
+        // A confirmation the platform cannot deliver must not be switchable
+        // on: the agent would promise a text that nothing sends.
+        for (const [enabled, channel] of [[input.smsConfirmation, 'sms'] as const, [input.emailConfirmation, 'email'] as const]) {
+          if (!enabled) continue;
+          const channelStatus = confirmationChannelStatus(channel);
+          if (channelStatus.status === 'unconfigured' || channelStatus.status === 'configured_pending') {
+            throw new CampaignTransitionError('confirmation_channel_unconfigured', [channelStatus]);
+          }
+        }
         const { bookingRules, status, ...rest } = input;
         let row = await tx.receptionistCampaign.update({
           where: { id },
           data: {
             ...rest,
-            ...(status !== undefined && !(status === 'ACTIVE' && existing.status !== 'ACTIVE') ? { status } : {}),
+            ...(status !== undefined && status !== 'ACTIVE' && status !== existing.status ? {} : {}),
             ...(bookingRules !== undefined ? { bookingRules: bookingRules ?? undefined } : {}),
           },
         });
-        if (nextStatus === 'ACTIVE' && existing.status !== 'ACTIVE') {
-          const attestation = await attestCampaignIntakeContract(tx, row, agent);
-          row = await tx.receptionistCampaign.update({ where: { id }, data: { ...attestation, status: 'ACTIVE' } });
+        // Every status change goes through the one state machine, so a status
+        // set here is gated exactly as POST /activate is — including C2's
+        // clinic activation readiness and locale-pack attestation, which
+        // `transitionCampaign` now performs on the ACTIVE transition.
+        if (status !== undefined && status !== existing.status) {
+          row = (await transitionCampaign(tx, { tenantId: request.auth.tenantId, campaignId: id, to: status })).campaign;
         }
         await auditReceptionistMutation(tx, request, {
           action: 'receptionistCampaign.updated', resource: 'receptionistCampaign', resourceId: id,
@@ -324,11 +478,8 @@ export const campaignRoutes: FastifyPluginAsync = async app => {
         return row;
       });
     } catch (error) {
-      const invalid = intakeConfigurationError(error);
-      if (invalid) throw app.httpErrors.badRequest(invalid);
-      const reason = campaignAssignmentError(error);
-      if (reason) throw app.httpErrors.conflict(`Campaign configuration is not deployable: ${reason}.`);
-      if (isReceptionistDestinationConflict(error)) throw app.httpErrors.conflict('This provider deployment already owns an active Studio campaign for the tenant.');
+      const mapped = campaignConflictBody(error);
+      if (mapped) return reply.code(mapped.status).send(mapped.body);
       throw error;
     }
   });
@@ -370,31 +521,139 @@ function configurationConflict(app: Parameters<FastifyPluginAsync>[0], error: Er
   return conflict;
 }
 
+export const campaignLifecycleRoutes: FastifyPluginAsync = async app => {
+  // The one readiness evaluation. Studio badges, the go-live card and the
+  // activation gate all read this, so a screen can never disagree with what
+  // activation will actually do.
+  app.get('/campaigns/:id/readiness', { preHandler: callArtifactRead }, async request => {
+    const { id } = idParam.parse(request.params);
+    const readiness = await runWithTenantContext(request.auth.tenantId, tx =>
+      evaluateCampaignReadiness(tx, { tenantId: request.auth.tenantId, campaignId: id }));
+    if (!readiness) throw app.httpErrors.notFound('Campaign not found');
+    return readiness;
+  });
+
+  for (const [path, target] of [['activate', 'ACTIVE'], ['pause', 'PAUSED'], ['archive', 'ARCHIVED']] as const) {
+    app.post(`/campaigns/:id/${path}`, { preHandler: writeRoles }, async (request, reply) => {
+      const { id } = idParam.parse(request.params);
+      try {
+        const result = await runWithTenantContext(request.auth.tenantId, async tx => {
+          await lockReceptionistConfiguration(tx, request.auth.tenantId);
+          const transition = await transitionCampaign(tx, { tenantId: request.auth.tenantId, campaignId: id, to: target });
+          await auditReceptionistMutation(tx, request, {
+            action: `receptionistCampaign.${path}d`, resource: 'receptionistCampaign', resourceId: id,
+            metadata: { status: transition.campaign.status, agentId: transition.campaign.agentId },
+          });
+          return transition.campaign;
+        });
+        return reply.code(200).send(result);
+      } catch (error) {
+        if (error instanceof Error && error.message === 'campaign_not_found') throw app.httpErrors.notFound('Campaign not found');
+        const mapped = campaignConflictBody(error);
+        if (mapped) return reply.code(mapped.status).send(mapped.body);
+        throw error;
+      }
+    });
+  }
+
+  // What this campaign would actually say, built from the same prompt facts
+  // that get deployed — so the preview cannot drift from the live call.
+  app.get('/campaigns/:id/preview', { preHandler: callArtifactRead }, async request => {
+    const { id } = idParam.parse(request.params);
+    const campaign = await loadCampaign(request.auth.tenantId, id);
+    if (!campaign) throw app.httpErrors.notFound('Campaign not found');
+    // C2's assembly: hours, approved knowledge, catalog services and the locale
+    // pack. Preview reads exactly what deployment reads, so it cannot drift.
+    let prepared;
+    try {
+      prepared = await promptConfigForCampaign(campaign as unknown as CampaignWithRelations, request.auth.tenantId);
+    } catch (error) {
+      // A configuration gap is a 409 the operator can act on, never a 500 (M71).
+      if (isConfigurationError(error)) throw configurationConflict(app, error);
+      throw error;
+    }
+    if (!prepared.ok) {
+      throw app.httpErrors.conflict('No approved locale pack is available for this clinic language and country. Approve one before previewing the campaign.');
+    }
+    const config = prepared.config;
+    const built = buildRetellConfig(config, { webhookBaseUrl: env.PUBLIC_API_URL });
+    const transcripts = generateSampleTranscripts(config);
+    const clinicDisclosure = (config.clinic.complianceDisclosure ?? '').trim();
+    return {
+      ...transcripts,
+      tools: built.tools.map(tool => ({
+        name: String(tool.name ?? ''),
+        kind: tool.type === 'transfer_call' ? 'transfer' as const : 'custom' as const,
+        description: String(tool.description ?? ''),
+        // The consent tool is what every other patient-data tool waits on.
+        requiresConsent: !['record_recording_preference', 'report_emergency'].includes(String(tool.name ?? '')),
+      })),
+      disclosure: {
+        baseline: mandatoryOpeningDisclosure({ ...config, clinic: { ...config.clinic, complianceDisclosure: '' } }),
+        additional: clinicDisclosure,
+        composed: built.beginMessage,
+      },
+      placeholders: findPlaceholders(config),
+      agent: {
+        name: config.agent.name,
+        voice: config.agent.voice,
+        language: config.agent.language,
+        // True when no agent row exists: Preview falls back to a stock identity
+        // so the screen renders, and says so rather than implying it is real.
+        placeholder: campaign.agentId === null,
+      },
+      systemPrompt: built.systemPrompt,
+    };
+  });
+};
+
 export const campaignExportRoutes: FastifyPluginAsync = async app => {
   // ===== Prompt generation + RetellAI export ==============================
-  app.get('/campaigns/:id/prompt', { preHandler: writeRoles }, async request => {
+  app.get('/campaigns/:id/prompt', { preHandler: receptionistRead }, async request => {
     const { id } = idParam.parse(request.params);
     const campaign = await loadCampaign(request.auth.tenantId, id);
     if (!campaign) throw app.httpErrors.notFound('Campaign not found');
     try {
-      const config = toPromptConfig(campaign as unknown as CampaignWithRelations);
+      const prepared = await promptConfigForCampaign(campaign as unknown as CampaignWithRelations, request.auth.tenantId);
+      if (!prepared.ok) {
+        throw app.httpErrors.conflict('No approved locale pack is available for this clinic language and country. Approve one before previewing the prompt.');
+      }
+      const systemPrompt = generateSystemPrompt(prepared.config);
+      const hashes = await configurationHashes(request.auth.tenantId, campaign.clinicId);
       return {
-        systemPrompt: generateSystemPrompt(config),
-        samples: generateSamples(config),
+        systemPrompt,
+        samples: generateSamples(prepared.config),
+        promptHash: promptHash(systemPrompt),
+        localePack: { id: prepared.localePackId, evidenceHash: prepared.evidenceHash },
+        ...hashes,
+        drift: campaign.status === 'ACTIVE'
+          ? { localePack: campaign.attestedLocalePackHash !== null && campaign.attestedLocalePackHash !== prepared.evidenceHash }
+          : { localePack: false },
       };
     } catch (error) {
+      // A configuration gap is a 409 the operator can act on, never a 500 (M71).
       if (isConfigurationError(error)) throw configurationConflict(app, error);
       throw error;
     }
   });
 
-  app.get('/campaigns/:id/retell-config', { preHandler: writeRoles }, async request => {
+  app.get('/campaigns/:id/retell-config', { preHandler: receptionistRead }, async request => {
     const { id } = idParam.parse(request.params);
     const campaign = await loadCampaign(request.auth.tenantId, id);
     if (!campaign) throw app.httpErrors.notFound('Campaign not found');
     try {
-      const config = toPromptConfig(campaign as unknown as CampaignWithRelations);
-      return buildRetellConfig(config, { webhookBaseUrl: env.PUBLIC_API_URL });
+      const prepared = await promptConfigForCampaign(campaign as unknown as CampaignWithRelations, request.auth.tenantId);
+      if (!prepared.ok) {
+        throw app.httpErrors.conflict('No approved locale pack is available for this clinic language and country. Approve one before exporting the agent configuration.');
+      }
+      const built = buildRetellConfig(prepared.config, { webhookBaseUrl: env.PUBLIC_API_URL });
+      const hashes = await configurationHashes(request.auth.tenantId, campaign.clinicId);
+      return {
+        ...built,
+        promptHash: promptHash(built.systemPrompt),
+        localePack: { id: prepared.localePackId, evidenceHash: prepared.evidenceHash },
+        ...hashes,
+      };
     } catch (error) {
       if (isConfigurationError(error)) throw configurationConflict(app, error);
       throw error;

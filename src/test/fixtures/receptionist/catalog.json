@@ -1,0 +1,30 @@
+{
+  "generatedAt": "2026-08-29T18:00:00.000Z",
+  "fieldTypes": [
+    { "type": "FIRST_NAME", "label": "First name", "question": "Can I start with your first name?", "validation": "non-empty text", "group": "Identity", "hasOptions": false, "sensitive": false },
+    { "type": "PHONE", "label": "Phone number", "question": "What is the best phone number to reach you on?", "validation": "E.164 phone", "group": "Contact", "hasOptions": false, "sensitive": true }
+  ],
+  "timezones": {
+    "groups": [
+      { "region": "America", "zones": ["America/Chicago", "America/Los_Angeles", "America/New_York"] },
+      { "region": "Europe", "zones": ["Europe/Dublin", "Europe/London"] }
+    ],
+    "recommended": ["Europe/London"]
+  },
+  "countries": [
+    { "code": "US", "name": "United States", "callingCode": "1", "defaultEmergencyNumber": "911", "defaultLanguages": ["en-US"], "currency": "USD" },
+    { "code": "GB", "name": "United Kingdom", "callingCode": "44", "defaultEmergencyNumber": "999", "defaultLanguages": ["en-GB"], "currency": "GBP" },
+    { "code": "IE", "name": "Ireland", "callingCode": "353", "defaultEmergencyNumber": "112", "defaultLanguages": ["en-GB"], "currency": "EUR" }
+  ],
+  "languages": [
+    { "id": "en-US", "label": "English (US)", "provider": "retell" },
+    { "id": "en-GB", "label": "English (UK)", "provider": "retell" }
+  ],
+  "tones": ["Warm and professional", "Calm and reassuring"],
+  "campaignTypes": ["Reactivation", "New patient", "Recall / Recare"],
+  "localePacks": [
+    { "language": "en-US", "country": "US", "status": "MISSING", "packId": null, "hasPlatformDefault": true, "platformDefaultVersion": 1 },
+    { "language": "en-GB", "country": "GB", "status": "APPROVED", "packId": "pack-gb-1", "hasPlatformDefault": true, "platformDefaultVersion": 1 }
+  ],
+  "limits": { "maxIntakeFields": 24, "faqMax": 50, "payersMax": 60, "closureMaxDays": 366, "knowledgeTextMax": 600, "closureReasonMax": 160, "accessNotesMax": 600 }
+}

@@ -31,6 +31,7 @@ import type { SessionUser } from './session';
 export type Permission =
   | 'admin:manage'
   | 'appointment:read'
+  | 'appointment:write'
   | 'billing:read'
   | 'campaign:read'
   | 'crm:read'
@@ -40,7 +41,10 @@ export type Permission =
   | 'operations:read'
   | 'partner-report:read'
   | 'patient:read'
+  | 'receptionist:booking-review'
+  | 'receptionist:call-artifacts:read'
   | 'receptionist:manage'
+  | 'receptionist:read'
   | 'revenue:read'
   | 'staff:read'
   | 'staff:task-status'
@@ -88,9 +92,15 @@ export const ROUTES = {
   '/scheduling': { label: 'Scheduling', permission: 'appointment:read' },
   // GET /v1/intake/queue — requirePermission('intake:read')
   '/patient-intake': { label: 'Patient Intake', permission: 'intake:read' },
+  // GET /v1/tasks (receptionist lanes), /v1/receptionist/call-logs, /appointment-requests
+  // — every call-artifact read is gated on receptionist:call-artifacts:read.
+  '/front-desk': { label: 'Front Desk', permission: 'receptionist:call-artifacts:read' },
   // GET /v1/conversations — requirePermission('crm:read')
   '/ai-receptionist': { label: 'AI Receptionist', permission: 'crm:read' },
-  // GET /v1/receptionist/clinics, /campaigns — receptionist:manage
+  // GET /v1/receptionist/clinics, /campaigns — receptionist:manage today. The
+  // read gate (`receptionist:read`, phase2-contracts §9) opens the Studio
+  // read-only once the Studio hides its mutation controls; until then a
+  // read-only holder would reach a page whose every Save 403s.
   '/receptionist-studio': { label: 'Receptionist Studio', permission: 'receptionist:manage' },
   // GET /v1/staff/overview, /v1/tasks — requirePermission('staff:read')
   '/staff': { label: 'Staff Tasks', permission: 'staff:read' },

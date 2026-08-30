@@ -1,0 +1,55 @@
+{
+  "at": "2026-08-29T20:15:00.000Z",
+  "clinics": [
+    {
+      "clinicId": "clinic-1",
+      "name": "Harley Street Medical Group",
+      "timezone": "Europe/London",
+      "country": "GB",
+      "configured": true,
+      "blockers": [],
+      "formatFallback": false,
+      "isOpenNow": false,
+      "today": {
+        "date": "2026-08-29",
+        "dayKey": "saturday",
+        "timezone": "Europe/London",
+        "open": true,
+        "windows": [{ "start": "09:00", "end": "13:00" }],
+        "closure": null,
+        "source": "clinic"
+      },
+      "todayHoursSpoken": "09:00 to 13:00",
+      "nextOpening": { "date": "2026-08-31", "start": "09:00", "startsAt": "2026-08-31T08:00:00.000Z", "spoken": "Monday 31 August at 09:00" },
+      "closureReason": null,
+      "afterHoursCalls": { "last24Hours": 2, "last7Days": 11, "lastAt": "2026-08-29T19:40:00.000Z" },
+      "locations": [
+        { "id": "loc-1", "name": "Harley Street", "timezone": "Europe/London", "configured": true, "isOpenNow": false, "todayHoursSpoken": "09:00 to 13:00" }
+      ]
+    },
+    {
+      "clinicId": "clinic-2",
+      "name": "Brightsmile Dental Group",
+      "timezone": "America/Los_Angeles",
+      "country": null,
+      "configured": false,
+      "blockers": ["clinic_hours_missing"],
+      "formatFallback": true,
+      "isOpenNow": false,
+      "today": {
+        "date": "2026-08-29",
+        "dayKey": "saturday",
+        "timezone": "America/Los_Angeles",
+        "open": false,
+        "windows": [],
+        "closure": null,
+        "source": "unconfigured"
+      },
+      "todayHoursSpoken": "hours not configured",
+      "nextOpening": null,
+      "closureReason": null,
+      "afterHoursCalls": { "last24Hours": 0, "last7Days": 0, "lastAt": null },
+      "locations": []
+    }
+  ]
+}

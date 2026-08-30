@@ -657,6 +657,16 @@ export class RlsBehaviorHarness {
       values.set('phase', 'INTENT');
       values.set('status', 'started');
     }
+    // AppointmentNote CHECKs its actor vocabulary; the generic string synthesizer
+    // would not satisfy it.
+    if (table === 'AppointmentNote') values.set('actorType', 'system');
+    // ISO-2 country and the source enum are CHECK-constrained text columns;
+    // the generic synthetic scalar would violate both.
+    if (table === 'ReceptionistLocalePack') {
+      values.set('country', 'US');
+      values.set('language', 'en-US');
+      values.set('source', 'platform_default');
+    }
     if (table === 'ConversationReplyAttempt') {
       values.set('phase', 'INTENT');
       values.set('status', 'authorized');
@@ -675,6 +685,15 @@ export class RlsBehaviorHarness {
       if (!patient) return null;
       values.set('patientId', patient.row.id);
       values.delete('leadId');
+    }
+    // Deployment fingerprints are hash-shaped by database CHECK (and carry a
+    // `mock:` prefix for fixture deployments). The generic text generator
+    // cannot know that, so the shape is stated here rather than weakening the
+    // constraint that keeps mock evidence distinguishable from live evidence.
+    if (table === 'ReceptionistAgentDeployment') {
+      for (const column of ['toolFingerprint', 'intakeFingerprint', 'configFingerprint']) {
+        values.set(column, createHash('sha256').update(`${table}:${column}:${tenantId}`).digest('hex'));
+      }
     }
     if (table === 'ReceptionistVoiceConsentEvent') {
       values.set('purpose', 'PATIENT_REACTIVATION');

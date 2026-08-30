@@ -22,7 +22,7 @@ async function makeTenant() {
   const user = await db.user.create({ data: { tenantId: id, role: 'PROVIDER', active: true, email: `pv-${id.slice(0, 8)}@rt.test`, displayName: 'Provider' } });
   const provider = await db.providerProfile.create({ data: { tenantId: id, branchId: branch.id, userId: user.id, specialty: 'General' } });
   await db.providerAvailability.createMany({ data: Array.from({ length: 7 }, (_, dayOfWeek) => ({ tenantId: id, branchId: branch.id, providerProfileId: provider.id, dayOfWeek, startMinute: 540, endMinute: 1020, slotMinutes: 30 })) });
-  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Clinic', phone: phoneFor(id) } });
+  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Clinic', phone: phoneFor(id), country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' } });
   const location = await db.receptionistLocation.create({ data: { tenantId: id, clinicId: clinic.id, branchId: branch.id, name: 'Main location', address: '1 Test Way', active: true } });
   const campaignId = randomUUID();
   const appointmentType = 'Consultation';

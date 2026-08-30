@@ -100,7 +100,7 @@ async function fixture(fields: Field[] = []) {
   });
   const uniquePhone = `+1${BigInt(`0x${tenantId.replaceAll('-', '')}`).toString().slice(-14)}`;
   const clinic = await db.receptionistClinic.create({
-    data: { tenantId, name: 'Atomic clinic', phone: uniquePhone },
+    data: { tenantId, name: 'Atomic clinic', phone: uniquePhone, country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' },
   });
   const location = await db.receptionistLocation.create({
     data: { tenantId, clinicId: clinic.id, branchId: branch.id, name: 'Main', address: '1 Test Way', active: true },

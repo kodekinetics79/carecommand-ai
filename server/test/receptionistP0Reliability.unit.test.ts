@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { env } from '../config/env';
 import { createPhoneCall, getPhoneCall, stopPhoneCall } from '../lib/retell';
 import { buildRetellConfig, generateSamples, generateSystemPrompt, type PromptConfig } from '../modules/receptionist/promptService';
+import { promptFixture } from './fixtures/receptionistPromptConfigs';
 
 const originalRetell = {
   apiKey: env.RETELL_API_KEY,
@@ -10,37 +11,14 @@ const originalRetell = {
   baseUrl: env.RETELL_BASE_URL,
 };
 
+const fixture = promptFixture('us-full');
 const promptConfig: PromptConfig = {
-  clinic: {
-    id: 'clinic-1',
-    name: 'Example Clinic',
-    phone: '+12125550100',
-    timezone: 'America/New_York',
-    defaultLanguage: 'en-US',
-    complianceDisclosure: 'Clinic-specific compliance language.',
-    doNotContactPolicy: 'Record the opt-out and end the call.',
-  },
-  agent: {
-    name: 'Avery',
-    voice: 'voice-1',
-    tone: 'warm',
-    language: 'en-US',
-    greetingOverride: 'I can help you schedule today.',
-  },
-  campaign: {
-    id: 'campaign-1',
-    name: 'Scheduling',
-    campaignType: 'outbound',
-    offerTitle: 'Appointment',
-    offerDescription: 'Schedule an appointment.',
-    offerScript: 'Would you like to schedule?',
-    appointmentType: 'Consultation',
-    eligibleLocationIds: ['branch-1'],
-    smsConfirmation: true,
-    emailConfirmation: false,
-  },
+  ...fixture,
+  clinic: { ...fixture.clinic, complianceDisclosure: 'Clinic-specific compliance language.', doNotContactPolicy: 'Record the opt-out and end the call.', humanFallbackNumber: null },
+  agent: { ...fixture.agent, greetingOverride: 'I can help you schedule today.' },
+  campaign: { ...fixture.campaign, campaignType: 'outbound', offerDescription: 'Schedule an appointment.', offerScript: 'Would you like to schedule?', eligibleLocationIds: ['branch-1'] },
   locations: [{ id: 'branch-1', name: 'Main', address: '1 Main St' }],
-  intakeFields: [],
+  hours: { clinicSummary: fixture.hours!.clinicSummary, perLocation: [{ id: 'branch-1', summary: fixture.hours!.clinicSummary, closures: [] }] },
 };
 
 afterEach(() => {

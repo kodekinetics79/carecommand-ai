@@ -32,7 +32,7 @@ async function setupTenant(tag: string, planKey: string) {
   const plan = await ownerDb.subscriptionPlan.findUnique({ where: { key: planKey } });
   await ownerDb.tenantSubscription.create({ data: { tenantId: id, planId: plan!.id, status: 'ACTIVE', startedAt: new Date() } });
   await recomputeEntitlements(id);
-  const clinic = await ownerDb.receptionistClinic.create({ data: { tenantId: id, name: `${tag} clinic`, phone: '+1 555 000 0000' } });
+  const clinic = await ownerDb.receptionistClinic.create({ data: { tenantId: id, name: `${tag} clinic`, phone: '+15550000000', country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' } });
   const branch = await ownerDb.branch.create({ data: { tenantId: id, name: `${tag} branch`, location: 'Main St' } });
   return { id, userId: user.id, clinicId: clinic.id, branchId: branch.id };
 }

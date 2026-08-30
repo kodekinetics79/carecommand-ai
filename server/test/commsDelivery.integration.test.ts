@@ -319,7 +319,7 @@ describe('cross-module: AI receptionist opt-out (ReceptionistOptOut, channel ALL
     const phone = '+15552220004';
     const patient = await makeInactivePatient(t.id, t.branchId, { phone });
     await db.receptionistOptOut.create({ data: { tenantId: t.id, contactPhone: phone, channel: 'ALL', reason: 'AI call' } });
-    const clinic = await db.receptionistClinic.create({ data: { tenantId: t.id, name: 'Main clinic', phone: phoneFor(t.id) }, select: { id: true } });
+    const clinic = await db.receptionistClinic.create({ data: { tenantId: t.id, name: 'Main clinic', phone: phoneFor(t.id), country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' }, select: { id: true } });
     const campaign = await db.receptionistOutboundCampaign.create({ data: { tenantId: t.id, clinicId: clinic.id, name: 'Outbound', script: 'Call the patient.', requiredFields: ['firstName', 'lastName', 'phone'] }, select: { id: true } });
     // A stored target is not permission to dial: every target is bound to exactly
     // one canonical patient/lead, and the launch path rechecks this shared gate

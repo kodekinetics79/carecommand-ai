@@ -7,6 +7,10 @@ import BentoCard from '../components/ui/BentoCard';
 import ProgressBar from '../components/ui/ProgressBar';
 import { apiRequest } from '../lib/api';
 import { mapStaffProfile, mapStaffTask, type ApiStaffProfile, type ApiStaffTask } from '../lib/apiAdapters';
+import { normalizeTaskRow } from '../lib/frontDesk';
+import { resolveTimezone } from '../lib/clinicTime';
+import { formatClinicDateTime, formatRelativeDue } from '../lib/frontDeskTime';
+import { ReceptionistTaskCard } from '../components/receptionist/ReceptionistTaskCard';
 import { hasPermission } from '../lib/access';
 import { useSession } from '../hooks/useSession';
 import type { StaffMember } from '../types';
@@ -52,9 +56,16 @@ export default function StaffWorkflow() {
   const { user } = useSession();
   const canAssignOthers = hasPermission(user, 'staff:write');
   const canWorkTasks = hasPermission(user, 'staff:task-status');
+  // A receptionist row is only legible to a caller who may read call artifacts;
+  // without the grant the server sends the restricted view and the card says so.
+  const canReadCallArtifacts = hasPermission(user, 'receptionist:call-artifacts:read');
+  const canBook = hasPermission(user, 'appointment:write') && hasPermission(user, 'receptionist:booking-review');
+  const viewerTimezone = resolveTimezone(null);
 
   const [staffRecords, setStaffRecords] = useState<StaffView[]>([]);
-  const [taskRecords, setTaskRecords] = useState<TaskView[]>([]);
+  // The raw server rows are kept as well as the mapped view: the receptionist
+  // card renders from the full C4 projection, the generic row from the view.
+  const [taskRows, setTaskRows] = useState<ApiStaffTask[]>([]);
   const [assignees, setAssignees] = useState<Assignee[]>([]);
   // Each source reports its own outcome. One failing panel must not blank the
   // others, and must never look like an empty result.
@@ -70,7 +81,7 @@ export default function StaffWorkflow() {
   const loadTasks = useCallback(async () => {
     try {
       const response = await apiRequest<ApiStaffTask[] | { data: ApiStaffTask[] }>(`/v1/tasks?limit=${TASK_PAGE_SIZE}`);
-      setTaskRecords(extractRows(response).map(row => mapStaffTask(row)));
+      setTaskRows(extractRows(response));
       setTasksState('ready');
       setTasksError(null);
     } catch (error) {
@@ -115,6 +126,9 @@ export default function StaffWorkflow() {
     })();
     return () => { active = false; };
   }, [canAssignOthers]);
+
+  const taskRecords = useMemo(() => taskRows.map(row => mapStaffTask(row)), [taskRows]);
+  const rawTaskById = useMemo(() => new Map(taskRows.map(row => [row.id, row])), [taskRows]);
 
   const tasksReady = tasksState === 'ready';
   const staffReady = staffState === 'ready' && staffRecords.length > 0;
@@ -161,7 +175,7 @@ export default function StaffWorkflow() {
     setRowError(null);
     try {
       const updated = await apiRequest<ApiStaffTask>(path, { method: 'PATCH', body: JSON.stringify(body) });
-      setTaskRecords(current => current.map(t => t.id === taskId ? mapStaffTask(updated) : t));
+      setTaskRows(current => current.map(row => row.id === taskId ? updated : row));
     } catch (error) {
       setRowError(errorText(error, failure));
       // The row is left exactly as the server last described it.
@@ -247,6 +261,22 @@ export default function StaffWorkflow() {
                     : `No task matches the “${QUEUE_FILTERS.find(f => f.id === filter)?.label}” filter. ${taskRecords.length} task${taskRecords.length === 1 ? '' : 's'} loaded in total.`}
                 </p>
               ) : visibleTasks.map(task => {
+                // A receptionist task is a caller waiting on a human. It gets the
+                // front-desk card (caller, message, callback window, transfer
+                // state, Acknowledge) instead of the generic title row.
+                const rawRow = rawTaskById.get(task.id);
+                if (task.receptionist && rawRow) {
+                  return (
+                    <ReceptionistTaskCard
+                      key={task.id}
+                      task={normalizeTaskRow(rawRow)}
+                      timezone={task.clinic?.timezone ?? viewerTimezone}
+                      variant="compact"
+                      can={{ work: canWorkTasks, readArtifacts: canReadCallArtifacts, book: canBook }}
+                      onChanged={async () => { await loadTasks(); }}
+                    />
+                  );
+                }
                 const priorityStyle = priorityStyles[task.priority as keyof typeof priorityStyles] ?? priorityStyles.low;
                 const statusStyle = statusStyles[task.status] ?? statusStyles.open;
                 const terminal = task.status === 'completed' || task.status === 'canceled';
@@ -260,7 +290,9 @@ export default function StaffWorkflow() {
                         <div className="flex items-center gap-2 mt-1 flex-wrap">
                           <span className={priorityStyle.badge}>{task.priority}</span>
                           <span className={statusStyle.badge}>{statusStyle.label}</span>
-                          <span className={`text-[10px] font-semibold ${task.overdue ? 'text-red-v' : 'text-t3'}`}>{task.overdue ? `Overdue · ${task.due}` : task.due}</span>
+                          <span className={`text-[10px] font-semibold ${task.overdue ? 'text-red-v' : 'text-t3'}`} title={formatClinicDateTime(task.dueAt, task.clinic?.timezone ?? viewerTimezone)}>
+                            {formatRelativeDue(task.dueAt).label}
+                          </span>
                           <span className="text-[10px] text-t3">· {task.branch} · {task.assignee ?? 'Unassigned'}</span>
                           {task.origin && <span className="text-[10px] text-t3">· from {task.origin}</span>}
                         </div>

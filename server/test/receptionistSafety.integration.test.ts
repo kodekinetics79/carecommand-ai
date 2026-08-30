@@ -5,6 +5,9 @@ import { fixtureDb as db } from './helpers/fixtureDb';
 import { handleAgentTool } from '../lib/receptionist/liveTools';
 import { runWithWebhookTenantContext } from '../lib/tenantContext';
 import { buildRetellConfig, generateSystemPrompt, type PromptConfig } from '../modules/receptionist/promptService';
+import { PLATFORM_LOCALE_PACKS, platformLocalePackHash } from '../lib/receptionist/localePacks/defaults';
+import { promptFixture } from './fixtures/receptionistPromptConfigs';
+import { EN_US } from './fixtures/receptionistPackStrings';
 
 const tenantIds: string[] = [];
 
@@ -19,6 +22,25 @@ async function makeTenant() {
   await db.tenant.create({ data: { id, name: `safety-${id.slice(0, 6)}`, slug: `safety-${id.slice(0, 8)}` } });
   const branch = await db.branch.create({ data: { tenantId: id, name: 'Main', location: 'Test', active: true } });
   return { id, branchId: branch.id };
+}
+
+/** A US call log with an approved en-US pack, so the tool can resolve wording. */
+async function registerUsCall(tenantId: string, callId: string) {
+  const platform = PLATFORM_LOCALE_PACKS.find(pack => pack.language === 'en-US' && pack.country === 'US')!;
+  const user = await db.user.create({ data: { tenantId, role: 'OWNER', active: true, email: `owner-${randomUUID().slice(0, 8)}@safety.test`, displayName: 'Owner' }, select: { id: true } });
+  const pack = await db.receptionistLocalePack.create({
+    data: {
+      tenantId, language: 'en-US', country: 'US', version: 1, status: 'APPROVED', source: 'platform_default',
+      baseDefaultVersion: platform.version, strings: platform.strings as never,
+      evidenceHash: platformLocalePackHash(platform), approvedByUserId: user.id, approvedAt: new Date(),
+    },
+    select: { id: true },
+  });
+  const clinic = await db.receptionistClinic.create({
+    data: { tenantId, name: `Safety clinic ${randomUUID().slice(0, 8)}`, phone: `+1${(BigInt(`0x${randomUUID().replace(/-/g, '').slice(0, 14)}`) % 10_000_000_000n).toString().padStart(10, '0')}`, country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' },
+    select: { id: true },
+  });
+  await db.receptionistCallLog.create({ data: { tenantId, clinicId: clinic.id, retellCallId: callId, direction: 'inbound', localePackId: pack.id, startedAt: new Date() } });
 }
 
 afterAll(async () => {
@@ -52,7 +74,11 @@ describe('AI receptionist safety workflows', () => {
     expect(task).toMatchObject({ branchId: tenant.branchId, priority: 'high', status: 'OPEN' });
     expect(task.metadata).toMatchObject({
       kind: 'human_handoff',
-      callbackPhone: '+12125550177', // verified caller wins over tool input
+      // C4 keeps both numbers apart instead of silently preferring one: the
+      // front desk sees what the caller asked for AND what the network proved.
+      verifiedPhone: '+12125550177',
+      requestedCallbackPhone: '+12125550999',
+      callbackPhone: '+12125550999',
       requiresAcknowledgement: true,
     });
 
@@ -94,21 +120,26 @@ describe('AI receptionist safety workflows', () => {
 
   it('creates a critical operational signal and directs an emergency caller not to wait for staff', async () => {
     const tenant = await makeTenant();
+    // The emergency number is jurisdictional, so it is resolved from the pack
+    // bound to this call's clinic rather than assumed.
+    const callId = `call-${randomUUID()}`;
+    await registerUsCall(tenant.id, callId);
     const result = await trustedTool(
-      { tenantId: tenant.id, callId: `call-${randomUUID()}`, callerPhone: '+12125550166' },
+      { tenantId: tenant.id, callId, callerPhone: '+12125550166' },
       'report_emergency',
       { reason_category: 'possible_emergency', message: 'Caller described possible emergency symptoms.' },
     ) as Record<string, unknown>;
 
     expect(result).toMatchObject({ emergency_recorded: true, acknowledgment_pending: true });
-    expect(result.message).toMatch(/call 911 now/i);
+    expect(result.message).toContain(EN_US.emergencyNumber);
     expect(result.message).toMatch(/do not wait/i);
     const signal = await db.operationalSignal.findFirstOrThrow({
       where: { tenantId: tenant.id, signalType: 'receptionist_emergency_mention', entityId: String(result.task_id) },
     });
     expect(signal).toMatchObject({ severity: 'critical', score: 100, status: 'open' });
     const task = await db.staffTask.findUniqueOrThrow({ where: { id: String(result.task_id) } });
-    expect(task).toMatchObject({ priority: 'high', status: 'OPEN' });
+    // An emergency is critical, never merely high, and is due immediately.
+    expect(task).toMatchObject({ priority: 'critical', status: 'OPEN' });
   });
 
   it('keeps voice identity proof server-side, records failures, and locks after three attempts', async () => {
@@ -189,20 +220,13 @@ describe('AI receptionist safety workflows', () => {
   });
 });
 
+const fixture = promptFixture('us-full');
 const promptConfig: PromptConfig = {
-  clinic: {
-    id: 'clinic-1', name: 'Example Clinic', phone: '+12125550100', timezone: 'America/New_York',
-    defaultLanguage: 'en-US', complianceDisclosure: '', humanFallbackNumber: '+12125550200',
-    doNotContactPolicy: 'Record the opt-out and end the call.',
-  },
-  agent: { name: 'Avery', voice: 'voice-1', tone: 'warm', language: 'en-US' },
-  campaign: {
-    id: 'campaign-1', name: 'Scheduling', campaignType: 'inbound', offerTitle: 'Appointment',
-    offerDescription: 'Schedule an appointment.', offerScript: 'How can I help?', appointmentType: 'Consultation',
-    eligibleLocationIds: ['branch-1'], smsConfirmation: true, emailConfirmation: false,
-  },
+  ...fixture,
+  clinic: { ...fixture.clinic, complianceDisclosure: null, doNotContactPolicy: 'Record the opt-out and end the call.' },
+  campaign: { ...fixture.campaign, eligibleLocationIds: ['branch-1'] },
   locations: [{ id: 'branch-1', name: 'Main', address: '1 Main St' }],
-  intakeFields: [],
+  hours: { clinicSummary: fixture.hours!.clinicSummary, perLocation: [{ id: 'branch-1', summary: fixture.hours!.clinicSummary, closures: [] }] },
 };
 
 describe('Retell safety configuration', () => {
@@ -223,8 +247,8 @@ describe('Retell safety configuration', () => {
     const invalid = { ...promptConfig, clinic: { ...promptConfig.clinic, humanFallbackNumber: 'front desk' } };
     expect(buildRetellConfig(invalid, { webhookBaseUrl: 'https://api.example.test' }).tools.some(tool => tool.name === 'transfer_to_staff')).toBe(false);
     const prompt = generateSystemPrompt(invalid);
-    expect(prompt).toMatch(/immediately tell them to hang up and call 911/i);
-    expect(prompt).toMatch(/Never delay the 911 instruction/i);
+    expect(prompt).toContain(EN_US.emergencyInstruction);
+    expect(prompt).toMatch(/Never delay the emergency instruction/i);
     expect(prompt).toMatch(/Never merely say that someone will follow up without a successful tool result and task ID/i);
     expect(prompt).toMatch(/proxy, guardian, or minor/i);
   });

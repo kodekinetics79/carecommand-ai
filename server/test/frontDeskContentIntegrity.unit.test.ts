@@ -17,8 +17,13 @@ describe('AI Front Desk authorization and evidence content', () => {
     const page = readFileSync('src/pages/AIReceptionist.tsx', 'utf8');
     const adapters = readFileSync('src/lib/apiAdapters.ts', 'utf8');
 
-    expect(page).toContain('title="Call records today"');
-    expect(page).toContain('title="Follow-up evidence"');
+    // The hardening pass repointed these tiles at canonical ReceptionistCallLog
+    // rows (REC-P0-006: Studio showed seven calls while Front Desk showed zero),
+    // so the labels now name the evidence they actually read.
+    expect(page).toContain('title="Stored voice calls"');
+    expect(page).toContain('title="Reviewed voice calls"');
+    expect(page).toContain('receptionistCallLogs');
+    expect(page).not.toContain('followUpEvidenceCount');
     expect(adapters).toContain('Recorded estimate · source not verified');
     expect(page).toContain('No after-hours metric is calculated.');
     expect(page).toContain('Browser-local time is not used as a substitute for verified clinic hours and timezone.');

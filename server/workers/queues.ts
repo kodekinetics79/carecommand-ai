@@ -111,7 +111,8 @@ export type ComplianceJobName =
   | 'access-review-reminder'
   | 'vendor-review-reminder'
   | 'security-scan-placeholder'
-  | 'receptionist-confirmation-dispatch';
+  | 'receptionist-confirmation-dispatch'
+  | 'receptionist-agent-reverify';
 
 export type ScheduledTickData = { _otel?: TraceCarrier };
 export type ScheduledQueueData = ScheduledTickData | TenantJobEnvelope;
@@ -141,6 +142,10 @@ const COMPLIANCE_SCHEDULES: Array<{ id: string; name: ComplianceJobName; pattern
   { id: 'compliance-vendor-review', name: 'vendor-review-reminder', pattern: '0 4 1 * *' },     // monthly 1st 04:00
   { id: 'compliance-security-scan', name: 'security-scan-placeholder', pattern: '45 2 * * *' }, // daily 02:45 (no-op unless data supplied)
   { id: 'receptionist-confirmation-dispatch', name: 'receptionist-confirmation-dispatch', pattern: '* * * * *' }, // every minute
+  // Hourly at :07 — renews provider attestations before the 24 h expiry fails
+  // them closed. Deliberately off the confirmation minute: it reads provider
+  // state and must not queue behind per-minute dispatch work.
+  { id: 'receptionist-agent-reverify', name: 'receptionist-agent-reverify', pattern: '7 * * * *' },
 ];
 
 export async function registerComplianceSchedules() {

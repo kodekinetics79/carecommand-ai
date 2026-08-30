@@ -4,11 +4,13 @@ import {
   LayoutDashboard, Radar, Users2, Megaphone, TrendingUp,
   CalendarDays, ClipboardList, Puzzle, Settings,
   Star, Orbit, Target, UserCircle2, ShieldCheck, Sparkles, BadgeCheck, Bot, FileText, CreditCard, Lock, Cpu, Activity, Plug, SlidersHorizontal,
-  ChevronsLeft, ChevronsRight, ChevronDown, Search, X,
+  ChevronsLeft, ChevronsRight, ChevronDown, Search, X, PhoneCall,
 } from 'lucide-react';
 import { useSession } from '../../hooks/useSession';
 import { useEntitlements } from '../../hooks/useEntitlements';
-import { canOpenPath, type RoutePath } from '../../lib/access';
+import { useFrontDeskPoll } from '../../hooks/useFrontDeskPoll';
+import { summarizeNeedsAction } from '../../lib/frontDesk';
+import { canOpenPath, hasPermission, type RoutePath } from '../../lib/access';
 import { useUiPrefs } from '../../lib/uiPrefs';
 import Logo from '../ui/Logo';
 
@@ -16,6 +18,7 @@ import Logo from '../ui/Logo';
 // to /subscription (backend still enforces access regardless of the UI).
 const NAV_FEATURE: Record<string, string> = {
   '/receptionist-studio': 'ai_receptionist',
+  '/front-desk': 'ai_receptionist',
   '/ai-receptionist': 'ai_receptionist',
   '/campaigns': 'campaign_automation',
   // Retired paths, still routable (they redirect to /campaigns). Kept here so a
@@ -70,6 +73,7 @@ const nav: NavSection[] = [
       { label: 'Patients', path: '/patients', icon: UserCircle2 },
       { label: 'Scheduling', path: '/scheduling', icon: CalendarDays },
       { label: 'Patient Intake', path: '/patient-intake', icon: ClipboardList },
+      { label: 'Front Desk', path: '/front-desk', icon: PhoneCall },
       { label: 'AI Receptionist', path: '/ai-receptionist', icon: Bot },
       { label: 'Receptionist Studio', path: '/receptionist-studio', icon: Bot },
       { label: 'Staff Tasks', path: '/staff', icon: ClipboardList },
@@ -149,6 +153,20 @@ export default function Sidebar({ mobileOpen = false, onNavigate }: { mobileOpen
   const { collapsed, collapsedSections, setCollapsed, toggleSection } = useUiPrefs();
   const [filter, setFilter] = useState('');
 
+  // The Front Desk badge is the shared 20s task summary (one poller for the
+  // whole app). It is only fetched for a session that may read call artifacts,
+  // and NOTHING is shown when the summary failed to load: a missing badge means
+  // "not known", and a zero would be a claim nobody verified.
+  const frontDeskSummary = useFrontDeskPoll({ enabled: !loading && hasPermission(user, 'receptionist:call-artifacts:read') });
+  const frontDeskCounts = summarizeNeedsAction(frontDeskSummary.state === 'ready' ? frontDeskSummary.data : null);
+  const frontDeskBadge: Pick<NavItem, 'badge' | 'badgeColor'> = frontDeskSummary.state !== 'ready'
+    ? {}
+    : frontDeskCounts.critical > 0
+      ? { badge: frontDeskCounts.critical, badgeColor: 'red' }
+      : frontDeskCounts.count > 0
+        ? { badge: frontDeskCounts.count, badgeColor: 'amber' }
+        : {};
+
   const q = filter.trim().toLowerCase();
   const collapsedSet = new Set(collapsedSections);
 
@@ -160,9 +178,9 @@ export default function Sidebar({ mobileOpen = false, onNavigate }: { mobileOpen
   const visibleNav = loading ? [] : nav
     .map(section => ({
       ...section,
-      items: section.items.filter(item =>
-        canOpenPath(user, item.path) &&
-        (!q || item.label.toLowerCase().includes(q))),
+      items: section.items
+        .filter(item => canOpenPath(user, item.path) && (!q || item.label.toLowerCase().includes(q)))
+        .map(item => item.path === '/front-desk' ? { ...item, ...frontDeskBadge } : item),
     }))
     .filter(section => section.items.length > 0);
 

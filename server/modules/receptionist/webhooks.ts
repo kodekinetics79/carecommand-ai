@@ -18,7 +18,20 @@ import { enforceInvalidRetellSignatureRateLimit, enforceVerifiedRetellRateLimit 
 import { recoverOutboundProviderIntent } from '../../lib/receptionist/providerIntentRecovery';
 import { retellRateStore } from '../../lib/receptionist/retellRateStore';
 import { fingerprintJson, type IntakeContractSnapshot } from './intakeContract';
+import { callHoursStamp } from '../../lib/receptionist/hoursSource';
+import { recordWorkflowEvent } from '../../lib/intelligence';
 import { uuid } from './shared';
+
+/**
+ * Retell reports why a call ended. `call_transfer` is explicit evidence that
+ * the provider handed the call to a human; every other reason is 'unknown'
+ * rather than an invented failure class (the provider has no transfer_failed
+ * disposition). C4's markTransferOutcome reads the stamped column.
+ */
+function transferOutcomeFor(disconnectionReason: string | undefined): 'connected' | 'unknown' | null {
+  if (!disconnectionReason) return null;
+  return disconnectionReason === 'call_transfer' ? 'connected' : 'unknown';
+}
 
 const RECEPTIONIST_CALL_LEASE_MS = 4 * 60 * 60 * 1_000;
 
@@ -376,6 +389,7 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         direction: z.string().optional(),
         metadata: z.record(z.string(), z.unknown()).optional(),
         recording_url: z.string().optional(),
+        disconnection_reason: z.string().max(120).optional(),
         call_analysis: z.object({
           call_summary: z.string().optional(),
           user_sentiment: z.string().optional(),
@@ -577,6 +591,15 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       ? normalizedOutcomeRaw as Exclude<CallOutcome, 'IN_PROGRESS'>
       : 'IN_PROGRESS';
 
+    // Was the clinic open when this call arrived? Computed once, from the
+    // clinic's own hours, and stored: recomputing it later against today's
+    // configuration would rewrite history. Null means "hours not configured",
+    // never "the clinic was open".
+    const hoursStamp = existingCall?.outsideHours === undefined || existingCall?.outsideHours === null
+      ? await callHoursStamp(db, { tenantId, clinicId: trustedClinicId ?? existingCall?.clinicId ?? null, at: existingCall?.startedAt ?? new Date() })
+      : { outsideHours: existingCall.outsideHours };
+    const transferOutcome = transferOutcomeFor(call.disconnection_reason);
+
     // Serialize lifecycle and usage accounting for this provider call. Retell
     // commonly sends call_ended and call_analyzed with the same duration; only
     // the positive billable-minute delta is charged, so replay cannot inflate
@@ -599,6 +622,9 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
             outcome: persistedOutcome,
             sentiment: analysis.user_sentiment,
             durationSeconds: Math.max(current.durationSeconds, durationSeconds),
+            // Stamped once; a later redelivery must not flip it.
+            ...(current.outsideHours === null ? { outsideHours: hoursStamp.outsideHours } : {}),
+            ...(transferOutcome && current.transferOutcome === null ? { transferOutcome } : {}),
             endedAt: ended ? (current.endedAt ?? new Date()) : undefined,
           },
         })
@@ -613,6 +639,7 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
             outcome: persistedOutcome,
             sentiment: analysis.user_sentiment,
             durationSeconds,
+            outsideHours: hoursStamp.outsideHours,
             startedAt: new Date(),
             endedAt: ended ? new Date() : undefined,
           },
@@ -652,6 +679,18 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       }
       return row;
     });
+
+    // An inbound call the clinic was closed for is a real operational fact the
+    // front desk needs: emitted once, when the row is first stamped.
+    if (persistedCall.outsideHours === true && persistedCall.direction === 'inbound' && existingCall?.outsideHours !== true) {
+      await recordWorkflowEvent(tenantId, {
+        eventType: 'receptionist.call.after_hours',
+        entityType: 'receptionistCallLog',
+        entityId: persistedCall.id,
+        sourceModule: 'receptionist',
+        payload: { clinicId: persistedCall.clinicId, direction: persistedCall.direction },
+      });
+    }
 
     // Provider/LLM analysis is never accepted as legal consent evidence. Only
     // the signed, idempotent in-call recording-preference tool may create it.

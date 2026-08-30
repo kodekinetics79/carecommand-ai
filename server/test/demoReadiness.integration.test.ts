@@ -248,6 +248,62 @@ if (!process.env.RLS_DISPOSABLE_DB) {
     });
   });
 
+  describe('the AI receptionist can actually answer a call', () => {
+    it('deploys, verifies and activates through the production paths', async () => {
+      // Not "a VERIFIED row exists": the seed runs the real deploy and the real
+      // verification, so if either would fail for a paying clinic it fails here.
+      const agents = await fixtureDb.receptionistAgent.findMany({
+        where: { tenantId: demoTenantId },
+        select: { id: true, name: true, voice: true, providerStatus: true, providerAgentId: true, currentDeploymentId: true },
+      });
+      expect(agents.length).toBeGreaterThan(0);
+      const verified = agents.filter(agent => agent.providerStatus === 'VERIFIED');
+      expect(verified.length).toBeGreaterThan(0);
+      for (const agent of verified) {
+        expect(agent.providerAgentId).not.toBeNull();
+        expect(agent.currentDeploymentId).not.toBeNull();
+        // The stock name and voice are placeholders the deploy path refuses.
+        expect(agent.name).not.toBe('Riley');
+        expect(agent.voice).not.toBe('11labs-Adrian');
+      }
+
+      const deployments = await fixtureDb.receptionistAgentDeployment.findMany({
+        where: { tenantId: demoTenantId },
+        select: { status: true, mock: true, promptHash: true, providerAgentVersion: true, numberBound: true, toolsJson: true },
+      });
+      expect(deployments.length).toBeGreaterThan(0);
+      for (const deployment of deployments.filter(row => row.status === 'VERIFIED')) {
+        // Mock evidence is marked as mock, everywhere, so a demo can never be
+        // mistaken for a live deployment.
+        expect(deployment.mock).toBe(true);
+        expect(deployment.promptHash.startsWith('mock:')).toBe(true);
+        expect(deployment.providerAgentVersion).not.toBeNull();
+        expect(deployment.numberBound).toBe(true);
+        // The real tool set was deployed, not a stub.
+        const toolNames = (deployment.toolsJson as Array<{ name?: string }>).map(tool => tool.name);
+        expect(toolNames).toEqual(expect.arrayContaining(['book_appointment', 'check_availability', 'report_emergency']));
+      }
+
+      const active = await fixtureDb.receptionistCampaign.count({ where: { tenantId: demoTenantId, status: 'ACTIVE' } });
+      expect(active).toBeGreaterThan(0);
+    });
+
+    it('gives every demo provider hours to offer, so a slot search is not empty', async () => {
+      // Peer sessions found the live demo tenant with twelve providers and zero
+      // availability rows: every segment of the receptionist demo looked
+      // configured, and the agent could still never offer an appointment.
+      const providers = await fixtureDb.providerProfile.findMany({
+        where: { tenantId: demoTenantId, active: true },
+        select: { id: true },
+      });
+      expect(providers.length).toBeGreaterThan(0);
+      for (const provider of providers) {
+        const windows = await fixtureDb.providerAvailability.count({ where: { providerProfileId: provider.id, active: true } });
+        expect(windows, `provider ${provider.id} has no availability`).toBeGreaterThan(0);
+      }
+    });
+  });
+
   describe('live dispatch stays off', () => {
     it('creates no CampaignLiveDispatchActivation anywhere in the seed', async () => {
       expect(await fixtureDb.campaignLiveDispatchActivation.count()).toBe(0);

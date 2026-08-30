@@ -1,0 +1,133 @@
+{
+  "packs": [
+    {
+      "id": "pack-gb-1",
+      "language": "en-GB",
+      "country": "GB",
+      "version": 1,
+      "status": "APPROVED",
+      "source": "platform_default",
+      "baseDefaultVersion": 1,
+      "strings": {
+        "emergencyNumber": "999",
+        "timeStyle": "24h",
+        "dateStyle": "weekday-day-month",
+        "messages": {
+          "disclosure.recording": "Hi, I'm {{agent_name}}, an AI assistant for {{clinic_name}}. This call may be recorded or monitored for quality and training purposes.{{clinic_disclosure}} Is that okay?",
+          "dnc.acknowledge": "I heard your request. I am recording it now.",
+          "dnc.confirmed": "Your do-not-contact request is recorded. I will end the call now.",
+          "dnc.failed": "I could not confirm that the request was recorded. I will end this call and flag it for the team to review.",
+          "voicemail.script": "This is {{agent_name}}, an AI assistant calling for {{clinic_name}}. Please call {{clinic_phone}}. Goodbye.",
+          "summary.line": "Perfect. I have {{fields}}. Is everything correct?",
+          "not_interested.line": "No problem at all. Would you like us not to contact you again about this offer?",
+          "emergency.instruction": "If this may be an emergency, please hang up and call {{emergency_number}} now, or go to your nearest A&E.",
+          "after_hours.line": "Thanks for calling {{clinic_name}}. The practice is currently closed. We next open {{next_opening}}.",
+          "human_fallback.line": "No staff transfer is available on this line right now. I can take a message for reception instead.",
+          "tool.emergency.message": "If you may be experiencing an emergency, hang up and call {{emergency_number}} now, or go to your nearest A&E. Do not wait for a call back from this practice.",
+          "tool.availability.closed": "{{clinic_name}} is closed on {{date}}. Would a different day work?",
+          "tool.availability.closed_reason": "{{clinic_name}} is closed on {{date}} for {{closure_reason}}. Would a different day work?"
+        }
+      },
+      "evidenceHash": "7d4594559ab4f78acdda5c22910f076c3d9c8a530438eb424ae58c466c285b9c",
+      "approvedAt": "2026-08-28T09:00:00.000Z",
+      "approvedBy": {
+        "id": "3f1c9a52-8b47-4c1e-9a6d-2f70b58c4d11",
+        "displayName": "Jane Okafor"
+      },
+      "retiredAt": null,
+      "createdAt": "2026-08-27T09:00:00.000Z",
+      "updatedAt": "2026-08-28T09:00:00.000Z",
+      "boundActiveCampaigns": 1
+    },
+    {
+      "id": "pack-gb-2",
+      "language": "en-GB",
+      "country": "GB",
+      "version": 2,
+      "status": "DRAFT",
+      "source": "tenant",
+      "baseDefaultVersion": 1,
+      "strings": {
+        "emergencyNumber": "999",
+        "timeStyle": "24h",
+        "dateStyle": "weekday-day-month",
+        "messages": {
+          "disclosure.recording": "Hi, I'm {{agent_name}}, an AI assistant for {{clinic_name}}. This call may be recorded for quality and training.{{clinic_disclosure}} Is that okay?",
+          "dnc.acknowledge": "I heard your request. I am recording it now.",
+          "dnc.confirmed": "Your do-not-contact request is recorded. I will end the call now.",
+          "dnc.failed": "I could not confirm that the request was recorded. I will end this call and flag it for the team to review.",
+          "voicemail.script": "This is {{agent_name}}, an AI assistant calling for {{clinic_name}}. Please ring us back on {{clinic_phone}}. Goodbye.",
+          "summary.line": "Perfect. I have {{fields}}. Is everything correct?",
+          "not_interested.line": "No problem at all. Would you like us not to contact you again about this offer?",
+          "emergency.instruction": "If this may be an emergency, please hang up and call {{emergency_number}} now, or go to your nearest A&E.",
+          "after_hours.line": "Thanks for calling {{clinic_name}}. Reception is closed right now. We next open {{next_opening}}.",
+          "human_fallback.line": "No staff transfer is available on this line right now. I can take a message for reception instead.",
+          "tool.emergency.message": "If you may be experiencing an emergency, hang up and call {{emergency_number}} now, or go to your nearest A&E. Do not wait for a call back from this practice.",
+          "tool.availability.closed": "{{clinic_name}} is closed on {{date}}. Would a different day work?",
+          "tool.availability.closed_reason": "{{clinic_name}} is closed on {{date}} for {{closure_reason}}. Would a different day work?"
+        }
+      },
+      "evidenceHash": "75d4c7a359836aa34f99bb29d634bcc0a26eb560b4ed7c86757052970b36036d",
+      "approvedAt": null,
+      "approvedBy": null,
+      "retiredAt": null,
+      "createdAt": "2026-08-29T09:00:00.000Z",
+      "updatedAt": "2026-08-29T10:00:00.000Z",
+      "boundActiveCampaigns": 0
+    }
+  ],
+  "defaults": [
+    {
+      "language": "en-US",
+      "country": "US",
+      "version": 1,
+      "strings": {
+        "emergencyNumber": "911",
+        "timeStyle": "12h",
+        "dateStyle": "weekday-month-day",
+        "messages": {
+          "disclosure.recording": "Hi, I'm {{agent_name}}, an AI assistant for {{clinic_name}}. This call may be recorded or monitored for quality and documentation.{{clinic_disclosure}} Is that okay?",
+          "dnc.acknowledge": "I heard your request. I am recording it now.",
+          "dnc.confirmed": "Your do-not-contact request is recorded. I will end the call now.",
+          "dnc.failed": "I could not confirm that the request was recorded. I will end this call and flag it for staff review.",
+          "voicemail.script": "This is {{agent_name}}, an AI assistant calling for {{clinic_name}}. Please call {{clinic_phone}}. Goodbye.",
+          "summary.line": "Perfect. I have {{fields}}. Is everything correct?",
+          "not_interested.line": "No problem at all. Would you like us not to contact you again about this offer?",
+          "emergency.instruction": "If this may be an emergency, hang up and call {{emergency_number}} now, or go to the nearest emergency room.",
+          "after_hours.line": "Thanks for calling {{clinic_name}}. The office is currently closed. Our next opening is {{next_opening}}.",
+          "human_fallback.line": "No staff transfer is available on this line right now. I can take a message for the front desk instead.",
+          "tool.emergency.message": "If you may be experiencing an emergency, hang up and call {{emergency_number}} now, or go to the nearest emergency room. Do not wait for a callback from this office.",
+          "tool.availability.closed": "{{clinic_name}} is closed on {{date}}. Would a different day work?",
+          "tool.availability.closed_reason": "{{clinic_name}} is closed on {{date}} for {{closure_reason}}. Would a different day work?"
+        }
+      },
+      "evidenceHash": "814bd1a1974a5512f253d2085dde089d523e8d68d1727f4e6d560c7176ed0800"
+    },
+    {
+      "language": "en-GB",
+      "country": "GB",
+      "version": 1,
+      "strings": {
+        "emergencyNumber": "999",
+        "timeStyle": "24h",
+        "dateStyle": "weekday-day-month",
+        "messages": {
+          "disclosure.recording": "Hi, I'm {{agent_name}}, an AI assistant for {{clinic_name}}. This call may be recorded or monitored for quality and training purposes.{{clinic_disclosure}} Is that okay?",
+          "dnc.acknowledge": "I heard your request. I am recording it now.",
+          "dnc.confirmed": "Your do-not-contact request is recorded. I will end the call now.",
+          "dnc.failed": "I could not confirm that the request was recorded. I will end this call and flag it for the team to review.",
+          "voicemail.script": "This is {{agent_name}}, an AI assistant calling for {{clinic_name}}. Please call {{clinic_phone}}. Goodbye.",
+          "summary.line": "Perfect. I have {{fields}}. Is everything correct?",
+          "not_interested.line": "No problem at all. Would you like us not to contact you again about this offer?",
+          "emergency.instruction": "If this may be an emergency, please hang up and call {{emergency_number}} now, or go to your nearest A&E.",
+          "after_hours.line": "Thanks for calling {{clinic_name}}. The practice is currently closed. We next open {{next_opening}}.",
+          "human_fallback.line": "No staff transfer is available on this line right now. I can take a message for reception instead.",
+          "tool.emergency.message": "If you may be experiencing an emergency, hang up and call {{emergency_number}} now, or go to your nearest A&E. Do not wait for a call back from this practice.",
+          "tool.availability.closed": "{{clinic_name}} is closed on {{date}}. Would a different day work?",
+          "tool.availability.closed_reason": "{{clinic_name}} is closed on {{date}} for {{closure_reason}}. Would a different day work?"
+        }
+      },
+      "evidenceHash": "7d4594559ab4f78acdda5c22910f076c3d9c8a530438eb424ae58c466c285b9c"
+    }
+  ]
+}
