@@ -1,19 +1,53 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Bot, Trash2, Check, Megaphone } from 'lucide-react';
+import { Bot, Trash2, Check, Megaphone, Link2 } from 'lucide-react';
 import { Field, TextInput, TextArea, Select, Toggle } from '../ui/Field';
 import { receptionistApi as api, CAMPAIGN_TYPES, type Clinic, type Campaign, type Agent } from '../../lib/receptionist';
+import {
+  channelUsable, deploymentApi, useReceptionistCatalog, withCurrentOption,
+  type AgentRow, type ChannelStatus, type ConfirmationChannels, type ReadinessResponse, type RetellStatusResponse,
+} from '../../lib/receptionistDeployment';
 import { ApiError } from '../../lib/api';
-import { describeFailure, type ResourceFailure } from '../../lib/resourceState';
+import { describeFailure, receivedData, type ResourceFailure } from '../../lib/resourceState';
+import { useResource } from '../../hooks/useResource';
 import { isBusy, savedAtOf, useMutationState } from '../../hooks/useMutationState';
 import { formatEnumLabel } from './helpers';
 import { ConfirmedButton, SaveBar } from './shared';
 import { LoadFailureNotice, MutationNotice } from './MutationNotice';
 import { AgentEditor } from './AgentEditor';
+import { ReadinessChecklist } from './ReadinessChecklist';
+import { CampaignActions } from './CampaignActions';
+import { GoLiveCard } from './GoLiveCard';
 
 // ===== Campaign Panel (agent + campaign) ===================================
 
+const CHANNEL_BADGE: Record<ChannelStatus['status'], string> = {
+  live: 'badge badge-emerald', mock: 'badge badge-violet', configured_pending: 'badge badge-amber', unconfigured: 'badge badge-amber',
+};
+
+function ChannelToggle({ label, channel, checked, onChange }: {
+  label: string; channel: ChannelStatus | null; checked: boolean; onChange: (next: boolean) => void;
+}) {
+  // A toggle for a channel that cannot deliver would promise a confirmation
+  // no patient receives; it stays disabled with the server's own reason.
+  const usable = channelUsable(channel);
+  const disabled = channel !== null && !usable;
+  return (
+    <div className="space-y-1">
+      <div className={disabled ? 'opacity-50' : undefined} aria-disabled={disabled || undefined}>
+        <Toggle checked={checked} onChange={next => { if (!disabled) onChange(next); }} label={label} />
+      </div>
+      {channel && (
+        <p className="flex flex-wrap items-center gap-1.5 text-[11px] text-t3">
+          <span className={CHANNEL_BADGE[channel.status]}>{channel.status.replaceAll('_', ' ')}</span>
+          {channel.detail}
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic; campaign: Campaign; onChanged: () => Promise<unknown> }) {
-  const [agents, setAgents] = useState<Agent[]>([]);
+  const [agents, setAgents] = useState<AgentRow[]>([]);
   const [agentsFailure, setAgentsFailure] = useState<ResourceFailure | null>(null);
   const [draft, setDraft] = useState<Campaign>(campaign);
   const saveState = useMutationState();
@@ -24,6 +58,17 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
   const locations = clinic.locations ?? [];
   const rules = draft.bookingRules ?? {};
   const busy = isBusy(saveState.state) || isBusy(createAgentState.state);
+
+  const { catalog } = useReceptionistCatalog();
+  const loadReadiness = useCallback((signal: AbortSignal) => deploymentApi.readiness(campaign.id, signal), [campaign.id]);
+  const readinessResource = useResource<ReadinessResponse>(loadReadiness);
+  const readiness = receivedData(readinessResource.state);
+  const loadChannels = useCallback((signal: AbortSignal) => deploymentApi.confirmationChannels(signal), []);
+  const channelsResource = useResource<ConfirmationChannels>(loadChannels);
+  const channels = receivedData(channelsResource.state);
+  const loadStatus = useCallback((signal: AbortSignal) => deploymentApi.retellStatus({ campaignId: campaign.id }, signal), [campaign.id]);
+  const statusResource = useResource<RetellStatusResponse>(loadStatus);
+  const providerStatus = receivedData(statusResource.state);
 
   const loadAgents = useCallback(async () => {
     try {
@@ -42,36 +87,51 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
 
   const activeAgent = agents.find(a => a.id === draft.agentId) ?? null;
 
+  const reloadReadiness = readinessResource.reload;
+  const reloadStatus = statusResource.reload;
+
+  async function refreshAll() {
+    await onChanged();
+    reloadReadiness();
+    reloadStatus();
+  }
+
   async function ensureAgentAndSave() {
     await saveState.run(async () => {
+      // `status` is deliberately not sent: transitions go through
+      // CampaignActions so the readiness gate is the only way in.
       await api.updateCampaign(campaign.id, {
-        name: draft.name, campaignType: draft.campaignType, status: draft.status, agentId: draft.agentId,
+        name: draft.name, campaignType: draft.campaignType, agentId: draft.agentId,
         offerTitle: draft.offerTitle, offerDescription: draft.offerDescription, offerScript: draft.offerScript,
         appointmentType: draft.appointmentType, bookingRules: draft.bookingRules, eligibleLocationIds: draft.eligibleLocationIds,
         smsConfirmation: draft.smsConfirmation, emailConfirmation: draft.emailConfirmation,
       });
-      await onChanged();
+      await refreshAll();
     });
   }
 
-  // AgentEditor owns the mutation state for these two: it shows the server's
-  // code/message next to the provider evidence block. Both must throw.
+  // AgentEditor owns the mutation state for these: it shows the server's
+  // code/message next to the provider evidence block. All of them must throw.
   async function saveAgent(patch: Partial<Agent>) {
     if (!activeAgent) return;
     const updated = await api.updateAgent(activeAgent.id, patch);
-    setAgents(prev => prev.map(a => (a.id === updated.id ? updated : a)));
+    setAgents(prev => prev.map(a => (a.id === updated.id ? { ...a, ...updated } : a)));
+    reloadReadiness();
+    reloadStatus();
   }
 
   async function verifyAgent() {
     if (!activeAgent) return;
     try {
       const updated = await api.verifyAgentProvider(activeAgent.id);
-      setAgents(prev => prev.map(a => (a.id === updated.id ? updated : a)));
+      setAgents(prev => prev.map(a => (a.id === updated.id ? { ...a, ...updated } : a)));
+      reloadReadiness();
+      reloadStatus();
     } catch (error) {
       // A failed provider request still records a durable attempt state, and
       // the 409/503 body carries the row as `agent`. Show that state even
       // though the request failed, then let the editor show the cause.
-      const row = error instanceof ApiError ? (error.details?.agent as Agent | undefined) : undefined;
+      const row = error instanceof ApiError ? (error.details?.agent as AgentRow | undefined) : undefined;
       if (row && typeof row === 'object' && typeof row.id === 'string') {
         setAgents(prev => prev.map(a => (a.id === row.id ? row : a)));
       } else {
@@ -79,6 +139,13 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
       }
       throw error;
     }
+  }
+
+  async function adoptProviderValues() {
+    if (!activeAgent) return;
+    const updated = await deploymentApi.adoptProviderValues(activeAgent.id);
+    setAgents(prev => prev.map(a => (a.id === updated.id ? { ...a, ...updated } : a)));
+    reloadReadiness();
   }
 
   async function createNamedAgent() {
@@ -105,8 +172,27 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
       : [...draft.eligibleLocationIds, id]);
   }
 
+  const campaignTypeOptions = withCurrentOption(
+    catalog?.campaignTypes.length ? catalog.campaignTypes : CAMPAIGN_TYPES.map(t => ({ id: t, label: formatEnumLabel(t) })),
+    draft.campaignType,
+  );
+
   return (
     <div className="space-y-4">
+      <GoLiveCard readiness={readiness} campaignStatus={campaign.status} providerMode={providerStatus?.providerMode ?? catalog?.providerMode ?? null} />
+
+      <div className="cc-card p-5 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-sm font-bold text-t1">Activation</h3>
+          <span className={`badge ${campaign.status === 'ACTIVE' ? 'badge-emerald' : campaign.status === 'PAUSED' ? 'badge-amber' : 'badge-blue'}`}>{formatEnumLabel(campaign.status)}</span>
+        </div>
+        {readinessResource.state.status === 'error' && (
+          <LoadFailureNotice what="Activation readiness" message={readinessResource.state.failure.message} onRetry={readinessResource.reload} />
+        )}
+        {readiness && <ReadinessChecklist readiness={readiness} />}
+        <CampaignActions campaign={campaign} readiness={readiness} onChanged={refreshAll} />
+      </div>
+
       {/* Agent */}
       <div className="cc-card p-5 space-y-4">
         <h3 className="text-sm font-bold text-t1 inline-flex items-center gap-2"><Bot className="w-4 h-4 text-violet-v" /> Agent</h3>
@@ -123,9 +209,21 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
             agent={activeAgent}
             onSave={saveAgent}
             onVerify={verifyAgent}
+            onAdoptProviderValues={adoptProviderValues}
+            referenced={campaign.agentId === activeAgent.id}
+            verification={providerStatus?.verification ?? null}
+            blockers={providerStatus?.blockers ?? []}
+            providerMode={providerStatus?.providerMode ?? catalog?.providerMode ?? null}
+            catalog={catalog}
           />
         ) : (
-          <div className="space-y-2">
+          <div className="space-y-2" data-testid="no-agent-linked">
+            <div role="status" className="rounded-lg border border-[var(--b1)] bg-[var(--s3)] px-3 py-2">
+              <p className="text-xs font-semibold text-t1 inline-flex items-center gap-1.5"><Link2 className="w-3.5 h-3.5 text-t3" /> No agent linked</p>
+              <p className="text-[11px] text-t3 mt-0.5">
+                This campaign has no receptionist yet, so it cannot answer or place calls. Name one below, or choose an existing agent above.
+              </p>
+            </div>
             <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
               <TextInput aria-label="New agent name" placeholder="Enter a receptionist name" value={newAgentName} onChange={e => setNewAgentName(e.target.value)} />
               <button type="button" disabled={!newAgentName.trim() || busy || Boolean(agentsFailure)} onClick={createNamedAgent} className="rounded-xl bg-indigo px-3 py-2 text-sm font-semibold text-white disabled:opacity-40">Create agent</button>
@@ -144,9 +242,10 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
             message={`Delete ${campaign.name} and its configuration? This action cannot be undone.`}
             confirmLabel="Delete campaign"
             tone="red"
-            disabled={isBusy(removeState.state)}
+            disabled={isBusy(removeState.state) || campaign.status === 'ACTIVE'}
+            buttonTitle={campaign.status === 'ACTIVE' ? 'Pause the campaign before deleting it.' : 'Delete the campaign'}
             onConfirm={deleteCampaign}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--red-soft)]"
+            className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--red-soft)] disabled:opacity-40"
           >
             <Trash2 className="w-3 h-3" /> Delete
           </ConfirmedButton>
@@ -155,13 +254,8 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
         <div className="grid gap-4 md:grid-cols-2">
           <Field label="Campaign name" required><TextInput value={draft.name} onChange={e => set('name', e.target.value)} /></Field>
           <Field label="Campaign type">
-            <Select value={draft.campaignType} onChange={e => set('campaignType', e.target.value)}>
-              {CAMPAIGN_TYPES.map(t => <option key={t} value={t}>{formatEnumLabel(t)}</option>)}
-            </Select>
-          </Field>
-          <Field label="Status">
-            <Select value={draft.status} onChange={e => set('status', e.target.value as Campaign['status'])}>
-              {['DRAFT', 'ACTIVE', 'PAUSED', 'ARCHIVED'].map(s => <option key={s} value={s}>{s}</option>)}
+            <Select aria-label="Campaign type" value={draft.campaignType} onChange={e => set('campaignType', e.target.value)}>
+              {campaignTypeOptions.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
             </Select>
           </Field>
           <Field label="Appointment type" required><TextInput value={draft.appointmentType} onChange={e => set('appointmentType', e.target.value)} /></Field>
@@ -202,9 +296,15 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
           </div>
         </div>
 
-        <div className="flex flex-wrap gap-3">
-          <Toggle checked={draft.smsConfirmation} onChange={v => set('smsConfirmation', v)} label="SMS confirmation" />
-          <Toggle checked={draft.emailConfirmation} onChange={v => set('emailConfirmation', v)} label="Email confirmation" />
+        <div>
+          <p className="text-[11px] font-bold uppercase tracking-wide text-t3 mb-2">Confirmations</p>
+          {channelsResource.state.status === 'error' && (
+            <LoadFailureNotice what="Confirmation channel status" message={channelsResource.state.failure.message} onRetry={channelsResource.reload} className="mb-2" />
+          )}
+          <div className="flex flex-wrap gap-4">
+            <ChannelToggle label="SMS confirmation" channel={channels?.sms ?? null} checked={draft.smsConfirmation} onChange={v => set('smsConfirmation', v)} />
+            <ChannelToggle label="Email confirmation" channel={channels?.email ?? null} checked={draft.emailConfirmation} onChange={v => set('emailConfirmation', v)} />
+          </div>
         </div>
 
         <MutationNotice state={saveState.state} showSaved={false} onRetry={dirty ? ensureAgentAndSave : undefined} />

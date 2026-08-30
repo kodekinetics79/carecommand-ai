@@ -1,31 +1,85 @@
-import { Check, AlertCircle, CircleCheck, CircleAlert } from 'lucide-react';
-import type { RetellStatus } from '../../../lib/receptionist';
+import { CircleCheck, CircleAlert, AlertCircle, RefreshCw } from 'lucide-react';
+import {
+  normalizeRetellStatus, verificationLine,
+  type Blocker, type RetellStatusLike,
+} from '../../../lib/receptionistDeployment';
+import { FixLink } from '../ReadinessChecklist';
 
-export function RetellStatusCard({ status }: { status: RetellStatus | null }) {
-  if (!status) return null;
-  const ok = status.configured;
+const TONE_TEXT = { ok: 'text-emerald-v', warn: 'text-amber-v', error: 'text-red-v', muted: 'text-t3' } as const;
+
+function BlockerRow({ blocker }: { blocker: Blocker }) {
+  const blocking = blocker.severity === 'blocking';
   return (
-    <div className={`cc-card p-4 border-l-4 ${ok ? 'border-l-emerald-v' : 'border-l-amber-v'}`}>
+    <li className={`flex items-start gap-2 rounded-lg border px-3 py-2 ${blocking ? 'border-amber-v/40' : 'border-[var(--b1)]'}`} data-blocker={blocker.code} data-severity={blocker.severity}>
+      <AlertCircle className={`mt-0.5 h-3.5 w-3.5 shrink-0 ${blocking ? 'text-amber-v' : 'text-t3'}`} aria-hidden="true" />
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-semibold text-t1">{blocker.title}</p>
+        {blocker.action && <p className="text-[11px] text-t3">{blocker.action}</p>}
+        <p className="font-mono text-[10px] text-t3/80">{blocker.code} · {blocker.scope}</p>
+      </div>
+      <FixLink href={blocker.fixHref} label={`Fix ${blocker.title}`} />
+    </li>
+  );
+}
+
+/**
+ * Provider readiness for the selected scope. Renders the server's blockers
+ * (title, action, fix link) verbatim, the verification expiry with whether
+ * auto-renewal is really running, and the attended-UAT block only when the
+ * server sent one (demo profile). Accepts the legacy `/retell-status` body
+ * too, so the outbound panel keeps working until it moves to the new fields.
+ */
+export function RetellStatusCard({ status, onRefresh }: { status: RetellStatusLike | null; onRefresh?: () => void }) {
+  if (!status) return null;
+  const view = normalizeRetellStatus(status);
+  const blocking = view.blockers.filter(blocker => blocker.severity === 'blocking');
+  const ok = view.providerConfigured && view.agentReady && blocking.length === 0;
+  const line = view.verification.status ? verificationLine(view.verification) : null;
+  const uat = view.attendedUat;
+
+  return (
+    <div className={`cc-card border-l-4 p-4 ${ok ? 'border-l-emerald-v' : 'border-l-amber-v'}`}>
       <div className="flex items-start gap-3">
-        {ok ? <CircleCheck className="w-5 h-5 text-emerald-v shrink-0" /> : <CircleAlert className="w-5 h-5 text-amber-v shrink-0" />}
-        <div className="flex-1">
-          <div className="flex items-center gap-2">
-            <h3 className="text-sm font-bold text-t1">Tenant Retell prerequisites {ok ? 'detected' : 'need setup'}</h3>
-            {status.mock && <span className="badge badge-violet">mock mode</span>}
+        {ok ? <CircleCheck className="h-5 w-5 shrink-0 text-emerald-v" aria-hidden="true" /> : <CircleAlert className="h-5 w-5 shrink-0 text-amber-v" aria-hidden="true" />}
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="text-sm font-bold text-t1">Provider status {ok ? '— ready' : '— needs attention'}</h3>
+            {view.providerMode === 'mock' && <span className="badge badge-violet">mock mode</span>}
+            {view.providerMode === 'unconfigured' && <span className="badge badge-amber">unconfigured</span>}
+            {onRefresh && (
+              <button type="button" onClick={onRefresh} className="ml-auto inline-flex items-center gap-1 rounded-lg border border-[var(--b1)] px-2 py-1 text-[11px] font-semibold text-t2 hover:bg-[var(--s2)]">
+                <RefreshCw className="h-3 w-3" aria-hidden="true" /> Refresh
+              </button>
+            )}
           </div>
-          <p className="text-xs text-t3 mt-0.5">
+          <p className="mt-0.5 text-xs text-t3">
+            {view.agentScope.agentName ? `Agent ${view.agentScope.agentName}. ` : ''}
             {ok
-              ? 'Server credentials and at least one tenant agent deployment passed the status check. Each selected campaign still requires its own current authority, consent, target, quiet-hours, capacity, and stop checks at launch.'
-              : 'Set the missing environment variables on the server to enable live outbound calls. Secrets are never sent to the browser.'}
+              ? 'Server credentials and the agent deployment passed the status check. Each campaign still needs its own readiness checks before activation.'
+              : blocking.length
+                ? `${blocking.length} blocking item${blocking.length === 1 ? '' : 's'} before calls can be placed or answered.`
+                : 'No blocking items; review the warnings below.'}
           </p>
-          <div className="flex flex-wrap gap-2 mt-3">
-            {status.checklist.map(item => (
-              <span key={item.key} className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[11px] font-semibold ${item.set ? 'border-[var(--b1)] text-t2' : 'border-amber-v/40 text-amber-v'}`}>
-                {item.set ? <Check className="w-3 h-3 text-emerald-v" /> : <AlertCircle className="w-3 h-3" />}
-                {item.label}
-              </span>
-            ))}
-          </div>
+          {line && <p className={`mt-1 text-xs font-semibold ${TONE_TEXT[line.tone]}`} data-verification={view.verification.status ?? ''}>{line.text}</p>}
+          {view.blockers.length > 0 && (
+            <ul className="mt-3 space-y-1.5" aria-label="Provider blockers">
+              {view.blockers.map(blocker => <BlockerRow key={blocker.code} blocker={blocker} />)}
+            </ul>
+          )}
+          {uat && (
+            <div className="mt-3 rounded-lg border border-[var(--b1)] bg-[var(--s3)] px-3 py-2" data-testid="attended-uat">
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="text-xs font-semibold text-t1">Attended live-test authorization</p>
+                <span className={`badge ${uat.active ? 'badge-emerald' : 'badge-amber'}`}>{uat.active ? 'active' : 'blocked'}</span>
+              </div>
+              <p className="mt-0.5 text-[11px] text-t3">
+                Destination {uat.allowedDestinationMasked ?? 'not configured'} · {uat.callsRemaining} call{uat.callsRemaining === 1 ? '' : 's'} remaining · {uat.minutesRemaining} minute{uat.minutesRemaining === 1 ? '' : 's'} remaining · window {uat.windowStart}–{uat.windowEnd} {uat.timezone}
+              </p>
+              {!uat.active && (uat.blockingReason || uat.admissionReason) && (
+                <p className="mt-0.5 font-mono text-[10px] text-amber-v">{uat.blockingReason ?? uat.admissionReason}</p>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>
