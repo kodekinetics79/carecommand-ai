@@ -40,14 +40,48 @@ describe('AI receptionist conversation safety contract', () => {
     expect(RECORDING_DISCLOSURE_EVIDENCE_TEMPLATE.endsWith('{{clinic_disclosure}} Is that okay?')).toBe(true);
   });
 
-  it('makes the provider begin message a consent-only turn and waits before greeting', () => {
+  // C4 — the begin message used to be the consent question ALONE, so the first
+  // thing a patient heard was an interrogation. It is now one turn that greets
+  // first and still ends on the consent question, so the agent must stop and
+  // wait. The greeting override still waits for consent.
+  it('greets the caller in the same turn as the disclosure, and still ends on the consent question', () => {
     const built = buildRetellConfig(baseConfig, { webhookBaseUrl: 'https://api.example.test' });
 
+    expect(built.beginMessage.startsWith('Thanks for calling Example Clinic.')).toBe(true);
+    expect(built.beginMessage).toContain('This call may be recorded or monitored');
     expect(built.beginMessage.endsWith('Is that okay?')).toBe(true);
+    // The campaign greeting override is still not spoken before consent.
     expect(built.beginMessage).not.toContain('Welcome to our scheduling line.');
     expect(built.systemPrompt).toMatch(/STOP SPEAKING after that question and wait/i);
-    expect(built.systemPrompt).toMatch(/Silence, voicemail, ambiguity, or continuing to speak is not consent/i);
-    expect(built.systemPrompt).toContain('After consent is granted, you may say: "Welcome to our scheduling line."');
+    expect(built.systemPrompt).toMatch(/Silence, voicemail, ambiguity, or simply carrying on talking is not agreement to being recorded/i);
+    expect(built.systemPrompt).toContain('You may then add: "Welcome to our scheduling line."');
+  });
+
+  // C3 — the prompt used to order the agent to "explain that this AI line
+  // cannot continue ... and end the call" when a caller refused recording,
+  // while the handler had always degraded safely. A patient exercising a
+  // privacy right was refused service by their own clinic.
+  it('continues the call when recording is refused, and never orders a hang-up', () => {
+    const prompt = generateSystemPrompt(baseConfig);
+
+    expect(prompt).toContain('# Consent — what each answer means');
+    expect(prompt).toContain(EN_US.strings.messages['consent.refused.continue']);
+    expect(prompt).toMatch(/THE CALL CONTINUES/);
+    expect(prompt).toMatch(/Never end the call because recording was refused/i);
+    expect(prompt).not.toMatch(/this AI line cannot continue/i);
+    // Only an objection to the AI itself routes away (contract section 2).
+    expect(prompt).toContain(EN_US.strings.messages['consent.declined.route']);
+    expect(prompt).toMatch(/Never treat a refusal to be recorded as an objection to talking to you/i);
+  });
+
+  // C4 — the tool must not read its own result aloud; "This pilot remains
+  // metadata-only unless the approved retention workflow applies" was the
+  // second sentence a patient heard.
+  it('does not let the consent tool speak its own result', () => {
+    const consentTool = buildRetellConfig(baseConfig, { webhookBaseUrl: 'https://api.example.test' })
+      .tools.find(tool => tool.name === 'record_recording_preference') as { speak_after_execution: boolean };
+    expect(consentTool.speak_after_execution).toBe(false);
+    expect(generateSystemPrompt(baseConfig)).toContain(EN_US.strings.messages['consent.granted.ack']);
   });
 
   it('gives emergency instructions absolute precedence over disclosure and tools', () => {

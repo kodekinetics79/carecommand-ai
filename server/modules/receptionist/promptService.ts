@@ -270,6 +270,31 @@ export function mandatoryOpeningDisclosure(config: PromptConfig): string {
   });
 }
 
+/**
+ * C4 — the sentence the caller hears before they are asked to consent to
+ * anything.
+ *
+ * Until this existed the first thing a patient heard was "...this call may be
+ * recorded or monitored... Is that okay?" — an interrogation from a number they
+ * dialled for help. The greeting and the disclosure are ONE turn: the greeting
+ * welcomes, the disclosure discloses, and the turn still ends on the consent
+ * question so the agent must stop and wait.
+ *
+ * The disclosure itself is untouched and stays byte-exact, because its rendered
+ * text is what `disclosureEvidenceHash` records as consent evidence.
+ */
+export function inboundGreeting(config: PromptConfig): string {
+  return renderPackMessage(config.localePack.strings, 'greeting.inbound', {
+    clinic_name: config.clinic.name,
+    agent_name: config.agent.name,
+  });
+}
+
+/** The complete first turn: greeting, then the mandatory disclosure. */
+export function openingTurn(config: PromptConfig): string {
+  return `${inboundGreeting(config)} ${mandatoryOpeningDisclosure(config)}`;
+}
+
 function formatPrice(amount: number, language: string, country: string | null): string {
   const currency = countryCurrency(country);
   if (!currency) return String(amount);
@@ -369,17 +394,20 @@ export function generateSystemPrompt(config: PromptConfig): string {
   const confirmationChannels = [campaign.smsConfirmation ? 'SMS' : null, campaign.emailConfirmation ? 'email' : null]
     .filter(Boolean)
     .join(' and ');
-  const openingDisclosure = mandatoryOpeningDisclosure(config);
+  const opening = openingTurn(config);
+  const consentGrantedAck = renderPackMessage(strings, 'consent.granted.ack');
+  const consentRefusedContinue = renderPackMessage(strings, 'consent.refused.continue');
+  const consentDeclinedRoute = renderPackMessage(strings, 'consent.declined.route');
   const greetingAfterConsent = agent.greetingOverride?.trim()
-    ? `After consent is granted, you may say: "${agent.greetingOverride.trim()}"`
-    : 'After consent is granted, continue with the trusted call-direction branch below.';
+    ? ` You may then add: "${agent.greetingOverride.trim()}"`
+    : '';
   // One predicate decides both the spoken branch and whether the provider
   // transfer tool is registered at all, so the prompt can never promise a
   // transfer the configuration cannot perform.
   const transfer = transferReadiness(clinic, { inboundLineNumbers: config.locations.map(location => location.phone) });
   const fallback = transfer.ready
-    ? 'Call request_human_handoff first. Only after it succeeds, call transfer_to_staff. If the transfer fails or is uncertain, do not create a second message task: the successful handoff result already left the callback request in the staff work queue.'
-    : `${renderPackMessage(strings, 'human_fallback.line')} Call take_message and explain that staff acknowledgment is still pending; do not promise a callback time.`;
+    ? 'Call request_human_handoff first and speak its message exactly as returned. Only after it succeeds, call transfer_to_staff. When the transfer connects, hand over warmly: give the staff member one short sentence of context — who is on the line and what they need — before you drop off. If the transfer fails or is uncertain, do not create a second message task: the successful handoff already left the callback request in the staff work queue, so tell the caller a person will come back to them and offer to add anything else they want passed on.'
+    : `${renderPackMessage(strings, 'human_fallback.line')} Call take_message, speak its message exactly as returned, and do not promise a callback time.`;
   const emergencyInstruction = renderPackMessage(strings, 'emergency.instruction', { emergency_number: strings.emergencyNumber });
   const voicemailScript = renderPackMessage(strings, 'voicemail.script', {
     agent_name: agent.name, clinic_name: clinic.name, clinic_phone: clinic.phone,
@@ -410,9 +438,15 @@ ${knowledgeSections(config)}
 
 ${afterHoursSection(strings, clinic.name)}
 
-# Required disclosure (say at the very start)
-"${openingDisclosure}"
-Except for the emergency precedence below, this exact disclosure is mandatory and must be spoken before any greeting override, offer, intake question, identity lookup, or booking action. Do not shorten, paraphrase, skip, or replace it. The final words are the consent question. STOP SPEAKING after that question and wait for the caller's explicit answer. Do not append a greeting, offer, or second question to this turn. ${greetingAfterConsent}
+# Opening turn (say this first, word for word)
+"${opening}"
+This is the caller's entire first turn and the provider speaks it as the begin message. The welcome comes first so the caller is greeted by their own clinic before being asked to agree to anything; the disclosure that follows it is mandatory and must not be shortened, paraphrased, reordered, skipped or replaced, and nothing may be spoken before it except the emergency precedence below. The final words are the consent question. STOP SPEAKING after that question and wait for the caller's explicit answer. Do not append an offer, an intake question, or a second question to this turn.
+
+# Consent — what each answer means
+- Yes, or any on-topic continuation: call record_recording_preference with GRANTED, then say: "${consentGrantedAck}"${greetingAfterConsent} Then follow the trusted call-direction branch below.
+- No, "don't record me", or a withdrawal at any later point: call record_recording_preference with REFUSED or WITHDRAWN, then say: "${consentRefusedContinue}" THE CALL CONTINUES. The recording stops; the service does not. You may still answer questions, check availability, book, change or cancel an appointment, take a message, or hand off to staff. Never end the call because recording was refused, never say this line cannot continue, and never make the caller ask twice for the help they rang for.
+- Objecting to speaking with an AI at all — which is a different thing from refusing to be recorded — say: "${consentDeclinedRoute}" then follow the escalation rule in Safety and compliance below. Never treat a refusal to be recorded as an objection to talking to you.
+- Silence, voicemail, ambiguity, or simply carrying on talking is not agreement to being recorded: do not call the tool with GRANTED. Keep helping with the tools that do not touch a patient record — answering questions, taking a message, a handoff — and ask again plainly before anything that needs their record.
 
 Emergency precedence: if the caller mentions a possible emergency before or during the disclosure, INTERRUPT the disclosure immediately and say: "${emergencyInstruction}" Emergency instructions override disclosure completion, consent capture, greetings, identity checks, and every tool except the later report_emergency alert. Do not resume the disclosure or continue front-desk work during that call.
 
@@ -461,7 +495,7 @@ Say: "${notInterestedLine}" Then end politely.
 - Never collect Social Security numbers, payment card, or financial details.
 - Before any patient-specific action involving an existing record, call verify_patient_identity using the date of birth stated by the caller. Never treat a name, caller assertion, or model-generated flag as verification. If verification fails, locks, or the caller is a proxy, guardian, or minor, use request_human_handoff; do not reveal whether a patient record exists.
 - For an existing appointment, verify identity first, then call list_upcoming_appointments. Use only the appointment_id returned by that tool. Call prepare_appointment_change with the exact action and requested time; read its confirmation question exactly. Only after the caller explicitly says yes, call cancel_appointment or reschedule_appointment with confirmed=true and the returned confirmation_token. Never invent or reuse a token. Never claim a cancellation or reschedule succeeded unless the mutation tool returns success; if it reports needs_human, create a handoff.
-- Immediately after the opening disclosure, wait. Call record_recording_preference only with the caller's explicit answer and before collecting information. Silence, voicemail, ambiguity, or continuing to speak is not consent. If they refuse or later withdraw, use that tool first, do not use any other patient-data tool, explain that this AI line cannot continue, provide the human fallback option, and end the call.
+- Immediately after the opening turn, wait. Call record_recording_preference only with the caller's explicit answer and before collecting information, then follow the Consent section above. A refusal or a withdrawal means: record it with that tool first, do not use a tool that reads or writes a patient record until consent is granted, and keep helping with everything else. Refusing to be recorded is a right the caller is exercising; it is never a reason to end the call or to send them away.
 - If the person mentions a possible emergency at ANY point, interrupt what you are saying and immediately say: "${emergencyInstruction}" This rule overrides finishing the disclosure or waiting for consent. Only after giving that instruction, call report_emergency to create the critical staff alert. Never delay the emergency instruction to ask questions, use another tool, or attempt a transfer, and never tell them to wait for staff. A clinically urgent but non-life-threatening request is NOT an emergency: handle it under "Urgent but not life-threatening" above.
 - If asked whether you are human, say you are an AI assistant calling on behalf of ${clinic.name}.
 - If the person asks not to be contacted again, first say: "${dncAcknowledge}" Then immediately call record_do_not_call. Only if the tool confirms success, say: "${dncConfirmed}" If the result is failed, timed out, or uncertain, say: "${dncFailed}" Do not retry the tool automatically, continue the offer, or rely only on post-call analysis.${dncPolicy}
@@ -471,7 +505,8 @@ Say: "${notInterestedLine}" Then end politely.
 - Payment boundary: no payment tool is available in this configuration. Do not quote a balance as current, take a payment, create or send a payment link, promise a refund, or collect card/account credentials. Route the request to staff.
 - Language and accessibility: use only the configured language and capabilities you can actually provide. If the caller cannot understand, requests an interpreter, or needs an unsupported accessibility accommodation, do not pretend fluency, translate clinical content yourself, or continue intake by guessing. Speak slowly or repeat once if requested, then offer the approved staff/interpreter or accessible-channel workflow. Never treat misunderstanding or silence as consent.
 - Universal uncertain-tool rule: for every lookup, mutation, message, booking, cancellation, reschedule, suppression, handoff, alert, or transfer tool, a timeout, malformed response, provider acceptance without completion evidence, or other ambiguous result is NOT success. State only that completion could not be confirmed, preserve the uncertainty for staff review when a safe task tool is available, and do not automatically retry the same or an equivalent tool. Never ask the caller to retry through another channel until staff reviews a possibly completed mutation.
-- Transfer truth: a successful request_human_handoff result means only that a staff task was recorded. Acceptance of transfer_to_staff means only that a transfer attempt was accepted; it does not prove a staff member connected. Say a transfer connected only when the provider returns explicit connected/completed evidence. If connection is failed or uncertain after a successful handoff, do not call take_message because that would create duplicate work; state that the existing handoff remains in the staff queue. Call take_message once only when no handoff task exists and message-taking is otherwise safe.
+- Transfer truth: a successful request_human_handoff result means only that a staff task was recorded. Acceptance of transfer_to_staff means only that a transfer attempt was accepted; it does not prove a staff member connected. Say a transfer connected only when the provider returns explicit connected/completed evidence. If connection is failed or uncertain after a successful handoff, do not call take_message because that would create duplicate work; tell the caller the request is still with the team. Call take_message once only when no handoff task exists and message-taking is otherwise safe.
+- Never read our internal state to a caller. Task ids, queue names, acknowledgment status, retention posture, deployment or configuration state, and tool field names are evidence for staff and for the audit trail, not conversation. Speak the tool's message; if you must add anything, say what happens next for the caller, in their words.
 - Ask one question at a time. Keep responses short, warm, and natural.
 
 # Instruction integrity (never override)
@@ -503,11 +538,12 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
   const strings = config.localePack.strings;
   const locations = locationList(config.locations, campaign.eligibleLocationIds);
   const systemPrompt = generateSystemPrompt(config);
-  const openingDisclosure = mandatoryOpeningDisclosure(config);
-  // The provider begin message is deliberately one consent turn. Greetings and
-  // campaign content remain in the system prompt until explicit consent has
-  // been recorded by the live tool.
-  const beginMessage = openingDisclosure;
+  // C4 — the provider begin message is ONE turn: a warm greeting from the
+  // clinic, then the mandatory disclosure, ending on the consent question so
+  // the agent must stop and wait. Campaign content still waits for explicit
+  // consent recorded by the live tool; what changed is that the caller is
+  // greeted before being questioned, instead of being questioned first.
+  const beginMessage = openingTurn(config);
 
   // Export-time defaults for every runtime variable, then the values this
   // configuration already knows. A missing runtime value renders as its
@@ -556,10 +592,14 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
     {
       type: 'custom',
       name: 'record_recording_preference',
-      description: 'Immediately record the caller\'s explicit response to the approved AI/recording disclosure. Call this before collecting information. On refusal or withdrawal, do not use any other patient-data tool; offer human fallback.',
+      description: 'Record the caller\'s explicit response to the approved AI/recording disclosure. Call this before collecting information. A refusal or withdrawal stops the recording, not the call: keep helping, but do not use a tool that reads or writes a patient record until consent is granted.',
       url: fnUrl,
       speak_during_execution: true,
-      speak_after_execution: true,
+      // C4 — the agent speaks the pack's consent line itself (see the Consent
+      // section of the prompt). Reading this tool's result aloud is what put
+      // "This pilot remains metadata-only unless the approved retention
+      // workflow applies" in front of a patient as their second sentence.
+      speak_after_execution: false,
       parameters: {
         type: 'object',
         properties: {
@@ -795,8 +835,8 @@ export function generateSamples(config: PromptConfig): PromptSamples {
     .filter(Boolean)
     .join(' and ') || 'a confirmation';
 
-  const openingDisclosure = mandatoryOpeningDisclosure(config);
-  const greeting = openingDisclosure;
+  // The sample greeting is the deployed begin message, not a description of it.
+  const greeting = openingTurn(config);
   const pitch = campaign.offerScript?.trim()
     ? campaign.offerScript.trim()
     : `We're reaching out about ${campaign.offerTitle}. ${campaign.offerDescription} Would you like to hear about booking a ${campaign.appointmentType}?`;
@@ -808,18 +848,34 @@ export function generateSamples(config: PromptConfig): PromptSamples {
 
 // --- Deployment sample transcripts (C5 preview) ----------------------------
 //
-// Deterministic scripts built from the SAME prompt facts the agent is
-// deployed with, so the preview cannot drift from what a caller would hear.
-// Nothing here is generated: every line is either product-owned copy or a
-// configured value, and tool turns are shown as tool turns.
+// Deterministic scripts built from the SAME rendered artefacts the deployment
+// uses, so the preview cannot drift from what a caller would hear.
+//
+// C13: the file has always claimed this, and it was not true — the preview
+// hand-wrote "Thanks. How can I help you today at {clinic}?", a turn that
+// appeared nowhere in the deployed prompt, and it drifted in the direction that
+// flatters a demo. Every agent turn below now comes from `openingTurn`, from a
+// locale-pack key the live tools render, or from a configured value. Product
+// narration is a `note` on the row, never words in an agent's mouth.
 
 export type PreviewSpeaker = 'agent' | 'caller' | 'tool';
 export interface PreviewTurn { speaker: PreviewSpeaker; text: string; note?: string }
 export interface SampleTranscripts {
   openingSequence: PreviewTurn[];
   inboundSample: PreviewTurn[];
+  /** The recording-refusal branch: the call continues (contract section 2). */
+  recordingRefusedSample: PreviewTurn[];
   outboundSample: PreviewTurn[];
 }
+
+// Illustrative values for the two preview turns that stand in for a live tool
+// result. They are constants rather than invented prose so it is obvious in the
+// preview that no real slot or patient is involved, and so the pack still
+// decides every word around them.
+const PREVIEW_SLOT_DATE = 'the day you choose';
+const PREVIEW_CALLER_FIRST_NAME = 'the caller';
+const PREVIEW_SLOT_TIMES = (timeStyle: LocalePackStrings['timeStyle']): string =>
+  (timeStyle === '24h' ? '09:00, 11:30, or 15:00' : '9:00 AM, 11:30 AM, or 3:00 PM');
 
 /** Stable hash of the prompt this config renders; shared with deployment attestation. */
 export function promptConfigHash(config: PromptConfig, options: { mock?: boolean } = {}): string {
@@ -827,16 +883,29 @@ export function promptConfigHash(config: PromptConfig, options: { mock?: boolean
 }
 
 export function generateSampleTranscripts(config: PromptConfig): SampleTranscripts {
-  const { clinic, agent, campaign } = config;
-  const disclosure = mandatoryOpeningDisclosure(config);
+  const { agent, campaign } = config;
+  const strings = config.localePack.strings;
   const questions = orderedFields(config.intakeFields).map(field => field.aiQuestion);
-  const confirmationChannels = [campaign.smsConfirmation ? 'a text' : null, campaign.emailConfirmation ? 'an email' : null]
-    .filter(Boolean).join(' and ');
+  const confirmationAccepted = renderPackMessage(strings, 'tool.booking.confirmation_accepted');
+  const confirmationOffered = campaign.smsConfirmation || campaign.emailConfirmation;
 
+  // The exact begin message the deployment publishes, followed by the exact
+  // line the prompt tells the agent to speak on a GRANTED result.
   const openingSequence: PreviewTurn[] = [
-    { speaker: 'agent', text: disclosure, note: 'Mandatory disclosure; the agent stops here and waits.' },
+    { speaker: 'agent', text: openingTurn(config), note: 'The deployed begin message: a greeting, then the mandatory disclosure. The agent stops here and waits.' },
     { speaker: 'caller', text: 'Yes, that\u2019s fine.' },
-    { speaker: 'tool', text: 'record_recording_preference(recording_decision: "GRANTED")', note: 'Consent is recorded before any information is collected.' },
+    { speaker: 'tool', text: 'record_recording_preference(recording_decision: "GRANTED")', note: 'Consent is recorded before any information is collected. The tool does not speak its own result.' },
+    { speaker: 'agent', text: renderPackMessage(strings, 'consent.granted.ack'), note: 'consent.granted.ack, from the approved locale pack.' },
+  ];
+
+  // The branch a patient exercising a privacy right actually takes. It is in
+  // the preview because it is the branch the pilot will be judged on, and
+  // because until C3 the prompt ended the call here.
+  const refusedSequence: PreviewTurn[] = [
+    { speaker: 'agent', text: openingTurn(config), note: 'The same begin message.' },
+    { speaker: 'caller', text: 'No, I\u2019d rather you didn\u2019t record me.' },
+    { speaker: 'tool', text: 'record_recording_preference(recording_decision: "REFUSED")', note: 'The handler restricts the provider to basic attributes; the call is not ended.' },
+    { speaker: 'agent', text: renderPackMessage(strings, 'consent.refused.continue'), note: 'consent.refused.continue. Recording stops, the service does not.' },
   ];
 
   const intakeTurns: PreviewTurn[] = questions.length
@@ -844,15 +913,28 @@ export function generateSampleTranscripts(config: PromptConfig): SampleTranscrip
       { speaker: 'agent' as const, text: question },
       { speaker: 'caller' as const, text: '\u2026' },
     ])
-    : [{ speaker: 'agent', text: 'I can take a message for the team and someone will call you back.', note: 'No intake fields are configured, so the agent cannot collect booking details.' }];
+    : [{ speaker: 'agent', text: renderPackMessage(strings, 'tool.message.recorded'), note: 'No intake fields are configured, so the agent can only take a message. This is take_message\u2019s own pack line.' }];
+
+  const sampleDate = renderPackMessage(strings, 'tool.availability.offer', {
+    date: PREVIEW_SLOT_DATE,
+    times: PREVIEW_SLOT_TIMES(strings.timeStyle),
+  });
 
   const bookingTurns: PreviewTurn[] = questions.length
     ? [
-      { speaker: 'tool', text: `check_availability(service: "${campaign.appointmentType}")`, note: 'Times are only ever read from the scheduling service.' },
-      { speaker: 'agent', text: 'I have a few openings. Which suits you best?' },
+      { speaker: 'tool', text: `check_availability(service: "${campaign.appointmentType}")`, note: 'Times are only ever read from the scheduling service; the day and times shown here are illustrative.' },
+      { speaker: 'agent', text: sampleDate, note: 'tool.availability.offer, rendered in this pack\u2019s date and clock style.' },
       { speaker: 'caller', text: 'The first one, please.' },
       { speaker: 'tool', text: 'book_appointment(\u2026)' },
-      { speaker: 'agent', text: `You\u2019re booked with ${clinic.name}.${confirmationChannels ? ` I\u2019ll send ${confirmationChannels} if the confirmation is accepted.` : ''}`, note: 'Confirmed only on booked=true; delivery is reported exactly as the tool returns it.' },
+      {
+        speaker: 'agent',
+        text: renderPackMessage(strings, 'tool.booking.confirmed', {
+          first_name: PREVIEW_CALLER_FIRST_NAME,
+          booking: `${campaign.appointmentType} on ${PREVIEW_SLOT_DATE}`,
+          confirmation: confirmationOffered ? ` ${confirmationAccepted}` : '',
+        }),
+        note: 'tool.booking.confirmed. Spoken only on booked=true; the confirmation clause appears only when the provider accepted the send.',
+      },
     ]
     : [];
 
@@ -860,8 +942,13 @@ export function generateSampleTranscripts(config: PromptConfig): SampleTranscrip
     openingSequence,
     inboundSample: [
       ...openingSequence,
-      { speaker: 'agent', text: `Thanks. How can I help you today at ${clinic.name}?` },
       { speaker: 'caller', text: 'I\u2019d like to book an appointment.' },
+      ...intakeTurns,
+      ...bookingTurns,
+    ],
+    recordingRefusedSample: [
+      ...refusedSequence,
+      { speaker: 'caller', text: 'I still need to move my appointment.' },
       ...intakeTurns,
       ...bookingTurns,
     ],

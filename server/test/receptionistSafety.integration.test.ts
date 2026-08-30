@@ -65,8 +65,16 @@ describe('AI receptionist safety workflows', () => {
 
     expect(first.handoff_recorded).toBe(true);
     expect(first.transfer_completed).toBe(false);
-    expect(first.message).toMatch(/not acknowledged/i);
-    expect(first.message).toMatch(/no transfer has occurred/i);
+    // C12 — the evidence a caller used to be read aloud ("I created a request
+    // in the front desk queue. Staff have not acknowledged it yet... no
+    // transfer has occurred yet") now lives in structured fields, where the
+    // front desk and the audit trail read it.
+    expect(first.staff_acknowledged).toBe(false);
+    expect(first.transfer_attempted).toBe(false);
+    expect(first.queue).toBe('front_desk');
+    expect(first.message).not.toMatch(/not acknowledged|no transfer has occurred|front desk queue/i);
+    expect(first.message).toMatch(/passed this to (the front desk|reception)/i);
+    expect(first.message).not.toMatch(/task|queue id|acknowledg/i);
     expect(replay).toMatchObject({ duplicate: true, task_id: first.task_id });
     expect(await db.staffTask.count({ where: { tenantId: tenant.id } })).toBe(1);
 

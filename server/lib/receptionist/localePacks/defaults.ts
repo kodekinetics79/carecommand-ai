@@ -23,7 +23,7 @@ export interface PlatformLocalePack {
 const EN_US_V1: PlatformLocalePack = {
   language: 'en-US',
   country: 'US',
-  version: 1,
+  version: 2,
   strings: {
     emergencyNumber: '911',
     timeStyle: '12h',
@@ -42,6 +42,41 @@ const EN_US_V1: PlatformLocalePack = {
       'tool.emergency.message': 'If you may be experiencing an emergency, hang up and call {{emergency_number}} now, or go to the nearest emergency room. Do not wait for a callback from this office.',
       'tool.availability.closed': '{{clinic_name}} is closed on {{date}}. Would a different day work?',
       'tool.availability.closed_reason': '{{clinic_name}} is closed on {{date}} for {{closure_reason}}. Would a different day work?',
+
+      // C4 — the caller is greeted before they are asked to consent to anything.
+      'greeting.inbound': "Thanks for calling {{clinic_name}}. You've reached the front desk, and I can book, move or cancel an appointment, answer a question, or take a message for the team. One quick thing before we start.",
+
+      // C3/C4 — the consent ladder. Refusing recording never costs the caller
+      // the service; only an objection to the AI itself routes away.
+      'consent.granted.ack': 'Thank you. So, how can I help you today?',
+      'consent.refused.continue': "That's absolutely fine. This call won't be recorded, and we can carry straight on. How can I help you today?",
+      'consent.declined.route': "Of course, you should speak to a person. Let me pass you to the team now, and if no one is free I'll take your details so they can call you straight back.",
+      'consent.refused.recorded': "That's recorded. This call won't be recorded or transcribed, and I can still help you here.",
+
+      // C6 — a lapsed or drifted deployment. The caller keeps a way through.
+      'receptionist.degraded.unverified': "I can't open the appointment book on this call, so I don't want to guess at a time. I can take a message for the front desk right now, or put you through to someone. Which would you prefer?",
+      'receptionist.degraded.verification_stale': "I can't reach the appointment system on this call, so I won't guess at a time. I can take a message for the front desk right now, or put you through to someone. Which would you prefer?",
+      'receptionist.degraded.deployment_drift': "The front desk system is being updated right now, so I can't book on this call. I can take a message for the team straight away, or put you through to someone. Which would you prefer?",
+
+      // C7 — an admission denial is still answered, and still offers a person.
+      'admission.denied.capacity': "We're taking more calls than usual right now, so rather than keep you waiting I'll put you through to the front desk.",
+      'admission.denied.demo': "Thanks for calling. This line is set up for demonstration only and isn't taking patient calls, so I won't take your details here. Please call the practice on its main number.",
+      'admission.denied.unavailable': "I'm sorry, the automated line isn't available right now. Let me put you through to the front desk instead.",
+
+      // C12 — what the caller hears when they ask for a human. The task id and
+      // the acknowledgment state stay in the structured result, not here.
+      'handoff.spoken': "Of course. I've passed this to the front desk with your number, so it won't be lost. Let me see if someone is free to pick up now.",
+      'handoff.no_transfer': "Of course. I've passed this to the front desk with your number, so it won't be lost, and someone will get back to you. Is there anything you'd like me to add for them?",
+
+      // C10 — booking and availability results, previously hardcoded en-US.
+      'tool.availability.none': "I don't have any openings on {{date}}. Would a different day work?",
+      'tool.availability.offer': 'On {{date}} I have {{times}}. Which works best for you?',
+      'tool.availability.needs_review': "I can't confirm the right clinician for that on this call. I can take a message so the front desk can call you back with times.",
+      'tool.booking.confirmed': "Perfect, {{first_name}}. You're booked for {{booking}}.{{confirmation}}",
+      'tool.booking.already': "You're already booked for {{booking}}.{{confirmation}}",
+      'tool.booking.confirmation_accepted': "I've sent your confirmation; I can't confirm it has arrived yet.",
+      'tool.message.recorded': "Thank you. That's written down for the front desk with your number. Someone will pick it up and get back to you; I can't promise exactly when.",
+      'tool.message.appended': "Thank you. I've added that to the same note for the front desk. Someone will pick it up and get back to you; I can't promise exactly when.",
     },
   },
 };
@@ -49,7 +84,7 @@ const EN_US_V1: PlatformLocalePack = {
 const EN_GB_V1: PlatformLocalePack = {
   language: 'en-GB',
   country: 'GB',
-  version: 1,
+  version: 2,
   strings: {
     emergencyNumber: '999',
     timeStyle: '24h',
@@ -68,6 +103,41 @@ const EN_GB_V1: PlatformLocalePack = {
       'tool.emergency.message': 'If you may be experiencing an emergency, hang up and call {{emergency_number}} now, or go to your nearest A&E. Do not wait for a call back from this practice.',
       'tool.availability.closed': '{{clinic_name}} is closed on {{date}}. Would a different day work?',
       'tool.availability.closed_reason': '{{clinic_name}} is closed on {{date}} for {{closure_reason}}. Would a different day work?',
+
+      // C4 — the caller is greeted before they are asked to consent to anything.
+      'greeting.inbound': "Thanks for calling {{clinic_name}}. You've reached reception, and I can book, move or cancel an appointment, answer a question, or take a message for the team. One quick thing before we start.",
+
+      // C3/C4 — the consent ladder. Refusing recording never costs the caller
+      // the service; only an objection to the AI itself routes away.
+      'consent.granted.ack': 'Thank you. So, how can I help you today?',
+      'consent.refused.continue': "That's absolutely fine. This call won't be recorded, and we can carry straight on. How can I help you today?",
+      'consent.declined.route': "Of course, you should speak to a person. Let me pass you to the team now, and if no one is free I'll take your details so they can ring you straight back.",
+      'consent.refused.recorded': "That's recorded. This call won't be recorded or transcribed, and I can still help you here.",
+
+      // C6 — a lapsed or drifted deployment. The caller keeps a way through.
+      'receptionist.degraded.unverified': "I can't open the appointment book on this call, so I don't want to guess at a time. I can take a message for reception right now, or put you through to someone. Which would you prefer?",
+      'receptionist.degraded.verification_stale': "I can't reach the appointment system on this call, so I won't guess at a time. I can take a message for reception right now, or put you through to someone. Which would you prefer?",
+      'receptionist.degraded.deployment_drift': "The reception system is being updated right now, so I can't book on this call. I can take a message for the team straight away, or put you through to someone. Which would you prefer?",
+
+      // C7 — an admission denial is still answered, and still offers a person.
+      'admission.denied.capacity': "We're taking more calls than usual right now, so rather than keep you waiting I'll put you through to reception.",
+      'admission.denied.demo': "Thanks for calling. This line is set up for demonstration only and isn't taking patient calls, so I won't take your details here. Please ring the practice on its main number.",
+      'admission.denied.unavailable': "I'm sorry, the automated line isn't available right now. Let me put you through to reception instead.",
+
+      // C12 — what the caller hears when they ask for a human. The task id and
+      // the acknowledgment state stay in the structured result, not here.
+      'handoff.spoken': "Of course. I've passed this to reception with your number, so it won't be lost. Let me see if someone is free to pick up now.",
+      'handoff.no_transfer': "Of course. I've passed this to reception with your number, so it won't be lost, and someone will get back to you. Is there anything you'd like me to add for them?",
+
+      // C10 — booking and availability results, previously hardcoded en-US.
+      'tool.availability.none': "I don't have any openings on {{date}}. Would a different day work?",
+      'tool.availability.offer': 'On {{date}} I have {{times}}. Which suits you best?',
+      'tool.availability.needs_review': "I can't confirm the right clinician for that on this call. I can take a message so reception can ring you back with times.",
+      'tool.booking.confirmed': "Perfect, {{first_name}}. You're booked for {{booking}}.{{confirmation}}",
+      'tool.booking.already': "You're already booked for {{booking}}.{{confirmation}}",
+      'tool.booking.confirmation_accepted': "I've sent your confirmation; I can't confirm it has arrived yet.",
+      'tool.message.recorded': "Thank you. That's written down for reception with your number. Someone will pick it up and get back to you; I can't promise exactly when.",
+      'tool.message.appended': "Thank you. I've added that to the same note for reception. Someone will pick it up and get back to you; I can't promise exactly when.",
     },
   },
 };
