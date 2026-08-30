@@ -1824,9 +1824,14 @@ function CreateCompanyForm({ plans, plansError, onCancel, onCreated }: { plans: 
 
 /* ─────────────────────────────────────────────────────────── */
 function TenantFeatureControls({ tenantId, canManage, onChanged }: { tenantId: string; canManage: boolean; onChanged: () => void }) {
-  const [ents, setEnts] = useState<Array<{ featureKey: string; enabled: boolean; source: string; limitValue: number | null }> | null>(null);
+  const [ents, setEnts] = useState<Array<{ featureKey: string; enabled: boolean; source: string; limitValue: number | null; overrideExpiresAt?: string | null; overrideReason?: string | null }> | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // A grant given "for the pilot" and never revisited becomes a permanent free
+  // feature. Offering an end date at the moment of granting is the only point
+  // where anyone is thinking about it.
+  const [expiresAt, setExpiresAt] = useState('');
+  const [reason, setReason] = useState('');
 
   const load = useCallback(async () => {
     const detail = await platformAdmin.tenant(tenantId);
@@ -1836,7 +1841,13 @@ function TenantFeatureControls({ tenantId, canManage, onChanged }: { tenantId: s
 
   async function toggle(featureKey: string, enabled: boolean) {
     setBusyKey(featureKey); setError(null);
-    try { await platformAdmin.overrideEntitlement(tenantId, featureKey, enabled); await load(); onChanged(); }
+    try {
+      await platformAdmin.overrideEntitlement(tenantId, featureKey, enabled, {
+        expiresAt: expiresAt.trim() || null,
+        reason: reason.trim() || undefined,
+      });
+      await load(); onChanged();
+    }
     catch (e) { setError(e instanceof Error ? e.message : 'Update failed'); }
     finally { setBusyKey(null); }
   }
@@ -1863,7 +1874,13 @@ function TenantFeatureControls({ tenantId, canManage, onChanged }: { tenantId: s
               <div key={key} className="flex items-center justify-between gap-2 rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-2">
                 <div className="min-w-0">
                   <p className="text-[12px] font-semibold text-t1 truncate">{FEATURE_LABELS[key] ?? key}</p>
-                  <p className="text-[10px] text-t3">{overridden ? 'platform override' : `via ${e?.source ?? 'plan'}`}{e?.limitValue != null ? ` · limit ${e.limitValue}` : ''}</p>
+                  <p className="text-[10px] text-t3">
+                    {overridden ? 'platform override' : `via ${e?.source ?? 'plan'}`}{e?.limitValue != null ? ` · limit ${e.limitValue}` : ''}
+                    {e?.overrideExpiresAt
+                      ? ` · lapses ${new Date(e.overrideExpiresAt).toLocaleDateString()}`
+                      : overridden ? ' · no end date' : ''}
+                    {e?.overrideReason ? ` · ${e.overrideReason}` : ''}
+                  </p>
                 </div>
                 <button type="button" role="switch" aria-checked={enabled ? 'true' : 'false'} aria-label={`Toggle ${FEATURE_LABELS[key] ?? key}`}
                   disabled={busyKey === key || !canManage} title={canManage ? undefined : 'Your platform role cannot change entitlements'} onClick={() => toggle(key, !enabled)}
@@ -1877,7 +1894,18 @@ function TenantFeatureControls({ tenantId, canManage, onChanged }: { tenantId: s
           })}
         </div>
       )}
-      <p className="mt-2 text-[10px] text-t3">Toggling sets a platform override for this tenant. Changing the plan re-derives any non-overridden features.</p>
+      {canManage && (
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <input type="date" aria-label="Override end date" value={expiresAt} onChange={e => setExpiresAt(e.target.value)}
+            className="rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-2 py-1 text-[11px] text-t1" />
+          <input value={reason} onChange={e => setReason(e.target.value)} placeholder="Why (recorded)" aria-label="Override reason"
+            className="flex-1 min-w-[180px] rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-2 py-1 text-[11px] text-t1 outline-none" />
+        </div>
+      )}
+      <p className="mt-2 text-[10px] text-t3">
+        Toggling sets a platform override for this tenant, using the end date and reason above. Changing the plan re-derives any
+        non-overridden features. An override with no end date stands until someone changes it.
+      </p>
     </div>
   );
 }

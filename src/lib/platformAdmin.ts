@@ -33,7 +33,11 @@ export interface TenantSummary {
   } | null;
   subscription: { planKey: string; planName: string; status: string; trialEndsAt: string | null; addons: string[] } | null;
   activeUsers: number; branches: number; enabledFeatures: number; setupStatus: string; deepLinkTarget: string | null;
-  entitlements?: Array<{ featureKey: string; enabled: boolean; source: string; limitValue: number | null }>;
+  entitlements?: Array<{
+    featureKey: string; enabled: boolean; source: string; limitValue: number | null;
+    /** Set when a platform override lapses on a date, with why it was granted. */
+    overrideExpiresAt?: string | null; overrideReason?: string | null;
+  }>;
 }
 
 export type PilotEntityType = 'patients' | 'appointments' | 'insurance';
@@ -213,7 +217,11 @@ export const platformAdmin = {
   changePlan: (id: string, planKey: string) => pf<TenantSummary>(`/v1/platform/tenants/${id}/subscription/change-plan`, { method: 'POST', body: JSON.stringify({ planKey }) }),
   addAddon: (id: string, addonKey: string) => pf<TenantSummary>(`/v1/platform/tenants/${id}/addons`, { method: 'POST', body: JSON.stringify({ addonKey }) }),
   removeAddon: (id: string, addonKey: string) => pf<TenantSummary>(`/v1/platform/tenants/${id}/addons/${addonKey}`, { method: 'DELETE' }),
-  overrideEntitlement: (id: string, featureKey: string, enabled: boolean) => pf<unknown>(`/v1/platform/tenants/${id}/entitlements/${featureKey}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
+  overrideEntitlement: (id: string, featureKey: string, enabled: boolean, options?: { expiresAt?: string | null; reason?: string }) =>
+    pf<unknown>(`/v1/platform/tenants/${id}/entitlements/${featureKey}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled, expiresAt: options?.expiresAt ?? undefined, reason: options?.reason }),
+    }),
   plans: () => pf<Array<{ key: string; name: string; monthlyPrice: number; features: string[] }>>(`/v1/platform/subscriptions/plans`),
   setPlanPrice: (planKey: string, monthlyPrice: number | null, reason: string) =>
     pf<{ key: string; monthlyPrice: number; tenantsRepriced: number }>(`/v1/platform/subscriptions/plans/${planKey}`, {

@@ -292,3 +292,111 @@ describe('platform price book', () => {
     expect(JSON.stringify(events[0].metadata)).toMatch(/Starter price/i);
   });
 });
+
+/**
+ * Entitlement overrides that end.
+ *
+ * A grant given "for the pilot" and never revisited becomes a permanent free
+ * feature - a pricing decision made by forgetting rather than by anyone
+ * deciding. An override may still be open-ended, but that has to be a choice.
+ */
+describe('entitlement override expiry', () => {
+  let app: FastifyInstance;
+  const adminId = randomUUID();
+  const suffix = randomUUID().slice(0, 8);
+  const created: string[] = [];
+  let tenantId = '';
+  let lockedFeature = '';
+
+  const auth = () => ({
+    authorization: `Bearer ${signPlatformToken(app, { id: adminId, role: 'PLATFORM_ADMIN' })}`,
+    'content-type': 'application/json',
+  });
+
+  beforeAll(async () => {
+    app = await buildApp();
+    await db.platformUser.create({
+      data: {
+        id: adminId, email: `expiry-${adminId.slice(0, 8)}@carecommand.test`, name: 'Expiry Admin',
+        passwordHash: await generatePasswordHash('Override-expiry-password-2026!'), role: 'PLATFORM_ADMIN', status: 'active',
+      },
+    });
+    const res = await app.inject({
+      method: 'POST', url: '/v1/platform/tenants', headers: auth(),
+      payload: {
+        name: 'Comped Clinic', slug: `comped-${suffix}`, ownerName: 'Dr Comp',
+        ownerEmail: `owner-comp-${suffix}@clinic.test`, ownerPassword: 'Override-expiry-password-2026!', planKey: 'starter',
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    tenantId = res.json().tenant.id;
+    created.push(tenantId);
+    lockedFeature = (await db.tenantFeatureEntitlement.findFirstOrThrow({ where: { tenantId, enabled: false } })).featureKey;
+  }, 90_000);
+
+  afterAll(async () => {
+    for (const id of created) await db.tenant.updateMany({ where: { id }, data: { status: 'cancelled', name: 'ZZ test fixture (override expiry)' } });
+    await db.platformAuditEvent.deleteMany({ where: { platformUserId: adminId } });
+    await db.platformUser.deleteMany({ where: { id: adminId } });
+    await app.close();
+  });
+
+  it('refuses an end date that has already passed, because it would grant nothing', async () => {
+    const res = await app.inject({
+      method: 'PATCH', url: `/v1/platform/tenants/${tenantId}/entitlements/${lockedFeature}`, headers: auth(),
+      payload: { enabled: true, expiresAt: '2020-01-01', reason: 'Backdated by mistake' },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('grants until a date, and records why', async () => {
+    const future = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
+    const res = await app.inject({
+      method: 'PATCH', url: `/v1/platform/tenants/${tenantId}/entitlements/${lockedFeature}`, headers: auth(),
+      payload: { enabled: true, expiresAt: future, reason: 'Comped for the two-week pilot' },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const row = await db.tenantFeatureEntitlement.findUniqueOrThrow({ where: { tenantId_featureKey: { tenantId, featureKey: lockedFeature } } });
+    expect(row).toMatchObject({ enabled: true, overrideEnabled: true, overrideReason: 'Comped for the two-week pilot' });
+    expect(row.overrideExpiresAt).toBeTruthy();
+
+    const detail = await app.inject({ method: 'GET', url: `/v1/platform/tenants/${tenantId}`, headers: auth() });
+    const shown = (detail.json().entitlements as Array<{ featureKey: string; overrideExpiresAt: string | null; overrideReason: string | null }>)
+      .find(e => e.featureKey === lockedFeature);
+    // An operator reviewing the account must be able to see which grants lapse.
+    expect(shown?.overrideExpiresAt).toBeTruthy();
+    expect(shown?.overrideReason).toBe('Comped for the two-week pilot');
+  }, 30_000);
+
+  it('stops honouring the grant once it lapses, without waiting for a plan change', async () => {
+    const { isFeatureEnabled } = await import('../lib/entitlements');
+    expect(await isFeatureEnabled(tenantId, lockedFeature, db)).toBe(true);
+
+    // Backdate it the way time would, then ask the guard the same question.
+    await db.tenantFeatureEntitlement.update({
+      where: { tenantId_featureKey: { tenantId, featureKey: lockedFeature } },
+      data: { overrideExpiresAt: new Date(Date.now() - 60_000) },
+    });
+
+    expect(await isFeatureEnabled(tenantId, lockedFeature, db)).toBe(false);
+
+    // And the lapsed override is cleared rather than left claiming a decision
+    // nobody stands behind.
+    const row = await db.tenantFeatureEntitlement.findUniqueOrThrow({ where: { tenantId_featureKey: { tenantId, featureKey: lockedFeature } } });
+    expect(row.overrideEnabled).toBeNull();
+    expect(row.overrideExpiresAt).toBeNull();
+  }, 30_000);
+
+  it('leaves an open-ended override standing, because that is still a legitimate choice', async () => {
+    const res = await app.inject({
+      method: 'PATCH', url: `/v1/platform/tenants/${tenantId}/entitlements/${lockedFeature}`, headers: auth(),
+      payload: { enabled: true, reason: 'Permanent goodwill grant' },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const { recomputeEntitlements, isFeatureEnabled } = await import('../lib/entitlements');
+    await recomputeEntitlements(tenantId, db);
+    expect(await isFeatureEnabled(tenantId, lockedFeature, db)).toBe(true);
+  }, 30_000);
+});

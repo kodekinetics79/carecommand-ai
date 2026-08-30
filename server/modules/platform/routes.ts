@@ -363,7 +363,20 @@ export const platformRoutes: FastifyPluginAsync = async app => {
     const { tenantId } = z.object({ tenantId: uuid }).parse(request.params);
     const summary = await tenantSummary(tenantId);
     if (!summary.tenant) return reply.code(404).send({ error: 'not_found', message: 'Tenant not found' });
-    const entitlements = await db.tenantFeatureEntitlement.findMany({ where: { tenantId }, orderBy: { featureKey: 'asc' }, select: { featureKey: true, enabled: true, source: true, limitValue: true } });
+    const rows = await db.tenantFeatureEntitlement.findMany({
+      where: { tenantId }, orderBy: { featureKey: 'asc' },
+      select: { featureKey: true, enabled: true, source: true, limitValue: true, overrideExpiresAt: true, overrideReason: true },
+    });
+    const entitlements = rows.map(row => ({
+      featureKey: row.featureKey,
+      enabled: row.enabled,
+      source: row.source,
+      limitValue: row.limitValue,
+      // An override that ends is worth showing as such: an operator reviewing
+      // an account should see which grants lapse and why they were given.
+      overrideExpiresAt: row.overrideExpiresAt?.toISOString() ?? null,
+      overrideReason: row.overrideReason,
+    }));
     return { ...summary, entitlements };
   });
 
@@ -649,17 +662,38 @@ export const platformRoutes: FastifyPluginAsync = async app => {
 
   app.patch('/tenants/:tenantId/entitlements/:featureKey', { preHandler: tenantManage }, async request => {
     const { tenantId, featureKey } = z.object({ tenantId: uuid, featureKey: z.string().min(1).max(60) }).parse(request.params);
-    const { enabled } = z.object({ enabled: z.boolean() }).parse(request.body);
+    const body = z.object({
+      enabled: z.boolean(),
+      // An override is nearly always temporary. The end date is optional
+      // because a permanent one is sometimes right - but it has to be chosen,
+      // not arrived at by nobody revisiting a pilot comp.
+      expiresAt: dateOrNull,
+      reason: z.string().trim().min(3).max(500).optional(),
+    }).parse(request.body);
+    const { enabled } = body;
+    const expiresAt = body.expiresAt ? new Date(body.expiresAt) : null;
+    if (expiresAt && expiresAt.getTime() <= Date.now()) {
+      throw app.httpErrors.badRequest('An override that has already expired grants nothing. Choose a future date, or leave it open-ended.');
+    }
+    const override = {
+      enabled,
+      source: 'platform_override',
+      overrideEnabled: enabled,
+      overrideExpiresAt: expiresAt,
+      overrideReason: body.reason ?? null,
+    };
     await runPlatformAuditedMutation(request, {
-      action: 'entitlement.overridden', target: { type: 'tenant', id: tenantId, tenantId }, metadata: { featureKey, enabled },
+      action: 'entitlement.overridden',
+      target: { type: 'tenant', id: tenantId, tenantId },
+      metadata: { featureKey, enabled, expiresAt: expiresAt?.toISOString() ?? null, reason: body.reason ?? null },
     }, tx => tx.tenantFeatureEntitlement.upsert({
       where: { tenantId_featureKey: { tenantId, featureKey } },
       // overrideEnabled is the standing decision; enabled is the resolved answer
       // guards read. Recording both is what makes the override outlive a plan change.
-      update: { enabled, source: 'platform_override', overrideEnabled: enabled },
-      create: { tenantId, featureKey, enabled, source: 'platform_override', overrideEnabled: enabled, limitValue: null },
+      update: override,
+      create: { tenantId, featureKey, limitValue: null, ...override },
     }));
-    return { tenantId, featureKey, enabled, source: 'platform_override' };
+    return { tenantId, featureKey, enabled, source: 'platform_override', expiresAt: expiresAt?.toISOString() ?? null, reason: body.reason ?? null };
   });
 
   // Legacy direct edit endpoint (kept for backward compatibility).

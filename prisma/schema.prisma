@@ -3049,6 +3049,13 @@ model TenantFeatureEntitlement {
   // a recompute rewrites; this column is what makes an override survive a plan
   // change, a suspension and a reactivation instead of being silently wiped.
   overrideEnabled Boolean?
+  // When the override lapses, and why it was granted. A comp given for a pilot
+  // that nobody ever revisits becomes a permanent free feature: an override
+  // with no end date is a pricing decision made by forgetting. null = the
+  // override stands until an operator changes it, which must be a deliberate
+  // choice rather than the default.
+  overrideExpiresAt DateTime?
+  overrideReason    String?
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
   tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)

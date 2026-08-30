@@ -47,9 +47,25 @@ export async function recomputeEntitlements(
   // an operator had explicitly granted - while the console claimed otherwise.
   const existing = await client.tenantFeatureEntitlement.findMany({
     where: { tenantId },
-    select: { featureKey: true, overrideEnabled: true },
+    select: { featureKey: true, overrideEnabled: true, overrideExpiresAt: true },
   });
-  const overrides = new Map(existing.filter(r => r.overrideEnabled !== null).map(r => [r.featureKey, r.overrideEnabled as boolean]));
+  const now = new Date();
+  // An override past its end date is simply not an override any more. It is
+  // cleared rather than left in place, so the row stops claiming a decision
+  // nobody is standing behind.
+  const lapsed = existing.filter(r => r.overrideEnabled !== null && r.overrideExpiresAt !== null && r.overrideExpiresAt <= now);
+  if (lapsed.length) {
+    await client.tenantFeatureEntitlement.updateMany({
+      where: { tenantId, featureKey: { in: lapsed.map(r => r.featureKey) } },
+      data: { overrideEnabled: null, overrideExpiresAt: null, overrideReason: null },
+    });
+  }
+  const lapsedKeys = new Set(lapsed.map(r => r.featureKey));
+  const overrides = new Map(
+    existing
+      .filter(r => r.overrideEnabled !== null && !lapsedKeys.has(r.featureKey))
+      .map(r => [r.featureKey, r.overrideEnabled as boolean]),
+  );
 
   const rows: ResolvedEntitlement[] = [];
   for (const key of FEATURE_KEYS) {
@@ -78,7 +94,15 @@ export async function isFeatureEnabled(
   client: PrismaClient | Prisma.TransactionClient = db,
 ): Promise<boolean> {
   const ent = await client.tenantFeatureEntitlement.findUnique({ where: { tenantId_featureKey: { tenantId, featureKey } } });
-  return Boolean(ent?.enabled);
+  if (!ent) return false;
+  // Self-healing: an override can lapse without anything having recomputed
+  // since, and a guard that honoured it until the next plan change would make
+  // the end date decorative. Recompute once, then answer from the fresh row.
+  if (ent.overrideEnabled !== null && ent.overrideExpiresAt !== null && ent.overrideExpiresAt <= new Date()) {
+    const rows = await recomputeEntitlements(tenantId, client);
+    return Boolean(rows.find(row => row.featureKey === featureKey)?.enabled);
+  }
+  return Boolean(ent.enabled);
 }
 
 /**
