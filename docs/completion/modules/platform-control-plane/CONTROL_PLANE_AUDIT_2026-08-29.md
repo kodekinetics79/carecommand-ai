@@ -139,6 +139,7 @@ transacts on a single platform-owned account per provider, read from `process.en
 | `7046b27` | L1 - voice minutes metered per BILLING PERIOD (append-only, dedupe-keyed `UsageEvent`); both admission gates read the current period; the Usage tab reports the period and says "not measured" where no meter exists |
 | `4261e11` | V1 + V2 - the credential vault is now the credential the product uses (complete-save > env > unset, one catalog, snapshot refreshed at boot and on write); "test ok" no longer claims success it has not earned |
 | `1369246` | Operators can change their own password (exact revocation via `sessionEpoch`), and MFA became `PlatformConfig.requireOperatorMfa` - the owner's audited decision instead of a hardcoded rule |
+| `5cf1130` + `5ebf39f` | Tenant **mode** (demo / pilot / production), enforced at BOTH call-admission gates via `server/lib/tenantMode.ts` - the switch above the dial path that did not exist. Plus contract start, account manager and BAA date on the company record |
 | `321b37c` | V5 - a real price book: column-scoped grant, audited reprice, and MRR that moves with both a reprice and a plan change |
 
 ### A defect found while fixing H1
@@ -160,6 +161,11 @@ scope should fail loudly, not return nothing.
 | L5 | `multi_location` limits and seats are still sold and not enforced | Small, but it changes what an existing tenant can do - wants a decision first |
 | L6 | `TenantSecurityPolicy` is still written by both planes; the floor is applied at provisioning but not resolved as `max(floor, tenant)` at read time | Touches the tenant compliance centre as well as the platform plane |
 | — | Pilot-import idempotency, removed by revert `2bdffe6` | See below |
+
+Closed since: tenant mode was the first of the seven "what you didn't ask" items
+(`5cf1130`). The remaining six - consented impersonation, entitlement override
+expiry, onboarding scored on first answered call, number provisioning in the
+console, a release stamp in production, and tenant health signals - are still open.
 
 ## 8. Known-failing tests (pre-existing, deliberately left failing)
 
