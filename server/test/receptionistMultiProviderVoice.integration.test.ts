@@ -32,6 +32,7 @@ const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
 const { compileIntakeContract, fingerprintJson } = await import('../modules/receptionist/intakeContract');
+const { compileCampaignIntakeContract } = await import('../modules/receptionist/shared');
 
 const RETELL_KEY = 'test-retell-multi-provider-key';
 const originalRetellKey = env.RETELL_API_KEY;
@@ -99,24 +100,20 @@ async function makeTenant() {
   const campaignId = randomUUID();
   const providerAgentId = `agent_${id.replaceAll('-', '')}`;
   const providerVersion = 1;
-  const contract = compileIntakeContract({
-    campaignId, revision: 1, appointmentType: APPOINTMENT_TYPE,
-    eligibleLocations: [location],
-    // A caller may name the clinician they want to see.
-    fields: [{
-      id: randomUUID(), fieldType: 'PREFERRED_PROVIDER', label: 'Preferred clinician',
-      aiQuestion: 'Is there a clinician you would like to see?', required: false,
-      confirmationRequired: false, sortOrder: 1,
-    }],
-    toolUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell/fn?clinicId=${clinic.id}`,
-    bookableServices: [APPOINTMENT_TYPE, LONG_SERVICE],
-  });
+  // A caller may name the clinician they want to see. The field is persisted
+  // as a real row so the activation attestation, which reads these rows, sees
+  // exactly what the deploy path compiled.
+  const intakeFields = [{
+    id: randomUUID(), fieldType: 'PREFERRED_PROVIDER' as const, label: 'Preferred clinician',
+    aiQuestion: 'Is there a clinician you would like to see?', validationRule: null,
+    options: [] as string[], required: false, confirmationRequired: false, sortOrder: 1,
+  }];
+  // Assembly order matters, and it mirrors the product's: the agent exists, the
+  // campaign is DRAFT and bound to it, the intake fields go in (which bumps the
+  // schema revision and clears any attestation), and only then is the contract
+  // compiled against the final revision and attested. Doing it in any other
+  // order trips the same triggers a real operator would trip.
   const providerGraphFingerprint = 'a'.repeat(64);
-  const providerToolFingerprint = fingerprintJson({
-    tool: contract.snapshot.bookAppointmentToolContract,
-    engine: { type: 'retell-llm', id: `llm_${id.replaceAll('-', '')}`, version: 1, graphFingerprint: providerGraphFingerprint },
-  });
-  const attestedSnapshot = { ...contract.snapshot, providerEffectiveDynamicVariables: {} };
   const now = new Date();
   const agent = await db.receptionistAgent.create({
     data: {
@@ -129,9 +126,8 @@ async function makeTenant() {
       providerDataStorageSetting: 'basic_attributes_only', providerSignedUrl: true,
       providerResponseEngineType: 'retell-llm', providerResponseEngineId: `llm_${id.replaceAll('-', '')}`,
       providerResponseEngineVersion: 1, providerResponseEngineGraphFingerprint: providerGraphFingerprint,
-      providerEffectiveDynamicVariables: {},
-      providerBookToolSchema: contract.snapshot.bookAppointmentToolContract as never,
-      providerBookToolFingerprint: providerToolFingerprint, providerToolCallStrictMode: true,
+      // The booking-tool columns are all-or-nothing at the database boundary,
+      // so they are set together once the contract exists.
       providerConfigRevision: 1, providerVerifiedRevision: 1, providerVerifiedAt: now,
       providerVerificationExpiresAt: new Date(now.getTime() + 60 * 60 * 1_000),
     },
@@ -140,11 +136,45 @@ async function makeTenant() {
   await db.receptionistCampaign.create({
     data: {
       id: campaignId, tenantId: id, clinicId: clinic.id, agentId: agent.id,
-      name: 'Inbound reception', status: 'ACTIVE', offerTitle: 'Appointment', offerDescription: 'Schedule care',
+      name: 'Inbound reception', status: 'DRAFT', offerTitle: 'Appointment', offerDescription: 'Schedule care',
       offerScript: 'Would you like to schedule?', appointmentType: APPOINTMENT_TYPE,
-      eligibleLocationIds: [location.id], intakeSchemaRevision: 1,
+      eligibleLocationIds: [location.id],
+    },
+  });
+  await db.receptionistIntakeField.createMany({
+    data: intakeFields.map(field => ({ ...field, tenantId: id, campaignId })),
+  });
+  const { intakeSchemaRevision } = await db.receptionistCampaign.findUniqueOrThrow({
+    where: { id: campaignId }, select: { intakeSchemaRevision: true },
+  });
+  const contract = compileIntakeContract({
+    campaignId, revision: intakeSchemaRevision, appointmentType: APPOINTMENT_TYPE,
+    eligibleLocations: [location],
+    fields: intakeFields,
+    toolUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell/fn?clinicId=${clinic.id}`,
+    bookableServices: [APPOINTMENT_TYPE, LONG_SERVICE],
+  });
+  const providerToolFingerprint = fingerprintJson({
+    tool: contract.snapshot.bookAppointmentToolContract,
+    engine: { type: 'retell-llm', id: `llm_${id.replaceAll('-', '')}`, version: 1, graphFingerprint: providerGraphFingerprint },
+  });
+  const attestedSnapshot = { ...contract.snapshot, providerEffectiveDynamicVariables: {} };
+  await db.receptionistAgent.update({
+    where: { id: agent.id },
+    data: {
+      providerBookToolSchema: contract.snapshot.bookAppointmentToolContract as never,
+      providerBookToolFingerprint: providerToolFingerprint,
+      providerEffectiveDynamicVariables: {},
+      providerToolCallStrictMode: true,
+    },
+  });
+  await db.receptionistCampaign.update({
+    where: { id: campaignId },
+    data: {
+      status: 'ACTIVE',
       intakeSchemaSnapshot: attestedSnapshot as never, intakeSchemaFingerprint: fingerprintJson(attestedSnapshot),
-      intakeToolFingerprint: providerToolFingerprint, intakeSchemaAttestedRevision: 1, intakeSchemaAttestedAt: now,
+      intakeToolFingerprint: providerToolFingerprint,
+      intakeSchemaAttestedRevision: intakeSchemaRevision, intakeSchemaAttestedAt: now,
       intakeSchemaProviderAgentId: providerAgentId, intakeSchemaProviderVersion: providerVersion,
       intakeSchemaResponseEngineId: `llm_${id.replaceAll('-', '')}`, intakeSchemaResponseEngineVersion: 1,
     },
@@ -152,7 +182,9 @@ async function makeTenant() {
   return {
     id, branchId: branch.id, clinicId: clinic.id, campaignId, locationId: location.id,
     providerAgentId, providerVersion, providers,
+    intakeSchemaRevision,
     semanticFingerprint: contract.snapshot.semanticFingerprint,
+    deployToolFingerprint: contract.snapshot.bookAppointmentToolFingerprint,
     bookToolProperties: (contract.snapshot.bookAppointmentToolContract.parameters as { properties: Record<string, { enum?: string[] }> }).properties,
   };
 }
@@ -205,7 +237,7 @@ function bookArgs(t: T, extra: Record<string, unknown>) {
     location_id: t.locationId,
     service: APPOINTMENT_TYPE,
     intake_contract_fingerprint: t.semanticFingerprint,
-    intake_schema_revision: 1,
+    intake_schema_revision: t.intakeSchemaRevision,
     booking_confirmed: true,
     ...extra,
   };
@@ -326,6 +358,21 @@ describe('C9 — one campaign, the clinic’s whole voice-bookable menu', () => 
     const t = await makeTenant();
     expect(t.bookToolProperties.service.enum).toEqual([APPOINTMENT_TYPE, LONG_SERVICE]);
     expect(t.bookToolProperties.service.enum).not.toContain(UNBOOKABLE_SERVICE);
+  });
+
+  // The deploy path and the activation attestation compile this tool
+  // independently and compare it byte for byte. When only the deploy path knew
+  // about the bookable menu, every demo campaign deployed, verified, and then
+  // refused to activate with `intake_schema_mismatch`.
+  it('compiles the same booking tool on the deploy path and the activation path', async () => {
+    const t = await makeTenant();
+    const campaign = await db.receptionistCampaign.findUniqueOrThrow({
+      where: { id: t.campaignId },
+      select: { id: true, tenantId: true, clinicId: true, appointmentType: true, eligibleLocationIds: true, intakeSchemaRevision: true },
+    });
+    const activation = await compileCampaignIntakeContract(db as never, campaign);
+    expect(activation.snapshot.bookableServices).toEqual([APPOINTMENT_TYPE, LONG_SERVICE]);
+    expect(activation.snapshot.bookAppointmentToolFingerprint).toBe(t.deployToolFingerprint);
   });
 
   it('books a service the campaign does not advertise', async () => {
