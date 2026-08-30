@@ -86,6 +86,11 @@ describe('dedicated platform database plane', () => {
    * because an applied migration must not be edited to satisfy a guard: doing
    * that changes its checksum and breaks every database that already ran it.
    * Reviewing this list is reviewing the guard.
+   *
+   * An entry is written by whoever removed the object, not by whoever hits the
+   * failure. A reason invented after the fact by someone reading unfamiliar SQL
+   * is a guess wearing the costume of a review, and this list is only worth
+   * anything if each line means "someone who knew why signed for it".
    */
   const ACKNOWLEDGED_OBJECT_REMOVALS: Record<string, string> = {
     '20260830130000_front_desk_loop':
