@@ -1,14 +1,20 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router';
-import { Bot, Building2, Plus, Sparkles, Phone, PhoneOff, Megaphone, ListChecks, Eye, Code2, Activity, Loader2, AlertCircle, PhoneOutgoing, BookOpen } from 'lucide-react';
-import { receptionistApi as api, type Campaign, type Overview } from '../lib/receptionist';
+import { Bot, Building2, Plus, Phone, PhoneOff, Megaphone, ListChecks, Eye, Rocket, Activity, Loader2, AlertCircle, PhoneOutgoing, BookOpen, ShieldCheck, Timer } from 'lucide-react';
+import { receptionistApi as api, type Campaign } from '../lib/receptionist';
 import { blockerLabel, receptionistClinicApi, type ClinicRow } from '../lib/receptionistClinic';
-import { describeFailure } from '../lib/resourceState';
+import {
+  deploymentApi, formatCount, formatRate, formatSeconds, resolveStudioTab, serviceStatus,
+  type GoLivePrerequisite, type OverviewKpis, type ReadinessResponse, type RetellStatusResponse, type StudioTab,
+} from '../lib/receptionistDeployment';
+import { useResource } from '../hooks/useResource';
+import { describeFailure, receivedData } from '../lib/resourceState';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
 import FormDialog from '../components/workflow/FormDialog';
 import { formatEnumLabel } from '../components/receptionist/helpers';
 import { EmptyState } from '../components/receptionist/shared';
+import { LoadFailureNotice } from '../components/receptionist/MutationNotice';
 import { ClinicPanel } from '../components/receptionist/ClinicPanel';
 import { CreateClinicDialog } from '../components/receptionist/CreateClinicDialog';
 import { KnowledgePanel } from '../components/receptionist/KnowledgePanel';
@@ -18,9 +24,21 @@ import { IntakeBuilder } from '../components/receptionist/IntakeBuilder';
 import { PreviewPanel } from '../components/receptionist/PreviewPanel';
 import { RetellPanel } from '../components/receptionist/RetellPanel';
 import { ActivityPanel } from '../components/receptionist/ActivityPanel';
+import { GoLiveCard, ServiceStatusStrip } from '../components/receptionist/GoLiveCard';
 import { OutboundPanel } from '../components/receptionist/outbound/OutboundPanel';
 
-type Tab = 'clinic' | 'knowledge' | 'campaign' | 'intake' | 'preview' | 'retell' | 'outbound' | 'activity';
+/**
+ * Two doors, not three: the Front Desk is where staff work a live queue, and
+ * this Studio is where the receptionist is configured and taken live. The tab
+ * formerly called "RetellAI Export" is now **Go live** — deploy, verify and
+ * the manual console fallback — because that is what an owner comes here to
+ * do, and because it is the tab id the server's remediation catalogue has
+ * been pointing at all along (`fixTab: 'deploy'`, 25 entries).
+ *
+ * The id list and the alias map live in `lib/receptionistDeployment.ts`, with
+ * the readiness keys: they are a contract with the server, not page trivia.
+ */
+type Tab = StudioTab;
 
 const TABS: Array<{ id: Tab; label: string; icon: React.ElementType }> = [
   { id: 'clinic', label: 'Clinic Profile', icon: Building2 },
@@ -28,26 +46,43 @@ const TABS: Array<{ id: Tab; label: string; icon: React.ElementType }> = [
   { id: 'campaign', label: 'Agent & Campaign', icon: Megaphone },
   { id: 'intake', label: 'Intake Builder', icon: ListChecks },
   { id: 'preview', label: 'Preview', icon: Eye },
-  { id: 'retell', label: 'RetellAI Export', icon: Code2 },
+  { id: 'deploy', label: 'Go live', icon: Rocket },
   { id: 'outbound', label: 'Outbound Calls', icon: PhoneOutgoing },
   { id: 'activity', label: 'Activity', icon: Activity },
 ];
 
-function isTab(value: string | null): value is Tab {
-  return TABS.some(tab => tab.id === value);
+/** A KPI tile that prints the server's definition beside the number and an em dash when it has none. */
+function KpiCard({ title, value, subtitle, definition, icon, accent }: {
+  title: string; value: string; subtitle?: string; definition?: string;
+  icon: React.ReactNode; accent: 'blue' | 'emerald' | 'violet' | 'amber' | 'red' | 'cyan' | 'indigo';
+}) {
+  return (
+    <div title={definition} data-kpi={title}>
+      <StatCard title={title} value={value} subtitle={subtitle ?? definition} icon={icon} accent={accent} />
+    </div>
+  );
 }
 
 export default function ReceptionistStudio() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [clinics, setClinics] = useState<ClinicRow[]>([]);
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
-  const [overview, setOverview] = useState<Overview | null>(null);
+  const [overview, setOverview] = useState<OverviewKpis | null>(null);
+  const [overviewFailure, setOverviewFailure] = useState<string | null>(null);
   const [activeClinicId, setActiveClinicId] = useState<string>('');
   const [activeCampaignId, setActiveCampaignId] = useState<string>('');
+  const [deploying, setDeploying] = useState(false);
+
+  // E3 — every parameter the server's fix links carry. Reading only `tab` is
+  // what made a Fix link open the wrong clinic's campaign on a two-clinic
+  // tenant. `clinicId` stays accepted so links printed before the rename work.
   const requestedTab = searchParams.get('tab');
-  const requestedClinicId = searchParams.get('clinicId');
+  const requestedClinicId = searchParams.get('clinic') ?? searchParams.get('clinicId');
+  const requestedCampaignId = searchParams.get('campaign');
+  const requestedAgentId = searchParams.get('agent');
   const requestedCallId = searchParams.get('callId');
-  const tab: Tab = isTab(requestedTab) ? requestedTab : 'clinic';
+  const tab: Tab = resolveStudioTab(requestedTab) ?? 'clinic';
+
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -66,14 +101,23 @@ export default function ReceptionistStudio() {
   const closeCreateDialog = useCallback(() => setCreateDialog(null), []);
 
   const loadClinics = useCallback(async () => {
-    const [rows, ov] = await Promise.all([receptionistClinicApi.listClinics(), api.overview().catch(() => null)]);
+    const rows = await receptionistClinicApi.listClinics();
     setClinics(rows);
-    if (ov) setOverview(ov);
     setActiveClinicId(prev => requestedClinicId && rows.some(row => row.id === requestedClinicId)
       ? requestedClinicId
       : prev && rows.some(r => r.id === prev) ? prev : rows[0]?.id ?? '');
     return rows;
   }, [requestedClinicId]);
+
+  const loadOverview = useCallback(async () => {
+    try {
+      setOverview(await deploymentApi.overview());
+      setOverviewFailure(null);
+    } catch (cause) {
+      // A failed KPI read must read as unavailable, never as a clinic with no calls.
+      setOverviewFailure(describeFailure(cause).message);
+    }
+  }, []);
 
   const loadCampaigns = useCallback(async (clinicId: string) => {
     const rows = await (clinicId ? api.listCampaigns(clinicId) : Promise.resolve<Campaign[]>([]));
@@ -86,6 +130,7 @@ export default function ReceptionistStudio() {
     (async () => {
       try {
         await loadClinics();
+        if (active) await loadOverview();
       } catch (e) {
         if (active) setError(e instanceof Error ? e.message : 'Failed to load');
       } finally {
@@ -93,21 +138,72 @@ export default function ReceptionistStudio() {
       }
     })();
     return () => { active = false; };
-  }, [loadClinics]);
+  }, [loadClinics, loadOverview]);
 
   useEffect(() => {
     let active = true;
     (activeClinicId ? api.listCampaigns(activeClinicId) : Promise.resolve<Campaign[]>([])).then(rows => {
       if (!active) return;
       setCampaigns(rows);
-      setActiveCampaignId(prev => (prev && rows.some(r => r.id === prev) ? prev : rows[0]?.id ?? ''));
+      // A fix link naming a campaign (or the agent that campaign links) wins
+      // over whatever was selected, so the operator lands on the row the
+      // failure was about rather than the clinic's first campaign.
+      setActiveCampaignId(prev => {
+        const requested = (requestedCampaignId ? rows.find(r => r.id === requestedCampaignId) : undefined)
+          ?? (requestedAgentId ? rows.find(r => r.agentId === requestedAgentId) : undefined);
+        if (requested) return requested.id;
+        return prev && rows.some(r => r.id === prev) ? prev : rows[0]?.id ?? '';
+      });
       setError(null);
     }).catch(cause => {
       // A failed campaign list must not read as "No campaigns yet".
       if (active) setError(`Campaigns could not be loaded: ${describeFailure(cause).message}`);
     });
     return () => { active = false; };
-  }, [activeClinicId]);
+  }, [activeClinicId, requestedCampaignId, requestedAgentId]);
+
+  // --- The persistent go-live rail (SF-4) and status strip (SF-3) ------------
+  const loadReadiness = useCallback(
+    (signal: AbortSignal) => (activeCampaignId ? deploymentApi.readiness(activeCampaignId, signal) : Promise.resolve(null)),
+    [activeCampaignId]);
+  const readinessResource = useResource<ReadinessResponse | null>(loadReadiness);
+  const railReadiness = receivedData(readinessResource.state) ?? null;
+  const loadRailStatus = useCallback(
+    (signal: AbortSignal) => (activeCampaignId ? deploymentApi.retellStatus({ campaignId: activeCampaignId }, signal) : Promise.resolve(null)),
+    [activeCampaignId]);
+  const railStatusResource = useResource<RetellStatusResponse | null>(loadRailStatus);
+  const railStatus = receivedData(railStatusResource.state) ?? null;
+  const reloadRail = readinessResource.reload;
+
+  const prerequisites: GoLivePrerequisite[] = useMemo(
+    () => (activeClinic?.readiness?.blockers ?? []).map(code => ({
+      code,
+      label: blockerLabel(code),
+      fixHref: `/receptionist-studio?clinic=${encodeURIComponent(activeClinic!.id)}&tab=clinic`,
+    })),
+    [activeClinic]);
+
+  const status = serviceStatus({
+    campaignStatus: activeCampaign?.status ?? 'DRAFT',
+    readiness: railReadiness,
+    verification: railStatus?.verification ?? null,
+    deploying,
+  });
+
+  const refreshCampaigns = useCallback(async () => {
+    await loadCampaigns(activeClinicId);
+    readinessResource.reload();
+    railStatusResource.reload();
+  }, [loadCampaigns, activeClinicId, readinessResource, railStatusResource]);
+
+  // A deep link that names a campaign this clinic does not hold must say so:
+  // showing a different campaign under the failure's heading is exactly the
+  // confusion the fix links were meant to end.
+  const deepLinkMiss = requestedCampaignId && campaigns.length > 0 && !campaigns.some(row => row.id === requestedCampaignId)
+    ? 'That link points at a campaign this clinic does not hold. Pick the clinic it belongs to on the left.'
+    : requestedClinicId && clinics.length > 0 && !clinics.some(row => row.id === requestedClinicId)
+      ? 'That link points at a clinic you cannot see. Pick a clinic on the left.'
+      : null;
 
   function handleCreateClinic() {
     setCreateDialog('clinic');
@@ -122,11 +218,13 @@ export default function ReceptionistStudio() {
     return <div className="flex items-center justify-center py-24 text-sm text-t3"><Loader2 className="w-4 h-4 animate-spin mr-2" /> Loading Receptionist Studio…</div>;
   }
 
+  const definitions = overview?.definitions ?? {};
+
   return (
     <div className="space-y-6 pb-10">
       <PageHeader
-        title="AI Receptionist Studio"
-        subtitle="Draft and export receptionist prompts, then link and verify the separately configured Retell deployment used for live calls."
+        title="Receptionist Studio"
+        subtitle="Configure the clinic's AI receptionist, deploy it to the phone line, and prove it can answer a real call."
         badge={`${clinics.length} clinic${clinics.length === 1 ? '' : 's'}`}
         badgeColor="violet"
         actions={
@@ -139,6 +237,12 @@ export default function ReceptionistStudio() {
       {error && (
         <div role="alert" className="flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--red-soft)] px-3 py-2 text-xs font-semibold text-red-v">
           <AlertCircle className="w-4 h-4" /> {error}
+        </div>
+      )}
+
+      {deepLinkMiss && (
+        <div role="alert" className="flex items-center gap-2 rounded-xl border border-amber-v/40 bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1">
+          <AlertCircle className="w-4 h-4 text-amber-v" /> {deepLinkMiss}
         </div>
       )}
 
@@ -183,13 +287,39 @@ export default function ReceptionistStudio() {
         />
       )}
 
+      {/*
+        SF-2 — the shift report. These are the kpi-v2 numbers with the server's
+        own definition printed under each one. The header used to show "calls
+        handled" over both directions and a booking rate over every call
+        including zero-second no-answers, plus "0m 0s" where the truth was
+        unknown. A rate with no denominator is an em dash here, never 0%.
+      */}
+      {overviewFailure && <LoadFailureNotice what="The receptionist KPIs" message={overviewFailure} onRetry={() => void loadOverview()} />}
       {overview && (
-        <div className="grid gap-3 grid-cols-2 lg:grid-cols-5">
-          <StatCard title="Active Campaigns" value={`${overview.activeCampaigns}/${overview.totalCampaigns}`} icon={<Megaphone className="w-4 h-4" />} accent="violet" />
-          <StatCard title="Calls Handled" value={String(overview.totalCalls)} icon={<Phone className="w-4 h-4" />} accent="blue" />
-          <StatCard title="Booking Rate" value={`${overview.bookingRate}%`} subtitle={`${overview.booked} booked`} icon={<Sparkles className="w-4 h-4" />} accent="emerald" />
-          <StatCard title="Avg Call" value={`${Math.floor(overview.avgDurationSeconds / 60)}m ${overview.avgDurationSeconds % 60}s`} icon={<Activity className="w-4 h-4" />} accent="cyan" />
-          <StatCard title="Do-Not-Contact" value={String(overview.optOuts)} icon={<PhoneOff className="w-4 h-4" />} accent="red" />
+        <div className="grid gap-3 grid-cols-2 lg:grid-cols-5" aria-label="Receptionist performance">
+          <KpiCard
+            title="Answered inbound" value={formatCount(overview.counts.answeredInbound)}
+            definition={definitions.answeredInbound} icon={<Phone className="w-4 h-4" />} accent="blue"
+          />
+          <KpiCard
+            title="Booking rate" value={formatRate(overview.rates.bookingRate)}
+            subtitle={overview.rates.bookingRate === null ? 'Not enough data' : `${formatCount(overview.counts.booked)} booked`}
+            definition={definitions.bookingRate} icon={<ShieldCheck className="w-4 h-4" />} accent="emerald"
+          />
+          <KpiCard
+            title="Contained" value={formatRate(overview.rates.containedPct)}
+            subtitle={overview.rates.containedPct === null ? 'Not enough data' : undefined}
+            definition={definitions.containedPct} icon={<Bot className="w-4 h-4" />} accent="violet"
+          />
+          <KpiCard
+            title="Avg call" value={formatSeconds(overview.aht)}
+            subtitle={overview.aht === null ? 'Not enough data' : undefined}
+            definition={definitions.aht} icon={<Timer className="w-4 h-4" />} accent="cyan"
+          />
+          <KpiCard
+            title="Do-not-contact" value={formatCount(overview.counts.optedOut)}
+            icon={<PhoneOff className="w-4 h-4" />} accent="red"
+          />
         </div>
       )}
 
@@ -261,6 +391,26 @@ export default function ReceptionistStudio() {
 
           {/* Main editing surface */}
           <div className="space-y-4">
+            {/*
+              SF-3 / SF-4. The strip and the rail sit above the tabs on every
+              screen, so "is the line answering, and what is blocking it" is
+              never more than one glance away, whichever tab is open.
+            */}
+            {activeCampaign && <ServiceStatusStrip status={status} />}
+            {activeCampaign && tab !== 'campaign' && readinessResource.state.status === 'error' && (
+              <LoadFailureNotice what="Activation readiness" message={readinessResource.state.failure.message} onRetry={reloadRail} />
+            )}
+            {activeCampaign && (tab === 'deploy' || tab === 'campaign') && (
+              <GoLiveCard
+                readiness={railReadiness}
+                campaignStatus={activeCampaign.status}
+                providerMode={railStatus?.providerMode ?? null}
+                prerequisites={prerequisites}
+                verification={railStatus?.verification ?? null}
+                deploying={deploying}
+              />
+            )}
+
             <div className="flex items-center gap-1 overflow-x-auto rounded-xl bg-[var(--s3)] p-1" role="tablist" aria-label="Receptionist Studio sections">
               {TABS.map((t, index) => {
                 const Icon = t.icon;
@@ -311,18 +461,28 @@ export default function ReceptionistStudio() {
             )}
             {tab === 'campaign' && activeClinic && (
               activeCampaign ? (
-                <CampaignPanel key={activeCampaign.id} clinic={activeClinic} campaign={activeCampaign} onChanged={() => loadCampaigns(activeClinicId)} />
+                <CampaignPanel key={activeCampaign.id} clinic={activeClinic} campaign={activeCampaign} onChanged={refreshCampaigns} />
               ) : <EmptyState text="No campaign selected. Create one to configure the agent and offer." onAction={handleCreateCampaign} actionLabel="New Campaign" />
             )}
             {tab === 'intake' && (
-              activeCampaign ? <IntakeBuilder key={activeCampaign.id} campaign={activeCampaign} clinic={activeClinic!} onChanged={() => loadCampaigns(activeClinicId)} />
+              activeCampaign ? <IntakeBuilder key={activeCampaign.id} campaign={activeCampaign} clinic={activeClinic!} onChanged={refreshCampaigns} />
                 : <EmptyState text="Select or create a campaign to build its intake flow." />
             )}
             {tab === 'preview' && (
               activeCampaign ? <PreviewPanel key={activeCampaign.id} campaignId={activeCampaign.id} /> : <EmptyState text="Select a campaign to preview the generated agent." />
             )}
-            {tab === 'retell' && (
-              activeCampaign ? <RetellPanel key={activeCampaign.id} campaignId={activeCampaign.id} onConfigure={selectTab} /> : <EmptyState text="Select a campaign to export its RetellAI configuration." />
+            {tab === 'deploy' && (
+              activeCampaign
+                ? (
+                  <RetellPanel
+                    key={activeCampaign.id}
+                    campaignId={activeCampaign.id}
+                    campaignStatus={activeCampaign.status}
+                    onDeployingChange={setDeploying}
+                    onConfigure={selectTab}
+                  />
+                )
+                : <EmptyState text="Select a campaign to deploy it and take the line live." />
             )}
             {tab === 'outbound' && (
               activeClinic ? <OutboundPanel key={activeClinic.id} clinic={activeClinic} />

@@ -85,7 +85,7 @@ function GroupedOptions({ options }: { options: SelectOption[] }) {
 
 export function ClinicPanel({ clinic, onChanged }: { clinic: ClinicRow; onChanged: () => Promise<unknown> }) {
   const stored = useMemo(() => toDraft(clinic), [clinic]);
-  const [baseline, setBaseline] = useState<ClinicDraft>(stored);
+  const [baselineKey, setBaselineKey] = useState(() => JSON.stringify(stored));
   const [draft, setDraft] = useState<ClinicDraft>(stored);
   const [localErrors, setLocalErrors] = useState<Record<string, string>>({});
   const saveState = useMutationState();
@@ -99,8 +99,14 @@ export function ClinicPanel({ clinic, onChanged }: { clinic: ClinicRow; onChange
   // save, or the STALE_REVISION "Reload" action) the draft restarts from it.
   // Done during render rather than in an effect so the very first paint after
   // a reload already shows the server's values instead of the stale draft.
-  if (baseline !== stored) {
-    setBaseline(stored);
+  //
+  // Compared by VALUE. The identity compare this replaces reset the draft on
+  // every reload of the clinic list — so adding a location below, or any
+  // sibling panel calling `onChanged`, silently discarded half-typed hours and
+  // disclosure edits even though not one stored field had changed.
+  const storedKey = JSON.stringify(stored);
+  if (baselineKey !== storedKey) {
+    setBaselineKey(storedKey);
     setDraft(stored);
   }
 

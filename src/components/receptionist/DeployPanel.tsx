@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router';
-import { Rocket, Loader2, CircleCheck, CircleX, CircleDashed, ShieldCheck, ListChecks } from 'lucide-react';
-import { receptionistApi } from '../../lib/receptionist';
+import { Rocket, Loader2, CircleCheck, CircleX, CircleDashed, ShieldCheck, ListChecks, AlertTriangle } from 'lucide-react';
+import { receptionistApi, type Campaign } from '../../lib/receptionist';
 import {
   DEPLOYMENT_POLL_INTERVAL_MS, DEPLOYMENT_POLL_MAX_ATTEMPTS, blockedByOf, deployChecklistOf, deploymentApi, deriveDeployState,
   formatExpiresIn, pollLatestDeployment, retryAfterSecondsOf, verificationLine,
@@ -44,9 +44,13 @@ function toolSummary(tool: Record<string, unknown>) {
  * copy is the server's `code` / `message`. The manual (BYO) checklist stays
  * available in every state so an operator can always finish in the console.
  */
-export function DeployPanel({ campaignId, config, pollIntervalMs = DEPLOYMENT_POLL_INTERVAL_MS, pollMaxAttempts = DEPLOYMENT_POLL_MAX_ATTEMPTS }: {
+export function DeployPanel({ campaignId, config, campaignStatus = null, onDeployingChange, pollIntervalMs = DEPLOYMENT_POLL_INTERVAL_MS, pollMaxAttempts = DEPLOYMENT_POLL_MAX_ATTEMPTS }: {
   campaignId: string;
   config: RetellConfigExport | null;
+  /** Known when the panel is hosted by Studio; drives the redeploy degrade warning. */
+  campaignStatus?: Campaign['status'] | null;
+  /** Raised while a deploy is publishing, so the status strip above can say the line is degraded. */
+  onDeployingChange?: (deploying: boolean) => void;
   pollIntervalMs?: number;
   pollMaxAttempts?: number;
 }) {
@@ -123,9 +127,11 @@ export function DeployPanel({ campaignId, config, pollIntervalMs = DEPLOYMENT_PO
         throw error;
       }
       setLatest(response.deployment);
-      setKnownAgentId(response.agent?.id ?? response.deployment?.agentId ?? agentId);
+      // The deploy route sends no agent row; the id we already resolved from
+      // provider status is the one to verify against.
+      setKnownAgentId(response.agent?.id ?? agentId);
       if (response.verification.status === 'failed') {
-        setVerifyError({ status: 'error', message: response.verification.message ?? 'Verification failed.', code: response.verification.code ?? null, fieldErrors: {}, failure: { message: response.verification.message ?? 'Verification failed.', code: response.verification.code, timedOut: false, offline: false, permissionDenied: false, sessionExpired: false } });
+        setVerifyError({ status: 'error', message: response.verification.message ?? 'Verification failed.', code: response.verification.code ?? null, fieldErrors: {}, remediation: null, failure: { message: response.verification.message ?? 'Verification failed.', code: response.verification.code, timedOut: false, offline: false, permissionDenied: false, sessionExpired: false } });
         setPhase('confirm');
         const settled = await pollLatestDeployment(campaignId, { intervalMs: pollIntervalMs, maxAttempts: pollMaxAttempts });
         setLatest(settled);
@@ -142,6 +148,10 @@ export function DeployPanel({ campaignId, config, pollIntervalMs = DEPLOYMENT_PO
   }
 
   const deploying = phase !== 'idle';
+  // The redeploy degrade window (the agent goes UNVERIFIED between publish and
+  // verify) is a fact about the live line, so it is raised to the surfaces
+  // above this panel rather than only shown here.
+  useEffect(() => { onDeployingChange?.(deploying); }, [deploying, onDeployingChange]);
   const deployFailure = deployState.state.status === 'error' ? deployState.state : null;
   const derived = deriveDeployState({ status, diff });
   const view: DeployPanelState = deploying ? 'deploying'
@@ -180,6 +190,15 @@ export function DeployPanel({ campaignId, config, pollIntervalMs = DEPLOYMENT_PO
 
         {view === 'never-deployed' && (
           <p className="text-xs text-t2">This campaign has never been deployed. Deploy publishes the generated prompt, tools and agent version to Retell and verifies it, or follow the manual checklist below to bring your own agent.</p>
+        )}
+
+        {campaignStatus === 'ACTIVE' && !deploying && (
+          <p role="note" data-testid="redeploy-degrade-warning" className="flex items-start gap-2 rounded-lg border border-amber-v/40 bg-[var(--s3)] px-3 py-2 text-[11px] text-t1">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-v" aria-hidden="true" />
+            <span>
+              <span className="font-semibold">This campaign is answering calls now.</span> Deploying resets provider verification: between publish and verify the agent runs on the safe tools only — a caller can leave a message or be transferred, but cannot book. Verification runs immediately and usually takes seconds; stay on this screen until it finishes.
+            </span>
+          </p>
         )}
 
         {view === 'deploying' && (
@@ -261,7 +280,7 @@ export function DeployPanel({ campaignId, config, pollIntervalMs = DEPLOYMENT_PO
             <div role="alert" className="rounded-lg border border-red-v/40 bg-[var(--red-soft)] px-3 py-2 text-xs text-red-v">
               <p className="font-semibold">Published, but verification failed{verifyError?.message ? `: ${verifyError.message}` : '.'}</p>
               {verifyError?.code && <p className="font-mono text-[10px]">code: {verifyError.code}</p>}
-              {latest && <p className="text-red-v/90">Deployment {latest.status.toLowerCase()} · version {latest.providerAgentVersion ?? '—'}</p>}
+              {latest?.status && <p className="text-red-v/90">Deployment {latest.status.toLowerCase()} · version {latest.providerAgentVersion ?? '—'}</p>}
             </div>
             {status?.blockers.filter(b => b.scope === 'agent' || b.scope === 'provider').map(blocker => (
               <p key={blocker.code} className="text-[11px] text-t2"><span className="font-semibold text-t1">{blocker.title}</span> — {blocker.action} <FixLink href={blocker.fixHref} label={`Fix ${blocker.title}`} /></p>

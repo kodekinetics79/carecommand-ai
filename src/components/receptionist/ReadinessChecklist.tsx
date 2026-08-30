@@ -30,6 +30,11 @@ export function ReadinessRow({ check }: { check: ReadinessCheck }) {
       <span className="sr-only">{word}:</span>
       <div className="min-w-0 flex-1">
         <p className="text-xs font-semibold text-t1">{check.label}</p>
+        {/* The remediation title the server wrote for this code — what to do,
+            beside what is wrong. Suppressed when it repeats the label. */}
+        {check.title && check.title !== check.label && check.status !== 'pass' && (
+          <p className="text-[11px] font-semibold text-amber-v">{check.title}</p>
+        )}
         {check.detail && <p className="text-[11px] text-t3">{check.detail}</p>}
         {check.code && <p className="font-mono text-[10px] text-t3/80">{check.code}</p>}
       </div>

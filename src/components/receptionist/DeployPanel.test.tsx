@@ -33,27 +33,43 @@ function status(overrides: Partial<RetellStatusResponse> = {}): RetellStatusResp
   };
 }
 
+/**
+ * Exactly what `deploymentProjection` sends: masked provider id, the number
+ * binding, and no `campaignId` / `agentId` / `createdAt` — the fields the
+ * client type used to invent. `GET /deployments/latest` wraps this in
+ * `{ deployment }`, which the client read as the row itself: the settle poll
+ * compared `undefined` to 'VERIFIED' and always spent its whole budget, and
+ * the verification-failed panel threw on `latest.status.toLowerCase()`.
+ */
 function deployment(overrides: Partial<Deployment> = {}): Deployment {
   return {
-    id: 'dep-1', campaignId: 'camp-1', agentId: 'agent-1', status: 'VERIFIED', mock: false,
-    providerAgentId: 'agen…7f21', providerAgentVersion: 4, providerLlmVersion: 2,
-    promptHash: 'abc123def456789', toolFingerprint: 'tools-1', intakeFingerprint: 'intake-1',
+    id: 'dep-1', status: 'VERIFIED', mock: false,
+    providerAgentIdMasked: 'agen…7f21', providerAgentVersion: 4, providerLlmVersion: 2, providerVersionTag: 'prod',
+    promptHash: 'abc123def456789', toolFingerprint: 'tools-1', intakeFingerprint: 'intake-1', configFingerprint: 'config-1',
     voiceId: '11labs-Anna', language: 'en-US', steps: [], providerErrorCode: null,
+    numberBound: true, boundPhoneNumberMasked: '+1 ••• ••• 0142', deployedBySource: 'USER',
     startedAt: '2026-08-29T17:00:00.000Z', publishedAt: '2026-08-29T17:00:20.000Z', verifiedAt: '2026-08-29T17:00:30.000Z',
-    createdAt: '2026-08-29T17:00:00.000Z',
     ...overrides,
   };
 }
 
+/** The envelope the route actually answers with. */
+const latestBody = (row: Deployment | null = deployment()) => ({ deployment: row });
+
+/**
+ * What `GET /deployment-diff` sends. There is no `toolsDiff` in it — the panel
+ * read `.added.length` off that missing object and threw the moment a draft
+ * went stale, which is precisely when an operator needs this screen.
+ */
 function diff(overrides: Partial<DeploymentDiff> = {}): DeploymentDiff {
   const row = deployment();
   return {
     deployment: {
-      id: row.id, status: row.status, mock: row.mock, verifiedAt: row.verifiedAt, publishedAt: row.publishedAt,
+      id: row.id, status: row.status, verifiedAt: row.verifiedAt,
       providerAgentVersion: row.providerAgentVersion, promptHash: row.promptHash, toolFingerprint: row.toolFingerprint,
-      voiceId: row.voiceId, language: row.language, providerErrorCode: null,
+      voiceId: row.voiceId, language: row.language,
     },
-    draft: { promptHash: row.promptHash, toolFingerprint: row.toolFingerprint, intakeFingerprint: row.intakeFingerprint, voiceId: row.voiceId, language: row.language, webhookUrl: 'https://api.example.com/v1/receptionist/webhooks/retell' },
+    draft: { promptHash: row.promptHash, toolFingerprint: row.toolFingerprint, intakeFingerprint: row.intakeFingerprint, voiceId: row.voiceId, language: row.language, webhookUrl: 'https://api.example.com/v1/receptionist/webhooks/retell', toolNames: ['book_appointment', 'take_message'] },
     changed: [],
     toolsDiff: { added: [], removed: [], changed: [] },
     ...overrides,
@@ -83,7 +99,7 @@ function routes(overrides: Partial<Record<'status' | 'diff' | 'latest' | 'deploy
   return (path: string, init?: RequestInit): Promise<unknown> => {
     if (path.startsWith('/v1/receptionist/retell-status')) return (overrides.status ?? (() => Promise.resolve(status())))();
     if (path.endsWith('/deployment-diff')) return (overrides.diff ?? (() => Promise.resolve(diff())))();
-    if (path.endsWith('/deployments/latest')) return (overrides.latest ?? (() => Promise.resolve(deployment())))();
+    if (path.endsWith('/deployments/latest')) return (overrides.latest ?? (() => Promise.resolve(latestBody())))();
     if (path.endsWith('/deploy') && init?.method === 'POST') return (overrides.deploy ?? (() => Promise.reject(new Error('deploy not stubbed'))))();
     if (path.endsWith('/verify-provider') && init?.method === 'POST') return (overrides.verify ?? (() => Promise.resolve({ id: 'agent-1' })))();
     return Promise.reject(new Error(`Unexpected request in test: ${init?.method ?? 'GET'} ${path}`));
@@ -125,14 +141,33 @@ describe('DeployPanel', () => {
   });
 
   it('shows changed-setting chips and a Deploy changes button when the draft moved on', async () => {
-    respond = routes({ diff: () => Promise.resolve(diff({ changed: ['prompt', 'voice'], toolsDiff: { added: ['check_availability'], removed: [], changed: [] } })) });
+    // No `toolsDiff` — the route does not send one. Rendering the stale state
+    // used to throw here and take the whole tab down with it.
+    const { deployment: row, draft, changed } = diff({ changed: ['prompt', 'voice'] });
+    respond = routes({ diff: () => Promise.resolve({ deployment: row, draft, changed, placeholders: [] }) });
     renderPanel();
 
     expect(await screen.findByTestId('deploy-changes')).toBeInTheDocument();
     expect(screen.getByText('Prompt')).toBeInTheDocument();
     expect(screen.getByText('Voice')).toBeInTheDocument();
-    expect(screen.getByText(/added check_availability/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Deploy changes/ })).toBeInTheDocument();
+  });
+
+  it('warns before redeploying a campaign that is answering calls right now', async () => {
+    respond = routes();
+    render(<MemoryRouter><DeployPanel campaignId="camp-1" config={config()} campaignStatus="ACTIVE" pollIntervalMs={1} pollMaxAttempts={2} /></MemoryRouter>);
+
+    const warning = await screen.findByTestId('redeploy-degrade-warning');
+    expect(warning).toHaveTextContent('This campaign is answering calls now.');
+    expect(warning).toHaveTextContent('cannot book');
+  });
+
+  it('does not warn about a degrade window on a campaign that is not live', async () => {
+    respond = routes();
+    render(<MemoryRouter><DeployPanel campaignId="camp-1" config={config()} campaignStatus="DRAFT" pollIntervalMs={1} pollMaxAttempts={2} /></MemoryRouter>);
+
+    await screen.findByText('Version 4');
+    expect(screen.queryByTestId('redeploy-degrade-warning')).not.toBeInTheDocument();
   });
 
   it('walks publish → verify → confirm and only then reports the settled row', async () => {
@@ -143,9 +178,11 @@ describe('DeployPanel', () => {
       calls.push(`${init?.method ?? 'GET'} ${path}`);
       return routes({
         diff: () => Promise.resolve(diff({ deployment: null })),
+        // The route sends no `agent`: the panel must verify the agent the
+        // provider-status read already resolved.
         deploy: async () => {
           await gate;
-          return { deployment: deployment({ status: 'PUBLISHED', verifiedAt: null }), agent: { id: 'agent-1' }, verification: { status: 'pending' } };
+          return { deployment: deployment({ status: 'PUBLISHED', verifiedAt: null }), verification: { status: 'pending' }, message: 'Published to Retell.' };
         },
       })(path, init);
     };
@@ -199,10 +236,9 @@ describe('DeployPanel', () => {
       diff: () => Promise.resolve(diff({ deployment: null })),
       deploy: () => Promise.resolve({
         deployment: deployment({ status: 'PUBLISHED', verifiedAt: null }),
-        agent: { id: 'agent-1' },
         verification: { status: 'failed', code: 'prompt_drift', message: 'The published prompt does not match this configuration.' },
       }),
-      latest: () => Promise.resolve(deployment({ status: 'PUBLISHED', verifiedAt: null })),
+      latest: () => Promise.resolve(latestBody(deployment({ status: 'PUBLISHED', verifiedAt: null }))),
     });
     renderPanel();
 
@@ -210,7 +246,25 @@ describe('DeployPanel', () => {
 
     expect(await screen.findByText(/Published, but verification failed: The published prompt does not match this configuration./)).toBeInTheDocument();
     expect(screen.getByText('code: prompt_drift')).toBeInTheDocument();
+    // Reading the `{ deployment }` envelope as the row made this line throw.
+    expect(await screen.findByText(/Deployment published · version 4/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Verify again/ })).toBeInTheDocument();
+  });
+
+  it('stops polling as soon as the settled row arrives, rather than spending the whole budget', async () => {
+    let latestCalls = 0;
+    respond = routes({
+      diff: () => Promise.resolve(diff({ deployment: null })),
+      deploy: () => Promise.resolve({ deployment: deployment({ status: 'PUBLISHED', verifiedAt: null }), verification: { status: 'pending' } }),
+      latest: () => { latestCalls += 1; return Promise.resolve(latestBody(deployment())); },
+    });
+    render(<MemoryRouter><DeployPanel campaignId="camp-1" config={config()} pollIntervalMs={1} pollMaxAttempts={8} /></MemoryRouter>);
+
+    fireEvent.click(await screen.findByRole('button', { name: /Deploy to Retell/ }));
+    expect(await screen.findByText('Deployed')).toBeInTheDocument();
+    // One read: the VERIFIED row settles the poll. Reading the envelope as the
+    // row never matched 'VERIFIED', so every deploy burned the whole budget.
+    expect(latestCalls).toBe(1);
   });
 
   it('refuses to offer a deploy with no agent linked and points at the Agent tab', async () => {

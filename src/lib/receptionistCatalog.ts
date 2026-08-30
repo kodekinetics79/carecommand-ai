@@ -33,7 +33,7 @@ export interface SelectOption { value: string; label: string; group?: string; ou
 
 /** Grouped timezones with the tenant's recommended zones first. */
 export function timezoneOptions(catalog: Catalog | null, current: string | null | undefined): SelectOption[] {
-  const recommended = catalog?.timezones.recommended ?? [];
+  const recommended = catalog?.timezones?.recommended ?? [];
   const seen = new Set<string>();
   const out: SelectOption[] = [];
   for (const zone of recommended) {
@@ -41,7 +41,7 @@ export function timezoneOptions(catalog: Catalog | null, current: string | null 
     seen.add(zone);
     out.push({ value: zone, label: zone, group: 'Recommended' });
   }
-  for (const group of catalog?.timezones.groups ?? []) {
+  for (const group of catalog?.timezones?.groups ?? []) {
     for (const zone of group.zones) {
       if (seen.has(zone)) continue;
       seen.add(zone);
@@ -58,7 +58,9 @@ export function countryOptions(catalog: Catalog | null, current: string | null |
 
 export function packStatusFor(catalog: Catalog | null, language: string | null | undefined, country: string | null | undefined): CatalogLocalePackStatus | null {
   if (!catalog || !language || !country) return null;
-  return catalog.localePacks.find(pack => pack.language === language && pack.country === country) ?? null;
+  // A catalog missing a section is a server that has not shipped it yet, not a
+  // reason to take the whole Clinic Profile tab down with a TypeError.
+  return catalog.localePacks?.find(pack => pack.language === language && pack.country === country) ?? null;
 }
 
 const PACK_SUFFIX: Record<CatalogLocalePackStatus['status'], string> = {

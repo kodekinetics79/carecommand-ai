@@ -1,19 +1,26 @@
 import { useCallback, useMemo } from 'react';
 import { Code2, Loader2 } from 'lucide-react';
 import { Field, TextInput } from '../ui/Field';
-import { receptionistApi as api, type RetellConfig } from '../../lib/receptionist';
+import { receptionistApi as api, type Campaign, type RetellConfig } from '../../lib/receptionist';
 import { useResource } from '../../hooks/useResource';
 import { receivedData } from '../../lib/resourceState';
 import { CopyButton, KV } from './shared';
 import { LoadFailureNotice } from './MutationNotice';
 import { DeployPanel } from './DeployPanel';
 
-// ===== RetellAI Panel ======================================================
-// C5: this tab is the deployment host. DeployPanel owns deploy / verify /
-// status; everything below it is the unchanged export + BYO fallback, which
-// stays because an operator must always be able to finish in the console.
+// ===== Go live =============================================================
+// This tab is the deployment host. DeployPanel owns deploy / verify / status.
+// The raw export JSON below it is a diagnostic, not a step: it is collapsed
+// (E4) so the tab reads as the go-live action it is called, while the BYO
+// console path stays one click away because an operator must always be able
+// to finish by hand.
 
-export function RetellPanel({ campaignId, onConfigure }: { campaignId: string; onConfigure?: (target: 'campaign' | 'intake') => void }) {
+export function RetellPanel({ campaignId, campaignStatus = null, onDeployingChange, onConfigure }: {
+  campaignId: string;
+  campaignStatus?: Campaign['status'] | null;
+  onDeployingChange?: (deploying: boolean) => void;
+  onConfigure?: (target: 'campaign' | 'intake') => void;
+}) {
   const loadConfig = useCallback(() => api.getRetellConfig(campaignId), [campaignId]);
   const { state, reload } = useResource<RetellConfig>(loadConfig);
   const config = receivedData(state);
@@ -22,7 +29,7 @@ export function RetellPanel({ campaignId, onConfigure }: { campaignId: string; o
 
   return (
     <div className="space-y-4">
-      <DeployPanel campaignId={campaignId} config={config} />
+      <DeployPanel campaignId={campaignId} config={config} campaignStatus={campaignStatus} onDeployingChange={onDeployingChange} />
 
       {state.status === 'error' && (
         <div className="cc-card p-6 space-y-2">
@@ -41,8 +48,9 @@ export function RetellPanel({ campaignId, onConfigure }: { campaignId: string; o
       )}
 
       {config && (
-        <>
-          <div className="cc-card p-5 space-y-3">
+        <details className="space-y-4" data-testid="export-configuration">
+          <summary className="cursor-pointer text-sm font-bold text-t1"><Code2 className="mr-1.5 inline h-4 w-4 text-indigo" aria-hidden="true" /> Export configuration (diagnostic) — not deployed</summary>
+          <div className="cc-card mt-4 p-5 space-y-3">
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-bold text-t1 inline-flex items-center gap-2"><Code2 className="w-4 h-4 text-indigo" /> Preview/export configuration — not deployed</h3>
               <CopyButton value={fullJson} label="Copy full JSON" />
@@ -61,10 +69,10 @@ export function RetellPanel({ campaignId, onConfigure }: { campaignId: string; o
             </Field>
           </div>
 
-          <div className="cc-card p-5 space-y-2">
+          <div className="cc-card mt-4 p-5 space-y-2">
             <h3 className="text-sm font-bold text-t1">Dynamic variables</h3>
             <div className="grid gap-2 md:grid-cols-2">
-              {Object.entries(config.dynamicVariables).map(([k, v]) => (
+              {Object.entries(config.dynamicVariables ?? {}).map(([k, v]) => (
                 <div key={k} className="flex items-center justify-between gap-2 rounded-lg border border-[var(--b1)] bg-[var(--s3)] px-3 py-1.5">
                   <code className="text-[11px] font-semibold text-violet-v">{`{{${k}}}`}</code>
                   <span className="text-[11px] text-t2 truncate">{v || '—'}</span>
@@ -73,7 +81,7 @@ export function RetellPanel({ campaignId, onConfigure }: { campaignId: string; o
             </div>
           </div>
 
-          <div className="grid gap-4 lg:grid-cols-2">
+          <div className="mt-4 grid gap-4 lg:grid-cols-2">
             <div className="cc-card p-5 space-y-2">
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-bold text-t1">Booking function schema</h3>
@@ -84,7 +92,7 @@ export function RetellPanel({ campaignId, onConfigure }: { campaignId: string; o
             <div className="cc-card p-5 space-y-2">
               <h3 className="text-sm font-bold text-t1">Call-outcome extraction fields</h3>
               <div className="space-y-1.5">
-                {config.callOutcomeFields.map((f, i) => (
+                {(config.callOutcomeFields ?? []).map((f, i) => (
                   <div key={i} className="rounded-lg border border-[var(--b1)] bg-[var(--s3)] px-3 py-2">
                     <div className="flex items-center gap-2">
                       <code className="text-[11px] font-bold text-indigo">{String(f.name)}</code>
@@ -96,7 +104,7 @@ export function RetellPanel({ campaignId, onConfigure }: { campaignId: string; o
               </div>
             </div>
           </div>
-        </>
+        </details>
       )}
     </div>
   );

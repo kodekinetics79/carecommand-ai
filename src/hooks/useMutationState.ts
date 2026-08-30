@@ -12,8 +12,9 @@ import { describeFailure, type ResourceFailure } from '../lib/resourceState';
  *   busy  — a request is in flight; controls should be disabled.
  *   saved — the server accepted the write. Only reachable from a 2xx.
  *   error — the server (or the network) refused. Carries the server's own
- *           `code` and `message`, plus per-field errors for a Zod 400, so the
- *           panel can show the real cause and an action instead of nothing.
+ *           `code` and `message`, plus per-field errors for a Zod 400 and the
+ *           remediation the server wrote for that code, so the panel can show
+ *           the real cause and an action instead of nothing.
  *
  * `run` never throws: a failed action becomes an `error` state, never an
  * unhandled rejection that leaves the "Save" button re-enabled and the user
@@ -23,9 +24,38 @@ export type MutationState =
   | { status: 'idle' }
   | { status: 'busy' }
   | { status: 'saved'; savedAt: number; message?: string }
-  | { status: 'error'; message: string; code: string | null; fieldErrors: Record<string, string[]>; failure: ResourceFailure };
+  | { status: 'error'; message: string; code: string | null; fieldErrors: Record<string, string[]>; remediation: ServerRemediation | null; failure: ResourceFailure };
 
 export type MutationError = Extract<MutationState, { status: 'error' }>;
+
+/**
+ * The remediation sentence the API sends beside a refusal.
+ *
+ * Every receptionist 409 carries `title` / `action` / `fixHref` from the
+ * server's remediation catalogue — 54 written sentences, one per failure code
+ * — and the client used to keep only `message` and `code`, so every mutation
+ * degraded to a bare identifier beside readiness rows that were fully guided.
+ * This is generic on purpose: any route that adopts the same three fields is
+ * rendered the same way, with no per-screen copy.
+ */
+export interface ServerRemediation {
+  title: string | null;
+  action: string | null;
+  fixHref: string | null;
+}
+
+function trimmed(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+/** Reads the remediation block off an API error body, or null when it carries none. */
+export function extractRemediation(details: Readonly<Record<string, unknown>> | undefined): ServerRemediation | null {
+  if (!details) return null;
+  const title = trimmed(details.title);
+  const action = trimmed(details.action);
+  const fixHref = trimmed(details.fixHref);
+  return title || action || fixHref ? { title, action, fixHref } : null;
+}
 
 const VALIDATION_CODE = 'VALIDATION_ERROR';
 
@@ -71,7 +101,8 @@ export function humanizeFieldName(path: string): string {
  * - Zod 400 (`VALIDATION_ERROR` with `details.fieldErrors`): the message is the
  *   first field error, named by its field, and the whole map is kept so a form
  *   can mark each input.
- * - 409: keeps the server `code` and its own `message` (it is the actionable one).
+ * - 409: keeps the server `code`, its own `message` (it is the actionable one)
+ *   and the remediation catalogue's title / action / fix link.
  * - Network / 5xx / everything else: `describeFailure` sentences.
  */
 export function describeMutationFailure(error: unknown): MutationError {
@@ -87,7 +118,8 @@ export function describeMutationFailure(error: unknown): MutationError {
     const formErrors = asStringList((error.details?.details as Record<string, unknown> | undefined)?.formErrors);
     if (formErrors.length) message = formErrors[0];
   }
-  return { status: 'error', message, code, fieldErrors, failure };
+  const remediation = error instanceof ApiError ? extractRemediation(error.details) : null;
+  return { status: 'error', message, code, fieldErrors, remediation, failure };
 }
 
 export interface MutationRunOptions {

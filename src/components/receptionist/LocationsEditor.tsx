@@ -34,7 +34,11 @@ export function LocationsEditor({ clinic, onChanged }: { clinic: ClinicRow; onCh
   const locations = clinic.locations ?? [];
   const branchesResource = useResource<SchedulingBranch[]>(loadSchedulingBranches);
   const branchFailure = resourceFailure(branchesResource.state);
-  const branches = receivedData(branchesResource.state) ?? [];
+  // A body that is not a list is a broken contract, not zero branches: keep
+  // the list empty so the panel says "could not be loaded" rather than
+  // throwing and taking the whole Clinic Profile tab down.
+  const loadedBranches = receivedData(branchesResource.state);
+  const branches = Array.isArray(loadedBranches) ? loadedBranches : [];
   const branchesLoading = branchesResource.state.status === 'loading';
   const [editingId, setEditingId] = useState<string | 'new' | null>(null);
   const [form, setForm] = useState<LocationForm>(EMPTY_FORM);

@@ -1,7 +1,7 @@
 import { useCallback } from 'react';
 import { ApiError, apiRequest } from './api';
 import { useResource } from '../hooks/useResource';
-import { receivedData, resourceFailure, type ResourceFailure } from './resourceState';
+import { describeFailure, receivedData, resourceFailure, type ResourceFailure } from './resourceState';
 import type { Agent, Campaign, RetellConfig, RetellStatus } from './receptionist';
 
 /**
@@ -151,27 +151,74 @@ export type DeploymentStatus = 'PENDING' | 'PUBLISHED' | 'VERIFIED' | 'FAILED' |
 
 export interface DeploymentStep { name: string; status: 'ok' | 'failed' | 'skipped'; at: string; providerErrorCode?: string | null }
 
+/**
+ * A deployment row as `deploymentProjection` in
+ * `server/modules/receptionist/deployment.ts` actually sends it.
+ *
+ * The previous shape here was aspirational — it declared `campaignId`,
+ * `agentId`, `createdAt` and an unmasked `providerAgentId`, none of which the
+ * server sends, and omitted `numberBound` / `boundPhoneNumberMasked`, the two
+ * fields the go-live path is about. Every optional field below is optional
+ * because a pre-C5 server may omit it, and a missing field is rendered as
+ * unknown, never as a zero or a false.
+ */
 export interface Deployment {
   id: string;
-  campaignId: string;
-  agentId: string;
   status: DeploymentStatus;
   mock: boolean;
-  /** Masked by the server (`agent_…1234`); the full id stays on the agent row. */
-  providerAgentId: string | null;
+  /** Masked by the server (`agen…1234`); the full id stays on the agent row. */
+  providerAgentIdMasked: string | null;
   providerAgentVersion: number | null;
   providerLlmVersion: number | null;
+  providerVersionTag?: string;
   promptHash: string;
   toolFingerprint: string;
   intakeFingerprint: string;
+  configFingerprint?: string;
   voiceId: string;
   language: string;
   steps: DeploymentStep[];
   providerErrorCode: string | null;
+  /** Whether the provider number answers with this deployment. */
+  numberBound?: boolean;
+  /** Masked (`+1 ••• ••• 0142`) — never dial from this; the readiness row carries the dialable number. */
+  boundPhoneNumberMasked?: string | null;
+  deployedBySource?: string;
   startedAt: string;
   publishedAt: string | null;
   verifiedAt: string | null;
-  createdAt: string;
+}
+
+function asDeploymentSteps(value: unknown): DeploymentStep[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap(item => {
+    if (!item || typeof item !== 'object') return [];
+    const row = item as Record<string, unknown>;
+    return typeof row.name === 'string'
+      ? [{
+        name: row.name,
+        status: row.status === 'ok' || row.status === 'failed' ? row.status : 'skipped',
+        at: typeof row.at === 'string' ? row.at : '',
+        providerErrorCode: typeof row.providerErrorCode === 'string' ? row.providerErrorCode : null,
+      }]
+      : [];
+  });
+}
+
+/**
+ * `GET /deployments/latest` answers `{ deployment: … | null }`, not the row.
+ * Reading the envelope as the row is why `pollLatestDeployment` never settled
+ * (it compared `undefined` to 'VERIFIED', so every deploy spent its whole
+ * 18-second budget) and why the verification-failed panel threw on
+ * `latest.status.toLowerCase()`. Unwrap either shape, and drop anything that
+ * is not a row.
+ */
+export function unwrapDeployment(raw: unknown): Deployment | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const root = raw as Record<string, unknown>;
+  const row = ('deployment' in root ? root.deployment : root) as Record<string, unknown> | null;
+  if (!row || typeof row !== 'object' || typeof row.id !== 'string') return null;
+  return { ...(row as unknown as Deployment), steps: asDeploymentSteps(row.steps) };
 }
 
 export type DeployFailureCode =
@@ -181,22 +228,51 @@ export type DeployFailureCode =
   | 'verification_failed' | 'concurrent_change';
 
 export interface DeployResponse {
-  deployment: Deployment;
-  agent: Agent;
+  deployment: Deployment | null;
+  /** The route does not send the agent row today; the panel keeps the id it already knew. */
+  agent?: Agent;
   verification: { status: 'pending' | 'verified' | 'failed'; code?: string; message?: string };
+  message?: string;
 }
 
 export type DeploymentChange = 'prompt' | 'tools' | 'intake' | 'voice' | 'language' | 'webhook' | 'beginMessage';
 
+export interface ToolsDiff { added: string[]; removed: string[]; changed: string[] }
+
 export interface DeploymentDiff {
   deployment: {
-    id: string; status: DeploymentStatus; mock: boolean; verifiedAt: string | null; publishedAt: string | null;
+    id: string; status: DeploymentStatus; verifiedAt: string | null;
     providerAgentVersion: number | null; promptHash: string; toolFingerprint: string; voiceId: string; language: string;
-    providerErrorCode: string | null;
+    mock?: boolean; publishedAt?: string | null; providerErrorCode?: string | null;
   } | null;
-  draft: { promptHash: string; toolFingerprint: string; intakeFingerprint: string; voiceId: string; language: string; webhookUrl: string };
+  draft: { promptHash: string; toolFingerprint: string; intakeFingerprint: string; voiceId: string; language: string; webhookUrl: string; toolNames?: string[] };
   changed: DeploymentChange[];
-  toolsDiff: { added: string[]; removed: string[]; changed: string[] };
+  /**
+   * The route sends `changed` and `placeholders`, not a tools diff. It is
+   * normalised to an empty diff rather than left undefined, because the panel
+   * used to read `.added.length` off it and threw the moment a draft went
+   * stale — the exact state an operator is in when they need this screen.
+   */
+  toolsDiff: ToolsDiff;
+  placeholders?: PreviewPlaceholder[];
+}
+
+const EMPTY_TOOLS_DIFF: ToolsDiff = { added: [], removed: [], changed: [] };
+
+function asToolsDiff(value: unknown): ToolsDiff {
+  if (!value || typeof value !== 'object') return EMPTY_TOOLS_DIFF;
+  const row = value as Record<string, unknown>;
+  const list = (v: unknown) => (Array.isArray(v) ? v.filter((item): item is string => typeof item === 'string') : []);
+  return { added: list(row.added), removed: list(row.removed), changed: list(row.changed) };
+}
+
+export function normalizeDeploymentDiff(raw: unknown): DeploymentDiff {
+  const root = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  return {
+    ...(root as unknown as DeploymentDiff),
+    changed: Array.isArray(root.changed) ? (root.changed as DeploymentChange[]) : [],
+    toolsDiff: asToolsDiff(root.toolsDiff),
+  };
 }
 
 export type DeployPanelState =
@@ -257,21 +333,86 @@ export function deployChecklistOf(config: RetellConfigExport): DeployChecklistIt
   return rows.map((row, index) => ({ step: index + 1, ...row }));
 }
 
+// --- Studio tabs: the client half of the server's `fixTab` map -----------------
+
+/**
+ * Every tab id `/receptionist-studio` accepts. It lives here, beside the
+ * readiness keys, because it is a contract with the server rather than a
+ * detail of the page: `remediation.ts` writes `fixTab` into 54 fix links, and
+ * 33 of them named ids the page did not have (`deploy` × 25, `agent` × 8).
+ * Those links landed on Clinic Profile at the exact moment the operator was
+ * stuck on a deployment.
+ *
+ * The page moved rather than the catalogue: the deploy tab is now `deploy`
+ * ("Go live"), which is what the operator is doing there and what the server
+ * has always called it. `retell` — the id it shipped with — and `agent` are
+ * kept as aliases so no printed link and no server entry breaks either way.
+ */
+export const STUDIO_TAB_IDS = ['clinic', 'knowledge', 'campaign', 'intake', 'preview', 'deploy', 'outbound', 'activity'] as const;
+
+export type StudioTab = (typeof STUDIO_TAB_IDS)[number];
+
+const STUDIO_TAB_ALIASES: Record<string, StudioTab> = {
+  retell: 'deploy',
+  'go-live': 'deploy',
+  golive: 'deploy',
+  agent: 'campaign',
+};
+
+export function isStudioTab(value: string | null | undefined): value is StudioTab {
+  return typeof value === 'string' && (STUDIO_TAB_IDS as readonly string[]).includes(value);
+}
+
+/** The tab a `?tab=` value opens, or null when nothing defines it — never a guess. */
+export function resolveStudioTab(value: string | null | undefined): StudioTab | null {
+  if (!value) return null;
+  if (isStudioTab(value)) return value;
+  return STUDIO_TAB_ALIASES[value] ?? null;
+}
+
 // --- Readiness and actions ---------------------------------------------------
 
-export type ReadinessKey =
-  | 'agent_linked' | 'agent_verified' | 'deployment_current' | 'locale_pack_approved' | 'hours_set'
-  | 'location_mapped' | 'services_bookable' | 'provider_availability' | 'intake_attested' | 'placeholders_absent'
-  | 'disclosure_composed' | 'confirmation_channels' | 'offer_content' | 'test_call_completed'
-  | 'transfer_target_distinct' | 'phone_number_bound' | 'data_storage_setting';
+/**
+ * The readiness rows the server emits, in its own order.
+ *
+ * This list is the client half of a contract: it must equal the keys of
+ * `LABELS` in `server/lib/receptionist/campaignReadiness.ts`, and
+ * `receptionistDeployment.contract.test.ts` reads that file and asserts it.
+ * The go-live card used to look for `phone_number_bound` — a key the server
+ * has never emitted — so the one step that proves a caller can reach the line
+ * ("forward the public number to the DID") could never leave "Not evaluated
+ * yet." and could never offer a Fix link. Nothing here may be invented: a key
+ * the server does not emit is a step that silently never evaluates.
+ */
+export const READINESS_KEYS = [
+  'agent_linked',
+  'agent_verified',
+  'deployment_current',
+  'number_bound',
+  'location_mapped',
+  'services_bookable',
+  'provider_availability',
+  'intake_attested',
+  'placeholders_absent',
+  'disclosure_composed',
+  'confirmation_channels',
+  'transfer_target_distinct',
+  'test_call_completed',
+  'data_storage_setting',
+] as const;
+
+export type ReadinessKey = (typeof READINESS_KEYS)[number];
 
 export type ReadinessStatus = 'pass' | 'fail' | 'warn' | 'pending';
 
 export interface ReadinessCheck {
-  key: ReadinessKey | string;
+  /** A key outside `READINESS_KEYS` still renders: the server owns this list, and a row we do not recognise is shown, never dropped. */
+  key: ReadinessKey | (string & {});
   label: string;
   status: ReadinessStatus;
   code: string | null;
+  /** The remediation title for a failing row; equals `label` when it passed. Absent on a pre-C5 server. */
+  title?: string;
   detail: string;
   fixHref: string | null;
 }
@@ -282,9 +423,15 @@ export interface ReadinessResponse {
   campaignId: string;
   status: Campaign['status'];
   ready: boolean;
+  /** Present since C5; absent from a pre-C5 server, in which case the badge is simply not shown. */
+  providerMode?: ProviderMode;
   checks: ReadinessCheck[];
   actions: { activate: ReadinessAction; pause: ReadinessAction; archive: ReadinessAction };
   evaluatedAt: string;
+}
+
+export function checkFor(readiness: ReadinessResponse | null, key: ReadinessKey): ReadinessCheck | null {
+  return readiness?.checks.find(row => row.key === key) ?? null;
 }
 
 export function failingChecks(readiness: ReadinessResponse): ReadinessCheck[] {
@@ -293,20 +440,26 @@ export function failingChecks(readiness: ReadinessResponse): ReadinessCheck[] {
 
 export type GoLiveStepStatus = 'done' | 'todo' | 'warn' | 'pending';
 
+export type GoLiveStepKey = 'deploy' | 'verify' | 'forward' | 'test_call' | 'activate';
+
 export interface GoLiveStep {
-  key: 'deploy' | 'verify' | 'forward' | 'test_call' | 'activate';
+  key: GoLiveStepKey;
   label: string;
+  /** The remediation title the server wrote for a failing row, when it sent one. */
+  title: string | null;
   detail: string;
   status: GoLiveStepStatus;
   fixHref: string | null;
 }
 
-function stepFromCheck(readiness: ReadinessResponse | null, key: ReadinessKey, label: string, todoDetail: string): GoLiveStep {
-  const check = readiness?.checks.find(row => row.key === key) ?? null;
-  const base: GoLiveStep = { key: 'deploy', label, detail: todoDetail, status: 'pending', fixHref: null };
-  if (!check) return { ...base, detail: 'Not evaluated yet.' };
+function stepFromCheck(readiness: ReadinessResponse | null, key: ReadinessKey, stepKey: GoLiveStepKey, label: string, todoDetail: string): GoLiveStep {
+  const check = checkFor(readiness, key);
+  const base: GoLiveStep = { key: stepKey, label, title: null, detail: todoDetail, status: 'pending', fixHref: null };
+  // No row means the server did not evaluate this step. Saying so is the
+  // whole point: a step nobody evaluated must never read as done.
+  if (!check) return { ...base, detail: readiness ? `The server did not report “${key}”, so this step is unproven.` : 'Not evaluated yet.' };
   const status: GoLiveStepStatus = check.status === 'pass' ? 'done' : check.status === 'warn' ? 'warn' : check.status === 'pending' ? 'pending' : 'todo';
-  return { ...base, status, detail: check.detail || todoDetail, fixHref: check.fixHref };
+  return { ...base, status, title: check.status === 'pass' ? null : check.title ?? null, detail: check.detail || todoDetail, fixHref: check.fixHref };
 }
 
 /**
@@ -316,18 +469,166 @@ function stepFromCheck(readiness: ReadinessResponse | null, key: ReadinessKey, l
  */
 export function goLiveSteps(readiness: ReadinessResponse | null, campaignStatus: Campaign['status']): GoLiveStep[] {
   return [
-    { ...stepFromCheck(readiness, 'deployment_current', 'Deploy the agent to Retell', 'Deploy from the RetellAI Export tab.'), key: 'deploy' },
-    { ...stepFromCheck(readiness, 'agent_verified', 'Verify the deployment', 'Verify after deploying; verification expires and auto-renews.'), key: 'verify' },
-    { ...stepFromCheck(readiness, 'phone_number_bound', 'Forward the public number to the DID', 'Bind the clinic number to the deployed agent and forward the public line to it.'), key: 'forward' },
-    { ...stepFromCheck(readiness, 'test_call_completed', 'Place a test call', 'Call the line from a staff number; the call log must show it.'), key: 'test_call' },
+    stepFromCheck(readiness, 'deployment_current', 'deploy', 'Deploy the agent to Retell', 'Deploy from the Go live tab.'),
+    stepFromCheck(readiness, 'agent_verified', 'verify', 'Verify the deployment', 'Verify after deploying; verification expires and auto-renews.'),
+    stepFromCheck(readiness, 'number_bound', 'forward', 'Forward the public number to the DID', 'Bind the clinic number to the deployed agent and forward the public line to it.'),
+    stepFromCheck(readiness, 'test_call_completed', 'test_call', 'Place a test call', 'Call the line from a staff number; the call log must show it.'),
     {
       key: 'activate',
       label: 'Activate the campaign',
+      title: null,
       detail: campaignStatus === 'ACTIVE' ? 'The campaign is live.' : readiness?.ready ? 'Every check passes — activate below.' : 'Activate once every readiness check passes.',
       status: campaignStatus === 'ACTIVE' ? 'done' : 'todo',
       fixHref: null,
     },
   ];
+}
+
+/**
+ * The dialable number, taken only from the passing `number_bound` row, which
+ * is the one place the server states it in full (the deployment projection
+ * masks it, and a masked number cannot be dialled or forwarded). Anything
+ * that is not an unambiguous E.164 number yields null, and the rail then says
+ * the number is not confirmed rather than printing a guess.
+ *
+ * TODO(Package A/B): send it as a field — `readiness.boundNumber`, or
+ * `boundPhoneNumber` on the deployment for roles allowed to see it — so this
+ * stops depending on the wording of a sentence.
+ */
+export function boundNumberOf(readiness: ReadinessResponse | null): string | null {
+  const check = checkFor(readiness, 'number_bound');
+  if (!check || check.status !== 'pass') return null;
+  const match = /\+[1-9]\d{6,14}/.exec(check.detail);
+  return match ? match[0] : null;
+}
+
+/** A clinic-level prerequisite (country, hours, locale pack) promoted onto the rail. */
+export interface GoLivePrerequisite { code: string; label: string; fixHref: string | null }
+
+export interface GoLiveRail {
+  steps: GoLiveStep[];
+  prerequisites: GoLivePrerequisite[];
+  done: number;
+  total: number;
+  /** The one thing to do next — a prerequisite first, then the first unfinished step. */
+  next: { label: string; detail: string; fixHref: string | null } | null;
+  boundNumber: string | null;
+}
+
+export function goLiveRail(input: {
+  readiness: ReadinessResponse | null;
+  campaignStatus: Campaign['status'];
+  prerequisites?: GoLivePrerequisite[];
+}): GoLiveRail {
+  const steps = goLiveSteps(input.readiness, input.campaignStatus);
+  const prerequisites = input.prerequisites ?? [];
+  const done = steps.filter(step => step.status === 'done' || step.status === 'warn').length;
+  const blockedStep = steps.find(step => step.status !== 'done' && step.status !== 'warn') ?? null;
+  const next = prerequisites.length
+    ? { label: prerequisites[0].label, detail: 'Finish the clinic profile before the receptionist can go live.', fixHref: prerequisites[0].fixHref }
+    : blockedStep
+      ? { label: blockedStep.title ?? blockedStep.label, detail: blockedStep.detail, fixHref: blockedStep.fixHref }
+      : null;
+  return { steps, prerequisites, done, total: steps.length, next, boundNumber: boundNumberOf(input.readiness) };
+}
+
+// --- Service status (SF-3) -----------------------------------------------------
+
+export type ServiceState = 'answering' | 'degraded' | 'not_answering' | 'unknown';
+
+export interface ServiceStatus {
+  state: ServiceState;
+  /** Short enough to sit on one always-visible line. */
+  headline: string;
+  detail: string;
+  action: string | null;
+  fixHref: string | null;
+}
+
+/** Verification this close to lapsing is worth saying out loud before it does. */
+export const VERIFICATION_WARN_MS = 4 * 60 * 60 * 1000;
+
+const SERVICE_BLOCKING_KEYS: ReadinessKey[] = ['agent_linked', 'agent_verified', 'deployment_current', 'number_bound'];
+
+/**
+ * One always-visible sentence: is this clinic's receptionist answering right
+ * now, and if not, what is the next click. Derived only from what the server
+ * reported — a state it did not report is `unknown`, never `answering`.
+ */
+export function serviceStatus(input: {
+  campaignStatus: Campaign['status'];
+  readiness: ReadinessResponse | null;
+  verification?: VerificationView | null;
+  /** A deploy is in flight right now: the provider is mid-swap. */
+  deploying?: boolean;
+}): ServiceStatus {
+  const { campaignStatus, readiness, verification = null, deploying = false } = input;
+
+  if (deploying) {
+    return {
+      state: 'degraded',
+      headline: 'Redeploying — reduced service',
+      detail: 'Between publishing and verification the agent is unverified, so a caller reaches only the safe tools: it can take a message or transfer, but it cannot book. Verification ends the window.',
+      action: 'Stay on this screen until verification finishes.',
+      fixHref: null,
+    };
+  }
+
+  if (!readiness) {
+    return {
+      state: 'unknown',
+      headline: 'Service status unknown',
+      detail: 'Readiness has not been evaluated, so CareCommand cannot say whether this line answers.',
+      action: 'Reload the readiness check.',
+      fixHref: null,
+    };
+  }
+
+  const broken = SERVICE_BLOCKING_KEYS
+    .map(key => checkFor(readiness, key))
+    .find(check => check !== null && check.status !== 'pass' && check.status !== 'warn') ?? null;
+
+  if (campaignStatus !== 'ACTIVE') {
+    const word = campaignStatus === 'ARCHIVED' ? 'archived' : campaignStatus === 'PAUSED' ? 'paused' : 'a draft';
+    return {
+      state: 'not_answering',
+      headline: 'Not answering',
+      detail: `The campaign is ${word}, so no caller reaches this receptionist.`,
+      action: broken ? broken.title ?? broken.label : readiness.ready ? 'Every check passes — activate the campaign.' : 'Clear the readiness checks, then activate.',
+      fixHref: broken?.fixHref ?? null,
+    };
+  }
+
+  if (broken) {
+    return {
+      state: 'not_answering',
+      headline: 'Active, but not answering',
+      detail: broken.detail,
+      action: broken.title ?? broken.label,
+      fixHref: broken.fixHref,
+    };
+  }
+
+  if (verification && verification.status === 'VERIFIED' && verification.expiresInMs !== null && verification.expiresInMs <= VERIFICATION_WARN_MS) {
+    return {
+      state: verification.expiresInMs <= 0 ? 'not_answering' : 'degraded',
+      headline: verification.expiresInMs <= 0 ? 'Verification expired' : `Verification expires in ${formatExpiresIn(verification.expiresInMs)}`,
+      detail: verificationLine(verification).text,
+      action: 'Verify the agent again.',
+      fixHref: null,
+    };
+  }
+
+  const warnings = readiness.checks.filter(check => check.status === 'warn');
+  return {
+    state: 'answering',
+    headline: 'Answering calls',
+    detail: warnings.length
+      ? `Callers reach this receptionist. ${warnings.length} warning${warnings.length === 1 ? '' : 's'} on the checklist.`
+      : 'Callers reach this receptionist.',
+    action: null,
+    fixHref: null,
+  };
 }
 
 // --- Preview -------------------------------------------------------------------
@@ -426,6 +727,12 @@ export interface CatalogView {
   tones: CatalogOption[];
   campaignTypes: CatalogOption[];
   providerMode: ProviderMode | null;
+  /**
+   * Why the voice list is empty, in the server's words. An empty select with
+   * no reason is the defect this closes: an operator could not choose or
+   * change the agent voice anywhere in Studio and nothing said why.
+   */
+  voicesUnavailable: string | null;
 }
 
 function asOption(item: unknown): CatalogOption | null {
@@ -464,6 +771,38 @@ export function normalizeCatalog(raw: unknown): CatalogView {
     tones: asList(root.tones).map(asOption).filter((v): v is CatalogOption => v !== null),
     campaignTypes: asList(root.campaignTypes).map(asOption).filter((v): v is CatalogOption => v !== null),
     providerMode: mode === 'live' || mode === 'mock' || mode === 'unconfigured' ? mode : null,
+    voicesUnavailable: null,
+  };
+}
+
+/**
+ * The voice catalogue (`GET /voices`) folded into the catalog view.
+ *
+ * Contract §7 says `buildReceptionistCatalog` should carry `voices` and
+ * `providerMode`; it does not yet, and `voicesCatalogSection()` is served only
+ * from the standalone route that no client called — which is why the picker
+ * was empty in every tenant and the mock-mode badge never appeared. Until the
+ * server folds the section in, the client asks for it and merges it here.
+ * `source: 'unavailable'` and `error` are carried through so the reason is
+ * shown instead of an empty select.
+ */
+export function mergeVoicesSection(view: CatalogView, raw: unknown): CatalogView {
+  const root = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  const voices = asList(root.voices).map(asVoice).filter((v): v is CatalogVoice => v !== null);
+  const mode = root.providerMode;
+  const providerMode = mode === 'live' || mode === 'mock' || mode === 'unconfigured' ? mode : view.providerMode;
+  const error = typeof root.error === 'string' && root.error.trim() ? root.error : null;
+  return {
+    ...view,
+    voices: voices.length ? voices : view.voices,
+    providerMode,
+    voicesUnavailable: voices.length || view.voices.length
+      ? null
+      : error
+        ? `The voice catalogue could not be read from the provider (${error}).`
+        : providerMode === 'unconfigured'
+          ? 'The voice provider is not configured on this server, so no voices can be listed.'
+          : 'The provider returned no voices.',
   };
 }
 
@@ -484,7 +823,25 @@ export function withCurrentOption(options: CatalogOption[], current: string): Ca
 }
 
 const CATALOG_PATH = `${base}/catalog`;
-const loadCatalog = (signal: AbortSignal) => apiRequest<unknown>(CATALOG_PATH, { signal }).then(normalizeCatalog);
+const VOICES_PATH = `${base}/voices`;
+
+/**
+ * One catalog read for the editors. `/catalog` carries no voices today, so
+ * the voice section is fetched from its own route and merged; a failure there
+ * degrades to a stated reason, never to a silently empty picker, and never
+ * fails the whole catalog.
+ */
+async function loadCatalogWithVoices(signal?: AbortSignal): Promise<CatalogView> {
+  const view = normalizeCatalog(await apiRequest<unknown>(CATALOG_PATH, { signal }));
+  if (view.voices.length) return view;
+  try {
+    return mergeVoicesSection(view, await apiRequest<unknown>(VOICES_PATH, { signal }));
+  } catch (error) {
+    return { ...view, voicesUnavailable: `The voice catalogue could not be loaded: ${describeFailure(error).message}` };
+  }
+}
+
+const loadCatalog = (signal: AbortSignal) => loadCatalogWithVoices(signal);
 
 export interface CatalogHookResult { catalog: CatalogView | null; failure: ResourceFailure | null; reload: () => void }
 
@@ -497,6 +854,84 @@ export function useReceptionistCatalog(): CatalogHookResult {
 export function useCampaignReadiness(campaignId: string) {
   const loader = useCallback((signal: AbortSignal) => deploymentApi.readiness(campaignId, signal), [campaignId]);
   return useResource<ReadinessResponse>(loader);
+}
+
+// --- Overview KPIs (kpi-v2, SF-2) ----------------------------------------------------
+
+export interface OverviewCounts {
+  inbound: number | null; outbound: number | null; answeredInbound: number | null; booked: number | null;
+  escalated: number | null; optedOut: number | null; pendingRequests: number | null; openHandoffs: number | null;
+  activeCampaigns: number | null; clinics: number | null;
+}
+
+export interface OverviewRates {
+  bookingRate: number | null; containedPct: number | null; afterHoursPct: number | null; callbacksWithinSlaPct: number | null;
+}
+
+export interface OverviewKpis {
+  counts: OverviewCounts;
+  rates: OverviewRates;
+  /** Average handle time in seconds. Null when nothing was answered. */
+  aht: number | null;
+  /** The server's own sentence for each metric, printed beside it. */
+  definitions: Record<string, string>;
+}
+
+function numberOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * The kpi-v2 block, read exactly as the server sends it.
+ *
+ * The rule this enforces is the one the legacy header broke: a rate with no
+ * denominator is UNAVAILABLE, never 0. `null` survives all the way to the
+ * screen, where it renders as an em dash. The legacy scalars (`totalCalls`,
+ * `bookingRate` as a percent over calls in both directions, `avgDurationSeconds`
+ * collapsed to 0) are deliberately not read — Package D deletes them.
+ */
+export function normalizeOverviewKpis(raw: unknown): OverviewKpis | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const root = raw as Record<string, unknown>;
+  const counts = (root.counts && typeof root.counts === 'object' ? root.counts : null) as Record<string, unknown> | null;
+  const rates = (root.rates && typeof root.rates === 'object' ? root.rates : null) as Record<string, unknown> | null;
+  if (!counts && !rates) return null;
+  const definitions: Record<string, string> = {};
+  if (root.definitions && typeof root.definitions === 'object') {
+    for (const [key, value] of Object.entries(root.definitions as Record<string, unknown>)) {
+      if (typeof value === 'string' && value.trim()) definitions[key] = value;
+    }
+  }
+  return {
+    counts: {
+      inbound: numberOrNull(counts?.inbound), outbound: numberOrNull(counts?.outbound),
+      answeredInbound: numberOrNull(counts?.answeredInbound), booked: numberOrNull(counts?.booked),
+      escalated: numberOrNull(counts?.escalated), optedOut: numberOrNull(counts?.optedOut),
+      pendingRequests: numberOrNull(counts?.pendingRequests), openHandoffs: numberOrNull(counts?.openHandoffs),
+      activeCampaigns: numberOrNull(counts?.activeCampaigns), clinics: numberOrNull(counts?.clinics),
+    },
+    rates: {
+      bookingRate: numberOrNull(rates?.bookingRate), containedPct: numberOrNull(rates?.containedPct),
+      afterHoursPct: numberOrNull(rates?.afterHoursPct), callbacksWithinSlaPct: numberOrNull(rates?.callbacksWithinSlaPct),
+    },
+    aht: numberOrNull(root.aht),
+    definitions,
+  };
+}
+
+/** An em dash, never "0%", when the server could not compute the rate. */
+export function formatRate(value: number | null): string {
+  return value === null ? '—' : `${Math.round(value * 100)}%`;
+}
+
+export function formatCount(value: number | null): string {
+  return value === null ? '—' : String(value);
+}
+
+/** "0m 54s", or an em dash when no call was long enough to average. */
+export function formatSeconds(value: number | null): string {
+  if (value === null) return '—';
+  return `${Math.floor(value / 60)}m ${value % 60}s`;
 }
 
 // --- Polling -------------------------------------------------------------------------
@@ -536,9 +971,18 @@ function query(params: Record<string, string | undefined>): string {
 export const deploymentApi = {
   retellStatus: (scope: { clinicId?: string; campaignId?: string } = {}, signal?: AbortSignal) =>
     apiRequest<RetellStatusLike>(`${base}/retell-status${query(scope)}`, { signal }).then(normalizeRetellStatus),
-  deploy: (campaignId: string) => apiRequest<DeployResponse>(`${base}/campaigns/${campaignId}/deploy`, { method: 'POST', body: JSON.stringify({}) }),
-  latestDeployment: (campaignId: string, signal?: AbortSignal) => apiRequest<Deployment | null>(`${base}/campaigns/${campaignId}/deployments/latest`, { signal }).then(row => row ?? null),
-  deploymentDiff: (campaignId: string, signal?: AbortSignal) => apiRequest<DeploymentDiff>(`${base}/campaigns/${campaignId}/deployment-diff`, { signal }),
+  deploy: (campaignId: string) => apiRequest<unknown>(`${base}/campaigns/${campaignId}/deploy`, { method: 'POST', body: JSON.stringify({}) })
+    .then(raw => {
+      const body = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+      const verification = body.verification && typeof body.verification === 'object'
+        ? body.verification as DeployResponse['verification']
+        : { status: 'pending' as const };
+      return { ...(body as unknown as DeployResponse), deployment: unwrapDeployment(body.deployment), verification };
+    }),
+  latestDeployment: (campaignId: string, signal?: AbortSignal) =>
+    apiRequest<unknown>(`${base}/campaigns/${campaignId}/deployments/latest`, { signal }).then(unwrapDeployment),
+  deploymentDiff: (campaignId: string, signal?: AbortSignal) =>
+    apiRequest<unknown>(`${base}/campaigns/${campaignId}/deployment-diff`, { signal }).then(normalizeDeploymentDiff),
   readiness: (campaignId: string, signal?: AbortSignal) => apiRequest<ReadinessResponse>(`${base}/campaigns/${campaignId}/readiness`, { signal }),
   activate: (campaignId: string) => apiRequest<Campaign>(`${base}/campaigns/${campaignId}/activate`, { method: 'POST', body: JSON.stringify({}) }),
   pause: (campaignId: string) => apiRequest<Campaign>(`${base}/campaigns/${campaignId}/pause`, { method: 'POST', body: JSON.stringify({}) }),
@@ -547,5 +991,7 @@ export const deploymentApi = {
   confirmationChannels: (signal?: AbortSignal) => apiRequest<ConfirmationChannels>(`${base}/confirmation-channels`, { signal }),
   adoptProviderValues: (agentId: string) => apiRequest<AgentRow>(`${base}/agents/${agentId}/adopt-provider-values`, { method: 'POST', body: JSON.stringify({}) }),
   retellConfig: (campaignId: string, signal?: AbortSignal) => apiRequest<RetellConfigExport>(`${base}/campaigns/${campaignId}/retell-config`, { signal }),
-  catalog: (signal?: AbortSignal) => apiRequest<unknown>(CATALOG_PATH, { signal }).then(normalizeCatalog),
+  catalog: loadCatalogWithVoices,
+  /** The kpi-v2 block. Legacy scalars in the same body are deliberately ignored. */
+  overview: (signal?: AbortSignal) => apiRequest<unknown>(`${base}/overview`, { signal }).then(normalizeOverviewKpis),
 };

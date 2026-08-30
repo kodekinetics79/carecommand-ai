@@ -16,7 +16,6 @@ import { LoadFailureNotice, MutationNotice } from './MutationNotice';
 import { AgentEditor } from './AgentEditor';
 import { ReadinessChecklist } from './ReadinessChecklist';
 import { CampaignActions } from './CampaignActions';
-import { GoLiveCard } from './GoLiveCard';
 
 // ===== Campaign Panel (agent + campaign) ===================================
 
@@ -46,15 +45,44 @@ function ChannelToggle({ label, channel, checked, onChange }: {
   );
 }
 
+/**
+ * Exactly the fields `ensureAgentAndSave` sends. `status` is deliberately
+ * absent: transitions go through CampaignActions, and including it in the
+ * dirty compare meant activating a campaign flipped the panel to "unsaved
+ * changes" and the next Save re-posted a draft assembled before the
+ * transition — overwriting whatever another operator had changed meanwhile.
+ */
+function editableCampaign(campaign: Campaign) {
+  return {
+    name: campaign.name, campaignType: campaign.campaignType, agentId: campaign.agentId,
+    offerTitle: campaign.offerTitle, offerDescription: campaign.offerDescription, offerScript: campaign.offerScript,
+    appointmentType: campaign.appointmentType, bookingRules: campaign.bookingRules,
+    eligibleLocationIds: campaign.eligibleLocationIds,
+    smsConfirmation: campaign.smsConfirmation, emailConfirmation: campaign.emailConfirmation,
+  };
+}
+
+const campaignKey = (campaign: Campaign) => JSON.stringify(editableCampaign(campaign));
+
 export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic; campaign: Campaign; onChanged: () => Promise<unknown> }) {
   const [agents, setAgents] = useState<AgentRow[]>([]);
   const [agentsFailure, setAgentsFailure] = useState<ResourceFailure | null>(null);
   const [draft, setDraft] = useState<Campaign>(campaign);
+  const [seedKey, setSeedKey] = useState(() => campaignKey(campaign));
   const saveState = useMutationState();
   const createAgentState = useMutationState();
   const removeState = useMutationState();
   const [newAgentName, setNewAgentName] = useState('');
-  const dirty = JSON.stringify(draft) !== JSON.stringify(campaign);
+  const storedKey = campaignKey(campaign);
+  const dirty = campaignKey(draft) !== storedKey;
+
+  // Value compare, during render: a status transition or a reload that changed
+  // nothing this panel edits must not reset the draft, and a stored value that
+  // really did change must not stay hidden behind a stale one.
+  if (seedKey !== storedKey) {
+    setSeedKey(storedKey);
+    setDraft(campaign);
+  }
   const locations = clinic.locations ?? [];
   const staleLocationIds = draft.eligibleLocationIds.filter(id => !locations.some(location => location.id === id));
   const rules = draft.bookingRules ?? {};
@@ -183,8 +211,6 @@ export function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic;
 
   return (
     <div className="space-y-4">
-      <GoLiveCard readiness={readiness} campaignStatus={campaign.status} providerMode={providerStatus?.providerMode ?? catalog?.providerMode ?? null} />
-
       <div className="cc-card p-5 space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-sm font-bold text-t1">Activation</h3>
