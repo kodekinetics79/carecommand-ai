@@ -128,8 +128,42 @@ transacts on a single platform-owned account per provider, read from `process.en
   entitlement enforcement and the voice meter are real. "No checkout/invoices/dunning"
   still holds.
 
-## 7. Pre-existing test-isolation defect (not a product regression)
+## 7. Fixed in this session (2026-08-29)
 
-`server/test/pilotImport.test.ts` fails against the shared dev database: `PilotImportPreset`
-has accumulated 72 rows with `isDefault = true`, so "the default preset" resolves to a
-different row each run. Fails identically with and without this session's changes.
+| Commit | What it closed |
+|---|---|
+| `4e7f744` | C1-C5, C7-C9, L4 - provisioning contract, transaction budget, platform settings that provisioning reads, presets, entitlement-override durability |
+| `d65aa01` | C10-C13, C15, C16 - failed lists no longer render as reassuring empty states, per-tenant audit fetch, dead quick-action cards, dev note, hardcoded /15, read-only role respected |
+| `f48121c` | H2, H3, H4 - role-escalation guard, URL redaction in logs (plus Fastify's 404 handler, which leaked the same URLs), permission gates + audit on the advisory PHI endpoints |
+| `5349c92` | H1 - break-glass required before platform staff read or write clinic data |
+
+### A defect found while fixing H1
+
+`pilotRoutes` never established the platform database request scope that `platformRoutes`
+sets up (`routes.ts:247`), so every platform-plane read inside the pilot plugin ran without
+its actor GUCs and was **silently denied by RLS** rather than erroring. Fixed in `5349c92`;
+it is what made the support-session lookup - and the plugin's own platform audit writes -
+work at all. Worth a lint or a plugin-level assertion: a platform-plane query outside the
+scope should fail loudly, not return nothing.
+
+## 8. Known-failing tests (pre-existing, deliberately left failing)
+
+`server/test/pilotImport.test.ts` - two cases:
+
+1. **Preset save is not idempotent.** The replayed save creates a second row instead of
+   returning the stored response.
+2. **A retried commit records a second durable intent** (`pilot.import.committed.requested`).
+
+Cause: commit `2bdffe6` (a revert of PR #4) removed idempotency handling from
+`pilot.routes.ts`. The console still sends an `Idempotency-Key` header that **nothing
+reads** - grep finds no idempotency handling in that file at all. So a double-clicked
+import is not protected by the mechanism the client believes is protecting it (data-key
+upserts limit the damage, but that is luck, not design).
+
+Both tests assert the correct behaviour of a capability that was reverted away. They are
+left failing rather than weakened to match the regression. Restoring idempotency on these
+routes is P1.
+
+Separately, the shared dev database has accumulated 72 `PilotImportPreset` rows with
+`isDefault = true`, which makes any "the default preset" assertion ambiguous - a test
+isolation problem worth fixing when that suite is next touched.
