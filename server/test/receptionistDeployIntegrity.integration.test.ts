@@ -428,6 +428,65 @@ describe('A5 — a failed deploy does not leak the engine it created', () => {
   });
 });
 
+describe('a published engine is frozen, so the next deploy makes a new one', () => {
+  it('creates a fresh response engine once the prior deployment was published', async () => {
+    // Confirmed against the live provider on 2026-08-30: PATCHing the engine of
+    // a published deployment answers `400 Cannot update published LLM`, which
+    // our provider layer reports as the generic `invalid_request`. The prior
+    // engine was chosen without regard to publication, so EVERY deploy after
+    // the first successful one failed at ensure_llm, permanently — a clinic
+    // could publish once and then never change its prompt, hours, services or
+    // disclosure again.
+    const agentId = providerId('agent_pub');
+    const firstLlm = providerId('llm_pub_one');
+    const secondLlm = providerId('llm_pub_two');
+    env.RETELL_API_KEY = 'real-provider-key';
+    env.RETELL_BASE_URL = 'https://api.retellai.com';
+    env.RETELL_FROM_NUMBER = '+15550100000';
+    let createdEngines = 0;
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL) => {
+      const value = String(url).replace('https://api.retellai.com', '');
+      calls.push(value);
+      if (value.startsWith('/create-retell-llm')) {
+        createdEngines += 1;
+        return new Response(JSON.stringify({ llm_id: createdEngines === 1 ? firstLlm : secondLlm, version: 0 }), { status: 200 });
+      }
+      if (value.startsWith('/update-retell-llm/')) {
+        // The provider's real answer for an engine that has been published.
+        return new Response(JSON.stringify({ status: 'error', message: 'Cannot update published LLM' }), { status: 400 });
+      }
+      if (value.startsWith('/create-agent') || value.startsWith('/update-agent/')) {
+        return new Response(JSON.stringify({ agent_id: agentId, version: 0 }), { status: 200 });
+      }
+      if (value.startsWith('/publish-agent-version/')) return new Response(JSON.stringify({}), { status: 200 });
+      if (value.startsWith('/update-phone-number/')) {
+        const number = decodeURIComponent(value.split('phone-number/')[1] ?? '');
+        return new Response(JSON.stringify({ phone_number: number, inbound_agents: [{ agent_id: agentId, agent_version: 0 }] }), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    }));
+    try {
+      const t = await tenant();
+      const { campaign } = await deployableCampaign(t);
+
+      expect((await deploy(t, campaign.id)).statusCode).toBe(200);
+      const published = await db.receptionistAgentDeployment.findFirstOrThrow({ where: { campaignId: campaign.id } });
+      expect(published.publishedAt).not.toBeNull();
+      expect(published.providerLlmId).toBe(firstLlm);
+
+      calls.length = 0;
+      // The second deploy must not touch the frozen engine.
+      expect((await deploy(t, campaign.id)).statusCode).toBe(200);
+      expect(calls.some(call => call.startsWith('/update-retell-llm/'))).toBe(false);
+      expect(calls.some(call => call.startsWith('/create-retell-llm'))).toBe(true);
+      expect(createdEngines).toBe(2);
+    } finally {
+      restoreProvider();
+    }
+  });
+});
+
 describe('A6 — two deploys of one agent do not both win', () => {
   it('serialises concurrent deploys and refuses to adopt the loser', async () => {
     useMockProvider();
