@@ -31,3 +31,19 @@ NOT READY for a customer-independent pilot. The governance core is ahead of mark
 - **C5 Deployment & activation** — M03 re-verify worker, M04 Deploy to Retell, M05 mock provider, M46 readiness + Activate/Pause/Archive, M50, M56, M66.
 - **C6 Outbound** — A6 findings + M69 scheduler (reminders/recall/reactivation), M47 transfer directory, M57 waitlist.
 - **C7 Harness & pilot pack** — M25 seeds/demo, M51 UI/integration/e2e, M67 a11y pass, M70 docs/runbook/limitations, pilot readiness scorecard.
+
+---
+
+## Decision 9 — BYO agents may not answer a patient line on an unprovable prompt (2026-08-30)
+
+Package A escalated this rather than deciding it alone, which was right.
+
+**The situation.** CareCommand can now verify *who answers* a clinic's number — `getPhoneNumberBinding` is read back from Retell and persisted, and unreadable is recorded as `pending`, never `pass`. But for a hand-linked (BYO) agent we cannot attest its **prompt or tools**: `evaluateRetellAgentReadiness` gets a null expected hash, so drift is undetectable by construction. Today that is reported as a non-blocking `warn` on `deployment_current`.
+
+**The decision: for the pilot, that warn becomes a blocking fail.** A BYO agent may be linked, verified and used for outbound, but may not activate an inbound patient-facing campaign until its prompt is deployed by CareCommand.
+
+**Why.** This is REC-P0-003/004/005 restated. The entire failure we spent this program fixing was a live number answering with a keypad demo that exposed `end_call` and `send_sms`, carried none of our tools, and which nobody could tell was wrong. A non-blocking warning is precisely the signal that failure produced. We do not let a patient-facing line go live on words no one can prove, and "the operator ticked a box" is not proof — Package A was correct to refuse to build that checkbox, on the grounds that a value we write and never re-read is the shape of the defect itself.
+
+**What it costs.** BYO becomes a configuration path, not a go-live path, for the pilot. Given decision 1 (CareCommand owns the deployment), that is the supported route anyway. If a customer needs BYO inbound later, the honest unlock is provider-side prompt attestation, not a downgraded check.
+
+**Not yet implemented** — one line in `campaignReadiness.ts` plus a remediation entry and a test. It is the only open item from the day-2 defect sweep.
