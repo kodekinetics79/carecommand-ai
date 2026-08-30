@@ -5,6 +5,7 @@ import { Prisma, PrismaClient } from '../server/generated/prisma/client';
 import { syntheticProfiles } from './synthetic/profileManifest';
 import { assertSyntheticSeedTarget } from './synthetic/seedSafety';
 import { seedGrowthDemo } from './synthetic/growthDemo';
+import { seedReceptionistDemo } from './synthetic/receptionistDemo';
 
 const target = assertSyntheticSeedTarget({
   nodeEnv: process.env.NODE_ENV,
@@ -366,6 +367,15 @@ async function seed(): Promise<void> {
     userIds, userTenant, patientIds, patientTenant, patientBranch,
   });
 
+  // The receptionist spine: a mapped location, a named agent, a campaign with
+  // real intake, a bookable service and provider availability — then deploy,
+  // verify and activate through the production paths, so a demo tenant opens
+  // Studio on a working front desk rather than four empty states.
+  const receptionist = await seedReceptionistDemo({
+    db, now, stableUuid,
+    clinicIds: receptionistClinicIds, branchIds, branchTenant, userIds, userTenant,
+  });
+
   const counts = {
     profile: profile.profile,
     database: databaseName,
@@ -385,6 +395,7 @@ async function seed(): Promise<void> {
     demoClock: demoClock.toISOString(),
     fixedSeed: profile.fixedSeed,
     growth,
+    receptionist,
   };
   console.log(JSON.stringify(counts));
 }

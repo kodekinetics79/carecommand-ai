@@ -65,7 +65,13 @@ export async function transitionCampaign(
   if (input.to === 'ACTIVE') {
     readiness = await evaluateCampaignReadiness(tx, { tenantId: input.tenantId, campaignId: input.campaignId, now: input.now });
     if (!readiness) throw new Error('campaign_not_found');
-    if (!readiness.ready) throw new CampaignTransitionError('campaign_not_ready', failingChecks(readiness));
+    // `intake_attested` is deliberately excluded from the gate decision here.
+    // The attestation below IS that check, and it distinguishes unattested
+    // from mismatched from not-strict; readiness can only say "not attested".
+    // Checking the same thing twice, less precisely, would replace a specific
+    // error the operator can act on with a vague one.
+    const blocking = failingChecks(readiness).filter(item => item.key !== 'intake_attested');
+    if (blocking.length) throw new CampaignTransitionError('campaign_not_ready', blocking);
     // Readiness passing does not replace the attestation write: activation
     // still binds this campaign to the exact provider deployment evidence.
     const campaign = await tx.receptionistCampaign.findFirstOrThrow({ where: { id: input.campaignId, tenantId: input.tenantId }, include: { agent: true } });
