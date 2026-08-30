@@ -27,6 +27,7 @@ import { enterTenantContext, runWithTenantContext } from '../../lib/tenantContex
 import { resolveIngressTenant } from '../../lib/tenantIngressResolvers';
 import { isFeatureEnabled } from '../../lib/entitlements';
 import { platformDb } from '../../lib/platformDb';
+import { captureException } from '../../lib/observability';
 import { stopPhoneCall } from '../../lib/retell';
 import {
   agentReadinessReason,
@@ -304,29 +305,63 @@ function opaqueIngressReference(value: string | undefined): string {
   return createHash('sha256').update(value ?? 'missing').digest('hex');
 }
 
-async function flagRetellIngressReview(tenantId: string, callId: string, reason: string) {
-  const entityId = opaqueIngressReference(callId);
-  await db.operationalSignal.upsert({
-    where: { tenantId_signalType_entityType_entityId: { tenantId, signalType: 'RECEPTIONIST_INGRESS_REVIEW', entityType: 'retell_call', entityId } },
-    update: { severity: 'high', score: 100, reason, status: 'open' },
-    create: { tenantId, signalType: 'RECEPTIONIST_INGRESS_REVIEW', entityType: 'retell_call', entityId, severity: 'high', score: 100, reason, status: 'open' },
+/**
+ * Both flag helpers below are DIAGNOSTICS. They record that an ingress could not
+ * be trusted; they are not part of answering the caller.
+ *
+ * They used to be awaited bare on the live-call paths, which made a failed
+ * bookkeeping write fail the call. On `call_inbound` that is the worst possible
+ * trade: `flagUnresolvedRetellIngress` writes through `platformDb`, which throws
+ * outright when PLATFORM_DATABASE_URL is unset, so a runtime missing a variable
+ * that only the vendor console needs answered the patient's pre-answer hook with
+ * a 500 — Retell gets no dynamic variables and the caller gets nothing. That is
+ * the same blast-radius mistake `lib/platformDb.ts` was already refactored to
+ * avoid, reintroduced one layer up.
+ *
+ * So the failure is contained HERE rather than at ~23 call sites: the write is
+ * attempted, a failure is reported through the observability seam, and the call
+ * continues. Losing an audit row is bad; dropping a patient's call because we
+ * could not write one is worse.
+ */
+async function reportIngressFlagFailure(error: unknown, route: string) {
+  captureException(error instanceof Error ? error : new Error(String(error)), {
+    route,
+    // No tenant/call identifiers: this path is reached precisely when we could
+    // not establish tenant authority, and the references are hashed anyway.
   });
 }
 
+async function flagRetellIngressReview(tenantId: string, callId: string, reason: string) {
+  const entityId = opaqueIngressReference(callId);
+  try {
+    await db.operationalSignal.upsert({
+    where: { tenantId_signalType_entityType_entityId: { tenantId, signalType: 'RECEPTIONIST_INGRESS_REVIEW', entityType: 'retell_call', entityId } },
+      update: { severity: 'high', score: 100, reason, status: 'open' },
+      create: { tenantId, signalType: 'RECEPTIONIST_INGRESS_REVIEW', entityType: 'retell_call', entityId, severity: 'high', score: 100, reason, status: 'open' },
+    });
+  } catch (error) {
+    await reportIngressFlagFailure(error, 'receptionist.ingress.review');
+  }
+}
+
 async function flagUnresolvedRetellIngress(callId: string | undefined, destination: string | null, direction: string | undefined) {
-  await platformDb.platformAuditEvent.create({
-    data: {
-      action: 'receptionist.ingress.unresolved',
-      targetType: 'retell_ingress',
-      targetId: opaqueIngressReference(callId).slice(0, 32),
-      metadata: {
-        callRef: opaqueIngressReference(callId).slice(0, 32),
-        destinationRef: opaqueIngressReference(destination ?? undefined).slice(0, 32),
-        direction: direction ?? 'unknown',
-        disposition: 'manual_configuration_review',
+  try {
+    await platformDb.platformAuditEvent.create({
+      data: {
+        action: 'receptionist.ingress.unresolved',
+        targetType: 'retell_ingress',
+        targetId: opaqueIngressReference(callId).slice(0, 32),
+        metadata: {
+          callRef: opaqueIngressReference(callId).slice(0, 32),
+          destinationRef: opaqueIngressReference(destination ?? undefined).slice(0, 32),
+          direction: direction ?? 'unknown',
+          disposition: 'manual_configuration_review',
+        },
       },
-    },
-  });
+    });
+  } catch (error) {
+    await reportIngressFlagFailure(error, 'receptionist.ingress.unresolved');
+  }
 }
 
 async function persistProviderIntentRecoveryReview(input: {
