@@ -20,7 +20,7 @@ const { fixtureDb: db } = await import('./helpers/fixtureDb');
 const { env } = await import('../config/env');
 const { compileIntakeContract } = await import('../modules/receptionist/intakeContract');
 const { PLATFORM_LOCALE_PACKS, platformLocalePackHash } = await import('../lib/receptionist/localePacks/defaults');
-const { readyCampaignFixture } = await import('./helpers/receptionistFixtures');
+const { readyCampaignFixture, proveTestCall } = await import('./helpers/receptionistFixtures');
 
 type Role = 'OWNER' | 'MANAGER' | 'BILLING';
 type TenantFixture = { id: string; users: Record<Role, string>; branchId: string };
@@ -402,7 +402,8 @@ describe('AI receptionist trusted configuration', () => {
 
   it('links and verifies one exact published provider deployment with durable safety evidence', async () => {
     const [owner, foreign] = await Promise.all([tenant(), tenant()]);
-    const ownerClinic = (await createClinic(owner, { name: 'Provider-ready clinic' })).json().id as string;
+    const ownerClinicRow = (await createClinic(owner, { name: 'Provider-ready clinic' })).json() as { id: string; phone: string };
+    const ownerClinic = ownerClinicRow.id;
     const foreignClinic = (await createClinic(foreign, { name: 'Foreign provider clinic' })).json().id as string;
     const providerAgentId = `agent_pilot_exact_${randomUUID()}`;
     env.RETELL_API_KEY = 'real-provider-key';
@@ -420,13 +421,31 @@ describe('AI receptionist trusted configuration', () => {
       campaignId: 'provider-contract', revision: 1, appointmentType: 'Consultation', eligibleLocations: [], fields: [],
       toolUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell/fn?clinicId=${ownerClinic}`,
     }).snapshot.bookAppointmentToolContract;
-    const fetchMock = vi.fn<typeof fetch>(async url => new Response(JSON.stringify(String(url).includes('/get-retell-llm/')
-      ? {
-        llm_id: 'llm_safe', version: 3, is_published: true, tool_call_strict_mode: true,
-        general_tools: [providerBookingTool],
+    // A hand-linked agent has no deployment row, so the ONE thing that can say
+    // whether the advertised line reaches it is Retell's own answer about the
+    // number. `number_bound` is blocking (contract §16, B1), and the honest way
+    // for a BYO clinic to satisfy it is this read-back — not an operator ticking
+    // a box, which would be a value we wrote and never checked, the exact shape
+    // of the defect the check exists to remove.
+    const boundNumbers = new Set<string>();
+    const fetchMock = vi.fn<typeof fetch>(async url => {
+      const value = String(url);
+      if (value.includes('/get-phone-number/')) {
+        const number = decodeURIComponent(value.split('phone-number/')[1] ?? '');
+        boundNumbers.add(number);
+        return new Response(JSON.stringify({
+          phone_number: number,
+          inbound_agents: [{ agent_id: providerAgentId, agent_version: providerPayload.version }],
+        }), { status: 200 });
       }
-      : String(url).includes('list-agents') ? listedRetellAgent(providerAgentId, providerPayload.version as number, ['prod', 'production'])
-        : providerPayload), { status: 200 }));
+      return new Response(JSON.stringify(value.includes('/get-retell-llm/')
+        ? {
+          llm_id: 'llm_safe', version: 3, is_published: true, tool_call_strict_mode: true,
+          general_tools: [providerBookingTool],
+        }
+        : value.includes('list-agents') ? listedRetellAgent(providerAgentId, providerPayload.version as number, ['prod', 'production'])
+          : providerPayload), { status: 200 });
+    });
     vi.stubGlobal('fetch', fetchMock);
 
     try {
@@ -454,6 +473,13 @@ describe('AI receptionist trusted configuration', () => {
         expect.objectContaining({ headers: { Authorization: 'Bearer real-provider-key' } }),
       );
       const stored = await db.receptionistAgent.findUniqueOrThrow({ where: { id: agentId } });
+      // Verification asked Retell who answers this clinic's line and recorded
+      // the answer, so a hand-linked agent has real evidence for `number_bound`
+      // rather than none at all.
+      expect(boundNumbers.has(ownerClinicRow.phone), 'the read-back asked about THIS clinic’s line').toBe(true);
+      expect(stored.providerInboundNumber).toBe(ownerClinicRow.phone);
+      expect(stored.providerInboundNumberVerifiedAt).not.toBeNull();
+      expect(stored.providerInboundNumberErrorCode).toBeNull();
       expect(stored.providerFingerprint).toMatch(/^[a-f0-9]{64}$/);
       expect(stored.providerResponseEngineGraphFingerprint).toMatch(/^[a-f0-9]{64}$/);
       expect(stored.providerBookToolFingerprint).toMatch(/^[a-f0-9]{64}$/);
@@ -477,7 +503,13 @@ describe('AI receptionist trusted configuration', () => {
         method: 'PATCH', url: `/v1/receptionist/agents/${foreignAgent.json().id}`, headers: auth(foreign, 'OWNER'), payload: { active: true },
       });
       expect(duplicateActivation.statusCode).toBe(409);
-      expect(duplicateActivation.json().message).toContain('already assigned');
+      // The index is deliberately cross-tenant, so the row that won is one this
+      // tenant cannot see. "Already assigned to another agent" sent an operator
+      // hunting for an agent that does not exist for them; the message now says
+      // what is true and what to do about it.
+      expect(duplicateActivation.json().message).toContain('another CareCommand configuration');
+      expect(duplicateActivation.json().message).toContain('outside this tenant');
+      expect(duplicateActivation.json().message).toMatch(/deploy from studio|unlink/i);
 
       const crossTenantCampaign = await app.inject({
         method: 'POST', url: '/v1/receptionist/campaigns', headers: auth(owner, 'OWNER'),
@@ -535,6 +567,13 @@ describe('AI receptionist trusted configuration', () => {
       }).snapshot.bookAppointmentToolContract;
       const schemaVerified = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agentId}/verify-provider`, headers: auth(owner, 'OWNER') });
       expect(schemaVerified.statusCode).toBe(200);
+      // `test_call_completed` is blocking (B4). A hand-linked agent proves it
+      // the same way a deployed one does — a connected inbound call carrying
+      // the provider version this agent is verified at — so the evidence is
+      // stamped from the agent, not from a deployment that never happened.
+      await proveTestCall({
+        tenantId: owner.id, clinicId: ownerClinic, campaignId: campaignDraft.json().id, agentId,
+      });
       const activeCampaign = await app.inject({
         method: 'PATCH', url: `/v1/receptionist/campaigns/${campaignDraft.json().id}`, headers: auth(owner, 'OWNER'), payload: { status: 'ACTIVE' },
       });

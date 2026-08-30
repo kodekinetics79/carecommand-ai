@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { fingerprintJson, normalizeBookAppointmentToolContract } from '../../modules/receptionist/intakeContract';
-import type { MockDeploymentSnapshot, RetellAgentSnapshot, RetellProviderResult, RetellVoice } from '../retell';
+import type { MockDeploymentSnapshot, MockPhoneNumberBinding, PhoneNumberBinding, RetellAgentSnapshot, RetellProviderResult, RetellVoice } from '../retell';
 
 // ===========================================================================
 // Mock Retell provider (RETELL_API_KEY starting with "mock").
@@ -332,6 +332,37 @@ export function mockUpdateAgent(agentId: string, body: unknown, previousVersion 
 
 export function mockPublishAgent(_agentId: string, version: number): RetellProviderResult<{ version: number }> {
   return { ok: true, value: { version }, mock: true };
+}
+
+/**
+ * The mock's answer to "who answers this number?".
+ *
+ * It reads the deployment row CareCommand wrote — the same durable state every
+ * other mock answer comes from — so a demo tenant exercises the real read-back
+ * path in `verifyAgentProvider` instead of routing around it. Three honest
+ * negatives it must be able to give, because each one is a real failure the
+ * live provider produces and readiness has to be able to see:
+ *
+ *   - no deployment evidence at all            → nothing is bound
+ *   - the deploy's bind step did not succeed   → nothing is bound
+ *   - the read is for a DIFFERENT number       → nothing is bound on THAT one
+ *
+ * It never invents a binding, and it never answers for a number the deployment
+ * did not target.
+ */
+export function mockPhoneNumberBinding(
+  phoneNumber: string,
+  binding: MockPhoneNumberBinding | null,
+): RetellProviderResult<PhoneNumberBinding> {
+  const unbound = { ok: true as const, value: { phoneNumber, inboundAgentId: null, inboundAgentVersion: null }, mock: true };
+  if (!binding || !binding.numberBound) return unbound;
+  if (binding.boundPhoneNumber !== phoneNumber) return unbound;
+  if (!binding.providerAgentId || binding.providerAgentVersion === null) return unbound;
+  return {
+    ok: true,
+    value: { phoneNumber, inboundAgentId: binding.providerAgentId, inboundAgentVersion: binding.providerAgentVersion },
+    mock: true,
+  };
 }
 
 let cachedMockVoices: RetellVoice[] | null = null;

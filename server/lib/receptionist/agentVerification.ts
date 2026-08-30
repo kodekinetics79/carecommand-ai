@@ -4,10 +4,12 @@ import { runWithTenantContext } from '../tenantContext';
 import {
   evaluateRetellAgentReadiness,
   expectedRetellAgentWebhookUrl,
+  getPhoneNumberBinding,
   isTransientRetellProviderError,
   probeRetellAgent,
   RETELL_AGENT_VERIFICATION_TTL_MS,
   type MockDeploymentSnapshot,
+  type MockPhoneNumberBinding,
   type RetellAgentSnapshot,
 } from '../retell';
 
@@ -24,6 +26,15 @@ import {
 // Verification never upgrades a claim on its own: a transient provider failure
 // leaves an existing VERIFIED snapshot exactly as it was, and drift on an
 // agent that is answering live calls is refused rather than silently adopted.
+//
+// The probe phase also re-reads the PHONE NUMBER BINDING (A2). `number_bound`
+// used to pass off `deployment.numberBound` — a column CareCommand wrote at
+// deploy time and then read back to itself — so anybody editing the number in
+// the Retell console, or any second deploy, could unbind the line while the
+// checklist stayed green. That is REC-P0-001, the exact failure this whole
+// deployment path exists to end. `getPhoneNumberBinding` had zero callers in
+// the tree; it has one here, in the phase that already runs outside any
+// transaction, and its answer is persisted as evidence rather than as a claim.
 // ===========================================================================
 
 export interface VerifyActor {
@@ -125,12 +136,20 @@ export async function verifyAgentProvider(input: VerifyInput): Promise<VerifyOut
     const deployment = agent.currentDeploymentId
       ? await tx.receptionistAgentDeployment.findFirst({ where: { id: agent.currentDeploymentId, tenantId: input.tenantId } })
       : null;
-    return { kind: 'ready' as const, agent, deployment };
+    // The clinic's own line, so a hand-linked agent with no deployment row can
+    // still have the number question ASKED of the provider rather than
+    // answered by an operator ticking a box.
+    const clinic = await tx.receptionistClinic.findFirst({
+      where: { id: agent.clinicId, tenantId: input.tenantId },
+      select: { inboundNumber: true, phone: true },
+    });
+    return { kind: 'ready' as const, agent, deployment, clinic };
   }, input.actor.trustedActor);
 
   if (prepared.kind !== 'ready') return prepared;
   const before = prepared.agent;
   const deployment = prepared.deployment;
+  const clinicInboundNumber = prepared.clinic?.inboundNumber?.trim() || prepared.clinic?.phone?.trim() || null;
 
   // Mock evidence is resolved HERE, inside the tenant context, and handed to
   // the probe. The provider client stays database-free, and the probe cannot
@@ -150,6 +169,18 @@ export async function verifyAgentProvider(input: VerifyInput): Promise<VerifyOut
       voiceId: deployment.voiceId,
       language: deployment.language,
       toolsJson: deployment.toolsJson,
+    }
+    : null;
+
+  // The same discipline for the number binding: mock mode answers from the
+  // deployment row, resolved here inside the tenant context, so a demo tenant
+  // exercises this read-back rather than routing around it.
+  const mockBinding: MockPhoneNumberBinding | null = deployment && deployment.mock
+    ? {
+      boundPhoneNumber: deployment.boundPhoneNumber,
+      numberBound: deployment.numberBound,
+      providerAgentId: deployment.providerAgentId,
+      providerAgentVersion: deployment.providerAgentVersion,
     }
     : null;
 
@@ -174,6 +205,24 @@ export async function verifyAgentProvider(input: VerifyInput): Promise<VerifyOut
     : null;
   const intakeEvidenceFailure = probe.ok ? providerIntakeEvidenceFailure(probe.snapshot) : null;
   const safeError = probe.ok ? readinessFailure ?? intakeEvidenceFailure : probe.error;
+
+  // A2 - ask the provider who answers this line. Still outside any transaction,
+  // and deliberately independent of the agent probe: an agent can be perfectly
+  // attested while its number points somewhere else entirely, and that is
+  // precisely the state that let patients reach nothing.
+  //
+  // One read-back serves both shapes. A deployed agent is checked against the
+  // exact version it published. A hand-linked agent has no published version to
+  // pin, so it is checked against the agent id and the version the probe just
+  // reported in this same pass — still the provider's answer, never ours.
+  const expectedBinding = {
+    boundPhoneNumber: deployment?.boundPhoneNumber ?? clinicInboundNumber,
+    providerAgentId: deployment?.providerAgentId ?? before.providerAgentId,
+    providerAgentVersion: deployment?.providerAgentVersion ?? (probe.ok ? probe.snapshot.version : null),
+  };
+  const numberBinding = expectedBinding.boundPhoneNumber
+    ? await readNumberBinding(expectedBinding, mockBinding, attemptedAt)
+    : null;
 
   // ---- Commit, in a short write transaction ---------------------------------
   return runWithTenantContext(input.tenantId, async tx => {
@@ -237,6 +286,17 @@ export async function verifyAgentProvider(input: VerifyInput): Promise<VerifyOut
       providerLastAttemptStatus: success ? 'SUCCEEDED' : 'FAILED',
       providerLastAttemptSource: input.actor.source,
       providerLastErrorCode: safeError,
+      // The same read-back, recorded on the agent as well, because a
+      // hand-linked agent has no deployment row to carry it. The database
+      // refuses a half-attested row, so an unreadable provider clears the
+      // attestation rather than leaving a stale pass standing.
+      ...(numberBinding
+        ? {
+          ...(numberBinding.numberBindingVerifiedAt ? { providerInboundNumber: expectedBinding.boundPhoneNumber } : {}),
+          providerInboundNumberVerifiedAt: numberBinding.numberBindingVerifiedAt,
+          providerInboundNumberErrorCode: numberBinding.numberBindingErrorCode,
+        }
+        : {}),
       ...(success && probe.ok ? providerSnapshotData(probe.snapshot) : {}),
       ...(success ? {
         providerStatus: 'VERIFIED' as const,
@@ -255,9 +315,12 @@ export async function verifyAgentProvider(input: VerifyInput): Promise<VerifyOut
     if (deployment) {
       await tx.receptionistAgentDeployment.update({
         where: { id: deployment.id },
-        data: success
-          ? { status: 'VERIFIED', verifiedAt: attemptedAt, providerErrorCode: null }
-          : { status: deployment.status === 'VERIFIED' ? 'VERIFIED' : deployment.status, providerErrorCode: safeError },
+        data: {
+          ...(success
+            ? { status: 'VERIFIED' as const, verifiedAt: attemptedAt, providerErrorCode: null }
+            : { status: deployment.status === 'VERIFIED' ? 'VERIFIED' as const : deployment.status, providerErrorCode: safeError }),
+          ...(numberBinding ?? {}),
+        },
       });
     }
 
@@ -274,6 +337,8 @@ export async function verifyAgentProvider(input: VerifyInput): Promise<VerifyOut
         deploymentChanged,
         source: input.actor.source,
         reason: safeError,
+        numberBindingVerified: numberBinding ? numberBinding.numberBindingVerifiedAt !== null : null,
+        numberBindingError: numberBinding?.numberBindingErrorCode ?? null,
       },
     });
 
@@ -287,6 +352,58 @@ export async function verifyAgentProvider(input: VerifyInput): Promise<VerifyOut
       httpStatus: transient ? 503 as const : 200 as const,
     };
   }, input.actor.trustedActor);
+}
+
+/** The deployment columns a number-binding read-back writes, or leaves alone. */
+type NumberBindingUpdate = {
+  numberBound?: boolean;
+  numberBindingReadAt?: Date;
+  numberBindingAgentId?: string | null;
+  numberBindingAgentVersion?: number | null;
+  numberBindingVerifiedAt: Date | null;
+  numberBindingErrorCode: string | null;
+};
+
+/**
+ * Re-read one deployment's inbound binding and turn the provider's answer into
+ * evidence. Three outcomes, and the difference between them is the whole point
+ * of A2:
+ *
+ *   matched      the provider names THIS deployment's published agent and
+ *                version - attested, `numberBindingVerifiedAt` stamped.
+ *   named other  the provider answers, and names something else (or nothing) -
+ *                a definite negative. `numberBound` is corrected to false and
+ *                the code says so, because the line genuinely is not ours.
+ *   unreadable   the provider did not answer - nothing was learned, so the last
+ *                read stands as history, `numberBound` is NOT downgraded, and
+ *                the attestation is cleared. Readiness renders that as pending.
+ *                Unreadable is never a pass, and it is not a fail either:
+ *                reporting a provider outage as "your number is wrong" sends an
+ *                operator to fix something that is not broken.
+ */
+async function readNumberBinding(
+  expected: { boundPhoneNumber: string | null; providerAgentId: string | null; providerAgentVersion: number | null },
+  mockBinding: MockPhoneNumberBinding | null,
+  at: Date,
+): Promise<NumberBindingUpdate | null> {
+  const deployment = expected;
+  if (!deployment.boundPhoneNumber) return null;
+  const answer = await getPhoneNumberBinding(deployment.boundPhoneNumber, { mockBinding });
+  if (!answer.ok) {
+    return { numberBindingVerifiedAt: null, numberBindingErrorCode: answer.error };
+  }
+  const matched = Boolean(deployment.providerAgentId)
+    && deployment.providerAgentVersion !== null
+    && answer.value.inboundAgentId === deployment.providerAgentId
+    && answer.value.inboundAgentVersion === deployment.providerAgentVersion;
+  return {
+    numberBound: matched,
+    numberBindingReadAt: at,
+    numberBindingAgentId: answer.value.inboundAgentId,
+    numberBindingAgentVersion: answer.value.inboundAgentVersion,
+    numberBindingVerifiedAt: matched ? at : null,
+    numberBindingErrorCode: matched ? null : 'number_bound_elsewhere',
+  };
 }
 
 async function writeAudit(

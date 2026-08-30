@@ -261,6 +261,13 @@ export interface ProveTestCallInput {
    * unscoped row the check must stop accepting.
    */
   deploymentId?: string | null;
+  /**
+   * A hand-linked (BYO) agent, which has no deployment row. The call is stamped
+   * from the agent's own verified provider evidence — the same columns the
+   * webhook writes — so `test_call_completed` is provable for BYO without
+   * inventing a deployment that never happened.
+   */
+  agentId?: string | null;
   durationSeconds?: number;
   /**
    * Terminal outcome. Defaults to BOOKED. The outcome and the binding are both
@@ -294,9 +301,10 @@ export async function proveTestCall(input: ProveTestCallInput): Promise<string> 
   // (`ReceptionistCallLog_provider_binding_complete_check`), and the webhook
   // takes them from the agent's verified provider evidence — so this fixture
   // reads exactly the same source rather than inventing a binding.
-  const agent = deployment
+  const boundAgentId = deployment?.agentId ?? input.agentId ?? null;
+  const agent = boundAgentId
     ? await db.receptionistAgent.findUniqueOrThrow({
-      where: { id: deployment.agentId },
+      where: { id: boundAgentId },
       select: { providerAgentId: true, providerVersion: true, providerConfigRevision: true, providerFingerprint: true },
     })
     : null;

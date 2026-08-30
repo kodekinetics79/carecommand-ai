@@ -40,6 +40,18 @@ const originalRetell = { apiKey: env.RETELL_API_KEY, baseUrl: env.RETELL_BASE_UR
 
 const phone = () => `+1${(BigInt(`0x${randomUUID().replace(/-/g, '').slice(0, 14)}`) % 10_000_000_000n).toString().padStart(10, '0')}`;
 
+// Provider ids are per-test, never literals.
+//
+// `ReceptionistAgent_active_provider_deployment_unique` is a GLOBAL partial
+// index on (providerAgentId, providerVersion) for active agents — deliberately
+// cross-tenant, because two live configurations sharing one provider version
+// would share its webhook and response-engine blast radius. A suite that
+// verifies against a hardcoded `agent_drift` therefore leaves a row that
+// collides with the next run on a shared development database, and the failure
+// lands on whichever test verifies second rather than on the one that leaked.
+// Isolating the ids keeps the constraint at full strength.
+const providerId = (prefix: string) => `${prefix}_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+
 async function tenant(): Promise<TenantFixture> {
   const id = randomUUID();
   tenantIds.push(id);
@@ -116,7 +128,7 @@ describe('deploying a campaign to Retell', () => {
     env.RETELL_FROM_NUMBER = '+15550100000';
     try {
       const t = await tenant();
-      const { agent, campaign } = await deployableCampaign(t);
+      const { clinic, agent, campaign } = await deployableCampaign(t);
 
       const deployed = await app.inject({ method: 'POST', url: `/v1/receptionist/campaigns/${campaign.id}/deploy`, headers: auth(t) });
       expect(deployed.statusCode).toBe(200);
@@ -131,7 +143,15 @@ describe('deploying a campaign to Retell', () => {
       const row = await db.receptionistAgentDeployment.findFirstOrThrow({ where: { campaignId: campaign.id } });
       expect(row.promptHash.startsWith('mock:')).toBe(true);
       expect(row.providerAgentVersion).not.toBeNull();
-      expect(row.boundPhoneNumber).toBe('+15550100000');
+      // A1 — this clinic's own line, claimed onto the clinic row, not the one
+      // global RETELL_FROM_NUMBER every clinic used to fight over.
+      expect(row.boundPhoneNumber).toBe(clinic.phone);
+      expect(await db.receptionistClinic.findUniqueOrThrow({ where: { id: clinic.id } }))
+        .toMatchObject({ inboundNumber: clinic.phone });
+      // A2 — publishing is not an attestation. Nothing has asked the provider
+      // who answers this number yet, so the binding is pending, never passing.
+      expect(row.numberBindingVerifiedAt).toBeNull();
+      expect(row.numberBindingReadAt).toBeNull();
       // The steps record what actually happened, so a retry can resume rather
       // than create a second agent at the provider.
       expect((row.steps as Array<{ name: string; status: string }>).filter(step => step.status === 'ok').map(step => step.name))
@@ -145,7 +165,16 @@ describe('deploying a campaign to Retell', () => {
       const verified = await app.inject({ method: 'POST', url: `/v1/receptionist/agents/${agent.id}/verify-provider`, headers: auth(t) });
       expect(verified.statusCode).toBe(200);
       expect(verified.json().agent).toMatchObject({ providerStatus: 'VERIFIED', providerVersion: row.providerAgentVersion });
-      expect(await db.receptionistAgentDeployment.findUniqueOrThrow({ where: { id: row.id } })).toMatchObject({ status: 'VERIFIED' });
+      const attested = await db.receptionistAgentDeployment.findUniqueOrThrow({ where: { id: row.id } });
+      expect(attested).toMatchObject({ status: 'VERIFIED' });
+      // A2 — and now the provider has been ASKED. The read-back names this
+      // deployment's own published agent and version, which is the only thing
+      // that may make `number_bound` pass.
+      expect(attested.numberBindingVerifiedAt).not.toBeNull();
+      expect(attested.numberBindingReadAt).not.toBeNull();
+      expect(attested.numberBindingAgentId).toBe(attested.providerAgentId);
+      expect(attested.numberBindingAgentVersion).toBe(attested.providerAgentVersion);
+      expect(attested.numberBindingErrorCode).toBeNull();
     } finally {
       env.RETELL_API_KEY = originalRetell.apiKey;
       env.RETELL_FROM_NUMBER = originalRetell.fromNumber;
@@ -208,31 +237,36 @@ describe('deploying a campaign to Retell', () => {
     env.RETELL_FROM_NUMBER = '+15550100000';
     let generalPrompt = 'You are Avery, the AI receptionist.';
     let generalTools: unknown[] = [];
+    const driftAgentId = providerId('agent_drift');
+    const driftLlmId = providerId('llm_drift');
     const webhookUrl = `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`;
     vi.stubGlobal('fetch', vi.fn(async (url: string | URL) => {
       const value = String(url);
-      if (value.includes('/create-retell-llm')) return new Response(JSON.stringify({ llm_id: 'llm_drift', version: 0 }), { status: 200 });
-      if (value.includes('/create-agent')) return new Response(JSON.stringify({ agent_id: 'agent_drift', version: 0 }), { status: 200 });
+      if (value.includes('/create-retell-llm')) return new Response(JSON.stringify({ llm_id: driftLlmId, version: 0 }), { status: 200 });
+      if (value.includes('/create-agent')) return new Response(JSON.stringify({ agent_id: driftAgentId, version: 0 }), { status: 200 });
       if (value.includes('/publish-agent-version/')) return new Response(JSON.stringify({}), { status: 200 });
-      if (value.includes('/update-phone-number/')) return new Response(JSON.stringify({ phone_number: '+15550100000', inbound_agents: [{ agent_id: 'agent_drift', agent_version: 0 }] }), { status: 200 });
+      if (value.includes('/update-phone-number/') || value.includes('/get-phone-number/')) {
+        const number = decodeURIComponent(value.split('phone-number/')[1] ?? '');
+        return new Response(JSON.stringify({ phone_number: number, inbound_agents: [{ agent_id: driftAgentId, agent_version: 0 }] }), { status: 200 });
+      }
       if (value.includes('/get-retell-llm/')) {
         return new Response(JSON.stringify({
-          llm_id: 'llm_drift', version: 0, is_published: true, tool_call_strict_mode: true,
+          llm_id: driftLlmId, version: 0, is_published: true, tool_call_strict_mode: true,
           general_prompt: generalPrompt, begin_message: 'Hi, this may be recorded. Is that okay?', general_tools: generalTools,
         }), { status: 200 });
       }
       if (value.includes('list-agents')) {
         return new Response(JSON.stringify({
           has_more: false,
-          items: [{ agent_id: 'agent_drift', agent_name: 'Avery', channel: 'voice', user_modified_timestamp: 1, tags: { prod: { version: 0, dynamic_variables: {} } } }],
+          items: [{ agent_id: driftAgentId, agent_name: 'Avery', channel: 'voice', user_modified_timestamp: 1, tags: { prod: { version: 0, dynamic_variables: {} } } }],
         }), { status: 200 });
       }
       return new Response(JSON.stringify({
-        agent_id: 'agent_drift', version: 0, assigned_tags: ['prod'], is_published: true,
+        agent_id: driftAgentId, version: 0, assigned_tags: ['prod'], is_published: true,
         voice_id: 'mock-voice-nova', language: 'en-US', webhook_url: webhookUrl,
         webhook_events: ['call_started', 'call_ended', 'call_analyzed'],
         data_storage_setting: 'basic_attributes_only', opt_in_signed_url: true,
-        response_engine: { type: 'retell-llm', llm_id: 'llm_drift', version: 0 },
+        response_engine: { type: 'retell-llm', llm_id: driftLlmId, version: 0 },
       }), { status: 200 });
     }));
     try {
@@ -294,7 +328,7 @@ describe('deploying a campaign to Retell', () => {
       const t = await tenant();
       const { agent, campaign } = await deployableCampaign(t);
       // Linked by hand: there is no deployment behind this provider agent id.
-      await db.receptionistAgent.update({ where: { id: agent.id }, data: { providerAgentId: 'agent_built_by_hand' } });
+      await db.receptionistAgent.update({ where: { id: agent.id }, data: { providerAgentId: providerId('agent_built_by_hand') } });
 
       const refused = await app.inject({ method: 'POST', url: `/v1/receptionist/campaigns/${campaign.id}/deploy`, headers: auth(t) });
       expect(refused.statusCode).toBe(409);
@@ -367,18 +401,20 @@ describe('deploying a campaign to Retell', () => {
     env.RETELL_BASE_URL = 'https://api.retellai.com';
     env.RETELL_FROM_NUMBER = '+15550100000';
     const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const newAgentId = providerId('agent_new');
+    const newLlmId = providerId('llm_new');
     vi.stubGlobal('fetch', vi.fn(async (url: string | URL, init?: RequestInit) => {
       const value = String(url);
       calls.push({ url: value, body: init?.body ? JSON.parse(String(init.body)) : {} });
-      if (value.includes('/create-retell-llm')) return new Response(JSON.stringify({ llm_id: 'llm_new', version: 0 }), { status: 200 });
-      if (value.includes('/create-agent')) return new Response(JSON.stringify({ agent_id: 'agent_new', version: 0 }), { status: 200 });
+      if (value.includes('/create-retell-llm')) return new Response(JSON.stringify({ llm_id: newLlmId, version: 0 }), { status: 200 });
+      if (value.includes('/create-agent')) return new Response(JSON.stringify({ agent_id: newAgentId, version: 0 }), { status: 200 });
       if (value.includes('/publish-agent-version/')) return new Response(JSON.stringify({}), { status: 200 });
-      if (value.includes('/update-phone-number/')) return new Response(JSON.stringify({ phone_number: '+15550100000', inbound_agents: [{ agent_id: 'agent_new', agent_version: 0 }] }), { status: 200 });
+      if (value.includes('/update-phone-number/')) return new Response(JSON.stringify({ phone_number: '+15550100000', inbound_agents: [{ agent_id: newAgentId, agent_version: 0 }] }), { status: 200 });
       return new Response('{}', { status: 200 });
     }));
     try {
       const t = await tenant();
-      const { campaign } = await deployableCampaign(t);
+      const { clinic, campaign } = await deployableCampaign(t);
       const deployed = await app.inject({ method: 'POST', url: `/v1/receptionist/campaigns/${campaign.id}/deploy`, headers: auth(t) });
       expect(deployed.statusCode).toBe(200);
 
@@ -392,6 +428,11 @@ describe('deploying a campaign to Retell', () => {
       expect((llm.general_tools as Array<{ name: string }>).map(tool => tool.name)).toEqual(expect.arrayContaining(['book_appointment', 'check_availability']));
       expect(llm.tool_call_strict_mode).toBe(true);
 
+      // A1 — the number that is repointed is THIS clinic's inbound line, never
+      // the single process-wide RETELL_FROM_NUMBER that every clinic shared.
+      expect(calls[3]!.url).toContain(encodeURIComponent(clinic.phone));
+      expect(calls[3]!.url).not.toContain(encodeURIComponent('+15550100000'));
+
       // The agent carries the webhook and pins the LLM version we just wrote;
       // without that pin the published agent runs the PREVIOUS engine version
       // and our own verification would read it as prompt drift.
@@ -400,13 +441,13 @@ describe('deploying a campaign to Retell', () => {
       expect(agentBody.webhook_events).toEqual(['call_started', 'call_ended', 'call_analyzed']);
       expect(agentBody.data_storage_setting).toBe('basic_attributes_only');
       expect(agentBody.opt_in_signed_url).toBe(true);
-      expect(agentBody.response_engine).toEqual({ type: 'retell-llm', llm_id: 'llm_new', version: 0 });
+      expect(agentBody.response_engine).toEqual({ type: 'retell-llm', llm_id: newLlmId, version: 0 });
 
       // Publishing pins an exact numeric version, and the phone number's
       // INBOUND agent is bound to it — otherwise publishing changes nothing
       // about who answers the phone.
       expect(calls[2]!.body).toEqual({ version: 0 });
-      expect(calls[3]!.body).toMatchObject({ inbound_agents: [{ agent_id: 'agent_new', agent_version: 0, weight: 1 }] });
+      expect(calls[3]!.body).toMatchObject({ inbound_agents: [{ agent_id: newAgentId, agent_version: 0, weight: 1 }] });
     } finally {
       vi.unstubAllGlobals();
       env.RETELL_API_KEY = originalRetell.apiKey;

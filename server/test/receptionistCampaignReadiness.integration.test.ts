@@ -282,10 +282,24 @@ describe('B1 — the number binding is proved, never assumed', () => {
       expect(deployment.boundPhoneNumber).toBeTruthy();
       expect(row(await readiness(t, campaign.id), 'number_bound').status).toBe('pass');
 
-      // `numberBound: true` with no number is a claim, not evidence.
-      await db.receptionistAgentDeployment.update({ where: { id: deployment.id }, data: { boundPhoneNumber: null } });
+      // `numberBound: true` with no number is a claim, not evidence — and A2
+      // moved that from a readiness opinion to a database invariant, so the
+      // state cannot be written at all any more.
+      await expect(db.receptionistAgentDeployment.update({ where: { id: deployment.id }, data: { boundPhoneNumber: null } }))
+        .rejects.toThrow(/bound_number_check/);
+
+      // The claim that CAN still be written is the one this check used to pass
+      // on: our own two columns, with nothing read back from the provider
+      // behind them. That is `pending` — blocking, and honestly labelled,
+      // because "we have not asked" is not "the number is wrong".
+      await db.receptionistAgentDeployment.update({
+        where: { id: deployment.id },
+        data: { numberBindingVerifiedAt: null, numberBindingAgentId: null, numberBindingAgentVersion: null, numberBindingReadAt: null },
+      });
       const bound = row(await readiness(t, campaign.id), 'number_bound');
-      expect(bound.status).toBe('fail');
+      expect(bound.status).toBe('pending');
+      expect(bound.status).not.toBe('pass');
+      expect(bound.blocking).toBe(true);
       expect(clinic.id).toBeTruthy();
     });
   });
