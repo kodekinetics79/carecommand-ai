@@ -21,7 +21,8 @@ import {
   RPM_SIGNOFF_ATTESTATION_REVISION,
   rpmPeriodBounds,
 } from '../../lib/connectedCare/rpmEvidence';
-import { computeAndStoreRpmReadiness, mapWithConcurrency, RPM_READINESS_CONCURRENCY } from '../../lib/connectedCare/rpmReadinessService';
+import { computeAndStoreRpmReadiness, mapWithConcurrency, RPM_READINESS_CONCURRENCY, resolveRpmTimeZone } from '../../lib/connectedCare/rpmReadinessService';
+import { MONITORING_ALERT_SOURCE } from '../../lib/connectedCare/alertInbox';
 import { resolveRpmCodeLadder } from '../../lib/connectedCare/rpmBillingCodes';
 
 const uuid = z.string().uuid();
@@ -219,6 +220,10 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
     const q = z.object({
       limit: z.coerce.number().min(1).max(100).default(50),
       offset: z.coerce.number().min(0).default(0),
+      // Billing happens after a period closes. Without this every caller got
+      // the CURRENT month, so on the 1st a clinic could no longer see — let
+      // alone attest — the month it was about to bill.
+      periodStart: z.coerce.date().optional(),
     }).parse(request.query);
     const enrollments = await db.patientDeviceEnrollment.findMany({
       where: { tenantId, ...branchScope(request), status: 'active', programType: 'rpm' },
@@ -233,7 +238,7 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
     const patientIds = allPatientIds.slice(q.offset, q.offset + q.limit);
     const names = await patientNames(tenantId, patientIds);
     const rows = await mapWithConcurrency(patientIds, RPM_READINESS_CONCURRENCY, async pid => {
-      const { row, result, readingDays, evidence } = await computeAndStoreRpmReadiness(tenantId, pid);
+      const { row, result, readingDays, evidence, period } = await computeAndStoreRpmReadiness(tenantId, pid, new Date(), { periodStart: q.periodStart });
       return {
         patientId: pid, patientName: names.get(pid) ?? 'Unknown', status: result.status,
         missing: result.missing, requirements: result.requirements, readingDays,
@@ -246,6 +251,12 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
         deviceExceptions: evidence.deviceExceptions,
         interactiveCommunication: evidence.interactiveCommunication,
         sessionsMissingNarrative: evidence.sessionsMissingNarrative,
+        // The period actually evaluated, in the zone it was reckoned in, so the
+        // screen can name the month instead of implying "now".
+        periodStart: period.start,
+        periodEnd: period.end,
+        periodTimeZone: period.timeZone,
+        periodClosed: period.closed,
         // Which codes the RECORDED EVIDENCE could support. Not coding advice,
         // not a claim, not a payment guarantee — a coder still decides. The
         // previous single READY boolean reported $0 for a device-supply month
@@ -296,8 +307,11 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
       communicationModality: z.enum(COMMUNICATION_MODALITIES).default('none'),
     }).parse(request.body ?? {});
     const tenantId = request.auth.tenantId;
-    const period = rpmPeriodBounds();
     await assertPatientEnrollmentAccess(request, patientId, true);
+    // In the clinic's zone: under UTC months, a clinician reviewing at 16:30 on
+    // the last day of the local month was told the session fell outside the
+    // period and could not record it at all.
+    const period = rpmPeriodBounds(new Date(), await resolveRpmTimeZone(tenantId, patientId));
     const elapsedMs = input.endedAt.getTime() - input.startedAt.getTime();
     if (elapsedMs < 60_000 || elapsedMs > 4 * 60 * 60_000) throw app.httpErrors.badRequest('Review session must be between 1 and 240 minutes');
     if (input.startedAt < period.start || input.endedAt > new Date(Date.now() + 60_000)) throw app.httpErrors.badRequest('Review session is outside the current period');
@@ -364,10 +378,16 @@ export const connectedCareRoutes: FastifyPluginAsync = async app => {
       expectedEvidenceVersion: z.string().trim().min(1).max(80),
       expectedEvidenceHash: z.string().regex(/^[a-f0-9]{64}$/),
       attestationRevision: z.string().trim().min(1).max(80),
+      /** Any instant inside the month being attested; defaults to the current one. */
+      periodStart: z.coerce.date().optional(),
     }).parse(request.body ?? {});
     const tenantId = request.auth.tenantId;
-    const period = rpmPeriodBounds();
     const { patient } = await assertPatientEnrollmentAccess(request, patientId, true);
+    // Attest the month that is being billed, in the zone the clinic works in.
+    // Every call site previously computed the current UTC month, so a closed
+    // month — the only kind anyone actually bills — was unreachable.
+    const timeZone = await resolveRpmTimeZone(tenantId, patientId);
+    const period = rpmPeriodBounds(new Date(), timeZone, input.periodStart);
     const clinician = await db.user.findFirst({
       where: { id: request.auth.userId, tenantId, active: true, role: 'PROVIDER', providerProfile: { is: { tenantId, branchId: patient.branchId } } },
       select: { id: true, providerProfile: { select: { id: true, branchId: true } } },
@@ -570,7 +590,7 @@ export const connectedCareWebhookRoutes: FastifyPluginAsync = async app => {
               : await tx.user.findFirst({ where: { tenantId, active: true, role: { in: ['PROVIDER', 'MANAGER', 'ADMIN', 'OWNER'] }, ...(branchId ? { OR: [{ branchId }, { role: { in: ['ADMIN', 'OWNER'] } }] } : {}) }, orderBy: { createdAt: 'asc' }, select: { id: true, displayName: true, role: true } });
             const alert = await tx.readingAlert.create({ data: { tenantId, patientId, branchId, readingId: reading.id, severity, severityRank: severityRank(severity), alertType: 'abnormal_reading', status: 'open', generatedReason: reason, assignedToUserId: recipient?.id ?? null }, select: { id: true } });
             alertId = alert.id;
-            await tx.notificationEvent.create({ data: { tenantId, alertId, patientId, recipientType: recipient?.role.toLowerCase() ?? 'unassigned_staff', recipientUserId: recipient?.id ?? null, recipientLabel: recipient?.displayName ?? 'unassigned clinical safety queue', channel: 'in_app', status: 'queued', attempts: 0, consentChecked: true, consentResult: 'not_required' } });
+            await tx.notificationEvent.create({ data: { tenantId, alertId, patientId, recipientType: recipient?.role.toLowerCase() ?? 'unassigned_staff', recipientUserId: recipient?.id ?? null, recipientLabel: recipient?.displayName ?? 'unassigned clinical safety queue', channel: 'in_app', source: MONITORING_ALERT_SOURCE, status: 'queued', attempts: 0, consentChecked: true, consentResult: 'not_required' } });
           }
           await invalidateRpmProviderSignoff(tx, {
             tenantId, patientId, periodStart: evidencePeriod.start,

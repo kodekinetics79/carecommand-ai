@@ -24,12 +24,20 @@ async function pf<T>(path: string, init?: RequestInit & { auth?: boolean }): Pro
   return body as T;
 }
 
-export interface PlatformMe { id: string; email: string | null; name: string; role: string; legacy: boolean; mfaEnabled: boolean }
+export interface PlatformMe { id: string; email: string | null; name: string; role: string; legacy: boolean; mfaEnabled: boolean; mfaRequired?: boolean }
 export interface TenantSummary {
-  tenant: { id: string; name: string; slug: string; status: string; createdAt: string; lastActivityAt: string } | null;
+  tenant: {
+    id: string; name: string; slug: string; status: string; createdAt: string; lastActivityAt: string;
+    /** demo | pilot | production. A demo workspace is refused at the call gates. */
+    mode: string; modeDescription: string; liveCallingAllowed: boolean;
+  } | null;
   subscription: { planKey: string; planName: string; status: string; trialEndsAt: string | null; addons: string[] } | null;
   activeUsers: number; branches: number; enabledFeatures: number; setupStatus: string; deepLinkTarget: string | null;
-  entitlements?: Array<{ featureKey: string; enabled: boolean; source: string; limitValue: number | null }>;
+  entitlements?: Array<{
+    featureKey: string; enabled: boolean; source: string; limitValue: number | null;
+    /** Set when a platform override lapses on a date, with why it was granted. */
+    overrideExpiresAt?: string | null; overrideReason?: string | null;
+  }>;
 }
 
 export type PilotEntityType = 'patients' | 'appointments' | 'insurance';
@@ -150,6 +158,8 @@ export interface TenantCompany {
   mainPhone: string | null; website: string | null;
   primaryContactName: string | null; primaryContactEmail: string | null; primaryContactPhone: string | null;
   billingContactName: string | null; billingContactEmail: string | null;
+  /** Relationship facts. Dates come back as ISO strings. */
+  contractStartedAt: string | null; accountManager: string | null; baaSignedAt: string | null;
   accountNotes: string | null;
 }
 
@@ -198,13 +208,25 @@ export const platformAdmin = {
   updateCompany: (id: string, body: Partial<TenantCompany> & { reason: string }) =>
     pf<{ tenantId: string; company: TenantCompany; changed: string[] }>(`/v1/platform/tenants/${id}/company`, { method: 'PATCH', body: JSON.stringify(body) }),
   roster: (id: string) => pf<TenantRoster>(`/v1/platform/tenants/${id}/users`),
+  setTenantMode: (id: string, mode: string, reason: string) =>
+    pf<{ tenantId: string; mode: string; liveCallingAllowed: boolean }>(`/v1/platform/tenants/${id}/mode`, {
+      method: 'PATCH', body: JSON.stringify({ mode, reason }),
+    }),
   suspend: (id: string) => pf<{ status: string }>(`/v1/platform/tenants/${id}/suspend`, { method: 'POST' }),
   reactivate: (id: string) => pf<{ status: string }>(`/v1/platform/tenants/${id}/reactivate`, { method: 'POST' }),
   changePlan: (id: string, planKey: string) => pf<TenantSummary>(`/v1/platform/tenants/${id}/subscription/change-plan`, { method: 'POST', body: JSON.stringify({ planKey }) }),
   addAddon: (id: string, addonKey: string) => pf<TenantSummary>(`/v1/platform/tenants/${id}/addons`, { method: 'POST', body: JSON.stringify({ addonKey }) }),
   removeAddon: (id: string, addonKey: string) => pf<TenantSummary>(`/v1/platform/tenants/${id}/addons/${addonKey}`, { method: 'DELETE' }),
-  overrideEntitlement: (id: string, featureKey: string, enabled: boolean) => pf<unknown>(`/v1/platform/tenants/${id}/entitlements/${featureKey}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
+  overrideEntitlement: (id: string, featureKey: string, enabled: boolean, options?: { expiresAt?: string | null; reason?: string }) =>
+    pf<unknown>(`/v1/platform/tenants/${id}/entitlements/${featureKey}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled, expiresAt: options?.expiresAt ?? undefined, reason: options?.reason }),
+    }),
   plans: () => pf<Array<{ key: string; name: string; monthlyPrice: number; features: string[] }>>(`/v1/platform/subscriptions/plans`),
+  setPlanPrice: (planKey: string, monthlyPrice: number | null, reason: string) =>
+    pf<{ key: string; monthlyPrice: number; tenantsRepriced: number }>(`/v1/platform/subscriptions/plans/${planKey}`, {
+      method: 'PATCH', body: JSON.stringify({ monthlyPrice, reason }),
+    }),
   addons: () => pf<Array<{ key: string; name: string; featureKey: string | null }>>(`/v1/platform/subscriptions/addons`),
   requests: (status?: string) => pf<Array<{ id: string; tenantName: string; requestType: string; status: string; requestedPlanKey: string | null; createdAt: string }>>(`/v1/platform/subscription-requests${status ? `?status=${status}` : ''}`),
   approveRequest: (id: string) => pf<{ status: string }>(`/v1/platform/subscription-requests/${id}/approve`, { method: 'POST' }),
@@ -212,7 +234,9 @@ export const platformAdmin = {
   users: () => pf<Array<{ id: string; email: string; name: string; role: string; status: string; mfaEnabled: boolean; lastLoginAt: string | null }>>(`/v1/platform/users`),
   createUser: (body: { email: string; name: string; password: string; role: string }) => pf<unknown>(`/v1/platform/users`, { method: 'POST', body: JSON.stringify(body) }),
   updateUser: (id: string, body: { status?: string; role?: string }) => pf<unknown>(`/v1/platform/users/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
-  audit: (limit = 100) => pf<Array<{ id: string; action: string; targetType: string; targetId: string | null; tenantId: string | null; metadata: unknown; createdAt: string }>>(`/v1/platform/audit?limit=${limit}`),
+  // tenantId is pushed to the server: filtering the global newest-N client-side
+  // made a busy platform render a tenant's real history as "no events yet".
+  audit: (limit = 100, tenantId?: string) => pf<Array<{ id: string; action: string; targetType: string; targetId: string | null; tenantId: string | null; metadata: unknown; createdAt: string }>>(`/v1/platform/audit?limit=${limit}${tenantId ? `&tenantId=${encodeURIComponent(tenantId)}` : ''}`),
 
   // ── Control Tower (Phase 2) ──────────────────────────────────────────
   getBilling: (id: string) => pf<TenantBilling>(`/v1/platform/tenants/${id}/billing`),
@@ -220,7 +244,7 @@ export const platformAdmin = {
     pf<TenantBilling>(`/v1/platform/tenants/${id}/billing`, { method: 'PATCH', body: JSON.stringify(body) }),
   extendTrial: (id: string, days: number, reason: string) => pf<{ trialEndsAt: string }>(`/v1/platform/tenants/${id}/billing/extend-trial`, { method: 'POST', body: JSON.stringify({ days, reason }) }),
 
-  getUsageLimits: (id: string) => pf<Array<{ key: string; used: number; limit: number | null }>>(`/v1/platform/tenants/${id}/usage-limits`),
+  getUsageLimits: (id: string) => pf<{ periodKey: string; rows: UsageLimitRow[] }>(`/v1/platform/tenants/${id}/usage-limits`),
   setUsageLimit: (id: string, key: string, limit: number | null) => pf<{ key: string; used: number; limit: number | null }>(`/v1/platform/tenants/${id}/usage-limits/${key}`, { method: 'PATCH', body: JSON.stringify({ limit }) }),
 
   getAiUsage: (id: string) => pf<AiUsageView>(`/v1/platform/tenants/${id}/ai-usage`),
@@ -245,7 +269,14 @@ export const platformAdmin = {
   createAnnouncement: (body: { title: string; body: string; severity?: string; audience?: string }) => pf<unknown>(`/v1/platform/announcements`, { method: 'POST', body: JSON.stringify(body) }),
   toggleAnnouncement: (id: string, active: boolean) => pf<unknown>(`/v1/platform/announcements/${id}`, { method: 'PATCH', body: JSON.stringify({ active }) }),
 
+  changeOwnPassword: (currentPassword: string, newPassword: string) =>
+    pf<{ changed: boolean; otherSessionsRevoked: boolean; token: string; user: PlatformMe }>(`/v1/platform/auth/password`, {
+      method: 'POST', body: JSON.stringify({ currentPassword, newPassword }),
+    }),
+  disableOwnMfa: (password: string, code: string) =>
+    pf<{ mfaEnabled: boolean }>(`/v1/platform/auth/mfa/disable`, { method: 'POST', body: JSON.stringify({ password, code }) }),
   getSettings: () => pf<PlatformSettings>(`/v1/platform/settings`),
+  settingPresets: () => pf<{ presets: PlatformSettingPreset[] }>(`/v1/platform/settings/presets`),
   updateSettings: (body: Partial<Omit<PlatformSettings, 'updatedAt'>>) => pf<PlatformSettings>(`/v1/platform/settings`, { method: 'PATCH', body: JSON.stringify(body) }),
 
   getPilotChecklist: (tenantId: string) => pf<PilotChecklistView>(`/v1/platform/tenants/${tenantId}/pilot-checklist`),
@@ -286,7 +317,22 @@ export const platformAdmin = {
   addIntegrationField: (key: string, body: { label: string; secret: boolean; required: boolean }) => pf<IntegrationView>(`/v1/platform/integrations/${key}/fields`, { method: 'PATCH', body: JSON.stringify(body) }),
 };
 
-export interface PlatformSettings { platformName: string; supportEmail: string | null; defaultTrialDays: number; defaultPlanKey: string; updatedAt: string }
+/** `used` is THIS billing period. `metered` is false where nothing counts the key yet. */
+export interface UsageLimitRow { key: string; used: number; limit: number | null; metered: boolean; lifetimeUsed: number }
+
+export interface PlatformSettings {
+  platformName: string; supportEmail: string | null;
+  defaultTrialDays: number; defaultPlanKey: string;
+  defaultTimezone: string; defaultCountry: string; defaultBranchName: string; defaultVoiceMinutes: number;
+  requireMfaFloor: boolean; sessionTimeoutMaxMinutes: number;
+  /** Whether YOUR OWN operators must use MFA on the Control Tower. */
+  requireOperatorMfa: boolean;
+  presetKey: string; updatedAt: string;
+}
+export interface PlatformSettingPreset {
+  key: string; label: string; description: string;
+  values: Partial<Omit<PlatformSettings, 'updatedAt' | 'presetKey' | 'platformName' | 'supportEmail' | 'defaultBranchName'>>;
+}
 export interface IntegrationView {
   key: string; label: string; status: string; source: 'db' | 'env' | null; isCustom?: boolean;
   fields: Array<{ key: string; label: string; secret: boolean; isSet: boolean; masked: string | null }>;

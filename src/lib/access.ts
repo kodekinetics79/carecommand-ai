@@ -31,6 +31,7 @@ import type { SessionUser } from './session';
 export type Permission =
   | 'admin:manage'
   | 'appointment:read'
+  | 'appointment:write'
   | 'billing:read'
   | 'campaign:read'
   | 'crm:read'
@@ -40,7 +41,10 @@ export type Permission =
   | 'operations:read'
   | 'partner-report:read'
   | 'patient:read'
+  | 'receptionist:booking-review'
+  | 'receptionist:call-artifacts:read'
   | 'receptionist:manage'
+  | 'receptionist:read'
   | 'revenue:read'
   | 'staff:read'
   | 'staff:task-status'
@@ -65,6 +69,12 @@ const OWNER_ADMIN = ['OWNER', 'ADMIN'] as const;
 // the patient contact evidence (audience preview, suppressions) it must show
 // before anyone can authorize an audience.
 const CAMPAIGN_WORKSPACE_GRANTS = ['campaign:read', 'crm:read'] as const;
+// The Front Desk board reads the AI's call evidence AND the staff task queue
+// those calls create; the two are guarded by different grants. See '/front-desk'.
+const FRONT_DESK_BOARD_GRANTS = ['receptionist:call-artifacts:read', 'staff:read'] as const;
+// The advisory brief names patients AND talks about their money, so its route
+// requires both grants. See '/advisory'.
+const ADVISORY_BRIEF_GRANTS = ['patient:read', 'revenue:read'] as const;
 // Module-level preHandler on monitoring + connected-care routes.
 const CLINICAL_LEADERSHIP = ['OWNER', 'ADMIN', 'MANAGER', 'PROVIDER'] as const;
 
@@ -77,8 +87,15 @@ export const ROUTES = {
   // GET /v1/dashboard/summary — authenticated only. Also the fallback landing
   // page, so it must stay reachable for every role.
   '/': { label: 'Command Center' },
-  // GET /v1/advisory/brief — authenticated only.
-  '/advisory': { label: 'Advisory Room' },
+  // GET /v1/advisory/brief, POST /v1/advisory/ask —
+  // requirePermission('patient:read', 'revenue:read'), which requires BOTH.
+  // The brief names patients and discusses their money, so the route asks for
+  // the patient grant and the revenue grant together and its own comment names
+  // who that closes it to: FRONT_DESK, PROVIDER and COMPLIANCE_OFFICER. This
+  // entry still said "authenticated only" — the wording from before that guard
+  // existed — so the room was offered to every one of them and answered 403 on
+  // arrival.
+  '/advisory': { label: 'Advisory Room', permission: ADVISORY_BRIEF_GRANTS },
   // GET /v1/opportunities, /v1/revenue-leaks — requirePermission('revenue:read')
   '/opportunities': { label: 'Opportunity Center', permission: 'revenue:read' },
 
@@ -88,9 +105,24 @@ export const ROUTES = {
   '/scheduling': { label: 'Scheduling', permission: 'appointment:read' },
   // GET /v1/intake/queue — requirePermission('intake:read')
   '/patient-intake': { label: 'Patient Intake', permission: 'intake:read' },
+  // Two grants, because the board is built from two data classes. The call
+  // evidence — GET /v1/receptionist/call-logs, /appointment-requests, /overview
+  // — takes receptionist:call-artifacts:read. The work itself — GET /v1/tasks
+  // and /v1/tasks/summary, which are the emergency, callback and service lanes
+  // and the badge above them — is guarded by requirePermission('staff:read')
+  // in server/modules/operations/routes.ts.
+  //
+  // AUDITOR holds the first and not the second, so declaring only the call
+  // grant offered an auditor a board whose every task lane answered 403 while
+  // the calls beside them loaded: exactly the half-page this registry exists to
+  // stop. FRONT_DESK holds both and is unaffected.
+  '/front-desk': { label: 'Front Desk', permission: FRONT_DESK_BOARD_GRANTS },
   // GET /v1/conversations — requirePermission('crm:read')
   '/ai-receptionist': { label: 'AI Receptionist', permission: 'crm:read' },
-  // GET /v1/receptionist/clinics, /campaigns — receptionist:manage
+  // GET /v1/receptionist/clinics, /campaigns — receptionist:manage today. The
+  // read gate (`receptionist:read`, phase2-contracts §9) opens the Studio
+  // read-only once the Studio hides its mutation controls; until then a
+  // read-only holder would reach a page whose every Save 403s.
   '/receptionist-studio': { label: 'Receptionist Studio', permission: 'receptionist:manage' },
   // GET /v1/staff/overview, /v1/tasks — requirePermission('staff:read')
   '/staff': { label: 'Staff Tasks', permission: 'staff:read' },
@@ -128,6 +160,8 @@ export const ROUTES = {
 
   // /v1/monitoring/* — module preHandler requireRoles(OWNER, ADMIN, MANAGER, PROVIDER)
   '/monitoring': { label: 'Remote Monitoring', roles: CLINICAL_LEADERSHIP },
+  // POST/PATCH/DELETE /v1/monitoring/rules — requireRoles(OWNER, ADMIN, MANAGER)
+  '/alert-thresholds': { label: 'Alert Thresholds', roles: CLINICAL_LEADERSHIP },
   // GET /v1/devices/overview — entitlement only (device_integration).
   '/devices': { label: 'Device Integration' },
   // /v1/connected-care/* — module preHandler requireRoles(OWNER, ADMIN, MANAGER, PROVIDER)

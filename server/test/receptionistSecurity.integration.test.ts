@@ -91,7 +91,7 @@ async function makeTenant() {
   tenantIds.push(id);
   await db.tenant.create({ data: { id, name: `sec-${id.slice(0, 6)}`, slug: `sec-${id.slice(0, 8)}` } });
   const branch = await db.branch.create({ data: { tenantId: id, name: 'Main', location: 'X' } });
-  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Clinic', phone: phoneFor(id) }, select: { id: true } });
+  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Clinic', phone: phoneFor(id), country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' }, select: { id: true } });
   await db.tenantFeatureEntitlement.create({ data: { tenantId: id, featureKey: 'ai_receptionist', enabled: true, source: 'test' } });
   return { id, branchId: branch.id, clinicId: clinic.id };
 }

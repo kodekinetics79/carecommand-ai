@@ -58,6 +58,11 @@ describe('pilot import flow', () => {
     const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'idempotency-key': `pilot-flow-${tenantId}` };
     const operationHeaders = (operation: string) => ({ ...headers, 'idempotency-key': `pilot-${operation}-${tenantId}` });
 
+    // Pilot routes read and write clinic data, so they now require a live
+    // break-glass session. Opening one is part of the operator flow.
+    const supportOpened = await app.inject({ method: 'POST', url: `/v1/platform/tenants/${tenantId}/support-session`, headers: { authorization: headers.authorization, 'content-type': 'application/json' }, payload: { reason: 'Pilot onboarding import', minutes: 60 } });
+    expect(supportOpened.statusCode).toBe(200);
+
     const patientCsv = [
       'external_ref,first_name,last_name,email,phone,branch_name,tags',
       'PAT-1,Maya,Lopez,maya@example.com,555-1111,Main,vip;follow-up',
@@ -317,6 +322,11 @@ describe('pilot import flow', () => {
       'content-type': 'application/json',
       'idempotency-key': `pilot-share-${tenantId}`,
     };
+
+    // Pilot routes read and write clinic data, so they now require a live
+    // break-glass session. Opening one is part of the operator flow.
+    const supportOpened = await app.inject({ method: 'POST', url: `/v1/platform/tenants/${tenantId}/support-session`, headers: { authorization: headers.authorization, 'content-type': 'application/json' }, payload: { reason: 'Pilot onboarding import', minutes: 60 } });
+    expect(supportOpened.statusCode).toBe(200);
     const created = await app.inject({
       method: 'POST',
       url: `/v1/platform/tenants/${tenantId}/pilot-status-links`,
@@ -429,6 +439,10 @@ describe('pilot import flow', () => {
     cleanup.push(removeFault);
 
     const headers = { authorization: `Bearer ${signPlatformToken(app, { id: platformUserId, role: 'PLATFORM_ADMIN' })}`, 'content-type': 'application/json', 'idempotency-key': `pilot-audit-${tenantId}` };
+    // Break-glass first: pilot routes refuse clinic data without a live session.
+    const supportOpened = await app.inject({ method: 'POST', url: `/v1/platform/tenants/${tenantId}/support-session`, headers: { authorization: headers.authorization, 'content-type': 'application/json' }, payload: { reason: 'Pilot onboarding import', minutes: 60 } });
+    expect(supportOpened.statusCode).toBe(200);
+
     const csvText = ['external_ref,first_name,last_name,branch_name', 'AUD-1,Audit,Rollback,Main'].join('\n');
     const failed = await app.inject({
       method: 'POST', url: `/v1/platform/tenants/${tenantId}/pilot-import/patients/commit`, headers,

@@ -69,6 +69,11 @@ function roleClient(role: string, isSuper: boolean, bypass: boolean, sessionRole
 describe('RLS runtime-role guard', () => {
   it('shares the complete DB-enforced append-only evidence manifest with the behavioral harness and boot guard', () => {
     expect([...TENANT_APPEND_ONLY_TABLES].sort()).toEqual([
+      // Front-desk note history (20260830130000_front_desk_loop). The migration
+      // REVOKEs ALL and then GRANTs only SELECT, INSERT, and writes only a
+      // SELECT and an INSERT policy — there is no UPDATE or DELETE path for
+      // app_rls to take. A note is corrected by appending another note.
+      'AppointmentNote',
       'AuditEvent',
       'ConsentEvent',
       'ConversationReplyAttempt',
@@ -78,6 +83,9 @@ describe('RLS runtime-role guard', () => {
       'ReceptionistOutboundProviderIntent',
       'ReceptionistRecordingConsentEvent',
       'ReceptionistVoiceConsentEvent',
+      // Billing ledger: append-only by grant and by trigger, so a recorded
+      // charge can never be quietly rewritten.
+      'UsageEvent',
     ]);
     expect([...TENANT_DELETE_PROTECTED_TABLES].sort()).toEqual([
       'Campaign',

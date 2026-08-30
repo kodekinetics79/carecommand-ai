@@ -8,6 +8,7 @@ const SUBROUTE_PARENTS: Record<string, string> = {
   '/insurance-eligibility': '/insurance',
   '/integration-setup': '/integrations',
   '/sync-logs': '/devices',
+  '/alert-thresholds': '/monitoring',
   '/enrollments': '/monitoring',
   '/rpm-readiness': '/monitoring',
   '/receptionist-studio': '/ai-receptionist',

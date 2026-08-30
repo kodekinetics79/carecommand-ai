@@ -1,4 +1,5 @@
 import { env } from '../config/env';
+import { providerConfig } from './providerCredentials';
 import { db } from './db';
 import {
   channelStatus, hasAffirmativeNonVoiceOutreachAuthority, isSuppressed,
@@ -61,9 +62,12 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 8000
 }
 
 async function sendTwilio(toNumber: string, body: string): Promise<SendResult> {
-  const sid = env.TWILIO_ACCOUNT_SID!;
-  const auth = Buffer.from(`${sid}:${env.TWILIO_AUTH_TOKEN}`).toString('base64');
-  const form = new URLSearchParams({ To: toNumber, From: env.TWILIO_FROM_NUMBER!, Body: body });
+  // Resolved through the credential vault first, environment second, so a key
+  // rotated in the Control Tower is the key this message actually uses.
+  const { values } = providerConfig('sms');
+  const sid = values.accountSid ?? env.TWILIO_ACCOUNT_SID!;
+  const auth = Buffer.from(`${sid}:${values.authToken ?? env.TWILIO_AUTH_TOKEN}`).toString('base64');
+  const form = new URLSearchParams({ To: toNumber, From: values.fromNumber ?? env.TWILIO_FROM_NUMBER!, Body: body });
   try {
     const res = await fetchWithTimeout(`${env.TWILIO_BASE_URL}/2010-04-01/Accounts/${sid}/Messages.json`, {
       method: 'POST', headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' }, body: form,
@@ -79,9 +83,10 @@ async function sendTwilio(toNumber: string, body: string): Promise<SendResult> {
 async function sendEmailHttp(to: string, subject: string, body: string): Promise<SendResult> {
   // Generic HTTP email API path (only used when EMAIL_HTTP_API_URL is configured).
   try {
-    const res = await fetchWithTimeout(env.EMAIL_HTTP_API_URL!, {
-      method: 'POST', headers: { Authorization: `Bearer ${env.EMAIL_HTTP_API_KEY ?? ''}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ to, from: env.EMAIL_FROM_ADDRESS, subject, text: body }),
+    const { values } = providerConfig('email');
+    const res = await fetchWithTimeout(values.apiUrl ?? env.EMAIL_HTTP_API_URL!, {
+      method: 'POST', headers: { Authorization: `Bearer ${values.apiKey ?? env.EMAIL_HTTP_API_KEY ?? ''}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to, from: values.fromAddress ?? env.EMAIL_FROM_ADDRESS, subject, text: body }),
     });
     const payload = await res.json().catch(() => null) as { id?: string; messageId?: string; message?: string } | null;
     const id = payload?.id ?? payload?.messageId;

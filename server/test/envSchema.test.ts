@@ -217,6 +217,34 @@ describe('env schema — DEPLOYMENT_PROFILE integration-mode gate', () => {
     }).success).toBe(true);
   });
 
+  // A mock voice provider is NOT acknowledgeable the way mock payments are.
+  // Nothing an operator can write in an env file makes a mock receptionist
+  // answer a patient call, so listing it as an ack token would advertise an
+  // escape hatch that does not exist.
+  it.each(['pilot', 'enterprise'] as const)('refuses a mock Retell key under the %s profile, acknowledged or not', profile => {
+    const res = envSchema.safeParse({
+      ...productionProfile,
+      DEPLOYMENT_PROFILE: profile,
+      PAYMENT_PROVIDER: 'stripe',
+      STRIPE_SECRET_KEY: 'sk_test_profile',
+      STRIPE_WEBHOOK_SECRET: 'whsec_profile',
+      STRIPE_SUCCESS_URL: 'https://pilot.carecommand.example.com/revenue-protection?payment=success',
+      STRIPE_CANCEL_URL: 'https://pilot.carecommand.example.com/revenue-protection?payment=cancel',
+      ALLOWED_MOCK_INTEGRATIONS: 'insurance,ai',
+      RETELL_API_KEY: 'mock_local_receptionist',
+    });
+    expect(res.success).toBe(false);
+    if (!res.success) {
+      const issue = res.error.issues.find(i => i.path.includes('RETELL_API_KEY'));
+      expect(issue?.message).toContain('cannot answer patient calls');
+      expect(issue?.message).toContain(`DEPLOYMENT_PROFILE=${profile}`);
+    }
+  });
+
+  it('allows a mock Retell key under the demo profile, which is what rehearsal is for', () => {
+    expect(envSchema.safeParse({ ...base, RETELL_API_KEY: 'mock_local_receptionist' }).success).toBe(true);
+  });
+
   it('unknown acknowledgement tokens fail boot in every profile (a typo must not silently ack nothing)', () => {
     const res = envSchema.safeParse({ ...base, ALLOWED_MOCK_INTEGRATIONS: 'payment' }); // typo: "payment"
     expect(res.success).toBe(false);

@@ -11,6 +11,7 @@ export const READ_APPEND_PRIVILEGES = new Set(['SELECT', 'INSERT']);
 export const NO_RUNTIME_PRIVILEGES = new Set<string>();
 
 export const TENANT_APPEND_ONLY_TABLES = new Set([
+  'AppointmentNote',
   'AuditEvent',
   'ConsentEvent',
   'ConversationReplyAttempt',
@@ -20,6 +21,9 @@ export const TENANT_APPEND_ONLY_TABLES = new Set([
   'ReceptionistOutboundProviderIntent',
   'ReceptionistRecordingConsentEvent',
   'ReceptionistVoiceConsentEvent',
+  // Billing ledger: the runtime adds usage and reads it back, and may never
+  // rewrite or erase it. Corrections are further events.
+  'UsageEvent',
 ]);
 
 /**

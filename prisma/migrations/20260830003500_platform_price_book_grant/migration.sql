@@ -1,0 +1,13 @@
+-- Let the platform set a price, and nothing else about the catalog.
+--
+-- 20260828120000_subscription_catalog_reference_data deliberately never writes
+-- "monthlyPrice": reference data should not carry commercial terms. But nothing
+-- else wrote it either, so every plan rendered $0/mo and every tenant's MRR and
+-- ARR were structurally zero across the whole book of business.
+--
+-- The plane migration grants app_platform SELECT on the catalog only, which is
+-- right: an operator must not be able to rename a plan, change its key, or
+-- alter which features it includes - that is a migration's job, reviewed like
+-- code. A price is the one part of a plan that is genuinely a commercial
+-- decision, so the grant is scoped to exactly that column.
+GRANT UPDATE ("monthlyPrice") ON TABLE "SubscriptionPlan" TO app_platform;

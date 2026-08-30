@@ -2,8 +2,39 @@ import type { Prisma } from '../../generated/prisma/client';
 import { sendAuthorizedAppointmentConfirmation, type SendResult } from '../commsProvider';
 import { getTenantContext, runWithJobTenantContext, runWithTenantContext } from '../tenantContext';
 import { isChannelSuppressedTx, lockSuppressionFences } from './dncFence';
+import { channelStatus } from '../campaigns';
+import { env } from '../../config/env';
 
 export const CONFIRMATION_OUTBOX_SOURCE = 'receptionist.appointment_confirmation';
+
+// The same provider status `sendAuthorizedAppointmentConfirmation` consults,
+// read ahead of time so a campaign cannot enable a confirmation the platform
+// has no way to deliver. The agent must never promise a text it cannot send.
+export type ConfirmationChannelState = 'live' | 'mock' | 'configured_pending' | 'unconfigured';
+export interface ConfirmationChannelStatus { channel: 'sms' | 'email'; status: ConfirmationChannelState; provider: string; detail: string }
+
+export function confirmationChannelStatus(channel: 'sms' | 'email'): ConfirmationChannelStatus {
+  const status = channelStatus(channel);
+  if (!status.configured) {
+    return {
+      channel, status: 'unconfigured', provider: status.provider,
+      detail: `Not configured. ${status.missing.join(', ')} must be set before ${channel === 'sms' ? 'text' : 'email'} confirmations can be sent.`,
+    };
+  }
+  if (status.mock && env.NODE_ENV !== 'production') {
+    return { channel, status: 'mock', provider: status.provider, detail: 'Development mock provider: confirmations are recorded, not delivered.' };
+  }
+  // Email needs an HTTP sending API; SMTP credentials alone leave it queued.
+  if (channel === 'email' && !env.EMAIL_HTTP_API_URL) {
+    return { channel, status: 'configured_pending', provider: status.provider, detail: 'Credentials are set but no email sending API is configured, so confirmations would stay queued.' };
+  }
+  return { channel, status: 'live', provider: status.provider, detail: `Live through ${status.provider}.` };
+}
+
+export function confirmationChannelDeliverable(channel: 'sms' | 'email'): boolean {
+  const state = confirmationChannelStatus(channel).status;
+  return state === 'live' || state === 'mock';
+}
 const RETRYING_LEASE_MS = 5 * 60_000;
 const MAX_BACKOFF_MS = 60 * 60_000;
 

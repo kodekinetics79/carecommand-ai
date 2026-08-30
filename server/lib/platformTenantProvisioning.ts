@@ -16,6 +16,13 @@ export interface PlatformProvisionInput {
   timezone?: string;
   planKey: string;
   trialDays: number;
+  /** Voice quota seeded for the new tenant. From PlatformConfig.defaultVoiceMinutes. */
+  voiceMinutesLimit?: number;
+  /**
+   * Security FLOOR from PlatformConfig, seeded into the tenant's own policy.
+   * The tenant may tighten these later; it may not drop below them.
+   */
+  securityFloor?: { requireMfa?: boolean; sessionTimeoutMinutes?: number };
 }
 
 export class PlatformProvisionError extends Error {
@@ -81,6 +88,36 @@ export async function platformProvisionTenant(
     await seedComplianceBaseline(tx, row.tenant_id);
     await recomputeEntitlements(row.tenant_id, tx);
 
+    // Seed the governance rows the Control Tower would otherwise create lazily
+    // on first view, so a brand-new tenant starts at the platform's stated
+    // defaults rather than at whatever a later read happens to invent.
+    if (input.securityFloor) {
+      // A floor only ever tightens. seedComplianceBaseline has already written
+      // this tenant's starting policy, so requiring MFA raises it, and the
+      // session ceiling is applied only where the baseline is looser than it.
+      const floor = input.securityFloor;
+      const current = await tx.tenantSecurityPolicy.findUnique({ where: { tenantId: row.tenant_id } });
+      const tightened: { requireMfa?: boolean; sessionTimeoutMinutes?: number } = {};
+      if (floor.requireMfa) tightened.requireMfa = true;
+      if (floor.sessionTimeoutMinutes && (current?.sessionTimeoutMinutes ?? Number.MAX_SAFE_INTEGER) > floor.sessionTimeoutMinutes) {
+        tightened.sessionTimeoutMinutes = floor.sessionTimeoutMinutes;
+      }
+      if (Object.keys(tightened).length > 0) {
+        await tx.tenantSecurityPolicy.upsert({
+          where: { tenantId: row.tenant_id },
+          update: tightened,
+          create: { tenantId: row.tenant_id, ...tightened },
+        });
+      }
+    }
+    if (typeof input.voiceMinutesLimit === 'number') {
+      await tx.tenantUsageLimit.upsert({
+        where: { tenantId_key: { tenantId: row.tenant_id, key: 'voice_minutes' } },
+        update: {},
+        create: { tenantId: row.tenant_id, key: 'voice_minutes', limitValue: input.voiceMinutesLimit, used: 0 },
+      });
+    }
+
     return {
       tenant: { id: row.tenant_id, name: row.tenant_name, slug: row.tenant_slug },
       owner: { id: row.owner_id, email: row.owner_email, displayName: input.ownerName.trim(), role: 'OWNER' as const },
@@ -94,6 +131,6 @@ export async function platformProvisionTenant(
   // nothing guarantee by opening a transaction here.
   const rootClient = client as PrismaClient;
   return typeof rootClient.$transaction === 'function'
-    ? rootClient.$transaction(tx => provision(tx))
+    ? rootClient.$transaction(tx => provision(tx), { timeout: 30_000, maxWait: 10_000 })
     : provision(client);
 }

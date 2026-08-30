@@ -43,16 +43,39 @@ export default function PlatformPilot() {
   const [checklist, setChecklist] = useState<PilotChecklistView | null>(null);
   const [busy, setBusy] = useState<'tenants' | 'checklist' | 'create' | 'preview' | 'commit' | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Pilot import reads and writes a clinic's patient and appointment rows, so
+  // the server refuses it without a live, reason-carrying support session. A
+  // bare 403 would read as "the console is broken", so offer the remedy inline.
+  const [supportReason, setSupportReason] = useState('');
+  const [supportBusy, setSupportBusy] = useState(false);
+  const needsSupportSession = Boolean(error && /support session/i.test(error));
 
   const [companyOpen, setCompanyOpen] = useState(true);
   const [companyName, setCompanyName] = useState('');
   const [companySlug, setCompanySlug] = useState('');
   const [slugEdited, setSlugEdited] = useState(false);
-  const [planKey, setPlanKey] = useState('starter');
+  const [planKey, setPlanKey] = useState('');
+  const [planOptions, setPlanOptions] = useState<Array<{ key: string; name: string }>>([]);
   const [ownerName, setOwnerName] = useState('');
   const [ownerEmail, setOwnerEmail] = useState('');
   const [ownerPassword, setOwnerPassword] = useState('');
   const [branchName, setBranchName] = useState('Main Branch');
+  // Plan used to be a free-text box defaulting to a hardcoded 'starter': a typo
+  // produced a 400 at the end of a long form, and Platform Settings' default
+  // plan could never apply. Both are now driven by the server.
+  useEffect(() => {
+    let alive = true;
+    void Promise.all([
+      platformAdmin.plans().catch(() => [] as Array<{ key: string; name: string }>),
+      platformAdmin.getSettings().catch(() => null),
+    ]).then(([catalog, cfg]) => {
+      if (!alive) return;
+      setPlanOptions(catalog);
+      setPlanKey(prev => prev || cfg?.defaultPlanKey || catalog[0]?.key || 'starter');
+      if (cfg?.defaultBranchName) setBranchName(prev => (prev === 'Main Branch' ? cfg.defaultBranchName : prev));
+    });
+    return () => { alive = false; };
+  }, []);
   const [timezone, setTimezone] = useState(localTimezone);
 
   const [entityType, setEntityType] = useState<PilotEntityType>('patients');
@@ -318,7 +341,43 @@ export default function PlatformPilot() {
             <p className="mt-1 text-sm text-t2">Give the clinic’s patients only the access the clinic chooses, then let them test their own portal flows.</p>
           </div>
         </div>
-        {error && <div className="mt-4 rounded-xl border border-[rgba(220,38,38,0.18)] bg-red-soft px-3 py-2 text-sm text-red-v">{error}</div>}
+        {error && (
+          <div className="mt-4 rounded-xl border border-[rgba(220,38,38,0.18)] bg-red-soft px-3 py-2 text-sm text-red-v">
+            <p>{error}</p>
+            {needsSupportSession && selectedTenantId && (
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <input
+                  value={supportReason}
+                  onChange={e => setSupportReason(e.target.value)}
+                  placeholder="Why you need access (recorded)"
+                  aria-label="Support session reason"
+                  className="flex-1 min-w-[220px] rounded-lg border border-[var(--b1)] bg-[var(--s1)] px-3 py-1.5 text-xs text-t1 outline-none"
+                />
+                <button
+                  type="button"
+                  disabled={supportBusy || supportReason.trim().length < 3}
+                  onClick={async () => {
+                    setSupportBusy(true);
+                    try {
+                      await platformAdmin.startSupport(selectedTenantId, supportReason.trim(), 60);
+                      setSupportReason('');
+                      setError(null);
+                      const data = await platformAdmin.getPilotChecklist(selectedTenantId);
+                      setChecklist(data);
+                    } catch (e) {
+                      setError(e instanceof Error ? e.message : 'Could not open a support session');
+                    } finally {
+                      setSupportBusy(false);
+                    }
+                  }}
+                  className="rounded-lg bg-[var(--indigo)] px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+                >
+                  {supportBusy ? 'Opening…' : 'Open 60-minute support session'}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
         {importResult && <div className="mt-4 rounded-xl border border-[rgba(5,150,105,0.18)] bg-emerald-soft px-3 py-2 text-sm text-emerald-v">{importResult}</div>}
       </section>
 
@@ -404,7 +463,9 @@ export default function PlatformPilot() {
                   </label>
                   <label className="block space-y-1">
                     <span className="text-[11px] font-semibold text-t3">Plan</span>
-                    <input value={planKey} onChange={e => setPlanKey(e.target.value)} className="w-full rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none" placeholder="starter" />
+                    <select aria-label="Plan" value={planKey} onChange={e => setPlanKey(e.target.value)} disabled={!planOptions.length} className="w-full rounded-xl border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-sm text-t1 outline-none">
+                      {planOptions.length ? planOptions.map(p => <option key={p.key} value={p.key}>{p.name}</option>) : <option value="">Plan catalog unavailable</option>}
+                    </select>
                   </label>
                   <label className="block space-y-1">
                     <span className="text-[11px] font-semibold text-t3">Default branch</span>

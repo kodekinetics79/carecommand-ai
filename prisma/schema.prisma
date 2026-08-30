@@ -124,6 +124,23 @@ model Tenant {
   billingContactName                  String?
   billingContactEmail                 String?
   accountNotes                        String?
+
+  // How this workspace is allowed to behave in the real world.
+  //   demo       - nobody real is on the other end of the phone. Live calling
+  //                is refused outright, so a sales demo cannot dial a patient.
+  //   pilot      - a real clinic, attended operation.
+  //   production - a real clinic, unattended.
+  // Enforced in server/lib/tenantMode.ts at both call-admission gates. A voice
+  // product needs one switch above every dial path, and this is it.
+  mode                                String                               @default("pilot")
+
+  // Relationship facts an operator needs and the console could not show. These
+  // are recorded facts, not runtime switches: their job is to be visible when
+  // someone asks "when does this renew" or "is the BAA signed".
+  contractStartedAt                   DateTime?
+  accountManager                      String?
+  baaSignedAt                         DateTime?
+
   createdAt                           DateTime                             @default(now())
   updatedAt                           DateTime                             @updatedAt
   branches                            Branch[]
@@ -143,6 +160,7 @@ model Tenant {
   providers                           ProviderProfile[]
   staffProfiles                       StaffProfile[]
   staffTasks                          StaffTask[]
+  appointmentNotes                    AppointmentNote[]
   revenueSnapshots                    RevenueSnapshot[]
   conversations                       Conversation[]
   conversationReplyAttempts           ConversationReplyAttempt[]
@@ -174,9 +192,9 @@ model Tenant {
   receptionistClinics                 ReceptionistClinic[]
   receptionistLocations               ReceptionistLocation[]
   receptionistAgents                  ReceptionistAgent[]
+  receptionistAgentDeployments        ReceptionistAgentDeployment[]
   receptionistCampaigns               ReceptionistCampaign[]
   receptionistIntakeFields            ReceptionistIntakeField[]
-  receptionistAppointmentRequests     ReceptionistAppointmentRequest[]
   receptionistCallLogs                ReceptionistCallLog[]
   receptionistOptOuts                 ReceptionistOptOut[]
   receptionistRecordingConsentEvents  ReceptionistRecordingConsentEvent[]
@@ -210,6 +228,9 @@ model Tenant {
   receptionistCallTargets             ReceptionistCallTarget[]
   appointmentRequests                 AppointmentRequest[]
   serviceCatalogItems                 ServiceCatalogItem[]
+  receptionistClosures                ReceptionistClosure[]
+  receptionistClinicKnowledge         ReceptionistClinicKnowledge[]
+  receptionistLocalePacks             ReceptionistLocalePack[]
   businessEvents                      BusinessEvent[]
   operationalSignals                  OperationalSignal[]
   aiRecommendations                   AIRecommendation[]
@@ -246,6 +267,7 @@ model Tenant {
   campaignSubmissionClaims            CampaignSubmissionClaim[]
   campaignLiveDispatchActivations     CampaignLiveDispatchActivation[]
   campaignAttributions                CampaignAttribution[]
+  usageEvents            UsageEvent[]
 }
 
 model User {
@@ -290,6 +312,13 @@ model User {
   eligibilityExecutions          EligibilityExecution[]          @relation("EligibilityExecutionActor")
   eligibilityReconciliationsVerified EligibilityExecution[]      @relation("EligibilityReconciliationVerifier")
   leadActivities                 LeadActivity[]                  @relation("LeadActivityActor")
+  acknowledgedStaffTasks         StaffTask[]                     @relation("StaffTaskAcknowledgedBy")
+  appointmentNotes               AppointmentNote[]               @relation("AppointmentNoteActor")
+  receptionistClosuresCreated    ReceptionistClosure[]           @relation("ReceptionistClosureCreator")
+  receptionistKnowledgeApproved  ReceptionistClinicKnowledge[]   @relation("ReceptionistKnowledgeApprover")
+  receptionistKnowledgeEdited    ReceptionistClinicKnowledge[]   @relation("ReceptionistKnowledgeEditor")
+  receptionistLocalePacksApproved ReceptionistLocalePack[]       @relation("ReceptionistLocalePackApprover")
+  receptionistLocalePacksCreated ReceptionistLocalePack[]        @relation("ReceptionistLocalePackCreator")
 
   @@unique([tenantId, email])
   @@unique([tenantId, id])
@@ -368,6 +397,22 @@ model Patient {
   tags                           String[]
   lastVisitAt                    DateTime?
   nextVisitAt                    DateTime?
+  // "Human only" — this person must never be answered by the AI line.
+  //
+  // A stored clinical decision, taken by a named human: cognitive impairment, a
+  // speech difference the line failed once already, a safeguarding note. It is
+  // deliberately NOT inferable — no model, no heuristic and no call outcome may
+  // set it, because the whole value of the flag is that a person decided it and
+  // a person can be asked why. `call_inbound` reads it before the receptionist
+  // takes a single turn.
+  //
+  // `humanOnlySetByUserId` is an attribution reference, not a relation: a
+  // composite FK here would add another managed constraint to the tenant
+  // integrity manifest for a field nothing joins on.
+  humanOnly                      Boolean                         @default(false)
+  humanOnlyReason                String?                         @db.VarChar(240)
+  humanOnlySetAt                 DateTime?
+  humanOnlySetByUserId           String?                         @db.Uuid
   deletedAt                      DateTime?
   createdAt                      DateTime                        @default(now())
   updatedAt                      DateTime                        @updatedAt
@@ -403,6 +448,8 @@ model Patient {
   notificationEvents    NotificationEvent[]
   receptionistCallTargets ReceptionistCallTarget[]
   receptionistOutboundProviderIntents ReceptionistOutboundProviderIntent[]
+  staffTasks            StaffTask[]                          @relation("StaffTaskPatient")
+  receptionistCallLogs  ReceptionistCallLog[]                @relation("ReceptionistCallLogPatient")
 
   @@unique([tenantId, externalRef])
   @@unique([tenantId, id])
@@ -454,6 +501,8 @@ model Appointment {
   appointmentRequests            AppointmentRequest[]             @relation("AppointmentRequestBookedAppointment")
   notificationEvents             NotificationEvent[]
   campaignAttributions           CampaignAttribution[]
+  // Append-only note history (C4). The scalar `notes` string stays for old readers.
+  noteEntries                    AppointmentNote[]
 
   @@unique([tenantId, id])
   @@unique([tenantId, receptionistCallLogId])
@@ -461,6 +510,31 @@ model Appointment {
   @@index([tenantId, patientId, startsAt])
   @@index([tenantId, status, startsAt])
   @@index([tenantId, providerProfileId, startsAt])
+}
+
+// ===========================================================================
+// Append-only appointment notes (C4 front desk loop). Staff, the voice agent,
+// and the system append; nothing updates or deletes at runtime (REVOKE-backed,
+// listed in TENANT_APPEND_ONLY_TABLES). Every FK is tenant-scoped so a note can
+// never point at another tenant's appointment, actor, or source call.
+// ===========================================================================
+model AppointmentNote {
+  id            String               @id @default(uuid()) @db.Uuid
+  tenantId      String               @db.Uuid
+  appointmentId String               @db.Uuid
+  text          String
+  // staff | voice_agent | system (DB CHECK)
+  actorType     String
+  actorUserId   String?              @db.Uuid
+  callLogId     String?              @db.Uuid
+  createdAt     DateTime             @default(now())
+  tenant        Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade, map: "AppointmentNote_tenant_fkey")
+  appointment   Appointment          @relation(fields: [tenantId, appointmentId], references: [tenantId, id], onDelete: Cascade, map: "AppointmentNote_appointment_scope_fkey")
+  actorUser     User?                @relation("AppointmentNoteActor", fields: [tenantId, actorUserId], references: [tenantId, id], onDelete: Restrict, map: "AppointmentNote_actor_scope_fkey")
+  callLog       ReceptionistCallLog? @relation("AppointmentNoteSourceCall", fields: [tenantId, callLogId], references: [tenantId, id], onDelete: Restrict, map: "AppointmentNote_callLog_scope_fkey")
+
+  @@index([tenantId, appointmentId, createdAt])
+  @@index([tenantId, callLogId])
 }
 
 model ConsentEvent {
@@ -1022,16 +1096,30 @@ model StaffTask {
   status       TaskStatus @default(OPEN)
   dueAt        DateTime?
   metadata     Json?
+  // C4 front desk loop: durable links and the human-closed outcome. Composite
+  // tenant-scoped FKs (Restrict: SET NULL on a composite FK would null tenantId).
+  patientId        String?   @db.Uuid
+  callLogId        String?   @db.Uuid
+  acknowledgedAt   DateTime?
+  acknowledgedById String?   @db.Uuid
+  completedAt      DateTime?
+  outcomeCode      String?
+  outcomeNote      String?
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
   tenant       Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   branch       Branch?    @relation(fields: [branchId], references: [id], onDelete: SetNull)
   assignedTo   User?      @relation(fields: [assignedToId], references: [id], onDelete: SetNull)
   eligibilityReconciliation EligibilityExecution? @relation("EligibilityReconciliationTask")
+  patient        Patient?             @relation("StaffTaskPatient", fields: [tenantId, patientId], references: [tenantId, id], onDelete: Restrict, map: "StaffTask_patient_scope_fkey")
+  callLog        ReceptionistCallLog? @relation("StaffTaskSourceCall", fields: [tenantId, callLogId], references: [tenantId, id], onDelete: Restrict, map: "StaffTask_callLog_scope_fkey")
+  acknowledgedBy User?                @relation("StaffTaskAcknowledgedBy", fields: [tenantId, acknowledgedById], references: [tenantId, id], onDelete: Restrict, map: "StaffTask_acknowledgedBy_scope_fkey")
 
   @@unique([tenantId, id])
   @@index([tenantId, status, dueAt])
   @@index([tenantId, assignedToId, status])
+  @@index([tenantId, callLogId])
+  @@index([tenantId, patientId, status])
 }
 
 model RevenueSnapshot {
@@ -1786,6 +1874,22 @@ enum ReceptionistAgentProbeStatus {
   FAILED
 }
 
+enum ReceptionistDeploymentStatus {
+  PENDING
+  PUBLISHED
+  VERIFIED
+  FAILED
+  SUPERSEDED
+}
+
+// Who asked for a provider attempt: a signed-in user, the re-verification
+// worker, or a deploy (which verifies as part of its own flow).
+enum ReceptionistAttemptSource {
+  USER
+  SYSTEM
+  DEPLOY
+}
+
 enum ReceptionistCallOutcome {
   IN_PROGRESS
   BOOKED
@@ -1802,14 +1906,6 @@ enum ReceptionistCallReviewStatus {
   DRAFT
   REVIEWED
   SIGNED_OFF
-}
-
-enum ReceptionistRequestStatus {
-  PENDING
-  CONFIRMED
-  CANCELED
-  COMPLETED
-  NO_SLOTS
 }
 
 enum ReceptionistOptOutChannel {
@@ -1854,14 +1950,28 @@ model ReceptionistClinic {
   // active trusted inbound destination (migration-managed; Prisma cannot
   // represent partial unique indexes in this schema).
   phone                String
+  // The provider-owned inbound line THIS clinic answers on — the number a
+  // deployment binds and the number verification re-reads. Backfilled from
+  // `phone`, and globally unique among active clinics (migration-managed), so
+  // one clinic's deploy can never repoint another clinic's line. Null means
+  // "not assigned yet"; deploy claims `phone` and records the claim.
+  inboundNumber        String?
   website              String?
   addressLine          String?
-  timezone             String                           @default("America/New_York")
-  defaultLanguage      String                           @default("en-US")
-  complianceDisclosure String                           @default("Hi, this is your AI assistant calling on behalf of the clinic.")
+  // ISO-3166-1 alpha-2, uppercase (CHECK in migration). Never inferred: a null
+  // country blocks activation until a human confirms it in Studio.
+  country              String?
+  timezone             String
+  defaultLanguage      String
+  // Supplemental clinic/jurisdiction sentence only; the disclosure baseline,
+  // emergency wording and DNC lines come from the approved locale pack.
+  complianceDisclosure String?
+  // Stored in canonical E.164 (CHECK in migration); null = no transfer target.
   humanFallbackNumber  String?
-  doNotContactPolicy   String                           @default("If the person asks not to be contacted again, confirm politely and mark them do-not-contact.")
+  doNotContactPolicy   String?
   workingHours         Json?
+  // Front desk SLA policy (C4): { sla: { <kind>: { dueMinutes, priority } } }; merged over code defaults.
+  frontDeskPolicy      Json?
   active               Boolean                          @default(true)
   createdAt            DateTime                         @default(now())
   updatedAt            DateTime                         @updatedAt
@@ -1869,10 +1979,11 @@ model ReceptionistClinic {
   locations            ReceptionistLocation[]
   agents               ReceptionistAgent[]
   campaigns            ReceptionistCampaign[]
-  appointmentRequests  ReceptionistAppointmentRequest[]
   callLogs             ReceptionistCallLog[]
   optOuts              ReceptionistOptOut[]
   outboundCampaigns    ReceptionistOutboundCampaign[]
+  closures             ReceptionistClosure[]
+  knowledge            ReceptionistClinicKnowledge?
 
   @@unique([tenantId, name])
   @@unique([tenantId, id])
@@ -1889,7 +2000,10 @@ model ReceptionistLocation {
   name         String
   address      String
   phone        String?
-  timezone     String?
+  // Parking / entrance / transit guidance spoken to callers who ask.
+  accessNotes  String?
+  // Per-day override of the clinic hours; null = inherit the clinic schedule.
+  // The location timezone is derived from branch.timezone and never stored.
   workingHours Json?
   active       Boolean            @default(true)
   createdAt    DateTime           @default(now())
@@ -1897,9 +2011,102 @@ model ReceptionistLocation {
   tenant       Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   clinic       ReceptionistClinic @relation(fields: [clinicId], references: [id], onDelete: Cascade)
   branch       Branch?            @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  closures     ReceptionistClosure[]
 
+  @@unique([tenantId, id])
   @@index([tenantId, clinicId, active])
   @@index([tenantId, branchId, active])
+}
+
+// Planned closures (holidays, training days). Ranges are clinic-local calendar
+// dates; a null locationId closes every location of the clinic. Partial-day
+// columns are reserved (CHECK: both or neither) but the API rejects them.
+model ReceptionistClosure {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @db.Uuid
+  clinicId        String   @db.Uuid
+  locationId      String?  @db.Uuid
+  startsOn        DateTime @db.Date
+  endsOn          DateTime @db.Date
+  startTime       String?
+  endTime         String?
+  reason          String
+  internalNote    String?
+  createdByUserId String?  @db.Uuid
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  tenant          Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clinic          ReceptionistClinic    @relation(fields: [tenantId, clinicId], references: [tenantId, id], onDelete: Cascade, map: "ReceptionistClosure_clinic_scope_fkey")
+  location        ReceptionistLocation? @relation(fields: [tenantId, locationId], references: [tenantId, id], onDelete: Cascade, map: "ReceptionistClosure_location_scope_fkey")
+  createdBy       User?                 @relation("ReceptionistClosureCreator", fields: [tenantId, createdByUserId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistClosure_creator_scope_fkey")
+
+  @@unique([tenantId, id])
+  @@index([tenantId, clinicId, startsOn, endsOn])
+}
+
+// One knowledge document per clinic: an editable draft plus the approved
+// snapshot the prompt renders. Approval is a set-level governance act that
+// produces one hash and one approver.
+model ReceptionistClinicKnowledge {
+  id               String    @id @default(uuid()) @db.Uuid
+  tenantId         String    @db.Uuid
+  clinicId         String    @db.Uuid
+  draft            Json
+  draftRevision    Int       @default(1)
+  approved         Json?
+  approvedRevision Int?
+  approvedHash     String?
+  approvedByUserId String?   @db.Uuid
+  approvedAt       DateTime?
+  updatedByUserId  String?   @db.Uuid
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  tenant           Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clinic           ReceptionistClinic @relation(fields: [tenantId, clinicId], references: [tenantId, id], onDelete: Cascade, map: "ReceptionistClinicKnowledge_clinic_scope_fkey")
+  approvedBy       User?              @relation("ReceptionistKnowledgeApprover", fields: [tenantId, approvedByUserId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistClinicKnowledge_approver_scope_fkey")
+  updatedBy        User?              @relation("ReceptionistKnowledgeEditor", fields: [tenantId, updatedByUserId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistClinicKnowledge_editor_scope_fkey")
+
+  @@unique([tenantId, clinicId])
+  @@unique([tenantId, id])
+}
+
+enum ReceptionistLocalePackStatus {
+  DRAFT
+  APPROVED
+  RETIRED
+}
+
+// Tenant-owned caller-facing wording per (language, country). Platform
+// defaults live in code (server/lib/receptionist/localePacks/defaults.ts); a
+// tenant adopts one as a DRAFT and an OWNER/ADMIN approves it. Approved
+// content is immutable at the application layer (409 PACK_IMMUTABLE); a change
+// is a new version. Exactly one APPROVED pack per (tenant, language, country)
+// is enforced by a partial unique index in the migration.
+model ReceptionistLocalePack {
+  id                 String                       @id @default(uuid()) @db.Uuid
+  tenantId           String                       @db.Uuid
+  language           String
+  country            String
+  version            Int
+  status             ReceptionistLocalePackStatus @default(DRAFT)
+  source             String
+  baseDefaultVersion Int?
+  strings            Json
+  evidenceHash       String
+  approvedByUserId   String?                      @db.Uuid
+  approvedAt         DateTime?
+  retiredAt          DateTime?
+  createdByUserId    String?                      @db.Uuid
+  createdAt          DateTime                     @default(now())
+  updatedAt          DateTime                     @updatedAt
+  tenant             Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  approvedBy         User?                 @relation("ReceptionistLocalePackApprover", fields: [tenantId, approvedByUserId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistLocalePack_approver_scope_fkey")
+  createdBy          User?                 @relation("ReceptionistLocalePackCreator", fields: [tenantId, createdByUserId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistLocalePack_creator_scope_fkey")
+  callLogs           ReceptionistCallLog[]
+
+  @@unique([tenantId, language, country, version])
+  @@unique([tenantId, id])
+  @@index([tenantId, language, country, status])
 }
 
 model ReceptionistAgent {
@@ -1947,16 +2154,43 @@ model ReceptionistAgent {
   providerVerificationExpiresAt DateTime?
   providerLastAttemptAt         DateTime?
   providerLastAttemptStatus     ReceptionistAgentProbeStatus    @default(NEVER)
+  providerLastAttemptSource     ReceptionistAttemptSource        @default(USER)
   providerLastErrorCode         String?
+  // Prompt hash read back from the verified provider deployment. Compared with
+  // the draft plan so a prompt edited in the Retell console reads as drift.
+  providerPromptHash            String?
+  // Which inbound line the PROVIDER says this agent answers on, read back
+  // during verification. It exists for the hand-linked (BYO) agent, which has
+  // no deployment row to carry the same evidence: the number question is
+  // answerable for BYO — ask Retell who answers the clinic's line — and it is
+  // answered by a read-back, never by an operator ticking a box.
+  providerInboundNumber         String?
+  // Stamped only when that read-back named THIS agent and the version the
+  // probe reported in the same pass. Ages out on the verification TTL exactly
+  // as `providerVerifiedAt` does.
+  providerInboundNumberVerifiedAt DateTime?
+  // Why the read-back could not be completed, or `number_bound_elsewhere` when
+  // it completed and named somebody else.
+  providerInboundNumberErrorCode  String?
+  // The deployment this agent currently runs. Null for a manually linked (BYO)
+  // agent, whose prompt CareCommand cannot attest to.
+  currentDeploymentId           String?                          @db.Uuid
   createdAt                     DateTime                         @default(now())
   updatedAt                     DateTime                         @updatedAt
   tenant                        Tenant                           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   clinic                        ReceptionistClinic               @relation(fields: [clinicId], references: [id], onDelete: Cascade)
   campaigns                     ReceptionistCampaign[]
   outboundCampaigns             ReceptionistOutboundCampaign[]
+  deployments                   ReceptionistAgentDeployment[]
 
   @@index([tenantId, clinicId, active])
   @@index([providerAgentId, providerVersion], map: "ReceptionistAgent_provider_deployment_idx")
+  // `currentDeploymentId` is deliberately not a foreign key (see
+  // 20260830140000_receptionist_agent_deployment: an enforced inverse would make
+  // the two deletes circular), so this index is the only thing keeping the
+  // deployment-to-agent lookup off a sequential scan. Declared here so the
+  // schema and that migration name the same index.
+  @@index([currentDeploymentId])
   @@unique([tenantId, clinicId, id])
 }
 
@@ -1988,19 +2222,94 @@ model ReceptionistCampaign {
   intakeSchemaProviderVersion       Int?
   intakeSchemaResponseEngineId      String?
   intakeSchemaResponseEngineVersion Int?
+  // Locale pack bound at activation; the retire guard reads it. Prompt, hours
+  // and knowledge hashes are attested on the agent deployment row (C5).
+  attestedLocalePackId              String?   @db.Uuid
+  attestedLocalePackHash            String?
   createdAt           DateTime                         @default(now())
   updatedAt           DateTime                         @updatedAt
   tenant              Tenant                           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   clinic              ReceptionistClinic               @relation(fields: [clinicId], references: [id], onDelete: Cascade)
   agent               ReceptionistAgent?               @relation(fields: [tenantId, clinicId, agentId], references: [tenantId, clinicId, id], onDelete: Restrict, map: "ReceptionistCampaign_agent_scope_fkey")
   intakeFields        ReceptionistIntakeField[]
-  appointmentRequests ReceptionistAppointmentRequest[]
   callLogs            ReceptionistCallLog[]
   outboundAuthorityCampaigns ReceptionistOutboundCampaign[] @relation("OutboundBookingAuthority")
+  deployments         ReceptionistAgentDeployment[]
 
   @@index([tenantId, clinicId, status])
   @@unique([tenantId, clinicId, id])
   @@unique([tenantId, id])
+}
+
+// One CareCommand-authored deployment of a campaign's prompt/tools to Retell.
+// The row is the deployment record AND the provider evidence: mock mode answers
+// its probe from these columns, so the API, the worker and the seed can never
+// disagree about what the provider is running.
+model ReceptionistAgentDeployment {
+  id                   String                       @id @default(uuid()) @db.Uuid
+  tenantId             String                       @db.Uuid
+  clinicId             String                       @db.Uuid
+  agentId              String                       @db.Uuid
+  campaignId           String                       @db.Uuid
+  status               ReceptionistDeploymentStatus @default(PENDING)
+  // True when the deployment was made against the mock provider. Enforced
+  // against the hash prefixes by a CHECK so mock evidence can never be read as
+  // live evidence.
+  mock                 Boolean                      @default(false)
+  providerAgentId      String?
+  providerLlmId        String?
+  providerLlmVersion   Int?
+  // The exact published agent version this deployment pins. Retell has no
+  // public tag-assignment write, so the number is the binding, not the tag.
+  providerAgentVersion Int?
+  providerVersionTag   String                       @default("prod")
+  promptHash           String
+  beginMessageHash     String
+  toolFingerprint      String
+  intakeFingerprint    String
+  intakeSchemaRevision Int
+  configFingerprint    String
+  voiceId              String
+  language             String
+  // Deployed prompt and tools: tenant configuration, never PHI. Kept so the
+  // draft-versus-deployed comparison is a fact and not a re-derivation.
+  promptText           String
+  toolsJson            Json
+  steps                Json?
+  providerErrorCode    String?
+  // `numberBound` and `boundPhoneNumber` are what the deploy ASKED the provider
+  // for. Everything below is what the provider ANSWERED when asked again, and
+  // it is the only evidence readiness may pass `number_bound` on: a stored
+  // claim we wrote ourselves is not an attestation.
+  numberBound          Boolean                      @default(false)
+  boundPhoneNumber     String?
+  // When the provider was last asked who answers `boundPhoneNumber`.
+  numberBindingReadAt  DateTime?
+  // Who the provider says answers it, read back verbatim.
+  numberBindingAgentId String?
+  numberBindingAgentVersion Int?
+  // Non-null ONLY when that read-back named this deployment's own published
+  // agent and version. Stale or null ⇒ `pending`; it may never read `pass`.
+  numberBindingVerifiedAt   DateTime?
+  // Why the read-back could not be completed, or `number_bound_elsewhere` when
+  // it completed and named somebody else.
+  numberBindingErrorCode    String?
+  deployedById         String?                      @db.Uuid
+  deployedBySource     ReceptionistAttemptSource    @default(USER)
+  startedAt            DateTime                     @default(now())
+  publishedAt          DateTime?
+  verifiedAt           DateTime?
+  createdAt            DateTime                     @default(now())
+  updatedAt            DateTime                     @updatedAt
+  tenant               Tenant                       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  agent                ReceptionistAgent            @relation(fields: [tenantId, clinicId, agentId], references: [tenantId, clinicId, id], onDelete: Cascade, map: "ReceptionistAgentDeployment_agent_scope_fkey")
+  campaign             ReceptionistCampaign         @relation(fields: [tenantId, campaignId], references: [tenantId, id], onDelete: Cascade, map: "ReceptionistAgentDeployment_campaign_scope_fkey")
+
+  @@unique([tenantId, id])
+  @@index([tenantId, agentId, createdAt])
+  @@index([tenantId, campaignId, status])
+  @@index([providerAgentId, providerAgentVersion])
+  @@index([tenantId, boundPhoneNumber, status])
 }
 
 model ReceptionistIntakeField {
@@ -2023,32 +2332,6 @@ model ReceptionistIntakeField {
 
   @@index([campaignId, sortOrder])
   @@index([tenantId])
-}
-
-model ReceptionistAppointmentRequest {
-  id              String                    @id @default(uuid()) @db.Uuid
-  tenantId        String                    @db.Uuid
-  clinicId        String?                   @db.Uuid
-  campaignId      String?                   @db.Uuid
-  locationId      String?                   @db.Uuid
-  contactName     String?
-  contactPhone    String?
-  contactEmail    String?
-  appointmentType String?
-  requestedDate   String?
-  requestedTime   String?
-  bookedSlot      String?
-  status          ReceptionistRequestStatus @default(PENDING)
-  collectedData   Json?
-  notes           String?
-  source          String                    @default("retell")
-  createdAt       DateTime                  @default(now())
-  updatedAt       DateTime                  @updatedAt
-  tenant          Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  clinic          ReceptionistClinic?       @relation(fields: [clinicId], references: [id], onDelete: SetNull)
-  campaign        ReceptionistCampaign?     @relation(fields: [campaignId], references: [id], onDelete: SetNull)
-
-  @@index([tenantId, status, createdAt])
 }
 
 model ReceptionistCallLog {
@@ -2093,8 +2376,24 @@ model ReceptionistCallLog {
   sentiment                    String?
   startedAt                    DateTime?
   endedAt                      DateTime?
+  // Stamped once from the clinic hours engine when the call is first seen;
+  // null = hours were not configured at call time (never "false").
+  outsideHours                 Boolean?
+  // 'connected' | 'unknown' from the provider disconnection reason at call end.
+  transferOutcome              String?
+  // Comprehension. `unparseableTurns` counts CONSECUTIVE turns the receptionist
+  // could not parse on this call; the server owns the count so the decision to
+  // stop trying is not the model's to make. `comprehensionBailoutAt` is stamped
+  // the moment the second one arrives and the call is handed to a person — the
+  // durable record that this caller was failed by the line, and the row the
+  // "What it missed" ledger reads.
+  unparseableTurns             Int                                  @default(0)
+  comprehensionBailoutAt       DateTime?
+  localePackId                 String?                              @db.Uuid
   outboundCampaignId           String?                              @db.Uuid
   targetId                     String?                              @db.Uuid
+  // Caller identity (C4): linked only from a verified identity or a single canonical phone match.
+  patientId                    String?                              @db.Uuid
   createdAt                    DateTime                             @default(now())
   updatedAt                    DateTime                             @updatedAt
   tenant                       Tenant                               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
@@ -2109,8 +2408,12 @@ model ReceptionistCallLog {
   legalHolds                   ReceptionistCallLegalHold[]
   reviewedBy                   User?                                @relation("ReceptionistCallReviewer", fields: [tenantId, reviewedByUserId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallLog_reviewer_scope_fkey")
   signedOffBy                  User?                                @relation("ReceptionistCallSignoff", fields: [tenantId, signedOffByUserId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallLog_signoff_scope_fkey")
+  localePack                   ReceptionistLocalePack?              @relation(fields: [tenantId, localePackId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallLog_locale_pack_scope_fkey")
   appointmentRequests          AppointmentRequest[]               @relation("AppointmentRequestSourceCall")
   appointments                 Appointment[]                      @relation("AppointmentSourceCall")
+  patient                      Patient?                             @relation("ReceptionistCallLogPatient", fields: [tenantId, patientId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallLog_patient_scope_fkey")
+  staffTasks                   StaffTask[]                          @relation("StaffTaskSourceCall")
+  appointmentNotes             AppointmentNote[]                    @relation("AppointmentNoteSourceCall")
 
   @@unique([tenantId, id])
   @@unique([tenantId, outboundCampaignId, id])
@@ -2120,6 +2423,16 @@ model ReceptionistCallLog {
   @@index([tenantId, transcriptRetentionExpiresAt])
   @@index([tenantId, reviewStatus, updatedAt])
   @@index([tenantId, boundProviderAgentId, boundProviderAgentVersion])
+  // Repeat-caller detection runs on every inbound call before the caller hears
+  // anything, so the window read has to be an index seek, not a scan.
+  @@index([tenantId, callerPhone, direction, createdAt], map: "ReceptionistCallLog_repeat_caller_idx")
+  @@index([tenantId, patientId, createdAt])
+  @@index([tenantId, clinicId, createdAt])
+  @@index([tenantId, clinicId, direction, createdAt])
+  // The after-hours read: which calls landed outside the clinic's hours, in
+  // arrival order. Created by 20260830110000_receptionist_knowledge_hours_locale;
+  // declared here so the schema and that migration name the same index.
+  @@index([tenantId, clinicId, outsideHours, startedAt])
 }
 
 // Append-only recording decisions. Database triggers reject UPDATE and DELETE.
@@ -2283,6 +2596,15 @@ model IdempotencyKey {
   scope     String
   key       String
   resultId  String?
+  // The response the FIRST completed attempt returned, replayed verbatim to a
+  // repeat of the same key. A resultId can only point at a row, which is not
+  // enough: a replay must return what the caller was told, not what the row has
+  // since become.
+  response  Json?
+  // Digest of the request the key was first used for. A key reused with a
+  // DIFFERENT request is a client bug, and answering it with the old receipt
+  // would hide that: it is refused as a conflict instead.
+  fingerprint String?
   createdAt DateTime @default(now())
 
   @@unique([scope, key])
@@ -2722,6 +3044,18 @@ model TenantFeatureEntitlement {
   enabled    Boolean  @default(false)
   source     String   @default("plan")
   limitValue Int?
+  // A platform operator's explicit decision for this feature, independent of
+  // the plan. null = no override. `enabled` above is the RESOLVED answer, which
+  // a recompute rewrites; this column is what makes an override survive a plan
+  // change, a suspension and a reactivation instead of being silently wiped.
+  overrideEnabled Boolean?
+  // When the override lapses, and why it was granted. A comp given for a pilot
+  // that nobody ever revisits becomes a permanent free feature: an override
+  // with no end date is a pricing decision made by forgetting. null = the
+  // override stands until an operator changes it, which must be a deliberate
+  // choice rather than the default.
+  overrideExpiresAt DateTime?
+  overrideReason    String?
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
   tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
@@ -2917,6 +3251,13 @@ model ServiceCatalogItem {
   defaultDurationMinutes  Int           @default(30)
   defaultAppointmentValue Decimal?      @db.Decimal(12, 2)
   depositRuleId           String?       @db.Uuid
+  // Voice-receptionist facts (one source of truth for services): what the
+  // agent may say about the service, whether it can be booked by phone, and
+  // the spoken duration / starting price when they differ from the defaults.
+  spokenDescription       String?
+  bookableByVoice         Boolean       @default(false)
+  voiceDurationMinutes    Int?
+  priceFrom               Decimal?      @db.Decimal(12, 2)
   active                  Boolean       @default(true)
   createdAt               DateTime      @default(now())
   updatedAt               DateTime      @updatedAt
@@ -3383,6 +3724,13 @@ model PlatformUser {
   failedLoginCount  Int       @default(0)
   lockedUntil       DateTime?
   passwordChangedAt DateTime  @default(now())
+  // When sessions were last revoked, for the operator to read.
+  sessionsRevokedAt DateTime?
+  // The mechanism. A token carries the epoch it was minted under; changing the
+  // password increments this, so every existing token stops verifying at once.
+  // A counter rather than a timestamp because JWT `iat` has one-second
+  // resolution, and "same second as the change" must not mean "still valid".
+  sessionEpoch      Int       @default(0)
   lastLoginAt       DateTime?
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
@@ -3426,6 +3774,49 @@ model TenantBilling {
   updatedAt       DateTime  @updatedAt
 
   @@index([paymentStatus])
+}
+
+/**
+ * Append-only usage ledger. One row per metered event, keyed to a billing
+ * period.
+ *
+ * Before this table, voice minutes were counted in two LIFETIME counters
+ * (TenantUsageLimit.used and TenantAiUsage.receptionistMinutes) that were only
+ * ever incremented - no period, no reset, no job. Both call-admission gates
+ * refuse a call once used >= limitValue, so a clinic on 500 included minutes
+ * stopped answering its patients' calls forever, part-way through its second
+ * month, with a 402 and no warning. A quota that never resets is not a quota.
+ *
+ * `dedupeKey` is the safety story: provider webhooks redeliver as a matter of
+ * course, so the unique index - not application care - is what stops a
+ * redelivered terminal event billing the same minute twice.
+ */
+model UsageEvent {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+
+  metric   String // voice_minute | sms_send | email_send | ai_token
+  quantity Int // whole units of `metric`; minutes are already rounded up at source
+
+  // occurredAt is provider truth (when the call ended), NOT ingest time, so a
+  // late redelivery still lands in the period the work happened in.
+  occurredAt DateTime
+  periodKey  String // 'YYYY-MM' derived from occurredAt in UTC
+
+  sourceModule String // receptionist | campaigns | ai_gateway
+  sourceType   String // receptionistCallLog | campaignDelivery | aIUsageLog
+  sourceId     String? @db.Uuid
+  dedupeKey    String
+
+  // Platform-only. What the event cost US, never shown to a tenant.
+  providerCostUsd Decimal? @db.Decimal(12, 6)
+
+  createdAt DateTime @default(now())
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, dedupeKey])
+  @@index([tenantId, periodKey, metric])
+  @@index([tenantId, metric, occurredAt])
 }
 
 model TenantUsageLimit {
@@ -3581,14 +3972,37 @@ model PatientPortalToken {
   @@index([tenantId])
 }
 
+// Global platform defaults. Every field here is READ at tenant provisioning
+// (server/lib/platformTenantProvisioning.ts) or at operator sign-in - a field
+// that nothing reads does not belong in this model. `presetKey` records which
+// starting point an operator applied; presets fill the form, they never lock
+// a field (see PLATFORM_SETTING_PRESETS in modules/platform/routes.ts).
 model PlatformConfig {
   id               String   @id @default("singleton")
   platformName     String   @default("CareCommand")
   supportEmail     String?
   defaultTrialDays Int      @default(14)
   defaultPlanKey   String   @default("starter")
-  updatedAt        DateTime @updatedAt
-  updatedById      String?  @db.Uuid
+
+  // Provisioning defaults - applied when the create-company request omits them.
+  defaultTimezone     String @default("America/New_York")
+  defaultCountry      String @default("US")
+  defaultBranchName   String @default("Main Branch")
+  defaultVoiceMinutes Int    @default(500)
+
+  // Security FLOOR, not a setting a tenant can lower. Provisioning seeds each
+  // new tenant's TenantSecurityPolicy from these; tenants may only tighten.
+  requireMfaFloor          Boolean @default(false)
+  sessionTimeoutMaxMinutes Int     @default(480)
+
+  // Whether YOUR OWN staff must use MFA on the Control Tower. Defaults to true
+  // because these accounts can reach every tenant's commercial record; the
+  // owner can turn it off, and the console says plainly what that costs.
+  requireOperatorMfa Boolean @default(true)
+
+  presetKey   String   @default("custom")
+  updatedAt   DateTime @updatedAt
+  updatedById String?  @db.Uuid
 }
 
 model PlatformAnnouncement {

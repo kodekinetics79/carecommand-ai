@@ -6,6 +6,7 @@ import { generatePasswordHash } from '../../server/lib/security';
 import { createMagicToken, hashPortalToken } from '../../server/lib/portalAuth';
 import { recomputeEntitlements } from '../../server/lib/entitlements';
 import { ensureE2eSubscriptionPlan } from './subscriptionFixture';
+import { watchNetwork } from './networkFailures';
 
 type GoldenData = {
   tenantId: string;
@@ -98,9 +99,11 @@ async function loginPatient(page: Page, data: GoldenData) {
 
 test('SDET portal insurance smoke: request-link + verify + save insurance', async ({ page }) => {
   const data = await seedData('sdet-smoke');
-  const failedRequests: string[] = [];
-
-  page.on('requestfailed', req => failedRequests.push(`${req.method()} ${req.url()} ${req.failure()?.errorText ?? ''}`));
+  // Same contract as the golden journey: transport failures and error statuses
+  // fail the smoke, while a request the portal cancelled by navigating off the
+  // surface that asked for it (dashboard → Insurance, mid-load) does not.
+  const network = watchNetwork();
+  network.watch(page);
 
   try {
     await loginPatient(page, data);
@@ -113,7 +116,8 @@ test('SDET portal insurance smoke: request-link + verify + save insurance', asyn
     await page.getByRole('button', { name: 'Save' }).click();
 
     await expect(page.getByText(/Policy details saved for clinic review/)).toBeVisible();
-    await expect(failedRequests).toEqual([]);
+    expect(network.failures).toEqual([]);
+    expect(network.errorResponses).toEqual([]);
 
     const policy = await db.patientInsurancePolicy.findFirst({
       where: { tenantId: data.tenantId, patientId: data.patientId, planName: 'Aetna Enterprise PPO', active: true },

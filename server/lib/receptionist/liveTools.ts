@@ -1,8 +1,16 @@
 import { db } from '../db';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import type { Prisma } from '../../generated/prisma/client';
 import { toE164, isValidE164 } from '../campaigns';
-import { getOpenSlots, parseSlot, speakTime, SLOT_MIN } from './availability';
+import {
+  getOpenSlotsAcrossProviders,
+  listBookableProviders,
+  matchPreferredProvider,
+  parseSlot,
+  speakTime,
+  SLOT_MIN,
+  type BookableProvider,
+} from './availability';
 import { findSlotConflict, getSchedulingPolicy, isDoubleBookConflictError, resolveSchedulingService, unmetPreVisitRequirements } from '../scheduling';
 import { evaluateDepositForAppointment } from '../deposits';
 import {
@@ -10,6 +18,7 @@ import {
   fingerprintJson,
   MAX_INTAKE_FIELDS,
   normalizeBookAppointmentToolContract,
+  resolveBookableService,
   type IntakeContractSnapshot,
 } from '../../modules/receptionist/intakeContract';
 import {
@@ -18,8 +27,27 @@ import {
   renderRecordingDisclosure,
 } from './privacyLifecycle';
 import { restrictCallToBasicAttributes } from '../retell';
+import { closingDisclosureEvidenceHash } from '../../modules/receptionist/promptService';
+import { transferReadiness } from './transferReadiness';
 import { CONFIRMATION_OUTBOX_SOURCE, processAppointmentConfirmations } from './confirmationOutbox';
 import { lockDncDestinationFence } from './dncFence';
+import {
+  COMPREHENSION_BAILOUT_REASON,
+  COMPREHENSION_BAILOUT_STAFF_NOTE,
+  HUMAN_ONLY_REASON,
+  HUMAN_ONLY_STAFF_NOTE,
+  createSafetyTask,
+  possibleDuplicatePatientNote,
+} from './frontDeskTask';
+import { HUMAN_ONLY_PERMITTED_TOOLS, callIsHumanOnly } from './humanOnly';
+import { MAX_UNPARSEABLE_TURNS, comprehensionDecision } from './comprehension';
+import { recordWorkflowEvent } from '../intelligence';
+import { resolveCallLocalePack, resolvedLocaleFormat, type ResolvedLocalePack } from './localePacks/resolve';
+import { renderPackMessage } from './localePacks/render';
+import { EMERGENCY_FALLBACK_NUMBER_FREE } from './localePacks/defaults';
+import { loadHoursSource } from './hoursSource';
+import { hoursConfigured, resolveEffectiveHours, spokenDate } from './clinicHours';
+import type { LocaleFormat, LocalePackMessageKey } from './localePacks/types';
 
 // Real-time tools the AI receptionist invokes DURING a call (Retell custom
 // functions). Each returns a JSON result with a `message` the agent can speak.
@@ -59,7 +87,6 @@ export interface ToolContext {
 // Bounded caps for caller-supplied free text.
 const MAX_NAME = 80;
 const MAX_SHORT = 40;
-const MAX_MESSAGE = 500;
 const MAX_IDENTITY_ATTEMPTS = 3;
 const IDENTITY_LOCK_MINUTES = 15;
 const CHANGE_CONFIRMATION_TTL_MS = 5 * 60_000;
@@ -109,16 +136,58 @@ async function auditLive(
 ) {
   await client.auditEvent.create({ data: { tenantId, actorUserId: null, action, resource: 'receptionistLiveAgent', resourceId: resourceId ?? undefined, userAgent: 'retell-webhook', metadata: metadata as Prisma.InputJsonValue } });
 }
-async function resolveBranch(tenantId: string): Promise<{ id: string; timezone: string } | null> {
-  const branches = await db.branch.findMany({ where: { tenantId, active: true }, orderBy: { createdAt: 'asc' }, select: { id: true, timezone: true }, take: 2 });
-  return branches.length === 1 ? branches[0] : null;
+
+// Live booking requires an unambiguous provider PER SLOT, not per branch.
+//
+// This used to be `resolveSoleProvider`: it returned null unless the branch had
+// exactly one active clinician, so a two-dentist practice was told "I need a
+// team member to confirm the provider or service" on every call, forever. A
+// provider-null appointment would bypass the canonical capacity guard, which is
+// the real constraint — and it is satisfied by choosing a provider who is
+// demonstrably free at the requested time, not by there being only one to
+// choose from.
+//
+// `PREFERRED_PROVIDER` narrows the roster when the caller named someone. A name
+// we cannot resolve is never silently replaced with a different clinician.
+const HHMM = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+
+type ProviderSelection =
+  | { ok: true; providers: BookableProvider[]; preferred: BookableProvider | null }
+  | { ok: false; reason: 'no_bookable_provider' | 'preferred_provider_unknown' };
+
+async function selectBookableProviders(
+  tenantId: string,
+  branchId: string,
+  requestedProvider: unknown,
+  client: typeof db | Prisma.TransactionClient = db,
+): Promise<ProviderSelection> {
+  const providers = await listBookableProviders(tenantId, branchId, client);
+  if (!providers.length) return { ok: false, reason: 'no_bookable_provider' };
+  const named = typeof requestedProvider === 'string' ? requestedProvider.trim() : '';
+  if (!named) return { ok: true, providers, preferred: null };
+  const preferred = matchPreferredProvider(providers, named);
+  if (!preferred) return { ok: false, reason: 'preferred_provider_unknown' };
+  return { ok: true, providers: [preferred], preferred };
 }
 
-// Live booking requires an unambiguous provider. Ambiguity is routed to staff;
-// provider-null appointments would bypass the canonical capacity guard.
-async function resolveSoleProvider(tenantId: string, branchId: string): Promise<string | null> {
-  const providers = await db.providerProfile.findMany({ where: { tenantId, branchId, active: true }, select: { id: true }, take: 2 });
-  return providers.length === 1 ? providers[0].id : null;
+/**
+ * The tool schema declares `callback_window` as `{date, from, to}` — what a
+ * caller actually says. The task contract stores `{start, end}`. One mapping,
+ * here, so neither side has to know about the other.
+ */
+export function normalizeCallbackWindowArg(value: unknown): { start: string; end: string } | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.start === 'string' && typeof raw.end === 'string') return { start: raw.start, end: raw.end };
+  const date = typeof raw.date === 'string' ? raw.date.trim() : '';
+  const from = typeof raw.from === 'string' ? raw.from.trim() : '';
+  const to = typeof raw.to === 'string' ? raw.to.trim() : '';
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !HHMM.test(from) || !HHMM.test(to)) return undefined;
+  return { start: `${date}T${from}`, end: `${date}T${to}` };
+}
+
+function withCallbackWindow(args: Record<string, unknown>): Record<string, unknown> {
+  return { ...args, callback_window: normalizeCallbackWindowArg(args.callback_window) };
 }
 
 async function patientsByCanonicalPhone(
@@ -141,10 +210,39 @@ async function patientsByCanonicalPhone(
     LIMIT 2
   `;
 }
-function speakList(times: string[]): string {
-  const labels = times.map(speakTime);
+function speakList(times: string[], locale?: LocaleFormat | null): string {
+  const labels = times.map(time => speakTime(time, locale));
   if (labels.length <= 2) return labels.join(' or ');
   return `${labels.slice(0, -1).join(', ')}, or ${labels.slice(-1)}`;
+}
+
+/** The call's approved locale pack, or null when none can be resolved. */
+async function callPack(ctx: ToolContext): Promise<ResolvedLocalePack | null> {
+  return resolveCallLocalePack(db, { tenantId: ctx.tenantId, callId: ctx.callId, trustedProviderAgentId: ctx.trustedProviderAgentId });
+}
+
+/**
+ * Render one caller-facing line from the call's pack.
+ *
+ * `fallback` is the pre-C10 en-US wording and is reached only when no pack and
+ * no country could be resolved for the call at all. A key merely absent from an
+ * older approved pack is filled by resolve.ts from the platform default, so the
+ * fallback is a last resort, not the normal path. It exists because the one
+ * thing worse than US phrasing on a GB call is a thrown renderer, which reaches
+ * the caller as silence.
+ */
+function speak(
+  pack: ResolvedLocalePack | null,
+  key: LocalePackMessageKey,
+  vars: Record<string, string>,
+  fallback: string,
+): string {
+  if (!pack) return fallback;
+  try {
+    return renderPackMessage(pack.strings, key, vars);
+  } catch {
+    return fallback;
+  }
 }
 
 type ContractValidation =
@@ -270,148 +368,208 @@ function validateAttestedBookingArgs(snapshot: IntakeContractSnapshot, args: Rec
   return issues.length ? { ok: false, answers, issues: [...new Set(issues)].sort() } : { ok: true, answers: answers! };
 }
 
-type SafetyWorkflow = 'human_handoff' | 'message' | 'emergency';
+// The receptionist StaffTask contract lives in frontDeskTask.ts (C4-pre): one
+// metadata schema, one writer. The three live tools below only shape the spoken
+// result; `createSafetyTask` resolves branch/call/patient, appends a second
+// message on the same live call, and files the audit/business events.
+export { createSafetyTask } from './frontDeskTask';
 
-const SAFETY_TASK: Record<SafetyWorkflow, { title: string; priority: string; dueMinutes: number }> = {
-  human_handoff: { title: 'AI receptionist human handoff requested', priority: 'high', dueMinutes: 15 },
-  message: { title: 'AI receptionist callback requested', priority: 'high', dueMinutes: 30 },
-  emergency: { title: 'URGENT: AI receptionist emergency mention', priority: 'high', dueMinutes: 0 },
-};
-
-// Creates the existing, staff-visible acknowledgment primitive before the
-// agent promises follow-up or attempts a transfer. Caller content stays in the
-// task only; the audit row contains classifications and identifiers, not names,
-// phone numbers, or message text. A stable call id makes Retell retries safe.
-async function createSafetyTask(ctx: ToolContext, workflow: SafetyWorkflow, args: Record<string, unknown>) {
-  const branch = await resolveBranch(ctx.tenantId);
-  const callbackPhone = validPhone(ctx.callerPhone) ?? validPhone(args.callback_phone);
-  const callerName = sanitizeText(args.caller_name, MAX_NAME);
-  const message = sanitizeText(args.message, MAX_MESSAGE);
-  const reasonCategory = sanitizeText(args.reason_category, MAX_SHORT) ?? 'other';
-  const config = SAFETY_TASK[workflow];
-  const safeCallId = sanitizeText(ctx.callId, 128);
-  // Retell normally supplies call_id. For a malformed/replayed callback without
-  // one, hash minimum-necessary inputs into a short time bucket: no caller
-  // content leaks into the key, while immediate provider retries remain safe.
-  const fallbackDigest = createHash('sha256')
-    .update(JSON.stringify({ tenantId: ctx.tenantId, workflow, callbackPhone, callerName, message, reasonCategory, bucket: Math.floor(Date.now() / 600_000) }))
-    .digest('hex');
-  const idemKey = safeCallId ? `${ctx.tenantId}:${safeCallId}:${workflow}` : `${ctx.tenantId}:fallback:${fallbackDigest}`;
-  const lockKey = `receptionist-safety:${idemKey}`;
-
-  const result = await db.$transaction(async tx => {
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey})::bigint)`;
-    const prior = await tx.idempotencyKey.findUnique({
-      where: { scope_key: { scope: 'receptionist.live-safety', key: idemKey } },
-      select: { id: true, resultId: true },
-    });
-    if (prior?.resultId) {
-      const task = await tx.staffTask.findFirst({
-        where: { id: prior.resultId, tenantId: ctx.tenantId },
-        select: { id: true },
-      });
-      if (task) return { taskId: task.id, duplicate: true };
-    }
-    if (prior) await tx.idempotencyKey.delete({ where: { id: prior.id } });
-
-    const task = await tx.staffTask.create({
-      data: {
-        tenantId: ctx.tenantId,
-        branchId: branch?.id,
-        title: config.title,
-        priority: config.priority,
-        dueAt: new Date(Date.now() + config.dueMinutes * 60_000),
-        metadata: {
-          workflow: 'receptionist_safety',
-          kind: workflow,
-          callId: safeCallId,
-          callbackPhone,
-          callerName,
-          message,
-          reasonCategory,
-          requiresAcknowledgement: true,
-          source: 'retell_live_call',
-        },
-      },
-      select: { id: true },
-    });
-    await tx.idempotencyKey.create({
-      data: { tenantId: ctx.tenantId, scope: 'receptionist.live-safety', key: idemKey, resultId: task.id },
-    });
-    await tx.auditEvent.create({
-      data: {
-        tenantId: ctx.tenantId,
-        actorUserId: null,
-        action: `receptionist.safety.${workflow}.created`,
-        resource: 'staffTask',
-        resourceId: task.id,
-        userAgent: 'retell-webhook',
-        // Minimum necessary: caller content is deliberately excluded.
-        metadata: { workflow, branchId: branch?.id ?? null, hasCallbackPhone: Boolean(callbackPhone), callIdPresent: Boolean(safeCallId) },
-      },
-    });
-    if (workflow === 'emergency') {
-      await tx.operationalSignal.create({
-        data: {
-          tenantId: ctx.tenantId,
-          signalType: 'receptionist_emergency_mention',
-          entityType: 'staffTask',
-          entityId: task.id,
-          severity: 'critical',
-          score: 100,
-          reason: 'Emergency language was reported during an AI receptionist call; staff acknowledgment is required.',
-        },
-      });
-    }
-    await tx.businessEvent.create({
-      data: {
-        tenantId: ctx.tenantId,
-        eventType: `receptionist.safety.${workflow}.created`,
-        entityType: 'staffTask',
-        entityId: task.id,
-        sourceModule: 'receptionist',
-        payload: { workflow, acknowledgmentRequired: true },
-      },
-    });
-    return { taskId: task.id, duplicate: false };
-  });
-  return result;
-}
-
-/** Records an acknowledgment-required handoff before Retell attempts transfer. */
+/**
+ * Records an acknowledgment-required handoff before Retell attempts transfer.
+ *
+ * C12: this is the "I want a human" turn, and one of the two moments a
+ * receptionist is judged on. Everything durable — that a task exists, that no
+ * human has acknowledged it, that no transfer has happened — stays in the
+ * structured fields below, where the front desk and the audit trail read it.
+ * The caller hears one sentence, from the pack, and never our queue mechanics.
+ */
 export async function requestHumanHandoff(ctx: ToolContext, args: Record<string, unknown>) {
-  const task = await createSafetyTask(ctx, 'human_handoff', args);
+  const callbackWindow = normalizeCallbackWindowArg(args.callback_window);
+  const task = await createSafetyTask(ctx, 'human_handoff', withCallbackWindow(args));
+  const [pack, transfer] = await Promise.all([callPack(ctx), callTransferReadiness(ctx)]);
   return {
     handoff_recorded: true,
+    // Structured evidence. `message` never restates any of it.
+    staff_acknowledged: false,
+    transfer_attempted: false,
     transfer_completed: false,
+    transfer_available: transfer.ready,
+    queue: 'front_desk',
+    callback_window_recorded: Boolean(callbackWindow),
     duplicate: task.duplicate,
+    appended: task.appended,
     task_id: task.taskId,
-    message: 'I created a request in the front desk queue. Staff have not acknowledged it yet. If a transfer option is available, I can try it next; no transfer has occurred yet, and the callback request remains open.',
+    message: transfer.ready
+      ? speak(pack, 'handoff.spoken', {}, "Of course. I've passed this to the front desk with your number, so it won't be lost. Let me see if someone is free to pick up now.")
+      : speak(pack, 'handoff.no_transfer', {}, "Of course. I've passed this to the front desk with your number, so it won't be lost, and someone will get back to you. Is there anything you'd like me to add for them?"),
   };
+}
+
+/**
+ * Can this call actually be handed to a person? The same predicate the prompt
+ * and buildRetellConfig use, so the spoken line can never promise a transfer
+ * the configuration cannot perform.
+ */
+async function callTransferReadiness(ctx: ToolContext): Promise<{ ready: boolean }> {
+  if (!ctx.callId) return { ready: false };
+  const call = await db.receptionistCallLog.findFirst({
+    where: { tenantId: ctx.tenantId, retellCallId: ctx.callId },
+    select: { clinic: { select: { humanFallbackNumber: true, phone: true, locations: { select: { phone: true } } } } },
+  });
+  if (!call?.clinic) return { ready: false };
+  return { ready: transferReadiness(call.clinic, { inboundLineNumbers: call.clinic.locations.map(location => location.phone) }).ready };
 }
 
 /** Persists a bounded callback message as a staff task with explicit acknowledgment status. */
 export async function takeMessage(ctx: ToolContext, args: Record<string, unknown>) {
-  const task = await createSafetyTask(ctx, 'message', args);
+  const callbackWindow = normalizeCallbackWindowArg(args.callback_window);
+  const task = await createSafetyTask(ctx, 'message', withCallbackWindow(args));
+  const pack = await callPack(ctx);
   return {
-    message_recorded: true,
+    // True only when a task was created or a message appended on this call.
+    message_recorded: !task.duplicate,
     acknowledgment_pending: true,
+    callback_window_recorded: Boolean(callbackWindow),
     duplicate: task.duplicate,
+    appended: task.appended,
     task_id: task.taskId,
-    message: 'Thank you. I have recorded a callback request for the front desk. A team member still needs to review and acknowledge it.',
+    message: task.appended
+      ? speak(pack, 'tool.message.appended', {}, "Thank you. I've added that to the same note for the front desk. Someone will pick it up and get back to you; I can't promise exactly when.")
+      : speak(pack, 'tool.message.recorded', {}, "Thank you. That's written down for the front desk with your number. Someone will pick it up and get back to you; I can't promise exactly when."),
   };
 }
 
-/** Creates a critical staff signal without delaying immediate emergency advice. */
+/**
+ * Emergency handling that does not depend on anyone looking at a screen.
+ *
+ * This used to create a StaffTask and a critical signal and stop there. The
+ * Front Desk board was the only thing that surfaced either: in-app only, a
+ * twenty-second poll, and nobody alerted at all if no tab is open. An emergency
+ * could therefore sit overnight behind a masked number — which is the single
+ * most serious gap in the whole product, and it is not one a colour, a lane or
+ * a badge can close.
+ *
+ * So the mechanism moves onto the call. The receptionist gives the emergency
+ * instruction, and then, in the same turn, either places the transfer to the
+ * clinic's human fallback or promises an immediate callback. `next_action` is
+ * what the agent must do next, and the prompt is written to obey it. The board
+ * card is still created — it is now the durable RECORD of what happened, not
+ * the mechanism that makes it happen.
+ */
 export async function reportEmergency(ctx: ToolContext, args: Record<string, unknown>) {
   const task = await createSafetyTask(ctx, 'emergency', args);
+  // The emergency number is jurisdictional: it comes from the call's approved
+  // locale pack. With no pack (and no country to fall back on) the agent says
+  // the number-free sentence rather than naming the wrong country's number.
+  const [pack, transfer] = await Promise.all([callPack(ctx), callTransferReadiness(ctx)]);
+  const instruction = pack
+    ? renderPackMessage(pack.strings, 'tool.emergency.message', { emergency_number: pack.strings.emergencyNumber })
+    : EMERGENCY_FALLBACK_NUMBER_FREE;
+  // The clinic-side half of the same turn. It is appended to the instruction
+  // rather than replacing it: calling the emergency services always comes
+  // first, and reaching the practice never displaces it.
+  const escalation = transfer.ready
+    ? speak(pack, 'emergency.transfer.line', {}, "I'm also connecting you to someone at the practice right now. Please stay on the line.")
+    : speak(pack, 'emergency.callback.line', {}, 'I have alerted the practice, and someone will call you straight back on this number. Please don’t wait for that call if you need help now.');
+  // Two pack renders joined, never a sentence written here: the emergency
+  // instruction the caller must hear first, then what we are doing about it.
+  const spoken = `${instruction} ${escalation}`;
   return {
     emergency_recorded: true,
     protocol_status: 'pending_provider_evidence',
     acknowledgment_pending: true,
+    // What the agent must DO next, on this call, while the caller is still on
+    // the line. Not advice; the prompt treats it as an instruction.
+    next_action: transfer.ready ? 'transfer_now' : 'offer_callback',
+    transfer_available: transfer.ready,
+    // The board card is evidence, not the alerting channel. Said plainly here
+    // so no future reader mistakes the task id for "somebody has been told".
+    alerting_channel: transfer.ready ? 'live_transfer' : 'immediate_callback',
     duplicate: task.duplicate,
+    appended: task.appended,
     task_id: task.taskId,
-    message: 'If you may be experiencing an emergency, hang up and call 911 now, or go to the nearest emergency room. Do not wait for a callback from this office.',
+    message: spoken,
+  };
+}
+
+/**
+ * Two consecutive turns the receptionist could not parse, and it stops trying.
+ *
+ * The count lives on the call row, not in the model's head, because a prompt
+ * instruction to give up is a suggestion and a server-side ceiling is a
+ * guarantee. Once `unparseableTurns` reaches the ceiling there is no branch in
+ * this function that returns a retry, however many times the agent asks — which
+ * is the property the "no third attempt" test pins.
+ *
+ * Nothing this returns ever asks the caller to change how they speak, what they
+ * are calling from, or where they are. That is enforced by the pack validator
+ * and by `receptionistProhibitedPhrases.lint.test.ts`, not by good intentions.
+ */
+export async function reportComprehensionFailure(ctx: ToolContext, args: Record<string, unknown>) {
+  const call = ctx.callId
+    ? await db.receptionistCallLog.findFirst({
+      where: { tenantId: ctx.tenantId, retellCallId: ctx.callId },
+      select: { id: true, clinicId: true, unparseableTurns: true, comprehensionBailoutAt: true },
+    })
+    : null;
+  const [pack, transfer] = await Promise.all([callPack(ctx), callTransferReadiness(ctx)]);
+
+  // No call row means we cannot count, and a comprehension failure we cannot
+  // count is not one we may keep retrying on a guess. Bail out immediately:
+  // the caller is already struggling, and the safe direction is toward a human.
+  const turns = call ? call.unparseableTurns + 1 : MAX_UNPARSEABLE_TURNS;
+  const decision = comprehensionDecision(turns);
+
+  if (call) {
+    await db.receptionistCallLog.update({
+      where: { id: call.id },
+      data: {
+        unparseableTurns: turns,
+        // Stamped once, on the turn the line gave up, and never moved after.
+        ...(decision.bailOut && !call.comprehensionBailoutAt ? { comprehensionBailoutAt: new Date() } : {}),
+      },
+    });
+  }
+
+  if (!decision.bailOut) {
+    return {
+      unparseable_turns: decision.unparseableTurns,
+      attempts_remaining: decision.attemptsRemaining,
+      bail_out: false,
+      next_action: 'ask_once_more',
+      message: speak(pack, 'comprehension.retry', {}, "I'm sorry, that's my fault — I didn't catch that. Could you tell me again?"),
+    };
+  }
+
+  // The handover is durable work, so it is filed as a handoff task with its own
+  // reason: the front desk sees "the line could not understand this person",
+  // which is a different thing to ask a human about than "they wanted a human".
+  const task = await createSafetyTask(ctx, 'human_handoff', {
+    ...args,
+    reason_category: COMPREHENSION_BAILOUT_REASON,
+    message: COMPREHENSION_BAILOUT_STAFF_NOTE,
+  });
+  if (call) {
+    await recordWorkflowEvent(ctx.tenantId, {
+      eventType: 'receptionist.call.comprehension_bailout',
+      entityType: 'receptionistCallLog',
+      entityId: call.id,
+      sourceModule: 'receptionist',
+      payload: { clinicId: call.clinicId, unparseableTurns: turns, transferAvailable: transfer.ready },
+    });
+  }
+  return {
+    unparseable_turns: decision.unparseableTurns,
+    // Zero, permanently. There is no third attempt.
+    attempts_remaining: 0,
+    bail_out: true,
+    next_action: transfer.ready ? 'transfer_now' : 'offer_callback',
+    transfer_available: transfer.ready,
+    task_id: task.taskId,
+    duplicate: task.duplicate,
+    message: transfer.ready
+      ? speak(pack, 'comprehension.bail_out.transfer', {}, "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I'm putting you through to a person at the practice now. Please stay on the line.")
+      : speak(pack, 'comprehension.bail_out.callback', {}, "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've asked someone at the practice to call you straight back on this number, and I've written down that we spoke."),
   };
 }
 
@@ -477,12 +635,19 @@ async function verifiedPatientForCall(ctx: ToolContext): Promise<string | null> 
   return patient && validPhone(patient.phone) === phone ? patient.id : null;
 }
 
-function localAppointmentLabel(startsAt: Date, timezone: string): string {
-  return new Intl.DateTimeFormat('en-US', {
+function localAppointmentLabel(startsAt: Date, timezone: string, locale?: LocaleFormat | null): string {
+  return new Intl.DateTimeFormat(locale?.language ?? 'en-US', {
     timeZone: timezone,
     weekday: 'short', month: 'short', day: 'numeric', year: 'numeric',
     hour: 'numeric', minute: '2-digit',
+    ...(locale ? { hour12: locale.timeStyle === '12h' } : {}),
   }).format(startsAt);
+}
+
+/** The call's LocaleFormat, or null when no pack can be resolved. */
+async function callLocaleFormat(ctx: ToolContext): Promise<LocaleFormat | null> {
+  const pack = await callPack(ctx);
+  return pack ? resolvedLocaleFormat(pack, pack.language) : null;
 }
 
 /** Return minimum-necessary upcoming appointments only after server-side identity proof. */
@@ -495,7 +660,8 @@ export async function listUpcomingAppointments(ctx: ToolContext) {
     select: { id: true, startsAt: true, service: true, branch: { select: { timezone: true } } },
   });
   await auditLive(ctx.tenantId, 'receptionist.appointments.listed', ctx.callId, { count: rows.length, via: 'verified_live_call' });
-  const appointments = rows.map(row => ({ appointment_id: row.id, service: row.service, starts_at: row.startsAt.toISOString(), spoken_time: localAppointmentLabel(row.startsAt, row.branch.timezone) }));
+  const locale = await callLocaleFormat(ctx);
+  const appointments = rows.map(row => ({ appointment_id: row.id, service: row.service, starts_at: row.startsAt.toISOString(), spoken_time: localAppointmentLabel(row.startsAt, row.branch.timezone, locale) }));
   return { verified: true, appointments, message: appointments.length ? `I found ${appointments.length} upcoming appointment${appointments.length === 1 ? '' : 's'}.` : 'I do not see an upcoming appointment that can be changed automatically.' };
 }
 
@@ -561,7 +727,7 @@ export async function prepareAppointmentChange(ctx: ToolContext, args: Record<st
     if (conflict) return { prepared: false, message: 'That time is no longer available. Please choose another.' };
     change.appointmentDate = appointmentDate;
     change.appointmentTime = appointmentTime;
-    spokenChange = `reschedule it to ${localAppointmentLabel(startsAt, appt.branch.timezone)}`;
+    spokenChange = `reschedule it to ${localAppointmentLabel(startsAt, appt.branch.timezone, await callLocaleFormat(ctx))}`;
   }
 
   const token = randomUUID();
@@ -659,7 +825,7 @@ export async function rescheduleAppointment(ctx: ToolContext, args: Record<strin
     appointment_id: appointmentId,
     starts_at: startsAt.toISOString(),
     deposit_review_pending: depositEvaluation === null,
-    message: `Your appointment is rescheduled to ${localAppointmentLabel(startsAt, appt.branch.timezone)}.${depositEvaluation === null ? ' Staff will review the deposit requirement separately.' : ''}`,
+    message: `Your appointment is rescheduled to ${localAppointmentLabel(startsAt, appt.branch.timezone, await callLocaleFormat(ctx))}.${depositEvaluation === null ? ' Staff will review the deposit requirement separately.' : ''}`,
   };
 }
 
@@ -710,32 +876,102 @@ export async function checkAvailability(ctx: ToolContext, args: Record<string, u
   if (!authority || !trusted.intakeSnapshot.eligibleLocationIds.includes(trusted.locationId)) {
     return { available: false, needs_review: true, slots: [], message: "I cannot verify this location against the active booking campaign." };
   }
-  const providerProfileId = await resolveSoleProvider(ctx.tenantId, trusted.branchId);
-  const requestedService = trusted.intakeSnapshot.appointmentType;
-  const service = await resolveSchedulingService({ tenantId: ctx.tenantId, service: requestedService, fallbackDurationMin: SLOT_MIN });
-  if (!providerProfileId || !service) {
-    await auditLive(ctx.tenantId, 'receptionist.availability.needsReview', trusted.branchId, { reason: !providerProfileId ? 'provider_ambiguous' : 'service_ambiguous' });
-    return { available: false, needs_review: true, slots: [], message: "I need a team member to confirm the provider or service before I offer a time." };
+  // The caller's own words decide the service, checked against the exact menu
+  // this deployment attested. An unrecognised name falls back to the campaign's
+  // advertised type rather than silently searching the wrong appointment length.
+  const requestedService = resolveBookableService(trusted.intakeSnapshot, args.service)
+    ?? trusted.intakeSnapshot.appointmentType;
+  const service = await resolveSchedulingService(
+    { tenantId: ctx.tenantId, service: requestedService, fallbackDurationMin: SLOT_MIN, useVoiceDuration: true },
+  );
+  const selection = await selectBookableProviders(ctx.tenantId, trusted.branchId, args.preferred_provider);
+  if (!selection.ok || !service) {
+    const reason = !service ? 'service_ambiguous' : selection.ok ? 'provider_ambiguous' : selection.reason;
+    await auditLive(ctx.tenantId, 'receptionist.availability.needsReview', trusted.branchId, { reason });
+    return {
+      available: false,
+      needs_review: true,
+      slots: [],
+      // Which of them is ambiguous is staff evidence, and it is already in the
+      // audit row above. The caller hears why they cannot be given a time and
+      // what happens instead.
+      review_reason: reason,
+      // A caller who named a clinician we could not match is told exactly that
+      // and offered a choice; every other reason gets the pack's wording. The
+      // named-clinician sentence has no pack key yet, so it stays literal
+      // rather than becoming silence.
+      message: reason === 'preferred_provider_unknown'
+        ? "I could not match that clinician's name at this location. Would another clinician work, or shall I have a team member call you back?"
+        : speak(await callPack(ctx), 'tool.availability.needs_review', {}, "I can't confirm the right clinician for that on this call. I can take a message so the front desk can call you back with times."),
+    };
   }
   const policy = await getSchedulingPolicy(ctx.tenantId);
   if (!policy.selfBookEnabled) return { available: false, needs_review: true, slots: [], message: 'This clinic requires staff review before offering self-booking times.' };
-  const slots = (await getOpenSlots(ctx.tenantId, trusted.branchId, date, service.durationMin, 6, providerProfileId))
+
+  // The clinic's own hours and closures decide whether that date is offerable
+  // at all. Provider availability alone would happily offer a slot on a day
+  // the practice is shut.
+  const bundle = await loadHoursSource(db, { tenantId: ctx.tenantId, clinicId: trusted.clinicId });
+  const locationSource = bundle?.locations.find(location => location.id === trusted.locationId)?.source ?? bundle?.source ?? null;
+  const pack = await callPack(ctx);
+  const locale = pack ? resolvedLocaleFormat(pack, pack.language) : null;
+  // One spoken form of the date for every branch below. The ISO string is the
+  // machine's word for a day, never the caller's.
+  const spokenDay = locale && /^\d{4}-\d{2}-\d{2}$/.test(date) ? spokenDate(date, locale) : date;
+  if (locationSource && hoursConfigured(locationSource) && /^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    const day = resolveEffectiveHours(locationSource, date);
+    if (!day.open) {
+      const clinicName = bundle?.clinic.name ?? 'the practice';
+      const message = pack
+        ? day.closure
+          ? renderPackMessage(pack.strings, 'tool.availability.closed_reason', { clinic_name: clinicName, date: spokenDay, closure_reason: day.closure.reason })
+          : renderPackMessage(pack.strings, 'tool.availability.closed', { clinic_name: clinicName, date: spokenDay })
+        : `${clinicName} is closed on ${spokenDay}. Would a different day work?`;
+      await auditLive(ctx.tenantId, 'receptionist.availability.closed', trusted.branchId, { date, closureId: day.closure?.id ?? null });
+      return { available: false, reason: 'clinic_closed', slots: [], message };
+    }
+  }
+
+  // Every clinician who can see this caller, merged into one offer. A branch
+  // with five dentists now answers with five calendars' worth of openings
+  // instead of refusing because there was more than one of them.
+  const slots = (await getOpenSlotsAcrossProviders({
+    tenantId: ctx.tenantId,
+    branchId: trusted.branchId,
+    dateISO: date,
+    durationMin: service.durationMin,
+    limit: 6,
+    providerProfileIds: selection.providers.map(provider => provider.id),
+  }))
     .filter(slot => {
       const startsAt = parseSlot(date, slot.time, trusted.branchTimezone!);
       return startsAt && startsAt.getTime() >= Date.now() + policy.minNoticeHours * 3_600_000
         && startsAt.getTime() <= Date.now() + policy.maxHorizonDays * 86_400_000;
     });
-  await auditLive(ctx.tenantId, 'receptionist.availability.checked', trusted.branchId, { date, count: slots.length, campaignId: trusted.campaignId });
-  if (slots.length === 0) return { available: false, slots: [], message: `I don't see any openings on ${date}. Would a different day work?` };
+  await auditLive(ctx.tenantId, 'receptionist.availability.checked', trusted.branchId, {
+    date, count: slots.length, campaignId: trusted.campaignId,
+    providerCount: selection.providers.length,
+    preferredProviderRequested: Boolean(selection.preferred),
+    service: service.name, durationMin: service.durationMin,
+  });
+  if (slots.length === 0) {
+    return {
+      available: false, slots: [],
+      message: speak(pack, 'tool.availability.none', { date: spokenDay }, `I don't have any openings on ${spokenDay}. Would a different day work?`),
+    };
+  }
+  const times = speakList(slots.map(slot => slot.time), locale);
   return {
     available: true,
-    slots: slots.map(s => ({ time: s.time, label: speakTime(s.time) })),
-    message: `On ${date} I have ${speakList(slots.map(s => s.time))}. Which works best for you?`,
+    service: service.name,
+    duration_minutes: service.durationMin,
+    slots: slots.map(slot => ({ time: slot.time, label: speakTime(slot.time, locale) })),
+    message: speak(pack, 'tool.availability.offer', { date: spokenDay, times }, `On ${spokenDay} I have ${times}. Which works best for you?`),
   };
 }
 
 type BookingTransactionResult =
-  | { kind: 'booked'; tenantId: string; appointmentId: string; requestId: string; patientId: string; firstName: string; email: string | null; phone: string | null; service: string; startsAt: Date; timezone: string; locationName: string; locationAddress: string | null; providerName: string | null; smsEnabled: boolean; emailEnabled: boolean; messagingConsent: boolean | null; duplicate: boolean }
+  | { kind: 'booked'; tenantId: string; appointmentId: string; requestId: string; patientId: string; firstName: string; email: string | null; phone: string | null; service: string; startsAt: Date; timezone: string; locationName: string; locationAddress: string | null; providerName: string | null; smsEnabled: boolean; emailEnabled: boolean; messagingConsent: boolean | null; duplicate: boolean; possibleDuplicateOfPatientId?: string | null }
   | { kind: 'review'; requestId: string; duplicate: boolean; message: string }
   | { kind: 'rejected'; message: string };
 
@@ -756,7 +992,13 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
   const messagingConsent = typeof recognizedAnswers.messaging_consent === 'boolean'
     ? recognizedAnswers.messaging_consent
     : null;
-  const service = trusted.intakeSnapshot.appointmentType;
+  // One campaign is no longer one service. The caller's choice is resolved
+  // against the exact enum this deployment attested; anything else is treated
+  // as unrecognised and falls back to the campaign's advertised type, so a
+  // model that invents a service name can never widen what we book.
+  const requestedServiceName = resolveBookableService(trusted.intakeSnapshot, recognizedAnswers.service);
+  const service = requestedServiceName ?? trusted.intakeSnapshot.appointmentType;
+  const preferredProviderRequest = sanitizeText(recognizedAnswers.preferred_provider, MAX_NAME);
   const phone = validPhone(trusted.observedPhone);
   const persistedAnswers = validation.answers
     ? boundedCanonicalObject({ ...validation.answers, observed_phone: phone })
@@ -982,21 +1224,27 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
     if (!policy.selfBookEnabled || startsAt < earliest || startsAt > latest) {
       return review('Canonical self-booking policy does not permit the requested time', ['schedulingPolicy'], 'A team member needs to review this appointment request.');
     }
-    const providers = await tx.providerProfile.findMany({
-      where: { tenantId: ctx.tenantId, branchId: trusted.branchId!, active: true, user: { active: true } },
-      select: {
-        id: true,
-        user: { select: { displayName: true } },
-        branch: { select: { name: true, location: true } },
-      }, take: 2,
-    });
-    const schedulingService = await resolveSchedulingService({ tenantId: ctx.tenantId, service, fallbackDurationMin: SLOT_MIN }, tx);
-    if (providers.length !== 1 || !schedulingService) {
-      return review(providers.length !== 1 ? 'Provider selection is ambiguous' : 'Configured service is not canonical', [providers.length !== 1 ? 'preferredProvider' : 'preferredService'], 'A team member needs to confirm the provider or service before booking.');
-    }
-    const providerProfileId = providers[0].id;
-    if (existingPatients.length && !verifiedExistingPatientId) {
-      return review(existingPatients.length > 1 ? 'Patient identity is ambiguous' : 'Existing patient identity was not verified for this call', ['identityVerification'], 'I need identity verification or front desk assistance before linking this booking.');
+    // Every clinician who could take this booking, not the one-and-only-one the
+    // old code demanded. The caller may have named someone; if they did and we
+    // cannot resolve the name, we ask rather than substituting a stranger.
+    const selection = await selectBookableProviders(ctx.tenantId, trusted.branchId!, preferredProviderRequest, tx);
+    const schedulingService = await resolveSchedulingService(
+      { tenantId: ctx.tenantId, service, fallbackDurationMin: SLOT_MIN, useVoiceDuration: true },
+      tx,
+    );
+    if (!selection.ok || !schedulingService) {
+      const reason = !schedulingService
+        ? 'Configured service is not canonical'
+        : selection.ok
+          ? 'No active clinician is bookable at this location'
+          : selection.reason === 'preferred_provider_unknown'
+            ? 'Requested clinician could not be matched at this location'
+            : 'No active clinician is bookable at this location';
+      return review(
+        reason,
+        [schedulingService ? 'preferredProvider' : 'preferredService'],
+        'A team member needs to confirm the provider or service before booking.',
+      );
     }
     if ((policy.requireEligibilityForSelfBook || policy.requireIntakeForSelfBook) && !verifiedExistingPatientId) {
       return review('Canonical pre-visit policy requires an existing verified patient', ['preVisitRequirements'], 'A team member must review eligibility or intake requirements before booking.');
@@ -1006,10 +1254,44 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
       if (unmet.length) return review(`Canonical pre-visit requirements are incomplete: ${unmet.join(', ')}`, unmet, 'A team member must review eligibility or intake requirements before booking.');
     }
 
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-book-slot:${ctx.tenantId}:${providerProfileId}:${startsAt.toISOString()}`})::bigint)`;
-    const slotConflict = await findSlotConflict({ tenantId: ctx.tenantId, providerProfileId, startsAt, durationMin: schedulingService.durationMin }, tx);
-    if (slotConflict) return review(`Canonical scheduler rejected the slot: ${slotConflict}`, ['preferredDateTime'], `I'm sorry — that time is unavailable. I recorded the same request for staff review.`);
+    // Lock each candidate's slot in roster order — the ids are already sorted,
+    // so two concurrent callers acquire the same locks in the same order and
+    // cannot deadlock — and take the first clinician who is genuinely free.
+    let booked: { providerProfileId: string; providerName: string | null; branchName: string; branchLocation: string } | null = null;
+    let lastConflict: string | null = null;
+    for (const candidate of selection.providers) {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-book-slot:${ctx.tenantId}:${candidate.id}:${startsAt.toISOString()}`})::bigint)`;
+      const conflict = await findSlotConflict(
+        { tenantId: ctx.tenantId, providerProfileId: candidate.id, startsAt, durationMin: schedulingService.durationMin },
+        tx,
+      );
+      if (conflict) { lastConflict = conflict; continue; }
+      const branch = await tx.providerProfile.findFirst({
+        where: { id: candidate.id, tenantId: ctx.tenantId },
+        select: { branch: { select: { name: true, location: true } } },
+      });
+      if (!branch) { lastConflict = 'outside_availability'; continue; }
+      booked = {
+        providerProfileId: candidate.id,
+        providerName: candidate.displayName || null,
+        branchName: branch.branch.name,
+        branchLocation: branch.branch.location,
+      };
+      break;
+    }
+    if (!booked) {
+      return review(`Canonical scheduler rejected the slot: ${lastConflict ?? 'already_booked'}`, ['preferredDateTime'], `I'm sorry — that time is unavailable. I recorded the same request for staff review.`);
+    }
+    const providerProfileId = booked.providerProfileId;
 
+    // A returning caller is most inbound calls. Matching their number to a
+    // Patient row used to end the call in human review — and two family members
+    // sharing one number was a hard dead end. When the DOB ladder verified them
+    // we link; when it did not, we still book them, as a new record, and hand
+    // the front desk a `booking_review` task naming the possible duplicate.
+    const possibleDuplicateOfPatientId = !verifiedExistingPatientId && existingPatients.length === 1
+      ? existingPatients[0].id
+      : null;
     let patient = verifiedExistingPatientId
       ? await tx.patient.findFirst({ where: { id: verifiedExistingPatientId, tenantId: ctx.tenantId, deletedAt: null }, select: { id: true } })
       : null;
@@ -1019,6 +1301,14 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
         select: { id: true },
       });
     }
+    // The duplicate marker travels WITH the request the front desk opens, so a
+    // reviewer sees which existing record this booking might belong to.
+    const bookedAnswers = possibleDuplicateOfPatientId
+      ? (boundedCanonicalObject({ ...(validation.answers ?? {}), observed_phone: phone, possible_duplicate_of_patient_id: possibleDuplicateOfPatientId }) ?? rawAnswers)
+      : rawAnswers;
+    const bookedOutcomeReason = possibleDuplicateOfPatientId
+      ? 'Booked live by AI receptionist as a new patient; this number already matches an existing record'
+      : 'Booked live by AI receptionist';
     const endsAt = new Date(startsAt.getTime() + schedulingService.durationMin * 60_000);
     const appointment = await tx.appointment.create({
       data: {
@@ -1036,8 +1326,8 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
           branchId: trusted.branchId, patientId: patient.id, campaignId: trusted.campaignId,
           requestedService: service, requestedDateTime: startsAt,
           collectedName: `${firstName} ${lastName}`, collectedPhone: phone, collectedEmail: email,
-          rawCollectedFields: rawAnswers, status: 'BOOKED', missingFields: [],
-          bookedAppointmentId: appointment.id, outcomeReason: 'Booked live by AI receptionist',
+          rawCollectedFields: bookedAnswers, status: 'BOOKED', missingFields: [],
+          bookedAppointmentId: appointment.id, outcomeReason: bookedOutcomeReason,
         },
         select: { id: true },
       })
@@ -1047,8 +1337,8 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
           campaignId: trusted.campaignId, callLogId: trusted.callLogId,
           requestedService: service, requestedDateTime: startsAt,
           collectedName: `${firstName} ${lastName}`, collectedPhone: phone, collectedEmail: email,
-          rawCollectedFields: rawAnswers, source: 'ai_receptionist', status: 'BOOKED',
-          missingFields: [], bookedAppointmentId: appointment.id, outcomeReason: 'Booked live by AI receptionist',
+          rawCollectedFields: bookedAnswers, source: 'ai_receptionist', status: 'BOOKED',
+          missingFields: [], bookedAppointmentId: appointment.id, outcomeReason: bookedOutcomeReason,
         },
         select: { id: true },
       });
@@ -1090,6 +1380,10 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
     await auditLive(ctx.tenantId, 'receptionist.appointment.booked', appointment.id, {
       branchId: trusted.branchId, appointmentRequestId: request.id, callLogId: trusted.callLogId,
       via: 'live_call', messagingConsent,
+      providerProfileId, service: schedulingService.name, durationMin: schedulingService.durationMin,
+      providerCandidateCount: selection.providers.length,
+      preferredProviderRequested: Boolean(selection.preferred),
+      possibleDuplicateOfPatientId,
       notificationPreferencePolicy: APPOINTMENT_NOTIFICATION_PREFERENCE_POLICY,
       notificationPreferenceAuthorizesMarketing: false,
     }, tx);
@@ -1101,6 +1395,8 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
         callLogId: trusted.callLogId,
         live: true,
         messagingConsent,
+        service: schedulingService.name,
+        possibleDuplicateOfPatientId,
         notificationPreferencePolicy: APPOINTMENT_NOTIFICATION_PREFERENCE_POLICY,
         notificationPreferenceAuthorizesMarketing: false,
       },
@@ -1109,10 +1405,11 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
     return {
       kind: 'booked', tenantId: ctx.tenantId, appointmentId: appointment.id, requestId: request.id, patientId: patient.id,
       firstName, email, phone, service: schedulingService.name, startsAt, timezone: trusted.branchTimezone!,
-      locationName: providers[0].branch.name,
-      locationAddress: providers[0].branch.location.trim() || null,
-      providerName: providers[0].user.displayName.trim() || null,
+      locationName: booked.branchName,
+      locationAddress: booked.branchLocation.trim() || null,
+      providerName: booked.providerName,
       smsEnabled: campaign.smsConfirmation, emailEnabled: campaign.emailConfirmation, messagingConsent, duplicate: false,
+      possibleDuplicateOfPatientId,
     };
   });
 
@@ -1126,8 +1423,26 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
   if (result.kind === 'rejected') return { booked: false, needs_human: true, message: result.message };
   if (result.kind === 'review') return { booked: false, needs_review: true, duplicate: result.duplicate, appointment_request_id: result.requestId, message: result.message };
 
-  const localLabel = localAppointmentLabel(result.startsAt, result.timezone);
-  const timezoneLabel = new Intl.DateTimeFormat('en-US', {
+  // The caller is booked. If their number already belonged to somebody and the
+  // DOB ladder did not verify them, the front desk gets a task naming both
+  // records — merging is a human decision, and it is not one worth ending a
+  // patient's call over.
+  if (result.possibleDuplicateOfPatientId && !result.duplicate) {
+    await createSafetyTask(ctx, 'booking_review', {
+      reason_category: 'possible_duplicate_patient',
+      // Staff copy, owned by frontDeskTask: this is read off a task board, not
+      // spoken to anyone.
+      message: possibleDuplicatePatientNote(result.possibleDuplicateOfPatientId),
+      appointment_request_id: result.requestId,
+      appointment_id: result.appointmentId,
+    }).catch(() => undefined);
+  }
+
+  // One pack read for both the locale and the confirmation wording below.
+  const bookingPack = await callPack(ctx);
+  const bookingLocale = bookingPack ? resolvedLocaleFormat(bookingPack, bookingPack.language) : null;
+  const localLabel = localAppointmentLabel(result.startsAt, result.timezone, bookingLocale);
+  const timezoneLabel = new Intl.DateTimeFormat(bookingLocale?.language ?? 'en-US', {
     timeZone: result.timezone,
     timeZoneName: 'long',
   }).formatToParts(result.startsAt).find(part => part.type === 'timeZoneName')?.value ?? result.timezone;
@@ -1156,13 +1471,53 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
     provider_name: result.providerName, service: result.service,
     sms_sent: false, sms_accepted: confirmations.sms.acceptedNow, sms_status: confirmations.sms.status,
     email_sent: false, email_accepted: confirmations.email.acceptedNow, email_status: confirmations.email.status,
-    message: result.duplicate
-      ? `You're already booked for ${spokenBooking}.${acceptedNow ? ' A pending confirmation was accepted by the messaging provider.' : ''}`
-      : `Perfect, ${result.firstName} — you're booked for ${spokenBooking}.${acceptedNow ? ' A confirmation was accepted by the messaging provider.' : ''}`,
+    message: (() => {
+      // Acceptance by the messaging provider is not delivery, and the pack line
+      // says so in the caller's own words. The exact per-channel status stays in
+      // sms_status / email_status above for staff and for the audit trail.
+      const confirmation = acceptedNow
+        ? ` ${speak(bookingPack, 'tool.booking.confirmation_accepted', {}, "I've sent your confirmation; I can't confirm it has arrived yet.")}`
+        : '';
+      return result.duplicate
+        ? speak(bookingPack, 'tool.booking.already', { booking: spokenBooking, confirmation }, `You're already booked for ${spokenBooking}.${confirmation}`)
+        : speak(bookingPack, 'tool.booking.confirmed', { first_name: result.firstName, booking: spokenBooking, confirmation }, `Perfect, ${result.firstName}. You're booked for ${spokenBooking}.${confirmation}`);
+    })(),
   };
 }
 
 export async function handleAgentTool(ctx: ToolContext, name: string, args: Record<string, unknown>) {
+  // "Human only", enforced where it cannot be talked out of.
+  //
+  // `call_inbound` already routed this caller to a person and the prompt is
+  // told to transfer without taking a turn. Both of those are instructions to a
+  // model, and a flag that exists because a patient must never be handled by an
+  // AI is not worth having as an instruction. So the tool layer refuses: on a
+  // Human-only call the receptionist may get the caller to a person, write down
+  // what they need, and raise an emergency. It may not check availability, book,
+  // cancel, reschedule, verify an identity or read a record — no matter what
+  // the prompt says, and no matter what the model decides to try.
+  if (!HUMAN_ONLY_PERMITTED_TOOLS.includes(name) && await callIsHumanOnly(db, { tenantId: ctx.tenantId, callId: ctx.callId })) {
+    const task = await createSafetyTask(ctx, 'human_handoff', {
+      ...args,
+      reason_category: HUMAN_ONLY_REASON,
+      message: HUMAN_ONLY_STAFF_NOTE,
+    });
+    const pack = await callPack(ctx);
+    return {
+      routed_to_human: true,
+      human_only: true,
+      tool_refused: name,
+      // No detail about the flag reaches the caller. They are being helped by a
+      // person; they are not being read their own record.
+      next_action: 'transfer_now',
+      task_id: task.taskId,
+      duplicate: task.duplicate,
+      message: speak(pack, 'admission.denied.human_only', {}, "Thanks for calling. I'm putting you straight through to someone at the front desk now — please stay on the line."),
+    };
+  }
+  // Any tool other than the comprehension report is evidence the receptionist
+  // understood this turn, so it clears the consecutive-failure count.
+  if (name !== 'report_comprehension_failure') await clearUnparseableTurns(ctx);
   if (name === 'record_recording_preference') {
     const decision = str(args.recording_decision)?.toUpperCase();
     if (!ctx.callId || !['GRANTED', 'REFUSED', 'WITHDRAWN'].includes(decision ?? '')) {
@@ -1198,11 +1553,26 @@ export async function handleAgentTool(ctx: ToolContext, name: string, args: Reco
     if (configuredAgents.length !== 1) {
       return { recorded: false, message: 'I could not bind that preference to one configured receptionist disclosure. I will keep this call metadata-only and connect you with staff.' };
     }
-    const disclosureText = renderRecordingDisclosure({
+    // C10 — the consent artefact must record the words that were SPOKEN.
+    // `renderRecordingDisclosure` is the en-US baseline; an en-GB caller heard
+    // their pack's "quality and training purposes" and, before this, we hashed
+    // wording they had never been read. Hash the pack-rendered disclosure, and
+    // fall back to the baseline only when no pack (and no country) resolves at
+    // all — which is also the only case where the baseline is what was said.
+    const consentPack = await callPack(ctx);
+    const baselineDisclosure = renderRecordingDisclosure({
       agentName: configuredAgents[0].name,
       clinicName: call.clinic.name,
       clinicDisclosure: call.clinic.complianceDisclosure,
     });
+    const supplemental = call.clinic.complianceDisclosure?.trim();
+    const disclosureText = speak(consentPack, 'disclosure.recording', {
+      agent_name: configuredAgents[0].name,
+      clinic_name: call.clinic.name,
+      // The supplemental sentence carries its own leading space, exactly as
+      // mandatoryOpeningDisclosure composes it for the deployed prompt.
+      clinic_disclosure: supplemental ? ` ${supplemental}` : '',
+    }, baselineDisclosure);
     let restriction = null;
     if (decision !== 'GRANTED') restriction = await restrictCallToBasicAttributes(ctx.callId);
     await recordRecordingConsent({
@@ -1217,15 +1587,35 @@ export async function handleAgentTool(ctx: ToolContext, name: string, args: Reco
         clinicId: call.clinic.id,
         providerRestrictionApplied: restriction?.applied ?? false,
         providerRestrictionOk: restriction?.ok ?? true,
+        // Which pack the hashed wording came from, so the artefact can be
+        // reproduced years later without guessing the locale.
+        disclosureLocalePackId: consentPack?.id ?? null,
+        disclosureLocale: consentPack ? `${consentPack.language}/${consentPack.country}` : null,
+        disclosureSource: consentPack ? consentPack.source : 'baseline_template',
+        // AB 3030 requires the disclosure at BOTH ends of the call, so the
+        // consent artefact records both. The opening hash is what the caller
+        // was read before they answered; this is the hash of the words they
+        // will be read at the end, resolved from the same pack in the same
+        // breath — so a regulator reading this row a year later can reproduce
+        // the whole disclosure, not half of it.
+        closingDisclosureTextHash: closingDisclosureEvidenceHash(speak(consentPack, 'disclosure.closing', {
+          agent_name: configuredAgents[0].name,
+          clinic_name: call.clinic.name,
+        }, '')),
       },
     });
     return {
       recorded: true,
       decision,
+      // Retention posture is staff/compliance evidence, and it stays here. It
+      // was previously read aloud to a patient as the second thing they heard.
       metadata_only: true,
+      // C3 — a refusal restricts the recording, never the service. This field
+      // is what the front desk and the prompt both key off.
+      service_continues: true,
       message: decision === 'GRANTED'
-        ? 'Thank you. Your preference is recorded. This pilot remains metadata-only unless the approved retention workflow applies.'
-        : 'Your preference is recorded. I will not retain call recording or transcript artifacts. I can connect you with staff instead.',
+        ? speak(consentPack, 'consent.granted.ack', {}, 'Thank you. So, how can I help you today?')
+        : speak(consentPack, 'consent.refused.recorded', {}, "That's recorded. This call won't be recorded or transcribed, and I can still help you here."),
     };
   }
   if (name === 'verify_patient_identity') return verifyPatientIdentity(ctx, args);
@@ -1239,5 +1629,28 @@ export async function handleAgentTool(ctx: ToolContext, name: string, args: Reco
   if (name === 'request_human_handoff') return requestHumanHandoff(ctx, args);
   if (name === 'take_message') return takeMessage(ctx, args);
   if (name === 'report_emergency') return reportEmergency(ctx, args);
+  if (name === 'report_comprehension_failure') return reportComprehensionFailure(ctx, args);
   return { error: 'unknown_function', message: "I'm not able to help with that just yet." };
+}
+
+/**
+ * A turn the receptionist DID understand clears the unparseable count.
+ *
+ * The ceiling is two CONSECUTIVE failures, and this is what makes that word
+ * true. Without it, a caller who is understood, misheard once, understood
+ * again, and misheard once more twenty turns later would be handed to a person
+ * for two entirely unrelated stumbles — which is a worse service, and would
+ * teach a practice to distrust the bail-out precisely when it matters.
+ *
+ * Calling any other tool is the evidence: the agent only reaches for a tool
+ * because it understood what the caller asked for. The `gt: 0` filter means
+ * this touches no rows on the overwhelming majority of calls, which is why it
+ * can sit on the dispatch path at all.
+ */
+async function clearUnparseableTurns(ctx: ToolContext): Promise<void> {
+  if (!ctx.callId) return;
+  await db.receptionistCallLog.updateMany({
+    where: { tenantId: ctx.tenantId, retellCallId: ctx.callId, unparseableTurns: { gt: 0 }, comprehensionBailoutAt: null },
+    data: { unparseableTurns: 0 },
+  }).catch(() => undefined);
 }

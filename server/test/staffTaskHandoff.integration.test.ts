@@ -271,7 +271,8 @@ describe('putting a name on a task', () => {
 
     const listed = await app.inject({ method: 'GET', url: '/v1/tasks?limit=100', headers: auth(f, f.frontDesk, 'FRONT_DESK') });
     expect(listed.statusCode).toBe(200);
-    expect(listed.json().map((t: { id: string }) => t.id)).toContain(taskId);
+    // The queue paginates now: { data, nextCursor }.
+    expect(listed.json().data.map((t: { id: string }) => t.id)).toContain(taskId);
 
     for (const [url, payload] of [
       [`/v1/staff/tasks/${taskId}/assignment`, { assignedToId: f.frontDesk }],

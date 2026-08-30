@@ -30,12 +30,17 @@ interface PlatformJwt {
   role: PlatformRole;
   type: 'platform';
   sessionId: string;
+  /** The account's session epoch when this token was minted. */
+  epoch?: number;
 }
 
 export type PlatformMfaPurpose = 'challenge' | 'enrollment';
 
-export function signPlatformToken(app: FastifyInstance, user: { id: string; role: string }, expiresIn = '15m'): string {
-  return app.jwt.sign({ platformUserId: user.id, role: user.role, type: 'platform', sessionId: randomUUID() } as PlatformJwt, { expiresIn });
+export function signPlatformToken(app: FastifyInstance, user: { id: string; role: string; sessionEpoch?: number }, expiresIn = '15m'): string {
+  return app.jwt.sign(
+    { platformUserId: user.id, role: user.role, type: 'platform', sessionId: randomUUID(), epoch: user.sessionEpoch ?? 0 } as PlatformJwt,
+    { expiresIn },
+  );
 }
 
 export function signPlatformMfaToken(app: FastifyInstance, userId: string, purpose: PlatformMfaPurpose): string {
@@ -115,13 +120,18 @@ export function requirePlatformAccess(...allowedRoles: PlatformRole[]) {
         const [pu, loggedOut] = await Promise.all([
           platformDb.platformUser.findFirst({
             where: { id: payload.platformUserId, status: 'active' },
-            select: { id: true, role: true, email: true },
+            select: { id: true, role: true, email: true, sessionEpoch: true },
           }),
           typeof payload.sessionId === 'string' && payload.sessionId.length > 0
             ? platformSessionWasLoggedOut(payload.platformUserId, payload.sessionId)
             : Promise.resolve(true),
         ]);
-        if (pu && !loggedOut) {
+        // A password change increments the account's session epoch, so every
+        // token minted before it stops verifying immediately - a credential that
+        // was shared or stolen cannot outlive its rotation. Tokens predating
+        // this field carry no epoch and are treated as epoch 0.
+        const revoked = !!pu && (payload.epoch ?? 0) !== pu.sessionEpoch;
+        if (pu && !loggedOut && !revoked) {
           actor = { id: pu.id, role: pu.role as PlatformRole, legacy: false, email: pu.email };
         }
       }
@@ -168,27 +178,39 @@ export async function platformAuditEvent(request: FastifyRequest | null, action:
 }
 
 /** Execute a platform-plane mutation and its audit evidence on one connection. */
+/**
+ * Transaction budget for a platform mutation. Prisma's default interactive
+ * transaction timeout is 5s, which is far too tight for provisioning: that
+ * path runs ~70 sequential round-trips (compliance baseline + entitlements)
+ * and a managed Postgres with 20-60ms RTT blows the default budget, surfacing
+ * as an unmapped P2028 -> HTTP 500 with no operator-readable cause.
+ */
+export interface PlatformMutationBudget { timeout?: number; maxWait?: number }
+
 export function runPlatformAuditedMutation<T>(
   request: FastifyRequest,
   event: (result: T) => { action: string; target: PlatformAuditTarget; metadata?: Prisma.InputJsonObject },
   mutate: (tx: Prisma.TransactionClient) => Promise<T>,
+  budget?: PlatformMutationBudget,
 ): Promise<T>;
 export function runPlatformAuditedMutation<T>(
   request: FastifyRequest,
   event: { action: string; target: PlatformAuditTarget; metadata?: Prisma.InputJsonObject },
   mutate: (tx: Prisma.TransactionClient) => Promise<T>,
+  budget?: PlatformMutationBudget,
 ): Promise<T>;
 export async function runPlatformAuditedMutation<T>(
   request: FastifyRequest,
   event: { action: string; target: PlatformAuditTarget; metadata?: Prisma.InputJsonObject } | ((result: T) => { action: string; target: PlatformAuditTarget; metadata?: Prisma.InputJsonObject }),
   mutate: (tx: Prisma.TransactionClient) => Promise<T>,
+  budget?: PlatformMutationBudget,
 ): Promise<T> {
   return platformDb.$transaction(async tx => {
     const result = await mutate(tx);
     const resolved = typeof event === 'function' ? event(result) : event;
     await createPlatformAuditEvent(tx, request, resolved.action, resolved.target, resolved.metadata);
     return result;
-  });
+  }, budget);
 }
 
 // --- First PLATFORM_OWNER seed (env-only; no weak default in production) ----

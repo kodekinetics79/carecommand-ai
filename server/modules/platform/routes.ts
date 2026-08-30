@@ -11,6 +11,11 @@ import { env } from '../../config/env';
 import { encryptSecret, decryptSecret } from '../../lib/security';
 import { runWithPlatformDatabaseRequest } from '../../lib/platformContextStore';
 import { validateIanaTimezone } from '../../lib/scheduling';
+import { PROVIDER_CATALOG, PROVIDER_KEYS, providerConfig, invalidateProviderCredentials, refreshProviderCredentials, type ProviderDef as SharedProviderDef } from '../../lib/providerCredentials';
+import { periodUsageByMetric, usagePeriodKey, USAGE_LIMIT_KEY_BY_METRIC } from '../../lib/usageMetering';
+import { TENANT_MODES, TENANT_MODE_DESCRIPTION, modeAllowsLiveCalling } from '../../lib/tenantMode';
+import { platformRemediationCatalogue } from '../../lib/receptionist/remediation';
+import { platformDeploymentProjection } from '../receptionist/deployment';
 
 const timezoneInput = z.string().trim().min(1).max(80).refine(value => {
   try { validateIanaTimezone(value); return true; } catch { return false; }
@@ -18,29 +23,10 @@ const timezoneInput = z.string().trim().min(1).max(80).refine(value => {
 
 // Integration provider catalog. `env` is the fallback config source; UI-saved
 // credentials live encrypted in PlatformIntegration and take precedence.
-interface ProviderField { k: string; label: string; secret: boolean }
-interface ProviderDef { label: string; fields: ProviderField[]; required: string[]; env: Record<string, keyof typeof env> }
-const PROVIDERS: Record<string, ProviderDef> = {
-  sms: { label: 'SMS (Twilio)', required: ['accountSid', 'authToken', 'fromNumber'],
-    fields: [{ k: 'accountSid', label: 'Account SID', secret: false }, { k: 'authToken', label: 'Auth Token', secret: true }, { k: 'fromNumber', label: 'From Number', secret: false }],
-    env: { accountSid: 'TWILIO_ACCOUNT_SID', authToken: 'TWILIO_AUTH_TOKEN', fromNumber: 'TWILIO_FROM_NUMBER' } },
-  email: { label: 'Email (HTTP API)', required: ['apiUrl', 'apiKey'],
-    fields: [{ k: 'apiUrl', label: 'API URL', secret: false }, { k: 'apiKey', label: 'API Key', secret: true }, { k: 'fromAddress', label: 'From Address', secret: false }],
-    env: { apiUrl: 'EMAIL_HTTP_API_URL', apiKey: 'EMAIL_HTTP_API_KEY', fromAddress: 'EMAIL_FROM_ADDRESS' } },
-  payments: { label: 'Payments (Stripe)', required: ['secretKey'],
-    fields: [{ k: 'secretKey', label: 'Secret Key', secret: true }],
-    env: { secretKey: 'STRIPE_SECRET_KEY' } },
-  payments_webhook: { label: 'Payment webhook', required: ['webhookSecret'],
-    fields: [{ k: 'webhookSecret', label: 'Webhook Secret', secret: true }],
-    env: { webhookSecret: 'STRIPE_WEBHOOK_SECRET' } },
-  insurance: { label: 'Insurance (Stedi)', required: ['apiKey'],
-    fields: [{ k: 'apiKey', label: 'API Key', secret: true }],
-    env: { apiKey: 'STEDI_API_KEY' } },
-  voice: { label: 'Voice (Retell)', required: ['apiKey', 'fromNumber'],
-    fields: [{ k: 'apiKey', label: 'API Key', secret: true }, { k: 'fromNumber', label: 'From Number', secret: false }],
-    env: { apiKey: 'RETELL_API_KEY', fromNumber: 'RETELL_FROM_NUMBER' } },
-};
-const PROVIDER_KEYS = Object.keys(PROVIDERS) as Array<keyof typeof PROVIDERS & string>;
+type ProviderDef = SharedProviderDef;
+// The catalog lives in lib/providerCredentials so the console and the senders
+// cannot disagree about which fields a provider has, or which credential wins.
+const PROVIDERS = PROVIDER_CATALOG;
 
 const reasonSchema = z.string().trim().min(3).max(500);
 const USAGE_KEYS = ['seats', 'locations', 'storage_gb', 'sms', 'voice_minutes', 'ai_credits', 'devices'] as const;
@@ -50,6 +36,68 @@ const USAGE_DEFAULTS: Record<string, { limit: number | null }> = {
 };
 
 const uuid = z.string().uuid();
+
+// The slug contract is owned by app_platform_provision_tenant (3-40 chars,
+// lowercase alphanumeric with inner hyphens). It is restated here - and
+// mirrored in the console - so a rejection happens on the field, not after
+// submit. Any change must be made in all three places at once.
+export const PLATFORM_SLUG_PATTERN = /^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])$/;
+const slugInput = z.string().trim().toLowerCase().min(3).max(40).regex(PLATFORM_SLUG_PATTERN, 'Slug must be 3-40 chars: lowercase letters, numbers, and inner hyphens.');
+
+// Provisioning runs ~70 sequential statements (compliance baseline +
+// entitlements) inside one transaction. Prisma's 5s default is not a budget
+// for that on managed Postgres; a blown budget looked like a bare 500.
+const PROVISIONING_BUDGET = { timeout: 30_000, maxWait: 10_000 };
+
+/**
+ * Starting points for platform settings. A preset only fills the form - the
+ * operator can edit every field before saving, and `presetKey` records which
+ * one they started from. Kept deliberately short: these are the shapes we
+ * actually sell, not a catalog of everything expressible.
+ */
+export const PLATFORM_SETTING_PRESETS = [
+  {
+    key: 'us_pilot',
+    label: 'US clinic - pilot',
+    description: 'Two-week trial, Eastern time, modest voice allowance, MFA optional while the clinic onboards.',
+    values: { defaultTrialDays: 14, defaultPlanKey: 'starter', defaultTimezone: 'America/New_York', defaultCountry: 'US', defaultVoiceMinutes: 300, requireMfaFloor: false, sessionTimeoutMaxMinutes: 480 },
+  },
+  {
+    key: 'us_production',
+    label: 'US clinic - production',
+    description: 'No trial, Eastern time, full voice allowance, MFA required and an 8-hour session ceiling.',
+    values: { defaultTrialDays: 0, defaultPlanKey: 'growth', defaultTimezone: 'America/New_York', defaultCountry: 'US', defaultVoiceMinutes: 1500, requireMfaFloor: true, sessionTimeoutMaxMinutes: 480 },
+  },
+  {
+    key: 'uk_pilot',
+    label: 'UK clinic - pilot',
+    description: 'Two-week trial, London time, modest voice allowance, MFA optional while the clinic onboards.',
+    values: { defaultTrialDays: 14, defaultPlanKey: 'starter', defaultTimezone: 'Europe/London', defaultCountry: 'GB', defaultVoiceMinutes: 300, requireMfaFloor: false, sessionTimeoutMaxMinutes: 480 },
+  },
+  {
+    key: 'uk_production',
+    label: 'UK clinic - production',
+    description: 'No trial, London time, full voice allowance, MFA required and a 4-hour session ceiling.',
+    values: { defaultTrialDays: 0, defaultPlanKey: 'growth', defaultTimezone: 'Europe/London', defaultCountry: 'GB', defaultVoiceMinutes: 1500, requireMfaFloor: true, sessionTimeoutMaxMinutes: 240 },
+  },
+] as const;
+
+/** Race-free singleton read: two concurrent first-time GETs must not collide. */
+async function ensureConfig(client: PrismaClient | Prisma.TransactionClient = db) {
+  return client.platformConfig.upsert({ where: { id: 'singleton' }, update: {}, create: { id: 'singleton' } });
+}
+
+function settingsView(c: Awaited<ReturnType<typeof ensureConfig>>) {
+  return {
+    platformName: c.platformName, supportEmail: c.supportEmail,
+    defaultTrialDays: c.defaultTrialDays, defaultPlanKey: c.defaultPlanKey,
+    defaultTimezone: c.defaultTimezone, defaultCountry: c.defaultCountry,
+    defaultBranchName: c.defaultBranchName, defaultVoiceMinutes: c.defaultVoiceMinutes,
+    requireMfaFloor: c.requireMfaFloor, sessionTimeoutMaxMinutes: c.sessionTimeoutMaxMinutes,
+    requireOperatorMfa: c.requireOperatorMfa,
+    presetKey: c.presetKey, updatedAt: c.updatedAt.toISOString(),
+  };
+}
 
 async function withTimeout<T>(op: Promise<T>, ms: number): Promise<T> {
   return Promise.race([op, new Promise<T>((_r, reject) => setTimeout(() => reject(new Error('timeout')), ms))]);
@@ -70,10 +118,17 @@ const COMPANY_FIELDS = [
   'postalCode', 'country', 'mainPhone', 'website', 'primaryContactName',
   'primaryContactEmail', 'primaryContactPhone', 'billingContactName',
   'billingContactEmail', 'accountNotes',
+  // Relationship facts. Dates are carried as ISO strings through this record so
+  // the whole company tab stays one string-in/string-out shape.
+  'contractStartedAt', 'accountManager', 'baaSignedAt',
 ] as const;
 
 const blankToNull = (max: number) =>
   z.string().trim().max(max).transform(v => (v === '' ? null : v)).nullable().optional();
+const dateOrNull = z.string().trim().max(40)
+  .transform(v => (v === '' ? null : v))
+  .refine(v => v === null || !Number.isNaN(Date.parse(v)), { message: 'must be a date (YYYY-MM-DD)' })
+  .nullable().optional();
 const emailOrNull = z.string().trim().max(200)
   .transform(v => (v === '' ? null : v))
   .refine(v => v === null || z.string().email().safeParse(v).success, { message: 'must be a valid email address' })
@@ -89,12 +144,20 @@ const companyUpdateSchema = z.object({
   primaryContactPhone: blankToNull(40),
   billingContactName: blankToNull(200), billingContactEmail: emailOrNull,
   accountNotes: blankToNull(4000),
+  accountManager: blankToNull(200),
+  // Dates arrive as YYYY-MM-DD (or blank to clear). Validated here rather than
+  // trusted, so a typo cannot land as an Invalid Date in a renewal report.
+  contractStartedAt: dateOrNull,
+  baaSignedAt: dateOrNull,
   reason: reasonSchema,
 });
 
 function companyView(tenant: Record<string, unknown>): Record<string, string | null> {
   const out: Record<string, string | null> = {};
-  for (const f of COMPANY_FIELDS) out[f] = (tenant[f] as string | null) ?? null;
+  for (const f of COMPANY_FIELDS) {
+    const value = tenant[f];
+    out[f] = value instanceof Date ? value.toISOString() : ((value as string | null) ?? null);
+  }
   return out;
 }
 
@@ -162,18 +225,23 @@ async function applySubscriptionChange(
     }
   }
   await recomputeEntitlements(tenantId, client);
+  // Move the money with the plan. The billing row copied a price once, lazily,
+  // on first read and was never touched again, so upgrading a tenant from
+  // Starter to Enterprise left the console reporting Starter's MRR forever.
+  const pricedPlan = await client.subscriptionPlan.findUnique({ where: { id: planId }, select: { monthlyPrice: true } });
+  await client.tenantBilling.updateMany({ where: { tenantId }, data: { mrr: Number(pricedPlan?.monthlyPrice ?? 0) } });
   return subscription;
 }
 
 async function tenantSummary(tenantId: string) {
   const [tenant, sub, activity, enabledCount] = await Promise.all([
-    db.tenant.findUnique({ where: { id: tenantId }, select: { id: true, name: true, slug: true, status: true, createdAt: true, updatedAt: true } }),
+    db.tenant.findUnique({ where: { id: tenantId }, select: { id: true, name: true, slug: true, status: true, mode: true, createdAt: true, updatedAt: true } }),
     db.tenantSubscription.findUnique({ where: { tenantId }, include: { plan: true, addons: { where: { active: true }, include: { addon: true } } } }),
     tenantActivityCounts(tenantId),
     db.tenantFeatureEntitlement.count({ where: { tenantId, enabled: true } }),
   ]);
   return {
-    tenant: tenant ? { id: tenant.id, name: tenant.name, slug: tenant.slug, status: tenant.status, createdAt: tenant.createdAt.toISOString(), lastActivityAt: tenant.updatedAt.toISOString() } : null,
+    tenant: tenant ? { id: tenant.id, name: tenant.name, slug: tenant.slug, status: tenant.status, mode: tenant.mode, modeDescription: TENANT_MODE_DESCRIPTION[tenant.mode as keyof typeof TENANT_MODE_DESCRIPTION] ?? tenant.mode, liveCallingAllowed: modeAllowsLiveCalling(tenant.mode), createdAt: tenant.createdAt.toISOString(), lastActivityAt: tenant.updatedAt.toISOString() } : null,
     subscription: sub ? { planKey: sub.plan.key, planName: sub.plan.name, status: sub.status, trialEndsAt: sub.trialEndsAt?.toISOString() ?? null, addons: sub.addons.map(a => a.addon.key) } : null,
     activeUsers: activity.activeUsers, branches: activity.branches, enabledFeatures: enabledCount,
     setupStatus: sub ? 'configured' : 'setup_required',
@@ -240,6 +308,52 @@ export const platformRoutes: FastifyPluginAsync = async app => {
     return plans.map(p => ({ key: p.key, name: p.name, monthlyPrice: Number(p.monthlyPrice ?? 0), features: p.features.map(f => f.featureKey) }));
   });
 
+  /**
+   * Set a plan's price.
+   *
+   * The catalog migration deliberately never wrote `monthlyPrice` - reference
+   * data should not carry commercial terms - but nothing else wrote it either,
+   * so every plan rendered $0/mo and every tenant's MRR and ARR were
+   * structurally zero across the whole book of business. This is the missing
+   * write: platform-only, audited, and the one place a price is decided.
+   */
+  app.patch('/subscriptions/plans/:planKey', { preHandler: subscriptionManage }, async (request, reply) => {
+    const { planKey } = z.object({ planKey: z.string().min(1).max(40) }).parse(request.params);
+    const body = z.object({
+      monthlyPrice: z.number().min(0).max(1_000_000).nullable(),
+      reason: reasonSchema,
+    }).parse(request.body);
+
+    const plan = await db.subscriptionPlan.findUnique({ where: { key: planKey } });
+    if (!plan) return reply.code(404).send({ error: 'not_found', message: 'Unknown plan' });
+
+    const updated = await runPlatformAuditedMutation(request, {
+      action: 'plan.price.changed',
+      target: { type: 'plan', id: planKey },
+      metadata: { reason: body.reason, from: Number(plan.monthlyPrice ?? 0), to: body.monthlyPrice },
+    }, async tx => {
+      const saved = await tx.subscriptionPlan.update({ where: { key: planKey }, data: { monthlyPrice: body.monthlyPrice } });
+      // A price is only real once it reaches the tenants on that plan. Billing
+      // rows copied the price once, lazily, on first read and were never
+      // updated again - so a repriced plan left every existing customer's MRR
+      // reporting the old number forever.
+      const subscriptions = await tx.tenantSubscription.findMany({ where: { planId: saved.id }, select: { tenantId: true } });
+      if (subscriptions.length) {
+        await tx.tenantBilling.updateMany({
+          where: { tenantId: { in: subscriptions.map(row => row.tenantId) } },
+          data: { mrr: body.monthlyPrice ?? 0 },
+        });
+      }
+      return { saved, repriced: subscriptions.length };
+    });
+
+    return {
+      key: updated.saved.key,
+      monthlyPrice: Number(updated.saved.monthlyPrice ?? 0),
+      tenantsRepriced: updated.repriced,
+    };
+  });
+
   app.get('/subscriptions/addons', async () => {
     const addons = await db.subscriptionAddon.findMany({ where: { active: true }, orderBy: { name: 'asc' } });
     return addons.map(a => ({ key: a.key, name: a.name, featureKey: a.featureKey }));
@@ -249,7 +363,20 @@ export const platformRoutes: FastifyPluginAsync = async app => {
     const { tenantId } = z.object({ tenantId: uuid }).parse(request.params);
     const summary = await tenantSummary(tenantId);
     if (!summary.tenant) return reply.code(404).send({ error: 'not_found', message: 'Tenant not found' });
-    const entitlements = await db.tenantFeatureEntitlement.findMany({ where: { tenantId }, orderBy: { featureKey: 'asc' }, select: { featureKey: true, enabled: true, source: true, limitValue: true } });
+    const rows = await db.tenantFeatureEntitlement.findMany({
+      where: { tenantId }, orderBy: { featureKey: 'asc' },
+      select: { featureKey: true, enabled: true, source: true, limitValue: true, overrideExpiresAt: true, overrideReason: true },
+    });
+    const entitlements = rows.map(row => ({
+      featureKey: row.featureKey,
+      enabled: row.enabled,
+      source: row.source,
+      limitValue: row.limitValue,
+      // An override that ends is worth showing as such: an operator reviewing
+      // an account should see which grants lapse and why they were given.
+      overrideExpiresAt: row.overrideExpiresAt?.toISOString() ?? null,
+      overrideReason: row.overrideReason,
+    }));
     return { ...summary, entitlements };
   });
 
@@ -278,12 +405,23 @@ export const platformRoutes: FastifyPluginAsync = async app => {
 
     // Only fields actually present in the request are written, so a partial
     // edit never blanks a field the operator did not touch.
-    const data: Record<string, string | null> = {};
+    const DATE_FIELDS = new Set(['contractStartedAt', 'baaSignedAt']);
+    const data: Record<string, string | Date | null> = {};
     const changed: string[] = [];
     for (const f of COMPANY_FIELDS) {
       if (!(f in body)) continue;
       const next = (body as Record<string, string | null | undefined>)[f] ?? null;
-      const prev = (existing as unknown as Record<string, string | null>)[f] ?? null;
+      const rawPrev = (existing as unknown as Record<string, unknown>)[f] ?? null;
+      if (DATE_FIELDS.has(f)) {
+        // Compare on the instant, not the string: '2026-01-05' and the stored
+        // ISO form are the same date and must not read as a change.
+        const prevIso = rawPrev instanceof Date ? rawPrev.toISOString() : null;
+        const nextDate = next === null ? null : new Date(next);
+        data[f] = nextDate;
+        if ((nextDate?.toISOString() ?? null) !== prevIso) changed.push(f);
+        continue;
+      }
+      const prev = (rawPrev as string | null) ?? null;
       data[f] = next;
       if (next !== prev) changed.push(f);
     }
@@ -298,6 +436,30 @@ export const platformRoutes: FastifyPluginAsync = async app => {
     }, tx => tx.tenant.update({ where: { id: tenantId }, data }));
 
     return { tenantId, company: companyView(updated as unknown as Record<string, unknown>), changed };
+  });
+
+  /**
+   * Set how a workspace may behave in the real world.
+   *
+   * Separate from the company record on purpose: the company record holds
+   * FACTS an operator types, while this is a switch that changes what the
+   * product will do - a demo workspace is refused at both call-admission gates
+   * (server/lib/tenantMode.ts). It carries a reason for the same reason suspend
+   * does.
+   */
+  app.patch('/tenants/:tenantId/mode', { preHandler: tenantManage }, async (request, reply) => {
+    const { tenantId } = z.object({ tenantId: uuid }).parse(request.params);
+    const body = z.object({ mode: z.enum(TENANT_MODES), reason: reasonSchema }).parse(request.body);
+    const existing = await db.tenant.findUnique({ where: { id: tenantId }, select: { mode: true } });
+    if (!existing) return reply.code(404).send({ error: 'not_found', message: 'Tenant not found' });
+
+    const updated = await runPlatformAuditedMutation(request, {
+      action: 'tenant.mode.changed',
+      target: { type: 'tenant', id: tenantId, tenantId },
+      metadata: { reason: body.reason, from: existing.mode, to: body.mode },
+    }, tx => tx.tenant.update({ where: { id: tenantId }, data: { mode: body.mode } }));
+
+    return { tenantId, mode: updated.mode, liveCallingAllowed: modeAllowsLiveCalling(updated.mode) };
   });
 
   // Break-glass staff roster. Readable only while an unexpired, unended
@@ -377,7 +539,10 @@ export const platformRoutes: FastifyPluginAsync = async app => {
   app.post('/tenants', { preHandler: tenantManage }, async (request, reply) => {
     const body = z.object({
       name: z.string().trim().min(2).max(160),
-      slug: z.string().trim().min(2).max(80),
+      // The authority on slug shape is app_platform_provision_tenant (3-40,
+      // lowercase alnum + inner hyphens). Accepting anything looser here only
+      // moves the rejection to the end of a long form.
+      slug: slugInput,
       planKey: z.string().min(1).max(40).optional(),
       ownerName: z.string().trim().min(2).max(120),
       ownerEmail: z.string().email().trim().toLowerCase(),
@@ -386,23 +551,30 @@ export const platformRoutes: FastifyPluginAsync = async app => {
       timezone: timezoneInput.optional(),
     }).parse(request.body);
     if (await db.tenant.findUnique({ where: { slug: body.slug } })) throw app.httpErrors.conflict('Slug already in use');
-    // Apply global platform defaults (default plan + trial length) from settings.
-    const cfg = await db.platformConfig.findUnique({ where: { id: 'singleton' } });
+    // Apply the global platform defaults from Platform Settings.
+    const cfg = await ensureConfig();
     try {
       const result = await runPlatformAuditedMutation(request, (provisioned: Awaited<ReturnType<typeof platformProvisionTenant>>) => ({
         action: 'tenant.created',
         target: { type: 'tenant', id: provisioned.tenant.id, tenantId: provisioned.tenant.id },
-        metadata: { name: body.name, planKey: body.planKey },
+        metadata: { name: body.name, planKey: body.planKey ?? cfg.defaultPlanKey },
       }), tx => platformProvisionTenant({
         clinicName: body.name, clinicSlug: body.slug,
         ownerName: body.ownerName, ownerEmail: body.ownerEmail, ownerPassword: body.ownerPassword,
-        defaultBranchName: body.defaultBranchName ?? 'Main Branch',
-        timezone: body.timezone, planKey: body.planKey ?? cfg?.defaultPlanKey ?? 'starter',
-        trialDays: cfg?.defaultTrialDays ?? env.TRIAL_DAYS,
-      }, tx));
+        defaultBranchName: body.defaultBranchName ?? cfg.defaultBranchName,
+        timezone: body.timezone ?? cfg.defaultTimezone, planKey: body.planKey ?? cfg.defaultPlanKey,
+        trialDays: cfg.defaultTrialDays ?? env.TRIAL_DAYS,
+        voiceMinutesLimit: cfg.defaultVoiceMinutes,
+        securityFloor: { requireMfa: cfg.requireMfaFloor, sessionTimeoutMinutes: cfg.sessionTimeoutMaxMinutes },
+      }, tx), PROVISIONING_BUDGET);
       return reply.code(201).send(await tenantSummary(result.tenant.id));
     } catch (error) {
       if (error instanceof PlatformProvisionError) throw app.httpErrors.badRequest(error.message);
+      // A blown transaction budget is an infrastructure fact, not a bad
+      // request: say so instead of leaking P2028 as a bare 500.
+      if ((error as { code?: string }).code === 'P2028') {
+        throw app.httpErrors.serviceUnavailable('Provisioning timed out before it could finish. No company was created - retry, and check database latency if it repeats.');
+      }
       throw error;
     }
   });
@@ -490,15 +662,38 @@ export const platformRoutes: FastifyPluginAsync = async app => {
 
   app.patch('/tenants/:tenantId/entitlements/:featureKey', { preHandler: tenantManage }, async request => {
     const { tenantId, featureKey } = z.object({ tenantId: uuid, featureKey: z.string().min(1).max(60) }).parse(request.params);
-    const { enabled } = z.object({ enabled: z.boolean() }).parse(request.body);
+    const body = z.object({
+      enabled: z.boolean(),
+      // An override is nearly always temporary. The end date is optional
+      // because a permanent one is sometimes right - but it has to be chosen,
+      // not arrived at by nobody revisiting a pilot comp.
+      expiresAt: dateOrNull,
+      reason: z.string().trim().min(3).max(500).optional(),
+    }).parse(request.body);
+    const { enabled } = body;
+    const expiresAt = body.expiresAt ? new Date(body.expiresAt) : null;
+    if (expiresAt && expiresAt.getTime() <= Date.now()) {
+      throw app.httpErrors.badRequest('An override that has already expired grants nothing. Choose a future date, or leave it open-ended.');
+    }
+    const override = {
+      enabled,
+      source: 'platform_override',
+      overrideEnabled: enabled,
+      overrideExpiresAt: expiresAt,
+      overrideReason: body.reason ?? null,
+    };
     await runPlatformAuditedMutation(request, {
-      action: 'entitlement.overridden', target: { type: 'tenant', id: tenantId, tenantId }, metadata: { featureKey, enabled },
+      action: 'entitlement.overridden',
+      target: { type: 'tenant', id: tenantId, tenantId },
+      metadata: { featureKey, enabled, expiresAt: expiresAt?.toISOString() ?? null, reason: body.reason ?? null },
     }, tx => tx.tenantFeatureEntitlement.upsert({
       where: { tenantId_featureKey: { tenantId, featureKey } },
-      update: { enabled, source: 'platform_override' },
-      create: { tenantId, featureKey, enabled, source: 'platform_override', limitValue: null },
+      // overrideEnabled is the standing decision; enabled is the resolved answer
+      // guards read. Recording both is what makes the override outlive a plan change.
+      update: override,
+      create: { tenantId, featureKey, limitValue: null, ...override },
     }));
-    return { tenantId, featureKey, enabled, source: 'platform_override' };
+    return { tenantId, featureKey, enabled, source: 'platform_override', expiresAt: expiresAt?.toISOString() ?? null, reason: body.reason ?? null };
   });
 
   // Legacy direct edit endpoint (kept for backward compatibility).
@@ -659,7 +854,24 @@ export const platformRoutes: FastifyPluginAsync = async app => {
   app.get('/tenants/:tenantId/usage-limits', async request => {
     const { tenantId } = z.object({ tenantId: uuid }).parse(request.params);
     const rows = await ensureUsageLimits(tenantId);
-    return rows.map(r => ({ key: r.key, used: r.used, limit: r.limitValue }));
+    // `used` on the row is a lifetime total. The limit is per billing period,
+    // so report what the gates actually enforce against: this period's metered
+    // usage. Keys with no meter behind them say so rather than showing a zero
+    // an operator would read as "nothing used".
+    const metered = await periodUsageByMetric(db, tenantId);
+    const usedByLimitKey = new Map(
+      Object.entries(metered).map(([metric, total]) => [USAGE_LIMIT_KEY_BY_METRIC[metric as keyof typeof USAGE_LIMIT_KEY_BY_METRIC] ?? metric, total]),
+    );
+    return {
+      periodKey: usagePeriodKey(new Date()),
+      rows: rows.map(r => ({
+        key: r.key,
+        used: usedByLimitKey.get(r.key) ?? 0,
+        limit: r.limitValue,
+        metered: usedByLimitKey.has(r.key),
+        lifetimeUsed: r.used,
+      })),
+    };
   });
   app.patch('/tenants/:tenantId/usage-limits/:key', { preHandler: tenantManage }, async request => {
     const { tenantId, key } = z.object({ tenantId: uuid, key: z.enum(USAGE_KEYS) }).parse(request.params);
@@ -810,6 +1022,67 @@ export const platformRoutes: FastifyPluginAsync = async app => {
     try { failedJobs = await withTimeout(autopilotQueue.getFailedCount(), 1000); } catch { failedJobs = -1; }
     return { providers, failedJobs };
   });
+  // ===== Voice line: the mechanics the tenant no longer receives ==========
+  //
+  // Everything stripped out of the receptionist's tenant routes lands here.
+  // The point of the split was never to delete the capability — support has to
+  // be able to answer "what is actually published on this clinic's line?" —
+  // only to stop the clinic reading our supply chain to do it. This surface is
+  // behind the platform JWT, which a tenant token cannot mint.
+
+  /**
+   * The failure catalogue with the supplier instruction attached.
+   *
+   * A clinic that hits `tag_dynamic_variables_not_empty` now reads "your voice
+   * line needs attention from CareCommand support" and a reference. This is
+   * where the person they reach looks up what that actually means and what to
+   * do in the provider console.
+   */
+  app.get('/voice-line/remediation', async () => ({
+    provider: PROVIDERS.voice?.label ?? 'Voice',
+    entries: platformRemediationCatalogue(),
+  }));
+
+  /**
+   * One tenant's live voice-line mechanics: provider agent ids, published and
+   * response-engine versions, the deployment tag, the webhook URL, every
+   * fingerprint, and the `configurationReference` the tenant was shown — so a
+   * support engineer can go from a quoted "LINE-4F2C91" to the exact row.
+   */
+  app.get('/tenants/:tenantId/voice-line', async request => {
+    const { tenantId } = z.object({ tenantId: uuid }).parse(request.params);
+    const [agents, deployments] = await Promise.all([
+      db.receptionistAgent.findMany({
+        where: { tenantId },
+        orderBy: { createdAt: 'asc' },
+        select: {
+          id: true, clinicId: true, name: true, active: true, voice: true, language: true,
+          providerAgentId: true, providerVersion: true, providerVersionTag: true, providerStatus: true,
+          providerPublished: true, providerAssignedTags: true, providerVoiceId: true, providerLanguage: true,
+          providerWebhookUrl: true, providerWebhookEvents: true, providerDataStorageSetting: true,
+          providerSignedUrl: true, providerResponseEngineType: true, providerResponseEngineId: true,
+          providerResponseEngineVersion: true, providerBookToolFingerprint: true,
+          providerToolCallStrictMode: true, providerFingerprint: true, providerLastErrorCode: true,
+          providerVerifiedAt: true, providerVerificationExpiresAt: true,
+        },
+      }),
+      db.receptionistAgentDeployment.findMany({
+        where: { tenantId },
+        orderBy: { startedAt: 'desc' },
+        take: 50,
+      }),
+    ]);
+    return {
+      provider: PROVIDERS.voice?.label ?? 'Voice',
+      agents,
+      deployments: deployments.map(row => ({
+        ...platformDeploymentProjection(row),
+        campaignId: row.campaignId,
+        agentId: row.agentId,
+      })),
+    };
+  });
+
   app.post('/health/retry-jobs', { preHandler: tenantManage }, async (request, reply) => {
     const body = z.object({ queue: z.literal('autopilot').default('autopilot') }).parse(request.body ?? {});
     let failed: Awaited<ReturnType<typeof autopilotQueue.getFailed>>;
@@ -857,29 +1130,35 @@ export const platformRoutes: FastifyPluginAsync = async app => {
   });
 
   // ===== Control Tower: Platform Settings (global, singleton) ============
-  async function ensureConfig(client: PrismaClient | Prisma.TransactionClient = db) {
-    return (await client.platformConfig.findUnique({ where: { id: 'singleton' } }))
-      ?? client.platformConfig.create({ data: { id: 'singleton' } });
-  }
-  app.get('/settings', async () => {
-    const c = await ensureConfig();
-    return { platformName: c.platformName, supportEmail: c.supportEmail, defaultTrialDays: c.defaultTrialDays, defaultPlanKey: c.defaultPlanKey, updatedAt: c.updatedAt.toISOString() };
-  });
+  // Presets are a starting point, never a lock: applying one fills the form,
+  // and every field stays editable afterwards. They live on the server so the
+  // console has no hardcoded catalog of its own.
+  app.get('/settings/presets', async () => ({ presets: PLATFORM_SETTING_PRESETS }));
+  app.get('/settings', async () => settingsView(await ensureConfig()));
   app.patch('/settings', { preHandler: tenantManage }, async request => {
     const body = z.object({
       platformName: z.string().trim().min(2).max(80).optional(),
       supportEmail: z.string().email().trim().nullable().optional(),
       defaultTrialDays: z.number().int().min(0).max(365).optional(),
       defaultPlanKey: z.string().trim().max(40).optional(),
+      defaultTimezone: timezoneInput.optional(),
+      defaultCountry: z.string().trim().length(2).toUpperCase().optional(),
+      defaultBranchName: z.string().trim().min(2).max(160).optional(),
+      defaultVoiceMinutes: z.number().int().min(0).max(1_000_000).optional(),
+      requireMfaFloor: z.boolean().optional(),
+      sessionTimeoutMaxMinutes: z.number().int().min(5).max(1440).optional(),
+      requireOperatorMfa: z.boolean().optional(),
+      presetKey: z.string().trim().max(40).optional(),
     }).parse(request.body);
     if (body.defaultPlanKey && !(await db.subscriptionPlan.findUnique({ where: { key: body.defaultPlanKey } }))) throw app.httpErrors.badRequest('Unknown plan');
+    if (body.presetKey && body.presetKey !== 'custom' && !PLATFORM_SETTING_PRESETS.some(p => p.key === body.presetKey)) throw app.httpErrors.badRequest('Unknown preset');
     const c = await runPlatformAuditedMutation(request, {
       action: 'settings.updated', target: { type: 'platform', id: 'config' }, metadata: body,
     }, async tx => {
       await ensureConfig(tx);
       return tx.platformConfig.update({ where: { id: 'singleton' }, data: { ...body, updatedById: request.platformUser?.id } });
     });
-    return { platformName: c.platformName, supportEmail: c.supportEmail, defaultTrialDays: c.defaultTrialDays, defaultPlanKey: c.defaultPlanKey, updatedAt: c.updatedAt.toISOString() };
+    return settingsView(c);
   });
 
   // ===== Control Tower: Integrations (encrypted credential store) ========
@@ -900,12 +1179,12 @@ export const platformRoutes: FastifyPluginAsync = async app => {
     try { return JSON.parse(decryptSecret(row.configEnc) ?? '{}') as Record<string, string>; } catch { return {}; }
   }
   function resolveValues(key: string, def: ProviderDef, row: IntegrationRow | null): { values: Record<string, string>; source: 'db' | 'env' | null } {
+    // Catalog providers resolve exactly the way a sender resolves them, so the
+    // badge cannot say "connected - via db" over a credential the product will
+    // not use. Custom services have no sender and no env, so they answer from
+    // their own row.
+    if (PROVIDERS[key]) return providerConfig(key);
     if (row?.configEnc) { const v = decryptConfig(row); if (Object.keys(v).length) return { values: v, source: 'db' }; }
-    if (PROVIDERS[key]) {
-      const values: Record<string, string> = {};
-      for (const f of def.fields) { const ev = env[def.env[f.k]] as string | undefined; if (ev) values[f.k] = ev; }
-      if (Object.keys(values).length) return { values, source: 'env' };
-    }
     return { values: {}, source: null };
   }
   function viewFor(key: string, def: ProviderDef, row: IntegrationRow | null) {
@@ -980,6 +1259,10 @@ export const platformRoutes: FastifyPluginAsync = async app => {
       update: { configEnc, setFields, status: configured ? 'connected' : 'disconnected', updatedById: request.platformUser?.id },
       create: { key, configEnc, setFields, status: configured ? 'connected' : 'disconnected', updatedById: request.platformUser?.id },
     }));
+    // The senders read a cached snapshot; a save that does not invalidate it
+    // would leave the console green and the product on the old credential.
+    invalidateProviderCredentials();
+    await refreshProviderCredentials();
     const fresh = await loadRow(key);
     return viewFor(key, defFor(key, fresh)!, fresh);
   });
@@ -990,6 +1273,8 @@ export const platformRoutes: FastifyPluginAsync = async app => {
     await runPlatformAuditedMutation(request, {
       action: row?.isCustom ? 'integration.service.deleted' : 'integration.disconnected', target: { type: 'integration', id: key }, metadata: {},
     }, tx => tx.platformIntegration.deleteMany({ where: { key } }));
+    invalidateProviderCredentials();
+    await refreshProviderCredentials();
     // Built-ins revert to env fallback; custom services are gone.
     if (PROVIDERS[key]) return viewFor(key, PROVIDERS[key], null);
     return { key, deleted: true };
@@ -1013,8 +1298,19 @@ export const platformRoutes: FastifyPluginAsync = async app => {
           const auth = Buffer.from(`${values.accountSid}:${values.authToken}`).toString('base64');
           const res = await withTimeout(fetch(`https://api.twilio.com/2010-04-01/Accounts/${values.accountSid}.json`, { headers: { Authorization: `Basic ${auth}` } }), 4000);
           status = res.ok ? 'ok' : 'failed'; detail = res.ok ? 'Twilio account reachable' : `Twilio returned ${res.status}`;
+        } else if (key === 'voice') {
+          // Retell has no cheap unauthenticated probe, but listing agents proves
+          // the key is accepted. Previously this branch reported "ok" for any
+          // provider without a ping, so "Voice (Retell) - test ok" meant only
+          // "two fields are non-empty".
+          const res = await withTimeout(fetch('https://api.retellai.com/list-agents', { headers: { Authorization: `Bearer ${values.apiKey}` } }), 4000);
+          status = res.ok ? 'ok' : 'failed';
+          detail = res.ok ? 'Retell API accepted the key' : `Retell returned ${res.status}`;
         } else {
-          detail = 'Credentials present (no live ping for this provider)';
+          // Say what was actually established. Reporting "ok" for an unverified
+          // credential is the failure mode this whole change exists to remove.
+          status = 'not_verified';
+          detail = 'Credentials are present. This provider has no connection test, so nothing has been verified.';
         }
       } catch (e) { status = 'failed'; detail = `Connection error: ${(e as Error).message.slice(0, 80)}`; }
     }

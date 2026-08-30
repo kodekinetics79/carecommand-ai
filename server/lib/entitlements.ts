@@ -23,7 +23,7 @@ export async function recomputeEntitlements(
   });
 
   const resolved = new Map<string, ResolvedEntitlement>();
-  const entitled = subscription && ENTITLED_STATUSES.includes(subscription.status);
+  const entitled = Boolean(subscription && ENTITLED_STATUSES.includes(subscription.status));
   if (subscription && entitled) {
     for (const feature of subscription.plan.features) {
       if (feature.included) resolved.set(feature.featureKey, { featureKey: feature.featureKey, enabled: true, source: 'plan', limitValue: feature.limitValue });
@@ -42,9 +42,41 @@ export async function recomputeEntitlements(
     }
   }
 
+  // Standing platform overrides survive this recompute. Without this, every
+  // plan change / add-on edit / suspend / reactivate silently revoked features
+  // an operator had explicitly granted - while the console claimed otherwise.
+  const existing = await client.tenantFeatureEntitlement.findMany({
+    where: { tenantId },
+    select: { featureKey: true, overrideEnabled: true, overrideExpiresAt: true },
+  });
+  const now = new Date();
+  // An override past its end date is simply not an override any more. It is
+  // cleared rather than left in place, so the row stops claiming a decision
+  // nobody is standing behind.
+  const lapsed = existing.filter(r => r.overrideEnabled !== null && r.overrideExpiresAt !== null && r.overrideExpiresAt <= now);
+  if (lapsed.length) {
+    await client.tenantFeatureEntitlement.updateMany({
+      where: { tenantId, featureKey: { in: lapsed.map(r => r.featureKey) } },
+      data: { overrideEnabled: null, overrideExpiresAt: null, overrideReason: null },
+    });
+  }
+  const lapsedKeys = new Set(lapsed.map(r => r.featureKey));
+  const overrides = new Map(
+    existing
+      .filter(r => r.overrideEnabled !== null && !lapsedKeys.has(r.featureKey))
+      .map(r => [r.featureKey, r.overrideEnabled as boolean]),
+  );
+
   const rows: ResolvedEntitlement[] = [];
   for (const key of FEATURE_KEYS) {
-    const ent = resolved.get(key) ?? { featureKey: key, enabled: false, source: 'plan', limitValue: null };
+    const planEnt = resolved.get(key) ?? { featureKey: key, enabled: false, source: 'plan', limitValue: null };
+    const override = overrides.get(key);
+    // An override decides the feature only while the subscription is entitled:
+    // a suspended or cancelled tenant loses access regardless, and the standing
+    // decision is preserved in overrideEnabled so reactivation restores it.
+    const ent: ResolvedEntitlement = override === undefined
+      ? planEnt
+      : { featureKey: key, enabled: entitled ? override : false, source: 'platform_override', limitValue: planEnt.limitValue };
     await client.tenantFeatureEntitlement.upsert({
       where: { tenantId_featureKey: { tenantId, featureKey: key } },
       update: { enabled: ent.enabled, source: ent.source, limitValue: ent.limitValue },
@@ -62,7 +94,15 @@ export async function isFeatureEnabled(
   client: PrismaClient | Prisma.TransactionClient = db,
 ): Promise<boolean> {
   const ent = await client.tenantFeatureEntitlement.findUnique({ where: { tenantId_featureKey: { tenantId, featureKey } } });
-  return Boolean(ent?.enabled);
+  if (!ent) return false;
+  // Self-healing: an override can lapse without anything having recomputed
+  // since, and a guard that honoured it until the next plan change would make
+  // the end date decorative. Recompute once, then answer from the fresh row.
+  if (ent.overrideEnabled !== null && ent.overrideExpiresAt !== null && ent.overrideExpiresAt <= new Date()) {
+    const rows = await recomputeEntitlements(tenantId, client);
+    return Boolean(rows.find(row => row.featureKey === featureKey)?.enabled);
+  }
+  return Boolean(ent.enabled);
 }
 
 /**

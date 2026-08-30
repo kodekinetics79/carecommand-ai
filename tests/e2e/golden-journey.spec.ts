@@ -6,6 +6,7 @@ import { fixtureDb as db } from '../../server/test/helpers/fixtureDb';
 import { generatePasswordHash } from '../../server/lib/security';
 import { recomputeEntitlements } from '../../server/lib/entitlements';
 import { assertAccessibilityContract } from './accessibility';
+import { watchNetwork } from './networkFailures';
 import { ensureE2eSubscriptionPlan } from './subscriptionFixture';
 
 const API = 'http://127.0.0.1:43201';
@@ -232,10 +233,10 @@ test.describe.serial('production-style browser golden journey', () => {
     // timeout for focused tests while allowing this comprehensive gate 3x.
     test.slow();
     const consoleErrors: string[] = [];
-    const failedRequests: string[] = [];
+    const network = watchNetwork();
     const watch = (p: Page) => {
       p.on('console', msg => { if (msg.type() === 'error') consoleErrors.push(msg.text()); });
-      p.on('requestfailed', req => failedRequests.push(`${req.method()} ${req.url()} ${req.failure()?.errorText ?? ''}`));
+      network.watch(p);
     };
     watch(page);
 
@@ -368,8 +369,15 @@ test.describe.serial('production-style browser golden journey', () => {
     ]));
     expect(auditActions.map(a => a.action)).not.toContain('portal.paymentPolicy.acknowledged');
 
+    // Keep the excused cancellations in the run's evidence. They are not
+    // failures, but a journey that suddenly cancels twenty requests is telling
+    // you something, and a silent filter would hide it.
+    if (network.cancelledByNavigation.length > 0) {
+      testInfo.annotations.push({ type: 'cancelled-by-navigation', description: network.cancelledByNavigation.join('\n') });
+    }
     expect(consoleErrors).toEqual([]);
-    expect(failedRequests).toEqual([]);
+    expect(network.failures).toEqual([]);
+    expect(network.errorResponses).toEqual([]);
   });
 });
 

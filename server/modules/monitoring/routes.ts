@@ -9,6 +9,7 @@ import { resolveRule, evaluateSeverity, computeRiskScore, SEVERITY_RANK, DEFAULT
 import { aiMorningBriefingService } from '../../lib/ai/services';
 import { invalidateRpmProviderSignoff, lockRpmEvidence, rpmPeriodBounds } from '../../lib/connectedCare/rpmEvidence';
 import { countCurrentReadyRpmPatients } from '../../lib/connectedCare/rpmReadinessService';
+import { MONITORING_ALERT_SOURCE, UNSEEN_NOTIFICATION_STATUSES, inboxScope } from '../../lib/connectedCare/alertInbox';
 
 const uuid = z.string().uuid();
 const readRoles = requireRoles('OWNER', 'ADMIN', 'MANAGER', 'PROVIDER');
@@ -234,6 +235,115 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
     // `truncated` lets the UI say "showing 100 of 143" instead of silently
     // implying the list is the whole queue.
     return { items, total: matching, limit: q.limit, truncated: matching > items.length };
+  });
+
+  // ── Alert inbox (in-app delivery) ─────────────────────────────────────────
+  //
+  // Alerts used to create a notification row and stop there: nothing drained
+  // it, no route returned it, and the assigned clinician was told nothing. The
+  // app is the channel for an in-app notification, so delivery is the moment
+  // the row reaches the recipient's inbox — which is what this route does, and
+  // records, rather than leaving every row at 'queued' forever implying a send
+  // is still pending.
+
+  app.get('/notifications', async request => {
+    const tenantId = request.auth.tenantId;
+    const userId = request.auth.userId;
+    if (!userId) throw app.httpErrors.unauthorized('A signed-in user is required to read an inbox');
+    const q = z.object({
+      includeSeen: z.coerce.boolean().default(false),
+      limit: z.coerce.number().min(1).max(100).default(50),
+    }).parse(request.query);
+
+    const scope = { tenantId, ...inboxScope(userId) };
+    const where = q.includeSeen ? scope : { ...scope, status: { in: [...UNSEEN_NOTIFICATION_STATUSES] } };
+
+    const [rows, unseen] = await Promise.all([
+      db.notificationEvent.findMany({
+        where, orderBy: { createdAt: 'desc' }, take: q.limit,
+        select: {
+          id: true, alertId: true, patientId: true, recipientLabel: true, recipientUserId: true,
+          status: true, createdAt: true, deliveredAt: true, acceptedAt: true,
+        },
+      }),
+      db.notificationEvent.count({ where: { ...scope, status: { in: [...UNSEEN_NOTIFICATION_STATUSES] } } }),
+    ]);
+
+    // Join the alert so the inbox says what happened, not just that something
+    // did. A notification the reader cannot act on is barely better than none.
+    const alertIds = rows.map(r => r.alertId).filter((v): v is string => !!v);
+    const alerts = alertIds.length
+      ? await db.readingAlert.findMany({
+          where: { tenantId, id: { in: alertIds } },
+          select: { id: true, severity: true, alertType: true, status: true, generatedReason: true, branchId: true },
+        })
+      : [];
+    const alertById = new Map(alerts.map(a => [a.id, a]));
+    const pNames = await patientNameMap(tenantId, rows.map(r => r.patientId));
+
+    // Reaching the addressed recipient's inbox IS delivery for an in-app
+    // channel. Only rows addressed to THIS caller are marked: an alert nobody
+    // owns must not drop out of everyone else's queue because one clinician
+    // happened to glance at their inbox. Seeing is not owning, and an unowned
+    // critical alert that silently disappears is the failure this whole route
+    // exists to prevent. Unaddressed rows stay unseen until someone explicitly
+    // acknowledges — which is the act of taking responsibility for it.
+    const undelivered = rows.filter(r => r.deliveredAt === null && r.recipientUserId === userId).map(r => r.id);
+    if (undelivered.length > 0) {
+      await db.notificationEvent.updateMany({
+        where: { tenantId, id: { in: undelivered }, deliveredAt: null },
+        data: { status: 'delivered', deliveredAt: new Date() },
+      });
+    }
+
+    await audit(request, { action: 'monitoring.notification.inbox_read', resource: 'notificationEvent', metadata: { returned: rows.length, unseen } });
+
+    return {
+      unseen,
+      items: rows.map(r => {
+        const alert = r.alertId ? alertById.get(r.alertId) : null;
+        return {
+          id: r.id,
+          alertId: r.alertId,
+          patientName: r.patientId ? pNames.get(r.patientId) ?? 'Unknown' : null,
+          severity: alert?.severity ?? null,
+          alertType: alert?.alertType ?? null,
+          alertStatus: alert?.status ?? null,
+          reason: alert?.generatedReason ?? null,
+          addressedToMe: r.recipientUserId === userId,
+          createdAt: r.createdAt,
+          // Reflect the write above rather than the pre-update row — and only
+          // for rows that were actually delivered.
+          deliveredAt: r.deliveredAt ?? (r.recipientUserId === userId ? new Date() : null),
+          acknowledgedAt: r.acceptedAt,
+        };
+      }),
+    };
+  });
+
+  app.post('/notifications/:id/acknowledge', async (request, reply) => {
+    const { id } = z.object({ id: uuid }).parse(request.params);
+    const tenantId = request.auth.tenantId;
+    const userId = request.auth.userId;
+    if (!userId) throw app.httpErrors.unauthorized('A signed-in user is required');
+    const existing = await db.notificationEvent.findFirst({ where: { id, tenantId, ...inboxScope(userId) }, select: { id: true, acceptedAt: true, deliveredAt: true } });
+    if (!existing) throw app.httpErrors.notFound('Notification not found');
+    // Acknowledgement is a human saying they saw it — distinct from delivery,
+    // and never overwritten once given. Delivery is only stamped if it somehow
+    // was not already: acknowledging proves it arrived, but the original
+    // arrival time is the truthful one and must survive.
+    if (!existing.acceptedAt) {
+      await db.notificationEvent.update({
+        where: { id: existing.id },
+        data: {
+          status: 'delivered',
+          acceptedAt: new Date(),
+          ...(existing.deliveredAt ? {} : { deliveredAt: new Date() }),
+        },
+      });
+    }
+    await audit(request, { action: 'monitoring.notification.acknowledged', resource: 'notificationEvent', resourceId: id });
+    return reply.code(204).send();
   });
 
   // ── Monitoring rules (thresholds, cadence, routing) ────────────────────────
@@ -692,7 +802,7 @@ export const monitoringRoutes: FastifyPluginAsync = async app => {
           ? await tx.user.findFirst({ where: { id: rule.assignedToUserId, tenantId, active: true }, select: { id: true, displayName: true, role: true } })
           : await tx.user.findFirst({ where: { tenantId, active: true, role: { in: ['PROVIDER', 'MANAGER', 'ADMIN', 'OWNER'] }, ...(branchId ? { OR: [{ branchId }, { role: { in: ['ADMIN', 'OWNER'] } }] } : {}) }, orderBy: { createdAt: 'asc' }, select: { id: true, displayName: true, role: true } });
         await tx.notificationEvent.create({
-          data: { tenantId, alertId, patientId: body.patientId ?? null, recipientType: recipient?.role.toLowerCase() ?? 'unassigned_staff', recipientUserId: recipient?.id ?? null, recipientLabel: recipient?.displayName ?? 'unassigned clinical safety queue', channel: 'in_app', status: 'queued', attempts: 0, consentChecked: true, consentResult: 'not_required' },
+          data: { tenantId, alertId, patientId: body.patientId ?? null, recipientType: recipient?.role.toLowerCase() ?? 'unassigned_staff', recipientUserId: recipient?.id ?? null, recipientLabel: recipient?.displayName ?? 'unassigned clinical safety queue', channel: 'in_app', source: MONITORING_ALERT_SOURCE, status: 'queued', attempts: 0, consentChecked: true, consentResult: 'not_required' },
         });
       }
       if (body.patientId) {

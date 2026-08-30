@@ -12,6 +12,17 @@ import type { Prisma } from '../generated/prisma/client';
 export type WorkflowEventType =
   | 'appointment.created' | 'appointment.cancelled' | 'appointment.rescheduled' | 'appointment.no_show'
   | 'appointment_request.created' | 'receptionist.appointmentRequest.created'
+  // AI receptionist clinic configuration and after-hours facts (C2).
+  | 'receptionist.call.after_hours'
+  | 'receptionist.clinic.hours_changed' | 'receptionist.clinic.timezone_changed' | 'receptionist.clinic.phone_changed'
+  | 'receptionist.knowledge.approved' | 'receptionist.locale_pack.approved'
+  // An ACTIVE campaign that no longer passes its own activation gate (B8).
+  | 'receptionist.campaign.readiness_regressed'
+  // Caller safety. Both of these say the same thing in different words — the AI
+  // line is failing a specific human being — so both are events with signals
+  // rather than a new alerting channel nobody would have built.
+  | 'receptionist.call.comprehension_bailout'
+  | 'receptionist.call.repeat_caller'
   | 'deposit.required' | 'deposit.missing' | 'deposit.paid'
   | 'payment.request.created' | 'payment.link.created' | 'payment.succeeded' | 'payment.failed' | 'payment.expired'
   | 'revenue.leakage_detected'
@@ -118,6 +129,76 @@ async function deriveFromEvent(tenantId: string, input: EventInput, eventId: str
     }
     case 'revenue.leakage_detected': {
       await upsertSignal(tenantId, { signalType: 'revenue_leakage', entityType: 'revenueLeak', entityId: id, severity: 'high', score: 70, reason: 'Potential revenue leakage detected.', sourceEventId: eventId });
+      break;
+    }
+    case 'receptionist.call.after_hours': {
+      // The event is per call; the signal is per clinic and is refreshed with
+      // a rolling 7-day count. Once a human resolves it, it is never reopened.
+      const clinicId = typeof input.payload?.clinicId === 'string' ? input.payload.clinicId : null;
+      if (!clinicId) break;
+      const since = new Date(Date.now() - 7 * 86_400_000);
+      const count = await db.receptionistCallLog.count({ where: { tenantId, clinicId, direction: 'inbound', outsideHours: true, startedAt: { gte: since } } });
+      await upsertSignal(tenantId, {
+        signalType: 'after_hours_call', entityType: 'receptionistClinic', entityId: clinicId, severity: 'low', score: 20,
+        reason: `${count} inbound call${count === 1 ? '' : 's'} arrived outside configured hours in the last 7 days.`, sourceEventId: eventId,
+      });
+      break;
+    }
+    case 'receptionist.call.comprehension_bailout': {
+      // The line could not understand a caller and handed them to a person. The
+      // event is per call; the signal is per clinic and carries a rolling
+      // 30-day count, because ONE of these is a bad minute for one patient and
+      // a rising count is a product that is failing a class of people — the
+      // exact pattern Healthwatch Rotherham logged and nobody's dashboard
+      // showed. Once a human resolves it, it is never reopened.
+      const clinicId = typeof input.payload?.clinicId === 'string' ? input.payload.clinicId : null;
+      if (!clinicId) break;
+      const since = new Date(Date.now() - 30 * 86_400_000);
+      const count = await db.receptionistCallLog.count({
+        where: { tenantId, clinicId, comprehensionBailoutAt: { gte: since } },
+      });
+      await upsertSignal(tenantId, {
+        signalType: 'receptionist_comprehension_bailout', entityType: 'receptionistClinic', entityId: clinicId,
+        severity: 'high', score: 75,
+        reason: `The receptionist could not understand ${count} caller${count === 1 ? '' : 's'} in the last 30 days and handed them to a person. Callers with a speech difference, a strong accent or a poor line are the ones this happens to.`,
+        sourceEventId: eventId,
+      });
+      break;
+    }
+    case 'receptionist.call.repeat_caller': {
+      // Three or more calls from one number in a short window is not a busy
+      // patient; it is the AI failing that person and them trying again. The
+      // signal is per clinic so it aggregates, and the payload keeps the window
+      // so the reason line can never claim more than it measured.
+      const clinicId = typeof input.payload?.clinicId === 'string' ? input.payload.clinicId : null;
+      const calls = typeof input.payload?.callsInWindow === 'number' ? input.payload.callsInWindow : null;
+      const hours = typeof input.payload?.windowHours === 'number' ? input.payload.windowHours : null;
+      if (!clinicId) break;
+      await upsertSignal(tenantId, {
+        signalType: 'receptionist_repeat_caller', entityType: 'receptionistClinic', entityId: clinicId,
+        severity: 'high', score: 70,
+        reason: calls && hours
+          ? `One number reached this line ${calls} times in ${hours} hours without getting what they rang for. They were routed to a person.`
+          : 'One number reached this line repeatedly in a short window without getting what they rang for. They were routed to a person.',
+        sourceEventId: eventId,
+      });
+      break;
+    }
+    case 'receptionist.campaign.readiness_regressed': {
+      // A live campaign was gated once, on activation, and never re-gated. The
+      // hourly re-check re-runs the same evaluation; a campaign that no longer
+      // passes it is answering calls it can no longer complete, so it becomes a
+      // signal the morning briefing and the Front Desk banner already read.
+      const codes = Array.isArray(input.payload?.blockingCodes) ? input.payload.blockingCodes : [];
+      const listed = codes.filter((code): code is string => typeof code === 'string');
+      await upsertSignal(tenantId, {
+        signalType: 'receptionist_readiness_regressed', entityType: 'receptionistCampaign', entityId: id,
+        severity: 'high', score: 80,
+        reason: listed.length
+          ? `A live receptionist campaign no longer passes its activation checks: ${listed.join(', ')}.`
+          : 'A live receptionist campaign no longer passes its activation checks.',
+        sourceEventId: eventId,
+      });
       break;
     }
     default:

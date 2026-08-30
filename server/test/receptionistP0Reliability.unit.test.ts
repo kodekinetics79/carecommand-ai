@@ -2,7 +2,8 @@ import 'dotenv/config';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { env } from '../config/env';
 import { createPhoneCall, getPhoneCall, stopPhoneCall } from '../lib/retell';
-import { buildRetellConfig, generateSamples, generateSystemPrompt, type PromptConfig } from '../modules/receptionist/promptService';
+import { buildRetellConfig, generateSamples, generateSystemPrompt, inboundGreeting, type PromptConfig } from '../modules/receptionist/promptService';
+import { promptFixture } from './fixtures/receptionistPromptConfigs';
 
 const originalRetell = {
   apiKey: env.RETELL_API_KEY,
@@ -10,37 +11,14 @@ const originalRetell = {
   baseUrl: env.RETELL_BASE_URL,
 };
 
+const fixture = promptFixture('us-full');
 const promptConfig: PromptConfig = {
-  clinic: {
-    id: 'clinic-1',
-    name: 'Example Clinic',
-    phone: '+12125550100',
-    timezone: 'America/New_York',
-    defaultLanguage: 'en-US',
-    complianceDisclosure: 'Clinic-specific compliance language.',
-    doNotContactPolicy: 'Record the opt-out and end the call.',
-  },
-  agent: {
-    name: 'Avery',
-    voice: 'voice-1',
-    tone: 'warm',
-    language: 'en-US',
-    greetingOverride: 'I can help you schedule today.',
-  },
-  campaign: {
-    id: 'campaign-1',
-    name: 'Scheduling',
-    campaignType: 'outbound',
-    offerTitle: 'Appointment',
-    offerDescription: 'Schedule an appointment.',
-    offerScript: 'Would you like to schedule?',
-    appointmentType: 'Consultation',
-    eligibleLocationIds: ['branch-1'],
-    smsConfirmation: true,
-    emailConfirmation: false,
-  },
+  ...fixture,
+  clinic: { ...fixture.clinic, complianceDisclosure: 'Clinic-specific compliance language.', doNotContactPolicy: 'Record the opt-out and end the call.', humanFallbackNumber: null },
+  agent: { ...fixture.agent, greetingOverride: 'I can help you schedule today.' },
+  campaign: { ...fixture.campaign, campaignType: 'outbound', offerDescription: 'Schedule an appointment.', offerScript: 'Would you like to schedule?', eligibleLocationIds: ['branch-1'] },
   locations: [{ id: 'branch-1', name: 'Main', address: '1 Main St' }],
-  intakeFields: [],
+  hours: { clinicSummary: fixture.hours!.clinicSummary, perLocation: [{ id: 'branch-1', summary: fixture.hours!.clinicSummary, closures: [] }] },
 };
 
 afterEach(() => {
@@ -260,15 +238,19 @@ describe('receptionist P0 reliability', () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
-  it('uses a fully rendered standalone consent turn before any greeting override', () => {
+  // C4 — a greeting, then the fully rendered disclosure, in one turn that still
+  // ends on the consent question. The campaign greeting override still waits
+  // for consent, and the preview still shows exactly the deployed turn.
+  it('greets before the fully rendered consent turn, and still waits for the answer', () => {
     const built = buildRetellConfig(promptConfig, { webhookBaseUrl: 'https://api.example.test/' });
-    const expected = "Hi, I'm Avery, an AI assistant for Example Clinic. This call may be recorded or monitored for quality and documentation.";
+    const disclosure = "Hi, I'm Avery, an AI assistant for Example Clinic. This call may be recorded or monitored for quality and documentation.";
 
-    expect(built.beginMessage).toBe(`${expected} Clinic-specific compliance language. Is that okay?`);
+    expect(built.beginMessage).toBe(`${inboundGreeting(promptConfig)} ${disclosure} Clinic-specific compliance language. Is that okay?`);
+    expect(built.beginMessage.startsWith('Thanks for calling Example Clinic.')).toBe(true);
     expect(built.beginMessage.endsWith('Is that okay?')).toBe(true);
     expect(built.beginMessage).not.toContain('I can help you schedule today.');
     expect(generateSamples(promptConfig).greeting).toBe(built.beginMessage);
-    expect(built.systemPrompt).toContain('After consent is granted, you may say: "I can help you schedule today."');
+    expect(built.systemPrompt).toContain('You may then add: "I can help you schedule today."');
     expect(built.systemPrompt).toMatch(/STOP SPEAKING after that question and wait/i);
   });
 
@@ -280,11 +262,11 @@ describe('receptionist P0 reliability', () => {
     };
     const expected = "Hi, I'm Avery, an AI assistant for Example Clinic. This call may be recorded or monitored for quality and documentation.";
 
-    expect(buildRetellConfig(config, { webhookBaseUrl: 'https://api.example.test' }).beginMessage).toBe(`${expected} Is that okay?`);
+    expect(buildRetellConfig(config, { webhookBaseUrl: 'https://api.example.test' }).beginMessage)
+      .toBe(`${inboundGreeting(config)} ${expected} Is that okay?`);
     const prompt = generateSystemPrompt(config);
     expect(prompt).toContain(expected);
-    expect(prompt).toContain('before any greeting override');
-    expect(prompt).toContain('Do not shorten, paraphrase, skip, or replace it.');
+    expect(prompt).toContain('must not be shortened, paraphrased, reordered, skipped or replaced');
     expect(prompt).toMatch(/Emergency instructions override disclosure completion/i);
   });
 });

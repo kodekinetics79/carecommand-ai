@@ -1,5 +1,6 @@
 import { db } from '../db';
 import { computeRpmReadiness } from './rpmReadiness';
+import { DEFAULT_RPM_TIME_ZONE, isSupportedTimeZone } from './rpmPeriod';
 import {
   buildRpmEvidenceSnapshot,
   invalidateRpmProviderSignoff,
@@ -17,6 +18,23 @@ import {
  * in-flight count so a large panel degrades into a slower response instead of a
  * tenant-wide outage.
  */
+/**
+ * The zone a patient's RPM period is reckoned in: their branch's.
+ *
+ * Falls back to UTC only when there is no branch or the stored identifier is
+ * one this runtime cannot resolve — a bad zone string must not throw in the
+ * middle of an evidence rebuild, and silently reckoning in UTC is the same
+ * behaviour as before, so the fallback can never be worse than the status quo.
+ */
+export async function resolveRpmTimeZone(tenantId: string, patientId: string): Promise<string> {
+  const patient = await db.patient.findFirst({
+    where: { tenantId, id: patientId },
+    select: { branch: { select: { timezone: true } } },
+  });
+  const zone = patient?.branch?.timezone;
+  return zone && isSupportedTimeZone(zone) ? zone : DEFAULT_RPM_TIME_ZONE;
+}
+
 export const RPM_READINESS_CONCURRENCY = 4;
 
 /** Bounded-concurrency map that preserves input order. */
@@ -38,8 +56,14 @@ export async function mapWithConcurrency<T, R>(
   return results;
 }
 
-export async function computeAndStoreRpmReadiness(tenantId: string, patientId: string, now = new Date()) {
-  const period = rpmPeriodBounds(now);
+export async function computeAndStoreRpmReadiness(
+  tenantId: string,
+  patientId: string,
+  now = new Date(),
+  options: { timeZone?: string; periodStart?: Date } = {},
+) {
+  const timeZone = options.timeZone ?? await resolveRpmTimeZone(tenantId, patientId);
+  const period = rpmPeriodBounds(now, timeZone, options.periodStart);
   return db.$transaction(async tx => {
     await lockRpmEvidence(tx, tenantId, patientId, period.start);
     const [evidence, existing] = await Promise.all([

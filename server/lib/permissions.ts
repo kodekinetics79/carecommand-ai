@@ -90,16 +90,43 @@ export const PERMISSIONS = [
   'receptionist:recordings:read',
   // Configure receptionist clinics/agents/campaigns and mutate their workflow.
   'receptionist:manage',
+  // Read-only view of receptionist configuration (clinics, hours, knowledge,
+  // locale packs, catalog): the read-only Studio and the Front Desk page.
+  'receptionist:read',
   // Narrow front-desk operation: decide or reconcile an AI appointment request
   // against an already-created canonical scheduler appointment.
   'receptionist:booking-review',
   // Tenant administration: manage users, roles, sessions, security posture.
   'admin:manage',
+  // ---- Platform-only ------------------------------------------------------
+  // The voice line's supplier mechanics: provider agent id and version, the
+  // deployment tag, prompt/tool/intake/config fingerprints, the webhook URL and
+  // the raw provider export. A clinic can act on none of it, and reading it
+  // discloses which supplier answers its phones — so unlike every other grant
+  // below, this one is NOT in any default role, INCLUDING Owner and Admin.
+  // It exists so CareCommand support can be granted it deliberately, per
+  // tenant, through the RoleDefinition override, rather than the capability
+  // being deleted outright.
+  'platform:voice-line-mechanics:read',
 ] as const;
 
 export type Permission = (typeof PERMISSIONS)[number];
 
-const ALL: Permission[] = [...PERMISSIONS];
+/**
+ * Grants that no role gets by default, not even the ones defined as "all".
+ *
+ * `OWNER: ALL` is a spreading default, and it is the right one for tenant
+ * data: an owner may see everything about their own clinic. A supplier's
+ * coordinates are not their clinic's data, so a `platform:*` grant added to
+ * PERMISSIONS must not arrive in the owner's token merely by being added to
+ * the list. Excluding them here makes that structural instead of a convention
+ * the next permission has to remember.
+ */
+export const PLATFORM_ONLY_PERMISSIONS: readonly Permission[] = ['platform:voice-line-mechanics:read'];
+
+const PLATFORM_ONLY = new Set<string>(PLATFORM_ONLY_PERMISSIONS);
+
+const ALL: Permission[] = PERMISSIONS.filter(permission => !PLATFORM_ONLY.has(permission));
 
 /**
  * Default grant matrix. These defaults are calibrated to exactly reproduce the
@@ -149,6 +176,7 @@ export const ROLE_PERMISSIONS: Record<UserRole, Permission[]> = {
     'crm:read', 'crm:write', 'campaign:read', 'inventory:read', 'inventory:write', 'partner-report:write',
     'receptionist:call-artifacts:read',
     'receptionist:booking-review',
+    'receptionist:read',
   ],
   ANALYST: [
     'patient:read', 'appointment:read', 'billing:read', 'staff:read', 'settings:read', 'audit:read',
@@ -160,7 +188,7 @@ export const ROLE_PERMISSIONS: Record<UserRole, Permission[]> = {
   ],
   AUDITOR: [
     'compliance:read', 'audit:read',
-    'receptionist:call-artifacts:read', 'receptionist:recordings:read',
+    'receptionist:call-artifacts:read', 'receptionist:recordings:read', 'receptionist:read',
   ],
 };
 
@@ -228,6 +256,44 @@ export async function hasPermission(request: FastifyRequest, permission: Permiss
  * the caller would need; when several grants are accepted it names the broad
  * one, because that is the grant an administrator would actually assign.
  */
+/**
+ * Guard for editing a tenant's RoleDefinition rows.
+ *
+ * A RoleDefinition whose `name` matches a built-in role REPLACES that role's
+ * default grants for everyone holding it (see resolvePermissions). Role CRUD is
+ * gated on `settings:write`, which MANAGER holds - so without this guard a
+ * Branch Manager could write a definition named "Branch Manager" granting
+ * `admin:manage`, `patient:export` and `audit:read`, and hold them on the next
+ * request. Two rules close it:
+ *
+ *   1. You may not grant a permission you do not already hold.
+ *   2. You may not define or edit a built-in role's grants without `admin:manage`.
+ *
+ * OWNER and ADMIN hold every permission, so neither rule constrains them.
+ */
+export async function assertRoleEditWithinAuthority(
+  request: FastifyRequest,
+  input: { names: Array<string | null | undefined>; permissions?: Permission[] },
+): Promise<{ ok: true } | { ok: false; status: 403; error: string; message: string }> {
+  const granted = await getRequestPermissions(request);
+  const reserved = new Set(Object.values(ROLE_ENUM_TO_NAME).map(name => name.toLowerCase()));
+  const touchesBuiltIn = input.names.some(name => typeof name === 'string' && reserved.has(name.trim().toLowerCase()));
+  if (touchesBuiltIn && !granted.has('admin:manage')) {
+    return {
+      ok: false, status: 403, error: 'reserved_role_name',
+      message: 'That name belongs to a built-in role. Redefining a built-in role requires the admin:manage permission.',
+    };
+  }
+  const escalation = (input.permissions ?? []).find(permission => !granted.has(permission));
+  if (escalation) {
+    return {
+      ok: false, status: 403, error: 'permission_escalation',
+      message: `You cannot grant a permission you do not hold yourself (${escalation}).`,
+    };
+  }
+  return { ok: true };
+}
+
 export function denyPermission(reply: FastifyReply, permission: Permission) {
   return reply.code(403).send({
     error: 'insufficient_permission',

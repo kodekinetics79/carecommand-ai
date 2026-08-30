@@ -8,6 +8,7 @@ import { env } from './config/env';
 import { loggerOptions } from './config/logger';
 import { authPlugin } from './plugins/auth';
 import { errorPlugin } from './plugins/errors';
+import { refreshProviderCredentials } from './lib/providerCredentials';
 import { metricsPlugin } from './plugins/metrics';
 import { healthRoutes } from './modules/health/routes';
 import { authRoutes } from './modules/auth/routes';
@@ -158,7 +159,20 @@ export async function buildApp() {
     });
     app.get('/docs/json', async (_request, reply) => reply.send(app.swagger()));
   }
+  // Load the provider credential vault before any route can send anything, so
+  // a credential saved in the Control Tower is the one the first message uses.
+  // Failure is non-fatal: the senders fall back to environment configuration,
+  // which is exactly the behaviour that existed before the vault was wired.
+  await refreshProviderCredentials();
+
   await app.register(errorPlugin);
+  // Fastify's built-in 404 logs "Route GET:<raw url> not found", which puts the
+  // full URL - a mistyped or expired intake/checkout/share token, or a patient
+  // search string - into logs at info. Own the handler so the reply is the same
+  // and the raw URL is never written.
+  app.setNotFoundHandler(async (request, reply) => {
+    reply.code(404).send({ error: 'not_found', message: `Route ${request.method} not found.` });
+  });
   // Metrics before auth so its onRequest/onResponse hooks time EVERY route
   // (including public/webhook ones) and /metrics stays outside the JWT scope.
   await app.register(metricsPlugin);

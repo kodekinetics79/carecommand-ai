@@ -99,13 +99,81 @@ with isolated tenants.
   records real start/end instants and the server recomputes from them.
 - No incumbent auto-selects between the mutually exclusive CY2026 pairs (99445/99454, 99470/99457).
 
-## Wave 2 — NOT delivered, and why
-- **E2E spec written, typechecks, lints — but never executed.** `tests/e2e/connected-care.spec.ts` is
-  untracked and uncommitted. A concurrent session left `src/components/opportunity/OpportunityActionDrawer.tsx`
-  in an unmerged `UU` state with conflict markers, which fails `tsc -b` and so fails the Playwright
-  webServer build. Backed up to the session scratchpad. It is UNPROVEN until that merge resolves
-  and it is run.
-- Notification delivery (finding I): monitoring alerts still create NotificationEvent rows that nothing
-  drains. Not started.
-- Prior-period attestation (F8) and UTC-month boundary handling (F4/F5): not started.
-- Threshold-editing UI: API + tests shipped; no screen yet.
+## Wave 3 — harness proven (2026-08-29)
+
+`tests/e2e/connected-care.spec.ts` — **3/3 passing** on desktop-chromium against a disposable RLS
+database. No longer UNPROVEN. Covers: enrol with device binding -> consent with script and
+cost-sharing -> signed webhook ingest -> measured review session -> 99445 + 2 review minutes rendered.
+
+**The harness earned its keep on first run.** It caught a defect in the connectivity work: the server
+derived reachability correctly but `DeviceIntegration.tsx` still rendered the stored `status` column,
+so a device that had never reported still showed a green "Online" badge. Fixed in be06e18 — the page
+now renders the derived value and the labels describe observation (Reporting / Not reporting / Never
+reported) rather than asserting a live connection.
+
+## Wave 4 — the three remaining items, delivered (2026-08-29)
+
+**152 passing across 13 server suites + 3 E2E.** Commit 3314da0.
+
+| Was | Now |
+|-----|-----|
+| Alerts created a `queued` NotificationEvent that nothing ever drained; no route returned them. A critical alert notified nobody. | `GET /v1/monitoring/notifications` + `POST /:id/acknowledge`. Delivery and acknowledgement recorded as separate facts. Only rows addressed to the reader are marked delivered, so an unowned alert cannot vanish from everyone else's queue because one clinician glanced at theirs. |
+| Billing period was a UTC month for every clinic. A clinic at UTC-7 could not record a review after ~17:00 on the last local day of the month. | Period is the branch's local calendar month. Unresolvable zone falls back to UTC rather than throwing. |
+| Device-days bucketed by UTC date, so one local day straddling UTC midnight counted twice — 8 local days could satisfy a 16-day CMS threshold. | Bucketed by local calendar date. |
+| Every call site computed the CURRENT month, so a closed month — the only kind anyone bills — was unreachable. | `periodStart` on readiness and signoff; any instant inside a month normalises to that month. |
+
+Evidence version **v5** + migration `20260829160000_rpm_evidence_v5_local_period`, clearing prior
+signoffs: local-day bucketing can reduce a recorded device-day count, so a standing attestation could
+otherwise cover a period that no longer meets its own threshold.
+
+New suites: `alertInbox.integration.test.ts` (7), `rpmPeriodBoundary.integration.test.ts` (7),
+`rpmPeriod.test.ts` (15 — DST boundaries, half-hour zones, round-trips).
+
+## Wave 5 — the last pilot blocker (2026-08-29)
+
+`/alert-thresholds` (85f671b). The rules API had tests but no screen, so a clinic could not change a
+single threshold without an engineer calling the endpoint — the one thing that actually blocked
+*independent* piloting. The screen shows the bands in force (an empty list previously read as "nothing
+is monitored" rather than "the defaults apply") and makes the missed-reading watch reachable, since
+that cadence lives only on a rule.
+
+**E2E now 5/5.** Added: a clinic setting its first rule and the watch turning on; the server refusing
+an inverted band.
+
+## Still open
+- **Consent annual expiry.** CY2020 requires consent at least annually; `PatientConsent` has no expiry
+  field. Not a pilot blocker — it becomes one at the first annual renewal, i.e. a year after go-live.
+- **Nothing is deployed.** All work is on `feat/receptionist-pilot-program-20260829`. `main`
+  auto-deploys to production; merging is the owner's call.
+- **v5 caveat.** The evidence migration clears every prior signoff. That costs nothing today (no
+  period could reach READY before this work) but stops being free once clinics start attesting.
+
+## Deployment decision — CTO, 2026-08-29
+
+**Shipped to a PR and a verified preview. NOT merged to production.**
+
+- PR #12, preview live (HTTP 200):
+  `https://carecommand-ai-git-feat-reception-23509c-kode-kinetics-projects.vercel.app`
+- `security` check: pass. Vercel build: pass. `npm run check`: clean.
+- Connected Care: 152 server tests + 5 E2E, all green.
+
+### Why not production
+1. **The pipeline was red and nobody could see why.** `main` had failed its last 5 CI runs — including
+   the two merges that shipped anyway — dying at `npm run db:seed` after 1m. Fixed in this PR: the step
+   described a `prisma/seed.ts` that no longer exists and had been repointed at the guarded synthetic
+   demo seeder, which CI can never satisfy and should never run. Plan reference data now ships in
+   migration `20260828120000_subscription_catalog_reference_data`, so the step was obsolete as well as
+   broken. CI now runs the full suite (8m17s) instead of dying at 1m.
+2. **Four real failures remain, none in Connected Care** — `pilotImport` (2) and
+   `platformPlaneIsolation` (2). Both proven pre-existing: `pilotImport` reproduced at `main` in an
+   isolated worktree with none of these commits; `platformPlaneIsolation` was failing typecheck before
+   any of this work began. They sit in the platform/pilot area another session is actively editing, so
+   they are not mine to fix without risking a conflict.
+3. **The v5 migration mutates data** — it clears every prior attestation. Free today (nothing could
+   reach READY before this work), but a data migration should run with a human present.
+4. **The safety detectors were never exercised against live Redis** — it is not running locally, so
+   the missed-reading and device-offline paths are unverified against real infrastructure.
+
+### To promote
+Fix or quarantine the 4 platform/pilot failures, confirm the detectors drain against live Redis on the
+preview, then merge #12 with someone watching the migration.

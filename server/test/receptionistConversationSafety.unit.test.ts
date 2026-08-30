@@ -8,39 +8,21 @@ import {
   generateSystemPrompt,
   type PromptConfig,
 } from '../modules/receptionist/promptService';
+import { promptFixture } from './fixtures/receptionistPromptConfigs';
+import { EN_US } from './fixtures/receptionistPackStrings';
 
+const fixture = promptFixture('us-full');
 const baseConfig: PromptConfig = {
+  ...fixture,
   clinic: {
-    id: 'clinic-1',
-    name: 'Example Clinic',
-    phone: '+12125550100',
-    timezone: 'America/New_York',
-    defaultLanguage: 'en-US',
+    ...fixture.clinic,
     complianceDisclosure: 'State-specific supplemental notice.',
-    humanFallbackNumber: '+12125550200',
     doNotContactPolicy: 'Record the suppression immediately and end the call.',
   },
-  agent: {
-    name: 'Avery',
-    voice: 'voice-1',
-    tone: 'warm',
-    language: 'en-US',
-    greetingOverride: 'Welcome to our scheduling line.',
-  },
-  campaign: {
-    id: 'campaign-1',
-    name: 'Scheduling',
-    campaignType: 'reactivation',
-    offerTitle: 'Appointment',
-    offerDescription: 'Schedule a visit.',
-    offerScript: 'Would you like to schedule?',
-    appointmentType: 'Consultation',
-    eligibleLocationIds: ['branch-1'],
-    smsConfirmation: true,
-    emailConfirmation: false,
-  },
+  agent: { ...fixture.agent, greetingOverride: 'Welcome to our scheduling line.' },
+  campaign: { ...fixture.campaign, campaignType: 'reactivation', offerDescription: 'Schedule a visit.', offerScript: 'Would you like to schedule?', eligibleLocationIds: ['branch-1'] },
   locations: [{ id: 'branch-1', name: 'Main', address: '1 Main St' }],
-  intakeFields: [],
+  hours: { clinicSummary: fixture.hours!.clinicSummary, perLocation: [{ id: 'branch-1', summary: fixture.hours!.clinicSummary, closures: [] }] },
 };
 
 describe('AI receptionist conversation safety contract', () => {
@@ -58,14 +40,48 @@ describe('AI receptionist conversation safety contract', () => {
     expect(RECORDING_DISCLOSURE_EVIDENCE_TEMPLATE.endsWith('{{clinic_disclosure}} Is that okay?')).toBe(true);
   });
 
-  it('makes the provider begin message a consent-only turn and waits before greeting', () => {
+  // C4 — the begin message used to be the consent question ALONE, so the first
+  // thing a patient heard was an interrogation. It is now one turn that greets
+  // first and still ends on the consent question, so the agent must stop and
+  // wait. The greeting override still waits for consent.
+  it('greets the caller in the same turn as the disclosure, and still ends on the consent question', () => {
     const built = buildRetellConfig(baseConfig, { webhookBaseUrl: 'https://api.example.test' });
 
+    expect(built.beginMessage.startsWith('Thanks for calling Example Clinic.')).toBe(true);
+    expect(built.beginMessage).toContain('This call may be recorded or monitored');
     expect(built.beginMessage.endsWith('Is that okay?')).toBe(true);
+    // The campaign greeting override is still not spoken before consent.
     expect(built.beginMessage).not.toContain('Welcome to our scheduling line.');
     expect(built.systemPrompt).toMatch(/STOP SPEAKING after that question and wait/i);
-    expect(built.systemPrompt).toMatch(/Silence, voicemail, ambiguity, or continuing to speak is not consent/i);
-    expect(built.systemPrompt).toContain('After consent is granted, you may say: "Welcome to our scheduling line."');
+    expect(built.systemPrompt).toMatch(/Silence, voicemail, ambiguity, or simply carrying on talking is not agreement to being recorded/i);
+    expect(built.systemPrompt).toContain('You may then add: "Welcome to our scheduling line."');
+  });
+
+  // C3 — the prompt used to order the agent to "explain that this AI line
+  // cannot continue ... and end the call" when a caller refused recording,
+  // while the handler had always degraded safely. A patient exercising a
+  // privacy right was refused service by their own clinic.
+  it('continues the call when recording is refused, and never orders a hang-up', () => {
+    const prompt = generateSystemPrompt(baseConfig);
+
+    expect(prompt).toContain('# Consent — what each answer means');
+    expect(prompt).toContain(EN_US.strings.messages['consent.refused.continue']);
+    expect(prompt).toMatch(/THE CALL CONTINUES/);
+    expect(prompt).toMatch(/Never end the call because recording was refused/i);
+    expect(prompt).not.toMatch(/this AI line cannot continue/i);
+    // Only an objection to the AI itself routes away (contract section 2).
+    expect(prompt).toContain(EN_US.strings.messages['consent.declined.route']);
+    expect(prompt).toMatch(/Never treat a refusal to be recorded as an objection to talking to you/i);
+  });
+
+  // C4 — the tool must not read its own result aloud; "This pilot remains
+  // metadata-only unless the approved retention workflow applies" was the
+  // second sentence a patient heard.
+  it('does not let the consent tool speak its own result', () => {
+    const consentTool = buildRetellConfig(baseConfig, { webhookBaseUrl: 'https://api.example.test' })
+      .tools.find(tool => tool.name === 'record_recording_preference') as { speak_after_execution: boolean };
+    expect(consentTool.speak_after_execution).toBe(false);
+    expect(generateSystemPrompt(baseConfig)).toContain(EN_US.strings.messages['consent.granted.ack']);
   });
 
   it('gives emergency instructions absolute precedence over disclosure and tools', () => {
@@ -83,11 +99,11 @@ describe('AI receptionist conversation safety contract', () => {
     expect(emergency.speak_during_execution).toBe(false);
     expect(emergency.parameters.required).not.toContain('emergency_instruction_spoken');
     const providerProtocolTrace = [
-      { kind: 'spoken', value: 'Hang up and call 911 now, or go to the nearest emergency room.' },
+      { kind: 'spoken', value: EN_US.emergencyInstruction },
       { kind: 'tool', value: 'report_emergency' },
       { kind: 'terminated', value: 'emergency_flow' },
     ];
-    expect(providerProtocolTrace[0]).toMatchObject({ kind: 'spoken', value: expect.stringMatching(/call 911.*nearest emergency room/i) });
+    expect(providerProtocolTrace[0]).toMatchObject({ kind: 'spoken', value: expect.stringContaining(EN_US.emergencyNumber) });
     expect(providerProtocolTrace.findIndex(event => event.kind === 'spoken')).toBeLessThan(providerProtocolTrace.findIndex(event => event.kind === 'tool'));
     expect(providerProtocolTrace.slice(2).some(event => event.value === 'disclosure' || event.value === 'normal_flow')).toBe(false);
   });
@@ -107,8 +123,9 @@ describe('AI receptionist conversation safety contract', () => {
   it('fails safely for unsupported insurance, payment, language, and accessibility requests', () => {
     const prompt = generateSystemPrompt(baseConfig);
 
-    expect(prompt).toMatch(/No insurance tool is available in this configuration/i);
-    expect(prompt).toMatch(/do not verify network status, eligibility, benefits, prior authorization, coverage, claim outcome, or patient responsibility/i);
+    expect(prompt).toMatch(/answer only from the accepted-plans list above/i);
+    expect(prompt).toMatch(/No insurance tool is available: do not verify eligibility/i);
+    expect(prompt).toMatch(/do not verify eligibility, benefits, network status, prior authorization, coverage, claim outcome, or patient responsibility/i);
     expect(prompt).toMatch(/no payment tool is available in this configuration/i);
     expect(prompt).toMatch(/Do not quote a balance as current, take a payment, create or send a payment link/i);
     expect(prompt).toMatch(/do not pretend fluency, translate clinical content yourself, or continue intake by guessing/i);

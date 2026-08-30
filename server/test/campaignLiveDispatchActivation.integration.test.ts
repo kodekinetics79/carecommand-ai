@@ -140,7 +140,16 @@ describe('live campaign dispatch activation endpoint', () => {
     });
     expect(refused.statusCode).toBe(409);
     expect(refused.json()).toMatchObject({ error: 'provider_not_configured', channel: 'email' });
-    expect(refused.json().missing).toContain('SMTP_HOST');
+    // The refusal states HOW FAR from ready we are — a count of the three keys
+    // this test just cleared — and names none of them. Naming them would put
+    // CareCommand's sending supplier and its server variables on a clinic's
+    // screen, where nobody can act on either (8af601d). The operator-only
+    // detail stays in the Control Tower.
+    expect(refused.json().missingConfigCount).toBe(3);
+    expect(refused.json().missing).toBeUndefined();
+    for (const leak of ['SMTP_HOST', 'SMTP_USER', 'SMTP_PASS', 'smtp']) {
+      expect(JSON.stringify(refused.json())).not.toContain(leak);
+    }
     expect(await db.campaignLiveDispatchActivation.count({ where: { tenantId: tenant.id } })).toBe(0);
     // The refusal itself is evidence.
     const audits = await db.auditEvent.findMany({ where: { tenantId: tenant.id, action: 'campaign.live_dispatch.activation_refused' } });

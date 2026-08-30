@@ -13,7 +13,22 @@ export function disclosureEvidenceHash(disclosure: string): string {
   return createHash('sha256').update(disclosure).digest('hex');
 }
 
-/** Single source of truth for the exact disclosure spoken and hashed. */
+/**
+ * The en-US v1 baseline disclosure.
+ *
+ * C10: this is NO LONGER the source of truth for what is hashed as consent
+ * evidence. It hardcodes "for quality and documentation", while a deployed
+ * en-GB pack says "quality and training purposes" — so hashing this text
+ * recorded wording an en-GB caller had never been read, which is the first
+ * thing a pilot's DPO would find. `handleAgentTool('record_recording_preference')`
+ * now hashes the pack-rendered `disclosure.recording`, and reaches this
+ * function only when no pack and no country can be resolved for the call at
+ * all, which is also the only case in which these are the words that were said.
+ *
+ * The text stays byte-equal to `RECORDING_DISCLOSURE_EVIDENCE_TEMPLATE` and to
+ * the en-US v1 pack's `disclosure.recording`, so every historical
+ * `disclosureTextHash` remains reproducible.
+ */
 export function renderRecordingDisclosure(input: { agentName: string; clinicName: string; clinicDisclosure?: string | null }): string {
   const baseline = `Hi, I'm ${input.agentName}, an AI assistant for ${input.clinicName}. This call may be recorded or monitored for quality and documentation.`;
   const clinicDisclosure = input.clinicDisclosure?.trim();

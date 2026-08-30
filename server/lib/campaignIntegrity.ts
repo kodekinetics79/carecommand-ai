@@ -91,7 +91,13 @@ export type CampaignLaunchPreview = {
   fingerprint: string;
   templateRevision: string;
   providerMode: ReturnType<typeof providerModeFor>;
-  provider: string;
+  // `provider` used to sit here and was printed verbatim in the launch
+  // confirmation dialog ("provider: twilio"), which is how a clinic learned who
+  // sends its texts. It stays in the fingerprint intent below — that is signed
+  // integrity evidence and must not change — but the operator confirming a
+  // dispatch is confirming the audience, the template, the CHANNEL and the
+  // MODE. Which company carries the SMS is not one of the facts they are
+  // attesting to, and not one they chose.
   channel: CommChannel;
   scheduledAt: string | null;
   audience: { total: number; eligible: number; suppressed: number; missingContact: number; authorityRequired: number; atomicBoundaryBlocked: number };
@@ -263,7 +269,6 @@ export async function buildCampaignDispatchSnapshot(tenantId: string, campaign: 
     fingerprint,
     templateRevision,
     providerMode: mode,
-    provider,
     channel,
     scheduledAt: campaign.scheduledAt?.toISOString() ?? null,
     branchScope: campaign.branchId ?? null,

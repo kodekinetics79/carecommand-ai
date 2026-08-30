@@ -1,4 +1,4 @@
-import { clearSession, getAccessToken, refreshSession, setAccessTokenOnly } from './session';
+import { AuthRequestError, clearSession, getAccessToken, refreshSession, setAccessTokenOnly } from './session';
 
 // Error thrown for a non-OK API response. Carries the HTTP status and, when the
 // server sent a JSON body, its `message`/`error` so callers can branch on a 409
@@ -27,6 +27,23 @@ async function bootstrapDevToken() {
   return payload.token;
 }
 
+/**
+ * A refusal to rebuild the session is the 401 it is.
+ *
+ * Callers branch on ApiError.status; useSession clears the signed-in user on
+ * 401/403 and on nothing else, deliberately, so a transient 5xx or a dropped
+ * connection cannot bounce staff to /login mid-task. But "the server refused to
+ * refresh" reached that catch as a bare Error with no status, so signing out
+ * left the workspace on screen: the tokens were gone and the UI never noticed.
+ * Only an actual authentication answer is converted; a network failure keeps
+ * its own error and still leaves the session alone.
+ */
+function sessionExpired(error: unknown): boolean {
+  return error instanceof AuthRequestError && (error.status === 401 || error.status === 403);
+}
+
+const SESSION_EXPIRED_MESSAGE = 'Session expired. Please sign in again.';
+
 async function resolveAccessToken() {
   const accessToken = getAccessToken();
   if (accessToken) return accessToken;
@@ -35,8 +52,13 @@ async function resolveAccessToken() {
     return bootstrapDevToken();
   }
 
-  const session = await refreshSession();
-  return session.accessToken;
+  try {
+    const session = await refreshSession();
+    return session.accessToken;
+  } catch (error) {
+    if (sessionExpired(error)) throw new ApiError(401, SESSION_EXPIRED_MESSAGE);
+    throw error;
+  }
 }
 
 async function rawApiRequest<T>(path: string, init?: RequestInit, retryOnRefresh = true): Promise<T> {
@@ -55,11 +77,12 @@ async function rawApiRequest<T>(path: string, init?: RequestInit, retryOnRefresh
     try {
       await refreshSession();
       return rawApiRequest<T>(path, init, false);
-    } catch {
+    } catch (error) {
       // refreshSession is client-wide single-flight and clears the token once
       // when that shared refresh fails. Do not let each waiting caller race to
       // repeat session cleanup independently.
-      throw new Error('Session expired. Please sign in again.');
+      if (sessionExpired(error)) throw new ApiError(401, SESSION_EXPIRED_MESSAGE);
+      throw new Error(SESSION_EXPIRED_MESSAGE, { cause: error });
     }
   }
 
@@ -75,7 +98,11 @@ async function rawApiRequest<T>(path: string, init?: RequestInit, retryOnRefresh
     let message = humanApiMessage(response.status);
     let code: string | undefined;
     const body = await response.json().catch(() => null) as Record<string, unknown> | null;
+    // errors.ts sends the code as `error`; a route that answers with its own
+    // structured body (the verify-provider route's `{ code, message, agent }`)
+    // sends it as `code`. Accept both so callers can branch either way.
     if (typeof body?.error === 'string') code = body.error;
+    else if (typeof body?.code === 'string') code = body.code;
     // An access denial is a fact about this account, not a fault to report. The
     // API answers with the permission key it enforced ("…required permission
     // (billing:read)…") or Fastify's bare "Forbidden"; neither is language for a

@@ -86,7 +86,7 @@ beforeAll(async () => {
   const provider = await db.providerProfile.create({
     data: { tenantId, branchId: branch.id, userId: providerUser.id, specialty: 'Primary Care' },
   });
-  const clinic = await db.receptionistClinic.create({ data: { tenantId, name: 'Review Clinic', phone: phoneFor(tenantId) } });
+  const clinic = await db.receptionistClinic.create({ data: { tenantId, name: 'Review Clinic', phone: phoneFor(tenantId), country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' } });
   const call = await db.receptionistCallLog.create({
     data: {
       tenantId,

@@ -3,6 +3,9 @@ import { z } from 'zod';
 import { db } from '../../lib/db';
 import { buildPilotChecklist, createPilotShareToken } from '../../lib/pilotStatus';
 import { platformAuditEvent, requirePlatformAccess } from '../../lib/platformAuth';
+import { platformDb } from '../../lib/platformDb';
+import { runWithPlatformDatabaseRequest } from '../../lib/platformContextStore';
+import { withIdempotency, idempotencyKeyFrom, requestFingerprint } from '../../lib/idempotentRequest';
 import { enterTenantContext, type TenantTxClient } from '../../lib/tenantContext';
 import {
   analyzePilotImport,
@@ -114,6 +117,10 @@ async function providerLookup(tx: TenantTxClient, tenantId: string) {
 }
 
 export const pilotRoutes: FastifyPluginAsync = async app => {
+  // Same scope platformRoutes establishes: platformDb only sets its actor GUCs
+  // inside this store, and without it every platform-plane read here is denied
+  // by RLS and silently returns nothing.
+  app.addHook('onRequest', (_request, _reply, done) => runWithPlatformDatabaseRequest(done));
   app.addHook('preHandler', pilotAdmin);
 
   // Every route below is scoped to /tenants/:tenantId and reads or writes TENANT
@@ -142,6 +149,30 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
     if (!parsed.success) return; // the route's own parse answers with a 400
 
     const actor = request.platformUser;
+
+    // Break-glass, same contract as the staff roster.
+    //
+    // These routes read and write a clinic's Patient, Appointment and
+    // PatientInsurancePolicy rows. The RLS `source = 'platform'` branch admits
+    // ANY active PlatformUser to ANY tenant table, so without this check the
+    // most sensitive platform capability we have was also the only one with no
+    // reason recorded, no expiry and nothing for the clinic to see afterwards -
+    // while the strict `source = 'support'` branch, built for exactly this, sat
+    // unused. Requiring a live session here does not weaken the database
+    // policy; it stops us relying on a route guard as the only control over
+    // vendor access to patient data.
+    const session = await platformDb.supportAccessSession.findFirst({
+      where: { tenantId: parsed.data, endedAt: null, expiresAt: { gt: new Date() } },
+      orderBy: { startedAt: 'desc' },
+      select: { id: true },
+    });
+    if (!session) {
+      return reply.code(403).send({
+        error: 'support_session_required',
+        message: 'Open a support session for this workspace before importing or reading its clinic data. The session records your reason and expires on its own.',
+      });
+    }
+
     enterTenantContext({
       tenantId: parsed.data,
       // Bare id: app_rls_tenant_allowed() requires a UUID that resolves to an
@@ -214,6 +245,16 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
     const tenant = await db.tenant.findUnique({ where: { id: tenantId }, select: { id: true } });
     if (!tenant) return reply.code(404).send({ error: 'not_found', message: 'Tenant not found' });
     const mapping = body.mapping ?? {};
+
+    // The console sends an Idempotency-Key on every save. A repeat returns the
+    // response the first save produced, even if the preset has been edited
+    // since - a replay must return what the caller was told.
+    const saved = await withIdempotency({
+      scope: `pilot.import.preset:${tenantId}`,
+      key: idempotencyKeyFrom(request.headers as Record<string, unknown>),
+      tenantId,
+      fingerprint: requestFingerprint(body),
+    }, async () => {
     if (body.isDefault) {
       await db.pilotImportPreset.updateMany({ where: { tenantId, entityType: body.entityType, isDefault: true }, data: { isDefault: false } });
     }
@@ -223,7 +264,7 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
       create: { tenantId, entityType: body.entityType, name: body.name, mapping, isDefault: body.isDefault },
     });
     await platformAuditEvent(request, 'pilot.import.preset.saved', { type: 'tenant', id: tenantId, tenantId }, { entityType: body.entityType, name: body.name, isDefault: body.isDefault });
-    return reply.code(201).send({
+    return {
       id: preset.id,
       tenantId: preset.tenantId,
       entityType: preset.entityType as PilotEntityType,
@@ -232,7 +273,15 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
       mapping: preset.mapping,
       createdAt: preset.createdAt.toISOString(),
       updatedAt: preset.updatedAt.toISOString(),
+    };
     });
+    if (saved.status === 'conflict') {
+      return reply.code(409).send({
+        error: 'pilot_idempotency_conflict',
+        message: 'That Idempotency-Key was already used for a different preset. Send a new key, or resend the original request.',
+      });
+    }
+    return reply.code(201).send(saved.value);
   });
 
   app.delete('/tenants/:tenantId/pilot-import/presets/:presetId', async (request, reply) => {
@@ -258,7 +307,13 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
       createdAt: row.createdAt.toISOString(),
       updatedAt: row.updatedAt.toISOString(),
       active: row.expiresAt.getTime() > Date.now(),
-      url: `${process.env.PUBLIC_APP_URL ?? ''}/pilot/${row.id}`,
+      // Two truths this list used to get wrong. The share token is stored only
+      // as a hash, so it cannot be rebuilt here - a link made from the row id
+      // would not open. And with no PUBLIC_APP_URL configured the old value was
+      // a bare path pretending to be a shareable address. Say plainly whether a
+      // public URL exists rather than emitting one that does not work.
+      publicUrlAvailable: Boolean(process.env.PUBLIC_APP_URL),
+      url: null as string | null,
     }));
   });
 
@@ -267,6 +322,28 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
     const body = shareBodySchema.parse(request.body);
     const tenant = await db.tenant.findUnique({ where: { id: tenantId }, select: { id: true, name: true, slug: true } });
     if (!tenant) return reply.code(404).send({ error: 'not_found', message: 'Tenant not found' });
+
+    // A share link is a credential: issuing a second one because a retry lost
+    // its response means a token nobody is tracking. The stored response is
+    // returned instead - including the clinic name as it was when the link was
+    // issued, not as it reads now.
+    const issued = await withIdempotency({
+      scope: `pilot.status_link:${tenantId}`,
+      key: idempotencyKeyFrom(request.headers as Record<string, unknown>),
+      tenantId,
+      fingerprint: requestFingerprint(body),
+    }, async ({ firstAttempt }) => {
+    // Durable intent on the platform plane, recorded BEFORE the token exists
+    // and in the past-conditional - the same order the import commit uses. The
+    // share row is written on the tenant plane, on a different connection, so
+    // this cannot be atomic with it and must not assert an outcome it cannot
+    // guarantee. Written once per key: a retry of an attempt that never
+    // completed is the same intent, not a second one.
+    if (firstAttempt) {
+      await platformAuditEvent(request, 'pilot.status_link.created.requested', { type: 'tenant', id: tenantId, tenantId }, {
+        label: body.label?.trim() || null, expiresInDays: body.expiresInDays,
+      });
+    }
     const { token, hash } = createPilotShareToken();
     const expiresAt = new Date(Date.now() + body.expiresInDays * 86400000);
     const row = await db.pilotStatusShare.create({
@@ -279,7 +356,7 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
       },
     });
     await platformAuditEvent(request, 'pilot.status_link.created', { type: 'tenant', id: tenantId, tenantId }, { label: row.label, expiresAt: row.expiresAt.toISOString() });
-    return reply.code(201).send({
+    return {
       id: row.id,
       tenantId: row.tenantId,
       label: row.label,
@@ -288,7 +365,15 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
       url: `${process.env.PUBLIC_APP_URL ?? ''}/pilot/${token}`,
       clinicName: tenant.name,
       clinicSlug: tenant.slug,
+    };
     });
+    if (issued.status === 'conflict') {
+      return reply.code(409).send({
+        error: 'pilot_idempotency_conflict',
+        message: 'That Idempotency-Key was already used for a different share link. Send a new key, or resend the original request.',
+      });
+    }
+    return reply.code(201).send(issued.value);
   });
 
   app.post('/tenants/:tenantId/pilot-import/:entityType/preview', async request => {
@@ -324,11 +409,23 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
   app.post('/tenants/:tenantId/pilot-import/:entityType/commit', async (request, reply) => {
     const { tenantId, entityType } = z.object({ tenantId: uuid, entityType: entityTypeSchema }).parse(request.params);
     const body = importBodySchema.parse(request.body);
+
+    // A commit writes a clinic's real patients and appointments, and the
+    // console sends an Idempotency-Key with it. A repeat of the same key
+    // returns the receipt the first commit produced without importing again -
+    // re-running would re-resolve the preset mapping, which may have changed,
+    // and hand back a receipt the caller was never given.
+    const committed = await withIdempotency({
+      scope: `pilot.import.commit:${tenantId}:${entityType}`,
+      key: idempotencyKeyFrom(request.headers as Record<string, unknown>),
+      tenantId,
+      fingerprint: requestFingerprint(body),
+    }, async ({ firstAttempt }) => {
     const preset = await loadPresetMapping(tenantId, entityType);
     const mapping = { ...preset.mapping, ...body.mapping };
     const analysis = analyzePilotImport(entityType, body.csvText, mapping);
     const validRows = analysis.rows.filter(row => !rowHasFatalIssues(row));
-    if (validRows.length === 0) return reply.code(400).send({ error: 'no_valid_rows', message: 'No rows are ready to import.' });
+    if (validRows.length === 0) throw app.httpErrors.badRequest('No rows are ready to import.');
 
     // Durable intent on the platform plane, recorded BEFORE the work and in the
     // past-conditional: ".requested", not ".committed". The platform plane sits
@@ -338,7 +435,7 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
     // the fact, which claimed an import that a later rollback could erase. The
     // outcome is recorded on the tenant plane, inside the same transaction as
     // the rows. Same order the public pilot-share route uses.
-    await platformAuditEvent(
+    if (firstAttempt) await platformAuditEvent(
       request,
       'pilot.import.committed.requested',
       { type: 'tenant', id: tenantId, tenantId },
@@ -489,5 +586,13 @@ export const pilotRoutes: FastifyPluginAsync = async app => {
       unmatchedProviderRefs,
       preview: analysis.rows.slice(0, 10).map(row => ({ index: row.index, status: row.status, issues: row.issues, sample: buildPreviewSample(row) })),
     };
+    });
+    if (committed.status === 'conflict') {
+      return reply.code(409).send({
+        error: 'pilot_idempotency_conflict',
+        message: 'That Idempotency-Key was already used for a different import. Send a new key, or resend the original request.',
+      });
+    }
+    return reply.send(committed.value);
   });
 };

@@ -261,8 +261,12 @@ export const crmRoutes: FastifyPluginAsync = async app => {
       return reply.code(409).send({
         error: 'provider_not_configured',
         channel: input.channel,
-        provider: status.provider,
-        missing: status.missing,
+        // The sending service's name and the exact missing environment keys are
+        // CareCommand's operational facts, not the clinic's: it holds no
+        // account with the sender and cannot set a server variable. A count
+        // tells it how far from ready we are; the audit row below keeps the
+        // precise answer, and the Control Tower shows it.
+        missingConfigCount: status.missing.length,
         providerMode: proposed.providerMode,
         message: `The ${input.channel} provider has no live sender configured, so live dispatch cannot be activated. Nothing was changed.`,
       });
@@ -595,7 +599,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     return reply.send({
       campaignId: id, status: newStatus, setupRequired: result.setupRequired > 0 && result.accepted === 0,
       summary: { total: result.total, accepted: result.accepted, deliveryUnknown: result.deliveryUnknown, suppressed: result.suppressed, skipped: result.skipped, setupRequired: result.setupRequired, queued: result.queued, failed: result.failed, authorityBlocked: result.authorityBlocked, atomicBoundaryBlocked: result.atomicBoundaryBlocked },
-      provider: { channel: result.channel, configured: result.provider.configured, setupRequired: result.provider.setupRequired, missing: result.provider.missing, mode: launchPreview.providerMode, liveDispatchActivated: launchPreview.liveDispatchActivated, activationBlockers: result.activationBlockers },
+      provider: { channel: result.channel, configured: result.provider.configured, setupRequired: result.provider.setupRequired, missingConfigCount: result.provider.missing.length, mode: launchPreview.providerMode, liveDispatchActivated: launchPreview.liveDispatchActivated, activationBlockers: result.activationBlockers },
       launchFingerprint: launchPreview.fingerprint,
       deepLinkTarget: `campaign/${id}`,
     });
@@ -687,7 +691,7 @@ export const crmRoutes: FastifyPluginAsync = async app => {
     // Provider readiness — truthful; no fake "sent".
     const status = channelStatus(channel);
     if (status.setupRequired) {
-      return reply.code(200).send({ status: 'setup_required', channel, provider: status.provider, missing: status.missing, message: `${channel} provider is not configured.` });
+      return reply.code(200).send({ status: 'setup_required', channel, missingConfigCount: status.missing.length, message: `The ${channel} service is not configured.` });
     }
 
     const tenant = await db.tenant.findUnique({ where: { id: request.auth.tenantId }, select: { name: true } });

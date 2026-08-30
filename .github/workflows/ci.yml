@@ -76,11 +76,19 @@ jobs:
       - run: npm ci
       - run: npm run db:generate
       - run: npm run db:deploy
-      # The suite needs reference data that no migration inserts — subscription
-      # plans exist only in prisma/seed.ts. Without this, 36 of 111 tests fail
-      # on `subscriptionPlan.findUnique(...) === null`, which is why `npm test`
-      # has never passed in this job.
-      - run: npm run db:seed
+      # Subscription-plan reference data now ships in a migration
+      # (20260828120000_subscription_catalog_reference_data), so `db:deploy`
+      # above installs it and the suite finds its plans.
+      #
+      # The `db:seed` step that used to sit here is deliberately gone. The
+      # comment it carried described prisma/seed.ts, which no longer exists;
+      # `db:seed` was repointed at prisma/seedSynthetic.ts, a DEMO seeder that
+      # fails closed unless SYNTHETIC_PROFILE, NODE_ENV=test and a disposable
+      # database name are all supplied. CI supplies none of them and its
+      # database is plain `carecommand`, so the step could never pass — it has
+      # failed every run since the repoint, which is why a red pipeline stopped
+      # being informative. Synthetic demo data has no business in the CI
+      # database regardless; the guard was right and the step was wrong.
       - name: Reject unexpected Prisma drift
         run: npm run verify:prisma-drift
       - name: Configure restricted RLS runtime role for verification

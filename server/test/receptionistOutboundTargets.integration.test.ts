@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { signRetell } from './helpers/retellSignature';
+import { maskProviderId } from '../lib/receptionist/liveCallUat';
 
 vi.mock('../workers/queues', () => ({
   redisConnection: {},
@@ -18,9 +19,11 @@ vi.mock('../workers/queues', () => ({
 const { buildApp } = await import('../app');
 const { env } = await import('../config/env');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
+const { recordUsageEvent, USAGE_METRICS } = await import('../lib/usageMetering');
 const { fingerprintJson } = await import('../modules/receptionist/intakeContract');
 const { isWithinQuietHours, quietHoursConfigurationReason, setProviderBoundaryTestHookForTests } = await import('../modules/receptionist/outbound');
 const { isDestinationOptedOut } = await import('../lib/campaigns');
+const { MAX_TENANT_ACTIVE_CALLS } = await import('../lib/receptionist/admissionPolicy');
 const { runWithJobTenantContext } = await import('../lib/tenantContext');
 
 type TenantFixture = Awaited<ReturnType<typeof makeTenant>>;
@@ -80,7 +83,7 @@ async function makeTenant() {
     },
   });
   const clinic = await db.receptionistClinic.create({
-    data: { tenantId: id, name: 'Main clinic', phone: phoneFor(id), timezone: 'America/New_York' },
+    data: { tenantId: id, name: 'Main clinic', phone: phoneFor(id), timezone: 'America/New_York', country: 'US', defaultLanguage: 'en-US' },
   });
   const now = new Date();
   const providerAgentId = `agent_${id.replaceAll('-', '')}`;
@@ -197,6 +200,7 @@ async function createCampaign(
     policyVersion?: string;
     quietHoursStart?: string | null;
     quietHoursEnd?: string | null;
+    requiredFields?: string[];
   } = {},
 ) {
   const defaultQuietHours = quietWindowOutsideNow();
@@ -209,7 +213,7 @@ async function createCampaign(
       agentId: tenant.agentId,
       name: options.name ?? `Outbound ${randomUUID().slice(0, 8)}`,
       script: 'Call the patient about care coordination.',
-      requiredFields: ['firstName', 'lastName', 'phone'],
+      requiredFields: options.requiredFields ?? ['firstName', 'lastName', 'phone'],
       bookingMode: options.bookingMode ?? 'APPOINTMENT_REQUEST_ONLY',
       receptionistCampaignId: options.receptionistCampaignId,
       defaultBranchId: options.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE' ? tenant.branchId : undefined,
@@ -342,7 +346,7 @@ describe('AI receptionist persistent reconciliation evidence', () => {
     const first = await read();
     expect(first.statusCode).toBe(200);
     expect(first.json()).toEqual([expect.objectContaining({
-      localCallLogId: call.id, providerCallId: call.retellCallId, targetId: target.id,
+      localCallLogId: call.id, providerCallId: maskProviderId(call.retellCallId), targetId: target.id,
       triggerSources: ['RECONCILIATION_REQUIRED', 'RECONCILIATION_SIGNAL', 'RECONCILIATION_TASK'],
       signalIds: [signal.id], signalStatuses: ['open'],
       reviewTaskIds: [task.id], reviewTaskStatuses: ['OPEN'],
@@ -409,7 +413,7 @@ describe('AI receptionist persistent reconciliation evidence', () => {
     });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual([expect.objectContaining({
-      localCallLogId: oldCall.id, providerCallId: oldCall.retellCallId,
+      localCallLogId: oldCall.id, providerCallId: maskProviderId(oldCall.retellCallId),
       triggerSources: ['RECONCILIATION_REQUIRED'],
     })]);
   });
@@ -1649,6 +1653,85 @@ describe('AI receptionist outbound authority and target integrity', () => {
     expect(mutated.json()).toMatchObject({ message: expect.stringContaining('outbound_authority_immutable') });
   });
 
+  it('pauses a RUNNING direct-booking campaign with custom requiredFields through a one-field PATCH without re-applying create defaults', async () => {
+    const tenant = await makeTenant();
+    const authority = await createDirectAuthority(tenant);
+    const requiredFields = ['firstName', 'lastName', 'phone', 'email'];
+    const campaignId = await createCampaign(tenant, {
+      bookingMode: 'DIRECT_BOOKING_IF_SLOT_AVAILABLE',
+      receptionistCampaignId: authority.id,
+      requiredFields,
+      maxRetryAttempts: 3,
+      status: 'RUNNING',
+    });
+    const before = await db.receptionistOutboundCampaign.findUniqueOrThrow({ where: { id: campaignId } });
+    expect(before).toMatchObject({ status: 'RUNNING', bookingMode: 'DIRECT_BOOKING_IF_SLOT_AVAILABLE', requiredFields, maxRetryAttempts: 3 });
+    expect(before.authorityApprovedAt).not.toBeNull();
+
+    // Zod 4 `.partial()` keeps `.default()`: a PATCH schema derived from the
+    // create schema used to fill requiredFields / bookingMode / maxRetryAttempts
+    // back in, read that as an authority change, and answer 409
+    // outbound_authority_immutable to a plain pause (A6-F01).
+    const paused = await app.inject({
+      method: 'PATCH',
+      url: `/v1/receptionist/outbound-campaigns/${campaignId}`,
+      headers: auth(tenant),
+      payload: { status: 'PAUSED' },
+    });
+    expect(paused.statusCode).toBe(200);
+    expect(paused.json()).toMatchObject({
+      status: 'PAUSED',
+      bookingMode: 'DIRECT_BOOKING_IF_SLOT_AVAILABLE',
+      requiredFields,
+      maxRetryAttempts: 3,
+      receptionistCampaignId: authority.id,
+      authorityFingerprint: before.authorityFingerprint,
+    });
+    expect(new Date(paused.json().authorityApprovedAt).toISOString()).toBe(before.authorityApprovedAt!.toISOString());
+  });
+
+  it('accepts empty strings for optional ids and policy fields as unset on create (M48)', async () => {
+    const tenant = await makeTenant();
+    const created = await app.inject({
+      method: 'POST',
+      url: '/v1/receptionist/outbound-campaigns',
+      headers: auth(tenant),
+      payload: {
+        clinicId: tenant.clinicId,
+        agentId: '',
+        receptionistCampaignId: '',
+        name: 'Request-only draft',
+        script: 'Call the patient about care coordination.',
+        purpose: '',
+        legalBasis: '',
+        policyVersion: '',
+        defaultBranchId: '',
+        defaultService: '',
+        consentText: '',
+        humanHandoffInstruction: '',
+        quietHoursStart: '',
+        quietHoursEnd: '',
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    expect(created.json()).toMatchObject({
+      status: 'DRAFT', bookingMode: 'APPOINTMENT_REQUEST_ONLY', requiredFields: ['firstName', 'lastName', 'phone'], maxRetryAttempts: 1,
+      agentId: null, receptionistCampaignId: null, purpose: null, legalBasis: null, policyVersion: null,
+      defaultBranchId: null, defaultService: null, quietHoursStart: null, quietHoursEnd: null,
+    });
+
+    // A real validation failure still names its field.
+    const invalid = await app.inject({
+      method: 'POST',
+      url: '/v1/receptionist/outbound-campaigns',
+      headers: auth(tenant),
+      payload: { clinicId: tenant.clinicId, name: 'x', script: 'Call the patient.', policyVersion: 'ab' },
+    });
+    expect(invalid.statusCode).toBe(400);
+    expect(invalid.json().message).toMatch(/^name: /);
+    expect(Object.keys(invalid.json().details.fieldErrors).sort()).toEqual(['name', 'policyVersion']);
+  });
+
   it('freezes attested direct-booking authority after approval', async () => {
     const tenant = await makeTenant();
     const authority = await createDirectAuthority(tenant);
@@ -2049,14 +2132,16 @@ describe('AI receptionist outbound regression safety controls', () => {
     const tenant = await makeTenant();
     const campaignId = await createCampaign(tenant, { status: 'RUNNING' });
     const target = await addPatientTarget(tenant, campaignId, 701);
+    // Fill the tenant's concurrency ceiling exactly, reading the policy value
+    // rather than restating it: C7 raised it off a hardcoded 3.
     await db.receptionistCallLog.createMany({
-      data: [1, 2, 3].map(suffix => ({
+      data: Array.from({ length: MAX_TENANT_ACTIVE_CALLS }, (_, index) => ({
         tenantId: tenant.id,
         clinicId: tenant.clinicId,
         outboundCampaignId: campaignId,
-        callerPhone: phoneFor(tenant.id, 710 + suffix),
+        callerPhone: phoneFor(tenant.id, 711 + index),
         direction: 'outbound',
-        outcome: 'IN_PROGRESS',
+        outcome: 'IN_PROGRESS' as const,
       })),
     });
 
@@ -2076,10 +2161,22 @@ describe('AI receptionist outbound regression safety controls', () => {
       where: { tenantId: tenant.id, outcome: 'IN_PROGRESS' },
       data: { outcome: 'FAILED', endedAt: new Date() },
     });
+    // Exhaust the allowance the way the product now measures it: usage is
+    // metered per billing period in UsageEvent, not accumulated forever in
+    // TenantUsageLimit.used. The limit row still carries the POLICY (1 minute).
     await db.tenantUsageLimit.upsert({
       where: { tenantId_key: { tenantId: tenant.id, key: 'voice_minutes' } },
       update: { used: 1, limitValue: 1 },
       create: { tenantId: tenant.id, key: 'voice_minutes', used: 1, limitValue: 1 },
+    });
+    await recordUsageEvent(db, {
+      tenantId: tenant.id,
+      metric: USAGE_METRICS.voiceMinute,
+      quantity: 1,
+      occurredAt: new Date(),
+      sourceModule: 'receptionist',
+      sourceType: 'receptionistCallLog',
+      dedupeKey: `test-exhaust-${tenant.id}`,
     });
     const minutesExhausted = await app.inject({
       method: 'POST',

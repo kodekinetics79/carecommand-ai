@@ -37,7 +37,7 @@ async function makeTenant() {
   await db.tenant.create({ data: { id, name: `life-${id.slice(0, 6)}`, slug: `life-${id.slice(0, 8)}` } });
   await db.tenantFeatureEntitlement.create({ data: { tenantId: id, featureKey: 'ai_receptionist', enabled: true, source: 'test' } });
   const user = await db.user.create({ data: { tenantId: id, role: 'OWNER', active: true, email: `owner-${id.slice(0, 8)}@life.test`, displayName: 'Owner' } });
-  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Main clinic', phone: phoneFor(id) }, select: { id: true } });
+  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Main clinic', phone: phoneFor(id), country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' }, select: { id: true } });
   const providerAgentId = `agent_${id.replaceAll('-', '')}`;
   const providerAgentVersion = 2;
   const verifiedAt = new Date();
@@ -151,10 +151,18 @@ describe('receptionist inbound-call lifecycle (event webhook)', () => {
     // 4. Retrievable via the authenticated call-logs API (client responses recorded).
     const res = await app.inject({ method: 'GET', url: '/v1/receptionist/call-logs', headers: authFor(t) });
     expect(res.statusCode).toBe(200);
-    const apiLogs = res.json() as Array<{ retellCallId: string; outcome: string; durationSeconds: number }>;
-    const mine = apiLogs.find(l => l.retellCallId === callId);
+    // The queue paginates and the list projection carries no raw phone,
+    // recording URL or sentiment — those live on the detail route now.
+    // The provider call id is MASKED on the wire now, and the field is named
+    // for what it is rather than for who supplies it — a list route must not
+    // hand a clinic the supplier's full call identifier.
+    const apiLogs = res.json().data as Array<{ providerCallRef: string; outcome: string; durationSeconds: number; callerPhoneMasked: string | null; recordingUrl: null }>;
+    const mine = apiLogs.find(l => l.providerCallRef === `${callId.slice(0, 4)}\u2026${callId.slice(-4)}`);
+    expect(mine, 'the masked provider call ref should identify the call').toBeDefined();
     expect(mine?.outcome).toBe('ESCALATED');
     expect(mine?.durationSeconds).toBe(125);
+    expect(mine?.recordingUrl).toBeNull();
+    expect(mine).not.toHaveProperty('callerPhone');
   });
 
   it('OPTED_OUT files exactly one opt-out, idempotent across redelivery', async () => {

@@ -223,6 +223,19 @@ const baseEnvSchema = z.object({
   RETELL_API_KEY: z.string().optional(),
   RETELL_FROM_NUMBER: z.string().optional(),
   RETELL_BASE_URL: z.string().url().default('https://api.retellai.com'),
+  // Receptionist deployment/verification budgets. A deploy is one HTTP request
+  // that makes up to four provider calls; the per-call timeout times the
+  // step count must stay inside the overall budget, which itself must stay
+  // inside the Vercel function limit (60 s) with room for verification.
+  RETELL_DEPLOY_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(30_000).default(8_000),
+  RECEPTIONIST_DEPLOY_BUDGET_MS: z.coerce.number().int().min(5_000).max(55_000).default(40_000),
+  RECEPTIONIST_DEPLOY_HOURLY_LIMIT: z.coerce.number().int().min(1).max(500).default(20),
+  // Per-agent cooldowns for USER-initiated deploys/verifies. Unset resolves to
+  // 60 s outside NODE_ENV=test and 0 in tests (suites verify back-to-back).
+  RECEPTIONIST_DEPLOY_COOLDOWN_MS: z.coerce.number().int().min(0).max(3_600_000).optional(),
+  RECEPTIONIST_VERIFY_COOLDOWN_MS: z.coerce.number().int().min(0).max(3_600_000).optional(),
+  // How far ahead of the 24 h verification expiry the hourly worker re-verifies.
+  RECEPTIONIST_REVERIFY_LEAD_MS: z.coerce.number().int().min(60_000).max(23 * 60 * 60 * 1_000).default(6 * 60 * 60 * 1_000),
   // Attended, synthetic-only live voice UAT. These controls are deliberately
   // independent of normal tenant limits. A run needs one exact destination,
   // a short-lived execution id, and hard call/minute/cost caps. Values belong
@@ -362,6 +375,17 @@ export const envSchema = baseEnvSchema.superRefine((cfg, ctx) => {
     } catch {
       ctx.addIssue({ code: 'custom', path: ['LIVE_TEST_TIMEZONE'], message: 'Live voice UAT requires a valid IANA time zone.' });
     }
+  }
+
+  // A mock voice provider is a rehearsal posture only. Unlike payments/insurance/
+  // ai it is not acknowledgeable: nothing a pilot clinic does can make a mock
+  // receptionist answer a patient call, so the profile gate refuses it outright.
+  if (cfg.DEPLOYMENT_PROFILE !== 'demo' && (cfg.RETELL_API_KEY ?? '').startsWith('mock')) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['RETELL_API_KEY'],
+      message: `A mock voice provider cannot answer patient calls (DEPLOYMENT_PROFILE=${cfg.DEPLOYMENT_PROFILE}); use DEPLOYMENT_PROFILE=demo for rehearsal or configure a real Retell API key.`,
+    });
   }
 
   // PORTAL_TOKEN_OUTBOX_PATH writes RAW patient magic-login tokens to disk —

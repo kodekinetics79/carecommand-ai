@@ -394,7 +394,7 @@ describe('campaign submission fence — opt-out races', () => {
     let claimStarted = false;
     try {
       await writer.query('BEGIN');
-      // Exactly what server/modules/receptionist/routes.ts takes before writing
+      // Exactly what server/modules/receptionist/activity.ts takes before writing
       // a ReceptionistOptOut row.
       await writer.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [dncFenceKey(t.id, phone)]);
 

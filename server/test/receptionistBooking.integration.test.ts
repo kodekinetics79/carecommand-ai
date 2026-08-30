@@ -41,7 +41,7 @@ async function makeTenant() {
   const provider = await db.providerProfile.create({ data: { tenantId: id, branchId: branch.id, userId: provUser.id, specialty: 'Primary Care' }, select: { id: true } });
   await db.providerAvailability.createMany({ data: Array.from({ length: 7 }, (_, dayOfWeek) => ({ tenantId: id, branchId: branch.id, providerProfileId: provider.id, dayOfWeek, startMinute: 540, endMinute: 1020, slotMinutes: 30 })) });
   const patient = await db.patient.create({ data: { tenantId: id, branchId: branch.id, firstName: 'Pat', lastName: 'Roe', lifecycleStage: 'ACTIVE' }, select: { id: true } });
-  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Clinic', phone: phoneFor(id) }, select: { id: true } });
+  const clinic = await db.receptionistClinic.create({ data: { tenantId: id, name: 'Clinic', phone: phoneFor(id), country: 'US', timezone: 'America/New_York', defaultLanguage: 'en-US' }, select: { id: true } });
   const location = await db.receptionistLocation.create({
     data: { tenantId: id, clinicId: clinic.id, branchId: branch.id, name: 'Main location', address: '1 Test Way', active: true },
     select: { id: true, name: true },
@@ -802,10 +802,25 @@ describe('receptionist /fn booking — real availability + booking', () => {
     expect(await db.auditEvent.count({ where: { tenantId: t.id, action: 'receptionist.recording_preference.recorded', resourceId: call.id } })).toBe(1);
   });
 
-  it('does not invent capacity when provider selection is ambiguous', async () => {
+  // C1. This assertion used to be inverted: a second clinician at the branch
+  // made the tool refuse to offer ANY time, so every real multi-clinician
+  // practice heard "I need a team member to confirm the provider" on every
+  // call. More than one clinician is the normal case, not an ambiguity.
+  it('offers times across every clinician at the branch instead of refusing on ambiguity', async () => {
     const t = await makeTenant();
     const user = await db.user.create({ data: { tenantId: t.id, role: 'PROVIDER', active: true, email: `pv2-${t.id.slice(0, 8)}@bk.test`, displayName: 'Dr Two' } });
     await db.providerProfile.create({ data: { tenantId: t.id, branchId: t.branchId, userId: user.id, specialty: 'Primary Care' } });
+    const date = futureDate(3);
+    const result = (await fn(t, 'check_availability', { appointment_date: date, service: 'Consultation' })).json() as { available: boolean; needs_review?: boolean; slots: unknown[] };
+    expect(result.available).toBe(true);
+    expect(result.needs_review).toBeUndefined();
+    expect(result.slots.length).toBeGreaterThan(0);
+  });
+
+  // A branch with no bookable clinician at all is still a genuine refusal.
+  it('still refuses when the branch has no active clinician to book with', async () => {
+    const t = await makeTenant();
+    await db.providerProfile.updateMany({ where: { tenantId: t.id, branchId: t.branchId }, data: { active: false } });
     const date = futureDate(3);
     const result = (await fn(t, 'check_availability', { appointment_date: date, service: 'Consultation' })).json() as { available: boolean; needs_review?: boolean; slots: unknown[] };
     expect(result.available).toBe(false);

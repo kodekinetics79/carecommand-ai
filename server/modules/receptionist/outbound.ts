@@ -5,6 +5,9 @@ import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
 import { env } from '../../config/env';
 import { retellConfigStatus, createPhoneCall, getPhoneCall, stopPhoneCall } from '../../lib/retell';
+import { buildHoursDynamicVariables, hoursStatus } from '../../lib/receptionist/clinicHours';
+import { loadHoursSource } from '../../lib/receptionist/hoursSource';
+import { resolveLocalePackWithFallback, resolvedLocaleFormat } from '../../lib/receptionist/localePacks/resolve';
 import { isDestinationOptedOut, isSuppressed, isValidE164, toE164 } from '../../lib/campaigns';
 import { requireRoles } from '../../plugins/roles';
 import {
@@ -50,7 +53,10 @@ const OUTBOUND_LEGAL_BASES = ['EXPLICIT_CONSENT', 'TREATMENT_OPERATIONS'] as con
 const STRICT_HH_MM = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 const CLIENT_LAUNCH_ATTEMPT_SCOPE = 'receptionist.outbound-client-attempt';
 const LIVE_UAT_TARGET_SOURCE_PREFIX = 'live_voice_uat:';
-export const MAX_TENANT_ACTIVE_CALLS = 3;
+import { MAX_TENANT_ACTIVE_CALLS } from '../../lib/receptionist/admissionPolicy';
+import { recordUsageEvent, periodUsageTotal, voiceCallDedupeKey, USAGE_METRICS } from '../../lib/usageMetering';
+import { liveCallingBlockReason, TENANT_MODE_DEMO_BLOCK } from '../../lib/tenantMode';
+
 export const DEFAULT_VOICE_MINUTES_LIMIT = 500;
 
 type ProviderBoundaryTestStage = 'before_suppression_fence' | 'suppression_fence_acquired' | 'provider_intent_committed' | 'before_provider_binding_lock' | 'provider_binding_committed' | 'before_call_stopping_evaluation';
@@ -718,87 +724,53 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
   });
 
   // ----- Retell setup status (no secrets exposed) -------------------------
-  app.get('/retell-status', async request => {
-    const status = retellConfigStatus();
-    const linkedAgents = await db.receptionistAgent.findMany({
-      where: { tenantId: request.auth.tenantId, active: true },
-      select: {
-        active: true, providerAgentId: true, providerVersion: true, providerStatus: true,
-        providerConfigRevision: true, providerVerifiedRevision: true, providerVerifiedAt: true,
-        providerVerificationExpiresAt: true,
-      },
-    });
-    const readyAgents = linkedAgents.filter(agent => !agentReadinessReason(agent)).length;
-    const liveTest = liveCallUatStatus(new Date(), request.auth.tenantId);
-    const liveScope = liveCallUatScope();
-    const liveAttempts = liveScope
-      ? await db.idempotencyKey.findMany({
-        where: { tenantId: request.auth.tenantId, scope: liveScope },
-        select: { resultId: true },
-        take: Math.max(20, liveTest.maxCalls + 1),
-      })
-      : [];
-    const liveCallIds = liveAttempts
-      .map(attempt => attempt.resultId)
-      .filter((value): value is string => Boolean(value && !value.startsWith('blocked:') && value !== 'dispatching'));
-    const liveCalls = liveCallIds.length
-      ? await db.receptionistCallLog.findMany({
-        where: { tenantId: request.auth.tenantId, id: { in: liveCallIds } },
-        select: { durationSeconds: true, endedAt: true, outcome: true },
-      })
-      : [];
-    const connectedSeconds = liveCalls.reduce((sum, call) => sum + call.durationSeconds, 0);
-    const liveAdmission = evaluateLiveCallAdmission({
-      attemptsUsed: liveAttempts.length,
-      connectedSeconds,
-      activeCalls: liveCalls.filter(call => !call.endedAt && call.outcome === 'IN_PROGRESS').length,
-    }, new Date(), request.auth.tenantId);
-    return {
-      configured: status.configured && readyAgents > 0,
-      mock: status.mock,
-      missing: [...status.missing, ...(readyAgents ? [] : ['AGENT_DEPLOYMENT'])],
-      readyAgents,
-      adhocTestCallsAllowed: status.mock && env.NODE_ENV !== 'production',
-      liveTest: {
-        ...liveTest,
-        attemptsUsed: liveAttempts.length,
-        callsRemaining: Math.max(0, liveTest.maxCalls - liveAttempts.length),
-        minutesUsed: Math.ceil(connectedSeconds / 60),
-        minutesRemaining: Math.max(0, liveTest.maxTotalMinutes - Math.ceil(connectedSeconds / 60)),
-        activeCalls: liveCalls.filter(call => !call.endedAt && call.outcome === 'IN_PROGRESS').length,
-        admissionReason: liveAdmission.allowed ? null : liveAdmission.reason,
-      },
-      checklist: [
-        { key: 'RETELL_API_KEY', label: 'Retell API key', set: !status.missing.includes('RETELL_API_KEY') },
-        { key: 'RETELL_FROM_NUMBER', label: 'Outbound caller number', set: !status.missing.includes('RETELL_FROM_NUMBER') },
-        { key: 'AGENT_DEPLOYMENT', label: 'Published agent deployment', set: readyAgents > 0 },
-        { key: 'LIVE_TEST_CALLS_AUTHORIZED', label: 'Attended live-test authorization', set: liveTest.active },
-      ],
-    };
-  });
+  // GET /retell-status moved to modules/receptionist/deployment.ts in C5: the
+  // tenant-wide checklist could not answer "can THIS campaign take a call?",
+  // and it belongs with deployment rather than with outbound dialling.
 
   // ----- Outbound campaigns ----------------------------------------------
-  const campaignCreate = z.object({
+  // The Studio form binds every optional field to a text input, so "unset"
+  // arrives as '' as often as null. Treat '' as null for optional ids and
+  // strings instead of answering 400 "Invalid UUID" for a field the user
+  // never touched.
+  const emptyToNull = <T extends z.ZodTypeAny>(schema: T) => z.preprocess(value => (value === '' ? null : value), schema);
+  const optionalUuid = emptyToNull(uuid.optional().nullable());
+  const optionalText = (max: number, min = 0) => emptyToNull((min > 0 ? z.string().trim().min(min) : z.string()).max(max).optional().nullable());
+  const optionalQuietHour = emptyToNull(z.string().trim().regex(STRICT_HH_MM).optional().nullable());
+  const optionalEnum = <T extends readonly [string, ...string[]]>(values: T) => emptyToNull(z.enum(values).optional().nullable());
+  const REQUIRED_FIELDS_DEFAULT: Array<(typeof REQUIRED_FIELD_KEYS)[number]> = ['firstName', 'lastName', 'phone'];
+  const bookingModeEnum = z.enum(['APPOINTMENT_REQUEST_ONLY', 'DIRECT_BOOKING_IF_SLOT_AVAILABLE']);
+  const maxRetryAttemptsInput = z.number().int().min(0).max(10);
+  // No `.default()` anywhere on the base: Zod 4's `.partial()` keeps defaults,
+  // so a one-field PATCH built from a defaulted schema would silently re-apply
+  // `requiredFields`/`bookingMode`/`maxRetryAttempts` and trip the authority
+  // immutability check on a RUNNING campaign (A6-F01).
+  const campaignBase = z.object({
     clinicId: uuid,
-    agentId: uuid.optional().nullable(),
-    receptionistCampaignId: uuid.optional().nullable(),
+    agentId: optionalUuid,
+    receptionistCampaignId: optionalUuid,
     name: z.string().trim().min(2).max(160),
     script: z.string().trim().min(2).max(4000),
-    purpose: z.enum(OUTBOUND_PURPOSES).optional().nullable(),
-    legalBasis: z.enum(OUTBOUND_LEGAL_BASES).optional().nullable(),
-    policyVersion: z.string().trim().min(3).max(80).optional().nullable(),
-    requiredFields: z.array(z.enum(REQUIRED_FIELD_KEYS)).default(['firstName', 'lastName', 'phone']),
+    purpose: optionalEnum(OUTBOUND_PURPOSES),
+    legalBasis: optionalEnum(OUTBOUND_LEGAL_BASES),
+    policyVersion: optionalText(80, 3),
+    requiredFields: z.array(z.enum(REQUIRED_FIELD_KEYS)),
     customQuestions: z.any().optional(),
-    consentText: z.string().max(2000).optional().nullable(),
-    humanHandoffInstruction: z.string().max(1000).optional().nullable(),
-    bookingMode: z.enum(['APPOINTMENT_REQUEST_ONLY', 'DIRECT_BOOKING_IF_SLOT_AVAILABLE']).default('APPOINTMENT_REQUEST_ONLY'),
-    defaultBranchId: uuid.optional().nullable(),
-    defaultService: z.string().max(160).optional().nullable(),
-    quietHoursStart: z.string().trim().regex(STRICT_HH_MM).optional().nullable(),
-    quietHoursEnd: z.string().trim().regex(STRICT_HH_MM).optional().nullable(),
-    maxRetryAttempts: z.number().int().min(0).max(10).default(1),
+    consentText: optionalText(2000),
+    humanHandoffInstruction: optionalText(1000),
+    bookingMode: bookingModeEnum,
+    defaultBranchId: optionalUuid,
+    defaultService: optionalText(160),
+    quietHoursStart: optionalQuietHour,
+    quietHoursEnd: optionalQuietHour,
+    maxRetryAttempts: maxRetryAttemptsInput,
   });
-  const campaignUpdate = campaignCreate.partial().omit({ clinicId: true }).extend({
+  const campaignCreate = campaignBase.extend({
+    requiredFields: z.array(z.enum(REQUIRED_FIELD_KEYS)).default(REQUIRED_FIELDS_DEFAULT),
+    bookingMode: bookingModeEnum.default('APPOINTMENT_REQUEST_ONLY'),
+    maxRetryAttempts: maxRetryAttemptsInput.default(1),
+  });
+  const campaignUpdate = campaignBase.omit({ clinicId: true }).partial().extend({
     status: z.enum(['DRAFT', 'SCHEDULED', 'RUNNING', 'PAUSED', 'COMPLETED', 'FAILED']).optional(),
   });
 
@@ -1355,7 +1327,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       if (!terminal || !targetReleased || (unboundUncertainIntent && !reconciliationResolved)) {
         return {
           cleared: false as const, proof: unboundUncertainIntent ? 'unbound_provider_intent' as const : 'call_not_terminal' as const,
-          callLogId: call.id, providerCallId: call.retellCallId,
+          callLogId: call.id, providerCallId: maskProviderId(call.retellCallId),
         };
       }
       await tx.idempotencyKey.update({ where: { id: attempt.id }, data: { resultId: `reconciled:${call.id}` } });
@@ -1366,7 +1338,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
         metadata: { clientAttemptToken: token, outcome: call.outcome, targetReleased },
       } });
-      return { cleared: true as const, proof: 'durable_terminal_reconciliation' as const, callLogId: call.id, providerCallId: call.retellCallId };
+      return { cleared: true as const, proof: 'durable_terminal_reconciliation' as const, callLogId: call.id, providerCallId: maskProviderId(call.retellCallId) };
     });
   });
 
@@ -1384,7 +1356,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     const campaign = await db.receptionistOutboundCampaign.findFirst({
       where: { id, tenantId: request.auth.tenantId },
       include: {
-        clinic: { select: { name: true, complianceDisclosure: true, timezone: true } },
+        clinic: { select: { id: true, name: true, complianceDisclosure: true, timezone: true, country: true, defaultLanguage: true } },
         agent: true,
         receptionistCampaign: { select: { id: true, offerScript: true, appointmentType: true } },
       },
@@ -1643,12 +1615,22 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
           const activeCalls = await tx.receptionistCallLog.count({
             where: { tenantId: request.auth.tenantId, outcome: 'IN_PROGRESS', endedAt: null },
           });
+          // A demonstration workspace must never dial a real number. Checked
+          // before concurrency and quota so it cannot be reached by waiting.
+          const modeBlock = await liveCallingBlockReason(request.auth.tenantId, tx);
+          if (modeBlock) {
+            await finishClientAttempt(`blocked:${TENANT_MODE_DEMO_BLOCK}`);
+            return { blocked: TENANT_MODE_DEMO_BLOCK as typeof TENANT_MODE_DEMO_BLOCK };
+          }
           const activeCallLimit = liveTest ? 1 : MAX_TENANT_ACTIVE_CALLS;
           if (activeCalls >= activeCallLimit) {
             await finishClientAttempt('blocked:concurrency_limit_reached');
             return { blocked: 'concurrency_limit_reached' as const };
           }
-          const usedMinutes = Math.max(voiceUsage.used, aiUsage.receptionistMinutes);
+          // Included minutes are per billing period; the lifetime counters above
+          // are display-only. Enforcing on them meant a clinic's allowance ran
+          // out once and never came back.
+          const usedMinutes = await periodUsageTotal(tx, request.auth.tenantId, USAGE_METRICS.voiceMinute);
           // Each in-progress call reserves at least one billable minute. This
           // prevents parallel launches from consuming the final minute twice.
           if (!aiUsage.overageAllowed && voiceUsage.limitValue !== null && usedMinutes + activeCalls >= voiceUsage.limitValue) {
@@ -1989,17 +1971,38 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         trackingDegraded,
       });
     }
+    // A campaign with no linked agent has no name to introduce itself with.
+    // Substituting one would put a fabricated identity on a real call, so the
+    // dial is refused instead (readiness already blocks this earlier).
+    if (!campaign.agent?.name) {
+      await releaseReservedAttempt('AGENT_REQUIRED');
+      await audit(request, { action: 'receptionist.call.blocked', resource: 'receptionistOutboundCampaign', resourceId: campaign.id, metadata: { reason: 'agent_required' } });
+      return reply.code(409).send({ status: 'blocked', reason: 'agent_required', callLogId: callLog.id });
+    }
+
+    // Call-time truth for the hours and emergency variables: what the agent
+    // says about "are you open" must be resolved now, not at export time.
+    const dialBundle = await loadHoursSource(db, { tenantId: request.auth.tenantId, clinicId: campaign.clinic.id });
+    const dialPack = await resolveLocalePackWithFallback(db, {
+      tenantId: request.auth.tenantId,
+      language: campaign.agent.language ?? campaign.clinic.defaultLanguage,
+      country: campaign.clinic.country,
+    });
+    const dialLocale = resolvedLocaleFormat(dialPack, campaign.clinic.defaultLanguage);
+    const dialStatus = dialBundle ? hoursStatus(dialBundle.source, new Date(), dialLocale) : null;
+
     const result = await createPhoneCall({
       toNumber: canonicalDialDestination,
       agentId: authorizedCampaign.agent!.providerAgentId!,
       agentVersion: authorizedCampaign.agent!.providerVersion!,
       webhookUrl: `${env.PUBLIC_API_URL}/v1/receptionist/webhooks/retell?clinicId=${campaign.clinicId}&campaignId=${campaign.receptionistCampaignId ?? ''}`,
       dynamicVariables: {
+        ...buildHoursDynamicVariables({ status: dialStatus, strings: dialPack?.strings ?? null }),
         clinic_name: campaign.clinic.name,
-        agent_name: campaign.agent?.name ?? 'Riley',
+        agent_name: campaign.agent.name,
         disclosure: liveTest
           ? liveCallUatDisclosure(campaign.clinic.complianceDisclosure)
-          : campaign.clinic.complianceDisclosure,
+          : campaign.clinic.complianceDisclosure ?? '',
         live_test_disclosure: liveTest ? liveCallUatDisclosure(null) : '',
         consent_text: campaign.consentText ?? '',
         human_handoff: campaign.humanHandoffInstruction ?? '',
@@ -2707,6 +2710,18 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         const finalMinutes = Math.ceil(updated.durationSeconds / 60);
         const delta = Math.max(0, finalMinutes - priorMinutes);
         if (delta > 0) {
+          // Billable record first, in the same transaction as the call row.
+          await recordUsageEvent(tx, {
+            tenantId: request.auth.tenantId,
+            metric: USAGE_METRICS.voiceMinute,
+            quantity: delta,
+            occurredAt: updated.endedAt ?? new Date(),
+            sourceModule: 'receptionist',
+            sourceType: 'receptionistCallLog',
+            sourceId: updated.id,
+            dedupeKey: voiceCallDedupeKey(localCall.retellCallId ?? updated.id, finalMinutes),
+          });
+          // Lifetime totals, kept for the operator's "since day one" view only.
           await tx.tenantAiUsage.upsert({
             where: { tenantId: request.auth.tenantId },
             update: { receptionistMinutes: { increment: delta } },
@@ -2809,10 +2824,14 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       resourceId: id,
       metadata: { count: rows.length, recordingsDisclosed: canReadRecordings },
     });
-    return rows.map(row => ({
+    return rows.map(({ retellCallId, ...row }) => ({
       ...row,
       callerPhone: maskPhone(row.callerPhone),
-      retellCallId: maskProviderId(row.retellCallId),
+      // The value was already masked; the KEY was not. A field called
+      // `retellCallId` names the supplier in every response body, every
+      // network tab and every error report a clinic forwards to us, whatever
+      // the value beside it has been reduced to.
+      providerCallRef: maskProviderId(retellCallId),
       recordingAvailable: Boolean(row.recordingUrl),
       recordingUrl: canReadRecordings ? row.recordingUrl : null,
     }));

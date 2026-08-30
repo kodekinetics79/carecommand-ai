@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { env } from '../../config/env';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
-import { requirePermission, PERMISSIONS, ROLE_PERMISSIONS, sanitizePermissions } from '../../lib/permissions';
+import { requirePermission, PERMISSIONS, ROLE_PERMISSIONS, sanitizePermissions, assertRoleEditWithinAuthority } from '../../lib/permissions';
 import { runWithTenantContext } from '../../lib/tenantContext';
 import { checkRlsRuntimeRole } from '../../lib/rlsGuard';
 import { setUserActiveSafely, setUserRoleSafely } from '../../lib/adminSafety';
@@ -585,6 +585,8 @@ export const settingsRoutes: FastifyPluginAsync = async app => {
   app.post('/roles', { preHandler: writeRoles }, async (request, reply) => {
     const { permissions, ...input } = roleCreate.parse(request.body);
     const sanitizedPermissions = permissions === undefined ? undefined : sanitizePermissions(permissions);
+    const authority = await assertRoleEditWithinAuthority(request, { names: [input.name], permissions: sanitizedPermissions });
+    if (!authority.ok) return reply.code(authority.status).send({ error: authority.error, message: authority.message });
     const row = await runWithTenantContext(request.auth.tenantId, async tx => {
       const created = await tx.roleDefinition.create({
         data: {
@@ -611,10 +613,15 @@ export const settingsRoutes: FastifyPluginAsync = async app => {
     return reply.code(201).send(row);
   });
 
-  app.patch('/roles/:id', { preHandler: writeRoles }, async request => {
+  app.patch('/roles/:id', { preHandler: writeRoles }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
     const { permissions, ...input } = roleUpdate.parse(request.body);
     const sanitizedPermissions = permissions === undefined ? undefined : sanitizePermissions(permissions);
+    const target = await runWithTenantContext(request.auth.tenantId, tx => tx.roleDefinition.findFirst({ where: { id, tenantId: request.auth.tenantId }, select: { name: true } }));
+    if (!target) throw app.httpErrors.notFound('Role not found');
+    // Both names matter: the row being edited and any name it is renamed to.
+    const authority = await assertRoleEditWithinAuthority(request, { names: [target.name, input.name], permissions: sanitizedPermissions });
+    if (!authority.ok) return reply.code(authority.status).send({ error: authority.error, message: authority.message });
     return runWithTenantContext(request.auth.tenantId, async tx => {
       const existing = await tx.roleDefinition.findFirst({ where: { id, tenantId: request.auth.tenantId } });
       if (!existing) throw app.httpErrors.notFound('Role not found');

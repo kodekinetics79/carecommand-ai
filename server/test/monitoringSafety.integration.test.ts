@@ -3,6 +3,7 @@ import { describe, it, expect, afterAll } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { fixtureDb as db } from './helpers/fixtureDb';
 import { detectMissedReadings, detectOfflineDevices } from '../lib/connectedCare/safetyDetection';
+import { MONITORING_ALERT_SOURCE } from '../lib/connectedCare/alertInbox';
 
 // Proves the proactive RPM safety net actually DETECTS at runtime (missed
 // readings + offline devices) — previously these alerts were seed-only. Uses
@@ -71,7 +72,18 @@ describe('missed-reading detection (P0 safety)', () => {
     const alerts = await db.readingAlert.findMany({ where: { tenantId: t.id, patientId: t.patientId, alertType: 'missed_reading', status: { in: ['open', 'acknowledged', 'assigned'] } } });
     expect(alerts).toHaveLength(1);
     const notification = await db.notificationEvent.findFirstOrThrow({ where: { tenantId: t.id, alertId: alerts[0].id } });
-    expect(notification).toMatchObject({ recipientUserId: owner.id, status: 'queued', attempts: 0, sentAt: null });
+    // 'queued' here means "waiting unseen in the recipient's inbox", which is
+    // the correct state the instant it is raised. It is NOT the end state: the
+    // row carries the monitoring source so the alert inbox can find it and
+    // record delivery. This assertion previously pinned non-delivery as
+    // expected behaviour while nothing anywhere could ever move the row.
+    expect(notification).toMatchObject({
+      recipientUserId: owner.id,
+      status: 'queued',
+      attempts: 0,
+      channel: 'in_app',
+      source: MONITORING_ALERT_SOURCE,
+    });
   });
 });
 

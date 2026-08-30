@@ -23,6 +23,7 @@
     "rls:verify": "tsx server/scripts/verifyRlsCatalog.ts",
     "rls:verify:role": "tsx server/scripts/verifyRlsStatus.ts",
     "rls:docs": "tsx server/scripts/verifyRlsCatalog.ts --write-docs",
+    "integrity:objects": "tsx server/scripts/withDisposableRlsDatabase.ts -- tsx server/scripts/printTenantIntegrityObjects.ts",
     "test:rls:behavior": "tsx server/scripts/withDisposableRlsDatabase.ts -- npx vitest run server/test/rlsBehavioralCoverage.integration.test.ts",
     "demo:provision": "tsx server/scripts/provisionDemoTenant.ts",
     "demo:verify": "tsx server/scripts/withDisposableRlsDatabase.ts -- npx vitest run server/test/demoReadiness.integration.test.ts",

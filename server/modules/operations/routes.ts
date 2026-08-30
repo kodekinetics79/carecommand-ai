@@ -10,7 +10,15 @@ import { requireFeature } from '../../lib/entitlements';
 import { sendMessage, type SendResult } from '../../lib/commsProvider';
 import { isSuppressed, isValidE164, isValidEmail, maskDestination, toE164, type CommChannel } from '../../lib/campaigns';
 import { getRequestPermissions, requirePermission } from '../../lib/permissions';
+import { Prisma } from '../../generated/prisma/client';
 import { ensureStaffTask } from '../../lib/staffTasks';
+import { cursorPage } from '../../lib/pagination';
+import {
+  normalizeTaskPriority, parseReceptionistTask,
+  RECEPTIONIST_TASK_KINDS, RECEPTIONIST_TASK_WORKFLOW, RECEPTIONIST_TASK_WORKFLOWS,
+  taskPriorityVariants, type ReceptionistTaskKind,
+} from '../../lib/receptionist/frontDeskTask';
+import { projectTaskRow, taskListInclude } from '../../lib/receptionist/taskProjection';
 
 const channel = z.enum(['WHATSAPP', 'SMS', 'EMAIL', 'PUSH', 'CALL', 'VIDEO']);
 const uuid = z.string().uuid();
@@ -945,37 +953,215 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     });
   });
 
+  // ===== Front desk queue ==================================================
+  // Branch visibility (M14): a branch-scoped caller sees their branch AND the
+  // unscoped rows, because `createSafetyTask` files a task with branchId null
+  // whenever the branch is ambiguous — dropping those would hide exactly the
+  // work nobody has claimed. Masking lives in lib/receptionist/taskProjection.
+  const csvEnum = <T extends string>(values: readonly T[]) => z.string()
+    .transform(value => value.split(',').map(part => part.trim()).filter(Boolean))
+    .pipe(z.array(z.enum(values as unknown as [T, ...T[]])).min(1));
+
+  const taskListQuery = z.object({
+    cursor: uuid.optional(),
+    limit: z.coerce.number().int().min(1).max(100).default(50),
+    status: csvEnum(['OPEN', 'IN_PROGRESS', 'COMPLETED', 'CANCELED'] as const).optional(),
+    workflow: z.string().max(60).optional(),
+    kind: csvEnum(RECEPTIONIST_TASK_KINDS).optional(),
+    assignee: z.union([z.literal('me'), z.literal('unassigned'), uuid]).optional(),
+    branchId: uuid.optional(),
+    // D14: in a multi-clinic tenant the Emergencies and Callbacks lanes showed
+    // every clinic's work while the three lanes beside them switched with the
+    // selector — two scopes on one screen with nothing saying so.
+    clinicId: uuid.optional(),
+    callLogId: uuid.optional(),
+    patientId: uuid.optional(),
+    dueBefore: z.coerce.date().optional(),
+    acknowledged: z.enum(['true', 'false']).optional(),
+    overdue: z.enum(['true']).optional(),
+  });
+
+  function taskVisibility(request: FastifyRequest, branchId?: string): Prisma.StaffTaskWhereInput {
+    const scope = request.auth.branchId ?? branchId;
+    return scope ? { OR: [{ branchId: scope }, { branchId: null }] } : {};
+  }
+
+  /**
+   * D14: a task belongs to a clinic either because `createSafetyTask` stamped
+   * `metadata.clinicId` or because its source call did. Both are matched, so a
+   * pre-C4 row with only a call link is not silently dropped from the lane.
+   */
+  function clinicFilter(clinicId: string): Prisma.StaffTaskWhereInput {
+    return { OR: [
+      { metadata: { path: ['clinicId'], equals: clinicId } },
+      { callLog: { clinicId } },
+    ] };
+  }
+
+  function taskFilters(request: FastifyRequest, query: z.infer<typeof taskListQuery>, now: Date): Prisma.StaffTaskWhereInput {
+    const kindFilter = query.kind
+      ? { OR: query.kind.map(kind => ({ metadata: { path: ['kind'], equals: kind } })) }
+      : null;
+    return {
+      tenantId: request.auth.tenantId,
+      ...taskVisibility(request, query.branchId),
+      status: { in: query.status ?? ['OPEN', 'IN_PROGRESS'] },
+      ...(query.callLogId ? { callLogId: query.callLogId } : {}),
+      ...(query.patientId ? { patientId: query.patientId } : {}),
+      ...(query.assignee === 'me' ? { assignedToId: request.auth.userId }
+        : query.assignee === 'unassigned' ? { assignedToId: null }
+          : query.assignee ? { assignedToId: query.assignee } : {}),
+      ...(query.acknowledged === 'true' ? { acknowledgedAt: { not: null } }
+        : query.acknowledged === 'false' ? { acknowledgedAt: null } : {}),
+      ...(query.overdue === 'true' ? { dueAt: { lt: now } } : query.dueBefore ? { dueAt: { lte: query.dueBefore } } : {}),
+      AND: [
+        ...(query.workflow ? [{ metadata: { path: ['workflow'], equals: query.workflow } }] : []),
+        ...(kindFilter ? [kindFilter] : []),
+        // In AND, not spread at the top level: `taskVisibility` already owns the
+        // top-level `OR` and a second one would silently replace it.
+        ...(query.clinicId ? [clinicFilter(query.clinicId)] : []),
+      ],
+    };
+  }
+
   app.get('/tasks', { preHandler: staffTaskRead }, async request => {
-    const query = listLimit.extend({ branchId: uuid.optional() }).parse(request.query);
-    const branchId = scopedBranch(request, query.branchId);
+    const query = taskListQuery.parse(request.query);
+    const now = new Date();
     const rows = await db.staffTask.findMany({
-      where: { tenantId: request.auth.tenantId, branchId },
-      take: query.limit,
-      orderBy: { createdAt: 'desc' },
-      include: {
-        branch: { select: { name: true } },
-        assignedTo: { select: { displayName: true } },
-      },
+      where: taskFilters(request, query, now),
+      // Soonest-due first; a task with no due date sorts last rather than first.
+      orderBy: [{ dueAt: { sort: 'asc', nulls: 'last' } }, { createdAt: 'desc' }, { id: 'asc' }],
+      cursor: query.cursor ? { id: query.cursor } : undefined,
+      skip: query.cursor ? 1 : 0,
+      take: query.limit + 1,
+      include: taskListInclude,
     });
     const permissions = await getRequestPermissions(request);
-    const canReadReceptionistArtifacts = permissions.has('receptionist:call-artifacts:read');
-    await audit(request, { action: 'task.list', resource: 'staffTask', metadata: { count: rows.length, branchScoped: Boolean(branchId) } });
-    return rows.map(row => {
-      const metadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
-        ? row.metadata as Record<string, unknown>
-        : null;
-      if (canReadReceptionistArtifacts || metadata?.workflow !== 'receptionist_safety') return row;
-      return {
-        ...row,
-        metadata: {
-          workflow: 'receptionist_safety',
-          kind: metadata.kind ?? 'restricted',
-          requiresAcknowledgement: metadata.requiresAcknowledgement === true,
-          restricted: true,
-        },
-      };
-    });
+    const options = {
+      canReadArtifacts: permissions.has('receptionist:call-artifacts:read'),
+      canReadPatient: permissions.has('patient:read'),
+    };
+    const page = cursorPage(rows, query.limit);
+    await audit(request, { action: 'task.list', resource: 'staffTask', metadata: {
+      count: page.data.length, branchScoped: Boolean(request.auth.branchId ?? query.branchId), receptionistDisclosed: options.canReadArtifacts,
+    } });
+    return { ...page, data: page.data.map(row => projectTaskRow(row, options)) };
   });
+
+  // Counts for the sidebar badge, the critical banner and the queue header.
+  // Titles only — no caller content, so it is safe for every staff:read holder.
+  //
+  // D7: the critical COUNT is a real count(), not the length of the 5-row
+  // preview. With 9 unacknowledged emergencies the banner used to say 5 and
+  // callers 6-9 stayed invisible until one of the first five was acknowledged.
+  // D8: the critical query is scoped to the receptionist workflows and carries
+  // `workflow`/`kind` per row, so a critical INSURANCE or OPS task is no longer
+  // announced to the front desk as a clinical emergency.
+  // D10: 'critical' and 'CRITICAL' both match, so the outbound reconciliation
+  // tasks stop being invisible to the one surface staff must be able to trust.
+  // D13: the kind histogram is a SQL GROUP BY, not every open row loaded into
+  // JS — this is the hottest polled endpoint in the product (20s, every tab).
+  app.get('/tasks/summary', { preHandler: staffTaskRead }, async request => {
+    const query = z.object({ branchId: uuid.optional(), clinicId: uuid.optional() }).parse(request.query);
+    const now = new Date();
+    const live = {
+      tenantId: request.auth.tenantId,
+      ...taskVisibility(request, query.branchId),
+      status: { in: ['OPEN', 'IN_PROGRESS'] as const },
+    } satisfies Prisma.StaffTaskWhereInput;
+    const clinicScope = query.clinicId ? [clinicFilter(query.clinicId)] : [];
+    const criticalWhere = {
+      ...live,
+      acknowledgedAt: null,
+      priority: { in: taskPriorityVariants('critical') },
+      AND: [
+        { OR: RECEPTIONIST_TASK_WORKFLOWS.map(workflow => ({ metadata: { path: ['workflow'], equals: workflow } })) },
+        ...clinicScope,
+      ],
+    } satisfies Prisma.StaffTaskWhereInput;
+
+    const branchScopeId = request.auth.branchId ?? query.branchId ?? null;
+    const [kindRows, overdue, mine, dueWithin30m, criticalRows, unacknowledgedCriticalCount] = await Promise.all([
+      db.$queryRaw<Array<{ kind: string | null; count: bigint }>>`
+        SELECT t."metadata"->>'kind' AS kind, count(*)::bigint AS count
+        FROM "StaffTask" t
+        ${query.clinicId ? Prisma.sql`LEFT JOIN "ReceptionistCallLog" c ON c."id" = t."callLogId" AND c."tenantId" = t."tenantId"` : Prisma.empty}
+        WHERE t."tenantId" = ${request.auth.tenantId}::uuid
+          AND t."status" IN ('OPEN', 'IN_PROGRESS')
+          AND t."metadata"->>'workflow' = ${RECEPTIONIST_TASK_WORKFLOW}
+          ${branchScopeId ? Prisma.sql`AND (t."branchId" = ${branchScopeId}::uuid OR t."branchId" IS NULL)` : Prisma.empty}
+          ${query.clinicId ? Prisma.sql`AND (t."metadata"->>'clinicId' = ${query.clinicId} OR c."clinicId" = ${query.clinicId}::uuid)` : Prisma.empty}
+        GROUP BY 1
+      `,
+      db.staffTask.count({ where: { ...live, dueAt: { lt: now } } }),
+      db.staffTask.count({ where: { ...live, assignedToId: request.auth.userId } }),
+      db.staffTask.count({ where: { ...live, dueAt: { gte: now, lte: new Date(now.getTime() + 30 * 60_000) } } }),
+      db.staffTask.findMany({
+        where: criticalWhere,
+        orderBy: [{ createdAt: 'asc' }],
+        take: 5,
+        select: {
+          id: true, title: true, createdAt: true, metadata: true,
+          callLog: { select: { clinic: { select: { id: true, name: true } } } },
+        },
+      }),
+      db.staffTask.count({ where: criticalWhere }),
+    ]);
+
+    const openByKind = Object.fromEntries(RECEPTIONIST_TASK_KINDS.map(kind => [kind, 0])) as Record<ReceptionistTaskKind, number>;
+    let openNeedsAction = 0;
+    for (const row of kindRows) {
+      const count = Number(row.count);
+      // `parseReceptionistTask` recovers an unrecognised kind as `message`;
+      // the histogram must land on the same lane the row itself lands in.
+      const kind = (RECEPTIONIST_TASK_KINDS as readonly string[]).includes(row.kind ?? '')
+        ? row.kind as ReceptionistTaskKind
+        : 'message';
+      openByKind[kind] += count;
+      openNeedsAction += count;
+    }
+
+    return {
+      openByKind,
+      openNeedsAction,
+      overdue,
+      mine,
+      dueWithin30m,
+      unacknowledgedCriticalCount,
+      unacknowledgedCritical: criticalRows.map(row => {
+        const metadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+          ? row.metadata as Record<string, unknown>
+          : {};
+        const meta = parseReceptionistTask(row);
+        return {
+          id: row.id,
+          title: row.title,
+          createdAt: row.createdAt,
+          clinicName: row.callLog?.clinic?.name ?? null,
+          clinicId: meta?.clinicId ?? row.callLog?.clinic?.id ?? null,
+          // Which alert this is. Without them the board announced an outbound
+          // reconciliation task in the same red as a chest-pain mention.
+          workflow: typeof metadata.workflow === 'string' ? metadata.workflow : null,
+          kind: meta?.kind ?? null,
+          fixHref: meta?.fixHref ?? null,
+          action: meta?.remediationAction ?? null,
+        };
+      }),
+      // D8: which numbers reconcile with which. `openByKind`, `openNeedsAction`
+      // and the critical block are receptionist-scoped; the three counters below
+      // span every workflow in the tenant, so they will not add up to them.
+      counterScope: {
+        openByKind: 'receptionist',
+        openNeedsAction: 'receptionist',
+        unacknowledgedCritical: 'receptionist',
+        overdue: 'all_workflows',
+        mine: 'all_workflows',
+        dueWithin30m: 'all_workflows',
+      },
+      generatedAt: now.toISOString(),
+    };
+  });
+
   app.post('/tasks', { preHandler: staffTaskWrite }, async (request, reply) => {
     const input = z.object({
       branchId: uuid.optional(), assignedToId: uuid.optional(), title: z.string().min(2).max(240),
@@ -983,12 +1169,15 @@ export const operationsRoutes: FastifyPluginAsync = async app => {
     }).parse(request.body);
     if (input.branchId) await requireTenantBranch(request, input.branchId);
     if (input.assignedToId) await requireTenantAssignee(request, input.assignedToId);
+    // D10: one vocabulary. 'CRITICAL' typed here used to file a row the critical
+    // banner could not see.
+    const priority = normalizeTaskPriority(input.priority) ?? input.priority;
     // GET /tasks scopes a branch-restricted caller to their own branch, so a task
     // created without one would be invisible to the queue that just created it.
     // Default to the creator's branch rather than filing work nobody can see.
     const branchId = input.branchId ?? request.auth.branchId ?? undefined;
     const row = await db.staffTask.create({
-      data: { tenantId: request.auth.tenantId, ...input, branchId },
+      data: { tenantId: request.auth.tenantId, ...input, priority, branchId },
       include: { branch: { select: { name: true } }, assignedTo: { select: { displayName: true } } },
     });
     await audit(request, { action: 'task.created', resource: 'staffTask', resourceId: row.id, metadata: { assigned: Boolean(row.assignedToId), branchScoped: Boolean(branchId) } });

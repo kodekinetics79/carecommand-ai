@@ -134,7 +134,7 @@ export interface PromptResult {
   };
 }
 
-export interface RetellConfig {
+export interface VoiceLineConfiguration {
   systemPrompt: string;
   voiceId: string;
   language: string;
@@ -147,8 +147,9 @@ export interface RetellConfig {
 
 export interface CallLog {
   id: string;
+  clinicId: string;
   campaignId: string | null;
-  retellCallId: string | null;
+  providerCallRef: string | null;
   callerName: string | null;
   callerPhone: string | null;
   direction: string;
@@ -263,7 +264,7 @@ export const OUTBOUND_REQUIRED_FIELDS: Array<{ key: OutboundRequiredField; label
   { key: 'preferredDateTime', label: 'Preferred date/time' },
 ];
 
-export interface RetellStatus {
+export interface VoiceLineStatus {
   configured: boolean;
   mock: boolean;
   missing: string[];
@@ -713,6 +714,14 @@ export interface OutboundCampaignInput {
 }
 
 // --- Field catalog (UI metadata) -------------------------------------------
+//
+// These lists are being retired in favour of GET /v1/receptionist/catalog
+// (see src/lib/receptionistCatalog.ts): a compiled-in list cannot describe a
+// tenant's own timezones, and silently rendered the first option whenever the
+// stored value was not one of them. TIMEZONE_OPTIONS is gone — ClinicPanel,
+// LocationsEditor and the create dialog read the catalog. The five below are
+// still imported by AgentEditor, CampaignPanel and IntakeBuilder, which other
+// packages own this wave; they go when those panels move to the catalog.
 
 export const FIELD_CATALOG: Array<{ type: FieldType; label: string; question: string; group: string; hasOptions?: boolean }> = [
   { type: 'FIRST_NAME', label: 'First name', question: 'Can I start with your first name?', group: 'Identity' },
@@ -721,7 +730,7 @@ export const FIELD_CATALOG: Array<{ type: FieldType; label: string; question: st
   { type: 'EMAIL', label: 'Email', question: 'What email should we send the confirmation to?', group: 'Contact' },
   { type: 'PREFERRED_DATE', label: 'Preferred date', question: 'What day works best for you?', group: 'Scheduling' },
   { type: 'PREFERRED_TIME', label: 'Preferred time', question: 'Do you prefer morning or afternoon?', group: 'Scheduling' },
-  { type: 'PREFERRED_LOCATION', label: 'Preferred location', question: 'Which of our locations is most convenient?', group: 'Scheduling', hasOptions: true },
+  { type: 'PREFERRED_LOCATION', label: 'Preferred location', question: 'Which of our locations is most convenient?', group: 'Scheduling' },
   { type: 'PATIENT_STATUS', label: 'New or existing patient', question: 'Have you visited us before, or would this be your first time?', group: 'Clinical' },
   { type: 'INSURANCE_PROVIDER', label: 'Insurance provider', question: 'Which insurance provider do you have, if any?', group: 'Clinical' },
   { type: 'REASON_FOR_VISIT', label: 'Reason for visit', question: 'May I ask the main reason for your visit?', group: 'Clinical' },
@@ -733,15 +742,12 @@ export const FIELD_CATALOG: Array<{ type: FieldType; label: string; question: st
   { type: 'CUSTOM_YES_NO', label: 'Custom yes/no field', question: 'Can you confirm yes or no?', group: 'Custom' },
 ];
 
-export const VOICE_OPTIONS = [
-  { id: '11labs-Adrian', label: 'Adrian (male, warm)' },
-  { id: '11labs-Anna', label: 'Anna (female, friendly)' },
-  { id: '11labs-Bella', label: 'Bella (female, calm)' },
-  { id: '11labs-Brian', label: 'Brian (male, professional)' },
-  { id: '11labs-Marissa', label: 'Marissa (female, upbeat)' },
-  { id: 'openai-Alloy', label: 'Alloy (neutral)' },
-  { id: 'openai-Nova', label: 'Nova (female, bright)' },
-];
+// VOICE_OPTIONS was deleted here. It was a hardcoded fallback list of seven
+// SUPPLIER-prefixed voice ids compiled into the
+// browser bundle, and nothing had imported it since the Studio moved to the
+// server-served catalogue — so it named two suppliers in shipped JavaScript
+// while doing no work at all. Voices come from `GET /voices`, which now
+// projects out the synthesising house as well.
 
 export const TONE_OPTIONS = [
   'Warm and professional',
@@ -762,11 +768,6 @@ export const LANGUAGE_OPTIONS = [
 ];
 
 export const CAMPAIGN_TYPES = ['Reactivation', 'New patient', 'Recall / Recare', 'Promotion', 'Waitlist fill', 'Post-op follow-up', 'Survey'];
-
-export const TIMEZONE_OPTIONS = [
-  'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles',
-  'America/Phoenix', 'Europe/London', 'Europe/Paris', 'Australia/Sydney',
-];
 
 // --- API helpers -----------------------------------------------------------
 
@@ -805,7 +806,7 @@ export const receptionistApi = {
   reorderIntakeFields: (campaignId: string, orderedIds: string[]) => apiRequest<IntakeField[]>(`${base}/intake-fields/reorder`, { method: 'POST', body: JSON.stringify({ campaignId, orderedIds }) }),
 
   getPrompt: (campaignId: string) => apiRequest<PromptResult>(`${base}/campaigns/${campaignId}/prompt`),
-  getRetellConfig: (campaignId: string) => apiRequest<RetellConfig>(`${base}/campaigns/${campaignId}/retell-config`),
+  getVoiceLineConfiguration: (campaignId: string) => apiRequest<VoiceLineConfiguration>(`${base}/campaigns/${campaignId}/voice-line-configuration`),
 
   listCallLogs: (clinicId: string) => apiRequest<CallLog[]>(`${base}/call-logs?clinicId=${clinicId}`),
   getCallLog: (id: string) => apiRequest<CallLog>(`${base}/call-logs/${id}`),
@@ -825,7 +826,7 @@ export const receptionistApi = {
   }),
 
   // --- Outbound calling ----------------------------------------------------
-  retellStatus: () => apiRequest<RetellStatus>(`${base}/retell-status`),
+  voiceLineStatus: () => apiRequest<VoiceLineStatus>(`${base}/voice-line-status`),
   listOutboundCampaigns: (clinicId?: string) => apiRequest<OutboundCampaign[]>(`${base}/outbound-campaigns${clinicId ? `?clinicId=${clinicId}` : ''}`),
   getOutboundCampaign: (id: string) => apiRequest<OutboundCampaign>(`${base}/outbound-campaigns/${id}`),
   createOutboundCampaign: (body: OutboundCampaignInput) => apiRequest<OutboundCampaign>(`${base}/outbound-campaigns`, { method: 'POST', body: JSON.stringify(body) }),

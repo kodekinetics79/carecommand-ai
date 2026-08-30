@@ -1,101 +1,89 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router';
+import { Bot, Building2, Plus, Phone, PhoneOff, Megaphone, ListChecks, Eye, Rocket, Activity, Loader2, AlertCircle, PhoneOutgoing, BookOpen, ShieldCheck, Timer } from 'lucide-react';
+import { receptionistApi as api, type Campaign } from '../lib/receptionist';
+import { blockerLabel, receptionistClinicApi, type ClinicRow } from '../lib/receptionistClinic';
 import {
-  Bot, Building2, Plus, Trash2, Save, Sparkles, Phone,
-  GripVertical, ChevronUp, ChevronDown, Copy, Check, ShieldCheck, PhoneOff,
-  Megaphone, ListChecks, Eye, Code2, Activity, MapPin, Loader2, AlertCircle,
-  PhoneCall, PhoneOutgoing, CalendarClock, CircleCheck, CircleAlert,
-  Pencil,
-} from 'lucide-react';
+  deploymentApi, formatCount, formatRate, formatSeconds, resolveStudioTab, serviceStatus,
+  type GoLivePrerequisite, type OverviewKpis, type ReadinessResponse, type VoiceLineStatusResponse, type StudioTab,
+} from '../lib/receptionistDeployment';
+import { useResource } from '../hooks/useResource';
+import { describeFailure, receivedData } from '../lib/resourceState';
 import PageHeader from '../components/ui/PageHeader';
 import StatCard from '../components/ui/StatCard';
-import ModuleTabs from '../components/ui/ModuleTabs';
-import ConfirmationModal from '../components/workflow/ConfirmationModal';
 import FormDialog from '../components/workflow/FormDialog';
-import { Field, TextInput, TextArea, Select, Toggle } from '../components/ui/Field';
-import { useSession } from '../hooks/useSession';
-import { getLocale } from '../lib/preferences';
-import {
-  receptionistApi as api,
-  FIELD_CATALOG, VOICE_OPTIONS, TONE_OPTIONS, LANGUAGE_OPTIONS, CAMPAIGN_TYPES, TIMEZONE_OPTIONS,
-  OUTBOUND_REQUIRED_FIELDS, OUTBOUND_RECONCILIATION_WARNING, launchControlsBlocked, mergeReconciliationRefresh, presentLaunchResult, validateOutboundQuietHours,
-  clearTransportAmbiguityToken, readTransportAmbiguityToken, transportAmbiguityStorageKey, writeTransportAmbiguityToken,
-  type Clinic, type Campaign, type IntakeField, type Agent, type FieldType,
-  type PromptResult, type RetellConfig, type CallLog, type AppointmentRequest, type OptOut, type Overview,
-  type RetellStatus, type OutboundCampaign, type OutboundRequiredField, type OutboundBookingMode,
-  type CallTarget, type BookingRequest, type BookingRequestStatus, type OutboundCampaignInput,
-  type Location, type SchedulingBranch, type WeeklyHours, type OutboundTargetCandidate, type ConfirmationDelivery,
-  type OutboundControlStatus, type OutboundStopResult,
-  type OutboundReconciliationEvidence,
-} from '../lib/receptionist';
+import { formatEnumLabel } from '../components/receptionist/helpers';
+import { EmptyState } from '../components/receptionist/shared';
+import { LoadFailureNotice } from '../components/receptionist/MutationNotice';
+import { ClinicPanel } from '../components/receptionist/ClinicPanel';
+import { CreateClinicDialog } from '../components/receptionist/CreateClinicDialog';
+import { KnowledgePanel } from '../components/receptionist/KnowledgePanel';
+import { LocalePackPanel } from '../components/receptionist/LocalePackPanel';
+import { CampaignPanel } from '../components/receptionist/CampaignPanel';
+import { IntakeBuilder } from '../components/receptionist/IntakeBuilder';
+import { PreviewPanel } from '../components/receptionist/PreviewPanel';
+import { GoLivePanel } from '../components/receptionist/GoLivePanel';
+import { ActivityPanel } from '../components/receptionist/ActivityPanel';
+import { GoLiveCard, ServiceStatusStrip } from '../components/receptionist/GoLiveCard';
+import { OutboundPanel } from '../components/receptionist/outbound/OutboundPanel';
 
-type Tab = 'clinic' | 'campaign' | 'intake' | 'preview' | 'retell' | 'outbound' | 'activity';
+/**
+ * Two doors, not three: the Front Desk is where staff work a live queue, and
+ * this Studio is where the receptionist is configured and taken live. The tab
+ * that once carried the voice supplier's name in its label is **Go live** —
+ * publish, line check — because that is what an owner comes here to do, and
+ * because it is the tab id the server's remediation catalogue has been
+ * pointing at all along (`fixTab: 'deploy'`, 25 entries). The supplier's
+ * console procedure that used to sit under it is now support-only.
+ *
+ * The id list and the alias map live in `lib/receptionistDeployment.ts`, with
+ * the readiness keys: they are a contract with the server, not page trivia.
+ */
+type Tab = StudioTab;
 
 const TABS: Array<{ id: Tab; label: string; icon: React.ElementType }> = [
   { id: 'clinic', label: 'Clinic Profile', icon: Building2 },
+  { id: 'knowledge', label: 'Knowledge', icon: BookOpen },
   { id: 'campaign', label: 'Agent & Campaign', icon: Megaphone },
   { id: 'intake', label: 'Intake Builder', icon: ListChecks },
   { id: 'preview', label: 'Preview', icon: Eye },
-  { id: 'retell', label: 'RetellAI Export', icon: Code2 },
+  { id: 'deploy', label: 'Go live', icon: Rocket },
   { id: 'outbound', label: 'Outbound Calls', icon: PhoneOutgoing },
   { id: 'activity', label: 'Activity', icon: Activity },
 ];
 
-function isTab(value: string | null): value is Tab {
-  return TABS.some(tab => tab.id === value);
-}
-
-function formatEnumLabel(value: string): string {
-  const words = value.trim().replaceAll('_', ' ').toLowerCase();
-  return words ? words[0].toUpperCase() + words.slice(1) : 'Unknown';
-}
-
-function maskedPhone(value: string | null | undefined): string {
-  if (!value) return '—';
-  if (value.includes('*')) return value;
-  const digits = value.replace(/\D/g, '');
-  return digits.length >= 4 ? `***-***-${digits.slice(-4)}` : '***-***-****';
-}
-
-function maskedProviderId(value: string | null | undefined): string {
-  if (!value) return 'no provider id';
-  if (value.includes('…') || value.includes('*')) return value;
-  return value.length > 8 ? `${value.slice(0, 4)}…${value.slice(-4)}` : '********';
-}
-
-const outcomeBadge: Record<string, string> = {
-  BOOKED: 'badge badge-emerald', NOT_INTERESTED: 'badge badge-amber', NO_ANSWER: 'badge badge-blue',
-  VOICEMAIL: 'badge badge-blue', ESCALATED: 'badge badge-red', OPTED_OUT: 'badge badge-violet',
-  FAILED: 'badge badge-red', IN_PROGRESS: 'badge badge-blue',
-};
-
-function CopyButton({ value, label = 'Copy' }: { value: string; label?: string }) {
-  const [copied, setCopied] = useState(false);
+/** A KPI tile that prints the server's definition beside the number and an em dash when it has none. */
+function KpiCard({ title, value, subtitle, definition, icon, accent }: {
+  title: string; value: string; subtitle?: string; definition?: string;
+  icon: React.ReactNode; accent: 'blue' | 'emerald' | 'violet' | 'amber' | 'red' | 'cyan' | 'indigo';
+}) {
   return (
-    <button
-      type="button"
-      onClick={async () => {
-        await navigator.clipboard.writeText(value);
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
-      }}
-      className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-2.5 py-1 text-[11px] font-semibold text-t2 hover:bg-[var(--s3)]"
-    >
-      {copied ? <Check className="w-3 h-3 text-emerald-v" /> : <Copy className="w-3 h-3" />}
-      {copied ? 'Copied' : label}
-    </button>
+    <div title={definition} data-kpi={title}>
+      <StatCard title={title} value={value} subtitle={subtitle ?? definition} icon={icon} accent={accent} />
+    </div>
   );
 }
 
 export default function ReceptionistStudio() {
   const [searchParams, setSearchParams] = useSearchParams();
-  const [clinics, setClinics] = useState<Clinic[]>([]);
+  const [clinics, setClinics] = useState<ClinicRow[]>([]);
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
-  const [overview, setOverview] = useState<Overview | null>(null);
+  const [overview, setOverview] = useState<OverviewKpis | null>(null);
+  const [overviewFailure, setOverviewFailure] = useState<string | null>(null);
   const [activeClinicId, setActiveClinicId] = useState<string>('');
   const [activeCampaignId, setActiveCampaignId] = useState<string>('');
+  const [deploying, setDeploying] = useState(false);
+
+  // E3 — every parameter the server's fix links carry. Reading only `tab` is
+  // what made a Fix link open the wrong clinic's campaign on a two-clinic
+  // tenant. `clinicId` stays accepted so links printed before the rename work.
   const requestedTab = searchParams.get('tab');
-  const tab: Tab = isTab(requestedTab) ? requestedTab : 'clinic';
+  const requestedClinicId = searchParams.get('clinic') ?? searchParams.get('clinicId');
+  const requestedCampaignId = searchParams.get('campaign');
+  const requestedAgentId = searchParams.get('agent');
+  const requestedCallId = searchParams.get('callId');
+  const tab: Tab = resolveStudioTab(requestedTab) ?? 'clinic';
+
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -114,11 +102,22 @@ export default function ReceptionistStudio() {
   const closeCreateDialog = useCallback(() => setCreateDialog(null), []);
 
   const loadClinics = useCallback(async () => {
-    const [rows, ov] = await Promise.all([api.listClinics(), api.overview().catch(() => null)]);
+    const rows = await receptionistClinicApi.listClinics();
     setClinics(rows);
-    if (ov) setOverview(ov);
-    setActiveClinicId(prev => (prev && rows.some(r => r.id === prev) ? prev : rows[0]?.id ?? ''));
+    setActiveClinicId(prev => requestedClinicId && rows.some(row => row.id === requestedClinicId)
+      ? requestedClinicId
+      : prev && rows.some(r => r.id === prev) ? prev : rows[0]?.id ?? '');
     return rows;
+  }, [requestedClinicId]);
+
+  const loadOverview = useCallback(async () => {
+    try {
+      setOverview(await deploymentApi.overview());
+      setOverviewFailure(null);
+    } catch (cause) {
+      // A failed KPI read must read as unavailable, never as a clinic with no calls.
+      setOverviewFailure(describeFailure(cause).message);
+    }
   }, []);
 
   const loadCampaigns = useCallback(async (clinicId: string) => {
@@ -132,6 +131,7 @@ export default function ReceptionistStudio() {
     (async () => {
       try {
         await loadClinics();
+        if (active) await loadOverview();
       } catch (e) {
         if (active) setError(e instanceof Error ? e.message : 'Failed to load');
       } finally {
@@ -139,17 +139,72 @@ export default function ReceptionistStudio() {
       }
     })();
     return () => { active = false; };
-  }, [loadClinics]);
+  }, [loadClinics, loadOverview]);
 
   useEffect(() => {
     let active = true;
     (activeClinicId ? api.listCampaigns(activeClinicId) : Promise.resolve<Campaign[]>([])).then(rows => {
       if (!active) return;
       setCampaigns(rows);
-      setActiveCampaignId(prev => (prev && rows.some(r => r.id === prev) ? prev : rows[0]?.id ?? ''));
+      // A fix link naming a campaign (or the agent that campaign links) wins
+      // over whatever was selected, so the operator lands on the row the
+      // failure was about rather than the clinic's first campaign.
+      setActiveCampaignId(prev => {
+        const requested = (requestedCampaignId ? rows.find(r => r.id === requestedCampaignId) : undefined)
+          ?? (requestedAgentId ? rows.find(r => r.agentId === requestedAgentId) : undefined);
+        if (requested) return requested.id;
+        return prev && rows.some(r => r.id === prev) ? prev : rows[0]?.id ?? '';
+      });
+      setError(null);
+    }).catch(cause => {
+      // A failed campaign list must not read as "No campaigns yet".
+      if (active) setError(`Campaigns could not be loaded: ${describeFailure(cause).message}`);
     });
     return () => { active = false; };
-  }, [activeClinicId]);
+  }, [activeClinicId, requestedCampaignId, requestedAgentId]);
+
+  // --- The persistent go-live rail (SF-4) and status strip (SF-3) ------------
+  const loadReadiness = useCallback(
+    (signal: AbortSignal) => (activeCampaignId ? deploymentApi.readiness(activeCampaignId, signal) : Promise.resolve(null)),
+    [activeCampaignId]);
+  const readinessResource = useResource<ReadinessResponse | null>(loadReadiness);
+  const railReadiness = receivedData(readinessResource.state) ?? null;
+  const loadRailStatus = useCallback(
+    (signal: AbortSignal) => (activeCampaignId ? deploymentApi.voiceLineStatus({ campaignId: activeCampaignId }, signal) : Promise.resolve(null)),
+    [activeCampaignId]);
+  const railStatusResource = useResource<VoiceLineStatusResponse | null>(loadRailStatus);
+  const railStatus = receivedData(railStatusResource.state) ?? null;
+  const reloadRail = readinessResource.reload;
+
+  const prerequisites: GoLivePrerequisite[] = useMemo(
+    () => (activeClinic?.readiness?.blockers ?? []).map(code => ({
+      code,
+      label: blockerLabel(code),
+      fixHref: `/receptionist-studio?clinic=${encodeURIComponent(activeClinic!.id)}&tab=clinic`,
+    })),
+    [activeClinic]);
+
+  const status = serviceStatus({
+    campaignStatus: activeCampaign?.status ?? 'DRAFT',
+    readiness: railReadiness,
+    verification: railStatus?.verification ?? null,
+    deploying,
+  });
+
+  const refreshCampaigns = useCallback(async () => {
+    await loadCampaigns(activeClinicId);
+    readinessResource.reload();
+    railStatusResource.reload();
+  }, [loadCampaigns, activeClinicId, readinessResource, railStatusResource]);
+
+  // A deep link that names a campaign this clinic does not hold must say so:
+  // showing a different campaign under the failure's heading is exactly the
+  // confusion the fix links were meant to end.
+  const deepLinkMiss = requestedCampaignId && campaigns.length > 0 && !campaigns.some(row => row.id === requestedCampaignId)
+    ? 'That link points at a campaign this clinic does not hold. Pick the clinic it belongs to on the left.'
+    : requestedClinicId && clinics.length > 0 && !clinics.some(row => row.id === requestedClinicId)
+      ? 'That link points at a clinic you cannot see. Pick a clinic on the left.'
+      : null;
 
   function handleCreateClinic() {
     setCreateDialog('clinic');
@@ -164,11 +219,13 @@ export default function ReceptionistStudio() {
     return <div className="flex items-center justify-center py-24 text-sm text-t3"><Loader2 className="w-4 h-4 animate-spin mr-2" /> Loading Receptionist Studio…</div>;
   }
 
+  const definitions = overview?.definitions ?? {};
+
   return (
     <div className="space-y-6 pb-10">
       <PageHeader
-        title="AI Receptionist Studio"
-        subtitle="Draft and export receptionist prompts, then link and verify the separately configured Retell deployment used for live calls."
+        title="Receptionist Studio"
+        subtitle="Configure the clinic's AI receptionist, publish it to the voice line, and prove it can answer a real call."
         badge={`${clinics.length} clinic${clinics.length === 1 ? '' : 's'}`}
         badgeColor="violet"
         actions={
@@ -179,23 +236,21 @@ export default function ReceptionistStudio() {
       />
 
       {error && (
-        <div className="flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--red-soft)] px-3 py-2 text-xs font-semibold text-red-v">
+        <div role="alert" className="flex items-center gap-2 rounded-xl border border-[var(--b1)] bg-[var(--red-soft)] px-3 py-2 text-xs font-semibold text-red-v">
           <AlertCircle className="w-4 h-4" /> {error}
         </div>
       )}
 
+      {deepLinkMiss && (
+        <div role="alert" className="flex items-center gap-2 rounded-xl border border-amber-v/40 bg-[var(--s3)] px-3 py-2 text-xs font-semibold text-t1">
+          <AlertCircle className="w-4 h-4 text-amber-v" /> {deepLinkMiss}
+        </div>
+      )}
+
       {createDialog === 'clinic' && (
-        <FormDialog
-          title="Create clinic"
-          message="Add the clinic identity and trusted inbound number used by receptionist configuration. No live provider is contacted."
-          submitLabel="Create clinic"
-          fields={[
-            { name: 'name', label: 'Clinic name', required: true, placeholder: 'Example Health' },
-            { name: 'phone', label: 'Trusted inbound phone number', type: 'tel', required: true, placeholder: '+12125550100', pattern: '\\+[1-9][0-9]{7,14}', help: 'Use E.164 format, including the country code.' },
-          ]}
+        <CreateClinicDialog
           onClose={closeCreateDialog}
-          onSubmit={async values => {
-            const clinic = await api.createClinic({ name: values.name, phone: values.phone });
+          onCreated={async clinic => {
             await loadClinics();
             setActiveClinicId(clinic.id);
             selectTab('clinic');
@@ -206,18 +261,24 @@ export default function ReceptionistStudio() {
       {createDialog === 'campaign' && activeClinic && (
         <FormDialog
           title="Create receptionist campaign"
-          message={`Create a draft for ${activeClinic.name}. No calls are placed by this action.`}
+          message={`Create a truthful draft for ${activeClinic.name}. These details are used in the generated receptionist prompt; no calls are placed by this action.`}
           submitLabel="Create draft"
-          fields={[{ name: 'name', label: 'Campaign name', required: true, placeholder: 'Appointment follow-up' }]}
+          fields={[
+            { name: 'name', label: 'Internal campaign name', required: true, placeholder: 'New-patient scheduling' },
+            { name: 'offerTitle', label: 'Caller-facing purpose', required: true, placeholder: 'Schedule a dental appointment' },
+            { name: 'appointmentType', label: 'Appointment type', required: true, placeholder: 'New-patient exam' },
+            { name: 'offerDescription', label: 'Approved scope', required: true, placeholder: 'Help callers request or book an eligible appointment.' },
+            { name: 'offerScript', label: 'Approved opening after disclosure', required: true, placeholder: 'How can I help with scheduling today?' },
+          ]}
           onClose={closeCreateDialog}
           onSubmit={async values => {
             const campaign = await api.createCampaign({
               clinicId: activeClinicId,
               name: values.name,
-              offerTitle: 'New offer',
-              offerDescription: 'Describe the offer here.',
-              offerScript: 'Introduce the offer warmly and ask if they would like to book.',
-              appointmentType: 'Consultation',
+              offerTitle: values.offerTitle,
+              offerDescription: values.offerDescription,
+              offerScript: values.offerScript,
+              appointmentType: values.appointmentType,
               eligibleLocationIds: activeClinic.locations?.map(location => location.id) ?? [],
             });
             await loadCampaigns(activeClinicId);
@@ -227,13 +288,39 @@ export default function ReceptionistStudio() {
         />
       )}
 
+      {/*
+        SF-2 — the shift report. These are the kpi-v2 numbers with the server's
+        own definition printed under each one. The header used to show "calls
+        handled" over both directions and a booking rate over every call
+        including zero-second no-answers, plus "0m 0s" where the truth was
+        unknown. A rate with no denominator is an em dash here, never 0%.
+      */}
+      {overviewFailure && <LoadFailureNotice what="The receptionist KPIs" message={overviewFailure} onRetry={() => void loadOverview()} />}
       {overview && (
-        <div className="grid gap-3 grid-cols-2 lg:grid-cols-5">
-          <StatCard title="Active Campaigns" value={`${overview.activeCampaigns}/${overview.totalCampaigns}`} icon={<Megaphone className="w-4 h-4" />} accent="violet" />
-          <StatCard title="Calls Handled" value={String(overview.totalCalls)} icon={<Phone className="w-4 h-4" />} accent="blue" />
-          <StatCard title="Booking Rate" value={`${overview.bookingRate}%`} subtitle={`${overview.booked} booked`} icon={<Sparkles className="w-4 h-4" />} accent="emerald" />
-          <StatCard title="Avg Call" value={`${Math.floor(overview.avgDurationSeconds / 60)}m ${overview.avgDurationSeconds % 60}s`} icon={<Activity className="w-4 h-4" />} accent="cyan" />
-          <StatCard title="Do-Not-Contact" value={String(overview.optOuts)} icon={<PhoneOff className="w-4 h-4" />} accent="red" />
+        <div className="grid gap-3 grid-cols-2 lg:grid-cols-5" aria-label="Receptionist performance">
+          <KpiCard
+            title="Answered inbound" value={formatCount(overview.counts.answeredInbound)}
+            definition={definitions.answeredInbound} icon={<Phone className="w-4 h-4" />} accent="blue"
+          />
+          <KpiCard
+            title="Booking rate" value={formatRate(overview.rates.bookingRate)}
+            subtitle={overview.rates.bookingRate === null ? 'Not enough data' : `${formatCount(overview.counts.booked)} booked`}
+            definition={definitions.bookingRate} icon={<ShieldCheck className="w-4 h-4" />} accent="emerald"
+          />
+          <KpiCard
+            title="Contained" value={formatRate(overview.rates.containedPct)}
+            subtitle={overview.rates.containedPct === null ? 'Not enough data' : undefined}
+            definition={definitions.containedPct} icon={<Bot className="w-4 h-4" />} accent="violet"
+          />
+          <KpiCard
+            title="Avg call" value={formatSeconds(overview.aht)}
+            subtitle={overview.aht === null ? 'Not enough data' : undefined}
+            definition={definitions.aht} icon={<Timer className="w-4 h-4" />} accent="cyan"
+          />
+          <KpiCard
+            title="Do-not-contact" value={formatCount(overview.counts.optedOut)}
+            icon={<PhoneOff className="w-4 h-4" />} accent="red"
+          />
         </div>
       )}
 
@@ -268,6 +355,13 @@ export default function ReceptionistStudio() {
                   <div className="min-w-0">
                     <p className="text-xs font-semibold text-t1 truncate">{clinic.name}</p>
                     <p className="text-[10px] text-t3 truncate">{clinic.locations?.length ?? 0} location{(clinic.locations?.length ?? 0) === 1 ? '' : 's'} · {clinic._count?.campaigns ?? 0} campaign{(clinic._count?.campaigns ?? 0) === 1 ? '' : 's'}</p>
+                    {(clinic.readiness?.blockers?.length ?? 0) > 0 && (
+                      <p className="mt-1 flex flex-wrap gap-1" aria-label={`${clinic.name} activation blockers`}>
+                        {clinic.readiness!.blockers.map(blocker => (
+                          <span key={blocker} className="badge badge-amber text-[9px]">{blockerLabel(blocker)}</span>
+                        ))}
+                      </p>
+                    )}
                   </div>
                 </button>
               ))}
@@ -278,7 +372,7 @@ export default function ReceptionistStudio() {
                 <p className="text-[10px] font-bold uppercase tracking-widest text-t3">Campaigns</p>
                 <button type="button" aria-label="Add campaign" title="Add campaign" onClick={handleCreateCampaign} className="text-t3 hover:text-indigo"><Plus className="w-3.5 h-3.5" /></button>
               </div>
-              {campaigns.length === 0 && <p className="px-1 text-[11px] text-t3">No campaigns yet.</p>}
+              {campaigns.length === 0 && !error && <p className="px-1 text-[11px] text-t3">No campaigns yet.</p>}
               {campaigns.map(campaign => (
                 <button
                   key={campaign.id}
@@ -298,6 +392,26 @@ export default function ReceptionistStudio() {
 
           {/* Main editing surface */}
           <div className="space-y-4">
+            {/*
+              SF-3 / SF-4. The strip and the rail sit above the tabs on every
+              screen, so "is the line answering, and what is blocking it" is
+              never more than one glance away, whichever tab is open.
+            */}
+            {activeCampaign && <ServiceStatusStrip status={status} />}
+            {activeCampaign && tab !== 'campaign' && readinessResource.state.status === 'error' && (
+              <LoadFailureNotice what="Activation readiness" message={readinessResource.state.failure.message} onRetry={reloadRail} />
+            )}
+            {activeCampaign && (tab === 'deploy' || tab === 'campaign') && (
+              <GoLiveCard
+                readiness={railReadiness}
+                campaignStatus={activeCampaign.status}
+                providerMode={railStatus?.providerMode ?? null}
+                prerequisites={prerequisites}
+                verification={railStatus?.verification ?? null}
+                deploying={deploying}
+              />
+            )}
+
             <div className="flex items-center gap-1 overflow-x-auto rounded-xl bg-[var(--s3)] p-1" role="tablist" aria-label="Receptionist Studio sections">
               {TABS.map((t, index) => {
                 const Icon = t.icon;
@@ -341,2180 +455,45 @@ export default function ReceptionistStudio() {
             {tab === 'clinic' && activeClinic && (
               <ClinicPanel key={activeClinic.id} clinic={activeClinic} onChanged={loadClinics} />
             )}
+            {tab === 'knowledge' && (
+              activeClinic
+                ? <div key={activeClinic.id} className="space-y-4"><KnowledgePanel clinic={activeClinic} /><LocalePackPanel clinic={activeClinic} /></div>
+                : <EmptyState text="Create a clinic profile first to teach the agent what it may say." />
+            )}
             {tab === 'campaign' && activeClinic && (
               activeCampaign ? (
-                <CampaignPanel key={activeCampaign.id} clinic={activeClinic} campaign={activeCampaign} onChanged={() => loadCampaigns(activeClinicId)} />
+                <CampaignPanel key={activeCampaign.id} clinic={activeClinic} campaign={activeCampaign} onChanged={refreshCampaigns} />
               ) : <EmptyState text="No campaign selected. Create one to configure the agent and offer." onAction={handleCreateCampaign} actionLabel="New Campaign" />
             )}
             {tab === 'intake' && (
-              activeCampaign ? <IntakeBuilder key={activeCampaign.id} campaign={activeCampaign} clinic={activeClinic!} onChanged={() => loadCampaigns(activeClinicId)} />
+              activeCampaign ? <IntakeBuilder key={activeCampaign.id} campaign={activeCampaign} clinic={activeClinic!} onChanged={refreshCampaigns} />
                 : <EmptyState text="Select or create a campaign to build its intake flow." />
             )}
             {tab === 'preview' && (
               activeCampaign ? <PreviewPanel key={activeCampaign.id} campaignId={activeCampaign.id} /> : <EmptyState text="Select a campaign to preview the generated agent." />
             )}
-            {tab === 'retell' && (
-              activeCampaign ? <RetellPanel key={activeCampaign.id} campaignId={activeCampaign.id} /> : <EmptyState text="Select a campaign to export its RetellAI configuration." />
+            {tab === 'deploy' && (
+              activeCampaign
+                ? (
+                  <GoLivePanel
+                    key={activeCampaign.id}
+                    campaignId={activeCampaign.id}
+                    campaignStatus={activeCampaign.status}
+                    onDeployingChange={setDeploying}
+                    onConfigure={selectTab}
+                  />
+                )
+                : <EmptyState text="Select a campaign to deploy it and take the line live." />
             )}
             {tab === 'outbound' && (
               activeClinic ? <OutboundPanel key={activeClinic.id} clinic={activeClinic} />
                 : <EmptyState text="Create a clinic profile first to configure outbound calling." />
             )}
             {tab === 'activity' && activeClinic && (
-              <ActivityPanel clinicId={activeClinic.id} />
+              <ActivityPanel clinicId={activeClinic.id} initialCallId={requestedCallId} />
             )}
             </div>
           </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function EmptyState({ text, onAction, actionLabel }: { text: string; onAction?: () => void; actionLabel?: string }) {
-  return (
-    <div className="cc-card p-10 text-center">
-      <p className="text-sm text-t3 mb-3">{text}</p>
-      {onAction && actionLabel && (
-        <button type="button" onClick={onAction} className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90">
-          <Plus className="w-4 h-4" /> {actionLabel}
-        </button>
-      )}
-    </div>
-  );
-}
-
-function ConfirmedButton({
-  children,
-  dialogTitle,
-  message,
-  confirmLabel,
-  tone = 'amber',
-  requireReason = false,
-  reasonLabel,
-  disabled,
-  className,
-  buttonTitle,
-  ariaLabel,
-  onConfirm,
-}: {
-  children: React.ReactNode;
-  dialogTitle: string;
-  message: string;
-  confirmLabel: string;
-  tone?: 'indigo' | 'red' | 'amber';
-  requireReason?: boolean;
-  reasonLabel?: string;
-  disabled?: boolean;
-  className: string;
-  buttonTitle?: string;
-  ariaLabel?: string;
-  onConfirm: (reason: string) => Promise<void> | void;
-}) {
-  const [open, setOpen] = useState(false);
-  const close = useCallback(() => setOpen(false), []);
-  return (
-    <>
-      <button type="button" disabled={disabled} title={buttonTitle} aria-label={ariaLabel} onClick={() => setOpen(true)} className={className}>{children}</button>
-      {open && (
-        <ConfirmationModal
-          title={dialogTitle}
-          message={message}
-          confirmLabel={confirmLabel}
-          tone={tone}
-          requireReason={requireReason}
-          reasonLabel={reasonLabel}
-          onConfirm={onConfirm}
-          onClose={close}
-        />
-      )}
-    </>
-  );
-}
-
-function SaveBar({ dirty, busy, onSave, savedAt }: { dirty: boolean; busy: boolean; onSave: () => void; savedAt: number | null }) {
-  return (
-    <div className="flex items-center justify-end gap-3">
-      {savedAt && !dirty && <span className="text-[11px] font-semibold text-emerald-v inline-flex items-center gap-1"><Check className="w-3.5 h-3.5" /> Saved</span>}
-      <button
-        type="button"
-        disabled={!dirty || busy}
-        onClick={onSave}
-        className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-40"
-      >
-        {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Save changes
-      </button>
-    </div>
-  );
-}
-
-// ===== Clinic Panel ========================================================
-
-function ClinicPanel({ clinic, onChanged }: { clinic: Clinic; onChanged: () => Promise<unknown> }) {
-  const [draft, setDraft] = useState<Clinic>(clinic);
-  const [busy, setBusy] = useState(false);
-  const [savedAt, setSavedAt] = useState<number | null>(null);
-  const dirty = JSON.stringify(draft) !== JSON.stringify(clinic);
-  const set = <K extends keyof Clinic>(key: K, value: Clinic[K]) => setDraft(prev => ({ ...prev, [key]: value }));
-
-  async function save() {
-    setBusy(true);
-    try {
-      await api.updateClinic(clinic.id, {
-        name: draft.name, phone: draft.phone, logoUrl: draft.logoUrl, website: draft.website,
-        addressLine: draft.addressLine, timezone: draft.timezone, defaultLanguage: draft.defaultLanguage,
-        complianceDisclosure: draft.complianceDisclosure, humanFallbackNumber: draft.humanFallbackNumber,
-        doNotContactPolicy: draft.doNotContactPolicy, active: draft.active,
-      });
-      await onChanged();
-      setSavedAt(Date.now());
-    } finally { setBusy(false); }
-  }
-
-  async function deleteClinic() {
-    await api.deleteClinic(clinic.id);
-    await onChanged();
-  }
-
-  return (
-    <div className="space-y-4">
-      <div className="cc-card p-5 space-y-4">
-        <div className="flex items-center justify-between">
-          <h3 className="text-sm font-bold text-t1">Clinic Profile</h3>
-          <ConfirmedButton
-            dialogTitle="Delete clinic configuration?"
-            message={`Delete ${clinic.name} and all receptionist campaigns under it? This cannot be undone.`}
-            confirmLabel="Delete clinic"
-            tone="red"
-            onConfirm={deleteClinic}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--red-soft)]"
-          >
-            <Trash2 className="w-3 h-3" /> Delete
-          </ConfirmedButton>
-        </div>
-        <div className="grid gap-4 md:grid-cols-2">
-          <Field label="Clinic name" required><TextInput value={draft.name} onChange={e => set('name', e.target.value)} /></Field>
-          <Field label="Phone number" required><TextInput value={draft.phone} onChange={e => set('phone', e.target.value)} /></Field>
-          <Field label="Website"><TextInput value={draft.website ?? ''} onChange={e => set('website', e.target.value)} placeholder="https://" /></Field>
-          <Field label="Logo URL"><TextInput value={draft.logoUrl ?? ''} onChange={e => set('logoUrl', e.target.value)} placeholder="https://…/logo.png" /></Field>
-          <Field label="Address"><TextInput value={draft.addressLine ?? ''} onChange={e => set('addressLine', e.target.value)} /></Field>
-          <Field label="Human fallback number" hint="Used when a caller asks for a person or escalation is needed.">
-            <TextInput value={draft.humanFallbackNumber ?? ''} onChange={e => set('humanFallbackNumber', e.target.value)} />
-          </Field>
-          <Field label="Timezone">
-            <Select value={draft.timezone} onChange={e => set('timezone', e.target.value)}>
-              {TIMEZONE_OPTIONS.map(tz => <option key={tz} value={tz}>{tz}</option>)}
-            </Select>
-          </Field>
-          <Field label="Default language">
-            <Select value={draft.defaultLanguage} onChange={e => set('defaultLanguage', e.target.value)}>
-              {LANGUAGE_OPTIONS.map(l => <option key={l.id} value={l.id}>{l.label}</option>)}
-            </Select>
-          </Field>
-        </div>
-        <Field label="Approved opening disclosure" hint="Paste the exact clinic- and counsel-approved jurisdictional wording. It must identify the assistant as AI; text alone is not consent evidence." required>
-          <TextArea rows={2} value={draft.complianceDisclosure} onChange={e => set('complianceDisclosure', e.target.value)} />
-        </Field>
-        <Field label="Do-not-contact policy" hint="How the agent handles a request to stop being contacted.">
-          <TextArea rows={2} value={draft.doNotContactPolicy} onChange={e => set('doNotContactPolicy', e.target.value)} />
-        </Field>
-        <SaveBar dirty={dirty} busy={busy} onSave={save} savedAt={savedAt} />
-      </div>
-
-      <LocationsEditor clinic={clinic} onChanged={onChanged} />
-    </div>
-  );
-}
-
-function LocationsEditor({ clinic, onChanged }: { clinic: Clinic; onChanged: () => Promise<unknown> }) {
-  const locations = clinic.locations ?? [];
-  const [branches, setBranches] = useState<SchedulingBranch[]>([]);
-  const [editingId, setEditingId] = useState<string | 'new' | null>(null);
-  const [form, setForm] = useState({ name: '', address: '', phone: '', branchId: '', timezone: clinic.timezone, active: true, hoursStart: '09:00', hoursEnd: '17:00' });
-  const [busy, setBusy] = useState(false);
-  const [formError, setFormError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    api.listSchedulingBranches().then(rows => { if (active) setBranches(rows); }).catch(e => {
-      if (active) setFormError(e instanceof Error ? e.message : 'Unable to load scheduling branches');
-    });
-    return () => { active = false; };
-  }, []);
-
-  const setFormValue = <K extends keyof typeof form>(key: K, value: typeof form[K]) => setForm(previous => ({ ...previous, [key]: value }));
-
-  function beginCreate() {
-    const branch = branches.find(row => row.active);
-    setForm({ name: '', address: '', phone: '', branchId: branch?.id ?? '', timezone: branch?.timezone ?? clinic.timezone, active: true, hoursStart: '09:00', hoursEnd: '17:00' });
-    setFormError(null);
-    setEditingId('new');
-  }
-
-  function beginEdit(location: Location) {
-    const monday = location.workingHours?.monday;
-    setForm({
-      name: location.name, address: location.address, phone: location.phone ?? '', branchId: location.branchId ?? '',
-      timezone: location.timezone ?? clinic.timezone, active: location.active,
-      hoursStart: monday?.start ?? '09:00', hoursEnd: monday?.end ?? '17:00',
-    });
-    setFormError(null);
-    setEditingId(location.id);
-  }
-
-  async function saveLocation() {
-    if (!form.name.trim() || !form.address.trim() || !form.branchId) {
-      setFormError('Name, address, and an active scheduling branch are required.');
-      return;
-    }
-    const weekdays: WeeklyHours = {
-      monday: { open: true, start: form.hoursStart, end: form.hoursEnd },
-      tuesday: { open: true, start: form.hoursStart, end: form.hoursEnd },
-      wednesday: { open: true, start: form.hoursStart, end: form.hoursEnd },
-      thursday: { open: true, start: form.hoursStart, end: form.hoursEnd },
-      friday: { open: true, start: form.hoursStart, end: form.hoursEnd },
-      saturday: { open: false }, sunday: { open: false },
-    };
-    setBusy(true);
-    setFormError(null);
-    try {
-      const payload = {
-        name: form.name.trim(), address: form.address.trim(), phone: form.phone.trim() || null,
-        branchId: form.branchId, timezone: form.timezone, active: form.active, workingHours: weekdays,
-      };
-      if (editingId === 'new') await api.createLocation({ clinicId: clinic.id, ...payload });
-      else if (editingId) await api.updateLocation(editingId, payload);
-      setEditingId(null);
-      await onChanged();
-    } catch (e) {
-      setFormError(e instanceof Error ? e.message : 'Unable to save location');
-    } finally { setBusy(false); }
-  }
-
-  async function remove(id: string) {
-    await api.deleteLocation(id);
-    await onChanged();
-  }
-
-  return (
-    <div className="cc-card p-5 space-y-3">
-      <div className="flex items-center justify-between">
-        <h3 className="text-sm font-bold text-t1 inline-flex items-center gap-2"><MapPin className="w-4 h-4 text-indigo" /> Locations</h3>
-        <button type="button" onClick={editingId === 'new' ? () => setEditingId(null) : beginCreate} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-indigo hover:bg-[var(--s3)]">
-          <Plus className="w-3 h-3" /> Add location
-        </button>
-      </div>
-      {locations.length === 0 && editingId !== 'new' && <p className="text-xs text-t3">No locations yet. Map a receptionist location to an active scheduling branch before calls can book.</p>}
-      <div className="space-y-2">
-        {locations.map(loc => (
-          <div key={loc.id} className="flex items-center justify-between gap-3 rounded-xl border border-[var(--b1)] px-3 py-2.5">
-            <div className="min-w-0">
-              <p className="text-sm font-semibold text-t1 truncate">{loc.name} {!loc.active && <span className="badge badge-amber">Inactive</span>}</p>
-              <p className="text-[11px] text-t3 truncate">{loc.address}{loc.phone ? ` · ${loc.phone}` : ''} · {loc.timezone ?? clinic.timezone}</p>
-              <p className="text-[10px] text-t3 truncate">Scheduling branch: {branches.find(branch => branch.id === loc.branchId)?.name ?? 'Not mapped — booking disabled'}</p>
-            </div>
-            <div className="flex gap-2">
-              <button type="button" aria-label="Edit location" title="Edit location" onClick={() => beginEdit(loc)} className="text-t3 hover:text-indigo shrink-0"><Pencil className="w-3.5 h-3.5" /></button>
-              <ConfirmedButton
-                dialogTitle="Remove location?"
-                message={`Remove ${loc.name} from this receptionist configuration? Existing scheduling records are not changed.`}
-                confirmLabel="Remove location"
-                tone="red"
-                ariaLabel={`Remove location ${loc.name}`}
-                buttonTitle="Remove location"
-                onConfirm={() => remove(loc.id)}
-                className="text-t3 hover:text-red-v shrink-0"
-              ><Trash2 className="w-3.5 h-3.5" /></ConfirmedButton>
-            </div>
-          </div>
-        ))}
-      </div>
-      {editingId && (
-        <div className="grid gap-3 md:grid-cols-2 rounded-xl border border-dashed border-[var(--b2)] p-3">
-          <Field label="Location name" required><TextInput value={form.name} onChange={e => setFormValue('name', e.target.value)} /></Field>
-          <Field label="Scheduling branch" required>
-            <Select value={form.branchId} onChange={e => {
-              const branch = branches.find(row => row.id === e.target.value);
-              setForm(previous => ({ ...previous, branchId: e.target.value, timezone: branch?.timezone ?? previous.timezone }));
-            }}>
-              <option value="">Select an active branch</option>
-              {branches.filter(branch => branch.active || branch.id === form.branchId).map(branch => <option key={branch.id} value={branch.id} disabled={!branch.active}>{branch.name}{!branch.active ? ' (inactive)' : ''}</option>)}
-            </Select>
-          </Field>
-          <Field label="Address" required><TextInput value={form.address} onChange={e => setFormValue('address', e.target.value)} /></Field>
-          <Field label="Phone (E.164)"><TextInput placeholder="+12125550100" value={form.phone} onChange={e => setFormValue('phone', e.target.value)} /></Field>
-          <Field label="Timezone" required><Select value={form.timezone} onChange={e => setFormValue('timezone', e.target.value)}>{TIMEZONE_OPTIONS.map(zone => <option key={zone}>{zone}</option>)}</Select></Field>
-          <div className="grid grid-cols-2 gap-2"><Field label="Weekday open"><TextInput type="time" value={form.hoursStart} onChange={e => setFormValue('hoursStart', e.target.value)} /></Field><Field label="Weekday close"><TextInput type="time" value={form.hoursEnd} onChange={e => setFormValue('hoursEnd', e.target.value)} /></Field></div>
-          <Toggle checked={form.active} onChange={value => setFormValue('active', value)} label="Location active" />
-          <div className="flex items-end justify-end gap-2">
-            <button type="button" onClick={() => setEditingId(null)} className="rounded-xl border border-[var(--b1)] px-3 py-2 text-sm font-semibold text-t2">Cancel</button>
-            <button type="button" disabled={busy} onClick={saveLocation} className="rounded-xl bg-indigo px-3 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-40">{busy ? 'Saving…' : 'Save location'}</button>
-          </div>
-          {formError && <p className="md:col-span-2 text-xs font-semibold text-red-v">{formError}</p>}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ===== Campaign Panel (agent + campaign) ===================================
-
-function CampaignPanel({ clinic, campaign, onChanged }: { clinic: Clinic; campaign: Campaign; onChanged: () => Promise<unknown> }) {
-  const [agents, setAgents] = useState<Agent[]>([]);
-  const [draft, setDraft] = useState<Campaign>(campaign);
-  const [busy, setBusy] = useState(false);
-  const [savedAt, setSavedAt] = useState<number | null>(null);
-  const [newAgentName, setNewAgentName] = useState('');
-  const dirty = JSON.stringify(draft) !== JSON.stringify(campaign);
-  const locations = clinic.locations ?? [];
-  const rules = draft.bookingRules ?? {};
-
-  useEffect(() => { void api.listAgents(clinic.id).then(setAgents); }, [clinic.id]);
-
-  const set = <K extends keyof Campaign>(key: K, value: Campaign[K]) => setDraft(prev => ({ ...prev, [key]: value }));
-  const setRule = (key: string, value: unknown) => setDraft(prev => ({ ...prev, bookingRules: { ...prev.bookingRules, [key]: value } }));
-
-  const activeAgent = agents.find(a => a.id === draft.agentId) ?? null;
-
-  async function ensureAgentAndSave() {
-    setBusy(true);
-    try {
-      await api.updateCampaign(campaign.id, {
-        name: draft.name, campaignType: draft.campaignType, status: draft.status, agentId: draft.agentId,
-        offerTitle: draft.offerTitle, offerDescription: draft.offerDescription, offerScript: draft.offerScript,
-        appointmentType: draft.appointmentType, bookingRules: draft.bookingRules, eligibleLocationIds: draft.eligibleLocationIds,
-        smsConfirmation: draft.smsConfirmation, emailConfirmation: draft.emailConfirmation,
-      });
-      await onChanged();
-      setSavedAt(Date.now());
-    } finally { setBusy(false); }
-  }
-
-  async function saveAgent(patch: Partial<Agent>) {
-    if (!activeAgent) return;
-    const updated = await api.updateAgent(activeAgent.id, patch);
-    setAgents(prev => prev.map(a => (a.id === updated.id ? updated : a)));
-  }
-
-  async function verifyAgent() {
-    if (!activeAgent) return;
-    try {
-      const updated = await api.verifyAgentProvider(activeAgent.id);
-      setAgents(prev => prev.map(a => (a.id === updated.id ? updated : a)));
-    } finally {
-      // A failed provider request still records a durable safe attempt state.
-      // Refresh so Studio shows that state even when the API returns 503/409.
-      setAgents(await api.listAgents(clinic.id));
-    }
-  }
-
-  async function createNamedAgent() {
-    const name = newAgentName.trim();
-    if (!name) return;
-    setBusy(true);
-    try {
-      const created = await api.createAgent({ clinicId: clinic.id, name });
-      setAgents(prev => [...prev, created]);
-      setDraft(prev => ({ ...prev, agentId: created.id }));
-      setNewAgentName('');
-    } finally { setBusy(false); }
-  }
-
-  async function deleteCampaign() {
-    await api.deleteCampaign(campaign.id);
-    await onChanged();
-  }
-
-  function toggleLocation(id: string) {
-    set('eligibleLocationIds', draft.eligibleLocationIds.includes(id)
-      ? draft.eligibleLocationIds.filter(l => l !== id)
-      : [...draft.eligibleLocationIds, id]);
-  }
-
-  return (
-    <div className="space-y-4">
-      {/* Agent */}
-      <div className="cc-card p-5 space-y-4">
-        <h3 className="text-sm font-bold text-t1 inline-flex items-center gap-2"><Bot className="w-4 h-4 text-violet-v" /> Agent</h3>
-        <Field label="Campaign agent" hint="Runnable campaigns require a fresh verified provider deployment.">
-          <Select value={draft.agentId ?? ''} onChange={e => set('agentId', e.target.value || null)}>
-            <option value="">No agent linked (draft only)</option>
-            {agents.map(row => <option key={row.id} value={row.id}>{row.name} · {row.providerStatus}</option>)}
-          </Select>
-        </Field>
-        {activeAgent ? (
-          <AgentEditor
-            key={`${activeAgent.id}:${activeAgent.providerLastAttemptAt ?? 'never'}:${activeAgent.providerStatus}:${activeAgent.providerVersion ?? 'unbound'}`}
-            agent={activeAgent}
-            onSave={saveAgent}
-            onVerify={verifyAgent}
-          />
-        ) : (
-          <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
-            <TextInput aria-label="New agent name" placeholder="Enter a receptionist name" value={newAgentName} onChange={e => setNewAgentName(e.target.value)} />
-            <button type="button" disabled={!newAgentName.trim() || busy} onClick={createNamedAgent} className="rounded-xl bg-indigo px-3 py-2 text-sm font-semibold text-white disabled:opacity-40">Create agent</button>
-          </div>
-        )}
-      </div>
-
-      {/* Campaign */}
-      <div className="cc-card p-5 space-y-4">
-        <div className="flex items-center justify-between">
-          <h3 className="text-sm font-bold text-t1 inline-flex items-center gap-2"><Megaphone className="w-4 h-4 text-indigo" /> Campaign</h3>
-          <ConfirmedButton
-            dialogTitle="Delete receptionist campaign?"
-            message={`Delete ${campaign.name} and its configuration? This action cannot be undone.`}
-            confirmLabel="Delete campaign"
-            tone="red"
-            onConfirm={deleteCampaign}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--red-soft)]"
-          >
-            <Trash2 className="w-3 h-3" /> Delete
-          </ConfirmedButton>
-        </div>
-        <div className="grid gap-4 md:grid-cols-2">
-          <Field label="Campaign name" required><TextInput value={draft.name} onChange={e => set('name', e.target.value)} /></Field>
-          <Field label="Campaign type">
-            <Select value={draft.campaignType} onChange={e => set('campaignType', e.target.value)}>
-              {CAMPAIGN_TYPES.map(t => <option key={t} value={t}>{formatEnumLabel(t)}</option>)}
-            </Select>
-          </Field>
-          <Field label="Status">
-            <Select value={draft.status} onChange={e => set('status', e.target.value as Campaign['status'])}>
-              {['DRAFT', 'ACTIVE', 'PAUSED', 'ARCHIVED'].map(s => <option key={s} value={s}>{s}</option>)}
-            </Select>
-          </Field>
-          <Field label="Appointment type" required><TextInput value={draft.appointmentType} onChange={e => set('appointmentType', e.target.value)} /></Field>
-        </div>
-        <Field label="Offer title" required><TextInput value={draft.offerTitle} onChange={e => set('offerTitle', e.target.value)} /></Field>
-        <Field label="Offer description" required><TextArea rows={2} value={draft.offerDescription} onChange={e => set('offerDescription', e.target.value)} /></Field>
-        <Field label="Offer script" hint="The exact pitch the agent uses when the caller is interested." required>
-          <TextArea rows={3} value={draft.offerScript} onChange={e => set('offerScript', e.target.value)} />
-        </Field>
-
-        <div>
-          <p className="text-[11px] font-bold uppercase tracking-wide text-t3 mb-2">Eligible locations</p>
-          <div className="flex flex-wrap gap-2">
-            {locations.length === 0 && <p className="text-xs text-t3">Add locations in the Clinic Profile tab first.</p>}
-            {locations.map(loc => {
-              const on = draft.eligibleLocationIds.includes(loc.id);
-              return (
-                <button key={loc.id} type="button" onClick={() => toggleLocation(loc.id)}
-                  className={`rounded-xl border px-3 py-1.5 text-xs font-semibold transition-colors ${on ? 'border-indigo bg-[var(--indigo-soft)] text-indigo' : 'border-[var(--b1)] bg-[var(--s3)] text-t3'}`}>
-                  {on ? <Check className="w-3 h-3 inline mr-1" /> : null}{loc.name}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-
-        <div>
-          <p className="text-[11px] font-bold uppercase tracking-wide text-t3 mb-2">Booking rules</p>
-          <div className="grid gap-3 md:grid-cols-3">
-            <Field label="Slot length (min)"><TextInput type="number" value={rules.slotDurationMinutes ?? ''} onChange={e => setRule('slotDurationMinutes', e.target.value ? Number(e.target.value) : undefined)} /></Field>
-            <Field label="Lead time (hrs)"><TextInput type="number" value={rules.leadTimeHours ?? ''} onChange={e => setRule('leadTimeHours', e.target.value ? Number(e.target.value) : undefined)} /></Field>
-            <Field label="Max per day"><TextInput type="number" value={rules.maxPerDay ?? ''} onChange={e => setRule('maxPerDay', e.target.value ? Number(e.target.value) : undefined)} /></Field>
-            <Field label="Hours start"><TextInput placeholder="08:00" value={rules.hoursStart ?? ''} onChange={e => setRule('hoursStart', e.target.value || undefined)} /></Field>
-            <Field label="Hours end"><TextInput placeholder="17:00" value={rules.hoursEnd ?? ''} onChange={e => setRule('hoursEnd', e.target.value || undefined)} /></Field>
-            <Field label="Available days" hint="Comma separated">
-              <TextInput placeholder="Monday, Tuesday…" value={(rules.availableDays ?? []).join(', ')} onChange={e => setRule('availableDays', e.target.value.split(',').map(d => d.trim()).filter(Boolean))} />
-            </Field>
-          </div>
-        </div>
-
-        <div className="flex flex-wrap gap-3">
-          <Toggle checked={draft.smsConfirmation} onChange={v => set('smsConfirmation', v)} label="SMS confirmation" />
-          <Toggle checked={draft.emailConfirmation} onChange={v => set('emailConfirmation', v)} label="Email confirmation" />
-        </div>
-
-        <SaveBar dirty={dirty} busy={busy} onSave={ensureAgentAndSave} savedAt={savedAt} />
-      </div>
-    </div>
-  );
-}
-
-function AgentEditor({ agent, onSave, onVerify }: { agent: Agent; onSave: (patch: Partial<Agent>) => Promise<void>; onVerify: () => Promise<void> }) {
-  const [draft, setDraft] = useState<Agent>(agent);
-  const [busy, setBusy] = useState(false);
-  const [savedAt, setSavedAt] = useState<number | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const dirty = JSON.stringify(draft) !== JSON.stringify(agent);
-  const set = <K extends keyof Agent>(key: K, value: Agent[K]) => setDraft(prev => ({ ...prev, [key]: value }));
-
-  async function save() {
-    setBusy(true);
-    setError(null);
-    try {
-      await onSave({
-        name: draft.name, voice: draft.voice, tone: draft.tone, language: draft.language,
-        persona: draft.persona, greetingOverride: draft.greetingOverride, active: draft.active,
-        providerAgentId: draft.providerAgentId, providerVersionTag: draft.providerVersionTag,
-      });
-      setSavedAt(Date.now());
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Unable to save the agent.');
-    } finally { setBusy(false); }
-  }
-
-  async function verify() {
-    setBusy(true);
-    setError(null);
-    try { await onVerify(); }
-    catch (caught) { setError(caught instanceof Error ? caught.message : 'Provider verification failed.'); }
-    finally { setBusy(false); }
-  }
-
-  return (
-    <div className="space-y-4">
-      <div className="grid gap-4 md:grid-cols-2">
-        <Field label="Agent name" required><TextInput value={draft.name} onChange={e => set('name', e.target.value)} /></Field>
-        <Field label="Prompt-preview voice" hint="Launch uses the provider-verified voice snapshot.">
-          <Select value={draft.voice} onChange={e => set('voice', e.target.value)}>
-            {VOICE_OPTIONS.map(v => <option key={v.id} value={v.id}>{v.label}</option>)}
-          </Select>
-        </Field>
-        <Field label="Prompt-preview tone" hint="Preview/export only; saving does not deploy this value to the linked Retell agent.">
-          <Select value={draft.tone} onChange={e => set('tone', e.target.value)}>
-            {[...new Set([draft.tone, ...TONE_OPTIONS])].map(t => <option key={t} value={t}>{t}</option>)}
-          </Select>
-        </Field>
-        <Field label="Prompt-preview language" hint="Launch uses the provider-verified language snapshot.">
-          <Select value={draft.language} onChange={e => set('language', e.target.value)}>
-            {LANGUAGE_OPTIONS.map(l => <option key={l.id} value={l.id}>{l.label}</option>)}
-          </Select>
-        </Field>
-      </div>
-      <Field label="Prompt-preview persona" hint="Preview/export only; this is not synchronized to the linked Retell response engine."><TextArea rows={2} value={draft.persona ?? ''} onChange={e => set('persona', e.target.value)} /></Field>
-      <Field label="Prompt-preview greeting" hint="Preview/export only; live calls use the separately configured and verified provider deployment."><TextInput value={draft.greetingOverride ?? ''} onChange={e => set('greetingOverride', e.target.value)} /></Field>
-      <div className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] p-4 space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div>
-            <p className="text-xs font-bold text-t1">Retell deployment</p>
-            <p className="text-[11px] text-t3">Link an existing published agent. CareCommand only reads and verifies it.</p>
-          </div>
-          <span className={`badge ${agent.providerStatus === 'VERIFIED' ? 'badge-emerald' : agent.providerStatus === 'INVALID' ? 'badge-red' : 'badge-amber'}`}>{agent.providerStatus}</span>
-        </div>
-        <div className="grid gap-3 md:grid-cols-2">
-          <Field label="Retell agent ID"><TextInput value={draft.providerAgentId ?? ''} onChange={e => set('providerAgentId', e.target.value || null)} placeholder="agent_…" /></Field>
-          <Field label="Deployment tag" hint="The returned agent must explicitly contain this tag."><TextInput value={draft.providerVersionTag} onChange={e => set('providerVersionTag', e.target.value)} /></Field>
-        </div>
-        {agent.providerVersion !== null && <p className="text-[11px] text-t2">Pinned version {agent.providerVersion} · {agent.providerVoiceId ?? 'voice unavailable'} · {agent.providerLanguage ?? 'language unavailable'}</p>}
-        {agent.providerVerifiedAt && <p className="text-[11px] text-t3">Verified {new Date(agent.providerVerifiedAt).toLocaleString()} · expires {agent.providerVerificationExpiresAt ? new Date(agent.providerVerificationExpiresAt).toLocaleString() : 'unknown'}</p>}
-        {agent.providerLastErrorCode && <p role="alert" className="text-xs font-semibold text-red-v">Provider check: {agent.providerLastErrorCode.replaceAll('_', ' ')}</p>}
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <Toggle checked={draft.active} onChange={value => set('active', value)} label="Agent active" />
-          <button type="button" disabled={busy || dirty || !agent.providerAgentId} onClick={verify} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t1 disabled:opacity-40">
-            {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />} Verify provider deployment
-          </button>
-        </div>
-      </div>
-      {error && <p role="alert" className="text-xs font-semibold text-red-v">{error}</p>}
-      <SaveBar dirty={dirty} busy={busy} onSave={save} savedAt={savedAt} />
-    </div>
-  );
-}
-
-// ===== Intake Builder ======================================================
-
-function IntakeBuilder({ campaign, clinic, onChanged }: { campaign: Campaign; clinic: Clinic; onChanged: () => Promise<unknown> }) {
-  const [fields, setFields] = useState<IntakeField[]>(campaign.intakeFields ?? []);
-  const [busy, setBusy] = useState(false);
-
-  const refresh = useCallback(async () => {
-    const rows = await api.listIntakeFields(campaign.id);
-    setFields(rows);
-    await onChanged();
-  }, [campaign.id, onChanged]);
-
-  useEffect(() => { void api.listIntakeFields(campaign.id).then(setFields); }, [campaign.id]);
-
-  const usedTypes = new Set(fields.map(f => f.fieldType));
-
-  async function addField(type: FieldType) {
-    const meta = FIELD_CATALOG.find(f => f.type === type)!;
-    setBusy(true);
-    try {
-      const options = type === 'PREFERRED_LOCATION' ? (clinic.locations ?? []).map(l => l.name) : [];
-      await api.createIntakeField({ campaignId: campaign.id, fieldType: type, label: meta.label, aiQuestion: meta.question, options, sortOrder: fields.length });
-      await refresh();
-    } finally { setBusy(false); }
-  }
-
-  async function move(index: number, dir: -1 | 1) {
-    const next = [...fields];
-    const target = index + dir;
-    if (target < 0 || target >= next.length) return;
-    [next[index], next[target]] = [next[target], next[index]];
-    setFields(next);
-    await api.reorderIntakeFields(campaign.id, next.map(f => f.id));
-    await onChanged();
-  }
-
-  return (
-    <div className="grid gap-4 lg:grid-cols-[1fr_240px]">
-      <div className="cc-card p-5 space-y-3">
-        <div className="flex items-center justify-between">
-          <h3 className="text-sm font-bold text-t1 inline-flex items-center gap-2"><ListChecks className="w-4 h-4 text-indigo" /> Intake fields ({fields.length})</h3>
-          <span className="text-[10px] text-t3">Collected in this order during the call</span>
-        </div>
-        {fields.length === 0 && <p className="text-xs text-t3 py-6 text-center">No fields yet. Add from the catalog →</p>}
-        <div className="space-y-2">
-          {fields.map((field, index) => (
-            <IntakeFieldRow
-              key={field.id}
-              field={field}
-              isFirst={index === 0}
-              isLast={index === fields.length - 1}
-              onMoveUp={() => move(index, -1)}
-              onMoveDown={() => move(index, 1)}
-              onChanged={refresh}
-            />
-          ))}
-        </div>
-      </div>
-
-      <div className="cc-card p-4 space-y-3 lg:sticky lg:top-4 self-start">
-        <p className="text-[10px] font-bold uppercase tracking-widest text-t3">Field catalog</p>
-        {['Identity', 'Contact', 'Scheduling', 'Clinical', 'Compliance', 'Custom'].map(group => (
-          <div key={group} className="space-y-1.5">
-            <p className="text-[10px] font-semibold text-t3">{group}</p>
-            {FIELD_CATALOG.filter(f => f.group === group).map(f => {
-              const isCustom = f.group === 'Custom';
-              const disabled = busy || (!isCustom && usedTypes.has(f.type));
-              return (
-                <button key={f.type} type="button" disabled={disabled} onClick={() => addField(f.type)}
-                  className="w-full flex items-center justify-between gap-2 rounded-lg border border-[var(--b1)] px-2.5 py-1.5 text-left text-[11px] font-semibold text-t2 hover:bg-[var(--s3)] hover:text-indigo disabled:opacity-30 disabled:hover:bg-transparent">
-                  {f.label}
-                  <Plus className="w-3 h-3 shrink-0" />
-                </button>
-              );
-            })}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function IntakeFieldRow({ field, isFirst, isLast, onMoveUp, onMoveDown, onChanged }: {
-  field: IntakeField; isFirst: boolean; isLast: boolean; onMoveUp: () => void; onMoveDown: () => void; onChanged: () => Promise<void>;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const [draft, setDraft] = useState<IntakeField>(field);
-  const [busy, setBusy] = useState(false);
-  const dirty = JSON.stringify(draft) !== JSON.stringify(field);
-  const set = <K extends keyof IntakeField>(key: K, value: IntakeField[K]) => setDraft(prev => ({ ...prev, [key]: value }));
-  const hasOptions = field.fieldType === 'CUSTOM_DROPDOWN' || field.fieldType === 'PREFERRED_LOCATION';
-
-  async function save() {
-    setBusy(true);
-    try {
-      await api.updateIntakeField(field.id, {
-        label: draft.label, aiQuestion: draft.aiQuestion, validationRule: draft.validationRule,
-        required: draft.required, confirmationRequired: draft.confirmationRequired, options: draft.options,
-      });
-      await onChanged();
-      setExpanded(false);
-    } finally { setBusy(false); }
-  }
-
-  async function remove() {
-    await api.deleteIntakeField(field.id);
-    await onChanged();
-  }
-
-  return (
-    <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)]">
-      <div className="flex items-center gap-2 px-3 py-2.5">
-        <div className="flex flex-col">
-          <button type="button" aria-label="Move field up" title="Move up" disabled={isFirst} onClick={onMoveUp} className="text-t3 hover:text-indigo disabled:opacity-20"><ChevronUp className="w-3.5 h-3.5" /></button>
-          <button type="button" aria-label="Move field down" title="Move down" disabled={isLast} onClick={onMoveDown} className="text-t3 hover:text-indigo disabled:opacity-20"><ChevronDown className="w-3.5 h-3.5" /></button>
-        </div>
-        <GripVertical className="w-3.5 h-3.5 text-t3 shrink-0" />
-        <button type="button" onClick={() => setExpanded(e => !e)} className="flex-1 min-w-0 text-left">
-          <div className="flex items-center gap-2">
-            <p className="text-sm font-semibold text-t1 truncate">{field.label}</p>
-            {field.required ? <span className="badge badge-red">Required</span> : <span className="badge badge-blue">Optional</span>}
-            {field.confirmationRequired && <span className="badge badge-violet">Confirm</span>}
-          </div>
-          <p className="text-[11px] text-t3 truncate mt-0.5">“{field.aiQuestion}”</p>
-        </button>
-        <ConfirmedButton
-          dialogTitle="Remove intake field?"
-          message={`Remove ${field.label} from this campaign's call intake flow?`}
-          confirmLabel="Remove field"
-          tone="red"
-          ariaLabel={`Remove field ${field.label}`}
-          buttonTitle="Remove field"
-          onConfirm={remove}
-          className="text-t3 hover:text-red-v shrink-0"
-        ><Trash2 className="w-3.5 h-3.5" /></ConfirmedButton>
-      </div>
-      {expanded && (
-        <div className="border-t border-[var(--b1)] p-3 space-y-3">
-          <Field label="Display label"><TextInput value={draft.label} onChange={e => set('label', e.target.value)} /></Field>
-          <Field label="AI question wording"><TextArea rows={2} value={draft.aiQuestion} onChange={e => set('aiQuestion', e.target.value)} /></Field>
-          <Field label="Validation rule" hint="Plain-language hint the agent uses to validate the answer.">
-            <TextInput value={draft.validationRule ?? ''} onChange={e => set('validationRule', e.target.value)} />
-          </Field>
-          {hasOptions && (
-            <Field label="Options" hint="Comma separated choices.">
-              <TextInput value={draft.options.join(', ')} onChange={e => set('options', e.target.value.split(',').map(o => o.trim()).filter(Boolean))} />
-            </Field>
-          )}
-          <div className="flex flex-wrap gap-3">
-            <Toggle checked={draft.required} onChange={v => set('required', v)} label="Required" />
-            <Toggle checked={draft.confirmationRequired} onChange={v => set('confirmationRequired', v)} label="Read back to confirm" />
-          </div>
-          <div className="flex justify-end">
-            <button type="button" disabled={!dirty || busy} onClick={save} className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-40">
-              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Save field
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ===== Preview Panel =======================================================
-
-function PreviewPanel({ campaignId }: { campaignId: string }) {
-  const [result, setResult] = useState<PromptResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    api.getPrompt(campaignId).then(r => { if (active) setResult(r); }).catch(e => { if (active) setError(e instanceof Error ? e.message : 'Failed'); });
-    return () => { active = false; };
-  }, [campaignId]);
-
-  if (error) return <div className="cc-card p-6 text-sm text-red-v">{error}</div>;
-  if (!result) return <div className="cc-card p-10 text-center text-sm text-t3"><Loader2 className="w-4 h-4 animate-spin inline mr-2" /> Generating preview…</div>;
-
-  return (
-    <div className="space-y-4">
-      <div className="grid gap-4 md:grid-cols-2">
-        <SampleCard icon={<Sparkles className="w-4 h-4 text-violet-v" />} title="Sample greeting" text={result.samples.greeting} />
-        <SampleCard icon={<Megaphone className="w-4 h-4 text-indigo" />} title="Sample pitch" text={result.samples.pitch} />
-      </div>
-      <div className="cc-card p-5 space-y-2">
-        <h3 className="text-sm font-bold text-t1 inline-flex items-center gap-2"><ListChecks className="w-4 h-4 text-indigo" /> Sample intake questions</h3>
-        {result.samples.intakeQuestions.length === 0 ? <p className="text-xs text-t3">No intake fields configured.</p> : (
-          <ol className="space-y-1.5">
-            {result.samples.intakeQuestions.map((q, i) => (
-              <li key={i} className="flex gap-2.5 text-sm text-t2">
-                <span className="w-5 h-5 rounded-full bg-[var(--indigo-soft)] text-indigo text-[10px] font-bold flex items-center justify-center shrink-0">{i + 1}</span>
-                {q}
-              </li>
-            ))}
-          </ol>
-        )}
-      </div>
-      <SampleCard icon={<Check className="w-4 h-4 text-emerald-v" />} title="Sample confirmation" text={result.samples.confirmation} />
-      <div className="cc-card p-5 space-y-2">
-        <div className="flex items-center justify-between">
-          <h3 className="text-sm font-bold text-t1 inline-flex items-center gap-2"><Bot className="w-4 h-4 text-violet-v" /> Generated system prompt</h3>
-          <CopyButton value={result.systemPrompt} label="Copy prompt" />
-        </div>
-        <pre className="max-h-[480px] overflow-auto rounded-xl border border-[var(--b1)] bg-[var(--s3)] p-4 text-[12px] leading-relaxed text-t2 whitespace-pre-wrap font-mono">{result.systemPrompt}</pre>
-      </div>
-    </div>
-  );
-}
-
-function SampleCard({ icon, title, text }: { icon: React.ReactNode; title: string; text: string }) {
-  return (
-    <div className="cc-card p-5 space-y-2">
-      <h3 className="text-sm font-bold text-t1 inline-flex items-center gap-2">{icon} {title}</h3>
-      <p className="text-sm text-t2 leading-relaxed">{text}</p>
-    </div>
-  );
-}
-
-// ===== RetellAI Panel ======================================================
-
-function RetellPanel({ campaignId }: { campaignId: string }) {
-  const [config, setConfig] = useState<RetellConfig | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    api.getRetellConfig(campaignId).then(r => { if (active) setConfig(r); }).catch(e => { if (active) setError(e instanceof Error ? e.message : 'Failed'); });
-    return () => { active = false; };
-  }, [campaignId]);
-
-  const fullJson = useMemo(() => (config ? JSON.stringify(config, null, 2) : ''), [config]);
-
-  if (error) return <div className="cc-card p-6 text-sm text-red-v">{error}</div>;
-  if (!config) return <div className="cc-card p-10 text-center text-sm text-t3"><Loader2 className="w-4 h-4 animate-spin inline mr-2" /> Building preview/export config…</div>;
-
-  return (
-    <div className="space-y-4">
-      <div className="cc-card p-5 space-y-3">
-        <div className="flex items-center justify-between">
-          <h3 className="text-sm font-bold text-t1 inline-flex items-center gap-2"><Code2 className="w-4 h-4 text-indigo" /> Preview/export configuration — not deployed</h3>
-          <CopyButton value={fullJson} label="Copy full JSON" />
-        </div>
-        <p role="note" className="text-xs text-t3">Copying this JSON does not change the live provider agent. Verify the linked deployment above before campaign activation.</p>
-        <div className="grid gap-3 md:grid-cols-3">
-          <KV label="Voice ID" value={config.voiceId} />
-          <KV label="Language" value={config.language} />
-          <KV label="Begin message" value={config.beginMessage} mono={false} />
-        </div>
-        <Field label="Webhook URL">
-          <div className="flex gap-2">
-            <TextInput readOnly value={config.webhookUrl} className="font-mono text-xs" />
-            <CopyButton value={config.webhookUrl} />
-          </div>
-        </Field>
-      </div>
-
-      <div className="cc-card p-5 space-y-2">
-        <h3 className="text-sm font-bold text-t1">Dynamic variables</h3>
-        <div className="grid gap-2 md:grid-cols-2">
-          {Object.entries(config.dynamicVariables).map(([k, v]) => (
-            <div key={k} className="flex items-center justify-between gap-2 rounded-lg border border-[var(--b1)] bg-[var(--s3)] px-3 py-1.5">
-              <code className="text-[11px] font-semibold text-violet-v">{`{{${k}}}`}</code>
-              <span className="text-[11px] text-t2 truncate">{v || '—'}</span>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div className="grid gap-4 lg:grid-cols-2">
-        <div className="cc-card p-5 space-y-2">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-bold text-t1">Booking function schema</h3>
-            <CopyButton value={JSON.stringify(config.bookingFunction, null, 2)} />
-          </div>
-          <pre className="max-h-80 overflow-auto rounded-xl border border-[var(--b1)] bg-[var(--s3)] p-3 text-[11px] leading-relaxed text-t2 font-mono">{JSON.stringify(config.bookingFunction, null, 2)}</pre>
-        </div>
-        <div className="cc-card p-5 space-y-2">
-          <h3 className="text-sm font-bold text-t1">Call-outcome extraction fields</h3>
-          <div className="space-y-1.5">
-            {config.callOutcomeFields.map((f, i) => (
-              <div key={i} className="rounded-lg border border-[var(--b1)] bg-[var(--s3)] px-3 py-2">
-                <div className="flex items-center gap-2">
-                  <code className="text-[11px] font-bold text-indigo">{String(f.name)}</code>
-                  <span className="badge badge-blue">{String(f.type)}</span>
-                </div>
-                <p className="text-[11px] text-t3 mt-0.5">{String(f.description)}</p>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function KV({ label, value, mono = true }: { label: string; value: string; mono?: boolean }) {
-  return (
-    <div className="rounded-xl border border-[var(--b1)] bg-[var(--s3)] px-3 py-2">
-      <p className="text-[10px] font-bold uppercase tracking-wide text-t3">{label}</p>
-      <p className={`text-xs text-t1 mt-0.5 break-words ${mono ? 'font-mono' : ''}`}>{value}</p>
-    </div>
-  );
-}
-
-// ===== Activity Panel ======================================================
-
-function ActivityPanel({ clinicId }: { clinicId: string }) {
-  const [calls, setCalls] = useState<CallLog[]>([]);
-  const [selectedCall, setSelectedCall] = useState<CallLog | null>(null);
-  const [callDetailLoading, setCallDetailLoading] = useState(false);
-  const [callDetailError, setCallDetailError] = useState<string | null>(null);
-  const [reviewSaving, setReviewSaving] = useState(false);
-  const [reviewError, setReviewError] = useState<string | null>(null);
-  const [noteSummary, setNoteSummary] = useState('');
-  const [staffCorrection, setStaffCorrection] = useState('');
-  const [callerIntent, setCallerIntent] = useState('');
-  const [actionsTaken, setActionsTaken] = useState('');
-  const [followUpNotes, setFollowUpNotes] = useState('');
-  const [unresolvedActions, setUnresolvedActions] = useState('');
-  const [requests, setRequests] = useState<AppointmentRequest[]>([]);
-  const [optOuts, setOptOuts] = useState<OptOut[]>([]);
-  const [sub, setSub] = useState<'calls' | 'requests' | 'optouts'>('calls');
-  const [revokingId, setRevokingId] = useState<string | null>(null);
-  const [revocationReason, setRevocationReason] = useState('');
-  const [revocationAcknowledged, setRevocationAcknowledged] = useState(false);
-  const [revocationPending, setRevocationPending] = useState(false);
-  const [revocationError, setRevocationError] = useState<string | null>(null);
-
-  const load = useCallback(async () => {
-    const [c, r, o] = await Promise.all([api.listCallLogs(clinicId), api.listAppointmentRequests(clinicId), api.listOptOuts()]);
-    setCalls(c); setRequests(r); setOptOuts(o);
-  }, [clinicId]);
-
-  useEffect(() => {
-    let active = true;
-    (async () => {
-      const [c, r, o] = await Promise.all([api.listCallLogs(clinicId), api.listAppointmentRequests(clinicId), api.listOptOuts()]);
-      if (!active) return;
-      setCalls(c); setRequests(r); setOptOuts(o);
-    })();
-    return () => { active = false; };
-  }, [clinicId]);
-
-  function hydrateReview(call: CallLog) {
-    setNoteSummary(call.operationalNotes?.summary ?? '');
-    setStaffCorrection(call.operationalNotes?.correction ?? '');
-    setCallerIntent(call.operationalNotes?.callerIntent ?? '');
-    setActionsTaken(call.operationalNotes?.actionsTaken.join('\n') ?? '');
-    setFollowUpNotes(call.operationalNotes?.followUpNotes ?? '');
-    setUnresolvedActions(call.unresolvedActionItems?.join('\n') ?? '');
-  }
-
-  async function openCall(callId: string) {
-    setCallDetailLoading(true); setCallDetailError(null); setReviewError(null);
-    try {
-      const detail = await api.getCallLog(callId);
-      setSelectedCall(detail);
-      hydrateReview(detail);
-    } catch (error) {
-      setSelectedCall(null);
-      setCallDetailError(error instanceof Error ? error.message : 'Call detail could not be loaded.');
-    } finally {
-      setCallDetailLoading(false);
-    }
-  }
-
-  async function saveReview(operation: 'SAVE_DRAFT' | 'MARK_REVIEWED' | 'SIGN_OFF') {
-    if (!selectedCall || selectedCall.reviewStatus === 'SIGNED_OFF') return;
-    const unresolved = unresolvedActions.split('\n').map(value => value.trim()).filter(Boolean);
-    setReviewSaving(true); setReviewError(null);
-    try {
-      await api.updateCallReview(selectedCall.id, {
-        operation,
-        expectedRevision: selectedCall.reviewRevision ?? 0,
-        operationalNotes: {
-          summary: noteSummary.trim() || null,
-          correction: staffCorrection.trim() || null,
-          callerIntent: callerIntent.trim() || null,
-          actionsTaken: actionsTaken.split('\n').map(value => value.trim()).filter(Boolean),
-          followUpNotes: followUpNotes.trim() || null,
-        },
-        unresolvedActionItems: unresolved,
-        ...(operation === 'SIGN_OFF' && unresolved.length > 0 ? { acknowledgeUnresolvedActions: true as const } : {}),
-      });
-      const detail = await api.getCallLog(selectedCall.id);
-      setSelectedCall(detail);
-      hydrateReview(detail);
-      await load();
-    } catch (error) {
-      setReviewError(error instanceof Error ? error.message : 'The call review could not be saved. Reload the call before retrying.');
-    } finally {
-      setReviewSaving(false);
-    }
-  }
-
-  async function revokeOptOut() {
-    if (!revokingId || revocationReason.trim().length < 5 || !revocationAcknowledged) return;
-    setRevocationPending(true); setRevocationError(null);
-    try {
-      await api.revokeOptOut(revokingId, revocationReason.trim());
-      setRevokingId(null); setRevocationReason(''); setRevocationAcknowledged(false);
-      await load();
-    } catch (error) {
-      setRevocationError(error instanceof Error ? error.message : 'Do-not-contact revocation was denied.');
-    } finally {
-      setRevocationPending(false);
-    }
-  }
-
-  return (
-    <div className="cc-card p-5 space-y-4">
-      <div className="w-fit">
-        <ModuleTabs
-          tabs={[
-            { id: 'calls', label: 'Call logs', count: calls.length },
-            { id: 'requests', label: 'Appointments', count: requests.length },
-            { id: 'optouts', label: 'Do-not-contact', count: optOuts.length },
-          ]}
-          activeTab={sub}
-          onChange={id => setSub(id as typeof sub)}
-          ariaLabel="Activity record type"
-        />
-      </div>
-
-      {sub === 'calls' && (
-        <div className="space-y-2">
-          {calls.length === 0 && <p className="text-xs text-t3 py-4 text-center">No calls logged yet. Calls appear here via the RetellAI webhook.</p>}
-          {calls.map(call => (
-            <button key={call.id} type="button" onClick={() => void openCall(call.id)} className="w-full flex items-start justify-between gap-3 rounded-xl border border-[var(--b1)] px-3 py-2.5 text-left hover:bg-[var(--s3)]">
-              <div className="min-w-0">
-                <div className="flex items-center gap-2">
-                  <p className="text-sm font-semibold text-t1 truncate">{call.callerName ?? maskedPhone(call.callerPhone)}</p>
-                  <span className={outcomeBadge[call.outcome] ?? 'badge badge-blue'}>{formatEnumLabel(call.outcome)}</span>
-                </div>
-                <p className="text-[11px] text-t3 truncate mt-0.5">{call.transcriptSummary ?? '—'}</p>
-              </div>
-              <div className="text-right shrink-0">
-                <p className="text-[11px] font-semibold text-t2">{Math.floor(call.durationSeconds / 60)}m {call.durationSeconds % 60}s</p>
-                <p className="text-[10px] text-t3">{call.startedAt ? new Date(call.startedAt).toLocaleString() : ''}</p>
-              </div>
-            </button>
-          ))}
-          {callDetailLoading && <p role="status" className="text-xs text-t3 py-3 text-center"><Loader2 className="w-4 h-4 animate-spin inline mr-2" />Loading permission-aware call detail…</p>}
-          {callDetailError && <p role="alert" className="rounded-xl border border-red-v/30 bg-[var(--red-soft)] p-3 text-xs text-red-v">{callDetailError}</p>}
-          {selectedCall && !callDetailLoading && (
-            <section aria-label="Selected call operational review" className="rounded-2xl border border-[var(--b1)] bg-[var(--s3)] p-4 space-y-4">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <p className="text-sm font-bold text-t1">Call operational review</p>
-                  <p className="text-[11px] text-t3">Provider analysis and staff-authored notes remain separately attributed.</p>
-                </div>
-                <span className={selectedCall.reviewStatus === 'SIGNED_OFF' ? 'badge badge-emerald' : selectedCall.reviewStatus === 'REVIEWED' ? 'badge badge-blue' : 'badge badge-amber'}>
-                  {formatEnumLabel(selectedCall.reviewStatus ?? 'UNREVIEWED')} · revision {selectedCall.reviewRevision ?? 0}
-                </span>
-              </div>
-
-              <div className="grid gap-3 md:grid-cols-2">
-                <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
-                  <p className="text-[10px] font-bold uppercase tracking-wide text-t3">Provider call analysis</p>
-                  <p className="mt-1 text-xs text-t2">{selectedCall.providerSummary?.text ?? 'No provider-derived summary is stored.'}</p>
-                  <p className="mt-2 text-[10px] text-t3">Source: {selectedCall.providerSummary ? 'provider call analysis' : 'not available'}{selectedCall.providerSummary?.sourceCallId ? ` · call ${maskedProviderId(selectedCall.providerSummary.sourceCallId)}` : ''}</p>
-                </div>
-                <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
-                  <p className="text-[10px] font-bold uppercase tracking-wide text-t3">Recording access</p>
-                  <p className="mt-1 text-xs text-t2">
-                    {selectedCall.recordingAccess === 'available' ? 'An authorized HTTPS recording link is available.'
-                      : selectedCall.recordingAccess === 'restricted' ? 'A recording exists, but your role cannot open it.'
-                        : selectedCall.recordingAccess === 'purged' ? 'The recording was purged under the retention workflow.'
-                          : 'No usable recording is stored.'}
-                  </p>
-                  {selectedCall.recordingAccess === 'available' && selectedCall.recordingUrl && (
-                    <a href={selectedCall.recordingUrl} target="_blank" rel="noreferrer" className="mt-2 inline-flex text-xs font-semibold text-indigo hover:underline">Open authorized recording</a>
-                  )}
-                </div>
-              </div>
-
-              <div className="grid gap-3 md:grid-cols-2">
-                <Field label="Staff operational summary" hint="Staff-entered; does not overwrite provider analysis.">
-                  <TextArea value={noteSummary} onChange={event => setNoteSummary(event.target.value)} maxLength={2000} disabled={selectedCall.reviewStatus === 'SIGNED_OFF'} />
-                </Field>
-                <Field label="Staff correction" hint="Record a verified correction to provider-derived analysis; the original remains visible.">
-                  <TextArea value={staffCorrection} onChange={event => setStaffCorrection(event.target.value)} maxLength={2000} disabled={selectedCall.reviewStatus === 'SIGNED_OFF'} />
-                </Field>
-                <Field label="Caller intent" hint="Staff-entered interpretation; verify before sign-off.">
-                  <TextArea value={callerIntent} onChange={event => setCallerIntent(event.target.value)} maxLength={500} disabled={selectedCall.reviewStatus === 'SIGNED_OFF'} />
-                </Field>
-                <Field label="Actions taken" hint="One action per line.">
-                  <TextArea value={actionsTaken} onChange={event => setActionsTaken(event.target.value)} maxLength={6200} disabled={selectedCall.reviewStatus === 'SIGNED_OFF'} />
-                </Field>
-                <Field label="Follow-up notes" hint="Staff-entered operational context only.">
-                  <TextArea value={followUpNotes} onChange={event => setFollowUpNotes(event.target.value)} maxLength={1000} disabled={selectedCall.reviewStatus === 'SIGNED_OFF'} />
-                </Field>
-              </div>
-              <p className="rounded-lg border border-[var(--b1)] bg-[var(--amber-soft)] p-2.5 text-[11px] text-t2">
-                Record minimum-necessary operational facts. Do not enter card data, Social Security numbers, passwords, diagnoses, clinical risk judgments, or speculative labels. Use the proper clinical record for authorized clinical documentation.
-              </p>
-              <Field label="Unresolved action items" hint="One open item per line. Signed-off reviews retain these items as unresolved evidence.">
-                <TextArea value={unresolvedActions} onChange={event => setUnresolvedActions(event.target.value)} maxLength={6200} disabled={selectedCall.reviewStatus === 'SIGNED_OFF'} />
-              </Field>
-
-              <div className="grid gap-3 md:grid-cols-3">
-                <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
-                  <p className="text-[10px] font-bold uppercase tracking-wide text-t3">Appointments</p>
-                  {selectedCall.appointments?.length ? selectedCall.appointments.map(item => <p key={item.id} className="mt-1 text-xs text-t2"><a href="/scheduling" className="font-semibold text-indigo hover:underline">{item.service}</a> · {new Date(item.startsAt).toLocaleString()} · {formatEnumLabel(item.status)}</p>) : <p className="mt-1 text-xs text-t3">No canonical appointment linked.</p>}
-                </div>
-                <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
-                  <p className="text-[10px] font-bold uppercase tracking-wide text-t3">Appointment requests</p>
-                  {selectedCall.appointmentRequests?.length ? selectedCall.appointmentRequests.map(item => <p key={item.id} className="mt-1 text-xs text-t2">{item.requestedService ?? 'Unspecified service'} · {formatEnumLabel(item.status)}{item.requestedDateTime ? ` · ${new Date(item.requestedDateTime).toLocaleString()}` : ''}</p>) : <p className="mt-1 text-xs text-t3">No appointment request linked.</p>}
-                </div>
-                <div className="rounded-xl border border-[var(--b1)] bg-[var(--s2)] p-3">
-                  <p className="text-[10px] font-bold uppercase tracking-wide text-t3">Human handoffs</p>
-                  {selectedCall.handoffReferences?.length ? selectedCall.handoffReferences.map(item => <p key={item.id} className="mt-1 text-xs text-t2"><a href="/staff" className="font-semibold text-indigo hover:underline">{item.title}</a> · {formatEnumLabel(item.status)}</p>) : <p className="mt-1 text-xs text-t3">No human-handoff task linked.</p>}
-                </div>
-              </div>
-
-              {selectedCall.operationalNotes && <p className="text-[10px] text-t3">Staff-note source: staff entered by user {selectedCall.operationalNotes.actorUserId} at {new Date(selectedCall.operationalNotes.recordedAt).toLocaleString()}.</p>}
-              {selectedCall.reviewedAt && <p className="text-[10px] text-t3">Reviewed by {selectedCall.reviewedBy?.displayName ?? 'recorded user'} at {new Date(selectedCall.reviewedAt).toLocaleString()}.</p>}
-              {selectedCall.signedOffAt && <p className="text-[10px] text-t3">Final sign-off by {selectedCall.signedOffBy?.displayName ?? 'recorded manager'} at {new Date(selectedCall.signedOffAt).toLocaleString()}.</p>}
-              {reviewError && <p role="alert" className="text-xs text-red-v">{reviewError}</p>}
-              {selectedCall.reviewStatus !== 'SIGNED_OFF' && (
-                <div className="flex flex-wrap gap-2">
-                  <button type="button" disabled={reviewSaving} onClick={() => void saveReview('SAVE_DRAFT')} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-t2 disabled:opacity-50">Save draft</button>
-                  <button type="button" disabled={reviewSaving} onClick={() => void saveReview('MARK_REVIEWED')} className="rounded-lg bg-indigo px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50">Mark reviewed</button>
-                  {selectedCall.reviewCapabilities?.canSignOff && (
-                    <ConfirmedButton
-                      dialogTitle="Finalize manager sign-off?"
-                      message={unresolvedActions.split('\n').some(value => value.trim())
-                        ? 'Unresolved action items remain. Signing off preserves and explicitly acknowledges them as still open; the review becomes final.'
-                        : 'Confirm that the staff notes and linked actions were reviewed. The signed-off review becomes final.'}
-                      confirmLabel="Finalize sign-off"
-                      tone="amber"
-                      disabled={reviewSaving}
-                      onConfirm={() => saveReview('SIGN_OFF')}
-                      className="rounded-lg bg-emerald-v px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
-                    >Final manager sign-off</ConfirmedButton>
-                  )}
-                </div>
-              )}
-            </section>
-          )}
-        </div>
-      )}
-
-      {sub === 'requests' && (
-        <div className="space-y-2">
-          {requests.length === 0 && <p className="text-xs text-t3 py-4 text-center">No appointment requests yet.</p>}
-          {requests.map(req => (
-            <div key={req.id} className="flex items-start justify-between gap-3 rounded-xl border border-[var(--b1)] px-3 py-2.5">
-              <div className="min-w-0">
-                <div className="flex items-center gap-2">
-                  <p className="text-sm font-semibold text-t1 truncate">{req.contactName ?? req.contactPhone ?? 'Unknown'}</p>
-                  <span className={`badge ${req.status === 'CONFIRMED' ? 'badge-emerald' : req.status === 'CANCELED' ? 'badge-red' : 'badge-blue'}`}>{formatEnumLabel(req.status)}</span>
-                </div>
-                <p className="text-[11px] text-t3 truncate mt-0.5">{req.bookedSlot || `${req.requestedDate ?? ''} ${req.requestedTime ?? ''}`.trim() || req.appointmentType || '—'}</p>
-              </div>
-              <p className="text-[10px] text-t3 shrink-0">{new Date(req.createdAt).toLocaleDateString()}</p>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {sub === 'optouts' && (
-        <div className="space-y-2">
-          {optOuts.length === 0 && <p className="text-xs text-t3 py-4 text-center">No do-not-contact records.</p>}
-          {optOuts.map(o => (
-            <div key={o.id} className="flex items-center justify-between gap-3 rounded-xl border border-[var(--b1)] px-3 py-2.5">
-              <div className="min-w-0 flex items-center gap-2">
-                <ShieldCheck className="w-4 h-4 text-violet-v shrink-0" />
-                <div className="min-w-0">
-                  <p className="text-sm font-semibold text-t1 truncate">{o.contactPhone ?? o.contactEmail}</p>
-                  <p className="text-[11px] text-t3 truncate">{o.channel} · {o.reason ?? 'No reason given'}</p>
-                </div>
-              </div>
-              <button
-                type="button"
-                aria-label="Review do-not-contact revocation"
-                title="Review reactivation"
-                onClick={() => { setRevokingId(o.id); setRevocationReason(''); setRevocationAcknowledged(false); setRevocationError(null); }}
-                className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--red-soft)] shrink-0"
-              >Review reactivation</button>
-            </div>
-          ))}
-          {revokingId && (
-            <div role="dialog" aria-label="Revoke do-not-contact suppression" className="rounded-xl border border-red-v/40 bg-[var(--red-soft)] p-4 space-y-3">
-              <div>
-                <p className="text-sm font-bold text-t1">Reactivate contact permission</p>
-                <p className="text-xs text-t3 mt-1">Owner or admin authorization is required. This preserves the original do-not-contact record and adds revocation evidence; it does not delete history.</p>
-              </div>
-              <Field label="Reason for reactivation" required hint="Record the verified patient request or other authorized basis (5–500 characters).">
-                <TextArea value={revocationReason} onChange={event => setRevocationReason(event.target.value)} maxLength={500} placeholder="Verified patient requested contact reactivation on…" />
-              </Field>
-              <label className="flex items-start gap-2 text-xs text-t2">
-                <input type="checkbox" checked={revocationAcknowledged} onChange={event => setRevocationAcknowledged(event.target.checked)} className="mt-0.5" />
-                <span>I confirm the reactivation was authorized and understand outbound contact may resume after this durable revocation is recorded.</span>
-              </label>
-              {revocationError && <p role="alert" className="text-xs text-red-v">{revocationError}</p>}
-              <div className="flex gap-2">
-                <button type="button" disabled={revocationPending || revocationReason.trim().length < 5 || !revocationAcknowledged} onClick={() => void revokeOptOut()} className="rounded-lg bg-red-v px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50">
-                  {revocationPending ? 'Recording…' : 'Record authorized reactivation'}
-                </button>
-                <button type="button" disabled={revocationPending} onClick={() => { setRevokingId(null); setRevocationError(null); }} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-t2">Cancel</button>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ===========================================================================
-// Outbound calling panel: Retell setup status, campaign builder, target list,
-// test-call launcher, call logs, and the appointment-request review queue.
-// ===========================================================================
-
-const requestBadge: Record<BookingRequestStatus, string> = {
-  PENDING_REVIEW: 'badge badge-amber', BOOKED: 'badge badge-emerald', REJECTED: 'badge badge-red',
-  MISSING_INFO: 'badge badge-violet', DUPLICATE: 'badge badge-blue',
-};
-
-const EMPTY_CAMPAIGN: OutboundCampaignInput = {
-  clinicId: '', name: '', script: '', requiredFields: ['firstName', 'lastName', 'phone'],
-  consentText: '', humanHandoffInstruction: '', bookingMode: 'APPOINTMENT_REQUEST_ONLY',
-  receptionistCampaignId: '', purpose: 'CARE_COORDINATION', legalBasis: 'TREATMENT_OPERATIONS', policyVersion: '',
-  defaultBranchId: '', defaultService: '', quietHoursStart: '', quietHoursEnd: '', maxRetryAttempts: 1,
-};
-
-function OutboundPanel({ clinic }: { clinic: Clinic }) {
-  const { user } = useSession();
-  const [status, setStatus] = useState<RetellStatus | null>(null);
-  const [control, setControl] = useState<OutboundControlStatus | null>(null);
-  const [stopResult, setStopResult] = useState<OutboundStopResult | null>(null);
-  const [stopError, setStopError] = useState<string | null>(null);
-  const [stopping, setStopping] = useState(false);
-  const [campaigns, setCampaigns] = useState<OutboundCampaign[]>([]);
-  const [bookingAuthorities, setBookingAuthorities] = useState<Campaign[]>([]);
-  const [requests, setRequests] = useState<BookingRequest[]>([]);
-  const [deliveries, setDeliveries] = useState<ConfirmationDelivery[]>([]);
-  const [loadErrors, setLoadErrors] = useState<string[]>([]);
-  const [selectedId, setSelectedId] = useState<string>('');
-  const [creating, setCreating] = useState(false);
-  const [loading, setLoading] = useState(true);
-
-  const reload = useCallback(async () => {
-    const results = await Promise.allSettled([
-      api.retellStatus(),
-      api.listOutboundCampaigns(clinic.id),
-      api.listBookingRequests(),
-      api.listCampaigns(clinic.id),
-      api.listConfirmationDeliveries(),
-      api.outboundControl(),
-    ]);
-    const labels = ['Retell status', 'outbound campaigns', 'appointment requests', 'booking authorities', 'confirmation delivery evidence', 'emergency-stop status'];
-    setLoadErrors(results.flatMap((result, index) => result.status === 'rejected' ? [`${labels[index]} could not be loaded.`] : []));
-    const [st, camps, reqs, authorities, confirmationRows, controlResult] = results;
-    if (st.status === 'fulfilled') setStatus(st.value);
-    if (camps.status === 'fulfilled') {
-      setCampaigns(camps.value);
-      setSelectedId(prev => (prev && camps.value.some(c => c.id === prev) ? prev : camps.value[0]?.id ?? ''));
-    }
-    if (reqs.status === 'fulfilled') setRequests(reqs.value);
-    if (authorities.status === 'fulfilled') setBookingAuthorities(authorities.value.filter(c => c.status === 'ACTIVE'));
-    if (confirmationRows.status === 'fulfilled') setDeliveries(confirmationRows.value);
-    if (controlResult.status === 'fulfilled') setControl(controlResult.value);
-    else setControl(null);
-    setLoading(false);
-  }, [clinic.id]);
-
-  useEffect(() => {
-    void (async () => { await reload(); })();
-  }, [reload]);
-
-  const selected = campaigns.find(c => c.id === selectedId) ?? null;
-  const canStop = user ? ['OWNER', 'ADMIN'].includes(user.role) : false;
-
-  async function stopOutbound(reason: string) {
-    if (reason.trim().length < 5) throw new Error('Enter at least five characters for the stop reason.');
-    setStopping(true); setStopError(null); setStopResult(null);
-    try {
-      const result = await api.stopOutbound(reason);
-      setStopResult(result);
-      setControl({ stopped: true, reason, changedAt: new Date().toISOString() });
-      await reload();
-    } catch (error) {
-      setStopError(error instanceof Error ? error.message : 'Emergency stop could not be confirmed. Verify status before any launch.');
-      await reload();
-    } finally {
-      setStopping(false);
-    }
-  }
-
-  if (loading) return <div className="cc-card p-10 text-center text-sm text-t3"><Loader2 className="w-5 h-5 animate-spin inline" /></div>;
-
-  return (
-    <div className="space-y-5">
-      <RetellStatusCard status={status} />
-      <OutboundStopCard control={control} result={stopResult} canStop={canStop} stopping={stopping} error={stopError} onStop={stopOutbound} onRetry={reload} />
-      {loadErrors.length > 0 && (
-        <div role="alert" className="cc-card border-l-4 border-l-red-v p-4">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <p className="text-sm font-bold text-red-v">Outbound data is incomplete</p>
-              <p className="text-xs text-t3 mt-1">{loadErrors.join(' ')} Existing data is preserved; empty results are not assumed.</p>
-            </div>
-            <button type="button" onClick={() => void reload()} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-t2">Retry</button>
-          </div>
-        </div>
-      )}
-
-      <div className="grid lg:grid-cols-[260px_1fr] gap-5">
-        {/* Campaign list */}
-        <div className="cc-card p-3 space-y-1.5 h-max">
-          <div className="flex items-center justify-between px-1 pb-1">
-            <span className="text-[11px] font-bold uppercase tracking-wide text-t3">Campaigns</span>
-            <button type="button" aria-label="New outbound campaign" title="New outbound campaign" onClick={() => { setCreating(true); setSelectedId(''); }} className="text-indigo hover:opacity-80"><Plus className="w-4 h-4" /></button>
-          </div>
-          {campaigns.length === 0 && !creating && loadErrors.length === 0 && <p className="px-1 py-3 text-xs text-t3">No outbound campaigns yet.</p>}
-          {campaigns.map(c => (
-            <button
-              key={c.id}
-              type="button"
-              onClick={() => { setSelectedId(c.id); setCreating(false); }}
-              className={`w-full rounded-lg px-2.5 py-2 text-left text-sm transition-colors ${selectedId === c.id && !creating ? 'bg-[var(--s2)] text-t1' : 'text-t2 hover:bg-[var(--s2)]'}`}
-            >
-              <span className="block font-semibold truncate">{c.name}</span>
-              <span className="text-[10px] text-t3">{formatEnumLabel(c.status)} · {c._count?.targets ?? 0} targets · {c._count?.callLogs ?? 0} calls</span>
-            </button>
-          ))}
-        </div>
-
-        {/* Builder / detail */}
-        <div className="space-y-5">
-          {creating && (
-            <CampaignBuilder
-              clinicId={clinic.id}
-              bookingAuthorities={bookingAuthorities}
-              locations={clinic.locations ?? []}
-              timezone={clinic.timezone}
-              onCancel={() => setCreating(false)}
-              onSaved={async (id) => { setCreating(false); await reload(); setSelectedId(id); }}
-            />
-          )}
-          {!creating && selected && (
-            <CampaignDetail key={selected.id} campaign={selected} status={status} outboundStopped={control?.stopped !== false} onChanged={reload} />
-          )}
-          {!creating && !selected && (
-            <div className="cc-card p-10 text-center text-sm text-t3">Select a campaign or create one to configure outbound calls.</div>
-          )}
-        </div>
-      </div>
-
-      <BookingRequestQueue requests={requests} onChanged={reload} />
-      <ConfirmationDeliveryQueue deliveries={deliveries} loadFailed={loadErrors.some(error => error.startsWith('confirmation delivery evidence'))} onRetry={reload} />
-    </div>
-  );
-}
-
-function OutboundStopCard({ control, result, canStop, stopping, error, onStop, onRetry }: {
-  control: OutboundControlStatus | null;
-  result: OutboundStopResult | null;
-  canStop: boolean;
-  stopping: boolean;
-  error: string | null;
-  onStop: (reason: string) => Promise<void>;
-  onRetry: () => Promise<void>;
-}) {
-  if (!control) return (
-    <div role="alert" className="cc-card border-l-4 border-l-red-v p-4">
-      <p className="text-sm font-bold text-red-v">Outbound safety status is unavailable</p>
-      <p className="text-xs text-t3 mt-1">Launch controls remain disabled until tenant emergency-stop status is verified.</p>
-      <button type="button" onClick={() => void onRetry()} className="mt-2 rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-t2">Retry status</button>
-    </div>
-  );
-  return (
-    <div role={control.stopped ? 'alert' : 'status'} className={`cc-card border-l-4 p-4 ${control.stopped ? 'border-l-red-v' : 'border-l-emerald-v'}`}>
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <p className={`text-sm font-bold ${control.stopped ? 'text-red-v' : 'text-t1'}`}>{control.stopped ? 'Tenant outbound is stopped' : 'Tenant outbound stop is not active'}</p>
-          <p className="text-xs text-t3 mt-1">
-            {control.stopped
-              ? 'No new outbound calls may launch. Only the independent platform safety control can clear this tenant-wide stop.'
-              : canStop ? 'Owners and administrators can fail safe immediately. This status does not prove any campaign is otherwise ready.' : 'Only an owner or administrator can activate the emergency stop.'}
-          </p>
-          {control.stopped && control.reason && <p className="text-xs text-t2 mt-2"><span className="font-semibold">Recorded reason:</span> {control.reason}</p>}
-          {control.stopped && control.changedAt && <p className="text-[11px] text-t3 mt-1">Stop state last changed {new Date(control.changedAt).toLocaleString()}.</p>}
-        </div>
-        {!control.stopped && canStop && (
-          <ConfirmedButton
-            dialogTitle="Stop all outbound AI calls?"
-            message="Activate the tenant-wide emergency stop now. Active provider calls will be canceled where possible; uncertain provider outcomes remain blocked for reconciliation."
-            confirmLabel="Activate emergency stop"
-            tone="red"
-            requireReason
-            reasonLabel="Emergency stop reason"
-            disabled={stopping}
-            onConfirm={onStop}
-            className="rounded-lg bg-red-v px-3 py-2 text-xs font-bold text-white disabled:opacity-50"
-          >{stopping ? 'Stopping…' : 'Emergency stop'}</ConfirmedButton>
-        )}
-      </div>
-      {result && (
-        <div className="mt-3 rounded-lg border border-[var(--b1)] p-3 text-xs text-t2">
-          Cancellation requested for {result.activeCancellation.requested}; confirmed {result.activeCancellation.confirmed}; failed {result.activeCancellation.failed}; unconfirmed {result.activeCancellation.unconfirmed}; unbound intents quarantined {result.activeCancellation.unboundIntentsQuarantined}; reconciliation required {result.activeCancellation.reconciliationRequired}.
-          <span className="block mt-1 text-t3">Review tasks {result.activeCancellation.reviewRecorded}/{result.activeCancellation.reconciliationRequired}; signals {result.activeCancellation.signalRecorded}/{result.activeCancellation.reconciliationRequired}; stop audit {result.activeCancellation.auditRecorded ? 'recorded' : 'degraded'}.</span>
-        </div>
-      )}
-      {error && <p role="alert" className="mt-2 text-xs font-semibold text-red-v">{error} Treat outbound as stopped or unknown until status is verified.</p>}
-    </div>
-  );
-}
-
-function RetellStatusCard({ status }: { status: RetellStatus | null }) {
-  if (!status) return null;
-  const ok = status.configured;
-  return (
-    <div className={`cc-card p-4 border-l-4 ${ok ? 'border-l-emerald-v' : 'border-l-amber-v'}`}>
-      <div className="flex items-start gap-3">
-        {ok ? <CircleCheck className="w-5 h-5 text-emerald-v shrink-0" /> : <CircleAlert className="w-5 h-5 text-amber-v shrink-0" />}
-        <div className="flex-1">
-          <div className="flex items-center gap-2">
-            <h3 className="text-sm font-bold text-t1">Tenant Retell prerequisites {ok ? 'detected' : 'need setup'}</h3>
-            {status.mock && <span className="badge badge-violet">mock mode</span>}
-          </div>
-          <p className="text-xs text-t3 mt-0.5">
-            {ok
-              ? 'Server credentials and at least one tenant agent deployment passed the status check. Each selected campaign still requires its own current authority, consent, target, quiet-hours, capacity, and stop checks at launch.'
-              : 'Set the missing environment variables on the server to enable live outbound calls. Secrets are never sent to the browser.'}
-          </p>
-          <div className="flex flex-wrap gap-2 mt-3">
-            {status.checklist.map(item => (
-              <span key={item.key} className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[11px] font-semibold ${item.set ? 'border-[var(--b1)] text-t2' : 'border-amber-v/40 text-amber-v'}`}>
-                {item.set ? <Check className="w-3 h-3 text-emerald-v" /> : <AlertCircle className="w-3 h-3" />}
-                {item.label}
-              </span>
-            ))}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function RequiredFieldPicker({ value, onChange }: { value: OutboundRequiredField[]; onChange: (next: OutboundRequiredField[]) => void }) {
-  return (
-    <div className="flex flex-wrap gap-2">
-      {OUTBOUND_REQUIRED_FIELDS.map(f => {
-        const on = value.includes(f.key);
-        return (
-          <button
-            key={f.key}
-            type="button"
-            onClick={() => onChange(on ? value.filter(k => k !== f.key) : [...value, f.key])}
-            className={`rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition-colors ${on ? 'border-indigo bg-[var(--indigo-soft)] text-indigo' : 'border-[var(--b1)] bg-[var(--s3)] text-t3'}`}
-          >
-            {f.label}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-function CampaignFormFields({ form, set, bookingAuthorities, locations }: { form: OutboundCampaignInput; set: (patch: Partial<OutboundCampaignInput>) => void; bookingAuthorities: Campaign[]; locations: Location[] }) {
-  return (
-    <>
-      <Field label="Campaign name" required>
-        <TextInput value={form.name} onChange={e => set({ name: e.target.value })} placeholder="June reactivation outreach" />
-      </Field>
-      <Field label="Call script" required hint="What the agent should say. Keep it scheduling-focused — the AI must not give medical advice.">
-        <TextArea rows={4} disabled={form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'} value={form.script} onChange={e => set({ script: e.target.value })} placeholder="Hi, this is {{agent_name}} calling from {{clinic_name}}..." />
-      </Field>
-      <Field label="Required fields to collect" hint="The agent will route to staff review if any of these are missing.">
-        {form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'
-          ? <p className="text-xs text-t3">Controlled by the linked attested booking campaign.</p>
-          : <RequiredFieldPicker value={form.requiredFields ?? []} onChange={v => set({ requiredFields: v })} />}
-      </Field>
-      <Field label="Campaign consent / disclaimer text" hint="Paste clinic- and counsel-approved jurisdictional wording. A saved script is not proof of consent.">
-        <TextArea rows={2} value={form.consentText ?? ''} onChange={e => set({ consentText: e.target.value })} placeholder="Approved campaign-specific disclosure" />
-      </Field>
-      <Field label="Human handoff instruction" hint="When the agent should transfer to a human.">
-        <TextInput value={form.humanHandoffInstruction ?? ''} onChange={e => set({ humanHandoffInstruction: e.target.value })} placeholder="Transfer if the caller asks clinical questions." />
-      </Field>
-      <Field label="Booking mode" required hint="Direct booking only books when a branch, a valid time, and a free slot are all available; otherwise it routes to staff review.">
-        <Select aria-label="Booking mode" value={form.bookingMode} onChange={e => set({ bookingMode: e.target.value as OutboundBookingMode })}>
-          <option value="APPOINTMENT_REQUEST_ONLY">Appointment request only (staff books)</option>
-          <option value="DIRECT_BOOKING_IF_SLOT_AVAILABLE">Direct booking if a slot is available</option>
-        </Select>
-      </Field>
-      {form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE' && (
-        <Field label="Attested booking campaign ID" required hint="Direct booking uses this active Receptionist Campaign as the sole prompt, intake, service, location, and tool authority.">
-          <Select aria-label="Attested booking campaign" value={form.receptionistCampaignId ?? ''} onChange={e => {
-            const authority = bookingAuthorities.find(c => c.id === e.target.value);
-            const eligibleLocation = locations.find(location => authority?.eligibleLocationIds.includes(location.id) && location.active && location.branchId);
-            set({
-              receptionistCampaignId: e.target.value || null,
-              agentId: authority?.agentId ?? null,
-              defaultService: authority?.appointmentType ?? null,
-              defaultBranchId: eligibleLocation?.branchId ?? null,
-              script: authority?.offerScript ?? form.script,
-            });
-          }}>
-            <option value="">Select active attested campaign</option>
-            {bookingAuthorities.map(authority => <option key={authority.id} value={authority.id}>{authority.name} — {authority.appointmentType}</option>)}
-          </Select>
-        </Field>
-      )}
-      <div className="grid grid-cols-3 gap-3">
-        <Field label="Call purpose" required>
-          <Select aria-label="Call purpose" value={form.purpose ?? ''} onChange={e => set({ purpose: e.target.value as OutboundCampaignInput['purpose'] })}>
-            <option value="CARE_COORDINATION">Care coordination</option>
-            <option value="APPOINTMENT_REMINDER">Appointment reminder</option>
-            <option value="PATIENT_REACTIVATION">Patient reactivation</option>
-          </Select>
-        </Field>
-        <Field label="Legal basis" required>
-          <Select aria-label="Legal basis" value={form.legalBasis ?? ''} onChange={e => set({ legalBasis: e.target.value as OutboundCampaignInput['legalBasis'] })}>
-            <option value="TREATMENT_OPERATIONS">Treatment / operations</option>
-            <option value="EXPLICIT_CONSENT">Explicit consent</option>
-          </Select>
-        </Field>
-        <Field label="Policy version" required hint="Approved outbound policy identifier.">
-          <TextInput value={form.policyVersion ?? ''} onChange={e => set({ policyVersion: e.target.value })} placeholder="OUTBOUND-2026-01" />
-        </Field>
-      </div>
-      <div className="grid grid-cols-2 gap-3">
-        <Field label="Default branch ID" hint="Required for direct booking.">
-          {form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE' ? (
-            <Select aria-label="Eligible booking branch" value={form.defaultBranchId ?? ''} onChange={e => set({ defaultBranchId: e.target.value || null })}>
-              <option value="">Select eligible mapped branch</option>
-              {locations.filter(location => {
-                const authority = bookingAuthorities.find(c => c.id === form.receptionistCampaignId);
-                return authority?.eligibleLocationIds.includes(location.id) && location.active && location.branchId;
-              }).map(location => <option key={location.id} value={location.branchId!}>{location.name}</option>)}
-            </Select>
-          ) : <TextInput value={form.defaultBranchId ?? ''} onChange={e => set({ defaultBranchId: e.target.value })} placeholder="branch uuid (optional)" />}
-        </Field>
-        <Field label="Default service">
-          <TextInput disabled={form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'} value={form.defaultService ?? ''} onChange={e => set({ defaultService: e.target.value })} placeholder="Consultation" />
-        </Field>
-      </div>
-      <div className="grid grid-cols-3 gap-3">
-        <Field label="Quiet hours start"><TextInput value={form.quietHoursStart ?? ''} onChange={e => set({ quietHoursStart: e.target.value })} placeholder="21:00" /></Field>
-        <Field label="Quiet hours end"><TextInput value={form.quietHoursEnd ?? ''} onChange={e => set({ quietHoursEnd: e.target.value })} placeholder="08:00" /></Field>
-        <Field label="Max retries"><TextInput type="number" min={0} max={10} value={form.maxRetryAttempts ?? 1} onChange={e => set({ maxRetryAttempts: Number(e.target.value) })} /></Field>
-      </div>
-    </>
-  );
-}
-
-function CampaignBuilder({ clinicId, bookingAuthorities, locations, timezone, onSaved, onCancel }: { clinicId: string; bookingAuthorities: Campaign[]; locations: Location[]; timezone: string; onSaved: (id: string) => void; onCancel: () => void }) {
-  const [form, setForm] = useState<OutboundCampaignInput>({ ...EMPTY_CAMPAIGN, clinicId });
-  const [saving, setSaving] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-  const set = (patch: Partial<OutboundCampaignInput>) => setForm(prev => ({ ...prev, ...patch }));
-
-  async function save() {
-    const quietHoursError = validateOutboundQuietHours(form.quietHoursStart, form.quietHoursEnd, timezone);
-    if (quietHoursError) { setErr(quietHoursError); return; }
-    setSaving(true); setErr(null);
-    try {
-      const payload: OutboundCampaignInput = {
-        ...form,
-        clinicId,
-        defaultBranchId: form.defaultBranchId || null,
-        defaultService: form.defaultService || null,
-        consentText: form.consentText || null,
-        humanHandoffInstruction: form.humanHandoffInstruction || null,
-        quietHoursStart: form.quietHoursStart || null,
-        quietHoursEnd: form.quietHoursEnd || null,
-      };
-      const row = await api.createOutboundCampaign(payload);
-      onSaved(row.id);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Failed to save campaign');
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <div className="cc-card p-5 space-y-4">
-      <h3 className="text-sm font-bold text-t1 flex items-center gap-2"><Megaphone className="w-4 h-4 text-indigo" /> New outbound campaign</h3>
-      <CampaignFormFields form={form} set={set} bookingAuthorities={bookingAuthorities} locations={locations} />
-      <p className="text-[11px] text-t3">Quiet hours are enforced in clinic timezone {timezone}. Overnight windows such as 21:00–08:00 are supported.</p>
-      {err && <p className="text-xs text-red-v">{err}</p>}
-      <div className="flex gap-2">
-        <button type="button" disabled={saving || !form.name || !form.script} onClick={save} className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50">
-          {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Create campaign
-        </button>
-        <button type="button" onClick={onCancel} className="rounded-xl border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s2)]">Cancel</button>
-      </div>
-    </div>
-  );
-}
-
-function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { campaign: OutboundCampaign; status: RetellStatus | null; outboundStopped: boolean; onChanged: () => void }) {
-  const transportAmbiguityKey = transportAmbiguityStorageKey(campaign.id);
-  const [targets, setTargets] = useState<CallTarget[]>([]);
-  const [logs, setLogs] = useState<CallLog[]>([]);
-  const [reconciliations, setReconciliations] = useState<OutboundReconciliationEvidence[]>([]);
-  const [reconciliationVerified, setReconciliationVerified] = useState(false);
-  const [phone, setPhone] = useState('');
-  const [firstName, setFirstName] = useState('');
-  const [launchMsg, setLaunchMsg] = useState<{ kind: 'ok' | 'warn' | 'err'; text: string } | null>(null);
-  const [transportAmbiguityToken, setTransportAmbiguityToken] = useState<string | null>(() => readTransportAmbiguityToken(window.localStorage, transportAmbiguityKey));
-  const [launching, setLaunching] = useState(false);
-  const [campaignActionPending, setCampaignActionPending] = useState(false);
-  const [attachingLiveTarget, setAttachingLiveTarget] = useState(false);
-  const [syncingCallId, setSyncingCallId] = useState<string | null>(null);
-  const [providerStatusByCall, setProviderStatusByCall] = useState<Record<string, string>>({});
-  const [detailErrors, setDetailErrors] = useState<string[]>([]);
-
-  const reloadDetail = useCallback(async () => {
-    const [targetResult, logResult, reconciliationResult] = await Promise.allSettled([
-      api.listTargets(campaign.id),
-      api.listOutboundCallLogs(campaign.id),
-      api.listOutboundReconciliations(campaign.id),
-    ]);
-    setDetailErrors([
-      ...(targetResult.status === 'rejected' ? ['Targets could not be loaded.'] : []),
-      ...(logResult.status === 'rejected' ? ['Call logs could not be loaded.'] : []),
-      ...(reconciliationResult.status === 'rejected' ? ['Reconciliation safety evidence could not be loaded.'] : []),
-    ]);
-    if (targetResult.status === 'fulfilled') setTargets(targetResult.value);
-    if (logResult.status === 'fulfilled') setLogs(logResult.value);
-    setReconciliations(current => mergeReconciliationRefresh(current, reconciliationResult.status === 'fulfilled'
-      ? { ok: true, rows: reconciliationResult.value }
-      : { ok: false }));
-    setReconciliationVerified(reconciliationResult.status === 'fulfilled');
-  }, [campaign.id]);
-
-  useEffect(() => {
-    void (async () => { await reloadDetail(); })();
-  }, [reloadDetail, transportAmbiguityKey]);
-
-  const persistTransportAmbiguity = (token: string) => {
-    setTransportAmbiguityToken(token);
-    writeTransportAmbiguityToken(window.localStorage, transportAmbiguityKey, token);
-  };
-
-  async function verifyAndClearTransportAmbiguity() {
-    setLaunching(true);
-    try {
-      if (!transportAmbiguityToken) return;
-      const [attempt, durableRows] = await Promise.all([
-        api.verifyClearLaunchAttempt(campaign.id, transportAmbiguityToken),
-        api.listOutboundReconciliations(campaign.id),
-        api.listOutboundCallLogs(campaign.id),
-        api.listTargets(campaign.id),
-      ]);
-      setReconciliations(durableRows);
-      setReconciliationVerified(true);
-      if (!attempt.cleared || durableRows.length > 0) {
-        setLaunchMsg({ kind: 'err', text: `${OUTBOUND_RECONCILIATION_WARNING}. Server attempt proof is ${attempt.proof}; resolve durable evidence before clearing this block.` });
-        return;
-      }
-      clearTransportAmbiguityToken(window.localStorage, transportAmbiguityKey);
-      setTransportAmbiguityToken(null);
-      setLaunchMsg({ kind: 'warn', text: `Server-fenced attempt proof (${attempt.proof}) and durable call evidence were verified. The transport block was explicitly cleared.` });
-    } catch {
-      setReconciliationVerified(false);
-      setLaunchMsg({ kind: 'err', text: `${OUTBOUND_RECONCILIATION_WARNING}. Durable evidence refresh failed, so the launch block remains.` });
-    } finally {
-      setLaunching(false);
-    }
-  }
-
-  async function launch(targetId?: string, toPhone?: string) {
-    const dial = toPhone ?? phone;
-    if (!targetId && !dial) return;
-    setLaunching(true); setLaunchMsg(null);
-    try {
-      const res = await api.launchCall(campaign.id, {
-        ...(dial ? { phone: dial } : {}),
-        firstName: firstName || undefined,
-        targetId,
-      });
-      const presentation = presentLaunchResult(res);
-      setLaunchMsg({ kind: presentation.kind, text: presentation.text });
-      if (res.status === 'transport_ambiguous') persistTransportAmbiguity(res.clientAttemptToken);
-      if (res.status === 'launched' && !res.trackingDegraded) {
-        setPhone('');
-      }
-      if (presentation.refresh) {
-        await reloadDetail();
-        onChanged();
-      }
-    } catch {
-      setReconciliationVerified(false);
-      setLaunchMsg({ kind: 'err', text: `The launch response was lost. ${OUTBOUND_RECONCILIATION_WARNING}. Refresh durable evidence and verify provider state before any retry.` });
-      await reloadDetail();
-    } finally {
-      setLaunching(false);
-    }
-  }
-
-  async function attachAuthorizedLiveTestTarget() {
-    setAttachingLiveTarget(true); setLaunchMsg(null);
-    try {
-      const attached = await api.attachLiveTestTarget(campaign.id, {
-        firstName: 'Jordan',
-        lastName: 'Test',
-        scenario: 'attended synthetic live voice UAT',
-        acknowledgeAuthorizedSyntheticRecipient: true,
-        acknowledgeSyntheticConsentEvidence: true,
-      });
-      setLaunchMsg({ kind: 'ok', text: `Authorized synthetic recipient ${attached.destinationMasked} is attached to this campaign.` });
-      await reloadDetail();
-    } catch (error) {
-      setLaunchMsg({ kind: 'err', text: error instanceof Error ? error.message : 'The authorized synthetic recipient could not be attached.' });
-    } finally {
-      setAttachingLiveTarget(false);
-    }
-  }
-
-  async function syncProviderCall(callLogId: string) {
-    setSyncingCallId(callLogId); setLaunchMsg(null);
-    try {
-      const result = await api.syncOutboundProviderCall(campaign.id, callLogId);
-      setProviderStatusByCall(current => ({ ...current, [callLogId]: `${formatEnumLabel(result.providerStatus)} · ${result.durationSeconds}s${result.costNativeUnits === null ? '' : ' · provider cost recorded'}` }));
-      setLaunchMsg({
-        kind: result.outcome === 'ESCALATED' ? 'warn' : 'ok',
-        text: result.outcome === 'ESCALATED'
-          ? 'The provider call ended without signed analyzed-webhook evidence. CareCommand created a staff review task instead of fabricating a successful outcome.'
-          : `Provider lifecycle synchronized as ${formatEnumLabel(result.providerStatus)}.`,
-      });
-      await reloadDetail();
-    } catch (error) {
-      setLaunchMsg({ kind: 'err', text: error instanceof Error ? error.message : 'Provider lifecycle could not be synchronized.' });
-    } finally {
-      setSyncingCallId(null);
-    }
-  }
-
-  const transportAmbiguous = transportAmbiguityToken !== null;
-  const configured = status?.configured ?? false;
-  const reconciliationBlocksLaunch = launchControlsBlocked({ transportAmbiguous, reconciliationVerified, reconciliations });
-
-  async function approveAndRun() {
-    setCampaignActionPending(true); setLaunchMsg(null);
-    try {
-      await api.approveOutboundCampaign(campaign.id, 'RUNNING');
-      setLaunchMsg({ kind: 'ok', text: 'Authority approved and campaign started.' });
-      await onChanged();
-    } catch (e) {
-      setLaunchMsg({ kind: 'err', text: e instanceof Error ? e.message : 'Approval failed.' });
-    } finally { setCampaignActionPending(false); }
-  }
-
-  async function pauseCampaign() {
-    setCampaignActionPending(true); setLaunchMsg(null);
-    try {
-      await api.updateOutboundCampaign(campaign.id, { status: 'PAUSED' });
-      setLaunchMsg({ kind: 'ok', text: 'Campaign paused. No new calls can launch.' });
-      await onChanged();
-    } catch (e) {
-      setLaunchMsg({ kind: 'err', text: e instanceof Error ? e.message : 'Pause failed.' });
-    } finally { setCampaignActionPending(false); }
-  }
-
-  return (
-    <div className="space-y-5">
-      {detailErrors.length > 0 && (
-        <div role="alert" className="rounded-xl border border-red-v/40 bg-[var(--red-soft)] p-3 flex items-center justify-between gap-3">
-          <p className="text-xs text-red-v">{detailErrors.join(' ')} Existing rows remain visible; retry before acting.</p>
-          <button type="button" onClick={() => void reloadDetail()} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-xs font-semibold text-t2">Retry</button>
-        </div>
-      )}
-      {transportAmbiguous && (
-        <div role="alert" aria-live="assertive" className="cc-card border-l-4 border-l-red-v p-4">
-          <p className="text-sm font-bold text-red-v">{OUTBOUND_RECONCILIATION_WARNING}</p>
-          <p className="mt-1 text-xs text-t2">The launch transport failed after submission. Launch controls remain blocked until provider and durable call evidence are independently reconciled.</p>
-          <button type="button" disabled={launching} onClick={() => void verifyAndClearTransportAmbiguity()} className="mt-2 rounded-lg border border-red-v/40 px-3 py-1.5 text-xs font-semibold text-red-v disabled:opacity-50">Refresh all durable evidence and clear only if no reconciliation remains</button>
-        </div>
-      )}
-      {reconciliations.length > 0 && (
-        <div role="alert" aria-live="assertive" className="cc-card border-l-4 border-l-red-v p-4">
-          <p className="text-sm font-bold text-red-v">Critical reconciliation required: {OUTBOUND_RECONCILIATION_WARNING}</p>
-          <p className="mt-1 text-xs text-t2">This warning was reconstructed from durable call and target evidence and remains after refresh or navigation until backend reconciliation evidence is resolved.</p>
-          <div className="mt-3 space-y-2">
-            {reconciliations.map(row => (
-              <div key={row.localCallLogId} className="rounded-lg border border-red-v/30 bg-[var(--red-soft)] p-2 text-[11px] text-t2">
-                <p><span className="font-semibold">Local call log ID:</span> <span className="font-mono">{row.localCallLogId}</span></p>
-                <p><span className="font-semibold">Provider call ID:</span> <span className="font-mono">{maskedProviderId(row.providerCallId)}</span></p>
-                <p className="text-t3">Evidence: {row.triggerSources.join(', ')}{row.signalIds.length ? ` · signals ${row.signalIds.join(', ')}` : ''}{row.reviewTaskIds.length ? ` · review tasks ${row.reviewTaskIds.join(', ')}` : ''}</p>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-      <div className="cc-card p-5 space-y-3">
-        <div className="flex items-center justify-between gap-3">
-          <h3 className="text-sm font-bold text-t1">{campaign.name}</h3>
-          <div className="flex items-center gap-2">
-            <span className="badge badge-blue">{formatEnumLabel(campaign.status)}</span>
-            {campaign.status === 'RUNNING'
-              ? <button type="button" disabled={campaignActionPending} onClick={pauseCampaign} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-xs font-semibold text-t2">Pause</button>
-              : <ConfirmedButton
-                  dialogTitle="Approve and start outbound campaign?"
-                  message={`Authorize policy ${campaign.policyVersion ?? 'not configured'} and allow this campaign to place calls to its approved targets. Provider configuration and all launch gates still apply.`}
-                  confirmLabel="Approve and start"
-                  tone="amber"
-                  disabled={campaignActionPending || !campaign.policyVersion}
-                  onConfirm={approveAndRun}
-                  className="rounded-lg bg-indigo px-2.5 py-1 text-xs font-semibold text-white disabled:opacity-50"
-                >Approve and start</ConfirmedButton>}
-          </div>
-        </div>
-        <p className="text-[11px] text-t3">
-          Policy {campaign.policyVersion ?? 'not configured'} · {campaign.authorityApprovedAt ? `approved ${new Date(campaign.authorityApprovedAt).toLocaleString()} by ${campaign.authorityApprovedById ?? 'unknown'}` : 'not approved'}
-          {campaign.authorityFingerprint ? ` · evidence ${campaign.authorityFingerprint.slice(0, 12)}…` : ''}
-        </p>
-        <p className="text-xs text-t3 whitespace-pre-wrap">{campaign.script}</p>
-        <div className="flex flex-wrap gap-1.5">
-          {campaign.requiredFields.map(f => <span key={f} className="badge badge-violet">{f}</span>)}
-          <span className="badge badge-blue">{campaign.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE' ? 'Direct booking' : 'Request only'}</span>
-        </div>
-      </div>
-
-      {status?.liveTest?.enabled && (
-        <div className={`cc-card border-l-4 p-4 ${status.liveTest.active ? 'border-l-emerald-v' : 'border-l-amber-v'}`}>
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <p className="text-sm font-bold text-t1">Attended synthetic live voice UAT</p>
-              <p className="mt-1 text-xs text-t2">
-                Destination {status.liveTest.allowedDestinationMasked ?? 'not configured'} · {status.liveTest.callsRemaining} calls remaining · {status.liveTest.minutesRemaining} minutes remaining · one active call at a time.
-              </p>
-              <p className="mt-1 text-[11px] text-t3">
-                Window {status.liveTest.windowStart}–{status.liveTest.windowEnd} {status.liveTest.timezone}. Authorization expires {status.liveTest.expiresAt ? new Date(status.liveTest.expiresAt).toLocaleString() : 'not configured'}.
-              </p>
-              {!status.liveTest.active && <p role="alert" className="mt-2 text-xs font-semibold text-amber-v">Blocked: {formatEnumLabel(status.liveTest.blockingReason ?? status.liveTest.admissionReason ?? 'live test not ready')}</p>}
-            </div>
-            <ConfirmedButton
-              dialogTitle="Attach the environment-authorized synthetic recipient?"
-              message="This creates or reuses a clearly synthetic lead and campaign target for the one masked destination authorized in the local process environment. It does not expose or accept a phone number from the browser."
-              confirmLabel="Attach synthetic recipient"
-              tone="amber"
-              disabled={!status.liveTest.active || attachingLiveTarget}
-              onConfirm={attachAuthorizedLiveTestTarget}
-              className="rounded-lg border border-emerald-v/40 px-3 py-1.5 text-xs font-semibold text-emerald-v disabled:opacity-50"
-            >
-              {attachingLiveTarget ? 'Attaching…' : 'Attach authorized synthetic recipient'}
-            </ConfirmedButton>
-          </div>
-        </div>
-      )}
-
-      {/* Launch test call */}
-      <div className="cc-card p-5 space-y-3">
-        <h4 className="text-sm font-bold text-t1 flex items-center gap-2"><PhoneCall className="w-4 h-4 text-indigo" /> Launch a call</h4>
-        {outboundStopped && (
-          <div role="alert" className="flex items-center gap-2 rounded-lg border border-red-v/40 bg-[var(--red-soft)] px-3 py-2 text-xs font-semibold text-red-v">
-            <PhoneOff className="w-4 h-4" /> Launch disabled: tenant emergency-stop status is active or unavailable.
-          </div>
-        )}
-        {!configured && (
-          <div className="flex items-center gap-2 rounded-lg border border-amber-v/40 bg-amber-v/5 px-3 py-2 text-xs text-amber-v">
-            <AlertCircle className="w-4 h-4" /> Retell isn’t configured — launching returns a setup-required notice instead of placing a call.
-          </div>
-        )}
-        {status?.adhocTestCallsAllowed ? (
-          <div className="grid grid-cols-[1fr_1fr_auto] gap-2 items-end">
-            <Field label="Test-call phone number" hint="When a provider is configured, this action may place a real call."><TextInput value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 010 0000" /></Field>
-            <Field label="First name (optional)"><TextInput value={firstName} onChange={e => setFirstName(e.target.value)} placeholder="Jordan" /></Field>
-            <ConfirmedButton
-              dialogTitle="Place test call?"
-              message={`A configured provider may immediately dial ${phone || 'the entered number'}. Confirm the number is approved for this pilot test.`}
-              confirmLabel="Place test call"
-              tone="amber"
-              disabled={launching || outboundStopped || reconciliationBlocksLaunch || !phone || campaign.status !== 'RUNNING' || !configured}
-              onConfirm={() => launch()}
-              className="inline-flex items-center gap-2 rounded-xl bg-indigo px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50 h-[38px]"
-            >
-              {launching ? <Loader2 className="w-4 h-4 animate-spin" /> : <PhoneOutgoing className="w-4 h-4" />} Place test call
-            </ConfirmedButton>
-          </div>
-        ) : <p className="text-xs text-t3">Calls must use an authorized patient or lead target below. During live UAT, attach the environment-authorized synthetic recipient and launch it from the target row; the browser cannot supply or change the number.</p>}
-        {launchMsg && (
-          <p role={launchMsg.kind === 'err' ? 'alert' : 'status'} aria-live={launchMsg.kind === 'err' ? 'assertive' : 'polite'} className={`text-xs ${launchMsg.kind === 'ok' ? 'text-emerald-v' : launchMsg.kind === 'warn' ? 'text-amber-v' : 'text-red-v'}`}>{launchMsg.text}</p>
-        )}
-      </div>
-
-      {/* Targets */}
-      <TargetList campaign={campaign} targets={targets} onAdded={reloadDetail} onCall={(t) => launch(t.id)} canCall={!launching && !outboundStopped && !reconciliationBlocksLaunch && configured && campaign.status === 'RUNNING'} />
-
-      {/* Call logs */}
-      <div className="cc-card p-5">
-        <h4 className="text-sm font-bold text-t1 mb-3 flex items-center gap-2"><Activity className="w-4 h-4 text-indigo" /> Call logs</h4>
-        {logs.length === 0 ? <p className="text-xs text-t3">No calls placed yet.</p> : (
-          <div className="space-y-1.5">
-            {logs.map(l => (
-              <div key={l.id} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[var(--b1)] px-3 py-2 text-xs">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className={outcomeBadge[l.outcome] ?? 'badge badge-blue'}>{formatEnumLabel(l.outcome)}</span>
-                    <span className="text-t2">{l.callerName || maskedPhone(l.callerPhone)}</span>
-                    <span className="text-t3">{maskedPhone(l.callerPhone)}</span>
-                  </div>
-                  <p className="mt-1 text-[10px] text-t3 font-mono">{maskedProviderId(l.retellCallId)}{providerStatusByCall[l.id] ? ` · ${providerStatusByCall[l.id]}` : ''}</p>
-                </div>
-                <button
-                  type="button"
-                  disabled={!l.retellCallId || syncingCallId === l.id}
-                  onClick={() => void syncProviderCall(l.id)}
-                  className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-indigo disabled:opacity-50"
-                >
-                  {syncingCallId === l.id ? 'Refreshing…' : 'Refresh provider status'}
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function TargetList({ campaign, targets, onAdded, onCall, canCall }: { campaign: OutboundCampaign; targets: CallTarget[]; onAdded: () => void; onCall: (t: CallTarget) => void; canCall: boolean }) {
-  const [candidates, setCandidates] = useState<OutboundTargetCandidate[]>([]);
-  const targetIdentityKey = targets
-    .map(target => target.patientId ?? target.leadId ?? target.id)
-    .sort()
-    .join(',');
-  const [selectedCandidate, setSelectedCandidate] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [candidateError, setCandidateError] = useState<string | null>(null);
-  const loadCandidates = useCallback(async () => {
-    try {
-      const rows = await api.listOutboundTargetCandidates(campaign.id);
-      setCandidates(rows); setCandidateError(null);
-    } catch {
-      setCandidateError('Authorized target candidates could not be loaded. Existing rows are preserved; do not infer that no candidates exist.');
-    }
-  }, [campaign.id]);
-  useEffect(() => {
-    let active = true;
-    void api.listOutboundTargetCandidates(campaign.id).then(rows => {
-      if (!active) return;
-      setCandidates(rows); setCandidateError(null);
-    }).catch(() => {
-      if (active) setCandidateError('Authorized target candidates could not be loaded. Existing rows are preserved; do not infer that no candidates exist.');
-    });
-    return () => { active = false; };
-  }, [campaign.id, targetIdentityKey]);
-
-  async function add() {
-    const candidate = candidates.find(item => `${item.type}:${item.id}` === selectedCandidate);
-    if (!candidate) return;
-    setBusy(true);
-    try {
-      await api.addTargets(campaign.id, [{
-        ...(candidate.type === 'patient' ? { patientId: candidate.id } : { leadId: candidate.id }),
-      }]);
-      setSelectedCandidate('');
-      onAdded();
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function remove(target: CallTarget) {
-    setDeletingId(target.id);
-    try {
-      await api.deleteTarget(campaign.id, target.id);
-      onAdded();
-    } finally {
-      setDeletingId(null);
-    }
-  }
-
-  return (
-    <div className="cc-card p-5 space-y-3">
-      <h4 className="text-sm font-bold text-t1 flex items-center gap-2"><Phone className="w-4 h-4 text-indigo" /> Target list ({targets.length})</h4>
-      {candidateError && <div role="alert" className="rounded-lg border border-red-v/40 bg-[var(--red-soft)] p-2 text-xs text-red-v">{candidateError} <button type="button" onClick={() => void loadCandidates()} className="ml-2 underline font-semibold">Retry</button></div>}
-      <div className="grid grid-cols-[1fr_auto] gap-2 items-end">
-        <Field label="Authorized patient or lead">
-          <Select aria-label="Authorized outbound target" value={selectedCandidate} onChange={e => setSelectedCandidate(e.target.value)}>
-            <option value="">Select an identity with a canonical phone</option>
-            {candidates.filter(candidate => candidate.voiceAuthorizationReady).map(candidate => <option key={`${candidate.type}:${candidate.id}`} value={`${candidate.type}:${candidate.id}`}>{candidate.name} · {maskedPhone(candidate.phone)} · {candidate.voiceAuthorizationReason === 'compatible_immutable_consent' ? 'compatible consent evidence' : 'treatment/operations authority'}</option>)}
-          </Select>
-        </Field>
-        <button type="button" disabled={busy || !selectedCandidate} onClick={add} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50 h-[38px]"><Plus className="w-4 h-4" /> Add</button>
-      </div>
-      {targets.length > 0 && (
-        <div className="space-y-1.5">
-              {targets.map(t => (
-                (() => {
-                  const candidate = candidates.find(item => item.id === (t.patientId ?? t.leadId));
-                  const consentReady = candidate?.voiceAuthorizationReady === true;
-                  return (
-                <div key={t.id} className="flex items-center justify-between rounded-lg border border-[var(--b1)] px-3 py-2 text-xs">
-                  <div className="flex items-center gap-2">
-                    <span className="badge badge-blue">{formatEnumLabel(t.status)}</span>
-                    <span className="text-t2">{[t.firstName, t.lastName].filter(Boolean).join(' ') || maskedPhone(t.phone)}</span>
-                    <span className="text-t3">{maskedPhone(t.phone)}</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <button type="button" disabled={!canCall || t.status !== 'PENDING' || !consentReady} title={!consentReady ? `Target is not authorized for this exact campaign (${candidate?.voiceAuthorizationReason ?? 'authorization evidence unavailable'})` : !canCall ? 'Campaign must be running, provider-ready, and not emergency-stopped' : t.status !== 'PENDING' ? `Target is ${t.status}` : 'Call target'} onClick={() => onCall(t)} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 font-semibold text-indigo hover:bg-[var(--s2)] disabled:opacity-50">
-                      <PhoneOutgoing className="w-3 h-3" /> Call
-                    </button>
-                    <ConfirmedButton
-                      dialogTitle="Remove outbound target?"
-                      message={`Remove ${[t.firstName, t.lastName].filter(Boolean).join(' ') || t.phone} from this campaign? No call is placed by this action.`}
-                      confirmLabel="Remove target"
-                      tone="red"
-                      disabled={busy || deletingId === t.id}
-                      onConfirm={() => remove(t)}
-                      className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 font-semibold text-red-v hover:bg-[var(--red-soft)] disabled:opacity-50"
-                    >
-                      {deletingId === t.id ? 'Removing…' : 'Remove'}
-                    </ConfirmedButton>
-                  </div>
-                </div>
-                  );
-                })()
-              ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-type CanonicalBookingDisplay = {
-  service: string;
-  startsAt: string;
-  timezone: string;
-  locationName: string;
-  locationAddress: string | null;
-  providerName: string | null;
-};
-
-function BookingRequestQueue({ requests, onChanged }: { requests: BookingRequest[]; onChanged: () => void | Promise<void> }) {
-  const [reconcilingId, setReconcilingId] = useState<string | null>(null);
-  const [appointmentId, setAppointmentId] = useState('');
-  const [reason, setReason] = useState('');
-  const [acknowledged, setAcknowledged] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [reconciledCanonicalByRequest, setReconciledCanonicalByRequest] = useState<Record<string, CanonicalBookingDisplay>>({});
-  const canonicalByRequest = useMemo(() => {
-    const canonical: Record<string, CanonicalBookingDisplay> = {};
-    for (const request of requests) {
-      if (!request.bookedAppointment) continue;
-      canonical[request.id] = {
-        service: request.bookedAppointment.service,
-        startsAt: request.bookedAppointment.startsAt,
-        timezone: request.bookedAppointment.branch.timezone,
-        locationName: request.bookedAppointment.branch.name,
-        locationAddress: request.bookedAppointment.branch.location.trim() || null,
-        providerName: request.bookedAppointment.providerProfile?.user.displayName ?? null,
-      };
-    }
-    return { ...canonical, ...reconciledCanonicalByRequest };
-  }, [requests, reconciledCanonicalByRequest]);
-
-  async function reject(id: string, outcomeReason: string) {
-    setBusy(true); setError(null);
-    try {
-      await api.updateBookingRequest(id, { status: 'REJECTED', outcomeReason });
-      await onChanged();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'The rejection was not recorded.');
-    } finally { setBusy(false); }
-  }
-
-  async function reconcile(id: string) {
-    setBusy(true); setError(null);
-    try {
-      const result = await api.reconcileBookingRequest(id, {
-        appointmentId: appointmentId.trim(), outcomeReason: reason.trim(), acknowledgeRequestDifferences: true,
-      });
-      setReconciledCanonicalByRequest(current => ({ ...current, [id]: result.appointment }));
-      setReconcilingId(null); setAppointmentId(''); setReason(''); setAcknowledged(false);
-      await onChanged();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'The appointment link was not recorded.');
-    } finally { setBusy(false); }
-  }
-  return (
-    <div className="cc-card p-5">
-      <h3 className="text-sm font-bold text-t1 mb-3 flex items-center gap-2"><CalendarClock className="w-4 h-4 text-indigo" /> Appointment requests ({requests.length})</h3>
-      {requests.length === 0 ? <p className="text-xs text-t3">No appointment requests collected yet. They appear here after calls complete.</p> : (
-        <div className="space-y-2">
-          {requests.map(r => {
-            const canonical = canonicalByRequest[r.id];
-            return (
-            <div key={r.id} className="rounded-lg border border-[var(--b1)] px-3 py-2.5">
-              <div className="flex items-center justify-between gap-3">
-                <div className="flex items-center gap-2 min-w-0">
-                  <span className={requestBadge[r.status]}>{formatEnumLabel(r.status)}</span>
-                  <span className="text-sm text-t1 font-semibold truncate">{r.collectedName || r.collectedPhone || 'Unknown contact'}</span>
-                  {r.status !== 'BOOKED' && r.requestedService && <span className="text-xs text-t3 truncate">· Requested: {r.requestedService}</span>}
-                </div>
-                <div className="flex items-center gap-1.5 shrink-0">
-                  {['PENDING_REVIEW', 'MISSING_INFO'].includes(r.status) && (
-                    <>
-                      <button type="button" disabled={busy} onClick={() => window.open('/scheduling', '_blank', 'noopener,noreferrer')} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-indigo hover:bg-[var(--s2)]">Open scheduler</button>
-                      <button type="button" disabled={busy} onClick={() => { setReconcilingId(r.id); setAppointmentId(''); setReason(''); setAcknowledged(false); setError(null); }} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-emerald-v hover:bg-[var(--s2)]">Link canonical appointment</button>
-                      <ConfirmedButton
-                        dialogTitle="Reject appointment request?"
-                        message="Record why this request cannot proceed. This changes the request status; it does not cancel or modify an appointment."
-                        confirmLabel="Reject request"
-                        tone="red"
-                        requireReason
-                        reasonLabel="Rejection reason"
-                        disabled={busy}
-                        onConfirm={outcomeReason => reject(r.id, outcomeReason)}
-                        className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-[11px] font-semibold text-red-v hover:bg-[var(--s2)] disabled:opacity-50"
-                      >Reject</ConfirmedButton>
-                    </>
-                  )}
-                </div>
-              </div>
-              <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-t3">
-                {r.status === 'BOOKED' && canonical ? (
-                  <span className="font-semibold text-emerald-v">
-                    Booked: {canonical.service} · {new Date(canonical.startsAt).toLocaleString(getLocale(), { timeZone: canonical.timezone })} {canonical.timezone}
-                    {' · '}{[canonical.locationName, canonical.locationAddress].filter(Boolean).join(', ')}
-                    {canonical.providerName ? ` · ${canonical.providerName}` : ''}
-                  </span>
-                ) : r.status === 'BOOKED' ? (
-                  <span className="font-semibold text-red-v">Canonical appointment details unavailable—refresh before relying on this booking.</span>
-                ) : r.requestedDateTime ? <span>Requested: {new Date(r.requestedDateTime).toLocaleString()}</span> : null}
-                {r.collectedPhone && <span>{r.collectedPhone}</span>}
-                {r.missingFields.length > 0 && <span className="text-amber-v">Missing: {r.missingFields.join(', ')}</span>}
-                {r.outcomeReason && <span className="italic">{r.outcomeReason}</span>}
-              </div>
-              {reconcilingId === r.id && (
-                <div role="dialog" aria-label="Link canonical appointment" className="mt-3 rounded-lg border border-[var(--b1)] bg-[var(--s2)] p-3 space-y-2">
-                  <p className="text-xs font-bold text-t1">Reconcile to an appointment created in the canonical scheduler</p>
-                  <p className="text-[11px] text-t3">This does not create or fake a booking. The server verifies the exact tenant, branch, patient, provider, appointment state, source-call binding, and one-request ownership before changing the queue.</p>
-                  <Field label="Canonical appointment ID" required><TextInput value={appointmentId} onChange={event => setAppointmentId(event.target.value)} placeholder="UUID from the appointment record" /></Field>
-                  <Field label="Reconciliation reason" required><TextInput value={reason} onChange={event => setReason(event.target.value)} placeholder="Scheduled by front desk after caller review" /></Field>
-                  <label className="flex items-start gap-2 text-[11px] text-t2">
-                    <input type="checkbox" checked={acknowledged} onChange={event => setAcknowledged(event.target.checked)} />
-                    I reviewed any requested service/time differences and confirm this is the exact canonical appointment for this request.
-                  </label>
-                  <div className="flex gap-2">
-                    <button type="button" disabled={busy || !acknowledged || reason.trim().length < 5 || !/^[0-9a-f-]{36}$/i.test(appointmentId.trim())} onClick={() => void reconcile(r.id)} className="rounded-lg bg-indigo px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50">{busy ? 'Linking…' : 'Link appointment'}</button>
-                    <button type="button" disabled={busy} onClick={() => { setReconcilingId(null); setError(null); }} className="rounded-lg border border-[var(--b1)] px-3 py-1.5 text-xs font-semibold text-t2">Cancel</button>
-                  </div>
-                </div>
-              )}
-            </div>
-            );
-          })}
-          {error && <p role="alert" className="text-xs font-semibold text-red-v">{error} Refresh before taking another action.</p>}
-        </div>
-      )}
-    </div>
-  );
-}
-
-const confirmationPresentation: Record<string, { badge: string; label: string; guidance: string; title: string }> = {
-  queued: { badge: 'badge badge-blue', label: 'Queued', guidance: 'Waiting for the delivery worker.', title: 'No provider submission has been attempted yet.' },
-  retrying: { badge: 'badge badge-amber', label: 'Retrying', guidance: 'A known non-submission is scheduled for another attempt.', title: 'The prior attempt is known not to have been submitted to the provider.' },
-  failed: { badge: 'badge badge-red', label: 'Failed', guidance: 'Check configuration before the next scheduled attempt.', title: 'The provider did not accept this attempt; retry policy may continue.' },
-  dead_lettered: { badge: 'badge badge-red', label: 'Needs action', guidance: 'Resolve the failure and contact the patient manually only after checking consent and duplicate risk.', title: 'Automatic attempts stopped without provider acceptance.' },
-  delivery_unknown: { badge: 'badge badge-red', label: 'Reconcile', guidance: 'Review provider logs before any manual resend; delivery may already have occurred.', title: 'Provider acceptance is ambiguous. Automatic resend is disabled to prevent duplicates.' },
-  suppressed: { badge: 'badge badge-blue', label: 'Suppressed', guidance: 'No message was sent because consent, do-not-contact, or appointment state blocked it.', title: 'Suppressed before provider submission.' },
-  accepted: { badge: 'badge badge-emerald', label: 'Provider accepted', guidance: 'Delivery is not yet proven.', title: 'The provider accepted the message. This does not prove recipient delivery.' },
-  delivered: { badge: 'badge badge-emerald', label: 'Delivered', guidance: 'Provider delivery evidence was recorded.', title: 'Delivery evidence was received and recorded.' },
-};
-
-function ConfirmationDeliveryQueue({ deliveries, loadFailed, onRetry }: { deliveries: ConfirmationDelivery[]; loadFailed: boolean; onRetry: () => Promise<void> }) {
-  return (
-    <div className="cc-card p-5">
-      <h3 className="text-sm font-bold text-t1 mb-1 flex items-center gap-2"><ShieldCheck className="w-4 h-4 text-indigo" /> Appointment confirmation delivery ({deliveries.length})</h3>
-      <p className="text-xs text-t3 mb-3">Provider acceptance and confirmed delivery are shown separately. Red items require staff review and are never silently retried when acceptance is uncertain.</p>
-      {loadFailed ? (
-        <div role="alert" className="rounded-lg border border-red-v/40 bg-[var(--red-soft)] p-3 flex items-center justify-between gap-3">
-          <p className="text-xs text-red-v">Delivery evidence is unavailable. Do not assume confirmations were sent or delivered.</p>
-          <button type="button" onClick={() => void onRetry()} className="rounded-lg border border-[var(--b1)] px-2.5 py-1 text-xs font-semibold text-t2">Retry</button>
-        </div>
-      ) : deliveries.length === 0 ? <p className="text-xs text-t3">No confirmation delivery events yet.</p> : (
-        <div className="space-y-2">
-          {deliveries.map(delivery => {
-            const presentation = confirmationPresentation[delivery.status] ?? confirmationPresentation.failed;
-            return (
-              <div key={delivery.id} className="rounded-lg border border-[var(--b1)] px-3 py-2.5">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className={presentation.badge} title={presentation.title}>{presentation.label}</span>
-                      <span className="text-sm font-semibold text-t1 truncate">{delivery.patientName || 'Patient'} · {delivery.channel.toUpperCase()}</span>
-                    </div>
-                    <p className="mt-1 text-[11px] text-t3">{presentation.guidance}</p>
-                  </div>
-                  <span className="text-[11px] text-t3 shrink-0">Attempt {delivery.attempts}/{delivery.maxAttempts}</span>
-                </div>
-                <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-t3">
-                  {delivery.appointmentService && <span>{delivery.appointmentService}</span>}
-                  {delivery.appointmentStartsAt && <span>{new Date(delivery.appointmentStartsAt).toLocaleString()}</span>}
-                  {delivery.failureReason && <span className="text-red-v">Code: {delivery.failureReason}</span>}
-                  {delivery.acceptedAt && !delivery.deliveredAt && <span>Accepted {new Date(delivery.acceptedAt).toLocaleString()}</span>}
-                  {delivery.deliveredAt && <span>Delivered {new Date(delivery.deliveredAt).toLocaleString()}</span>}
-                </div>
-              </div>
-            );
-          })}
         </div>
       )}
     </div>

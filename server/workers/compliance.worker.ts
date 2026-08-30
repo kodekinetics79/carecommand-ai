@@ -10,8 +10,9 @@ import {
 } from './queues';
 import { assertSchedulerTick, validateTenantJobEnvelope } from '../lib/jobEnvelope';
 import { resolveActiveJobTenantIds } from '../lib/jobTenantResolver';
-import { runWithJobTenantContext } from '../lib/tenantContext';
+import { runInTenantContext, runWithJobTenantContext } from '../lib/tenantContext';
 import { dispatchDueAppointmentConfirmations } from '../lib/receptionist/confirmationOutbox';
+import { reverifyExpiringAgents } from '../lib/receptionist/agentReverification';
 import {
   runReadinessRecalc,
   runEvidenceExpiry,
@@ -32,6 +33,7 @@ const COMPLIANCE_SCHEDULERS: Record<ComplianceJobName, string> = {
   'vendor-review-reminder': 'compliance-vendor-review',
   'security-scan-placeholder': 'compliance-security-scan',
   'receptionist-confirmation-dispatch': 'receptionist-confirmation-dispatch',
+  'receptionist-agent-reverify': 'receptionist-agent-reverify',
 };
 
 function isComplianceJobName(name: string): name is ComplianceJobName {
@@ -53,6 +55,27 @@ export async function runTenantComplianceJob(operation: ComplianceJobName, tenan
         tenantId,
         async () => { await dispatchDueAppointmentConfirmations(tenantId); },
         'worker:receptionist-confirmation',
+      );
+      break;
+    case 'receptionist-agent-reverify':
+      // A3 — deliberately `runInTenantContext`, NOT `runWithJobTenantContext`.
+      //
+      // The latter opens one Prisma interactive transaction around the whole
+      // job, and this job makes three or more HTTPS round trips to Retell per
+      // agent, up to fifty agents a pass. Prisma's default interactive
+      // transaction timeout is 5000 ms; a probe measured 6108 ms for a single
+      // agent. So the transaction aborted with P2028, BullMQ retried it three
+      // times into the same wall, and attestations lapsed after 24 hours —
+      // which is a receptionist that stops answering, raised by the same dead
+      // worker that was supposed to raise it.
+      //
+      // AsyncLocalStorage alone still fences the tenant: `db` opens a short
+      // transaction per operation with the tenant GUCs applied (see lib/db.ts),
+      // and `verifyAgentProvider` opens its own scoped transactions around a
+      // probe that must run with nothing open.
+      await runInTenantContext(
+        { tenantId, actorId: 'worker:receptionist-agent-reverify', actorRole: 'WORKER', source: 'worker' },
+        async () => { await reverifyExpiringAgents(tenantId); },
       );
       break;
   }

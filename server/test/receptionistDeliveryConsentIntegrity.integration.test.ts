@@ -54,7 +54,7 @@ async function fixture() {
     return [role, user] as const;
   }))) as unknown as Record<'OWNER' | 'ADMIN' | 'MANAGER' | 'FRONT_DESK' | 'BILLING', { id: string }>;
   const clinic = await db.receptionistClinic.create({ data: {
-    tenantId, name: 'Integrity clinic', phone: phoneFor(tenantId), timezone: 'UTC',
+    tenantId, name: 'Integrity clinic', phone: phoneFor(tenantId), timezone: 'UTC', country: 'US', defaultLanguage: 'en-US',
   } });
   const patient = await db.patient.create({ data: {
     tenantId, branchId: branch.id, firstName: 'Consent', lastName: 'Patient',

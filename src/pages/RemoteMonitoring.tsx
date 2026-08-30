@@ -20,6 +20,17 @@ interface Alert {
   id: string; patientName: string; readingType: string | null; value: string | null; unit: string | null;
   severity: string; alertType: string; status: string; assignedTo: string | null; generatedReason: string | null; createdAt: string;
 }
+/**
+ * GET /v1/monitoring/alerts answers with a page, not a bare list.
+ *
+ * The route orders by acuity IN THE DATABASE and then truncates, so the rows it
+ * returns are the most severe ones rather than the most recent — and it reports
+ * `total` precisely so this screen can say how many it is NOT showing. Reading
+ * the envelope as an array threw `alerts.filter is not a function` on render,
+ * which took the whole staff workspace down to a blank page; the queue is now
+ * read from `items`, and truncation is stated instead of implied.
+ */
+interface AlertPage { items: Alert[]; total: number; limit: number; truncated: boolean }
 interface RiskRow {
   patientId: string; patientName: string; riskScore: number; reasons: string[]; missedReadings: number;
   lastReadingType: string | null; lastReadingAt: string | null; assignedTo: string | null; recommendedAction: string;
@@ -63,6 +74,7 @@ function notificationStatusLabel(status: string): string {
 export default function RemoteMonitoring() {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [alertTotal, setAlertTotal] = useState<{ total: number; truncated: boolean }>({ total: 0, truncated: false });
   const [risk, setRisk] = useState<RiskRow[]>([]);
   const [briefing, setBriefing] = useState<Briefing | null>(null);
   const [loading, setLoading] = useState(true);
@@ -73,11 +85,12 @@ export default function RemoteMonitoring() {
     try {
       const [o, a, r, b] = await Promise.all([
         apiRequest<Overview>('/v1/monitoring/overview'),
-        apiRequest<Alert[]>('/v1/monitoring/alerts'),
+        apiRequest<AlertPage>('/v1/monitoring/alerts'),
         apiRequest<RiskRow[]>('/v1/monitoring/patients-at-risk'),
         apiRequest<Briefing>('/v1/monitoring/morning-briefing'),
       ]);
-      setOverview(o); setAlerts(a); setRisk(r); setBriefing(b); setError(null);
+      setOverview(o); setAlerts(a.items); setAlertTotal({ total: a.total, truncated: a.truncated });
+      setRisk(r); setBriefing(b); setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load monitoring data');
     } finally {
@@ -176,7 +189,13 @@ export default function RemoteMonitoring() {
               : alerts.length === 0 ? <EmptyStatePremium icon={<CheckCircle2 className="w-5 h-5" />} title="No open workflow alerts" description="No threshold, missed-reading, or device alerts were returned in the current response." />
               : (
                 <div className="space-y-2">
-                  {alerts.filter(a => a.status !== 'resolved').map(a => (
+                  {/* The route answers with open work only, ordered by acuity
+                      before the row limit. Say what is off the end rather than
+                      letting the list imply it is the whole queue. */}
+                  {alertTotal.truncated && (
+                    <p className="text-[11px] text-t3">Showing the {alerts.length} most severe of {alertTotal.total} open alerts.</p>
+                  )}
+                  {alerts.map(a => (
                     <div key={a.id} data-alert-id={a.id} className="rounded-xl border border-[var(--b1)] bg-[var(--s1)] p-3">
                       <div className="flex items-start justify-between gap-3">
                         <div className="min-w-0">

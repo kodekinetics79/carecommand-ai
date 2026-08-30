@@ -38,7 +38,7 @@ afterAll(async () => {
   await db.$disconnect();
 });
 
-async function pilotTenant() {
+async function pilotTenant({ openSession = true }: { openSession?: boolean } = {}) {
   const tenantId = randomUUID();
   const platformUserId = randomUUID();
   const tag = tenantId.slice(0, 8);
@@ -77,6 +77,19 @@ async function pilotTenant() {
     authorization: `Bearer ${signPlatformToken(app, { id: platformUserId, role: 'PLATFORM_ADMIN' })}`,
     'content-type': 'application/json',
   };
+
+  // Pilot import reads and writes the clinic's patient and appointment rows, so
+  // it now requires a live break-glass session the same way the staff roster
+  // does. Opening one is part of the operator flow, not test scaffolding.
+  if (openSession) {
+    const session = await app.inject({
+      method: 'POST', url: `/v1/platform/tenants/${tenantId}/support-session`, headers,
+      payload: { reason: 'Pilot data import for onboarding', minutes: 60 },
+    });
+    if (session.statusCode >= 400) throw new Error(`could not open a support session: ${session.statusCode} ${session.body}`);
+    cleanup.push(async () => { await db.supportAccessSession.deleteMany({ where: { tenantId } }).catch(() => {}); });
+  }
+
   return { tenantId, branch, provider, user, headers };
 }
 
@@ -168,4 +181,28 @@ describe('pilot import — provider linkage', () => {
       },
     })).rejects.toThrow();
   }, 90_000);
+
+  /**
+   * Pilot import is the only platform capability that reads and writes a
+   * clinic's patient and appointment rows. It ran on the operator's identity
+   * alone: no reason recorded, no expiry, nothing the clinic could see
+   * afterwards. It now needs the same break-glass session the staff roster does.
+   */
+  it('refuses to touch clinic data without an open support session, and says how to get one', async () => {
+    const { tenantId, headers } = await pilotTenant({ openSession: false });
+    const res = await commit(tenantId, headers, [
+      'external_ref,first_name,last_name',
+      'PAT-2,Rosa,Marin',
+    ].join('\n'));
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toBe('support_session_required');
+    expect(String(res.json().message)).toMatch(/support session/i);
+  });
+
+  it('refuses the checklist read too - the guard is on the workspace, not on one route', async () => {
+    const { tenantId, headers } = await pilotTenant({ openSession: false });
+    const res = await app.inject({ method: 'GET', url: `/v1/platform/tenants/${tenantId}/pilot-checklist`, headers });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toBe('support_session_required');
+  });
 });

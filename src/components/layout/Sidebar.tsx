@@ -3,11 +3,13 @@ import { useLocation, Link, useNavigate } from 'react-router';
 import {
   LayoutDashboard, Radar, Users2, Megaphone, TrendingUp,
   CalendarDays, ClipboardList, Puzzle, Settings,
-  Star, Orbit, Target, UserCircle2, ShieldCheck, Sparkles, BadgeCheck, Bot, FileText, CreditCard, Lock, Cpu, Activity, Plug,
-  ChevronsLeft, ChevronsRight, ChevronDown, Search, X,
+  Star, Orbit, Target, UserCircle2, ShieldCheck, Sparkles, BadgeCheck, Bot, FileText, CreditCard, Lock, Cpu, Activity, Plug, SlidersHorizontal,
+  ChevronsLeft, ChevronsRight, ChevronDown, Search, X, PhoneCall,
 } from 'lucide-react';
 import { useSession } from '../../hooks/useSession';
 import { useEntitlements } from '../../hooks/useEntitlements';
+import { useFrontDeskPoll } from '../../hooks/useFrontDeskPoll';
+import { summarizeNeedsAction } from '../../lib/frontDesk';
 import { canOpenPath, type RoutePath } from '../../lib/access';
 import { useUiPrefs } from '../../lib/uiPrefs';
 import Logo from '../ui/Logo';
@@ -16,6 +18,7 @@ import Logo from '../ui/Logo';
 // to /subscription (backend still enforces access regardless of the UI).
 const NAV_FEATURE: Record<string, string> = {
   '/receptionist-studio': 'ai_receptionist',
+  '/front-desk': 'ai_receptionist',
   '/ai-receptionist': 'ai_receptionist',
   '/campaigns': 'campaign_automation',
   // Retired paths, still routable (they redirect to /campaigns). Kept here so a
@@ -33,6 +36,7 @@ const NAV_FEATURE: Record<string, string> = {
   '/enrollments': 'device_integration',
   '/sync-logs': 'device_integration',
   '/rpm-readiness': 'device_integration',
+  '/alert-thresholds': 'device_integration',
 };
 
 interface NavItem {
@@ -69,6 +73,7 @@ const nav: NavSection[] = [
       { label: 'Patients', path: '/patients', icon: UserCircle2 },
       { label: 'Scheduling', path: '/scheduling', icon: CalendarDays },
       { label: 'Patient Intake', path: '/patient-intake', icon: ClipboardList },
+      { label: 'Front Desk', path: '/front-desk', icon: PhoneCall },
       { label: 'AI Receptionist', path: '/ai-receptionist', icon: Bot },
       { label: 'Receptionist Studio', path: '/receptionist-studio', icon: Bot },
       { label: 'Staff Tasks', path: '/staff', icon: ClipboardList },
@@ -102,6 +107,7 @@ const nav: NavSection[] = [
     label: 'Connected Care',
     items: [
       { label: 'Remote Monitoring', path: '/monitoring', icon: Activity },
+      { label: 'Alert Thresholds', path: '/alert-thresholds', icon: SlidersHorizontal },
       { label: 'Device Integration', path: '/devices', icon: Cpu },
       { label: 'Device Enrollments', path: '/enrollments', icon: UserCircle2 },
       { label: 'RPM Billing Readiness', path: '/rpm-readiness', icon: CreditCard },
@@ -147,6 +153,29 @@ export default function Sidebar({ mobileOpen = false, onNavigate }: { mobileOpen
   const { collapsed, collapsedSections, setCollapsed, toggleSection } = useUiPrefs();
   const [filter, setFilter] = useState('');
 
+  // The Front Desk badge is the shared 20s task summary (one poller for the
+  // whole app). It is fetched only for a session that can open the board it
+  // badges — GET /v1/tasks/summary is guarded by staff:read, not by the call
+  // grant, so asking on behalf of an auditor was a 403 every 20 seconds for a
+  // number that could never arrive. One question, asked once: canOpenPath.
+  // NOTHING is shown when the summary failed to load: a missing badge means
+  // "not known", and a zero would be a claim nobody verified.
+  //
+  // The critical number is the server's real count, not the length of the
+  // capped preview (D7): a badge reading 5 beside nine open emergencies is
+  // worse than no badge at all. Where only the capped preview is available the
+  // badge reads "5+".
+  const frontDeskSummary = useFrontDeskPoll({ enabled: !loading && canOpenPath(user, '/front-desk') });
+  const frontDeskCounts = summarizeNeedsAction(frontDeskSummary.state === 'ready' ? frontDeskSummary.data : null);
+  const criticalBadge = frontDeskCounts.criticalExact ? frontDeskCounts.critical : `${frontDeskCounts.critical}+`;
+  const frontDeskBadge: Pick<NavItem, 'badge' | 'badgeColor'> = frontDeskSummary.state !== 'ready'
+    ? {}
+    : frontDeskCounts.critical > 0
+      ? { badge: criticalBadge, badgeColor: 'red' }
+      : frontDeskCounts.count > 0
+        ? { badge: frontDeskCounts.count, badgeColor: 'amber' }
+        : {};
+
   const q = filter.trim().toLowerCase();
   const collapsedSet = new Set(collapsedSections);
 
@@ -158,9 +187,9 @@ export default function Sidebar({ mobileOpen = false, onNavigate }: { mobileOpen
   const visibleNav = loading ? [] : nav
     .map(section => ({
       ...section,
-      items: section.items.filter(item =>
-        canOpenPath(user, item.path) &&
-        (!q || item.label.toLowerCase().includes(q))),
+      items: section.items
+        .filter(item => canOpenPath(user, item.path) && (!q || item.label.toLowerCase().includes(q)))
+        .map(item => item.path === '/front-desk' ? { ...item, ...frontDeskBadge } : item),
     }))
     .filter(section => section.items.length > 0);
 

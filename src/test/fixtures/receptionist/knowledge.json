@@ -1,0 +1,38 @@
+{
+  "clinicId": "clinic-1",
+  "draft": {
+    "acceptedPayers": [
+      { "id": "91e30cd4-6804-4bca-a4c4-59375d3b4b5e", "name": "Bupa", "plans": ["Bupa Select", "Bupa Complete"], "note": "Pre-authorisation required for MRI", "source": "manual" },
+      { "id": "13e535bb-6142-43c1-bc56-bc851fc8036e", "name": "AXA Health", "plans": [], "source": "manual" }
+    ],
+    "paymentPolicy": "We accept card and bank transfer. Payment is due on the day of the appointment.",
+    "newPatientPolicy": "New patients are welcome. Please arrive ten minutes early with photo ID.",
+    "urgentCare": {
+      "whatCountsAsUrgent": "Severe pain, a lost filling with pain, or swelling that is getting worse.",
+      "sameDayPolicy": "We keep two same-day slots each morning for urgent cases.",
+      "onCallNumber": "+442071234570"
+    },
+    "faq": [
+      { "id": "c1b3c6ec-6a52-43c2-b093-44346216f59f", "question": "Is there parking?", "answer": "There is metered street parking on Harley Street and a car park on Weymouth Mews." },
+      { "id": "b31f4c40-187a-407d-b712-ae0ee39ad782", "question": "Do you offer sedation?", "answer": "" }
+    ]
+  },
+  "draftRevision": 4,
+  "approved": {
+    "acceptedPayers": [
+      { "id": "91e30cd4-6804-4bca-a4c4-59375d3b4b5e", "name": "Bupa", "plans": ["Bupa Select"], "source": "manual" }
+    ],
+    "paymentPolicy": "We accept card and bank transfer.",
+    "newPatientPolicy": "New patients are welcome.",
+    "urgentCare": { "whatCountsAsUrgent": "Severe pain or swelling.", "sameDayPolicy": "Two same-day slots each morning.", "onCallNumber": null },
+    "faq": [
+      { "id": "c1b3c6ec-6a52-43c2-b093-44346216f59f", "question": "Is there parking?", "answer": "Metered street parking on Harley Street.", "approvedByUserId": "3f1c9a52-8b47-4c1e-9a6d-2f70b58c4d11", "approvedAt": "2026-08-28T09:00:00.000Z" }
+    ]
+  },
+  "approvedRevision": 3,
+  "approvedHash": "db58b7e37b5a84f85a7eef776d4fbb7bf2a3615c6c3a03feca0534727cafb62e",
+  "approvedAt": "2026-08-28T09:00:00.000Z",
+  "approvedBy": { "id": "3f1c9a52-8b47-4c1e-9a6d-2f70b58c4d11", "displayName": "Jane Okafor" },
+  "dirty": true,
+  "validation": { "ok": false, "issues": [{ "path": "faq.1.answer", "message": "Answer is required" }] }
+}

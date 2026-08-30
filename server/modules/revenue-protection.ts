@@ -2,6 +2,7 @@ import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { env } from '../config/env';
+import { providerValue } from '../lib/providerCredentials';
 import { db } from '../lib/db';
 import { audit } from '../lib/audit';
 import { assertBranchAccess } from '../lib/scope';
@@ -732,7 +733,8 @@ export class StediEligibilityProvider extends MockEligibilityProvider {
   mode: ProviderMode = env.STEDI_TEST_MODE ? 'sandbox' : 'live';
 
   async runEligibilityCheck(context: EligibilityCheckContext): Promise<EligibilityOutcome> {
-    if (!env.STEDI_API_KEY) {
+    const stediApiKey = providerValue('insurance', 'apiKey');
+    if (!stediApiKey) {
       throw new Error('Stedi eligibility is not configured');
     }
 
@@ -763,7 +765,7 @@ export class StediEligibilityProvider extends MockEligibilityProvider {
       const { response, body: payload } = await fetchJsonWithTimeout(`${env.STEDI_BASE_URL}/2024-04-01/change/medicalnetwork/eligibility/v3`, {
         method: 'POST',
         headers: {
-          Authorization: env.STEDI_API_KEY,
+          Authorization: stediApiKey,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(requestBody),
@@ -961,15 +963,15 @@ class MockPaymentProvider {
 export class StripePaymentProvider extends MockPaymentProvider {
   providerKey = 'stripe';
   displayName = 'Stripe Payments';
-  mode: ProviderMode = env.STRIPE_SECRET_KEY?.startsWith('sk_test_') || env.NODE_ENV !== 'production' ? 'sandbox' : 'live';
+  mode: ProviderMode = providerValue('payments', 'secretKey')?.startsWith('sk_test_') || env.NODE_ENV !== 'production' ? 'sandbox' : 'live';
 
   private async stripeForm(path: string, fields: Record<string, string>): Promise<StripePayload | null> {
-    if (!env.STRIPE_SECRET_KEY) return null;
+    if (!providerValue('payments', 'secretKey')) return null;
     const body = new URLSearchParams(fields);
     const { response, body: payload } = await fetchJsonWithTimeout(`https://api.stripe.com${path}`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${env.STRIPE_SECRET_KEY}`,
+        Authorization: `Bearer ${providerValue('payments', 'secretKey')}`,
         'Content-Type': 'application/x-www-form-urlencoded',
       },
       body,
@@ -979,7 +981,7 @@ export class StripePaymentProvider extends MockPaymentProvider {
   }
 
   async createPaymentRequest(input: PaymentRequestContext): Promise<PaymentOutcome> {
-    if (!env.STRIPE_SECRET_KEY) throw new ProviderOperationError(this.displayName, 'checkout session creation');
+    if (!providerValue('payments', 'secretKey')) throw new ProviderOperationError(this.displayName, 'checkout session creation');
 
     try {
       const amount = roundMoney(input.amount);
@@ -1016,7 +1018,7 @@ export class StripePaymentProvider extends MockPaymentProvider {
   }
 
   async createPaymentLink(input: PaymentRequestContext): Promise<PaymentOutcome> {
-    if (!env.STRIPE_SECRET_KEY) throw new ProviderOperationError(this.displayName, 'payment link creation');
+    if (!providerValue('payments', 'secretKey')) throw new ProviderOperationError(this.displayName, 'payment link creation');
 
     try {
       const amount = roundMoney(input.amount);
@@ -1051,11 +1053,11 @@ export class StripePaymentProvider extends MockPaymentProvider {
   }
 
   async getPaymentStatus(reference: string) {
-    if (!env.STRIPE_SECRET_KEY) throw new ProviderOperationError(this.displayName, 'status lookup');
+    if (!providerValue('payments', 'secretKey')) throw new ProviderOperationError(this.displayName, 'status lookup');
     try {
       const path = reference.startsWith('plink_') ? `/v1/payment_links/${reference}` : `/v1/checkout/sessions/${reference}`;
       const { response, body: payload } = await fetchJsonWithTimeout(`https://api.stripe.com${path}`, {
-        headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` },
+        headers: { Authorization: `Bearer ${providerValue('payments', 'secretKey')}` },
       });
       if (!response.ok || !payload) throw new ProviderOperationError(this.displayName, 'status lookup');
       const status = String(payload.payment_status ?? payload.active ?? 'pending');
@@ -1098,7 +1100,7 @@ class UnavailablePaymentProvider extends MockPaymentProvider {
 export function createInsuranceProvider() {
   switch (env.INSURANCE_PROVIDER) {
     case 'stedi':
-      return env.STEDI_API_KEY ? new StediEligibilityProvider() : new UnavailableEligibilityProvider('stedi', 'Stedi Eligibility');
+      return providerValue('insurance', 'apiKey') ? new StediEligibilityProvider() : new UnavailableEligibilityProvider('stedi', 'Stedi Eligibility');
     case 'availity':
       return new UnavailableEligibilityProvider('availity', 'Availity Eligibility');
     case 'pverify':
@@ -1114,7 +1116,7 @@ export function createInsuranceProvider() {
 export function createPaymentProvider() {
   switch (env.PAYMENT_PROVIDER) {
     case 'stripe':
-      return env.STRIPE_SECRET_KEY ? new StripePaymentProvider() : new UnavailablePaymentProvider('stripe', 'Stripe Payments');
+      return providerValue('payments', 'secretKey') ? new StripePaymentProvider() : new UnavailablePaymentProvider('stripe', 'Stripe Payments');
     case 'square':
       return new UnavailablePaymentProvider('square', 'Square Payments');
     case 'authorize_net':
@@ -1833,8 +1835,8 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
   app.get('/integration-status', { preHandler: billingRead }, async request => {
     const insuranceProvider = createInsuranceProvider();
     const paymentProvider = createPaymentProvider();
-    const insuranceConfigured = env.INSURANCE_PROVIDER === 'mock' || (env.INSURANCE_PROVIDER === 'stedi' && Boolean(env.STEDI_API_KEY));
-    const paymentConfigured = env.PAYMENT_PROVIDER === 'mock' || (env.PAYMENT_PROVIDER === 'stripe' && Boolean(env.STRIPE_SECRET_KEY));
+    const insuranceConfigured = env.INSURANCE_PROVIDER === 'mock' || (env.INSURANCE_PROVIDER === 'stedi' && Boolean(providerValue('insurance', 'apiKey')));
+    const paymentConfigured = env.PAYMENT_PROVIDER === 'mock' || (env.PAYMENT_PROVIDER === 'stripe' && Boolean(providerValue('payments', 'secretKey')));
     const [recentRuns, payerList] = await Promise.all([
       db.integrationRunLog.findMany({
         where: { tenantId: request.auth.tenantId, ...branchFilter(request, undefined) },
@@ -3000,7 +3002,7 @@ export const revenueProtectionRoutes: FastifyPluginAsync = async app => {
 // ===========================================================================
 export const revenueProtectionWebhookRoutes: FastifyPluginAsync = async app => {
   app.post('/webhooks/stripe', async (request, reply) => {
-    const secret = env.STRIPE_WEBHOOK_SECRET;
+    const secret = providerValue('payments_webhook', 'webhookSecret');
     const signatureRaw = request.headers['stripe-signature'];
     const signatureHeader = Array.isArray(signatureRaw) ? signatureRaw[0] : signatureRaw;
 

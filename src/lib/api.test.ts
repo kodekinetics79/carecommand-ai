@@ -1,10 +1,24 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, apiRequest } from './api';
 
-// A live token, so the request goes straight out instead of trying to refresh.
+// A live token by default, so the request goes straight out instead of trying
+// to refresh. The session-expiry block below takes the token away on purpose.
+const session = vi.hoisted(() => {
+  class AuthRequestError extends Error {
+    readonly status: number;
+    constructor(status: number, message: string) {
+      super(message);
+      this.name = 'AuthRequestError';
+      this.status = status;
+    }
+  }
+  return { AuthRequestError, token: { value: 'test-access-token' as string | null }, refreshSession: vi.fn() };
+});
+
 vi.mock('./session', () => ({
-  getAccessToken: () => 'test-access-token',
-  refreshSession: vi.fn(),
+  AuthRequestError: session.AuthRequestError,
+  getAccessToken: () => session.token.value,
+  refreshSession: session.refreshSession,
   clearSession: vi.fn(),
   setAccessTokenOnly: vi.fn(),
 }));
@@ -42,6 +56,8 @@ async function failureFrom(status: number, body: unknown): Promise<ApiError> {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  session.token.value = 'test-access-token';
+  session.refreshSession.mockReset();
 });
 
 describe('apiRequest 403 handling', () => {
@@ -96,5 +112,54 @@ describe('apiRequest error text', () => {
 
     expect(error.message).toBe('That slot was just booked by someone else.');
     expect(error.status).toBe(409);
+  });
+});
+
+// ===========================================================================
+// There is no session left, versus the network dropped.
+//
+// useSession clears the signed-in user on ApiError 401/403 and on nothing else,
+// deliberately: a transient 5xx must not bounce staff to /login mid-task. That
+// left one case unattributed. Signing out clears the tokens and the refresh
+// cookie, so the very next request has no access token, asks for a refresh, and
+// is refused — and that refusal used to arrive as a bare Error with no status.
+// Nothing cleared the user, so the workspace stayed on screen after Sign out.
+// ===========================================================================
+describe('apiRequest when the session cannot be rebuilt', () => {
+  it('reports a refused refresh as the 401 it is, so the app signs out', async () => {
+    session.token.value = null;
+    session.refreshSession.mockRejectedValue(new session.AuthRequestError(401, 'Session expired.'));
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    const error = await apiRequest('/v1/auth/me').catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).status).toBe(401);
+    // No request is sent without a token; the refusal is the whole answer.
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('does NOT report a dropped connection as a 401, so a blip never signs anyone out', async () => {
+    session.token.value = null;
+    session.refreshSession.mockRejectedValue(new TypeError('Failed to fetch'));
+    vi.stubGlobal('fetch', vi.fn());
+
+    const error = await apiRequest('/v1/auth/me').catch((e: unknown) => e);
+
+    expect(error).not.toBeInstanceOf(ApiError);
+    expect(error).toBeInstanceOf(TypeError);
+  });
+
+  it('reports an expired access token whose refresh is refused as a 401', async () => {
+    // A token that is present but stale: the request goes out, the server says
+    // 401, the retry path asks for a refresh and is refused.
+    answerWith(401, { error: 'unauthorized', message: 'Token expired' });
+    session.refreshSession.mockRejectedValue(new session.AuthRequestError(401, 'Session expired.'));
+
+    const error = await apiRequest('/v1/anything').catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).status).toBe(401);
   });
 });

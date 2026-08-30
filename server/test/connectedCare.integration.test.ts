@@ -59,7 +59,14 @@ async function makeTenant(planKey: 'enterprise' | 'starter') {
   const plan = await db.subscriptionPlan.findUnique({ where: { key: planKey } });
   await db.tenantSubscription.create({ data: { tenantId: id, planId: plan!.id, status: 'ACTIVE', startedAt: new Date() } });
   await recomputeEntitlements(id, db);
-  const branch = await db.branch.create({ data: { tenantId: id, name: 'b', location: 'x' } });
+  // Explicitly UTC. The suite pins its clock to the last instant of the UTC
+  // month so the RPM fixtures can supply a full set of device-days; the billing
+  // period is now reckoned in the BRANCH's zone, so a branch on the default
+  // Europe/London would already be in the next local month at that instant and
+  // every fixture reading would fall outside the period. The local-period
+  // behaviour itself is covered by rpmPeriod.test.ts and by the non-UTC branch
+  // case below, rather than by leaving this fixture's zone implicit.
+  const branch = await db.branch.create({ data: { tenantId: id, name: 'b', location: 'x', timezone: 'UTC' } });
   const patient = await db.patient.create({ data: { tenantId: id, branchId: branch.id, firstName: 'IT', lastName: 'Patient', lifecycleStage: 'NEW' } });
   const payer = await db.insurancePayer.create({ data: { tenantId: id, name: 'Aetna', sourceProvider: 'stedi' } });
   const activePolicy = await db.patientInsurancePolicy.create({ data: { tenantId: id, branchId: branch.id, patientId: patient.id, payerId: payer.id, planName: 'PPO', memberId: 'AET-110293', coverageOrder: 1 } });
@@ -560,7 +567,7 @@ describe('connected care — enrollment, webhook ingest, RPM readiness (integrat
     expect(signed.json().status).toBe('READY');
     const firstSnapshot = await db.rPMBillingReadiness.findFirstOrThrow({ where: { tenantId: t.id, patientId: t.patientId } });
     expect(firstSnapshot.providerSignoffUserId).toBe(t.providerUserId);
-    expect(firstSnapshot.providerSignoffEvidenceVersion).toBe('rpm-readiness-evidence-v4');
+    expect(firstSnapshot.providerSignoffEvidenceVersion).toBe('rpm-readiness-evidence-v5');
     expect(firstSnapshot.providerSignoffAttestationRevision).toBe('rpm-provider-attestation-v1');
     expect(firstSnapshot.providerSignoffEvidenceHash).toMatch(/^[a-f0-9]{64}$/);
 

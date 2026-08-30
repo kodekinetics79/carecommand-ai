@@ -125,6 +125,20 @@ interface ReadinessRow {
   inactive_90_180: number;
   never_visited: number;
   live_dispatch_activations: number;
+  receptionist_locale_packs_approved: number;
+  receptionist_clinics_with_hours: number;
+  receptionist_clinics_with_country: number;
+  receptionist_locations: number;
+  receptionist_knowledge_approved: number;
+  receptionist_after_hours_calls: number;
+  receptionist_bookable_services: number;
+  receptionist_verified_agents: number;
+  receptionist_active_campaigns: number;
+  receptionist_bound_deployments: number;
+  branches_without_bookable_provider: number;
+  campaigns_without_voice_bookable_service: number;
+  clinics_without_matching_locale_pack: number;
+  deployments_without_proven_test_call: number;
 }
 
 /**
@@ -177,7 +191,61 @@ async function verify(ownerUrl: string): Promise<ReadinessRow> {
            AND floor(extract(epoch from (now()::timestamp - p."lastVisitAt")) / 86400) >= 90
            AND floor(extract(epoch from (now()::timestamp - p."lastVisitAt")) / 86400) < 180)::int AS inactive_90_180,
         (SELECT count(*) FROM "Patient" p WHERE p."tenantId" = d.id AND p."deletedAt" IS NULL AND p."lastVisitAt" IS NULL)::int AS never_visited,
-        (SELECT count(*) FROM "CampaignLiveDispatchActivation")::int AS live_dispatch_activations
+        (SELECT count(*) FROM "CampaignLiveDispatchActivation")::int AS live_dispatch_activations,
+        (SELECT count(*) FROM "ReceptionistLocalePack" p WHERE p."tenantId" = d.id AND p.status = 'APPROVED')::int AS receptionist_locale_packs_approved,
+        (SELECT count(*) FROM "ReceptionistClinic" c WHERE c."tenantId" = d.id AND c."workingHours" IS NOT NULL)::int AS receptionist_clinics_with_hours,
+        (SELECT count(*) FROM "ReceptionistClinic" c WHERE c."tenantId" = d.id AND c.country IS NOT NULL)::int AS receptionist_clinics_with_country,
+        (SELECT count(*) FROM "ReceptionistLocation" l WHERE l."tenantId" = d.id)::int AS receptionist_locations,
+        (SELECT count(*) FROM "ReceptionistClinicKnowledge" k WHERE k."tenantId" = d.id AND k."approvedHash" IS NOT NULL)::int AS receptionist_knowledge_approved,
+        (SELECT count(*) FROM "ReceptionistCallLog" cl WHERE cl."tenantId" = d.id AND cl."outsideHours" = true)::int AS receptionist_after_hours_calls,
+        (SELECT count(*) FROM "ServiceCatalogItem" s WHERE s."tenantId" = d.id AND s."bookableByVoice")::int AS receptionist_bookable_services,
+        (SELECT count(*) FROM "ReceptionistAgent" a WHERE a."tenantId" = d.id AND a."providerStatus" = 'VERIFIED' AND a.active)::int AS receptionist_verified_agents,
+        (SELECT count(*) FROM "ReceptionistCampaign" c WHERE c."tenantId" = d.id AND c.status = 'ACTIVE')::int AS receptionist_active_campaigns,
+        (SELECT count(*) FROM "ReceptionistAgentDeployment" dep WHERE dep."tenantId" = d.id AND dep.status = 'VERIFIED' AND dep."numberBound")::int AS receptionist_bound_deployments,
+        -- A branch a campaign can book into, with nobody bookable in it, is the
+        -- state that made twelve providers mean zero available appointments.
+        (SELECT count(*) FROM "Branch" b
+          WHERE b."tenantId" = d.id AND b.active
+            AND EXISTS (SELECT 1 FROM "ReceptionistLocation" l WHERE l."tenantId" = d.id AND l."branchId" = b.id AND l.active)
+            AND NOT EXISTS (
+              SELECT 1 FROM "ProviderAvailability" pa
+              JOIN "ProviderProfile" pp ON pp.id = pa."providerProfileId" AND pp.active
+              WHERE pa."tenantId" = d.id AND pa."branchId" = b.id AND pa.active
+            ))::int AS branches_without_bookable_provider,
+        -- A campaign whose appointment type is not a VOICE-BOOKABLE catalogue
+        -- row deploys a prompt that says "not bookable on this call: take a
+        -- message instead" for the one thing the campaign exists to book.
+        -- Counting bookable services somewhere in the tenant is not the same
+        -- question, and it is the question that was being asked.
+        (SELECT count(*) FROM "ReceptionistCampaign" c
+          WHERE c."tenantId" = d.id AND c.status IN ('ACTIVE', 'PAUSED')
+            AND NOT EXISTS (
+              SELECT 1 FROM "ServiceCatalogItem" s
+              WHERE s."tenantId" = d.id AND s.active AND s."bookableByVoice"
+                AND lower(s.name) = lower(c."appointmentType")
+            ))::int AS campaigns_without_voice_bookable_service,
+        -- An approved pack for the clinic's OWN country and language. Two packs
+        -- existing somewhere does not mean this clinic can render a sentence.
+        (SELECT count(*) FROM "ReceptionistClinic" c
+          WHERE c."tenantId" = d.id AND c.active
+            AND NOT EXISTS (
+              SELECT 1 FROM "ReceptionistLocalePack" p
+              WHERE p."tenantId" = d.id AND p.status = 'APPROVED'
+                AND p.country = c.country AND p.language = c."defaultLanguage"
+            ))::int AS clinics_without_matching_locale_pack,
+        -- Evidence a caller reached THIS deployment: inbound, non-zero, stamped
+        -- with the version that answered, recorded after it published.
+        (SELECT count(*) FROM "ReceptionistAgentDeployment" dep
+          WHERE dep."tenantId" = d.id AND dep.status = 'VERIFIED'
+            AND NOT EXISTS (
+              SELECT 1 FROM "ReceptionistCallLog" cl
+              WHERE cl."tenantId" = d.id
+                AND cl."clinicId" = dep."clinicId"
+                AND cl.direction = 'inbound'
+                AND cl."durationSeconds" > 0
+                AND cl."boundProviderAgentVersion" = dep."providerAgentVersion"
+                AND cl."createdAt" > dep."publishedAt"
+            ))::int AS deployments_without_proven_test_call
       FROM demo d
     `);
     const row = rows[0];
@@ -205,6 +273,36 @@ function assertReady(row: ReadinessRow): string[] {
   if (row.consent_opted_out < 1) failures.push('no suppression evidence exists, so a preview cannot demonstrate suppression');
   if (row.campaign_attributions < 1) failures.push('no campaign attribution evidence exists, so every campaign shows zero outcomes');
   if (row.live_dispatch_activations !== 0) failures.push('live campaign dispatch is ACTIVATED; the demo must run on the mock provider path');
+  // The receptionist cannot be activated, and cannot answer a single question
+  // about the clinic, without these.
+  if (row.receptionist_locale_packs_approved < 2) failures.push('fewer than two approved locale packs exist; an en-GB or en-US clinic could not be activated');
+  if (row.receptionist_clinics_with_country < 1) failures.push('no receptionist clinic has a country, so activation is blocked and the emergency number is unknown');
+  if (row.receptionist_clinics_with_hours < 1) failures.push('no receptionist clinic has working hours, so the agent cannot answer "are you open"');
+  if (row.receptionist_locations < 1) failures.push('no receptionist location exists, so the prompt has no address or access notes to read');
+  if (row.receptionist_knowledge_approved < 1) failures.push('no approved clinic knowledge exists, so insurance/payment/FAQ answers are all "take a message"');
+  if (row.receptionist_after_hours_calls < 1) failures.push('no after-hours call evidence exists, so the front-desk after-hours card renders empty');
+  if (row.receptionist_bookable_services < 1) failures.push('no service is bookable by voice, so the agent can describe nothing and book nothing');
+  // The receptionist is the module a buyer asks to see answer a call. A demo
+  // where it is configured but not deployed, or deployed but not bound to a
+  // number, cannot demonstrate the one thing it is for.
+  if (row.receptionist_verified_agents < 1) failures.push('no receptionist agent is VERIFIED; Studio would show an unconfigured front desk');
+  if (row.receptionist_active_campaigns < 1) failures.push('no receptionist campaign is ACTIVE; nothing would answer an inbound call');
+  if (row.receptionist_bound_deployments < 1) failures.push('no verified deployment is bound to a phone number; publishing an agent changes nothing about who answers');
+  if (row.branches_without_bookable_provider > 0) {
+    failures.push(`${row.branches_without_bookable_provider} bookable branch(es) have no provider availability; the agent could never offer an appointment time`);
+  }
+  // A demo is only a demo of a receptionist if the clinic is genuinely
+  // bookable. Each of the three below was green on the live tenant while the
+  // thing it stands for was false.
+  if (row.campaigns_without_voice_bookable_service > 0) {
+    failures.push(`${row.campaigns_without_voice_bookable_service} campaign(s) book an appointment type no service is marked bookableByVoice for; the agent would take a message instead of booking`);
+  }
+  if (row.clinics_without_matching_locale_pack > 0) {
+    failures.push(`${row.clinics_without_matching_locale_pack} clinic(s) have no APPROVED locale pack for their own country and language, so nothing the caller would hear can be rendered`);
+  }
+  if (row.deployments_without_proven_test_call > 0) {
+    failures.push(`${row.deployments_without_proven_test_call} verified deployment(s) have no inbound call proving the line reaches them; test_call_completed would be green on historical rows instead`);
+  }
   return failures;
 }
 
@@ -250,6 +348,11 @@ export async function provisionDemoTenant(): Promise<ReadinessRow> {
     SYNTHETIC_DATABASE_URL: plan.ownerUrl,
     DATABASE_MIGRATION_URL: plan.ownerUrl,
     CONFIRM_SYNTHETIC_DATABASE: plan.databaseName,
+    // The receptionist demo deploys through the production deploy path, which
+    // refuses to run with no voice provider. Mock is the honest rehearsal
+    // posture, and the env schema refuses a mock key outside the demo profile.
+    RETELL_API_KEY: process.env.RETELL_API_KEY ?? `mock_demo_${plan.databaseName}`.slice(0, 60),
+    RETELL_FROM_NUMBER: process.env.RETELL_FROM_NUMBER ?? '+15550100000',
   });
 
   console.log('[demo] verifying');
@@ -271,6 +374,12 @@ export async function provisionDemoTenant(): Promise<ReadinessRow> {
   console.log('');
   console.log('  Start the app against it with:');
   console.log(`    DATABASE_URL='${plan.runtimeUrl}' DATABASE_MIGRATION_URL='${plan.ownerUrl}' npm run dev:all`);
+  console.log('');
+  console.log(`  receptionist    ${readiness.receptionist_verified_agents} verified agent(s), ${readiness.receptionist_active_campaigns} active campaign(s)`);
+  console.log('');
+  console.log('  The receptionist runs on the MOCK voice provider. Set');
+  console.log(`    RETELL_API_KEY='mock_demo_${plan.databaseName}' RETELL_FROM_NUMBER='+15550100000'`);
+  console.log('  on the API and worker too, or Studio will report the provider as unconfigured.');
   console.log('');
   console.log('  Live campaign dispatch is OFF (no CampaignLiveDispatchActivation row).');
   console.log('  Outreach demonstrates on the dev mock provider path; nothing is contacted.');
