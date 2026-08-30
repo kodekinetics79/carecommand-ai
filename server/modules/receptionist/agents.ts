@@ -1,16 +1,12 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { db } from '../../lib/db';
-import { env } from '../../config/env';
 import { runWithTenantContext } from '../../lib/tenantContext';
-import { isValidRetellVersionTag, listRetellVoices, retellProviderMode } from '../../lib/retell';
+import { isValidRetellVersionTag } from '../../lib/retell';
 import { Prisma } from '../../generated/prisma/client';
 import { uuid, idParam, writeRoles, callArtifactRead, isReceptionistDestinationConflict, lockReceptionistConfiguration, auditReceptionistMutation } from './shared';
 import { verifyAgentProvider, type VerifyActor } from '../../lib/receptionist/agentVerification';
-import { agentReadinessReason } from '../../lib/receptionist/agentReadiness';
 import { remediationFor } from '../../lib/receptionist/remediation';
-import { confirmationChannelStatus } from '../../lib/receptionist/confirmationOutbox';
-import { liveCallUatScope, liveCallUatStatus, evaluateLiveCallAdmission } from '../../lib/receptionist/liveCallUat';
 
 const providerAgentIdInput = z.string().trim().regex(/^[A-Za-z0-9_-]{1,128}$/).optional().nullable();
 

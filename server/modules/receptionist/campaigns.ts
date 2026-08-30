@@ -408,7 +408,7 @@ export const campaignRoutes: FastifyPluginAsync = async app => {
           || (input.appointmentType !== undefined && input.appointmentType !== existing.appointmentType)
           || (input.eligibleLocationIds !== undefined && JSON.stringify(input.eligibleLocationIds) !== JSON.stringify(existing.eligibleLocationIds));
         if (existing.status === 'ACTIVE' && nextStatus === 'ACTIVE' && schemaRelevantChange) throw new Error('active_intake_contract_immutable');
-        const agent = await assertCampaignAgent(tx, {
+        await assertCampaignAgent(tx, {
           tenantId: request.auth.tenantId, clinicId: existing.clinicId, agentId: nextAgentId,
           requireReady: nextStatus === 'ACTIVE',
         });

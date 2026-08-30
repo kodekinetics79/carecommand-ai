@@ -12,6 +12,7 @@ import { assertSchedulerTick, validateTenantJobEnvelope } from '../lib/jobEnvelo
 import { resolveActiveJobTenantIds } from '../lib/jobTenantResolver';
 import { runWithJobTenantContext } from '../lib/tenantContext';
 import { dispatchDueAppointmentConfirmations } from '../lib/receptionist/confirmationOutbox';
+import { reverifyExpiringAgents } from '../lib/receptionist/agentReverification';
 import {
   runReadinessRecalc,
   runEvidenceExpiry,
@@ -32,6 +33,7 @@ const COMPLIANCE_SCHEDULERS: Record<ComplianceJobName, string> = {
   'vendor-review-reminder': 'compliance-vendor-review',
   'security-scan-placeholder': 'compliance-security-scan',
   'receptionist-confirmation-dispatch': 'receptionist-confirmation-dispatch',
+  'receptionist-agent-reverify': 'receptionist-agent-reverify',
 };
 
 function isComplianceJobName(name: string): name is ComplianceJobName {
@@ -53,6 +55,13 @@ export async function runTenantComplianceJob(operation: ComplianceJobName, tenan
         tenantId,
         async () => { await dispatchDueAppointmentConfirmations(tenantId); },
         'worker:receptionist-confirmation',
+      );
+      break;
+    case 'receptionist-agent-reverify':
+      await runWithJobTenantContext(
+        tenantId,
+        async () => { await reverifyExpiringAgents(tenantId); },
+        'worker:receptionist-agent-reverify',
       );
       break;
   }
