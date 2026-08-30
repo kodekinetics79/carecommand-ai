@@ -44,7 +44,12 @@ describe('READINESS_KEYS ≡ the server’s LABELS keys', () => {
   });
 
   it('does not carry the client-only keys the go-live card used to invent', () => {
-    for (const invented of ['phone_number_bound', 'locale_pack_approved', 'hours_set', 'offer_content']) {
+    // `locale_pack_approved` was invented here once, but Package B now emits it
+    // as a real readiness row (the clinic activation blockers became checks), so
+    // it belongs to the server union above. These three are still inventions:
+    // the server says `number_bound` and `clinic_hours_set`, and nothing says
+    // `offer_content`.
+    for (const invented of ['phone_number_bound', 'hours_set', 'offer_content']) {
       expect(READINESS_KEYS).not.toContain(invented);
     }
   });

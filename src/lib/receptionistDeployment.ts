@@ -385,6 +385,13 @@ export function resolveStudioTab(value: string | null | undefined): StudioTab | 
  * the server does not emit is a step that silently never evaluates.
  */
 export const READINESS_KEYS = [
+  // Checklist order, and it must equal the server's LABELS keys exactly —
+  // src/lib/receptionistDeployment.test.ts reads campaignReadiness.ts and
+  // asserts set equality, which is how the 14-vs-19 drift was caught.
+  'clinic_country_set',
+  'clinic_hours_set',
+  'locale_pack_approved',
+  'agent_language_supported',
   'agent_linked',
   'agent_verified',
   'deployment_current',
@@ -392,6 +399,7 @@ export const READINESS_KEYS = [
   'location_mapped',
   'services_bookable',
   'provider_availability',
+  'provider_resolvable',
   'intake_attested',
   'placeholders_absent',
   'disclosure_composed',
