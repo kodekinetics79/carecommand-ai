@@ -477,62 +477,50 @@ export const campaignExportRoutes: FastifyPluginAsync = async app => {
     const { id } = idParam.parse(request.params);
     const campaign = await loadCampaign(request.auth.tenantId, id);
     if (!campaign) throw app.httpErrors.notFound('Campaign not found');
-<<<<<<< HEAD
     try {
-      const config = toPromptConfig(campaign as unknown as CampaignWithRelations);
+      const prepared = await promptConfigForCampaign(campaign as unknown as CampaignWithRelations, request.auth.tenantId);
+      if (!prepared.ok) {
+        throw app.httpErrors.conflict('No approved locale pack is available for this clinic language and country. Approve one before previewing the prompt.');
+      }
+      const systemPrompt = generateSystemPrompt(prepared.config);
+      const hashes = await configurationHashes(request.auth.tenantId, campaign.clinicId);
       return {
-        systemPrompt: generateSystemPrompt(config),
-        samples: generateSamples(config),
+        systemPrompt,
+        samples: generateSamples(prepared.config),
+        promptHash: promptHash(systemPrompt),
+        localePack: { id: prepared.localePackId, evidenceHash: prepared.evidenceHash },
+        ...hashes,
+        drift: campaign.status === 'ACTIVE'
+          ? { localePack: campaign.attestedLocalePackHash !== null && campaign.attestedLocalePackHash !== prepared.evidenceHash }
+          : { localePack: false },
       };
     } catch (error) {
+      // A configuration gap is a 409 the operator can act on, never a 500 (M71).
       if (isConfigurationError(error)) throw configurationConflict(app, error);
       throw error;
     }
-=======
-    const prepared = await promptConfigForCampaign(campaign as unknown as CampaignWithRelations, request.auth.tenantId);
-    if (!prepared.ok) {
-      throw app.httpErrors.conflict('No approved locale pack is available for this clinic language and country. Approve one before previewing the prompt.');
-    }
-    const systemPrompt = generateSystemPrompt(prepared.config);
-    const hashes = await configurationHashes(request.auth.tenantId, campaign.clinicId);
-    return {
-      systemPrompt,
-      samples: generateSamples(prepared.config),
-      promptHash: promptHash(systemPrompt),
-      localePack: { id: prepared.localePackId, evidenceHash: prepared.evidenceHash },
-      ...hashes,
-      drift: campaign.status === 'ACTIVE'
-        ? { localePack: campaign.attestedLocalePackHash !== null && campaign.attestedLocalePackHash !== prepared.evidenceHash }
-        : { localePack: false },
-    };
->>>>>>> worktree-agent-a44bea0988522c2a1
   });
 
   app.get('/campaigns/:id/retell-config', { preHandler: receptionistRead }, async request => {
     const { id } = idParam.parse(request.params);
     const campaign = await loadCampaign(request.auth.tenantId, id);
     if (!campaign) throw app.httpErrors.notFound('Campaign not found');
-<<<<<<< HEAD
     try {
-      const config = toPromptConfig(campaign as unknown as CampaignWithRelations);
-      return buildRetellConfig(config, { webhookBaseUrl: env.PUBLIC_API_URL });
+      const prepared = await promptConfigForCampaign(campaign as unknown as CampaignWithRelations, request.auth.tenantId);
+      if (!prepared.ok) {
+        throw app.httpErrors.conflict('No approved locale pack is available for this clinic language and country. Approve one before exporting the agent configuration.');
+      }
+      const built = buildRetellConfig(prepared.config, { webhookBaseUrl: env.PUBLIC_API_URL });
+      const hashes = await configurationHashes(request.auth.tenantId, campaign.clinicId);
+      return {
+        ...built,
+        promptHash: promptHash(built.systemPrompt),
+        localePack: { id: prepared.localePackId, evidenceHash: prepared.evidenceHash },
+        ...hashes,
+      };
     } catch (error) {
       if (isConfigurationError(error)) throw configurationConflict(app, error);
       throw error;
     }
-=======
-    const prepared = await promptConfigForCampaign(campaign as unknown as CampaignWithRelations, request.auth.tenantId);
-    if (!prepared.ok) {
-      throw app.httpErrors.conflict('No approved locale pack is available for this clinic language and country. Approve one before exporting the agent configuration.');
-    }
-    const built = buildRetellConfig(prepared.config, { webhookBaseUrl: env.PUBLIC_API_URL });
-    const hashes = await configurationHashes(request.auth.tenantId, campaign.clinicId);
-    return {
-      ...built,
-      promptHash: promptHash(built.systemPrompt),
-      localePack: { id: prepared.localePackId, evidenceHash: prepared.evidenceHash },
-      ...hashes,
-    };
->>>>>>> worktree-agent-a44bea0988522c2a1
   });
 };

@@ -294,16 +294,13 @@ model User {
   eligibilityExecutions          EligibilityExecution[]          @relation("EligibilityExecutionActor")
   eligibilityReconciliationsVerified EligibilityExecution[]      @relation("EligibilityReconciliationVerifier")
   leadActivities                 LeadActivity[]                  @relation("LeadActivityActor")
-<<<<<<< HEAD
   acknowledgedStaffTasks         StaffTask[]                     @relation("StaffTaskAcknowledgedBy")
   appointmentNotes               AppointmentNote[]               @relation("AppointmentNoteActor")
-=======
   receptionistClosuresCreated    ReceptionistClosure[]           @relation("ReceptionistClosureCreator")
   receptionistKnowledgeApproved  ReceptionistClinicKnowledge[]   @relation("ReceptionistKnowledgeApprover")
   receptionistKnowledgeEdited    ReceptionistClinicKnowledge[]   @relation("ReceptionistKnowledgeEditor")
   receptionistLocalePacksApproved ReceptionistLocalePack[]       @relation("ReceptionistLocalePackApprover")
   receptionistLocalePacksCreated ReceptionistLocalePack[]        @relation("ReceptionistLocalePackCreator")
->>>>>>> worktree-agent-a44bea0988522c2a1
 
   @@unique([tenantId, email])
   @@unique([tenantId, id])

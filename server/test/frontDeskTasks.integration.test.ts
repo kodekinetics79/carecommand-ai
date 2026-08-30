@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { createClinicFixture } from './helpers/receptionistFixtures';
 import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 
@@ -66,9 +67,7 @@ async function makeFixture(): Promise<Fixture> {
     db.branch.create({ data: { tenantId, name: 'Branch A', location: 'A', timezone: 'UTC' } }),
     db.branch.create({ data: { tenantId, name: 'Branch B', location: 'B', timezone: 'UTC' } }),
   ]);
-  const clinic = await db.receptionistClinic.create({
-    data: { tenantId, name: `Clinic ${tag}`, phone: uniquePhone(), timezone: 'UTC' },
-  });
+  const clinic = await createClinicFixture(db, { tenantId, name: `Clinic ${tag}`, phone: uniquePhone(), timezone: 'UTC' });
   // Exactly one active location with a branch → createSafetyTask can resolve it.
   await db.receptionistLocation.create({
     data: { tenantId, clinicId: clinic.id, branchId: branchA.id, name: 'Main', address: '1 Test St', active: true },

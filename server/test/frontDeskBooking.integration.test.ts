@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { createClinicFixture } from './helpers/receptionistFixtures';
 import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 
@@ -65,9 +66,7 @@ async function makeFixture(): Promise<Fixture> {
   await db.tenant.create({ data: { id: tenantId, name: `fdb-${tag}`, slug: `fdb-${tag}` } });
   await db.tenantFeatureEntitlement.create({ data: { tenantId, featureKey: 'ai_receptionist', enabled: true, source: 'test' } });
   const branch = await db.branch.create({ data: { tenantId, name: 'Main', location: 'x', timezone: 'UTC' } });
-  const clinic = await db.receptionistClinic.create({
-    data: { tenantId, name: `Clinic ${tag}`, phone: uniquePhone(), timezone: 'UTC' },
-  });
+  const clinic = await createClinicFixture(db, { tenantId, name: `Clinic ${tag}`, phone: uniquePhone(), timezone: 'UTC' });
   await db.receptionistLocation.create({
     data: { tenantId, clinicId: clinic.id, branchId: branch.id, name: 'Main', address: '1 Test St', active: true },
   });

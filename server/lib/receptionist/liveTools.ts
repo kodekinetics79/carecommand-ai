@@ -20,16 +20,13 @@ import {
 import { restrictCallToBasicAttributes } from '../retell';
 import { CONFIRMATION_OUTBOX_SOURCE, processAppointmentConfirmations } from './confirmationOutbox';
 import { lockDncDestinationFence } from './dncFence';
-<<<<<<< HEAD
 import { createSafetyTask } from './frontDeskTask';
-=======
 import { resolveCallLocalePack, resolvedLocaleFormat } from './localePacks/resolve';
 import { renderPackMessage } from './localePacks/render';
 import { EMERGENCY_FALLBACK_NUMBER_FREE } from './localePacks/defaults';
 import { loadHoursSource } from './hoursSource';
 import { hoursConfigured, resolveEffectiveHours, spokenDate } from './clinicHours';
 import type { LocaleFormat } from './localePacks/types';
->>>>>>> worktree-agent-a44bea0988522c2a1
 
 // Real-time tools the AI receptionist invokes DURING a call (Retell custom
 // functions). Each returns a JSON result with a `message` the agent can speak.
