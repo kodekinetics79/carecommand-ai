@@ -105,9 +105,19 @@ export function projectTaskRow(row: TaskRowWithRelations, options: TaskProjectio
     ? { id: row.patient.id, firstName: row.patient.firstName, lastName: row.patient.lastName }
     : null;
   const clinic = row.callLog?.clinic ? { id: row.callLog.clinic.id, name: row.callLog.clinic.name, timezone: row.callLog.clinic.timezone } : null;
-  const metadata = restricted && meta
-    ? { workflow: 'receptionist_safety', kind: meta.kind, requiresAcknowledgement: true, restricted: true }
-    : row.metadata;
+  // The raw metadata blob is echoed for old readers, but a list must never be
+  // the place a real phone number escapes — even for a call-artifact holder.
+  // The unmasked number exists on the audited task detail alone.
+  const metadata = !meta
+    ? row.metadata
+    : restricted
+      ? { workflow: 'receptionist_safety', kind: meta.kind, requiresAcknowledgement: true, restricted: true }
+      : {
+        ...(row.metadata as Record<string, unknown>),
+        callbackPhone: maskPhone(meta.callbackPhone),
+        verifiedPhone: maskPhone(meta.verifiedPhone),
+        requestedCallbackPhone: maskPhone(meta.requestedCallbackPhone),
+      };
   return {
     id: row.id,
     title: row.title,

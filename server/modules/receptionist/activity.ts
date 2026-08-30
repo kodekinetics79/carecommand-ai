@@ -110,9 +110,12 @@ export const activityRoutes: FastifyPluginAsync = async app => {
     return {
       ...page,
       // The raw collected payload and the unmasked number stay on the detail route.
-      data: page.data.map(({ rawCollectedFields, collectedPhone, ...row }) => ({
+      data: page.data.map(row => ({
         ...row,
-        collectedPhoneMasked: maskDestination(collectedPhone),
+        // The raw collected payload and the unmasked number are detail-only.
+        rawCollectedFields: undefined,
+        collectedPhone: undefined,
+        collectedPhoneMasked: maskDestination(row.collectedPhone),
       })),
     };
   });
@@ -238,22 +241,28 @@ export const activityRoutes: FastifyPluginAsync = async app => {
         }
         const patient = await tx.patient.findUniqueOrThrow({ where: { id: patientId }, select: { id: true, phone: true, email: true } });
 
-        // C4-R06: one appointment per source call. Until C3's booking sequence
-        // lands, a call that already produced an appointment links through the
-        // request only rather than colliding on the unique index.
-        const alreadyStamped = existing.callLogId
+        // One appointment per source call, enforced in the database: a request
+        // carrying a call may only be linked to an appointment stamped with THAT
+        // call (FK on (tenantId, bookedAppointmentId, callLogId) ->
+        // Appointment(tenantId, id, receptionistCallLogId)). So if the call has
+        // already produced an appointment, booking a second one here could not
+        // be linked to the request — it would leave an appointment nobody's
+        // queue points at. Refuse, and send staff to `reconcile`, which is the
+        // route for binding a request to an appointment that already exists.
+        // (C3's booking sequence is what will allow several per call.)
+        const alreadyBooked = existing.callLogId
           ? await tx.appointment.findFirst({
             where: { tenantId: request.auth.tenantId, receptionistCallLogId: existing.callLogId },
             select: { id: true },
           })
           : null;
-        const linkedViaRequestOnly = Boolean(existing.callLogId && alreadyStamped);
+        if (alreadyBooked) return { kind: 'call_already_booked' as const, appointmentId: alreadyBooked.id };
 
         const booked = await bookCanonicalAppointment(tx, {
           tenantId: request.auth.tenantId, branchId: provider.branchId, patientId: patient.id,
           providerProfileId: provider.id, service, startsAt: input.startsAt, channel: input.channel,
           policy, patientContact: { phone: patient.phone, email: patient.email },
-          receptionistCallLogId: linkedViaRequestOnly ? null : existing.callLogId,
+          receptionistCallLogId: existing.callLogId,
         });
         if ('conflict' in booked) return { kind: 'conflict' as const, reason: booked.conflict };
 
@@ -295,7 +304,7 @@ export const activityRoutes: FastifyPluginAsync = async app => {
           requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
           metadata: {
             appointmentId: booked.appointment.id, identityProof: 'staff_selected', differences,
-            patientCreated, linkedViaRequestOnly, tasksClosed, requestDifferencesAcknowledged: true,
+            patientCreated, tasksClosed, requestDifferencesAcknowledged: true,
           },
         } });
         await tx.businessEvent.create({ data: {
@@ -308,7 +317,6 @@ export const activityRoutes: FastifyPluginAsync = async app => {
           appointment: booked.appointment,
           confirmationsQueued: booked.queued,
           differences,
-          linkedViaRequestOnly,
         };
       }) as never;
     } catch (error) {
@@ -320,19 +328,26 @@ export const activityRoutes: FastifyPluginAsync = async app => {
 
     const result = outcome as unknown as
       | { kind: 'not_found' } | { kind: 'resolved' } | { kind: 'provider_invalid' } | { kind: 'patient_invalid' }
+      | { kind: 'call_already_booked'; appointmentId: string }
       | { kind: 'conflict'; reason: string }
-      | { kind: 'booked'; appointment: { id: string; service: string; startsAt: Date }; confirmationsQueued: string[]; differences: string[]; linkedViaRequestOnly: boolean };
+      | { kind: 'booked'; appointment: { id: string; service: string; startsAt: Date }; confirmationsQueued: string[]; differences: string[] };
     if (result.kind === 'not_found') throw app.httpErrors.notFound('Appointment request not found');
     if (result.kind === 'resolved') throw app.httpErrors.conflict('This request has already been resolved.');
     if (result.kind === 'provider_invalid') throw app.httpErrors.badRequest('Select an active provider in this tenant');
     if (result.kind === 'patient_invalid') throw app.httpErrors.badRequest("Patient not found in this provider's clinic");
+    if (result.kind === 'call_already_booked') {
+      return reply.code(409).send({
+        error: 'call_already_booked',
+        appointmentId: result.appointmentId,
+        message: 'This call already produced an appointment. Link this request to that appointment, or book the extra visit from the scheduler.',
+      });
+    }
     if (result.kind === 'conflict') return reply.code(409).send({ error: 'slot_unavailable', reason: result.reason });
     return reply.code(201).send({
       status: 'BOOKED',
       appointment: result.appointment,
       confirmationsQueued: result.confirmationsQueued,
       differences: result.differences,
-      linkedViaRequestOnly: result.linkedViaRequestOnly,
     });
   });
 

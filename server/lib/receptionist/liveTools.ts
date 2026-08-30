@@ -60,7 +60,6 @@ export interface ToolContext {
 // Bounded caps for caller-supplied free text.
 const MAX_NAME = 80;
 const MAX_SHORT = 40;
-const MAX_MESSAGE = 500;
 const MAX_IDENTITY_ATTEMPTS = 3;
 const IDENTITY_LOCK_MINUTES = 15;
 const CHANGE_CONFIRMATION_TTL_MS = 5 * 60_000;
@@ -109,10 +108,6 @@ async function auditLive(
   client: typeof db | Prisma.TransactionClient = db,
 ) {
   await client.auditEvent.create({ data: { tenantId, actorUserId: null, action, resource: 'receptionistLiveAgent', resourceId: resourceId ?? undefined, userAgent: 'retell-webhook', metadata: metadata as Prisma.InputJsonValue } });
-}
-async function resolveBranch(tenantId: string): Promise<{ id: string; timezone: string } | null> {
-  const branches = await db.branch.findMany({ where: { tenantId, active: true }, orderBy: { createdAt: 'asc' }, select: { id: true, timezone: true }, take: 2 });
-  return branches.length === 1 ? branches[0] : null;
 }
 
 // Live booking requires an unambiguous provider. Ambiguity is routed to staff;
