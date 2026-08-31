@@ -1129,6 +1129,37 @@ export interface RetellAgentReadinessRequirements {
  * value we set. Keys present only on the provider's copy are defaults we did
  * not express an opinion about, so they are ignored.
  */
+export interface DeployedToolDifference {
+  /** The tool the difference is on, or null when the SET of tools differs. */
+  tool: string | null;
+  /** The key whose value differs, `*missing*` when the tool is absent, `*unexpected*` when it is one we never authored. */
+  key: string;
+}
+
+/** The first difference `compareDeployedTools` would reject, for an operator to act on. */
+export function describeDeployedToolDrift(authored: unknown[], actual: unknown[]): DeployedToolDifference | null {
+  const byName = (tools: unknown[]) => {
+    const map = new Map<string, Record<string, unknown>>();
+    for (const tool of tools) {
+      const row = record(tool);
+      const name = nonEmptyString(row?.name);
+      if (row && name) map.set(name, row);
+    }
+    return map;
+  };
+  const want = byName(authored);
+  const got = byName(actual);
+  for (const name of got.keys()) if (!want.has(name)) return { tool: name, key: '*unexpected*' };
+  for (const [name, authoredTool] of want) {
+    const actualTool = got.get(name);
+    if (!actualTool) return { tool: name, key: '*missing*' };
+    for (const [key, value] of Object.entries(authoredTool)) {
+      if (fingerprintJson(value) !== fingerprintJson(actualTool[key])) return { tool: name, key };
+    }
+  }
+  return null;
+}
+
 export function compareDeployedTools(authored: unknown[], actual: unknown[]): 'ok' | 'tools_drift' {
   const byName = (tools: unknown[]) => {
     const map = new Map<string, Record<string, unknown>>();
