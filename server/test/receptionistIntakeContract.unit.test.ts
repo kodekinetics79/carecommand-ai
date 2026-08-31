@@ -205,7 +205,7 @@ describe('the booking schema uses only keywords the provider keeps', () => {
       toolUrl: 'https://api.example.test/v1/receptionist/webhooks/retell/fn?clinicId=c',
     });
     const offenders: string[] = [];
-    const contract = snapshot.bookAppointmentToolContract as Record<string, unknown>;
+    const contract = snapshot.bookAppointmentToolContract as unknown as Record<string, unknown>;
     walk(contract.parameters, 'parameters', offenders);
     expect(offenders).toEqual([]);
   });
