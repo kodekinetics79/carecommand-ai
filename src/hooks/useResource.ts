@@ -21,6 +21,21 @@ export const RESOURCE_TIMEOUT_MS = 15_000;
 export interface UseResourceOptions {
   /** Override the watchdog. Keep it finite; there is no "wait forever" option. */
   timeoutMs?: number;
+  /**
+   * Whether to ask at all. Default true.
+   *
+   * Two callers need this, and both mean "the question is not askable yet or
+   * ever": one waiting for the session to resolve before it knows whether the
+   * user may see this data, and one that already knows they may not. A hook
+   * cannot be called conditionally, so the choice has to live here.
+   *
+   * A disabled resource issues NO request and stays `loading`. That is
+   * deliberate for the first caller — it is genuinely still waiting — and safe
+   * for the second only because a panel the user is not permitted to see is
+   * not rendered at all. Do not render a disabled resource and expect it to
+   * resolve: it never will, because nothing was asked.
+   */
+  enabled?: boolean;
 }
 
 export interface UseResourceResult<T> {
@@ -45,11 +60,15 @@ interface SettledRecord<T> {
  * state is `error`, and the caller has no value to render.
  */
 export function useResource<T>(source: ResourceSource<T>, options: UseResourceOptions = {}): UseResourceResult<T> {
-  const { timeoutMs = RESOURCE_TIMEOUT_MS } = options;
+  const { timeoutMs = RESOURCE_TIMEOUT_MS, enabled = true } = options;
   const [attempt, setAttempt] = useState(0);
   const [record, setRecord] = useState<SettledRecord<T>>(() => ({ source, attempt: 0, state: LOADING_STATE }));
 
   useEffect(() => {
+    // Not asked, so nothing is in flight and nothing will settle. The state
+    // below stays `loading`, which is the truth: no answer has been received.
+    if (!enabled) return;
+
     let active = true;
     let settled = false;
     const controller = new AbortController();
@@ -92,13 +111,13 @@ export function useResource<T>(source: ResourceSource<T>, options: UseResourceOp
       clearTimeout(watchdog);
       controller.abort();
     };
-  }, [source, attempt, timeoutMs]);
+  }, [source, attempt, timeoutMs, enabled]);
 
   const reload = useCallback(() => setAttempt(current => current + 1), []);
 
   // Derived, not stored: a record from an earlier source or attempt is not an
   // answer to the question being asked now, so it reads as loading.
-  const state = record.source === source && record.attempt === attempt ? record.state : LOADING_STATE;
+  const state = enabled && record.source === source && record.attempt === attempt ? record.state : LOADING_STATE;
 
   return { state, reload };
 }

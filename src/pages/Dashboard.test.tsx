@@ -27,8 +27,21 @@ const PENDING_FOREVER = () => new Promise<never>(() => {});
 type Handler = (init?: RequestInit) => unknown;
 let handlers: Record<string, Handler>;
 
+/**
+ * The signed-in session. Every panel on this page is gated on what the user is
+ * permitted to see, so a test that answers no session is testing a dashboard
+ * nobody ever sees — the panels stay loading because nothing has been asked.
+ * These tests are about campaign handoffs, so they run as a user holding the
+ * grants the panels require; the gating itself is pinned separately below.
+ */
+const FULL_ACCESS_SESSION = {
+  user: { id: 'u1', email: 'owner@example.com', name: 'Owner', role: 'OWNER', tenantId: 't1' },
+  access: { permissions: ['revenue:read', 'staff:read', 'campaign:read'] },
+};
+
 beforeEach(() => {
   handlers = {};
+  handlers['GET /v1/auth/me'] = () => FULL_ACCESS_SESSION;
   apiRequestMock.mockReset();
   apiRequestMock.mockImplementation(async (path: string, init?: RequestInit) => {
     const handler = handlers[`${init?.method ?? 'GET'} ${path}`];
@@ -94,5 +107,77 @@ describe('Dashboard campaign handoffs', () => {
     renderDashboard();
     fireEvent.click(await screen.findByRole('button', { name: /Review campaigns/ }));
     await waitFor(() => expect(landedState()).toEqual({ source: 'Dashboard' }));
+  });
+});
+
+/**
+ * The cockpit used to ask for every panel's data regardless of who was looking,
+ * so FRONT_DESK, PROVIDER and AUDITOR each collected fourteen 403s on the
+ * landing page, every visit, while the UI swallowed them silently. Nothing
+ * rendered a status code, which is exactly why it went unnoticed for so long.
+ *
+ * These pin both halves: the requests are not sent, and the panels that could
+ * only ever show a refusal are not rendered.
+ */
+describe('Dashboard panels a role may not see', () => {
+  // Endpoint -> the grant its route enforces, per the receptionist/operations
+  // /providers/campaigns route modules on the server.
+  const GATED = {
+    'GET /v1/revenue-snapshots?limit=100': 'revenue:read',
+    'GET /v1/opportunities': 'revenue:read',
+    'GET /v1/revenue-leaks': 'revenue:read',
+    'GET /v1/providers/overview': 'staff:read',
+    'GET /v1/campaigns?limit=4': 'campaign:read',
+  } as const;
+
+  function renderAs(permissions: string[]) {
+    handlers['GET /v1/auth/me'] = () => ({ ...FULL_ACCESS_SESSION, access: { permissions } });
+    return renderDashboard();
+  }
+
+  /** Every path the page actually requested, method included. */
+  function requested(): string[] {
+    return apiRequestMock.mock.calls.map(([path, init]) => `${(init as RequestInit | undefined)?.method ?? 'GET'} ${path}`);
+  }
+
+  it('asks for nothing the signed-in role is not permitted to read', async () => {
+    renderAs([]);
+    // The session resolving is what unblocks every other decision on the page.
+    await waitFor(() => expect(requested()).toContain('GET /v1/auth/me'));
+    await waitFor(() => expect(requested()).toContain('GET /v1/dashboard/summary'));
+
+    for (const endpoint of Object.keys(GATED)) {
+      expect(requested(), `${endpoint} must not be requested by a role without ${GATED[endpoint as keyof typeof GATED]}`).not.toContain(endpoint);
+    }
+  });
+
+  it('does not render a panel that could only ever show a refusal', async () => {
+    renderAs([]);
+    await waitFor(() => expect(requested()).toContain('GET /v1/dashboard/summary'));
+
+    expect(screen.queryByText('Revenue snapshot trend')).toBeNull();
+    expect(screen.queryByText('Provider Capacity')).toBeNull();
+    expect(screen.queryByText('Branch Capacity Planning')).toBeNull();
+    expect(screen.queryByText('Campaign performance evidence')).toBeNull();
+    // ...and no raw authorization vocabulary in its place.
+    expect(screen.queryByText(/does not have access/i)).toBeNull();
+  });
+
+  it('still asks, and still renders, for a role that holds the grants', async () => {
+    renderAs(['revenue:read', 'staff:read', 'campaign:read']);
+    for (const endpoint of Object.keys(GATED)) {
+      await waitFor(() => expect(requested()).toContain(endpoint));
+    }
+    expect(screen.getByText('Revenue snapshot trend')).toBeTruthy();
+    expect(screen.getByText('Campaign performance evidence')).toBeTruthy();
+  });
+
+  it('asks only for the family a partially-granted role holds', async () => {
+    renderAs(['staff:read']);
+    await waitFor(() => expect(requested()).toContain('GET /v1/providers/overview'));
+    expect(requested()).not.toContain('GET /v1/revenue-snapshots?limit=100');
+    expect(requested()).not.toContain('GET /v1/campaigns?limit=4');
+    expect(screen.getByText('Provider Capacity')).toBeTruthy();
+    expect(screen.queryByText('Revenue snapshot trend')).toBeNull();
   });
 });

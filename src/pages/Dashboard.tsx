@@ -16,6 +16,8 @@ import { apiRequest } from '../lib/api';
 import type { CampaignHandoff } from '../lib/crm';
 import { receivedData } from '../lib/resourceState';
 import { useResource } from '../hooks/useResource';
+import { useSession } from '../hooks/useSession';
+import { hasPermission } from '../lib/access';
 import { mapRevenueSnapshot, type ApiRevenueSnapshot } from '../lib/apiAdapters';
 import RevenueChart, { type RevenueChartRow } from '../components/charts/RevenueChart';
 import {
@@ -51,13 +53,33 @@ export default function Dashboard() {
   const navigate = useNavigate();
   const [drawerAction, setDrawerAction] = useState<PriorityAction | null>(null);
 
+  // What this user is allowed to be shown. Each panel below asks an endpoint
+  // guarded by a specific grant, and the cockpit used to ask for all of them
+  // regardless: FRONT_DESK, PROVIDER and AUDITOR each collected fourteen 403s
+  // on their landing page, every visit, while the UI quietly swallowed them.
+  //
+  // A panel a role can never fill is HIDDEN rather than shown refused. Four
+  // permanent "your role does not have access" boxes are not information, they
+  // are furniture — and the same reasoning the navigation registry already
+  // applies to doors ("an entry they lack is hidden outright") applies to the
+  // panels behind them.
+  //
+  // Until the session resolves we do not know, so nothing is asked yet and the
+  // panels read as loading. The API remains the enforcement point: this only
+  // stops us asking questions we know the answer to.
+  const { user, loading: sessionLoading } = useSession();
+  const knowsUser = !sessionLoading;
+  const canSeeRevenue = knowsUser && hasPermission(user, 'revenue:read');
+  const canSeeStaff = knowsUser && hasPermission(user, 'staff:read');
+  const canSeeCampaigns = knowsUser && hasPermission(user, 'campaign:read');
+
   const summary = useResource<DashboardSummary>(loadSummary);
-  const branches = useResource<BranchHealth[]>(loadBranchHealth);
-  const providers = useResource<ProviderUtilization[]>(loadProviderUtilization);
-  const campaigns = useResource<CampaignROI[]>(loadCampaignROI);
-  const actions = useResource<PriorityAction[]>(loadPriorityActions);
+  const branches = useResource<BranchHealth[]>(loadBranchHealth, { enabled: canSeeStaff });
+  const providers = useResource<ProviderUtilization[]>(loadProviderUtilization, { enabled: canSeeStaff });
+  const campaigns = useResource<CampaignROI[]>(loadCampaignROI, { enabled: canSeeCampaigns });
+  const actions = useResource<PriorityAction[]>(loadPriorityActions, { enabled: canSeeRevenue });
   // One snapshots fetch feeds both the deck sparkline and the revenue chart.
-  const snapshots = useResource<RevenueChartRow[]>(loadRevenueSnapshots);
+  const snapshots = useResource<RevenueChartRow[]>(loadRevenueSnapshots, { enabled: canSeeRevenue });
 
   // The sparkline hides below two points, so an unavailable feed reads as an
   // absent sparkline rather than a flat line that was never measured.
@@ -123,8 +145,11 @@ export default function Dashboard() {
         </ResourceSection>
       </div>
 
-      {/* Visualization row — money + capacity */}
+      {/* Visualization row — money + capacity. A row whose every panel is
+          withheld is removed rather than left as an empty band. */}
+      {(!knowsUser || canSeeRevenue || canSeeStaff) && (
       <div className="dash-viz">
+        {(!knowsUser || canSeeRevenue) && (
         <BentoCard className="cockpit-card" title="Revenue snapshot trend" subtitle="Recorded revenue and associated-value fields"
           headerRight={<LineChart className="w-4 h-4 text-violet-v" aria-hidden="true" />}>
           <ResourceSection
@@ -141,6 +166,8 @@ export default function Dashboard() {
             {rows => <RevenueChart data={rows} fitParent />}
           </ResourceSection>
         </BentoCard>
+        )}
+        {(!knowsUser || canSeeStaff) && (
         <BentoCard className="cockpit-card" title="Provider Capacity" subtitle="Recorded utilization, ordered highest to lowest"
           headerRight={<Gauge className="w-4 h-4 text-indigo" aria-hidden="true" />}>
           <ResourceSection
@@ -161,10 +188,14 @@ export default function Dashboard() {
             )}
           </ResourceSection>
         </BentoCard>
+        )}
       </div>
+      )}
 
       {/* Operations row — locations + growth */}
+      {(!knowsUser || canSeeStaff || canSeeCampaigns) && (
       <div className="dash-ops">
+        {(!knowsUser || canSeeStaff) && (
         <BentoCard className="cockpit-card" title="Branch Capacity Planning" subtitle="Unvalidated fixed index from utilization and recorded ratings"
           headerRight={avgHealth != null ? <span className="text-xs font-semibold text-t3 bg-[var(--s3)] px-2.5 py-1 rounded-full">Planning avg {avgHealth}/100</span> : undefined}>
           <ResourceSection
@@ -185,6 +216,8 @@ export default function Dashboard() {
             )}
           </ResourceSection>
         </BentoCard>
+        )}
+        {(!knowsUser || canSeeCampaigns) && (
         <BentoCard className="cockpit-card" title="Campaign performance evidence" subtitle="Stored audience, booking, and associated-value fields; causation not established"
           headerRight={<button type="button" onClick={() => openCampaigns({ source: 'Dashboard' })} className="text-xs font-semibold text-indigo hover:opacity-75 inline-flex items-center gap-1"><BarChart3 className="w-3.5 h-3.5" aria-hidden="true" /> All campaigns</button>}>
           <ResourceSection
@@ -198,9 +231,12 @@ export default function Dashboard() {
             {rows => <CampaignROIPanel campaigns={rows} onViewAll={() => openCampaigns({ source: 'Dashboard' })} onCreate={() => openCampaigns({ goal: 'winback', source: 'Dashboard', contextLabel: 'No campaigns recorded yet' })} />}
           </ResourceSection>
         </BentoCard>
+        )}
       </div>
+      )}
 
       {/* Priority queue — full-height rail, scrolls internally */}
+      {(!knowsUser || canSeeRevenue) && (
       <div className="dash-rail">
         <ResourceSection
           label="Priority queue"
@@ -220,6 +256,7 @@ export default function Dashboard() {
           )}
         </ResourceSection>
       </div>
+      )}
 
       {drawerAction && <ActionDrawer action={drawerAction} onClose={() => setDrawerAction(null)} onNavigate={(r) => { setDrawerAction(null); navigate(r); }} />}
     </div>
