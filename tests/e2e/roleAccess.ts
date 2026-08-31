@@ -194,8 +194,26 @@ export const RESTRICTED_STATE_SENTENCE = 'is not part of your access';
  * is matched only when it is not part of a longer figure, so a real currency
  * amount such as "1,403.00" is not mistaken for a status code.
  */
+// WHY THERE IS NO BARE `403` PATTERN HERE
+//
+// There was one: /(?<![\d.,])403(?![\d.,])/. It excluded neighbouring digits
+// and commas and nothing else, so it fired on any page containing
+//
+//   * a metric that happened to equal 403 ("403 patients"), or
+//   * ANY identifier with 403 between two non-digits ("a1b403fe-...").
+//
+// Ids are regenerated every run, so this failed at random, on every branch,
+// with no defect present — and a green rerun of unchanged code was the only
+// way to tell. A check that cries wolf on a coin flip trains people to re-run
+// CI until it passes, which is worse than not having it.
+//
+// The real signal was already being collected: the crawl records every /v1
+// response, so an offered destination that answers 403 is now asserted
+// against the NETWORK, exactly and without ambiguity, in role-access-gate's
+// step 2. That is strictly stronger than the text scan it replaces, which
+// could only see a 403 the UI chose to print. The word patterns below stay:
+// unlike a number, they cannot occur innocently.
 const RAW_ACCESS_TEXT: readonly { name: string; pattern: RegExp }[] = [
-  { name: '403', pattern: /(?<![\d.,])403(?![\d.,])/ },
   { name: 'Forbidden', pattern: /forbidden/i },
   { name: 'required permission', pattern: /required permission/i },
   // The literal error code the API returns with a 403, in case it is ever

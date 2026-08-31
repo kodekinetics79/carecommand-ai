@@ -144,6 +144,14 @@ test.describe('per-role access model', () => {
         // --- 2. no raw authorization vocabulary, anywhere ----------------
         expect(rawAccessTextIn(await page.locator('body').innerText()), `raw authorization text on ${href} for ${role}`).toEqual([]);
 
+        // A destination the sidebar OFFERS must not be refused underneath it.
+        // Asserted against the network rather than the rendered text: a text
+        // scan can only catch a 403 the UI decided to print, and the number it
+        // looked for also matched innocent ids and metrics. This sees every
+        // refusal, including the ones a friendly empty state would hide.
+        const refusals = traffic.responses.filter(call => call.status === 403);
+        expect(refusals, `${role} is offered ${href} but its requests were refused`).toEqual([]);
+
         const serverErrors = traffic.responses.filter(call => call.status >= 500);
         expect(serverErrors, `server errors while ${role} opened ${href}`).toEqual([]);
       }
