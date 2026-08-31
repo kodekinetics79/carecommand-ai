@@ -639,3 +639,93 @@ describe('A7 — ownership is about this provider agent, not about any row', () 
     }
   });
 });
+
+describe('the second deploy of a line that is already live', () => {
+  it('deploys, verifies, deploys again and verifies again', async () => {
+    // No test in this repo had ever deployed twice AND verified twice. That is
+    // the shape of every second-deploy defect we shipped this week — the frozen
+    // response engine, the pinned engine version, the tag that was never
+    // assigned — each one invisible to a suite whose deployments were all
+    // first deployments. A clinic edits its hours and redeploys; that is the
+    // ordinary case, not an edge one, so it is covered as four steps that all
+    // have to succeed.
+    //
+    // Against the simulated provider, which now models what Retell does on a
+    // republish: a published response engine is frozen and refuses an update,
+    // and a published agent VERSION cannot be rewritten in place.
+    useMockProvider();
+    try {
+      const t = await tenant();
+      const { agent, campaign, clinic } = await deployableCampaign(t);
+
+      // ---- 1. deploy -------------------------------------------------------
+      expect((await deploy(t, campaign.id)).statusCode).toBe(200);
+      const first = await db.receptionistAgentDeployment.findFirstOrThrow({
+        where: { campaignId: campaign.id }, orderBy: { startedAt: 'desc' },
+      });
+      expect(first.status).toBe('PUBLISHED');
+      expect(first.providerAgentVersion).toBe(0);
+
+      // ---- 2. verify -------------------------------------------------------
+      const firstVerify = await verify(t, agent.id);
+      expect(firstVerify.statusCode).toBe(200);
+      expect(firstVerify.json().code).toBeNull();
+      expect(firstVerify.json().agent.providerStatus).toBe('VERIFIED');
+      expect((await db.receptionistAgentDeployment.findUniqueOrThrow({ where: { id: first.id } })).status).toBe('VERIFIED');
+
+      // The clinic changes what the receptionist says, which is the reason a
+      // second deploy exists at all. The prompt genuinely differs from here on.
+      await db.receptionistCampaign.update({
+        where: { id: campaign.id },
+        data: { offerScript: 'We have moved to late appointments on Thursdays; I can book you one now.' },
+      });
+
+      // ---- 3. deploy again -------------------------------------------------
+      const second = await deploy(t, campaign.id);
+      expect(second.statusCode).toBe(200);
+      const republished = await db.receptionistAgentDeployment.findFirstOrThrow({
+        where: { campaignId: campaign.id }, orderBy: { startedAt: 'desc' },
+      });
+      expect(republished.id).not.toBe(first.id);
+      expect(republished.status).toBe('PUBLISHED');
+      // Same agent, next version — and a NEW response engine, because
+      // publishing froze the previous one. Updating it would have been refused
+      // by the simulation exactly as the live account refuses it.
+      expect(republished.providerAgentId).toBe(first.providerAgentId);
+      expect(republished.providerAgentVersion).toBe(1);
+      expect(republished.providerLlmId).not.toBe(first.providerLlmId);
+      // A second deploy is a real change, not a re-publish of the same words.
+      expect(republished.promptHash).not.toBe(first.promptHash);
+      expect(republished.boundPhoneNumber).toBe(clinic.phone);
+      // The first deployment stops being current the moment the second lands.
+      expect((await db.receptionistAgentDeployment.findUniqueOrThrow({ where: { id: first.id } })).status).toBe('SUPERSEDED');
+
+      // ---- 4. verify again -------------------------------------------------
+      const secondVerify = await verify(t, agent.id);
+      expect(secondVerify.statusCode).toBe(200);
+      expect(secondVerify.json().code).toBeNull();
+      expect(secondVerify.json().agent.providerStatus).toBe('VERIFIED');
+
+      const attested = await db.receptionistAgentDeployment.findUniqueOrThrow({ where: { id: republished.id } });
+      expect(attested.status).toBe('VERIFIED');
+      expect(attested.providerErrorCode).toBeNull();
+      // The line answers with the version we just published, read back rather
+      // than asserted.
+      expect(attested.numberBindingVerifiedAt).not.toBeNull();
+      expect(attested.numberBindingAgentVersion).toBe(1);
+
+      const row = await db.receptionistAgent.findUniqueOrThrow({ where: { id: agent.id } });
+      expect(row.currentDeploymentId).toBe(republished.id);
+      expect(row.providerStatus).toBe('VERIFIED');
+      expect(row.providerVersion).toBe(1);
+      // A deployment CareCommand made is routed by number, so the row is a
+      // pinned attestation; the CHECK constraint accepts it without a tag.
+      expect(row.providerVersionPinned).toBe(true);
+      expect(row.providerVerifiedRevision).toBe(row.providerConfigRevision);
+      // And the attested prompt is the one the second deploy published.
+      expect(row.providerPromptHash).toBe(republished.promptHash);
+    } finally {
+      restoreProvider();
+    }
+  });
+});

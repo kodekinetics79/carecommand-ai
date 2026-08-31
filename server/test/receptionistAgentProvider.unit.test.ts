@@ -1,7 +1,18 @@
 import 'dotenv/config';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { env } from '../config/env';
-import { compareDeployedTools, describeDeployedToolDrift, evaluateRetellAgentReadiness, hashPrompt, probeRetellAgent } from '../lib/retell';
+import {
+  compareDeployedTools,
+  createRetellAgent,
+  createRetellLlm,
+  describeDeployedToolDrift,
+  evaluateRetellAgentReadiness,
+  hashPrompt,
+  probeRetellAgent,
+  publishRetellAgent,
+  updateRetellAgent,
+  updateRetellLlm,
+} from '../lib/retell';
 import { bookAppointmentToolFingerprint, compileIntakeContract } from '../modules/receptionist/intakeContract';
 import { buildRetellConfig, type PromptConfig } from '../modules/receptionist/promptService';
 import { promptFixture } from './fixtures/receptionistPromptConfigs';
@@ -856,12 +867,18 @@ describe('Retell agent provider contract', () => {
     const mocked = await probeRetellAgent('agent_pilot', 'prod', { mockDeployment });
     if (!mocked.ok) throw new Error('expected a mock snapshot for a deployment we made');
     expect(mocked.snapshot.mock).toBe(true);
+    // `mock_llm_1` is an engine this process never wrote, so the simulation
+    // holds no copy of its prompt and says so — null, the same answer the live
+    // client gives when the engine body could not be read. It must NOT be the
+    // hash we were hoping for; echoing that back is what made drift invisible.
+    expect(mocked.snapshot.promptHash).toBeNull();
+    expect(mocked.snapshot.beginMessageHash).toBeNull();
     // The fixture satisfies every readiness rule, so a demo tenant verifies for
     // a real reason rather than being waved through. The tools comparison is
-    // now a real one: the simulation returns the authored tools with the
-    // provider's write-time defaults applied, exactly as Retell does, and this
-    // passes only because containment ignores keys we never authored. It used
-    // to compare 'mock:tools' with 'mock:tools'.
+    // a real one: the simulation returns the authored tools with the provider's
+    // write-time defaults applied, exactly as Retell does, and this passes only
+    // because containment ignores keys we never authored. It used to compare
+    // 'mock:tools' with 'mock:tools'.
     expect(evaluateRetellAgentReadiness(mocked.snapshot, {
       versionTag: 'prod', webhookUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`,
       pinnedVersion: 3, expectedPromptHash: 'mock:prompt', expectedTools: [bookingTool()],
@@ -873,5 +890,93 @@ describe('Retell agent provider contract', () => {
 
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network contains secret'); }));
     await expect(probeRetellAgent('agent_pilot', 'prod')).resolves.toEqual({ ok: false, error: 'provider_unavailable' });
+  });
+
+  it('reads prompt drift back from the simulation instead of comparing a value with itself', async () => {
+    // The simulated provider used to answer the verification probe with
+    //   promptHash: deployment.promptHash
+    // so `evaluateRetellAgentReadiness` compared x with x. Prompt drift — the
+    // provider running words other than the ones we published, which is the
+    // difference between a receptionist that follows the clinic's script and
+    // one that does not — could not be detected by any test in this repo. This
+    // is that test: it fails on any build where the mock echoes the expectation.
+    env.RETELL_API_KEY = 'mock_provider';
+    const deployedPrompt = 'You are Avery at Northside Dental. Ask for the caller’s first name.';
+    const deployedBeginMessage = 'Hi, thanks for calling Northside. This call may be recorded.';
+
+    // Write the engine exactly as a deploy does. From here the simulation holds
+    // a copy of the prompt, and can be asked what it is running.
+    const engine = await createRetellLlm({ generalPrompt: deployedPrompt, beginMessage: deployedBeginMessage, tools: [] });
+    if (!engine.ok) throw new Error('the simulation refused a valid engine body');
+
+    const deployment = {
+      providerAgentId: 'agent_pilot', providerAgentVersion: 3,
+      providerLlmId: engine.value.llmId, providerLlmVersion: engine.value.version,
+      providerVersionTag: 'prod',
+      promptHash: hashPrompt(deployedPrompt, { mock: true }),
+      beginMessageHash: hashPrompt(deployedBeginMessage, { mock: true }),
+      toolFingerprint: 'mock:tools',
+      voiceId: 'mock-voice-nova', language: 'en-US', toolsJson: [bookingTool()],
+    };
+    const requirements = {
+      versionTag: 'prod',
+      webhookUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`,
+      pinnedVersion: 3,
+      expectedTools: [bookingTool()],
+    };
+
+    // Agreement: the hash comes from the words the provider was given, and it
+    // happens to equal what we deployed because nothing has drifted.
+    const agreed = await probeRetellAgent('agent_pilot', 'prod', { mockDeployment: deployment });
+    if (!agreed.ok) throw new Error('expected a mock snapshot for a deployment we made');
+    expect(agreed.snapshot.promptHash).toBe(deployment.promptHash);
+    expect(agreed.snapshot.beginMessageHash).toBe(deployment.beginMessageHash);
+    expect(evaluateRetellAgentReadiness(agreed.snapshot, { ...requirements, expectedPromptHash: deployment.promptHash })).toBeNull();
+
+    // Disagreement: the deployment row says we published one prompt, and the
+    // provider is running another. Same engine, same version, same agent — the
+    // only difference is the words, which is exactly the case the echo hid.
+    const drifted = { ...deployment, promptHash: hashPrompt('You are Avery. Say whatever you like.', { mock: true }) };
+    const probe = await probeRetellAgent('agent_pilot', 'prod', { mockDeployment: drifted });
+    if (!probe.ok) throw new Error('expected a mock snapshot for a deployment we made');
+    expect(probe.snapshot.promptHash).not.toBe(drifted.promptHash);
+    expect(evaluateRetellAgentReadiness(probe.snapshot, { ...requirements, expectedPromptHash: drifted.promptHash })).toBe('prompt_drift');
+  });
+
+  it('refuses to update a published response engine, as the live account does', async () => {
+    // Confirmed against the live provider on 2026-08-30: PATCHing the engine of
+    // a published deployment answers `400 Cannot update published LLM`. The
+    // simulation accepted it forever, so the deploy path's create-a-new-engine
+    // branch had no test that could tell whether it was needed — and the bug it
+    // exists for made every second deploy fail permanently in production.
+    env.RETELL_API_KEY = 'mock_provider';
+    const spec = { generalPrompt: 'You are the front desk.', beginMessage: 'Hello.', tools: [] };
+    const engine = await createRetellLlm(spec);
+    if (!engine.ok) throw new Error('the simulation refused a valid engine body');
+
+    // Before publication the engine is a draft, and an update is a new version.
+    // That is what makes a retry after a failed deploy idempotent.
+    const draftUpdate = await updateRetellLlm(engine.value.llmId, spec, engine.value.version);
+    expect(draftUpdate).toMatchObject({ ok: true, mock: true });
+
+    const agent = await createRetellAgent({
+      agentName: 'Avery', llmId: engine.value.llmId, llmVersion: draftUpdate.ok ? draftUpdate.value.version : 0,
+      voiceId: 'mock-voice-nova', language: 'en-US',
+      webhookUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`,
+      postCallAnalysisData: [],
+    });
+    if (!agent.ok) throw new Error('the simulation refused a valid agent body');
+    expect((await publishRetellAgent(agent.value.agentId, agent.value.version)).ok).toBe(true);
+
+    // Publishing froze it. The agent itself stays updatable — a new draft
+    // version is how a second deploy of a live line happens at all.
+    expect(await updateRetellLlm(engine.value.llmId, spec, 1))
+      .toMatchObject({ ok: false, error: 'invalid_request', status: 400, mock: true });
+    expect(await updateRetellAgent(agent.value.agentId, {
+      agentName: 'Avery', llmId: engine.value.llmId, llmVersion: 0,
+      voiceId: 'mock-voice-nova', language: 'en-US',
+      webhookUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`,
+      postCallAnalysisData: [],
+    }, agent.value.version)).toMatchObject({ ok: true, mock: true });
   });
 });
