@@ -18,7 +18,21 @@ async function pf<T>(path: string, init?: RequestInit & { auth?: boolean }): Pro
       ...init?.headers,
     },
   });
-  if (res.status === 401) { setPlatformToken(null); throw new Error('Platform session expired. Please sign in again.'); }
+  if (res.status === 401) {
+    const refused = await res.json().catch(() => null) as { message?: string; error?: string } | null;
+    // A 401 on a call made WITH the stored session token means that session is
+    // gone: drop it and say so. A 401 from sign-in or two-factor verification
+    // means the CREDENTIAL was refused, and calling that "session expired" sends
+    // the operator to fix the wrong thing - it also cleared state that was never
+    // the problem. The server already distinguishes these ("Invalid
+    // authentication code." vs "Platform session expired."); this used to throw
+    // the body away and substitute one message for all of them.
+    const usedStoredSession = init?.auth !== false && Boolean(token);
+    if (usedStoredSession) setPlatformToken(null);
+    throw new Error(refused?.message ?? (usedStoredSession
+      ? 'Platform session expired. Please sign in again.'
+      : 'That request was refused. Check the details and try again.'));
+  }
   const body = res.status === 204 ? null : await res.json().catch(() => null);
   if (!res.ok) { const e = body as { message?: string; error?: string } | null; throw new Error(e?.message ?? e?.error ?? `Request failed (${res.status})`); }
   return body as T;
