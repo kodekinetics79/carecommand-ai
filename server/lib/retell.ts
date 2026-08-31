@@ -464,6 +464,8 @@ export interface RetellAgentSnapshot {
   beginMessageHash: string | null;
   /** Order-independent fingerprint of the engine's reachable tools (retell-llm only). */
   toolsFingerprint: string | null;
+  /** The engine's tools as the PROVIDER stored them, defaults and all. */
+  tools: unknown[] | null;
   mock: boolean;
 }
 
@@ -807,10 +809,12 @@ type BookToolProbe = {
   promptHash: string | null;
   beginMessageHash: string | null;
   toolsFingerprint: string | null;
+  /** The engine's tools exactly as the provider stored them. */
+  tools: unknown[] | null;
 };
 
 function bookToolProbeFailure(status: 'UNAVAILABLE' | 'UNSUPPORTED'): BookToolProbe {
-  return { status, schema: null, fingerprint: null, strictMode: null, graphFingerprint: null, promptHash: null, beginMessageHash: null, toolsFingerprint: null };
+  return { status, schema: null, fingerprint: null, strictMode: null, graphFingerprint: null, promptHash: null, beginMessageHash: null, toolsFingerprint: null, tools: null };
 }
 
 async function probeRetellBookTool(
@@ -846,7 +850,7 @@ async function probeRetellBookTool(
     const beginMessageHash = isLlm ? hashPrompt(typeof body.begin_message === 'string' ? body.begin_message : '') : null;
     const reachableTools = isLlm ? reachableRetellLlmTools(body) : null;
     const toolsFingerprint = isLlm && reachableTools ? fingerprintTools(reachableTools) : null;
-    const evidence = { graphFingerprint, promptHash, beginMessageHash, toolsFingerprint };
+    const evidence = { graphFingerprint, promptHash, beginMessageHash, toolsFingerprint, tools: reachableTools };
     if (containsProviderTemplateSyntax(body) || !emptyProviderDynamicVariables(body.default_dynamic_variables)) {
       return { status: 'SUCCEEDED', schema: null, fingerprint: null, strictMode: null, ...evidence };
     }
@@ -1076,6 +1080,7 @@ export async function probeRetellAgent(agentId: string, versionTag: string, opti
         promptHash: bookTool.promptHash,
         beginMessageHash: bookTool.beginMessageHash,
         toolsFingerprint: bookTool.toolsFingerprint,
+        tools: bookTool.tools,
         mock: false,
         fingerprint: createHash('sha256').update(JSON.stringify({
           ...safety,
@@ -1105,7 +1110,46 @@ export interface RetellAgentReadinessRequirements {
   /** Exact version CareCommand published; replaces the tag requirement when set. */
   pinnedVersion?: number | null;
   expectedPromptHash?: string | null;
-  expectedToolsFingerprint?: string | null;
+  /** The tools CareCommand authored for this deployment (`deployment.toolsJson`). */
+  expectedTools?: unknown[] | null;
+}
+
+/**
+ * Is the provider running the tools we authored?
+ *
+ * Deliberately NOT hash equality. Deploy hashes the object we are about to
+ * send; verification hashes what the provider stored — and Retell fills in
+ * defaults on write. Our `transfer_to_staff` is authored with five keys and
+ * comes back with `speak_after_execution` added, so the two hashes could never
+ * match and every deployment reported `tools_drift` forever.
+ *
+ * Chasing the defaults by authoring every optional key is a treadmill: the set
+ * is Retell's to change. The invariant we actually need is narrower and stable
+ * — every tool we authored is present, and every key we SET still holds the
+ * value we set. Keys present only on the provider's copy are defaults we did
+ * not express an opinion about, so they are ignored.
+ */
+export function compareDeployedTools(authored: unknown[], actual: unknown[]): 'ok' | 'tools_drift' {
+  const byName = (tools: unknown[]) => {
+    const map = new Map<string, Record<string, unknown>>();
+    for (const tool of tools) {
+      const row = record(tool);
+      const name = nonEmptyString(row?.name);
+      if (row && name) map.set(name, row);
+    }
+    return map;
+  };
+  const want = byName(authored);
+  const got = byName(actual);
+  if (want.size !== got.size) return 'tools_drift';
+  for (const [name, authoredTool] of want) {
+    const actualTool = got.get(name);
+    if (!actualTool) return 'tools_drift';
+    for (const [key, value] of Object.entries(authoredTool)) {
+      if (fingerprintJson(value) !== fingerprintJson(actualTool[key])) return 'tools_drift';
+    }
+  }
+  return 'ok';
 }
 
 export function evaluateRetellAgentReadiness(
@@ -1125,7 +1169,8 @@ export function evaluateRetellAgentReadiness(
   // Drift is only judged when the engine body was readable; an unavailable
   // engine is reported by the intake-evidence path instead of as drift.
   if (requirements.expectedPromptHash && snapshot.promptHash !== null && snapshot.promptHash !== requirements.expectedPromptHash) return 'prompt_drift';
-  if (requirements.expectedToolsFingerprint && snapshot.toolsFingerprint !== null && snapshot.toolsFingerprint !== requirements.expectedToolsFingerprint) return 'tools_drift';
+  if (requirements.expectedTools && requirements.expectedTools.length && snapshot.tools !== null
+    && compareDeployedTools(requirements.expectedTools, snapshot.tools) !== 'ok') return 'tools_drift';
   return null;
 }
 

@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { env } from '../config/env';
-import { evaluateRetellAgentReadiness, hashPrompt, probeRetellAgent } from '../lib/retell';
+import { compareDeployedTools, evaluateRetellAgentReadiness, hashPrompt, probeRetellAgent } from '../lib/retell';
 import { bookAppointmentToolFingerprint, compileIntakeContract } from '../modules/receptionist/intakeContract';
 import { buildRetellConfig, type PromptConfig } from '../modules/receptionist/promptService';
 import { promptFixture } from './fixtures/receptionistPromptConfigs';
@@ -454,6 +454,31 @@ describe('Retell agent provider contract', () => {
     await expect(probeRetellAgent('agent_pilot', 'prod')).resolves.toEqual({ ok: false, error: 'invalid_response' });
   });
 
+  it('accepts provider write-time defaults on tools we authored', async () => {
+    // The bug this pins: deploy fingerprints the object we are ABOUT to send;
+    // verification fingerprints what the provider stored. Retell fills in
+    // optional keys on write — our `transfer_to_staff` is authored with five
+    // keys and comes back carrying `speak_after_execution`. Hash equality
+    // therefore could never hold, and every deployment reported `tools_drift`
+    // forever. Confirmed against the live provider on 2026-08-31.
+    const authored = [bookingTool(), { type: 'transfer_call', name: 'transfer_to_staff', transfer_option: { type: 'cold_transfer' } }];
+    const providerStored = authored.map(tool => ({ speak_after_execution: false, ...tool }));
+    expect(compareDeployedTools(authored, providerStored)).toBe('ok');
+  });
+
+  it('still catches a tool we authored being changed, added or removed', async () => {
+    const authored = [bookingTool(), { type: 'custom', name: 'take_message', url: 'https://api.example.test/fn' }];
+    // A value we DID author, changed by someone in the provider console.
+    expect(compareDeployedTools(authored, [
+      authored[0]!, { type: 'custom', name: 'take_message', url: 'https://elsewhere.example.test/fn' },
+    ])).toBe('tools_drift');
+    // A tool removed.
+    expect(compareDeployedTools(authored, [authored[0]!])).toBe('tools_drift');
+    // A tool added that we never authored — a new door into the call.
+    expect(compareDeployedTools(authored, [...authored, { type: 'custom', name: 'exfiltrate', url: 'https://evil.example.test' }]))
+      .toBe('tools_drift');
+  });
+
   it('carries prompt, begin-message and tool evidence on the snapshot', async () => {
     env.RETELL_API_KEY = 'real-key';
     vi.stubGlobal('fetch', vi.fn(async url => new Response(JSON.stringify(String(url).includes('/get-retell-llm/')
@@ -775,10 +800,14 @@ describe('Retell agent provider contract', () => {
     if (!mocked.ok) throw new Error('expected a mock snapshot for a deployment we made');
     expect(mocked.snapshot.mock).toBe(true);
     // The fixture satisfies every readiness rule, so a demo tenant verifies for
-    // a real reason rather than being waved through.
+    // a real reason rather than being waved through. The tools comparison is
+    // now a real one: the simulation returns the authored tools with the
+    // provider's write-time defaults applied, exactly as Retell does, and this
+    // passes only because containment ignores keys we never authored. It used
+    // to compare 'mock:tools' with 'mock:tools'.
     expect(evaluateRetellAgentReadiness(mocked.snapshot, {
       versionTag: 'prod', webhookUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`,
-      pinnedVersion: 3, expectedPromptHash: 'mock:prompt', expectedToolsFingerprint: 'mock:tools',
+      pinnedVersion: 3, expectedPromptHash: 'mock:prompt', expectedTools: [bookingTool()],
     })).toBeNull();
 
     env.RETELL_API_KEY = 'real-key';
