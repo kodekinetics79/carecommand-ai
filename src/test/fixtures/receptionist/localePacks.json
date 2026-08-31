@@ -58,7 +58,9 @@
           "tool.confirm.recorded": "Thank you — I have recorded that you are attending.",
           "tool.confirm.already": "Thank you — that appointment is already confirmed.",
           "tool.confirm.not_confirmable": "That appointment is not one I can confirm on this call. I can connect you with the front desk.",
-          "tool.confirm.locked": "That appointment can no longer be confirmed automatically. I can connect you with the front desk."
+          "tool.confirm.locked": "That appointment can no longer be confirmed automatically. I can connect you with the front desk.",
+          "reminder.appointment.line": "I'm ringing about your {{appointment_service}} appointment on {{appointment_date}} at {{appointment_time}}, at {{appointment_location}}.",
+          "reminder.appointment.clinician": "You're booked in with {{appointment_clinician}}."
         }
       },
       "evidenceHash": "ce30e8be04af5d9273c10270af44ab4f0470f6a326fab3de601f66b1455b5045",
@@ -130,7 +132,9 @@
           "tool.confirm.recorded": "Thank you — I have recorded that you are attending.",
           "tool.confirm.already": "Thank you — that appointment is already confirmed.",
           "tool.confirm.not_confirmable": "That appointment is not one I can confirm on this call. I can connect you with the front desk.",
-          "tool.confirm.locked": "That appointment can no longer be confirmed automatically. I can connect you with the front desk."
+          "tool.confirm.locked": "That appointment can no longer be confirmed automatically. I can connect you with the front desk.",
+          "reminder.appointment.line": "I'm ringing about your {{appointment_service}} appointment on {{appointment_date}} at {{appointment_time}}, at {{appointment_location}}.",
+          "reminder.appointment.clinician": "You're booked in with {{appointment_clinician}}."
         }
       },
       "evidenceHash": "7b585a11d5603acc4faa5220d201ebb6fcf41231b0773ef97f3b1abbfa13305b",
@@ -189,7 +193,9 @@
           "tool.confirm.recorded": "Thank you — I have recorded that you are attending.",
           "tool.confirm.already": "Thank you — that appointment is already confirmed.",
           "tool.confirm.not_confirmable": "That appointment is not one I can confirm on this call. I can connect you with the front desk.",
-          "tool.confirm.locked": "That appointment can no longer be confirmed automatically. I can connect you with the front desk."
+          "tool.confirm.locked": "That appointment can no longer be confirmed automatically. I can connect you with the front desk.",
+          "reminder.appointment.line": "I'm calling about your {{appointment_service}} appointment on {{appointment_date}} at {{appointment_time}}, at {{appointment_location}}.",
+          "reminder.appointment.clinician": "You're booked in with {{appointment_clinician}}."
         }
       },
       "evidenceHash": "96593e692983930812319ce82ddd8aaca9f667057d78b592741329ac00e83240"
@@ -240,7 +246,9 @@
           "tool.confirm.recorded": "Thank you — I have recorded that you are attending.",
           "tool.confirm.already": "Thank you — that appointment is already confirmed.",
           "tool.confirm.not_confirmable": "That appointment is not one I can confirm on this call. I can connect you with the front desk.",
-          "tool.confirm.locked": "That appointment can no longer be confirmed automatically. I can connect you with the front desk."
+          "tool.confirm.locked": "That appointment can no longer be confirmed automatically. I can connect you with the front desk.",
+          "reminder.appointment.line": "I'm ringing about your {{appointment_service}} appointment on {{appointment_date}} at {{appointment_time}}, at {{appointment_location}}.",
+          "reminder.appointment.clinician": "You're booked in with {{appointment_clinician}}."
         }
       },
       "evidenceHash": "ce30e8be04af5d9273c10270af44ab4f0470f6a326fab3de601f66b1455b5045"

@@ -100,6 +100,11 @@ const EN_US_V1: PlatformLocalePack = {
       'tool.confirm.locked': "That appointment can no longer be confirmed automatically. I can connect you with the front desk.",
       'tool.message.recorded': "Thank you. That's written down for the front desk with your number. Someone will pick it up and get back to you; I can't promise exactly when.",
       'tool.message.appended': "Thank you. I've added that to the same note for the front desk. Someone will pick it up and get back to you; I can't promise exactly when.",
+      // The reminder, in this patient's own details. The holes are runtime
+      // variables resolved at dial time from the appointment the call target is
+      // bound to; the campaign script no longer gets to state them.
+      'reminder.appointment.line': "I'm calling about your {{appointment_service}} appointment on {{appointment_date}} at {{appointment_time}}, at {{appointment_location}}.",
+      'reminder.appointment.clinician': "You're booked in with {{appointment_clinician}}.",
     },
   },
 };
@@ -181,6 +186,8 @@ const EN_GB_V1: PlatformLocalePack = {
       'tool.confirm.locked': "That appointment can no longer be confirmed automatically. I can put you through to reception.",
       'tool.message.recorded': "Thank you. That's written down for reception with your number. Someone will pick it up and get back to you; I can't promise exactly when.",
       'tool.message.appended': "Thank you. I've added that to the same note for reception. Someone will pick it up and get back to you; I can't promise exactly when.",
+      'reminder.appointment.line': "I'm ringing about your {{appointment_service}} appointment on {{appointment_date}} at {{appointment_time}}, at {{appointment_location}}.",
+      'reminder.appointment.clinician': "You're booked in with {{appointment_clinician}}.",
     },
   },
 };

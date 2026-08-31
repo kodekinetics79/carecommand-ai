@@ -6,6 +6,10 @@ import { audit } from '../../lib/audit';
 import { env } from '../../config/env';
 import { retellConfigStatus, createPhoneCall, getPhoneCall, stopPhoneCall } from '../../lib/retell';
 import { buildHoursDynamicVariables, hoursStatus } from '../../lib/receptionist/clinicHours';
+import {
+  VOICE_MUTABLE_STATUSES,
+  buildAppointmentDynamicVariables,
+} from '../../lib/receptionist/appointmentContext';
 import { loadHoursSource } from '../../lib/receptionist/hoursSource';
 import { resolveLocalePackWithFallback, resolvedLocaleFormat } from '../../lib/receptionist/localePacks/resolve';
 import { isDestinationOptedOut, isSuppressed, isValidE164, toE164 } from '../../lib/campaigns';
@@ -52,6 +56,20 @@ const OUTBOUND_LEGAL_BASES = ['EXPLICIT_CONSENT', 'TREATMENT_OPERATIONS'] as con
 const STRICT_HH_MM = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 const CLIENT_LAUNCH_ATTEMPT_SCOPE = 'receptionist.outbound-client-attempt';
 const LIVE_UAT_TARGET_SOURCE_PREFIX = 'live_voice_uat:';
+// How many upcoming appointments a target candidate offers to bind to. A
+// reminder is about the next visit or two; a longer list is a picker nobody
+// reads and a bigger disclosure of a patient's diary than the job needs.
+const MAX_CANDIDATE_APPOINTMENTS_PER_PATIENT = 5;
+
+/** One bindable appointment on a target candidate; raw values, formatted by the caller. */
+type TargetCandidateAppointment = {
+  appointmentId: string;
+  startsAt: string;
+  timezone: string;
+  service: string;
+  clinician: string | null;
+  location: string;
+};
 import { MAX_TENANT_ACTIVE_CALLS } from '../../lib/receptionist/admissionPolicy';
 import { recordUsageEvent, periodUsageTotal, voiceCallDedupeKey, USAGE_METRICS } from '../../lib/usageMetering';
 import { liveCallingBlockReason, TENANT_MODE_DEMO_BLOCK } from '../../lib/tenantMode';
@@ -981,9 +999,52 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         select: { id: true, name: true, phone: true }, take: 50,
       }),
     ]));
+    // The appointments a target may be created FROM. A reminder campaign that
+    // cannot see them can only be built from a script written once for
+    // everybody, which is exactly how one clinician, day and time ended up
+    // addressed to a whole list. Leads have none by construction: an
+    // appointment belongs to a patient.
+    const appointmentsByPatient = new Map<string, TargetCandidateAppointment[]>();
+    if (patients.length) {
+      const upcoming = await runWithTenantContext(request.auth.tenantId, tx => tx.appointment.findMany({
+        where: {
+          tenantId: request.auth.tenantId,
+          patientId: { in: patients.map(patient => patient.id) },
+          deletedAt: null,
+          startsAt: { gt: new Date() },
+          status: { in: [...VOICE_MUTABLE_STATUSES] },
+        },
+        orderBy: { startsAt: 'asc' },
+        take: MAX_CANDIDATE_APPOINTMENTS_PER_PATIENT * patients.length,
+        select: {
+          id: true, patientId: true, startsAt: true, service: true,
+          branch: { select: { name: true, timezone: true } },
+          providerProfile: { select: { user: { select: { displayName: true } } } },
+        },
+      }));
+      for (const appointment of upcoming) {
+        const bucket = appointmentsByPatient.get(appointment.patientId) ?? [];
+        if (bucket.length >= MAX_CANDIDATE_APPOINTMENTS_PER_PATIENT) continue;
+        bucket.push({
+          appointmentId: appointment.id,
+          startsAt: appointment.startsAt.toISOString(),
+          timezone: appointment.branch.timezone,
+          service: appointment.service,
+          clinician: appointment.providerProfile?.user.displayName.trim() || null,
+          location: appointment.branch.name,
+        });
+        appointmentsByPatient.set(appointment.patientId, bucket);
+      }
+    }
     const identities = [
-      ...patients.map(patient => ({ type: 'patient' as const, id: patient.id, name: `${patient.firstName} ${patient.lastName}`, phone: toE164(patient.phone ?? '') })),
-      ...leads.map(lead => ({ type: 'lead' as const, id: lead.id, name: lead.name, phone: toE164(lead.phone ?? '') })),
+      ...patients.map(patient => ({
+        type: 'patient' as const, id: patient.id, name: `${patient.firstName} ${patient.lastName}`, phone: toE164(patient.phone ?? ''),
+        appointments: appointmentsByPatient.get(patient.id) ?? [],
+      })),
+      ...leads.map(lead => ({
+        type: 'lead' as const, id: lead.id, name: lead.name, phone: toE164(lead.phone ?? ''),
+        appointments: [] as TargetCandidateAppointment[],
+      })),
     ].filter(identity => isValidE164(identity.phone));
     const requiresImmutableConsent = campaign.legalBasis === 'EXPLICIT_CONSENT' || campaign.purpose === 'PATIENT_REACTIVATION';
     return runWithTenantContext(request.auth.tenantId, async tx => {
@@ -1105,6 +1166,11 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         email: z.string().trim().max(160).optional(),
         patientId: uuid.optional(),
         leadId: uuid.optional(),
+        // The appointment this target is being called ABOUT. Optional because
+        // reactivation and recall targets are legitimately about none; when it
+        // is present the call states THIS patient's clinician, day and time
+        // instead of whatever the campaign script was written with.
+        appointmentId: uuid.optional(),
       })).min(1).max(500),
     }).parse(request.body);
     const campaign = await db.receptionistOutboundCampaign.findFirst({ where: { id, tenantId: request.auth.tenantId } });
@@ -1121,6 +1187,32 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
         const identityPhone = toE164(identity.phone ?? '');
         if (!isValidE164(identityPhone)) throw new Error('target_phone_invalid');
         if (target.phone && !target.phone.includes('*') && toE164(target.phone) !== identityPhone) throw new Error('target_phone_identity_mismatch');
+        // The appointment binding is an assertion about WHOSE appointment this
+        // is, so it is verified against the same identity the phone number was
+        // verified against — not merely against the tenant. The database
+        // refuses a mismatch too (composite FK on tenant + patient + id); this
+        // is here so the caller gets a reason instead of a constraint error.
+        if (target.appointmentId) {
+          if (!target.patientId) throw new Error('target_appointment_requires_patient');
+          const appointment = await tx.appointment.findFirst({
+            where: {
+              id: target.appointmentId,
+              tenantId: request.auth.tenantId,
+              patientId: target.patientId,
+              deletedAt: null,
+            },
+            select: { startsAt: true, status: true },
+          });
+          if (!appointment) throw new Error('target_appointment_foreign_or_unknown');
+          // A reminder about a visit that has happened, or one the clinic has
+          // already cancelled, is a false statement to a patient. Targets are
+          // created FROM upcoming appointments; a campaign about no appointment
+          // simply binds none.
+          if (appointment.startsAt.getTime() <= Date.now()) throw new Error('target_appointment_not_upcoming');
+          if (!VOICE_MUTABLE_STATUSES.includes(appointment.status as (typeof VOICE_MUTABLE_STATUSES)[number])) {
+            throw new Error('target_appointment_not_remindable');
+          }
+        }
         if (seenDestinations.has(identityPhone)) throw new Error('target_destination_duplicate');
         seenDestinations.add(identityPhone);
         if (await tx.receptionistCallTarget.count({ where: { tenantId: request.auth.tenantId, campaignId: id, phone: identityPhone } })) {
@@ -1136,7 +1228,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     let created;
     try {
       created = await db.receptionistCallTarget.createMany({
-        data: normalized.map(t => ({ tenantId: request.auth.tenantId, campaignId: id, phone: t.phone, firstName: t.firstName, lastName: t.lastName, email: t.email, patientId: t.patientId, leadId: t.leadId })),
+        data: normalized.map(t => ({ tenantId: request.auth.tenantId, campaignId: id, phone: t.phone, firstName: t.firstName, lastName: t.lastName, email: t.email, patientId: t.patientId, leadId: t.leadId, appointmentId: t.appointmentId })),
       });
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
@@ -2081,6 +2173,36 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     const dialLocale = resolvedLocaleFormat(dialPack, campaign.clinic.defaultLanguage);
     const dialStatus = dialBundle ? hoursStatus(dialBundle.source, new Date(), dialLocale) : null;
 
+    // The appointment this call is about, re-read AT DIAL TIME under the same
+    // tenant + patient scope the binding was created under. A target queued
+    // last week can be dialled after the visit was moved, cancelled or has
+    // simply already happened; sending the row as it was bound would read a
+    // stale fact to a patient. A binding that no longer qualifies yields empty
+    // variables and the prompt then states no appointment at all, which is the
+    // only honest answer available on the line.
+    const boundAppointment = target?.appointmentId && target.patientId
+      ? await db.appointment.findFirst({
+        where: {
+          id: target.appointmentId,
+          tenantId: request.auth.tenantId,
+          patientId: target.patientId,
+          deletedAt: null,
+          startsAt: { gt: new Date() },
+          status: { in: [...VOICE_MUTABLE_STATUSES] },
+        },
+        select: {
+          id: true, startsAt: true, service: true,
+          branch: { select: { name: true, timezone: true } },
+          providerProfile: { select: { user: { select: { displayName: true } } } },
+        },
+      })
+      : null;
+    if (target?.appointmentId && !boundAppointment) {
+      request.log.warn({
+        callLogId: callLog.id, campaignId: campaign.id, targetId: target.id, appointmentId: target.appointmentId,
+      }, 'Outbound target is bound to an appointment that is no longer remindable; dialling with no appointment context');
+    }
+
     // The per-call webhook URL is read by the receiving handler BEFORE the
     // provider signature is verified: its first statement is
     // `z.object({ clinicId: uuid.optional(), campaignId: uuid.optional() }).parse(request.query)`.
@@ -2108,6 +2230,23 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       webhookUrl: `${env.PUBLIC_API_URL}/v1/receptionist/webhooks/retell?${callWebhookQuery.toString()}`,
       dynamicVariables: {
         ...buildHoursDynamicVariables({ status: dialStatus, strings: dialPack?.strings ?? null }),
+        // This patient's own appointment, in the BRANCH's timezone and this
+        // call's locale format. Every key is present on every call: an unbound
+        // target sends empty strings, exactly like the optional variables
+        // below, never a placeholder the agent could speak as if it were a fact.
+        ...buildAppointmentDynamicVariables({
+          appointment: boundAppointment
+            ? {
+              id: boundAppointment.id,
+              startsAt: boundAppointment.startsAt,
+              service: boundAppointment.service,
+              timezone: boundAppointment.branch.timezone,
+              locationName: boundAppointment.branch.name,
+              clinicianName: boundAppointment.providerProfile?.user.displayName ?? null,
+            }
+            : null,
+          locale: dialLocale,
+        }),
         clinic_name: campaign.clinic.name,
         agent_name: campaign.agent.name,
         disclosure: liveTest

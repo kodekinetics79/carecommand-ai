@@ -27,6 +27,9 @@ import {
   renderRecordingDisclosure,
 } from './privacyLifecycle';
 import { restrictCallToBasicAttributes } from '../retell';
+// One definition of "an appointment voice may still act on", shared with the
+// outbound reminder binding so the two can never drift apart.
+import { VOICE_MUTABLE_STATUSES } from './appointmentContext';
 import { closingDisclosureEvidenceHash } from '../../modules/receptionist/promptService';
 import { transferReadiness } from './transferReadiness';
 import { CONFIRMATION_OUTBOX_SOURCE, processAppointmentConfirmations } from './confirmationOutbox';
@@ -95,7 +98,6 @@ const MAX_CANONICAL_ANSWER_BYTES = 16 * 1024;
 const MAX_BOOKING_SCHEMA_PROPERTIES = 57;
 const APPOINTMENT_NOTIFICATION_PREFERENCE_POLICY = 'appointment-notification-preference-v1';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const VOICE_MUTABLE_STATUSES = ['CONFIRMED', 'RISKY', 'WAITLIST'] as const;
 
 function str(v: unknown, max = MAX_SHORT): string | null {
   const s = typeof v === 'string' ? v.trim() : '';

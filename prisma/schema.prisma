@@ -523,6 +523,10 @@ model Appointment {
 
   @@unique([tenantId, id])
   @@unique([tenantId, receptionistCallLogId])
+  // Parent key for ReceptionistCallTarget's appointment binding. It carries
+  // patientId so the database — not the writer — refuses a call target bound to
+  // an appointment belonging to somebody else.
+  @@unique([tenantId, patientId, id])
   @@index([tenantId, branchId, startsAt])
   @@index([tenantId, patientId, startsAt])
   @@index([tenantId, status, startsAt])
@@ -3231,7 +3235,12 @@ model ReceptionistCallTarget {
   campaign      ReceptionistOutboundCampaign @relation(fields: [tenantId, campaignId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallTarget_campaign_scope_fkey")
   patient       Patient?                     @relation(fields: [tenantId, patientId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallTarget_patient_scope_fkey")
   lead          Lead?                        @relation(fields: [tenantId, leadId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallTarget_lead_scope_fkey")
-  appointment   Appointment?                 @relation("ReceptionistCallTargetAppointment", fields: [tenantId, appointmentId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallTarget_appointment_scope_fkey")
+  // Scoped by patient as well as tenant: a reminder that names somebody else's
+  // clinician, day and time is the exact defect this column exists to fix, so
+  // the wrong-patient case is refused by the FK rather than by remembering to
+  // check. A DB CHECK (see the migration) refuses appointmentId without
+  // patientId, which MATCH SIMPLE would otherwise let through unverified.
+  appointment   Appointment?                 @relation("ReceptionistCallTargetAppointment", fields: [tenantId, patientId, appointmentId], references: [tenantId, patientId, id], onDelete: Restrict, map: "ReceptionistCallTarget_appointment_scope_fkey")
   callLogs      ReceptionistCallLog[] @relation("ReceptionistCallLogTarget")
   lastCallLog   ReceptionistCallLog? @relation("ReceptionistCallTargetLastCall", fields: [tenantId, campaignId, lastCallLogId], references: [tenantId, outboundCampaignId, id], onDelete: Restrict, map: "ReceptionistCallTarget_last_call_ownership_fkey")
   providerIntents ReceptionistOutboundProviderIntent[]

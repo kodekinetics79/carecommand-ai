@@ -2399,3 +2399,289 @@ describe('AI receptionist outbound regression safety controls', () => {
     }
   });
 });
+
+// ===========================================================================
+// The reminder is about THIS patient's appointment.
+//
+// The pilot's first outbound reminder campaign carried its clinician, day and
+// time as static text in `ReceptionistOutboundCampaign.script`, so every
+// patient on the list would have heard the same appointment. These tests pin
+// the facts that make that impossible to repeat: a bound target sends the real
+// row, an unbound one sends empty strings rather than a sentence the agent
+// could speak as a fact, and a binding can never reach across a patient or a
+// tenant.
+// ===========================================================================
+
+async function createClinician(tenant: TenantFixture, displayName: string) {
+  const user = await db.user.create({
+    data: {
+      tenantId: tenant.id,
+      role: 'PROVIDER',
+      active: true,
+      branchId: tenant.branchId,
+      email: `clinician-${randomUUID().slice(0, 8)}@outbound.test`,
+      displayName,
+    },
+  });
+  return db.providerProfile.create({
+    data: { tenantId: tenant.id, branchId: tenant.branchId, userId: user.id, specialty: 'General dentistry' },
+  });
+}
+
+async function createAppointment(
+  tenant: TenantFixture,
+  patientId: string,
+  options: { startsAt?: Date; service?: string; providerProfileId?: string; status?: 'CONFIRMED' | 'CANCELED' } = {},
+) {
+  const startsAt = options.startsAt ?? new Date(Date.now() + 3 * 24 * 60 * 60 * 1_000);
+  return db.appointment.create({
+    data: {
+      tenantId: tenant.id,
+      branchId: tenant.branchId,
+      patientId,
+      service: options.service ?? 'Hygiene review',
+      startsAt,
+      endsAt: new Date(startsAt.getTime() + 30 * 60 * 1_000),
+      status: options.status ?? 'CONFIRMED',
+      channel: 'CALL',
+      providerProfileId: options.providerProfileId,
+    },
+  });
+}
+
+/** The `retell_llm_dynamic_variables` of the one create-phone-call this made. */
+function dialVariablesFrom(providerFetch: ReturnType<typeof vi.fn<typeof fetch>>): Record<string, string> {
+  const call = providerFetch.mock.calls.find(([url]) => String(url).includes('/v2/create-phone-call'));
+  if (!call) throw new Error('no create-phone-call was submitted');
+  const body = JSON.parse(String((call[1] as RequestInit).body)) as {
+    retell_llm_dynamic_variables: Record<string, string>;
+  };
+  return body.retell_llm_dynamic_variables;
+}
+
+function stubAcceptedProviderCall(tenant: TenantFixture, providerCallId: string) {
+  const providerFetch = vi.fn<typeof fetch>(async url => String(url).includes('/v2/create-phone-call')
+    ? new Response(JSON.stringify({ call_id: providerCallId, agent_id: tenant.providerAgentId, agent_version: 1 }), {
+      status: 201, headers: { 'content-type': 'application/json' },
+    })
+    : new Response(null, { status: 204 }));
+  vi.stubGlobal('fetch', providerFetch);
+  return providerFetch;
+}
+
+const APPOINTMENT_VARIABLE_NAMES = [
+  'appointment_id', 'appointment_clinician', 'appointment_date',
+  'appointment_time', 'appointment_service', 'appointment_location',
+] as const;
+
+describe('an outbound reminder states the appointment it is actually about', () => {
+  it('sends the bound appointment’s own clinician, day, time, service and location', async () => {
+    const tenant = await makeTenant();
+    const campaignId = await createCampaign(tenant, { status: 'RUNNING', purpose: 'APPOINTMENT_REMINDER' });
+    const patient = await createPatient(tenant, 810);
+    const clinician = await createClinician(tenant, 'Dr Amara Osei');
+    // A fixed instant so the spoken date and time are exact rather than
+    // recomputed by the same helper the product uses. 15:30Z in December is
+    // 10:30 in America/New_York, which is the BRANCH's timezone — the hour
+    // proves the conversion happened, and it is far enough ahead that the
+    // "must be upcoming" fence never expires this fixture.
+    const appointment = await createAppointment(tenant, patient.id, {
+      startsAt: new Date('2126-12-16T15:30:00.000Z'),
+      service: 'Six-month check-up',
+      providerProfileId: clinician.id,
+    });
+
+    const created = await app.inject({
+      method: 'POST',
+      url: `/v1/receptionist/outbound-campaigns/${campaignId}/targets`,
+      headers: auth(tenant),
+      payload: { targets: [{ patientId: patient.id, phone: patient.phone, appointmentId: appointment.id }] },
+    });
+    expect(created.statusCode).toBe(201);
+    const target = await db.receptionistCallTarget.findFirstOrThrow({
+      where: { tenantId: tenant.id, campaignId, patientId: patient.id },
+    });
+    expect(target.appointmentId).toBe(appointment.id);
+
+    const providerFetch = stubAcceptedProviderCall(tenant, randomRetellCallId('retell_reminder_call'));
+    const response = await app.inject({
+      method: 'POST',
+      url: `/v1/receptionist/outbound-campaigns/${campaignId}/call`,
+      headers: auth(tenant),
+      payload: { targetId: target.id, phone: target.phone },
+    });
+    expect(response.statusCode).toBe(201);
+
+    const variables = dialVariablesFrom(providerFetch);
+    expect(variables.appointment_id).toBe(appointment.id);
+    expect(variables.appointment_clinician).toBe('Dr Amara Osei');
+    // en-US pack: 12-hour clock, weekday-month-day, rendered in the branch tz.
+    expect(variables.appointment_date).toBe('Monday, December 16');
+    expect(variables.appointment_time).toBe('10:30 AM');
+    expect(variables.appointment_service).toBe('Six-month check-up');
+    expect(variables.appointment_location).toBe('Main branch');
+  }, 30_000);
+
+  it('sends empty strings, never a placeholder, when the target is bound to no appointment', async () => {
+    const tenant = await makeTenant();
+    const campaignId = await createCampaign(tenant, { status: 'RUNNING', purpose: 'APPOINTMENT_REMINDER' });
+    const target = await addPatientTarget(tenant, campaignId, 811);
+    expect(target.appointmentId).toBeNull();
+
+    const providerFetch = stubAcceptedProviderCall(tenant, randomRetellCallId('retell_unbound_call'));
+    const response = await app.inject({
+      method: 'POST',
+      url: `/v1/receptionist/outbound-campaigns/${campaignId}/call`,
+      headers: auth(tenant),
+      payload: { targetId: target.id, phone: target.phone },
+    });
+    expect(response.statusCode).toBe(201);
+
+    const variables = dialVariablesFrom(providerFetch);
+    for (const name of APPOINTMENT_VARIABLE_NAMES) {
+      // Present and empty, not absent: an absent key leaves Retell holding a
+      // literal token for the agent to read out.
+      expect(variables, name).toHaveProperty(name);
+      expect(variables[name], name).toBe('');
+    }
+    // Not "your appointment", not "an appointment", not a date we invented.
+    expect(APPOINTMENT_VARIABLE_NAMES.map(name => variables[name]).join('')).toBe('');
+  }, 30_000);
+
+  it('never binds an appointment belonging to another patient, another tenant, or no patient at all', async () => {
+    const tenant = await makeTenant();
+    const otherTenant = await makeTenant();
+    const campaignId = await createCampaign(tenant, { status: 'RUNNING', purpose: 'APPOINTMENT_REMINDER' });
+    const patient = await createPatient(tenant, 812);
+    const sibling = await createPatient(tenant, 813);
+    const foreignPatient = await createPatient(otherTenant, 814);
+    const siblingAppointment = await createAppointment(tenant, sibling.id);
+    const foreignAppointment = await createAppointment(otherTenant, foreignPatient.id);
+    const lead = await createLead(tenant, 815);
+
+    const post = (target: Record<string, unknown>) => app.inject({
+      method: 'POST',
+      url: `/v1/receptionist/outbound-campaigns/${campaignId}/targets`,
+      headers: auth(tenant),
+      payload: { targets: [target] },
+    });
+
+    // Another patient inside the same tenant.
+    const wrongPatient = await post({ patientId: patient.id, phone: patient.phone, appointmentId: siblingAppointment.id });
+    expect(wrongPatient.statusCode).toBe(409);
+    expect(wrongPatient.json().message).toContain('target_appointment_foreign_or_unknown');
+
+    // Another tenant entirely.
+    const wrongTenant = await post({ patientId: patient.id, phone: patient.phone, appointmentId: foreignAppointment.id });
+    expect(wrongTenant.statusCode).toBe(409);
+    expect(wrongTenant.json().message).toContain('target_appointment_foreign_or_unknown');
+
+    // A lead has no patient, so it can have no appointment.
+    const leadBinding = await post({ leadId: lead.id, phone: lead.phone, appointmentId: siblingAppointment.id });
+    expect(leadBinding.statusCode).toBe(409);
+    expect(leadBinding.json().message).toContain('target_appointment_requires_patient');
+
+    // Nothing was written by any of the three refusals.
+    expect(await db.receptionistCallTarget.count({ where: { tenantId: tenant.id, campaignId } })).toBe(0);
+
+    // And the database refuses the same thing without the route's help: this is
+    // the guarantee; the checks above are only the readable error.
+    await expect(db.receptionistCallTarget.create({
+      data: {
+        tenantId: tenant.id, campaignId, patientId: patient.id,
+        phone: patient.phone!, appointmentId: siblingAppointment.id,
+      },
+    })).rejects.toThrow();
+    await expect(db.receptionistCallTarget.create({
+      data: {
+        tenantId: tenant.id, campaignId, leadId: lead.id,
+        phone: lead.phone!, appointmentId: siblingAppointment.id,
+      },
+    })).rejects.toThrow();
+  }, 30_000);
+
+  it('refuses a binding to an appointment that has been and gone, or has been cancelled', async () => {
+    const tenant = await makeTenant();
+    const campaignId = await createCampaign(tenant, { status: 'RUNNING', purpose: 'APPOINTMENT_REMINDER' });
+    const patient = await createPatient(tenant, 816);
+    const past = await createAppointment(tenant, patient.id, { startsAt: new Date(Date.now() - 60 * 60 * 1_000) });
+    const cancelled = await createAppointment(tenant, patient.id, { status: 'CANCELED' });
+
+    const post = (appointmentId: string) => app.inject({
+      method: 'POST',
+      url: `/v1/receptionist/outbound-campaigns/${campaignId}/targets`,
+      headers: auth(tenant),
+      payload: { targets: [{ patientId: patient.id, phone: patient.phone, appointmentId }] },
+    });
+
+    expect((await post(past.id)).json().message).toContain('target_appointment_not_upcoming');
+    expect((await post(cancelled.id)).json().message).toContain('target_appointment_not_remindable');
+  }, 30_000);
+
+  it('falls back to no appointment when the bound one is cancelled between queueing and dialling', async () => {
+    const tenant = await makeTenant();
+    const campaignId = await createCampaign(tenant, { status: 'RUNNING', purpose: 'APPOINTMENT_REMINDER' });
+    const patient = await createPatient(tenant, 817);
+    const appointment = await createAppointment(tenant, patient.id, { service: 'Whitening consult' });
+    const created = await app.inject({
+      method: 'POST',
+      url: `/v1/receptionist/outbound-campaigns/${campaignId}/targets`,
+      headers: auth(tenant),
+      payload: { targets: [{ patientId: patient.id, phone: patient.phone, appointmentId: appointment.id }] },
+    });
+    expect(created.statusCode).toBe(201);
+    const target = await db.receptionistCallTarget.findFirstOrThrow({
+      where: { tenantId: tenant.id, campaignId, patientId: patient.id },
+    });
+    // The clinic cancels it after the campaign was built. Reading it out now
+    // would tell the patient about a visit that is no longer happening.
+    await db.appointment.update({ where: { id: appointment.id }, data: { status: 'CANCELED' } });
+
+    const providerFetch = stubAcceptedProviderCall(tenant, randomRetellCallId('retell_stale_binding_call'));
+    const response = await app.inject({
+      method: 'POST',
+      url: `/v1/receptionist/outbound-campaigns/${campaignId}/call`,
+      headers: auth(tenant),
+      payload: { targetId: target.id, phone: target.phone },
+    });
+    expect(response.statusCode).toBe(201);
+
+    const variables = dialVariablesFrom(providerFetch);
+    expect(variables.appointment_id).toBe('');
+    expect(variables.appointment_service).toBe('');
+  }, 30_000);
+
+  it('offers a patient’s upcoming appointments as bindable target candidates, and a lead none', async () => {
+    const tenant = await makeTenant();
+    const campaignId = await createCampaign(tenant, { purpose: 'APPOINTMENT_REMINDER' });
+    const patient = await createPatient(tenant, 818);
+    await createLead(tenant, 819);
+    const clinician = await createClinician(tenant, 'Dr Priya Raman');
+    const upcoming = await createAppointment(tenant, patient.id, { service: 'Implant review', providerProfileId: clinician.id });
+    await createAppointment(tenant, patient.id, { startsAt: new Date(Date.now() - 48 * 60 * 60 * 1_000) });
+    await createAppointment(tenant, patient.id, { status: 'CANCELED' });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/v1/receptionist/outbound-target-candidates?campaignId=${campaignId}`,
+      headers: auth(tenant),
+    });
+    expect(response.statusCode).toBe(200);
+    const candidates = response.json() as Array<{
+      type: string; id: string;
+      appointments: Array<{ appointmentId: string; service: string; clinician: string | null; location: string }>;
+    }>;
+    const patientCandidate = candidates.find(candidate => candidate.type === 'patient' && candidate.id === patient.id);
+    expect(patientCandidate?.appointments).toEqual([
+      expect.objectContaining({
+        appointmentId: upcoming.id,
+        service: 'Implant review',
+        clinician: 'Dr Priya Raman',
+        location: 'Main branch',
+      }),
+    ]);
+    for (const candidate of candidates.filter(item => item.type === 'lead')) {
+      expect(candidate.appointments).toEqual([]);
+    }
+  }, 30_000);
+});

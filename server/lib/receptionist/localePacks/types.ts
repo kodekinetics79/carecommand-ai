@@ -141,6 +141,28 @@ export const LOCALE_PACK_MESSAGE_KEYS = {
   'tool.message.recorded': { vars: [], describe: 'take_message recorded a new callback request.' },
   'tool.message.appended': { vars: [], describe: 'take_message appended to the callback request already open for this call.' },
 
+  // --- The appointment an outbound reminder is actually about --------------
+  // Until now a reminder campaign stated its appointment from static text in
+  // the campaign script: one clinician, one day, one time, written once and
+  // read to every patient on the list. These two keys are the per-patient
+  // replacement, and their holes are the runtime variables the dial resolves
+  // from the target's BOUND appointment — so the words stay a clinic's to
+  // change and the facts stay the patient's own.
+  //
+  // Split in two on purpose. Service, date, time and location are present on
+  // every appointment row; a clinician is not. Folding an optional value into
+  // the required sentence is how a patient ends up hearing "with , on Tuesday".
+  'reminder.appointment.line': {
+    vars: ['appointment_service', 'appointment_date', 'appointment_time', 'appointment_location'],
+    mustContain: ['appointment_date', 'appointment_time'],
+    describe: 'Outbound reminder: the appointment this call is about, in the branch timezone and this pack\'s date/time style. A reminder that cannot say when is not a reminder, so the date and time are required.',
+  },
+  'reminder.appointment.clinician': {
+    vars: ['appointment_clinician'],
+    mustContain: ['appointment_clinician'],
+    describe: 'Outbound reminder: who the patient is booked in with. Spoken as its own sentence and ONLY when a clinician is recorded, never as an empty hole inside the appointment line.',
+  },
+
   // --- Caller safety: the emergency path happens ON THE CALL ---------------
   // An emergency used to produce a StaffTask and a critical signal, and the
   // Front Desk board was the only thing that surfaced it: in-app only, a 20
