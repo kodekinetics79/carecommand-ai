@@ -271,6 +271,13 @@ const COMPILER_OWNED_BOOKING_PATTERNS = new Set([
   '^\\+[1-9]\\d{7,14}$',
   '^\\d{4}-\\d{2}-\\d{2}$',
   '^(?:[01]\\d|2[0-3]):[0-5]\\d$',
+  // Email. The compiler used to express this as `format: 'email'`, but the
+  // provider strips `format` on write (it is outside the strict
+  // structured-output subset), so every deployment failed verification with
+  // `tools_drift`. It is a `pattern` now, and a pattern only takes effect at
+  // runtime if it is listed here — this set is what stops a tampered tool
+  // schema smuggling in an arbitrary regex.
+  '^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$',
 ]);
 
 function validateContractProperty(key: string, value: unknown, schemaValue: unknown): string[] {

@@ -241,8 +241,18 @@ function propertyFor(field: IntakeFieldConfiguration, locationIds: string[]): Re
   switch (field.fieldType) {
     case 'FIRST_NAME':
     case 'LAST_NAME': return stringProperty(field.label, 80);
-    case 'PHONE': return stringProperty('Provider-observed call identity; never supplied by model arguments.', 16, { pattern: '^\\+[1-9]\\d{7,14}$', readOnly: true });
-    case 'EMAIL': return stringProperty(field.label, 160, { format: 'email' });
+    // `readOnly` and `format` are NOT in the strict structured-output subset the
+    // provider accepts. We send `tool_call_strict_mode: true`, so the provider
+    // sanitises the schema down to that subset and stores neither — which made
+    // every deployment fail verification with `tools_drift` on
+    // `parameters.properties.email.format`, forever.
+    //
+    // `pattern` IS kept, so the email constraint is expressed as one. That is
+    // strictly better than `format`: it survives to the provider and therefore
+    // actually constrains the model, where `format` was silently discarded and
+    // only looked like validation.
+    case 'PHONE': return stringProperty('Provider-observed call identity; never supplied by model arguments.', 16, { pattern: '^\\+[1-9]\\d{7,14}$' });
+    case 'EMAIL': return stringProperty(field.label, 160, { pattern: '^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$' });
     case 'PREFERRED_DATE': return stringProperty(field.label, 10, { pattern: '^\\d{4}-\\d{2}-\\d{2}$' });
     case 'PREFERRED_TIME': return stringProperty(field.label, 5, { pattern: '^(?:[01]\\d|2[0-3]):[0-5]\\d$' });
     case 'PREFERRED_LOCATION': return stringProperty(field.label, 36, { enum: locationIds });
