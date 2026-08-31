@@ -222,7 +222,7 @@ test.describe.serial('installed Chrome live AI receptionist UAT', () => {
     await expect(page.getByText('1 calls remaining')).toBeVisible();
     await expect(page.locator('body')).not.toContainText(fixture.live.destination);
 
-    await page.getByRole('button', { name: 'Attach authorized synthetic recipient' }).click();
+    await page.getByRole('button', { name: 'Add the approved test number' }).click();
     await page.getByRole('button', { name: 'Attach synthetic recipient' }).click();
     await expect(page.getByText(/Authorized synthetic recipient .* is attached/)).toBeVisible();
     await expect(page.getByText('Jordan Test')).toBeVisible();

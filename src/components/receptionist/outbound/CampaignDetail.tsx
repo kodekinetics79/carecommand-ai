@@ -299,7 +299,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
               onConfirm={attachAuthorizedLiveTestTarget}
               className="rounded-lg border border-emerald-v/40 px-3 py-1.5 text-xs font-semibold text-emerald-v disabled:opacity-50"
             >
-              {attachingLiveTarget ? 'Attaching…' : 'Attach authorized synthetic recipient'}
+              {attachingLiveTarget ? 'Adding…' : 'Add the approved test number'}
             </ConfirmedButton>
           </div>
         </div>
@@ -334,7 +334,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
               {launching ? <Loader2 className="w-4 h-4 animate-spin" /> : <PhoneOutgoing className="w-4 h-4" />} Place test call
             </ConfirmedButton>
           </div>
-        ) : <p className="text-xs text-t3">Calls go to the people in your target list below — pick one and use its Call button. For safety, a number can never be typed in here; it comes from the patient or lead record.</p>}
+        ) : <p className="text-xs text-t3">Calls go to the people in your target list below — pick one and use its Call button. A phone number can never be typed in here or changed from this screen; it always comes from the saved patient or lead record.</p>}
         {launchMsg && (
           <p role={launchMsg.kind === 'err' ? 'alert' : 'status'} aria-live={launchMsg.kind === 'err' ? 'assertive' : 'polite'} className={`text-xs ${launchMsg.kind === 'ok' ? 'text-emerald-v' : launchMsg.kind === 'warn' ? 'text-amber-v' : 'text-red-v'}`}>{launchMsg.text}</p>
         )}
