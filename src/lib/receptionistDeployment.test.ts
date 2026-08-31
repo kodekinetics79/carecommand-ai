@@ -8,6 +8,7 @@ import campaignReadinessSource from '../../server/lib/receptionist/campaignReadi
 import {
   READINESS_KEYS, boundNumberOf, formatCount, formatRate, formatSeconds, goLiveRail, goLiveSteps,
   mergeVoicesSection, normalizeCatalog, normalizeDeploymentDiff, normalizeOverviewKpis, serviceStatus, unwrapDeployment,
+  studioTabAttention, studioTabFromFixHref, studioReadyFraction,
   type ReadinessResponse,
 } from './receptionistDeployment';
 
@@ -257,5 +258,63 @@ describe('the kpi-v2 block (SF-2)', () => {
   it('returns null for a body that carries no kpi-v2 block at all', () => {
     expect(normalizeOverviewKpis({ totalCalls: 7, bookingRate: 14 })).toBeNull();
     expect(normalizeOverviewKpis(null)).toBeNull();
+  });
+});
+
+/**
+ * Eight tabs, no order, no state: the reason this module read as hard to
+ * handle. The server already answers "where do I fix this" on every failing
+ * readiness row, and nothing surfaced it.
+ */
+describe('where the outstanding Studio work is', () => {
+  const check = (over: Partial<ReadinessResponse['checks'][number]>): ReadinessResponse['checks'][number] => ({
+    key: 'agent_linked', label: 'Agent linked', status: 'pass', code: null, detail: '', fixHref: null, ...over,
+  });
+
+  it('reads the tab out of a remediation link', () => {
+    expect(studioTabFromFixHref('/receptionist-studio?clinic=abc&tab=knowledge')).toBe('knowledge');
+    expect(studioTabFromFixHref('/receptionist-studio?tab=not-a-tab')).toBeNull();
+    expect(studioTabFromFixHref('/somewhere-else')).toBeNull();
+    expect(studioTabFromFixHref(null)).toBeNull();
+  });
+
+  it('counts failing and pending rows against the tab that fixes them', () => {
+    const readiness = readinessOf([
+      check({ status: 'fail', fixHref: '/receptionist-studio?tab=clinic' }),
+      check({ status: 'fail', fixHref: '/receptionist-studio?tab=clinic' }),
+      check({ status: 'pending', fixHref: '/receptionist-studio?tab=knowledge' }),
+      check({ status: 'pass', fixHref: '/receptionist-studio?tab=deploy' }),
+    ]);
+    expect(studioTabAttention(readiness)).toEqual({ clinic: 2, knowledge: 1 });
+  });
+
+  it('does not mark a tab for an advisory warning', () => {
+    // A warn does not block go-live. Flagging it trains people to ignore flags.
+    const readiness = readinessOf([check({ status: 'warn', fixHref: '/receptionist-studio?tab=deploy' })]);
+    expect(studioTabAttention(readiness)).toEqual({});
+  });
+
+  it('counts a pending check, because unknown is not done', () => {
+    const readiness = readinessOf([check({ status: 'pending', fixHref: '/receptionist-studio?tab=deploy' })]);
+    expect(studioTabAttention(readiness)).toEqual({ deploy: 1 });
+  });
+
+  it('folds clinic prerequisites in alongside campaign readiness', () => {
+    const readiness = readinessOf([check({ status: 'fail', fixHref: '/receptionist-studio?tab=clinic' })]);
+    expect(studioTabAttention(readiness, [{ fixHref: '/receptionist-studio?tab=clinic' }])).toEqual({ clinic: 2 });
+  });
+
+  it('says nothing at all when readiness has not loaded', () => {
+    expect(studioTabAttention(null)).toEqual({});
+    expect(studioReadyFraction(null)).toBeNull();
+    expect(studioReadyFraction(readinessOf([]))).toBeNull();
+  });
+
+  it('reports progress as passed-over-total', () => {
+    const readiness = readinessOf([
+      check({ status: 'pass' }), check({ status: 'pass' }), check({ status: 'fail' }), check({ status: 'warn' }),
+    ]);
+    // A warn is not a pass: the bar must not read as complete while one stands.
+    expect(studioReadyFraction(readiness)).toEqual({ passed: 2, total: 4 });
   });
 });

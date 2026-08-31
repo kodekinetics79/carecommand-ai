@@ -5,6 +5,7 @@ import { receptionistApi as api, type Campaign } from '../lib/receptionist';
 import { blockerLabel, receptionistClinicApi, type ClinicRow } from '../lib/receptionistClinic';
 import {
   deploymentApi, formatCount, formatRate, formatSeconds, resolveStudioTab, serviceStatus,
+  studioTabAttention, studioReadyFraction,
   type GoLivePrerequisite, type OverviewKpis, type ReadinessResponse, type VoiceLineStatusResponse, type StudioTab,
 } from '../lib/receptionistDeployment';
 import { useResource } from '../hooks/useResource';
@@ -183,6 +184,12 @@ export default function ReceptionistStudio() {
       fixHref: `/receptionist-studio?clinic=${encodeURIComponent(activeClinic!.id)}&tab=clinic`,
     })),
     [activeClinic]);
+
+  // Where the outstanding work actually is. The server already says which tab
+  // fixes each failing check; surfacing it here is the difference between a
+  // strip of eight identical pills and a map of what is left to do.
+  const attention = useMemo(() => studioTabAttention(railReadiness, prerequisites), [railReadiness, prerequisites]);
+  const readyFraction = useMemo(() => studioReadyFraction(railReadiness), [railReadiness]);
 
   const status = serviceStatus({
     campaignStatus: activeCampaign?.status ?? 'DRAFT',
@@ -412,9 +419,36 @@ export default function ReceptionistStudio() {
               />
             )}
 
-            <div className="flex items-center gap-1 overflow-x-auto rounded-xl bg-[var(--s3)] p-1" role="tablist" aria-label="Receptionist Studio sections">
+            {/*
+              Setup progress. Eight tabs with no order and no state is the
+              reason this module reads as hard to handle: nothing told anyone
+              which steps were done or where the remaining work lived. Both
+              facts were already on the server — every failing readiness row
+              names the tab that fixes it — and simply were not shown.
+            */}
+            {readyFraction && (
+              <div className="flex items-center gap-3">
+                <div className="prog-track md flex-1" role="progressbar" aria-valuemin={0} aria-valuemax={readyFraction.total} aria-valuenow={readyFraction.passed} aria-label="Receptionist setup progress">
+                  <div
+                    className="prog-fill"
+                    style={{
+                      width: `${Math.round((readyFraction.passed / readyFraction.total) * 100)}%`,
+                      background: readyFraction.passed === readyFraction.total ? 'var(--emerald)' : 'var(--indigo)',
+                    }}
+                  />
+                </div>
+                <span className="shrink-0 text-[11px] font-semibold text-t3 tabular-nums">
+                  {readyFraction.passed === readyFraction.total
+                    ? 'All checks ready'
+                    : `${readyFraction.passed} of ${readyFraction.total} checks ready`}
+                </span>
+              </div>
+            )}
+
+            <div className="flex items-center gap-1 overflow-x-auto rounded-2xl border border-[var(--b1)] bg-[var(--s3)] p-1.5" role="tablist" aria-label="Receptionist Studio sections">
               {TABS.map((t, index) => {
                 const Icon = t.icon;
+                const outstanding = attention[t.id] ?? 0;
                 return (
                   <button
                     key={t.id}
@@ -424,6 +458,7 @@ export default function ReceptionistStudio() {
                     role="tab"
                     aria-selected={tab === t.id}
                     aria-controls={`receptionist-studio-panel-${t.id}`}
+                    aria-describedby={outstanding > 0 ? `receptionist-studio-tab-${t.id}-attention` : undefined}
                     tabIndex={tab === t.id ? 0 : -1}
                     onClick={() => selectTab(t.id)}
                     onKeyDown={event => {
@@ -437,10 +472,37 @@ export default function ReceptionistStudio() {
                       selectTab(TABS[nextIndex].id);
                       tabRefs.current[nextIndex]?.focus();
                     }}
-                    className={`flex items-center gap-1.5 whitespace-nowrap rounded-lg px-3 py-1.5 text-xs font-semibold transition-all ${tab === t.id ? 'bg-[var(--s2)] text-t1 shadow-sm' : 'text-t3 hover:text-t2'}`}
+                    className={`relative flex items-center gap-1.5 whitespace-nowrap rounded-xl px-3 py-2 text-xs font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--indigo-glow)] ${tab === t.id ? 'bg-[var(--s0)] text-t1 shadow-[0_1px_2px_rgba(15,23,42,0.06),0_4px_10px_rgba(15,23,42,0.05)]' : 'text-t3 hover:bg-[var(--s2)] hover:text-t2'}`}
                   >
                     <Icon className="w-3.5 h-3.5" /> {t.label}
+                    {/*
+                      A DOT, not a number, and it carries no text.
+                      A count rendered inside the button became part of the tab's
+                      own text — "Clinic Profile1" — which is what a screen
+                      reader announces and what a label pin reads. The exact
+                      count belongs in the readiness list, which names each item
+                      and links to its fix; the strip only has to say "work is
+                      here". Eight numbered tabs would be noise anyway.
+                      The count is still spoken, via aria-describedby, from an
+                      element outside this button.
+                    */}
+                    {outstanding > 0 && (
+                      <span aria-hidden="true" className="ml-0.5 h-1.5 w-1.5 shrink-0 rounded-full bg-amber-v" />
+                    )}
                   </button>
+                );
+              })}
+            </div>
+            {/* Descriptions live outside the buttons so they change what is
+                ANNOUNCED without changing what each tab is NAMED. */}
+            <div className="sr-only">
+              {TABS.map(t => {
+                const outstanding = attention[t.id] ?? 0;
+                if (outstanding === 0) return null;
+                return (
+                  <span key={t.id} id={`receptionist-studio-tab-${t.id}-attention`}>
+                    {outstanding === 1 ? '1 item needs attention' : `${outstanding} items need attention`}
+                  </span>
                 );
               })}
             </div>
