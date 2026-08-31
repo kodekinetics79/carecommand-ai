@@ -64,6 +64,7 @@ function serverStatus(overrides: Partial<VoiceLineStatusResponse> = {}): VoiceLi
       maxCalls: 2, maxCallMinutes: 5, maxTotalMinutes: 10, maxProviderCostUsd: 3, projectedMaximumCostUsd: 1.5,
       blockingReason: null, callsRemaining: 2, minutesRemaining: 10, admissionReason: null,
     } as VoiceLineStatusResponse['attendedUat'],
+    adhocTestCallsAllowed: false,
     ...overrides,
   };
 }
