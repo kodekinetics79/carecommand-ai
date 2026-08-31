@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { PhoneOff, Activity, Loader2, AlertCircle, PhoneCall, PhoneOutgoing } from 'lucide-react';
+import { PhoneOff, Activity, Loader2, AlertCircle, PhoneCall, PhoneOutgoing, UserCheck } from 'lucide-react';
 import { Field, TextInput } from '../../ui/Field';
-import { receptionistApi as api, OUTBOUND_RECONCILIATION_WARNING, launchControlsBlocked, mergeReconciliationRefresh, presentLaunchResult, clearTransportAmbiguityToken, readTransportAmbiguityToken, transportAmbiguityStorageKey, writeTransportAmbiguityToken, type CallLog, type OutboundCampaign, type CallTarget, type OutboundReconciliationEvidence } from '../../../lib/receptionist';
+import { receptionistApi as api, OUTBOUND_RECONCILIATION_WARNING, launchControlsBlocked, mergeReconciliationRefresh, presentLaunchResult, clearTransportAmbiguityToken, readTransportAmbiguityToken, transportAmbiguityStorageKey, writeTransportAmbiguityToken, type CallLog, type OutboundCampaign, type CallTarget, type OutboundConfirmationSummary, type OutboundReconciliationEvidence } from '../../../lib/receptionist';
 import { normalizeVoiceLineStatus, type VoiceLineStatusLike } from '../../../lib/receptionistDeployment';
-import { describeFailure } from '../../../lib/resourceState';
+import { describeFailure, LOADING_STATE, resolveResourceState, type ResourceState } from '../../../lib/resourceState';
+import { patientConfirmedSummary } from '../../../lib/patientConfirmation';
 import { isBusy, useMutationState } from '../../../hooks/useMutationState';
 import { formatEnumLabel, maskedPhone, maskedProviderId, outcomeBadge } from '../helpers';
 import { ConfirmedButton } from '../shared';
@@ -28,12 +29,18 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
   const [syncingCallId, setSyncingCallId] = useState<string | null>(null);
   const [providerStatusByCall, setProviderStatusByCall] = useState<Record<string, string>>({});
   const [detailErrors, setDetailErrors] = useState<string[]>([]);
+  // The four-state contract, held literally (src/lib/resourceState.ts). A count
+  // is the one thing that must never survive a failed request: "0 confirmed"
+  // and "we could not ask" look identical on screen and mean opposite things,
+  // so the failure replaces the number rather than sitting beside a stale one.
+  const [confirmations, setConfirmations] = useState<ResourceState<OutboundConfirmationSummary>>(LOADING_STATE);
 
   const reloadDetail = useCallback(async () => {
-    const [targetResult, logResult, reconciliationResult] = await Promise.allSettled([
+    const [targetResult, logResult, reconciliationResult, confirmationResult] = await Promise.allSettled([
       api.listTargets(campaign.id),
       api.listOutboundCallLogs(campaign.id),
       api.listOutboundReconciliations(campaign.id),
+      api.getOutboundConfirmations(campaign.id),
     ]);
     setDetailErrors([
       ...(targetResult.status === 'rejected' ? [`Targets could not be loaded (${describeFailure(targetResult.reason).message})`] : []),
@@ -46,6 +53,17 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
       ? { ok: true, rows: reconciliationResult.value }
       : { ok: false }));
     setReconciliationVerified(reconciliationResult.status === 'fulfilled');
+    // Not folded into `detailErrors` above: that banner keeps existing rows on
+    // screen, which is right for a list and wrong for a total. This card names
+    // its own failure in the place the number would have been.
+    setConfirmations(confirmationResult.status === 'fulfilled'
+      ? resolveResourceState<OutboundConfirmationSummary>(
+          { status: 'ready', data: confirmationResult.value, receivedAt: Date.now() },
+          // "Empty" is a fact about the campaign, not about the request: nobody
+          // on the list is about an appointment, so there is nothing to confirm.
+          data => data.targetsWithAppointment === 0,
+        )
+      : { status: 'error', failure: describeFailure(confirmationResult.reason) });
   }, [campaign.id]);
 
   useEffect(() => {
@@ -272,6 +290,46 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
           {campaign.requiredFields.map(f => <span key={f} className="badge badge-violet">{f}</span>)}
           <span className="badge badge-blue">{campaign.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE' ? 'Direct booking' : 'Request only'}</span>
         </div>
+      </div>
+
+      {/*
+        Did the campaign work? A reminder campaign exists to turn "the clinic
+        booked this" into "the patient says they are coming", and until now the
+        panel showed only the calls it placed — never the answers they produced.
+      */}
+      <div className="cc-card p-5 space-y-2">
+        <h4 className="text-sm font-bold text-t1 flex items-center gap-2">
+          <UserCheck className="w-4 h-4 text-indigo" aria-hidden="true" /> Who has said they’re coming
+        </h4>
+        {confirmations.status === 'loading' && <p className="text-xs text-t3">Checking who has confirmed…</p>}
+        {confirmations.status === 'error' && (
+          <p role="alert" className="text-xs text-red-v">
+            {confirmations.failure.message}{' '}
+            <button type="button" onClick={() => void reloadDetail()} className="underline font-semibold">Try again</button>
+          </p>
+        )}
+        {confirmations.status === 'empty' && (
+          <p className="text-xs text-t3">Nobody on this list is booked in for an appointment yet, so there is nothing for a patient to confirm.</p>
+        )}
+        {confirmations.status === 'ready' && (
+          <>
+            <p className="text-sm font-semibold text-t1">
+              {patientConfirmedSummary(confirmations.data.patientConfirmed, confirmations.data.targetsWithAppointment)}
+            </p>
+            {confirmations.data.patientConfirmed > 0 && (
+              <p className="text-xs text-t2">
+                {confirmations.data.confirmedOnCampaignCall === 0
+                  ? 'None of them said so on a call from this campaign — those answers came from somewhere else.'
+                  : `${confirmations.data.confirmedOnCampaignCall} of them said so on a call from this campaign.`}
+              </p>
+            )}
+            {confirmations.data.targets > confirmations.data.targetsWithAppointment && (
+              <p className="text-[11px] text-t3">
+                {confirmations.data.targets - confirmations.data.targetsWithAppointment} more {confirmations.data.targets - confirmations.data.targetsWithAppointment === 1 ? 'person on this list is' : 'people on this list are'} not booked in for an appointment, so they are not counted above.
+              </p>
+            )}
+          </>
+        )}
       </div>
 
       {uat?.enabled && (

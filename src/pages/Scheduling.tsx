@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
-import { CalendarDays, Zap, AlertCircle, CheckCircle2, Clock, Users, DollarSign, RefreshCw, CreditCard, LogIn, UserX, CheckCheck, XCircle, CalendarClock } from 'lucide-react';
+import { CalendarDays, Zap, AlertCircle, CheckCircle2, Clock, Users, DollarSign, RefreshCw, CreditCard, LogIn, UserX, CheckCheck, XCircle, CalendarClock, UserCheck, PhoneCall } from 'lucide-react';
 import AppointmentPaymentCard from '../components/payments/AppointmentPaymentCard';
 import PaymentRequestsPanel from '../components/payments/PaymentRequestsPanel';
 import ProviderSetupPanel from '../components/scheduling/ProviderSetupPanel';
@@ -25,6 +25,8 @@ import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { clinicDateLabel, clinicDayRangeUtc, clinicTimeToUtc, resolveTimezone, shiftClinicDate, todayInZone } from '../lib/clinicTime';
 import { useSession } from '../hooks/useSession';
 import { checkEligibility, fetchAppointmentVerificationQueue, type AppointmentVerificationQueueRow } from '../lib/revenueProtection';
+import { hasPermission } from '../lib/access';
+import { PATIENT_CONFIRMED_BADGE, PATIENT_CONFIRMED_EXPLANATION, patientConfirmationDetail, patientConfirmedSummary } from '../lib/patientConfirmation';
 
 // Dates are clinic-local and therefore cannot be module constants: the zone is
 // not known until the branches load. Computing them here with toISOString()
@@ -44,7 +46,12 @@ function availableActions(status: string): { checkIn: boolean; noShow: boolean; 
 }
 
 const statusConfig: Record<string, { label: string; dot: string; bg: string; text: string }> = {
-  confirmed:  { label: 'Confirmed',  dot: 'bg-emerald-500', bg: 'bg-[var(--emerald-soft)]',  text: 'text-emerald-v' },
+  // 'Booked', not 'Confirmed'. CONFIRMED is the status every appointment is
+  // created in, so labelling it "Confirmed" put a green Confirmed badge on a
+  // row nobody had spoken to — and next to the patient's own confirmation it
+  // would read as the same claim twice. The clinic's booking and the patient's
+  // answer are different facts and now say so.
+  confirmed:  { label: 'Booked',     dot: 'bg-emerald-500', bg: 'bg-[var(--emerald-soft)]',  text: 'text-emerald-v' },
   arrived:    { label: 'Arrived',    dot: 'bg-blue-500',    bg: 'bg-[var(--blue-soft)]',     text: 'text-blue-v' },
   risky:      { label: 'High Risk',  dot: 'bg-red-500 animate-pulse', bg: 'bg-[var(--red-soft)]', text: 'text-red-v' },
   'no-show':  { label: 'No-Show',   dot: 'bg-[var(--b2)]',   bg: 'bg-[var(--s3)]',   text: 'text-t3' },
@@ -182,6 +189,12 @@ export default function Scheduling() {
   const [rescheduleFor, setRescheduleFor] = useState<string | null>(null);
   const [rescheduleForm, setRescheduleForm] = useState<{ date: string | null; time: string }>({ date: null, time: '10:00' });
   const [intakeBusy, setIntakeBusy] = useState<string | null>(null);
+  // The call that evidences a confirmation lives in the Receptionist Studio's
+  // call queue. Offering the link to someone who cannot open either the call
+  // record (receptionist:call-artifacts:read) or the Studio itself
+  // (receptionist:manage, see ROUTES in src/lib/access.ts) is a door that
+  // closes on arrival, so it is hidden rather than shown-and-403'd.
+  const canOpenConfirmingCall = hasPermission(user, 'receptionist:call-artifacts:read') && hasPermission(user, 'receptionist:manage');
 
   // Providers bookable for the chosen patient (same branch — the book route
   // requires the patient to belong to the provider's clinic).
@@ -381,7 +394,11 @@ export default function Scheduling() {
 
   const totalValue = todayAppts.reduce((s, a) => s + a.value, 0);
   const riskyCount = todayAppts.filter(a => a.status === 'risky').length;
-  const confirmedCount = todayAppts.filter(a => a.status === 'confirmed' || a.status === 'arrived').length;
+  const bookedCount = todayAppts.filter(a => a.status === 'confirmed' || a.status === 'arrived').length;
+  // The other half of the same day: how many of these people have told US they
+  // are coming. Counted from `patientConfirmation`, which mapAppointment only
+  // sets from a timestamp the response actually carried — never from `status`.
+  const patientConfirmedCount = todayAppts.filter(a => a.patientConfirmation).length;
   const eligibilityModes = [...new Set(insuranceQueue.map(row => row.providerMode).filter(Boolean))];
   const queueMode = eligibilityModes.length === 0
     ? 'Provider mode unavailable'
@@ -514,7 +531,7 @@ export default function Scheduling() {
 
       <div className="grid gap-3 grid-cols-2 sm:grid-cols-4">
         <StatCard title="Appointments" value={todayAppts.length} subtitle="Selected date and branches" icon={<CalendarDays className="w-4 h-4" />} accent="blue" />
-        <StatCard title="Confirmed or arrived" value={confirmedCount} subtitle="Recorded status" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
+        <StatCard title="Booked or arrived" value={bookedCount} subtitle="The clinic's own booking status" icon={<CheckCircle2 className="w-4 h-4" />} accent="emerald" />
         <StatCard title="Risk flagged" value={riskyCount} subtitle="Stored no-show score" icon={<AlertCircle className="w-4 h-4" />} accent="red" />
         <StatCard title="Recorded value" value={formatCurrency(totalValue)} subtitle="Selected appointments" icon={<DollarSign className="w-4 h-4" />} accent="violet" />
       </div>
@@ -635,12 +652,32 @@ export default function Scheduling() {
                 {' '}<button type="button" onClick={noShowPolicy.reload} className="underline">Retry</button>
               </p>
             ) : null}
+            {/* How many of the people on this list have told US they are
+                coming, as distinct from how many the clinic has booked. Both
+                numbers come from the SAME received response — `source` is only
+                'live' once one has landed — so a failed or in-flight load
+                renders no sentence at all rather than "0 of 0". */}
+            {source === 'live' && !appointmentError && todayAppts.length > 0 && (
+              <p className="mb-2 text-[11px] text-t3">
+                {patientConfirmedSummary(patientConfirmedCount, todayAppts.length)}
+                {patientConfirmedCount === 0 ? ' Nobody has answered a reminder yet.' : ''}
+              </p>
+            )}
             <div className="space-y-2">
               {todayAppts.length === 0 ? (
                 <div className="py-8 text-center text-sm text-t3">No appointments match the selected date and branch.</div>
               ) : todayAppts.map((appt) => {
                 const sc = statusConfig[appt.status] ?? statusConfig['confirmed'];
                 const isRisky = receivedNoShowPolicy !== null && appt.noShowRisk >= receivedNoShowPolicy.noShowRiskHigh;
+                // Null unless the server sent a real confirmation timestamp.
+                // An unconfirmed row renders nothing here — absence means "not
+                // confirmed", and a "not confirmed" badge would be a claim the
+                // clinic never made about a patient nobody has called.
+                const confirmation = appt.patientConfirmation ?? null;
+                const confirmationDetailId = `appt-${appt.id}-patient-confirmation`;
+                // Bound here so the link below cannot be rendered without the
+                // id it needs; a confirmation taken at the desk carries none.
+                const confirmingCallLogId = confirmation?.callLogId ?? null;
                 return (
                   <div key={appt.id} data-appointment-id={appt.id} className={`flex items-start gap-3 p-3.5 rounded-xl border transition-all hover:bg-[var(--s3)] ${isRisky ? 'border-[var(--b2)] bg-[var(--red-soft)]' : 'border-[var(--b1)]'}`}>
                     <div className="text-center shrink-0 w-14">
@@ -653,10 +690,43 @@ export default function Scheduling() {
                         <p className="text-sm font-bold text-t1">{appt.patientName}</p>
                         <div className="flex items-center gap-2">
                           {isRisky && <RiskBadge level="high" label={`${appt.noShowRisk}% risk`} size="sm" />}
+                          {confirmation && (
+                            <span
+                              title={PATIENT_CONFIRMED_EXPLANATION}
+                              className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full bg-[var(--emerald-soft)] text-emerald-v"
+                            >
+                              <UserCheck className="w-2.5 h-2.5" aria-hidden="true" /> {PATIENT_CONFIRMED_BADGE}
+                            </span>
+                          )}
                           <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${sc.bg} ${sc.text}`}>{sc.label}</span>
                         </div>
                       </div>
                       <p className="text-xs text-t3">{appt.service} · {appt.doctorName}</p>
+                      {confirmation && (
+                        <p className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-emerald-v">
+                          {/* The id sits on the sentence itself, not on the
+                              paragraph that also wraps the button: a
+                              description that contained the control's own
+                              label would describe it to itself. */}
+                          <span id={confirmationDetailId}>{patientConfirmationDetail(confirmation, clinicTimezone)}</span>
+                          {/* Straight from the appointment to the call that
+                              evidences it. The description is carried by
+                              aria-describedby from the sentence ABOVE, never
+                              folded into the button's own name — a count or a
+                              date inside a control's accessible name is how
+                              "Clinic Profile1" got announced. */}
+                          {confirmingCallLogId && canOpenConfirmingCall && (
+                            <button
+                              type="button"
+                              aria-describedby={confirmationDetailId}
+                              onClick={() => navigate(`/receptionist-studio?tab=activity&callId=${encodeURIComponent(confirmingCallLogId)}`)}
+                              className="inline-flex items-center gap-1 rounded-full border border-[var(--b1)] bg-[var(--s2)] px-2 py-0.5 font-semibold text-t2 hover:bg-[var(--s3)] transition-colors"
+                            >
+                              <PhoneCall className="w-2.5 h-2.5" aria-hidden="true" /> Open the call
+                            </button>
+                          )}
+                        </p>
+                      )}
                       {(() => {
                         const act = availableActions(appt.status);
                         const busy = rowBusy === appt.id;

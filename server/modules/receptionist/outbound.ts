@@ -1031,6 +1031,70 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     return rows.map(row => ({ ...row, phone: maskPhone(row.phone) }));
   });
 
+  /**
+   * Did the campaign work? — the only question a reminder campaign exists to
+   * answer, and the one nothing in the product could answer before this.
+   *
+   * A reminder call asks the patient to confirm or cancel. Cancelling moves
+   * `Appointment.status`; confirming writes `patientConfirmedAt`, deliberately
+   * NOT a status (see the migration comment: `status` defaults to CONFIRMED at
+   * creation, so it already means "the clinic booked this" and re-writing it
+   * would erase the distinction). That left a clinic able to run the campaign
+   * and still not see a single confirmation anywhere in the UI.
+   *
+   * Counts only. No names, no phone numbers, no appointment ids — nothing here
+   * discloses a patient, so this adds no PHI surface to a route class
+   * (`receptionist:call-artifacts:read`) that already reads this campaign's
+   * targets and call logs. Read-only: it writes nothing and decides nothing.
+   *
+   * `confirmedOnCampaignCall` is the narrower, honest claim. A patient may have
+   * confirmed at the front desk or in the portal, and counting that as the
+   * campaign's work would be attribution we have not earned; the confirming
+   * call log must belong to THIS campaign.
+   */
+  app.get('/outbound-campaigns/:id/confirmations', { preHandler: callArtifactRead }, async request => {
+    const { id } = idParam.parse(request.params);
+    const tenantId = request.auth.tenantId;
+    const campaign = await db.receptionistOutboundCampaign.findFirst({ where: { id, tenantId }, select: { id: true } });
+    if (!campaign) throw app.httpErrors.notFound('Campaign not found');
+
+    // A soft-deleted appointment is not something the clinic can act on, so it
+    // counts in neither the numerator nor the denominator.
+    return runWithTenantContext(tenantId, async tx => {
+      const confirmedTarget = { is: { deletedAt: null, patientConfirmedAt: { not: null } } } as const;
+      const [targets, targetsWithAppointment, patientConfirmed, confirmedRows] = await Promise.all([
+        tx.receptionistCallTarget.count({ where: { tenantId, campaignId: id } }),
+        tx.receptionistCallTarget.count({ where: { tenantId, campaignId: id, appointment: { is: { deletedAt: null } } } }),
+        tx.receptionistCallTarget.count({ where: { tenantId, campaignId: id, appointment: confirmedTarget } }),
+        tx.receptionistCallTarget.findMany({
+          where: { tenantId, campaignId: id, appointment: confirmedTarget },
+          select: { appointment: { select: { patientConfirmedCallLogId: true } } },
+        }),
+      ]);
+
+      // Which of those confirmations came off one of THIS campaign's calls.
+      // Resolved as a set of call-log ids rather than a count of them: one call
+      // can confirm two appointments, and counting logs would under-report.
+      const confirmingLogIds = [...new Set(
+        confirmedRows
+          .map(row => row.appointment?.patientConfirmedCallLogId)
+          .filter((value): value is string => typeof value === 'string'),
+      )];
+      const campaignLogIds = confirmingLogIds.length === 0
+        ? new Set<string>()
+        : new Set((await tx.receptionistCallLog.findMany({
+            where: { tenantId, outboundCampaignId: id, id: { in: confirmingLogIds } },
+            select: { id: true },
+          })).map(row => row.id));
+      const confirmedOnCampaignCall = confirmedRows.filter(row => {
+        const logId = row.appointment?.patientConfirmedCallLogId;
+        return typeof logId === 'string' && campaignLogIds.has(logId);
+      }).length;
+
+      return { campaignId: id, targets, targetsWithAppointment, patientConfirmed, confirmedOnCampaignCall };
+    });
+  });
+
   app.post('/outbound-campaigns/:id/targets', { preHandler: writeRoles }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
     const body = z.object({
