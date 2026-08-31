@@ -14,6 +14,13 @@ function receptionistStudioSource(): string {
 }
 
 const outboundSource = readFileSync('server/modules/receptionist/outbound.ts', 'utf8');
+// The launch path — everything between "a person clicked Call" and the provider
+// request — moved out of the route module so the dialler worker calls the SAME
+// fences rather than a second copy of them. A worker cannot import a Fastify
+// route, and a duplicated live-test cap is a cap that will eventually disagree
+// with itself. The pins below follow the code: they still assert that each
+// control exists exactly once, in the one place both callers reach.
+const outboundLaunchSource = readFileSync('server/lib/receptionist/outboundLaunch.ts', 'utf8');
 const liveUatSource = readFileSync('server/lib/receptionist/liveCallUat.ts', 'utf8');
 const retellSource = readFileSync('server/lib/retell.ts', 'utf8');
 const studioSource = receptionistStudioSource();
@@ -24,14 +31,18 @@ const packageSource = readFileSync('package.json', 'utf8');
 
 describe('live AI receptionist UAT production contract', () => {
   it('fences the provider boundary with exact runtime authorization and run-level admission controls', () => {
-    expect(outboundSource).toContain('authorizeLiveCallDestination');
-    expect(outboundSource).toContain('evaluateLiveCallAdmission');
+    expect(outboundLaunchSource).toContain('authorizeLiveCallDestination');
+    expect(outboundLaunchSource).toContain('evaluateLiveCallAdmission');
     expect(liveUatSource).toContain('live_test_destination_not_allowlisted');
-    expect(outboundSource).toContain('live_test_single_active_call');
-    expect(outboundSource).toContain('live_test_call_cap_reached');
-    expect(outboundSource).toContain('live_test_minute_cap_reached');
-    expect(outboundSource).toContain('live_test_cost_cap_reached');
-    expect(outboundSource).toContain('maxCallDurationMs: liveTest.maxCallMinutes * 60_000');
+    expect(outboundLaunchSource).toContain('live_test_single_active_call');
+    expect(outboundLaunchSource).toContain('live_test_call_cap_reached');
+    expect(outboundLaunchSource).toContain('live_test_minute_cap_reached');
+    expect(outboundLaunchSource).toContain('live_test_cost_cap_reached');
+    expect(outboundLaunchSource).toContain('maxCallDurationMs: liveTest.maxCallMinutes * 60_000');
+    // And the route must NOT have kept a copy of any of them. One definition
+    // is the whole point of the move; two would be the drift it prevents.
+    expect(outboundSource).not.toContain('evaluateLiveCallAdmission');
+    expect(outboundSource).not.toContain('authorizeLiveCallDestination');
   });
 
   it('creates the synthetic recipient from server-held environment authorization rather than browser-supplied phone data', () => {
