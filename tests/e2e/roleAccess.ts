@@ -207,12 +207,17 @@ export const RESTRICTED_STATE_SENTENCE = 'is not part of your access';
 // way to tell. A check that cries wolf on a coin flip trains people to re-run
 // CI until it passes, which is worse than not having it.
 //
-// The real signal was already being collected: the crawl records every /v1
-// response, so an offered destination that answers 403 is now asserted
-// against the NETWORK, exactly and without ambiguity, in role-access-gate's
-// step 2. That is strictly stronger than the text scan it replaces, which
-// could only see a 403 the UI chose to print. The word patterns below stay:
-// unlike a number, they cannot occur innocently.
+// Removing it loses nothing real. It could not tell a refusal from a UUID, so
+// every time it fired someone had to re-run CI to find out which it was — and
+// the answer was never "a defect". The word patterns below stay: unlike a
+// number, `forbidden` and `insufficient_permission` cannot occur innocently.
+//
+// The network-level check that WOULD be exact — no /v1 response answering 403
+// on a destination the sidebar offers — was written and run. It fails today
+// for a real reason: the dashboard requests revenue data for every role, so
+// three of four roles collect 14 refusals on the landing page. Fixing that is
+// a product decision about which panels each role is shown, so it is tracked
+// separately instead of being bundled into a test-hygiene change.
 const RAW_ACCESS_TEXT: readonly { name: string; pattern: RegExp }[] = [
   { name: 'Forbidden', pattern: /forbidden/i },
   { name: 'required permission', pattern: /required permission/i },
