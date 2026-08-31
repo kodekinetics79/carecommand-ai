@@ -78,7 +78,10 @@ export const agentRoutes: FastifyPluginAsync = async app => {
       await lockReceptionistConfiguration(tx, request.auth.tenantId);
       const existing = await tx.receptionistAgent.findFirst({ where: { id, tenantId: request.auth.tenantId } });
       if (!existing) throw app.httpErrors.notFound('Agent not found');
-      const providerBindingChanged = (input.providerAgentId !== undefined && input.providerAgentId !== existing.providerAgentId)
+      // The agent id moving and the version tag moving are NOT the same event,
+      // and only the first one invalidates the deployment we published.
+      const providerAgentIdChanged = input.providerAgentId !== undefined && input.providerAgentId !== existing.providerAgentId;
+      const providerBindingChanged = providerAgentIdChanged
         || (input.providerVersionTag !== undefined && input.providerVersionTag !== existing.providerVersionTag);
       const deactivating = input.active === false && existing.active;
       if (providerBindingChanged || deactivating) {
@@ -129,7 +132,21 @@ export const agentRoutes: FastifyPluginAsync = async app => {
         // moves is what let a later deploy treat somebody's hand-built agent as
         // one we own, and would have had verification compare a stranger's
         // agent against our prompt hash.
-        currentDeploymentId: null,
+        //
+        // That reasoning holds for the AGENT ID and only the agent id. A version
+        // tag edit leaves the deployment describing the very same provider agent
+        // at the very same published version, so throwing the pointer away threw
+        // away the numeric version pin with it — and an unpinned probe then asks
+        // Retell for `?version=<tag>`, which 404s because Retell exposes no
+        // public tag-assignment write and CareCommand can never create that tag.
+        // A deployed agent that lost this pointer could therefore never verify
+        // again by any route. Observed in production: editing only the tag took a
+        // healthy published v0 deployment straight to `not_found`.
+        //
+        // Re-attestation is still forced — `providerConfigRevision` bumps and
+        // the status drops to UNVERIFIED above — which is the part a tag edit
+        // genuinely warrants.
+        ...(providerAgentIdChanged ? { currentDeploymentId: null } : {}),
       });
       const row = await tx.receptionistAgent.update({ where: { id }, data });
       await auditReceptionistMutation(tx, request, {
