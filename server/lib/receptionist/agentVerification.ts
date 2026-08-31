@@ -200,7 +200,9 @@ export async function verifyAgentProvider(input: VerifyInput): Promise<VerifyOut
       webhookUrl: expectedRetellAgentWebhookUrl(),
       pinnedVersion: deployment?.providerAgentVersion ?? null,
       expectedPromptHash: deployment?.promptHash ?? null,
-      expectedToolsFingerprint: deployment?.toolFingerprint ?? null,
+      // The tools we AUTHORED, not their hash. Retell fills in defaults on
+      // write, so hash equality against our pre-write copy can never hold.
+      expectedTools: Array.isArray(deployment?.toolsJson) ? deployment.toolsJson as unknown[] : null,
     })
     : null;
   const intakeEvidenceFailure = probe.ok ? providerIntakeEvidenceFailure(probe.snapshot) : null;

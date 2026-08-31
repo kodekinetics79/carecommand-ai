@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { fingerprintJson, normalizeBookAppointmentToolContract } from '../../modules/receptionist/intakeContract';
 import { retellAgentRequestIssues, retellLlmRequestIssues } from './retellRequestContract';
+import { fingerprintTools } from '../retell';
 import type {
   MockDeploymentSnapshot,
   MockPhoneNumberBinding,
@@ -155,6 +156,10 @@ function simulatedListVoices(): RetellVoice[] {
  * deployment row so a later prompt edit in Studio still reads as
  * "deployment stale" while the provider side stays internally consistent.
  */
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
 function simulatedAgentSnapshot(input: {
   agentId: string;
   versionTag: string;
@@ -163,6 +168,13 @@ function simulatedAgentSnapshot(input: {
 }): RetellAgentSnapshot {
   const { deployment } = input;
   const tools = Array.isArray(deployment.toolsJson) ? deployment.toolsJson as unknown[] : [];
+  // Retell fills in optional keys on write — `speak_after_execution` is one it
+  // adds to tools that omit it. The simulation must do the same, or it models a
+  // provider that stores exactly what it is given, which Retell does not.
+  const providerStoredTools = tools.map(tool => {
+    const row = record(tool);
+    return row ? { speak_after_execution: false, ...row } : tool;
+  });
   const bookingTools = tools.filter((tool): tool is Record<string, unknown> =>
     Boolean(tool) && typeof tool === 'object' && (tool as Record<string, unknown>).name === 'book_appointment');
   const bookToolSchema = bookingTools.length === 1 ? normalizeBookAppointmentToolContract(bookingTools[0]!) : null;
@@ -203,7 +215,17 @@ function simulatedAgentSnapshot(input: {
     fingerprint: simulatedDigest(`mock:${input.agentId}|${input.versionTag}|${deployment.providerAgentVersion}|${deployment.promptHash}`),
     promptHash: deployment.promptHash,
     beginMessageHash: deployment.beginMessageHash,
-    toolsFingerprint: deployment.toolFingerprint,
+    // NOT `deployment.toolFingerprint`. Echoing the expected value made
+    // verification compare `x !== x`, so tool drift was undetectable by any
+    // test in this repo — on one of the three fields that gate go-live. That
+    // tautology is why a permanent `tools_drift` against the real provider
+    // shipped unnoticed.
+    //
+    // Answer the way Retell does: from the tools we were handed, with the
+    // provider's write-time defaults applied. A comparison that cannot survive
+    // a default being added here would not survive the real provider either.
+    toolsFingerprint: fingerprintTools(providerStoredTools, { mock: true }),
+    tools: providerStoredTools,
     mock: true,
   };
 }
