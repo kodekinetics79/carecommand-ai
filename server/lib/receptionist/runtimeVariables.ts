@@ -32,6 +32,17 @@ export const RUNTIME_DYNAMIC_VARIABLES = [
   { name: 'location_name', default: '' },
   { name: 'location_address', default: '' },
   { name: 'location_phone', default: '' },
+  // The appointment THIS call is about. Per-patient by definition, so they can
+  // only be resolved at dial time; the reminder campaign that carried them as
+  // static script text read one patient's clinician, day and time to everybody
+  // on the list. Every one defaults to empty: a call with no bound appointment
+  // must state nothing rather than a plausible-sounding placeholder.
+  { name: 'appointment_id', default: '' },
+  { name: 'appointment_clinician', default: '' },
+  { name: 'appointment_date', default: '' },
+  { name: 'appointment_time', default: '' },
+  { name: 'appointment_service', default: '' },
+  { name: 'appointment_location', default: '' },
 ] as const;
 
 export type RuntimeDynamicVariable = (typeof RUNTIME_DYNAMIC_VARIABLES)[number]['name'];

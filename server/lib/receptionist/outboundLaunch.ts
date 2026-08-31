@@ -41,6 +41,7 @@ import { db } from '../db';
 import { env } from '../../config/env';
 import { retellConfigStatus, createPhoneCall, stopPhoneCall } from '../retell';
 import { buildHoursDynamicVariables, hoursStatus } from './clinicHours';
+import { VOICE_MUTABLE_STATUSES, buildAppointmentDynamicVariables } from './appointmentContext';
 import { loadHoursSource } from './hoursSource';
 import { resolveLocalePackWithFallback, resolvedLocaleFormat } from './localePacks/resolve';
 import { isDestinationOptedOut, isSuppressed, isValidE164, toE164 } from '../campaigns';
@@ -1313,6 +1314,34 @@ export async function launchOutboundCall(input: LaunchOutboundCallInput): Promis
     // An optional parameter that is ABSENT has to be omitted, not sent empty.
     // `emptyToNull` (above) exists for exactly this confusion on the way IN
     // from the Studio form; this is the same mistake on the way OUT.
+    // The appointment this call is ABOUT, re-read at DIAL time rather than
+    // trusted from the target row. A binding made when the list was built can
+    // have been cancelled or moved since; speaking a stale appointment down the
+    // phone is worse than speaking none. Scoped to the target's own patient, so
+    // a mis-set binding cannot read one patient's diary to another.
+    const boundAppointment = target?.appointmentId && target.patientId
+      ? await db.appointment.findFirst({
+        where: {
+          id: target.appointmentId,
+          tenantId,
+          patientId: target.patientId,
+          deletedAt: null,
+          startsAt: { gt: new Date() },
+          status: { in: [...VOICE_MUTABLE_STATUSES] },
+        },
+        select: {
+          id: true, startsAt: true, service: true,
+          branch: { select: { name: true, timezone: true } },
+          providerProfile: { select: { user: { select: { displayName: true } } } },
+        },
+      })
+      : null;
+    if (target?.appointmentId && !boundAppointment) {
+      log.warn({
+        callLogId: callLog.id, campaignId: campaign.id, targetId: target.id, appointmentId: target.appointmentId,
+      }, 'Outbound target is bound to an appointment that is no longer remindable; dialling with no appointment context');
+    }
+
     const callWebhookQuery = new URLSearchParams({ clinicId: campaign.clinicId });
     if (campaign.receptionistCampaignId) callWebhookQuery.set('campaignId', campaign.receptionistCampaignId);
     const result = await createPhoneCall({
@@ -1322,6 +1351,23 @@ export async function launchOutboundCall(input: LaunchOutboundCallInput): Promis
       webhookUrl: `${env.PUBLIC_API_URL}/v1/receptionist/webhooks/retell?${callWebhookQuery.toString()}`,
       dynamicVariables: {
         ...buildHoursDynamicVariables({ status: dialStatus, strings: dialPack?.strings ?? null }),
+        // This patient's own appointment, in the BRANCH's timezone and this
+        // call's locale format. Every key is present on every call: an unbound
+        // target sends empty strings, exactly like the optional variables
+        // below, never a placeholder the agent could speak as if it were fact.
+        ...buildAppointmentDynamicVariables({
+          appointment: boundAppointment
+            ? {
+              id: boundAppointment.id,
+              startsAt: boundAppointment.startsAt,
+              service: boundAppointment.service,
+              timezone: boundAppointment.branch.timezone,
+              locationName: boundAppointment.branch.name,
+              clinicianName: boundAppointment.providerProfile?.user.displayName ?? null,
+            }
+            : null,
+          locale: dialLocale,
+        }),
         clinic_name: campaign.clinic.name,
         agent_name: campaign.agent.name,
         disclosure: liveTest
