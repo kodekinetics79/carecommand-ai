@@ -2128,6 +2128,7 @@ model ReceptionistAgent {
   providerStatus                ReceptionistAgentProviderStatus @default(UNVERIFIED)
   providerPublished             Boolean?
   providerAssignedTags          String[]                    @default([])
+  providerVersionPinned         Boolean                         @default(false)
   providerVoiceId               String?
   providerLanguage              String?
   providerWebhookUrl            String?

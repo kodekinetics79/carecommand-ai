@@ -725,6 +725,44 @@ describe('AI receptionist trusted configuration', () => {
     }
   });
 
+  it('lets a version-pinned deployment be verified with no provider tags, and still refuses a BYO agent without one', async () => {
+    // CareCommand routes by numeric version, not by tag — inbound binds
+    // `agent_version` and outbound sends `override_agent_version` — and Retell
+    // exposes no public tag-assignment write, so an agent we deploy comes back
+    // with `assigned_tags: []`. The old CHECK demanded
+    // `providerAssignedTags @> ARRAY[providerVersionTag]` for every VERIFIED
+    // row, so the success write threw a constraint violation and verification
+    // could never complete for a deployment of ours. It had never fired because
+    // nothing had ever got far enough to write VERIFIED.
+    const t = await tenant();
+    const clinicId = (await createClinic(t, { name: 'Pinned clinic' })).json().id as string;
+    const verifiedShape = {
+      tenantId: t.id, clinicId, providerAgentId: 'agent_pinned', providerVersionTag: 'carecommand',
+      providerVersion: 0, providerStatus: 'VERIFIED' as const, providerPublished: true,
+      providerWebhookUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`,
+      providerWebhookEvents: ['call_started', 'call_ended', 'call_analyzed'],
+      providerDataStorageSetting: 'basic_attributes_only', providerSignedUrl: true,
+      providerResponseEngineType: 'retell-llm', providerResponseEngineId: 'llm-pinned', providerResponseEngineVersion: 0,
+      providerResponseEngineGraphFingerprint: 'b'.repeat(64), providerBookToolSchema: { fixture: true },
+      providerEffectiveDynamicVariables: {}, providerBookToolFingerprint: 'c'.repeat(64),
+      providerToolCallStrictMode: true, providerFingerprint: 'a'.repeat(64),
+      providerConfigRevision: 1, providerVerifiedRevision: 1,
+      providerVerifiedAt: new Date(), providerVerificationExpiresAt: new Date(Date.now() + 60_000),
+    };
+
+    // Pinned by version: no tag needed, because the tag routes nothing.
+    const pinned = await db.receptionistAgent.create({
+      data: { ...verifiedShape, name: 'Pinned agent', providerAssignedTags: [], providerVersionPinned: true },
+    });
+    expect(pinned.providerStatus).toBe('VERIFIED');
+
+    // Hand-linked and routed BY tag: the tag must genuinely be assigned, so a
+    // half-attested row is still refused by the database.
+    await expect(db.receptionistAgent.create({
+      data: { ...verifiedShape, name: 'BYO agent', providerAgentId: 'agent_byo', providerAssignedTags: [], providerVersionPinned: false },
+    })).rejects.toThrow();
+  });
+
   it('preserves a verified snapshot on transient probe failure and rejects stale concurrent verification', async () => {
     const t = await tenant();
     const clinicId = (await createClinic(t, { name: 'Concurrency clinic' })).json().id as string;
