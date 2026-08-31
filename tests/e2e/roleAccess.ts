@@ -194,8 +194,31 @@ export const RESTRICTED_STATE_SENTENCE = 'is not part of your access';
  * is matched only when it is not part of a longer figure, so a real currency
  * amount such as "1,403.00" is not mistaken for a status code.
  */
+// WHY THERE IS NO BARE `403` PATTERN HERE
+//
+// There was one: /(?<![\d.,])403(?![\d.,])/. It excluded neighbouring digits
+// and commas and nothing else, so it fired on any page containing
+//
+//   * a metric that happened to equal 403 ("403 patients"), or
+//   * ANY identifier with 403 between two non-digits ("a1b403fe-...").
+//
+// Ids are regenerated every run, so this failed at random, on every branch,
+// with no defect present — and a green rerun of unchanged code was the only
+// way to tell. A check that cries wolf on a coin flip trains people to re-run
+// CI until it passes, which is worse than not having it.
+//
+// Removing it loses nothing real. It could not tell a refusal from a UUID, so
+// every time it fired someone had to re-run CI to find out which it was — and
+// the answer was never "a defect". The word patterns below stay: unlike a
+// number, `forbidden` and `insufficient_permission` cannot occur innocently.
+//
+// The network-level check that WOULD be exact — no /v1 response answering 403
+// on a destination the sidebar offers — was written and run. It fails today
+// for a real reason: the dashboard requests revenue data for every role, so
+// three of four roles collect 14 refusals on the landing page. Fixing that is
+// a product decision about which panels each role is shown, so it is tracked
+// separately instead of being bundled into a test-hygiene change.
 const RAW_ACCESS_TEXT: readonly { name: string; pattern: RegExp }[] = [
-  { name: '403', pattern: /(?<![\d.,])403(?![\d.,])/ },
   { name: 'Forbidden', pattern: /forbidden/i },
   { name: 'required permission', pattern: /required permission/i },
   // The literal error code the API returns with a 403, in case it is ever
