@@ -56,6 +56,64 @@ function transferOutcomeFor(disconnectionReason: string | undefined): 'connected
   return disconnectionReason === 'call_transfer' ? 'connected' : 'unknown';
 }
 
+/** Every ReceptionistCallOutcome except the non-terminal IN_PROGRESS. */
+export type ReceptionistTerminalOutcome =
+  | 'BOOKED' | 'NOT_INTERESTED' | 'NO_ANSWER' | 'VOICEMAIL' | 'ESCALATED' | 'OPTED_OUT' | 'FAILED';
+
+/**
+ * What the PROVIDER says happened to the call, independent of anything the
+ * model wrote in its post-call analysis.
+ *
+ * This is the authority on two questions the LLM must never answer:
+ *   1. did the call end?          (terminality)
+ *   2. did it ever connect?       (whether a business outcome is even possible)
+ *
+ * The mapping is the one already committed to in `outbound.ts`'s provider-sync
+ * handler (`providerTerminalOutcome`, the `snapshot.status` ladder): `error` →
+ * FAILED, `not_connected` → NO_ANSWER unless the reason names voicemail, and an
+ * `ended` call whose reason we cannot read → ESCALATED, i.e. explicit staff
+ * review rather than an invented success. It is repeated here rather than
+ * imported because the outbound copy is an inline const inside a route handler,
+ * not an exported function; collapsing the two onto this export is a follow-up
+ * that has to touch outbound.ts.
+ *
+ * `connected: false` means the patient was never reached, so no analysis this
+ * call produces can be true — there was no conversation to analyse.
+ */
+export function providerTerminalOutcome(
+  callStatus: string | undefined,
+  disconnectionReason: string | undefined,
+): { outcome: ReceptionistTerminalOutcome; connected: boolean } {
+  const status = (callStatus ?? '').trim().toLowerCase();
+  const reason = (disconnectionReason ?? '').trim().toLowerCase();
+  // A provider-side failure to place or hold the call. Never the patient's doing.
+  if (status === 'error') return { outcome: 'FAILED', connected: false };
+  // The provider registered the call and it never became a conversation:
+  // ring-out, busy, declined, carrier reject, straight to voicemail.
+  if (status === 'not_connected') {
+    return { outcome: reason.includes('voicemail') ? 'VOICEMAIL' : 'NO_ANSWER', connected: false };
+  }
+  // `ended` (or a lifecycle event with no status at all): read the reason.
+  // A machine picking up is not a patient answering.
+  if (reason.includes('voicemail') || reason.includes('machine_detected')) {
+    return { outcome: 'VOICEMAIL', connected: false };
+  }
+  if (reason.includes('no_answer') || reason.includes('unanswered') || reason.includes('busy')
+    || reason.includes('declined') || reason.includes('registered_call_timeout')) {
+    return { outcome: 'NO_ANSWER', connected: false };
+  }
+  if (reason.startsWith('error') || reason.includes('dial_failed') || reason.includes('invalid_destination')
+    || reason.includes('telephony') || reason.includes('sip_') || reason.includes('scam_detected')
+    || reason.includes('concurrency_limit') || reason.includes('no_valid_payment')) {
+    return { outcome: 'FAILED', connected: false };
+  }
+  // user_hangup, agent_hangup, call_transfer, inactivity, max_duration_reached,
+  // an unknown reason, or no reason at all: somebody was on the line and the
+  // call is over. Without analysis we do not know what came of it, so the
+  // honest terminal answer is "a human should look at this".
+  return { outcome: 'ESCALATED', connected: true };
+}
+
 const RECEPTIONIST_CALL_LEASE_MS = 4 * 60 * 60 * 1_000;
 
 // --- Idempotency + signature helpers for the public webhook ----------------
@@ -653,6 +711,11 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
         direction: z.string().optional(),
         metadata: z.record(z.string(), z.unknown()).optional(),
         recording_url: z.string().optional(),
+        // The provider's own lifecycle verdict: registered | not_connected |
+        // ongoing | ended | error. Read alongside disconnection_reason, this is
+        // the only signal that survives a call which never became a conversation
+        // and therefore never produced an analysis block.
+        call_status: z.string().max(40).optional(),
         disconnection_reason: z.string().max(120).optional(),
         call_analysis: z.object({
           call_summary: z.string().optional(),
@@ -1019,7 +1082,12 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     type CallOutcome = 'IN_PROGRESS' | 'BOOKED' | 'NOT_INTERESTED' | 'NO_ANSWER' | 'VOICEMAIL' | 'ESCALATED' | 'OPTED_OUT' | 'FAILED';
     const validOutcomes: ReadonlyArray<Exclude<CallOutcome, 'IN_PROGRESS'>> = ['BOOKED', 'NOT_INTERESTED', 'NO_ANSWER', 'VOICEMAIL', 'ESCALATED', 'OPTED_OUT', 'FAILED'];
     const durationSeconds = call.duration_ms ? Math.round(call.duration_ms / 1000) : 0;
-    const ended = endedEvent;
+    // Terminality is the PROVIDER's call, never the model's. A lifecycle event
+    // says the call is over; so does a provider status of not_connected/error,
+    // whatever event carried it.
+    const providerStatus = (call.call_status ?? '').trim().toLowerCase();
+    const provider = providerTerminalOutcome(call.call_status, call.disconnection_reason);
+    const ended = endedEvent || providerStatus === 'ended' || providerStatus === 'not_connected' || providerStatus === 'error';
     const existingCall = await db.receptionistCallLog.findFirst({ where: { retellCallId: providerCallId, tenantId } });
     trustedClinicId ??= existingCall?.clinicId ?? undefined;
     const canonicalBookingRequest = existingCall
@@ -1037,9 +1105,30 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     // Provider/LLM analysis alone is not proof of a booking. Without the
     // canonical Appointment created by the signed live tool, route to review.
     const normalizedOutcomeRaw = outcomeRaw === 'BOOKED' && !canonicalBooking ? 'ESCALATED' : outcomeRaw;
-    const outcome: CallOutcome = validOutcomes.includes(normalizedOutcomeRaw as Exclude<CallOutcome, 'IN_PROGRESS'>)
+    // What the model claims came of the call. It drives the analysis-derived
+    // side effects below (opt-out filing, unproven-booking review) exactly as
+    // before — but it is no longer allowed to decide whether the call ended.
+    const analysisOutcome: CallOutcome = validOutcomes.includes(normalizedOutcomeRaw as Exclude<CallOutcome, 'IN_PROGRESS'>)
       ? normalizedOutcomeRaw as Exclude<CallOutcome, 'IN_PROGRESS'>
       : 'IN_PROGRESS';
+
+    // THE OUTCOME THE ROW IS PERSISTED WITH.
+    //
+    // Previously this was `analysisOutcome` alone, so every call that ended
+    // without an analysis block — no answer, busy, declined, carrier reject,
+    // voicemail: every call that did not really happen — was written as
+    // IN_PROGRESS *with endedAt set*. That is a contradiction on its face, and
+    // downstream it is fatal: `targetStatusAfterOutcome('')` returns null, the
+    // ReceptionistCallTarget stays CALLING, and only PENDING targets are
+    // dialable — so the patient could never be called again by anyone.
+    //
+    // Now the provider decides terminality and the floor outcome; the analysis
+    // may only refine WHY, and only for a call the provider says connected. A
+    // call that never connected cannot have produced a booking, an opt-out, or
+    // a "not interested" — there was nobody on the line to say it.
+    const outcome: CallOutcome = ended
+      ? (provider.connected && analysisOutcome !== 'IN_PROGRESS' ? analysisOutcome : provider.outcome)
+      : analysisOutcome;
 
     // Was the clinic open when this call arrived? Computed once, from the
     // clinic's own hours, and stored: recomputing it later against today's
@@ -1059,7 +1148,11 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lifecycleKey})::bigint)`;
       const current = await tx.receptionistCallLog.findFirst({ where: { retellCallId: providerCallId, tenantId } });
       // Canonical booking evidence wins. Otherwise the first terminal outcome
-      // is immutable under later provider analysis/redelivery.
+      // is immutable under later provider analysis/redelivery — the DB trigger
+      // ReceptionistCallLog_first_terminal_outcome_trg enforces it, so this is
+      // the ONE write that decides the outcome. Reading `current` inside the
+      // advisory lock is what keeps a redelivered event from attempting a
+      // second terminal write and failing the whole transaction.
       const persistedOutcome: CallOutcome = canonicalBooking
         ? 'BOOKED'
         : current && current.outcome !== 'IN_PROGRESS'
@@ -1168,16 +1261,28 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     // Move an owned outbound target out of CALLING exactly once. Retryable
     // outcomes return to PENDING only while the configured retry allowance
     // remains; terminal states cannot be reopened by webhook redelivery.
+    //
+    // Driven by the outcome actually persisted on the call log, not by the raw
+    // model string. The raw string was `''` for every call that never became a
+    // conversation — `targetStatusAfterOutcome('')` is null, so the target was
+    // left CALLING and the patient became permanently un-callable. It also
+    // disagreed with the call log whenever the two diverged (an unproven
+    // 'BOOKED' persisted the log as ESCALATED but stamped the target BOOKED).
+    // Every terminal ReceptionistCallOutcome is covered by
+    // targetStatusAfterOutcome — OPTED_OUT, BOOKED/NOT_INTERESTED/ESCALATED,
+    // NO_ANSWER/VOICEMAIL/FAILED — so a terminal call always releases CALLING.
     if (existingCall?.targetId && existingCall.outboundCampaignId && ended) {
       const target = await db.receptionistCallTarget.findFirst({
         where: { id: existingCall.targetId, tenantId, campaignId: existingCall.outboundCampaignId },
         include: { campaign: { select: { maxRetryAttempts: true } } },
       });
-      const nextStatus = target ? targetStatusAfterOutcome(outcomeRaw, target.attempts, target.campaign.maxRetryAttempts) : null;
+      const nextStatus = target
+        ? targetStatusAfterOutcome(persistedCall.outcome, target.attempts, target.campaign.maxRetryAttempts)
+        : null;
       if (target && nextStatus) {
         await db.receptionistCallTarget.updateMany({
           where: { id: target.id, tenantId, campaignId: existingCall.outboundCampaignId, status: 'CALLING' },
-          data: { status: nextStatus, lastOutcome: outcomeRaw, lastCallLogId: existingCall.id },
+          data: { status: nextStatus, lastOutcome: persistedCall.outcome, lastCallLogId: existingCall.id },
         });
       }
     }
@@ -1190,7 +1295,11 @@ export const receptionistWebhookRoutes: FastifyPluginAsync = async app => {
     const optOutPhone = existingCall?.direction === 'outbound'
       ? existingCall.callerPhone
       : call.from_number;
-    if (outcome === 'OPTED_OUT' && (optOutPhone || custom.email)) {
+    // Suppression stays keyed to what the model reported, not to the outcome
+    // frozen on the call log. A "stop calling me" is honoured even when it
+    // arrives on a later analyzed event whose outcome the first terminal write
+    // already fixed — suppression fails safe in the direction of not dialling.
+    if (analysisOutcome === 'OPTED_OUT' && (optOutPhone || custom.email)) {
       const contactEmail = typeof custom.email === 'string' && custom.email.trim().length <= 160
         ? custom.email.trim().toLowerCase()
         : undefined;
