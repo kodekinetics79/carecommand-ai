@@ -148,3 +148,65 @@ describe('receptionist typed intake contract', () => {
     expect(stripRuntimeVariables(JSON.stringify(exported))).not.toMatch(/\{\{|\$\{/);
   });
 });
+
+describe('the booking schema uses only keywords the provider keeps', () => {
+  // We send `tool_call_strict_mode: true`, so the provider sanitises the tool
+  // schema down to the strict structured-output subset and stores only that.
+  // Anything outside it is silently discarded on write — which is not merely
+  // cosmetic: verification compares what we authored against what the provider
+  // stored, so one unsupported keyword made every deployment fail with
+  // `tools_drift` on `parameters.properties.email.format`, permanently.
+  //
+  // `format` and `readOnly` were the two. This list is the contract; adding to
+  // it means confirming against the live provider that the keyword survives a
+  // write, not assuming it will.
+  const KEPT_BY_PROVIDER = new Set([
+    'type', 'description', 'enum', 'const', 'items', 'properties', 'required',
+    'additionalProperties', 'minLength', 'maxLength', 'pattern',
+  ]);
+
+  function walk(node: unknown, path: string, seen: string[]): void {
+    if (Array.isArray(node)) {
+      node.forEach((item, index) => walk(item, `${path}[${index}]`, seen));
+      return;
+    }
+    if (!node || typeof node !== 'object') return;
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      // Property NAMES are clinic data, not schema keywords; only descend.
+      if (path.endsWith('.properties')) { walk(value, `${path}.${key}`, seen); continue; }
+      if (!KEPT_BY_PROVIDER.has(key)) seen.push(`${path}.${key}`);
+      walk(value, `${path}.${key}`, seen);
+    }
+  }
+
+  // EVERY field type, not just the ones a fixture happens to carry. The live
+  // failure was on EMAIL, which the default prompt fixture does not configure —
+  // so a fixture-shaped test would have passed while production could not
+  // verify at all.
+  const ALL_FIELD_TYPES = [
+    'FIRST_NAME', 'LAST_NAME', 'PHONE', 'EMAIL', 'PREFERRED_DATE', 'PREFERRED_TIME',
+    'PREFERRED_LOCATION', 'PATIENT_STATUS', 'INSURANCE_PROVIDER', 'REASON_FOR_VISIT',
+    'PREFERRED_PROVIDER', 'LANGUAGE_PREFERENCE', 'CONSENT', 'CUSTOM_TEXT',
+    'CUSTOM_DROPDOWN', 'CUSTOM_YES_NO',
+  ] as const;
+
+  it('authors no schema keyword the provider would discard, for any field type', () => {
+    const fields = ALL_FIELD_TYPES.map((fieldType, index) => ({
+      id: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+      fieldType, label: `${fieldType} label`, aiQuestion: `Question for ${fieldType}?`,
+      options: fieldType === 'CUSTOM_DROPDOWN' ? ['One', 'Two'] : [],
+      required: true, confirmationRequired: false, sortOrder: index,
+    }));
+    const { snapshot } = compileIntakeContract({
+      campaignId: '00000000-0000-4000-8000-0000000000ff', revision: 1,
+      appointmentType: 'New-patient cleaning & exam',
+      eligibleLocations: [{ id: '00000000-0000-4000-8000-00000000000a', name: 'Main' }],
+      fields: fields as never,
+      toolUrl: 'https://api.example.test/v1/receptionist/webhooks/retell/fn?clinicId=c',
+    });
+    const offenders: string[] = [];
+    const contract = snapshot.bookAppointmentToolContract as Record<string, unknown>;
+    walk(contract.parameters, 'parameters', offenders);
+    expect(offenders).toEqual([]);
+  });
+});
