@@ -390,7 +390,7 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
     const priorEngine = await tx.receptionistAgentDeployment.findFirst({
       where: { tenantId: input.tenantId, agentId: agent.id, providerLlmId: { not: null }, id: { not: deployment.id } },
       orderBy: { startedAt: 'desc' },
-      select: { providerLlmId: true, providerLlmVersion: true, providerAgentVersion: true },
+      select: { providerLlmId: true, providerLlmVersion: true, providerAgentVersion: true, publishedAt: true },
     });
     return {
       kind: 'claimed' as const,
@@ -402,6 +402,10 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
       providerAgentId: agent.providerAgentId,
       priorLlmId: priorEngine?.providerLlmId ?? null,
       priorLlmVersion: priorEngine?.providerLlmVersion ?? 0,
+      // Retell answers `400 Cannot update published LLM`. Publishing a
+      // deployment freezes its response engine at the provider, so the engine
+      // of a PUBLISHED prior deployment can never be updated again.
+      priorLlmPublished: priorEngine?.publishedAt != null,
       priorAgentVersion: latest?.providerAgentVersion ?? priorEngine?.providerAgentVersion ?? 0,
     };
   }, input.actor.trustedActor);
@@ -464,11 +468,27 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
     tools: claim.plan.config.tools,
   };
 
-  // Step 1 — the response engine. We update the one we own, or create a fresh
-  // one; creating is only ever chosen when we hold no id, which is what makes
-  // a retry after a partial failure idempotent.
+  // Step 1 — the response engine. We update the one we own when it is still
+  // updatable, and otherwise create a fresh one.
+  //
+  // Reusing the engine is what makes a retry after a PARTIAL failure
+  // idempotent: a deploy that died before publishing leaves an unpublished
+  // engine, and minting a new one on every retry produced orphans (A5).
+  //
+  // But publishing freezes the engine at the provider. Retell answers
+  // `400 Cannot update published LLM`, which our provider layer reports as the
+  // generic `invalid_request`. Because the prior engine was chosen without
+  // regard to whether it had been published, EVERY deploy after the first
+  // successful one failed at this step, for good: a clinic could publish once
+  // and then never change its prompt, hours, services or disclosure again.
+  // Confirmed against the live provider on 2026-08-30 — the second deploy of a
+  // working line failed here and no retry could ever succeed.
+  //
+  // So the published case takes the create path. That is not an orphan: the
+  // published engine is still referenced by the published agent version that
+  // callers are on until this deploy replaces it.
   let llm: RetellProviderResult<{ llmId: string; version: number }>;
-  if (claim.priorLlmId) {
+  if (claim.priorLlmId && !claim.priorLlmPublished) {
     llm = await updateRetellLlm(claim.priorLlmId, llmSpec, claim.priorLlmVersion);
   } else {
     llm = await createRetellLlm(llmSpec);
