@@ -2,6 +2,7 @@ import { env } from '../../config/env';
 import { Prisma } from '../../generated/prisma/client';
 import { runWithTenantContext } from '../tenantContext';
 import {
+  describeDeployedToolDrift,
   evaluateRetellAgentReadiness,
   expectedRetellAgentWebhookUrl,
   getPhoneNumberBinding,
@@ -207,6 +208,14 @@ export async function verifyAgentProvider(input: VerifyInput): Promise<VerifyOut
     : null;
   const intakeEvidenceFailure = probe.ok ? providerIntakeEvidenceFailure(probe.snapshot) : null;
   const safeError = probe.ok ? readinessFailure ?? intakeEvidenceFailure : probe.error;
+  // `tools_drift` on its own is unactionable — it says the live tools differ
+  // and not which tool, nor which field. That cost real diagnosis time on the
+  // first live deployment, so the first difference is recorded alongside it.
+  // Names of tools and keys only; no values, which can carry clinic text.
+  const toolDrift = readinessFailure === 'tools_drift' && probe.ok && probe.snapshot.tools
+    && Array.isArray(deployment?.toolsJson)
+    ? describeDeployedToolDrift(deployment.toolsJson as unknown[], probe.snapshot.tools)
+    : null;
 
   // A2 - ask the provider who answers this line. Still outside any transaction,
   // and deliberately independent of the agent probe: an agent can be perfectly
@@ -339,6 +348,7 @@ export async function verifyAgentProvider(input: VerifyInput): Promise<VerifyOut
         deploymentChanged,
         source: input.actor.source,
         reason: safeError,
+        ...(toolDrift ? { toolDriftTool: toolDrift.tool, toolDriftKey: toolDrift.key } : {}),
         numberBindingVerified: numberBinding ? numberBinding.numberBindingVerifiedAt !== null : null,
         numberBindingError: numberBinding?.numberBindingErrorCode ?? null,
       },
