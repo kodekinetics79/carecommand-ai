@@ -52,17 +52,23 @@ const { isTargetDialable } = await import('../modules/receptionist/outbound');
 //   * every later attended call was refused `live_test_single_active_call`,
 //     because `activeCalls > 0` is computed from that same stranded row.
 //
-// SIX OF THESE NINE TESTS ARE EXPECTED TO FAIL ON MAIN. They are the
-// acceptance bar for the fix, not a broken build. Each of the six is marked
-// `it.fails(...)` — the pattern this repo already uses in
-// receptionistReadinessContract.test.ts and receptionistRemediationCoverage.test.ts
-// — so `npm test` stays green today and turns RED the moment the defect is
-// fixed without deleting the pin. Delete the `.fails` as part of the fix; do
-// NOT weaken an assertion to match today's behaviour.
+// SIX OF THESE NINE TESTS WERE WRITTEN TO FAIL, as `it.fails(...)`, and were
+// the acceptance bar for the fix. All six now pass and the markers are gone:
+// this file is a regression suite, not a reproduction. It is the whole point
+// of the exercise that not one assertion was weakened to get there — the six
+// were flipped only after the fix made them true.
 //
-// The tests written as plain `it(...)` are GREEN today on purpose. They are
+// What made them true: the malformed per-call webhook URL (a trailing
+// `&campaignId=` that failed query parsing with a 400 BEFORE signature
+// verification, so the provider's every delivery was permanently refused),
+// a `deadlineAt` bound so a non-terminal row stops holding capacity, terminal
+// outcomes taken from the provider's own signal rather than from an LLM
+// analysis block that a never-connected call never produces, and a
+// reconciler that asks the provider instead of waiting to be told.
+//
+// The remaining three tests were green from the start and stay green. They are
 // the guard rails: they stop an over-broad fix from accepting a provider call
-// we never submitted, and they record which half of the admission story is
+// we never submitted, and they record which half of the admission story was
 // already sound.
 //
 // ---------------------------------------------------------------------------
@@ -406,7 +412,7 @@ afterAll(async () => {
 // 1. A call the provider never connects must reach a terminal state.
 // ===========================================================================
 describe('an outbound call the provider never connects', () => {
-  it.fails('reaches a terminal outcome and releases its target, with no webhook ever delivered', async () => {
+  it('reaches a terminal outcome and releases its target, with no webhook ever delivered', async () => {
     const tenant = await makeTenant();
     const campaignId = await createCampaign(tenant);
     const target = await addPatientTarget(tenant, campaignId, 1);
@@ -433,7 +439,7 @@ describe('an outbound call the provider never connects', () => {
     expect(provider.reads).toContain(launched.callId);
   });
 
-  it.fails('does not leave a call the provider never started counted as an active call', async () => {
+  it('does not leave a call the provider never started counted as an active call', async () => {
     const tenant = await makeTenant();
     const campaignId = await createCampaign(tenant);
     const target = await addPatientTarget(tenant, campaignId, 2);
@@ -450,7 +456,7 @@ describe('an outbound call the provider never connects', () => {
     expect(await activeCallCount(tenant.id), 'a call that never connected still occupies a concurrency slot').toBe(0);
   });
 
-  it.fails('lets the operator clear the launch attempt it was dispatched under', async () => {
+  it('lets the operator clear the launch attempt it was dispatched under', async () => {
     const tenant = await makeTenant();
     const campaignId = await createCampaign(tenant);
     const target = await addPatientTarget(tenant, campaignId, 8);
@@ -479,7 +485,7 @@ describe('an outbound call the provider never connects', () => {
 // 2. The target must become retryable (ASSUMPTION C).
 // ===========================================================================
 describe('the target of a call that never connected', () => {
-  it.fails('returns to a dialable state and can actually be called again', async () => {
+  it('returns to a dialable state and can actually be called again', async () => {
     const tenant = await makeTenant();
     const campaignId = await createCampaign(tenant, { maxRetryAttempts: 2 });
     const target = await addPatientTarget(tenant, campaignId, 3);
@@ -510,7 +516,7 @@ describe('the target of a call that never connected', () => {
 // 3. Reconciliation from the call id alone.
 // ===========================================================================
 describe('provider-sync reconciliation authority', () => {
-  it.fails('reconciles a call WE submitted even though the provider record carries no metadata', async () => {
+  it('reconciles a call WE submitted even though the provider record carries no metadata', async () => {
     const tenant = await makeTenant();
     const campaignId = await createCampaign(tenant);
     const target = await addPatientTarget(tenant, campaignId, 4);
@@ -624,7 +630,7 @@ describe('admission after a call that never connected', () => {
     expect(second.json()).toMatchObject({ status: 'launched' });
   });
 
-  it.fails('does not refuse every later attended call with live_test_single_active_call', async () => {
+  it('does not refuse every later attended call with live_test_single_active_call', async () => {
     const tenant = await makeTenant();
     // Two campaigns, one authorized destination. The attended UAT allowlist
     // holds exactly one number, so the second attempt is a genuinely separate
