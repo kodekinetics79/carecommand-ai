@@ -144,7 +144,7 @@ function stubLiveProvider(options: {
     if (value.includes('/create-agent') || value.includes('/update-agent')) {
       return new Response(JSON.stringify({ agent_id: options.agentId, version: 0 }), { status: 200 });
     }
-    if (value.includes('/publish-agent-version/')) return new Response(JSON.stringify({}), { status: 200 });
+    if (value.includes('/publish-agent/')) return new Response(JSON.stringify({}), { status: 200 });
     if (value.includes('/update-phone-number/')) {
       const number = decodeURIComponent(value.split('phone-number/')[1] ?? '');
       return new Response(JSON.stringify({ phone_number: number, inbound_agents: [{ agent_id: options.agentId, agent_version: 0 }] }), { status: 200 });
@@ -389,7 +389,12 @@ describe('A5 — a failed deploy does not leak the engine it created', () => {
         if (agentStepFails) return new Response('upstream is down', { status: 503 });
         return new Response(JSON.stringify({ agent_id: agentId, version: 0 }), { status: 200 });
       }
-      if (value.startsWith('/publish-agent-version/')) return new Response(JSON.stringify({}), { status: 200 });
+      if (value.startsWith('/publish-agent/')) return new Response(JSON.stringify({}), { status: 200 });
+      // Publishing now CONFIRMS the version with the provider instead of
+      // trusting the number it was handed, so the read-back has to answer.
+      if (value.startsWith('/get-agent/')) {
+        return new Response(JSON.stringify({ agent_id: agentId, version: 0, is_published: true }), { status: 200 });
+      }
       if (value.startsWith('/update-phone-number/')) {
         const number = decodeURIComponent(value.split('phone-number/')[1] ?? '');
         return new Response(JSON.stringify({ phone_number: number, inbound_agents: [{ agent_id: agentId, agent_version: 0 }] }), { status: 200 });
@@ -459,7 +464,12 @@ describe('a published engine is frozen, so the next deploy makes a new one', () 
       if (value.startsWith('/create-agent') || value.startsWith('/update-agent/')) {
         return new Response(JSON.stringify({ agent_id: agentId, version: 0 }), { status: 200 });
       }
-      if (value.startsWith('/publish-agent-version/')) return new Response(JSON.stringify({}), { status: 200 });
+      if (value.startsWith('/publish-agent/')) return new Response(JSON.stringify({}), { status: 200 });
+      // Publishing now CONFIRMS the version with the provider instead of
+      // trusting the number it was handed, so the read-back has to answer.
+      if (value.startsWith('/get-agent/')) {
+        return new Response(JSON.stringify({ agent_id: agentId, version: 0, is_published: true }), { status: 200 });
+      }
       if (value.startsWith('/update-phone-number/')) {
         const number = decodeURIComponent(value.split('phone-number/')[1] ?? '');
         return new Response(JSON.stringify({ phone_number: number, inbound_agents: [{ agent_id: agentId, agent_version: 0 }] }), { status: 200 });
@@ -511,7 +521,12 @@ describe('the agent write never pins an engine version', () => {
         agentWrites.push(JSON.parse(init?.body ?? '{}') as Record<string, unknown>);
         return new Response(JSON.stringify({ agent_id: agentId, version: 1 }), { status: 200 });
       }
-      if (value.startsWith('/publish-agent-version/')) return new Response(JSON.stringify({}), { status: 200 });
+      if (value.startsWith('/publish-agent/')) return new Response(JSON.stringify({}), { status: 200 });
+      // Publishing now CONFIRMS the version with the provider instead of
+      // trusting the number it was handed, so the read-back has to answer.
+      if (value.startsWith('/get-agent/')) {
+        return new Response(JSON.stringify({ agent_id: agentId, version: 1, is_published: true }), { status: 200 });
+      }
       if (value.startsWith('/update-phone-number/')) {
         const number = decodeURIComponent(value.split('phone-number/')[1] ?? '');
         return new Response(JSON.stringify({ phone_number: number, inbound_agents: [{ agent_id: agentId, agent_version: 1 }] }), { status: 200 });
