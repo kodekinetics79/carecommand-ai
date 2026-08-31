@@ -47,7 +47,6 @@ const callArtifactRead = requireReceptionistPermission(RECEPTIONIST_PERMISSIONS.
 const ownerAdminRoles = requireRoles('OWNER', 'ADMIN');
 const REQUIRED_FIELD_KEYS = ['firstName', 'lastName', 'phone', 'email', 'preferredBranch', 'preferredService', 'preferredDateTime'] as const;
 const RUNNABLE_CAMPAIGN_STATUS = 'RUNNING';
-const DIALABLE_TARGET_STATUS = 'PENDING';
 const OUTBOUND_PURPOSES = ['CARE_COORDINATION', 'APPOINTMENT_REMINDER', 'PATIENT_REACTIVATION'] as const;
 const OUTBOUND_LEGAL_BASES = ['EXPLICIT_CONSENT', 'TREATMENT_OPERATIONS'] as const;
 const STRICT_HH_MM = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
@@ -56,8 +55,13 @@ const LIVE_UAT_TARGET_SOURCE_PREFIX = 'live_voice_uat:';
 import { MAX_TENANT_ACTIVE_CALLS } from '../../lib/receptionist/admissionPolicy';
 import { recordUsageEvent, periodUsageTotal, voiceCallDedupeKey, USAGE_METRICS } from '../../lib/usageMetering';
 import { liveCallingBlockReason, TENANT_MODE_DEMO_BLOCK } from '../../lib/tenantMode';
-
-export const DEFAULT_VOICE_MINUTES_LIMIT = 500;
+// The campaign dialling policy lives outside this route module so the
+// reconciliation worker can share it without importing the HTTP graph.
+// Re-exported because callers already import these names from here.
+import {
+  DEFAULT_VOICE_MINUTES_LIMIT, DIALABLE_TARGET_STATUS, isTargetDialable, targetStatusAfterOutcome,
+} from '../../lib/receptionist/outboundPolicy';
+export { DEFAULT_VOICE_MINUTES_LIMIT, isTargetDialable, targetStatusAfterOutcome };
 
 type ProviderBoundaryTestStage = 'before_suppression_fence' | 'suppression_fence_acquired' | 'provider_intent_committed' | 'before_provider_binding_lock' | 'provider_binding_committed' | 'before_call_stopping_evaluation';
 let providerBoundaryTestHook: ((stage: ProviderBoundaryTestStage) => Promise<void>) | null = null;
@@ -126,23 +130,6 @@ function outboundAuthorityFingerprint(campaign: OutboundAuthorityFingerprintInpu
     providerAgentId: campaign.agent?.providerAgentId ?? null,
     providerVersion: campaign.agent?.providerVersion ?? null,
   });
-}
-
-export function isTargetDialable(status: string, attempts: number, maxRetryAttempts: number): boolean {
-  return status === DIALABLE_TARGET_STATUS && attempts <= maxRetryAttempts;
-}
-
-export function targetStatusAfterOutcome(
-  outcome: string,
-  attempts: number,
-  maxRetryAttempts: number,
-): 'PENDING' | 'COMPLETED' | 'FAILED' | 'OPTED_OUT' | null {
-  if (outcome === 'OPTED_OUT') return 'OPTED_OUT';
-  if (['BOOKED', 'NOT_INTERESTED', 'ESCALATED'].includes(outcome)) return 'COMPLETED';
-  if (['NO_ANSWER', 'VOICEMAIL', 'FAILED'].includes(outcome)) {
-    return attempts <= maxRetryAttempts ? 'PENDING' : 'FAILED';
-  }
-  return null;
 }
 
 async function outboundStopped(tenantId: string): Promise<boolean> {
