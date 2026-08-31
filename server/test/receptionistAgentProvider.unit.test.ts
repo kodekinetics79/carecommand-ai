@@ -980,3 +980,110 @@ describe('Retell agent provider contract', () => {
     }, agent.value.version)).toMatchObject({ ok: true, mock: true });
   });
 });
+
+// ===========================================================================
+// Publishing must not cost the clinic the ability to change its receptionist.
+//
+// `POST /publish-agent-version/{id} { version }` publishes and then FREEZES the
+// agent entity: every later `PATCH /update-agent/{id}` answers 422 "Cannot
+// update published agent other than version title". A clinic could deploy once
+// and never edit its prompt, hours, services, voice or disclosure again.
+//
+// `POST /publish-agent/{id}` publishes the current draft and leaves the agent
+// updatable — confirmed against the live account on 2026-08-31 — but it takes
+// no version argument. So the version we hand it is an assumption until the
+// provider confirms it, and the caller binds a real telephone line to that
+// number. These tests pin both halves: the endpoint, and the refusal to return
+// a version the provider did not confirm.
+// ===========================================================================
+describe('publishing a Retell agent', () => {
+  const PUBLISHED_VERSION = 4;
+
+  /** Records every provider call so the endpoint and the read-back are both assertable. */
+  function stubPublishNetwork(readBack: { status?: number; body?: unknown }) {
+    const calls: Array<{ url: string; method?: string; hasBody: boolean }> = [];
+    const fetchMock = vi.fn<typeof fetch>(async (url, init) => {
+      const value = String(url);
+      calls.push({ url: value, method: init?.method, hasBody: init?.body !== undefined });
+      if (value.includes('/publish-agent/')) return new Response(JSON.stringify({}), { status: 200 });
+      return new Response(JSON.stringify(readBack.body ?? {}), { status: readBack.status ?? 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return calls;
+  }
+
+  function liveProvider() {
+    env.RETELL_API_KEY = 'real-key';
+    env.RETELL_BASE_URL = 'https://api.retellai.com';
+  }
+
+  it('publishes with the endpoint that leaves the agent updatable and returns the version the provider confirms', async () => {
+    liveProvider();
+    const calls = stubPublishNetwork({
+      body: { agent_id: 'agent_pilot', version: PUBLISHED_VERSION, is_published: true },
+    });
+
+    await expect(publishRetellAgent('agent_pilot', PUBLISHED_VERSION))
+      .resolves.toEqual({ ok: true, value: { version: PUBLISHED_VERSION }, mock: false });
+
+    // The freezing endpoint is never called, and the one we do call carries no
+    // body because it takes no version argument.
+    expect(calls.map(call => call.url)).toEqual([
+      'https://api.retellai.com/publish-agent/agent_pilot',
+      `https://api.retellai.com/get-agent/agent_pilot?version=${PUBLISHED_VERSION}`,
+    ]);
+    expect(calls[0]).toMatchObject({ method: 'POST', hasBody: false });
+    expect(calls[1]).toMatchObject({ method: 'GET', hasBody: false });
+    expect(JSON.stringify(calls)).not.toContain('publish-agent-version');
+  });
+
+  it('returns an error rather than a version when the read-back says that version is not published', async () => {
+    // The whole point of the read-back. `/publish-agent` answered 200, so the
+    // old code would have handed version 4 to the phone-number binding on the
+    // strength of a number nobody confirmed. The provider says otherwise.
+    liveProvider();
+    const calls = stubPublishNetwork({
+      body: { agent_id: 'agent_pilot', version: PUBLISHED_VERSION, is_published: false },
+    });
+
+    const result = await publishRetellAgent('agent_pilot', PUBLISHED_VERSION);
+    expect(result).toEqual({ ok: false, error: 'invalid_response', mock: false });
+    expect(result.ok).toBe(false);
+    expect(calls).toHaveLength(2);
+  });
+
+  it('returns an error when the provider published a different version than the one we expected', async () => {
+    liveProvider();
+    stubPublishNetwork({ body: { agent_id: 'agent_pilot', version: 7, is_published: true } });
+    await expect(publishRetellAgent('agent_pilot', PUBLISHED_VERSION))
+      .resolves.toEqual({ ok: false, error: 'invalid_response', mock: false });
+  });
+
+  it('returns an error when the read-back itself fails', async () => {
+    liveProvider();
+    stubPublishNetwork({ status: 404, body: {} });
+    await expect(publishRetellAgent('agent_pilot', PUBLISHED_VERSION))
+      .resolves.toEqual({ ok: false, error: 'not_found', status: 404, mock: false });
+  });
+
+  it('does not read back when the publish itself was refused', async () => {
+    liveProvider();
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>(async url => {
+      calls.push(String(url));
+      return new Response('provider secret detail', { status: 401 });
+    }));
+    await expect(publishRetellAgent('agent_pilot', PUBLISHED_VERSION))
+      .resolves.toEqual({ ok: false, error: 'unauthorized', status: 401, mock: false });
+    expect(calls).toEqual(['https://api.retellai.com/publish-agent/agent_pilot']);
+  });
+
+  it('refuses an impossible version before touching the provider', async () => {
+    liveProvider();
+    const fetchMock = vi.fn<typeof fetch>();
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(publishRetellAgent('agent_pilot', -1))
+      .resolves.toEqual({ ok: false, error: 'invalid_request', mock: false });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});

@@ -1366,9 +1366,14 @@ export async function deleteCallData(callId: string): Promise<RetellMutationResu
 //   - create-agent returns { agent_id, version, is_published }; every
 //     update-agent PATCH creates a NEW draft version, so response_engine.version
 //     must be set to the LLM version being deployed in the same call.
-//   - Publishing is POST /publish-agent-version/{agent_id} { version }. The
-//     response body is undocumented; the published version is the one we asked
-//     for and verification reads it back with get-agent?version=<n>.
+//   - Publishing is POST /publish-agent/{agent_id}, no body. Its sibling
+//     /publish-agent-version/{agent_id} { version } also publishes, but it
+//     FREEZES the agent entity: every later update-agent PATCH answers
+//     422 "Cannot update published agent other than version title", so a clinic
+//     could deploy exactly once and never change its prompt, hours, services,
+//     voice or disclosure again. /publish-agent leaves the agent updatable.
+//     Neither response body is documented, so publishing is confirmed by
+//     reading get-agent?version=<n> back.
 //   - There is no public write endpoint for version tags; deployments pin by
 //     numeric version and the tag stays a BYO-only evidence path.
 // ===========================================================================
@@ -1492,8 +1497,35 @@ export async function updateRetellAgent(agentId: string, spec: RetellAgentSpec, 
 }
 
 /**
- * Publish one exact draft version. The response is deliberately not trusted
- * for the version number: the caller verifies `get-agent?version=<n>` next.
+ * Publish the agent's current draft, and return the version the PROVIDER says
+ * is published rather than the one we hoped for.
+ *
+ * Two endpoints publish, and only one of them leaves the clinic able to change
+ * its receptionist afterwards:
+ *
+ *   - POST /publish-agent-version/{agent_id} { version } publishes the exact
+ *     version named, and then freezes the agent entity. Every subsequent
+ *     PATCH /update-agent/{id} answers 422 "Cannot update published agent other
+ *     than version title" — permanently. A clinic could deploy once and never
+ *     edit its prompt, hours, services, voice or disclosure again, and the only
+ *     way out was to abandon the agent and create a new one per deploy.
+ *   - POST /publish-agent/{agent_id}, no body, publishes the current draft and
+ *     leaves the agent updatable: the next PATCH still returns 200. Verified
+ *     against the live account on 2026-08-31.
+ *
+ * The cost of the good endpoint is that it takes no version argument: it
+ * publishes whatever draft is current, so the version we were handed is an
+ * assumption until the provider confirms it. That number is not cosmetic — the
+ * caller binds the clinic's inbound phone number to it, so guessing it wrong
+ * points a real telephone line at a version that may not exist or may not be
+ * published. So we read it back with `get-agent?version=<expected>` and only
+ * return a version the provider itself reports as published at that number.
+ *
+ * Deliberately the version-scoped read and not the bare `get-agent/{id}`: after
+ * /publish-agent the entity-level read reports the NEXT draft
+ * (`version = N+1, is_published = false`), which is correct and is not the
+ * thing we published. The version-scoped read is the one that answers the
+ * question, and it is the same read `evaluateRetellAgentReadiness` trusts.
  */
 export async function publishRetellAgent(agentId: string, version: number): Promise<RetellProviderResult<{ version: number }>> {
   if (!retellCredentials().apiKey) return { ok: false, error: 'setup_required', mock: false };
@@ -1501,8 +1533,18 @@ export async function publishRetellAgent(agentId: string, version: number): Prom
   if (!Number.isSafeInteger(version) || version < 0) return { ok: false, error: 'invalid_request', mock: status.mock };
   const simulated = await simulatedRetellProvider();
   if (simulated) return simulated.publishAgent(agentId, version);
-  const result = await providerRequest(`/publish-agent-version/${encodeURIComponent(agentId)}`, { method: 'POST', body: { version } });
-  return result.ok ? { ok: true, value: { version }, mock: false } : result;
+  const published = await providerRequest(`/publish-agent/${encodeURIComponent(agentId)}`, { method: 'POST' });
+  if (!published.ok) return published;
+  // The read-back. A publish that "succeeded" and a version that is actually
+  // published are different claims, and only the second one is safe to bind a
+  // phone number to.
+  const confirmed = await providerRequest(`/get-agent/${encodeURIComponent(agentId)}?version=${version}`, { method: 'GET' });
+  if (!confirmed.ok) return confirmed;
+  const confirmedVersion = nonNegativeInteger(confirmed.value.version);
+  if (confirmed.value.is_published !== true || confirmedVersion !== version) {
+    return { ok: false, error: 'invalid_response', mock: false };
+  }
+  return { ok: true, value: { version: confirmedVersion }, mock: false };
 }
 
 export interface PhoneNumberBinding { phoneNumber: string; inboundAgentId: string | null; inboundAgentVersion: number | null }
