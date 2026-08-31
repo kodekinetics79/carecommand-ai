@@ -273,3 +273,21 @@ export async function enqueueReceptionistCallReconciliationTenantJob(tenantId: s
   const data = createTenantJobEnvelope({ queue: 'receptionist-call-reconciliation', operation: 'scan', tenantId, _otel: currentTraceCarrier() });
   await receptionistCallReconciliationQueue.add('scan-tenant', data, { jobId: tenantJobId(data) });
 }
+
+// ---- The registry -----------------------------------------------------------
+// Every queue that lives under `bullMqPrefix`, in one place.
+//
+// This exists because the namespace-teardown test hand-listed the queues it
+// knew about, so adding a queue silently left that list stale: the new queue's
+// `:meta` key survived a cleanup that claimed to remove "every key in its own
+// namespace". A list that a new member must remember to join is not a list of
+// every member. Anything iterating all queues — teardown, depth sampling,
+// health — should derive from this rather than restate it.
+export const ALL_QUEUES = [
+  autopilotQueue,
+  complianceQueue,
+  campaignQueue,
+  monitoringQueue,
+  eligibilityReconciliationQueue,
+  receptionistCallReconciliationQueue,
+] as const;

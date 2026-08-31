@@ -69,11 +69,29 @@ export function hashResetToken(token: string) {
 // --- AES-256-GCM secret encryption (for MFA secrets at rest) ---------------
 // Key: dedicated AUTH_ENCRYPTION_KEY if provided, else derived from JWT_SECRET.
 // Stored format: gcm$<iv hex>$<authTag hex>$<ciphertext hex>.
-const encryptionKey = scryptSync(env.AUTH_ENCRYPTION_KEY ?? env.JWT_SECRET, 'carecommand-auth-enc', 32);
+//
+// Derived ON FIRST USE, not at import. `scryptSync` is a deliberately slow KDF
+// and it THROWS when handed undefined, so deriving at module scope made merely
+// importing this file expensive and, in any process whose env carries neither
+// key, fatal. That reached well beyond the code that encrypts anything: the
+// reconciliation worker imports `retell` for one API call, `retell` imports
+// `providerCredentials`, and that imported this — so the worker could not boot
+// because of a key it never uses. A module should not fail to load over
+// configuration it may never touch.
+//
+// Memoised, so the cost is still paid exactly once per process.
+let encryptionKeyCache: Buffer | null = null;
+function encryptionKey(): Buffer {
+  if (encryptionKeyCache) return encryptionKeyCache;
+  const material = env.AUTH_ENCRYPTION_KEY ?? env.JWT_SECRET;
+  if (!material) throw new Error('security: AUTH_ENCRYPTION_KEY or JWT_SECRET is required to encrypt or decrypt secrets');
+  encryptionKeyCache = scryptSync(material, 'carecommand-auth-enc', 32);
+  return encryptionKeyCache;
+}
 
 export function encryptSecret(plaintext: string): string {
   const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', encryptionKey, iv);
+  const cipher = createCipheriv('aes-256-gcm', encryptionKey(), iv);
   const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
   const tag = cipher.getAuthTag();
   return `gcm$${iv.toString('hex')}$${tag.toString('hex')}$${ciphertext.toString('hex')}`;
@@ -84,7 +102,7 @@ export function decryptSecret(stored: string): string | null {
   if (parts.length !== 4 || parts[0] !== 'gcm') return null;
   try {
     const [, ivHex, tagHex, dataHex] = parts;
-    const decipher = createDecipheriv('aes-256-gcm', encryptionKey, Buffer.from(ivHex, 'hex'));
+    const decipher = createDecipheriv('aes-256-gcm', encryptionKey(), Buffer.from(ivHex, 'hex'));
     decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
     return Buffer.concat([decipher.update(Buffer.from(dataHex, 'hex')), decipher.final()]).toString('utf8');
   } catch {

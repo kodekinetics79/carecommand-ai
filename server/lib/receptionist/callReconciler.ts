@@ -50,10 +50,11 @@ import { requireTenantContext } from '../tenantContext';
 import { recordUsageEvent, voiceCallDedupeKey, USAGE_METRICS } from '../usageMetering';
 // `targetStatusAfterOutcome` is the single definition of the campaign retry
 // policy and must not be forked here — a target this reconciler releases has to
-// land in exactly the state the webhook path would have put it in. It lives in
-// the outbound route module today; extracting it into this directory is the
-// right follow-up, and would stop the worker pulling a Fastify route module in.
-import { DEFAULT_VOICE_MINUTES_LIMIT, targetStatusAfterOutcome } from '../../modules/receptionist/outbound';
+// land in exactly the state the webhook path would have put it in. It now lives
+// in a policy module with no HTTP dependencies, so this worker no longer drags
+// the Fastify route graph (and its module-scope credential key derivation) into
+// a process that serves no requests.
+import { DEFAULT_VOICE_MINUTES_LIMIT, targetStatusAfterOutcome } from './outboundPolicy';
 import type { ReceptionistCallOutcome } from '../../generated/prisma/client';
 
 export const CALL_RECONCILIATION_ACTOR = 'worker:receptionist-call-reconciliation';
