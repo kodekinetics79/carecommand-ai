@@ -21,11 +21,11 @@ export function OutboundStopCard({ control, result, canStop, stopping, error, on
     <div role={control.stopped ? 'alert' : 'status'} className={`cc-card border-l-4 p-4 ${control.stopped ? 'border-l-red-v' : 'border-l-emerald-v'}`}>
       <div className="flex items-start justify-between gap-4">
         <div>
-          <p className={`text-sm font-bold ${control.stopped ? 'text-red-v' : 'text-t1'}`}>{control.stopped ? 'Tenant outbound is stopped' : 'Tenant outbound stop is not active'}</p>
+          <p className={`text-sm font-bold ${control.stopped ? 'text-red-v' : 'text-t1'}`}>{control.stopped ? 'Outbound calling is stopped' : 'Outbound calling is on'}</p>
           <p className="text-xs text-t3 mt-1">
             {control.stopped
               ? 'No new outbound calls may launch. Only the independent platform safety control can clear this tenant-wide stop.'
-              : canStop ? 'Owners and administrators can fail safe immediately. This status does not prove any campaign is otherwise ready.' : 'Only an owner or administrator can activate the emergency stop.'}
+              : canStop ? 'Stop every outbound call for this clinic at once. Campaigns still have their own checks; this only says calling is not blocked here.' : 'Only an owner or administrator can stop outbound calling.'}
           </p>
           {control.stopped && control.reason && <p className="text-xs text-t2 mt-2"><span className="font-semibold">Recorded reason:</span> {control.reason}</p>}
           {control.stopped && control.changedAt && <p className="text-[11px] text-t3 mt-1">Stop state last changed {new Date(control.changedAt).toLocaleString()}.</p>}
