@@ -83,8 +83,14 @@ export function hashResetToken(token: string) {
 let encryptionKeyCache: Buffer | null = null;
 function encryptionKey(): Buffer {
   if (encryptionKeyCache) return encryptionKeyCache;
+  // `??`, not `||`, and the guard matches it: an explicitly empty
+  // AUTH_ENCRYPTION_KEY derived a usable key before this change and must keep
+  // doing so. Moving derivation later must not quietly move the boundary of
+  // what counts as configured.
   const material = env.AUTH_ENCRYPTION_KEY ?? env.JWT_SECRET;
-  if (!material) throw new Error('security: AUTH_ENCRYPTION_KEY or JWT_SECRET is required to encrypt or decrypt secrets');
+  if (material === undefined || material === null) {
+    throw new Error('security: AUTH_ENCRYPTION_KEY or JWT_SECRET is required to encrypt or decrypt secrets');
+  }
   encryptionKeyCache = scryptSync(material, 'carecommand-auth-enc', 32);
   return encryptionKeyCache;
 }
