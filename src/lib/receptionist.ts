@@ -351,6 +351,8 @@ export interface CallTarget {
   attempts: number;
   lastCallLogId: string | null;
   lastOutcome: string | null;
+  /** The appointment this target is being called ABOUT; null for a recall or reactivation call. */
+  appointmentId: string | null;
   createdAt: string;
 }
 
@@ -384,6 +386,17 @@ export function launchControlsBlocked(input: {
   return input.transportAmbiguous || !input.reconciliationVerified || input.reconciliations.length > 0;
 }
 
+/** One upcoming appointment a target may be created FROM, so the call is about the patient's own visit. */
+export interface OutboundTargetCandidateAppointment {
+  appointmentId: string;
+  /** ISO instant; render it in `timezone`, which is the branch the patient attends. */
+  startsAt: string;
+  timezone: string;
+  service: string;
+  clinician: string | null;
+  location: string;
+}
+
 export interface OutboundTargetCandidate {
   type: 'patient' | 'lead';
   id: string;
@@ -391,6 +404,8 @@ export interface OutboundTargetCandidate {
   phone: string;
   voiceAuthorizationReady: boolean;
   voiceAuthorizationReason: 'compatible_immutable_consent' | 'treatment_operations' | 'suppressed' | 'consent_missing_or_incompatible';
+  /** Always empty for a lead: an appointment belongs to a patient. */
+  appointments: OutboundTargetCandidateAppointment[];
 }
 
 export interface BookingRequest {
@@ -834,7 +849,7 @@ export const receptionistApi = {
   approveOutboundCampaign: (id: string, status: 'SCHEDULED' | 'RUNNING') => apiRequest<OutboundCampaign>(`${base}/outbound-campaigns/${id}/approve`, { method: 'POST', body: JSON.stringify({ approvalConfirmed: true, status }) }),
   listTargets: (campaignId: string) => apiRequest<CallTarget[]>(`${base}/outbound-campaigns/${campaignId}/targets`),
   listOutboundTargetCandidates: (campaignId: string, q = '') => apiRequest<OutboundTargetCandidate[]>(`${base}/outbound-target-candidates?campaignId=${encodeURIComponent(campaignId)}${q ? `&q=${encodeURIComponent(q)}` : ''}`),
-  addTargets: (campaignId: string, targets: Array<Partial<CallTarget> & { patientId?: string; leadId?: string }>) =>
+  addTargets: (campaignId: string, targets: Array<Partial<CallTarget> & { patientId?: string; leadId?: string; appointmentId?: string }>) =>
     apiRequest<{ added: number }>(`${base}/outbound-campaigns/${campaignId}/targets`, { method: 'POST', body: JSON.stringify({ targets }) }),
   attachLiveTestTarget: (campaignId: string, body: {
     firstName?: string;

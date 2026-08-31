@@ -16,11 +16,7 @@ import {
 import { bookAppointmentToolFingerprint, compileIntakeContract } from '../modules/receptionist/intakeContract';
 import { buildRetellConfig, type PromptConfig } from '../modules/receptionist/promptService';
 import { promptFixture } from './fixtures/receptionistPromptConfigs';
-
-// A finished prompt still carries the runtime {{variables}} Retell substitutes
-// per call; only those are allowed to survive rendering.
-const RUNTIME_PLACEHOLDER = /\{\{\s*(is_open_now|hours_today|next_opening|closure_reason|emergency_number|known_first_name|human_fallback_number|admission_state|location_name|location_address|location_phone)\s*\}\}/g;
-const stripRuntimeVariables = (value: string) => value.replace(RUNTIME_PLACEHOLDER, '');
+import { stripRuntimeVariables } from './helpers/runtimePlaceholders';
 
 
 const original = { apiKey: env.RETELL_API_KEY, baseUrl: env.RETELL_BASE_URL };
