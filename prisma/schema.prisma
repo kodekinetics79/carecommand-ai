@@ -2341,6 +2341,15 @@ model ReceptionistCallLog {
   clinicId                     String?                              @db.Uuid
   campaignId                   String?                              @db.Uuid
   retellCallId                 String?                              @unique
+  // When a non-terminal call stops counting against capacity.
+  //
+  // A call the provider never starts sends no lifecycle webhook, so nothing
+  // ever closes its row. Those rows accumulated forever and consumed tenant
+  // concurrency permanently. The DB CHECK below makes a non-terminal row
+  // impossible to insert WITHOUT an expiry, so the leak cannot be
+  // reintroduced by a new code path that forgets to set one, and capacity
+  // recovers on its own even if the sweeper is not running.
+  deadlineAt                   DateTime?
   // Inbound patient-data tools bind the signed provider envelope to one exact,
   // currently verified clinic deployment before any tool is dispatched. These
   // fields are immutable call authority; null is retained for legacy and
