@@ -390,7 +390,7 @@ describe('env schema — attended synthetic live voice UAT', () => {
     // deployed, and the cap is 24 hours — six consecutive production deploys
     // died on a value that was correct when it was typed. A duration is
     // computed from process start and cannot expire in transit.
-    const { LIVE_TEST_EXPIRES_AT: _omitted, ...withoutTimestamp } = validLiveUat();
+    const withoutTimestamp = { ...validLiveUat(), LIVE_TEST_EXPIRES_AT: undefined };
     expect(envSchema.safeParse({ ...withoutTimestamp, LIVE_TEST_EXPIRES_IN_HOURS: 20 }).success).toBe(true);
 
     // The unblock that matters operationally: a duration makes an already-stale
@@ -402,7 +402,7 @@ describe('env schema — attended synthetic live voice UAT', () => {
   });
 
   it('still requires an expiry of some kind, and bounds the duration', () => {
-    const { LIVE_TEST_EXPIRES_AT: _omitted, ...withoutTimestamp } = validLiveUat();
+    const withoutTimestamp = { ...validLiveUat(), LIVE_TEST_EXPIRES_AT: undefined };
     expect(envSchema.safeParse(withoutTimestamp).success).toBe(false);
     expect(envSchema.safeParse({ ...withoutTimestamp, LIVE_TEST_EXPIRES_IN_HOURS: 0 }).success).toBe(false);
     expect(envSchema.safeParse({ ...withoutTimestamp, LIVE_TEST_EXPIRES_IN_HOURS: 25 }).success).toBe(false);
