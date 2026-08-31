@@ -59,6 +59,16 @@ import { liveCallingBlockReason, TENANT_MODE_DEMO_BLOCK } from '../../lib/tenant
 
 export const DEFAULT_VOICE_MINUTES_LIMIT = 500;
 
+// How long an outbound call may still plausibly be running. This is a CAPACITY
+// bound, not a call-duration policy: the provider hard-stops calls far inside
+// it, and nothing here ever decides a call's outcome. An attended live test
+// already carries a provider-enforced ceiling (`maxCallDurationMs`, from
+// LIVE_TEST_MAX_CALL_MINUTES), so that number is used when there is one.
+const OUTBOUND_CALL_MAX_MINUTES = 60;
+// Slack for a late `call_ended`/`call_analyzed`, so a call that really did run
+// to the bound is not treated as expired while its webhook is still in flight.
+const OUTBOUND_CALL_DEADLINE_MARGIN_MINUTES = 15;
+
 type ProviderBoundaryTestStage = 'before_suppression_fence' | 'suppression_fence_acquired' | 'provider_intent_committed' | 'before_provider_binding_lock' | 'provider_binding_committed' | 'before_call_stopping_evaluation';
 let providerBoundaryTestHook: ((stage: ProviderBoundaryTestStage) => Promise<void>) | null = null;
 
@@ -1538,6 +1548,20 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       direction: 'outbound',
       outcome: 'IN_PROGRESS' as const,
       startedAt: new Date(),
+      // When this row stops counting against tenant capacity if nothing ever
+      // closes it. A provider call that is accepted and never connected sends
+      // no lifecycle webhook at all — no `call_started`, so no `call_ended` —
+      // so without an expiry the row stays IN_PROGRESS forever and the leak is
+      // monotonic. `ReceptionistCallLog_non_terminal_needs_deadline_check`
+      // makes a non-terminal row impossible to insert without one, so a future
+      // path that forgets fails loudly here instead of leaking quietly.
+      //
+      // Expiring is NOT reconciling: the outcome stays IN_PROGRESS until a
+      // signed webhook or an explicit provider read says what happened. All an
+      // expired row loses is its claim on a concurrency slot.
+      deadlineAt: new Date(Date.now() + (
+        (liveTest ? liveTest.maxCallMinutes : OUTBOUND_CALL_MAX_MINUTES) + OUTBOUND_CALL_DEADLINE_MARGIN_MINUTES
+      ) * 60_000),
     };
     const reservation = await db.$transaction(async tx => {
           const clientAttemptKey = body.clientAttemptToken
@@ -1612,8 +1636,23 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
             },
             select: { used: true, limitValue: true },
           });
+          // Only calls that could still be live hold a slot. Before `deadlineAt`
+          // nothing ever decremented this count for a call the provider never
+          // connected, so a tenant walked one-way toward its ceiling and stayed
+          // there: at the attended-test ceiling of one call that is the line off
+          // the air after a single stranded dial, and ~25 of them shut an
+          // ordinary clinic. An expired row releasing its slot is what lets a
+          // tenant recover on its own even when the reconciler is down.
+          //
+          // A row with NO deadline still counts. Null means "written before
+          // this column existed, or by a writer that does not stamp one yet",
+          // and "we cannot tell whether this call is over" must never be read
+          // as "this call is over".
           const activeCalls = await tx.receptionistCallLog.count({
-            where: { tenantId: request.auth.tenantId, outcome: 'IN_PROGRESS', endedAt: null },
+            where: {
+              tenantId: request.auth.tenantId, outcome: 'IN_PROGRESS', endedAt: null,
+              OR: [{ deadlineAt: null }, { deadlineAt: { gt: new Date() } }],
+            },
           });
           // A demonstration workspace must never dial a real number. Checked
           // before concurrency and quota so it cannot be reached by waiting.
@@ -1991,11 +2030,31 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     const dialLocale = resolvedLocaleFormat(dialPack, campaign.clinic.defaultLanguage);
     const dialStatus = dialBundle ? hoursStatus(dialBundle.source, new Date(), dialLocale) : null;
 
+    // The per-call webhook URL is read by the receiving handler BEFORE the
+    // provider signature is verified: its first statement is
+    // `z.object({ clinicId: uuid.optional(), campaignId: uuid.optional() }).parse(request.query)`.
+    // `receptionistCampaignId` is null on every APPOINTMENT_REQUEST_ONLY
+    // campaign — only DIRECT_BOOKING_IF_SLOT_AVAILABLE requires one, and
+    // APPOINTMENT_REQUEST_ONLY is the default — so interpolating `?? ''` put a
+    // trailing `&campaignId=` on the URL. '' is not a uuid, so the parse threw
+    // and the error plugin answered 400 before signature verification and
+    // without an audit row. A 400 is permanent to a webhook sender: every
+    // lifecycle event for a default-shape outbound campaign was dropped, which
+    // is why those call logs never left IN_PROGRESS. Confirmed against
+    // production 2026-08-31 — the URL with `&campaignId=` answers 400, the same
+    // URL without the parameter answers 401, i.e. it reaches signature
+    // verification, which is the correct refusal for an unsigned probe.
+    //
+    // An optional parameter that is ABSENT has to be omitted, not sent empty.
+    // `emptyToNull` (above) exists for exactly this confusion on the way IN
+    // from the Studio form; this is the same mistake on the way OUT.
+    const callWebhookQuery = new URLSearchParams({ clinicId: campaign.clinicId });
+    if (campaign.receptionistCampaignId) callWebhookQuery.set('campaignId', campaign.receptionistCampaignId);
     const result = await createPhoneCall({
       toNumber: canonicalDialDestination,
       agentId: authorizedCampaign.agent!.providerAgentId!,
       agentVersion: authorizedCampaign.agent!.providerVersion!,
-      webhookUrl: `${env.PUBLIC_API_URL}/v1/receptionist/webhooks/retell?clinicId=${campaign.clinicId}&campaignId=${campaign.receptionistCampaignId ?? ''}`,
+      webhookUrl: `${env.PUBLIC_API_URL}/v1/receptionist/webhooks/retell?${callWebhookQuery.toString()}`,
       dynamicVariables: {
         ...buildHoursDynamicVariables({ status: dialStatus, strings: dialPack?.strings ?? null }),
         clinic_name: campaign.clinic.name,
@@ -2653,19 +2712,74 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
       return reply.code(502).send({ status: 'provider_unavailable', reason: provider.error });
     }
     const snapshot = provider.call;
+
+    // ---- Reconciliation authority -----------------------------------------
+    // Whether this provider record is OURS is decided by evidence we already
+    // hold, not by reading our own metadata back off the provider:
+    //
+    //   * we minted the request under a durable
+    //     `ReceptionistOutboundProviderIntent` for THIS call log, committed
+    //     before the provider was ever contacted;
+    //   * the provider returned this `call_id` synchronously on that same
+    //     request, and `getPhoneCall` refuses to answer about any other id
+    //     (`retell_call_id_mismatch`);
+    //   * `ReceptionistCallLog.retellCallId` is globally `@unique`, so one
+    //     provider call cannot be claimed by two tenants — cross-tenant
+    //     misattribution is a database invariant, not a policy.
+    //
+    // The intent is the load-bearing half. A `retellCallId` sitting on a local
+    // row with no intent is NOT ours however friendly the provider record
+    // looks, and stays quarantined: "the id is on one of our rows, therefore
+    // it is ours" is precisely the reasoning this refuses.
+    const submissionIntent = await db.receptionistOutboundProviderIntent.findFirst({
+      where: {
+        tenantId: request.auth.tenantId,
+        callLogId: localCall.id,
+        outboundCampaignId: params.campaignId,
+      },
+      select: { id: true },
+    });
+
+    // The provider record is corroboration, matched three-valued:
+    // match / mismatch / ABSENT. The old check collapsed absent into mismatch,
+    // and a call the provider never STARTED carries no metadata at all — no
+    // tenant, no campaign, no call log, no `to_number`. So the one population
+    // this endpoint exists to rescue (accepted, never connected, no lifecycle
+    // webhook ever delivered, row pinned IN_PROGRESS forever) was the exact
+    // population it was guaranteed to refuse. Silence is not contradiction.
+    // A populated field naming someone ELSE still hard-quarantines.
     const metadataTenant = typeof snapshot.metadata.tenantId === 'string' ? snapshot.metadata.tenantId : null;
     const metadataCampaign = typeof snapshot.metadata.outboundCampaignId === 'string' ? snapshot.metadata.outboundCampaignId : null;
     const metadataCallLog = typeof snapshot.metadata.callLogId === 'string' ? snapshot.metadata.callLogId : null;
-    const expectedAgentId = localCall.outboundCampaign?.agent?.providerAgentId ?? null;
-    const expectedAgentVersion = localCall.outboundCampaign?.agent?.providerVersion ?? null;
-    if (metadataTenant !== request.auth.tenantId
-      || metadataCampaign !== params.campaignId
-      || metadataCallLog !== localCall.id
-      || (expectedAgentId && snapshot.agentId !== expectedAgentId)
-      || (expectedAgentVersion !== null && snapshot.agentVersion !== expectedAgentVersion)) {
+    // Agent IDS are stable across a republish, so the campaign's binding is a
+    // sound expectation for one. Agent VERSIONS are not: re-verifying or
+    // republishing an agent bumps `providerVersion`, and the provider record
+    // keeps reporting the version the call actually ran under — so comparing a
+    // finished call against the campaign's version NOW quarantined correctly
+    // attributed calls every time the deployment moved on. A version may only
+    // be contradicted by the version this call was dispatched under, which is
+    // the immutable binding stamped on the call row itself (null on rows that
+    // carry no binding — absent, and therefore not a contradiction).
+    const expectedAgentId = localCall.boundProviderAgentId ?? localCall.outboundCampaign?.agent?.providerAgentId ?? null;
+    const dispatchedAgentVersion = localCall.boundProviderAgentVersion;
+    const contradicts = (expected: string | number | null, actual: string | number | null) =>
+      expected !== null && actual !== null && expected !== actual;
+    const bindingContradiction = contradicts(request.auth.tenantId, metadataTenant) ? 'metadata_tenant'
+      : contradicts(params.campaignId, metadataCampaign) ? 'metadata_campaign'
+        : contradicts(localCall.id, metadataCallLog) ? 'metadata_call_log'
+          : contradicts(expectedAgentId, snapshot.agentId) ? 'provider_agent'
+            : contradicts(dispatchedAgentVersion, snapshot.agentVersion) ? 'provider_agent_version'
+              : null;
+    if (!submissionIntent || bindingContradiction) {
       await audit(request, {
         action: 'receptionist.call.providerSyncQuarantined', resource: 'receptionistCallLog', resourceId: localCall.id,
-        metadata: { campaignId: params.campaignId, providerStatus: snapshot.status, reason: 'provider_binding_mismatch' },
+        metadata: {
+          campaignId: params.campaignId, providerStatus: snapshot.status, reason: 'provider_binding_mismatch',
+          // Which half refused, so an operator can tell "we never submitted
+          // this call" apart from "the provider says it belongs to someone
+          // else" without reading the provider record by hand.
+          quarantine: submissionIntent ? bindingContradiction : 'no_local_submission_intent',
+        },
       });
       return reply.code(409).send({ status: 'quarantined', reason: 'provider_binding_mismatch' });
     }
