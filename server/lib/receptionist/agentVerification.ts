@@ -311,6 +311,11 @@ export async function verifyAgentProvider(input: VerifyInput): Promise<VerifyOut
       ...(success && probe.ok ? providerSnapshotData(probe.snapshot) : {}),
       ...(success ? {
         providerStatus: 'VERIFIED' as const,
+        // Which kind of attestation this row is. A pinned deployment is routed
+        // by numeric version and needs no provider tag; a hand-linked (BYO)
+        // agent is routed BY tag, so the database still refuses to call it
+        // attested until the tag is genuinely assigned at the provider.
+        providerVersionPinned: deployment?.providerAgentVersion !== null && deployment?.providerAgentVersion !== undefined,
         providerVerifiedRevision: current.providerConfigRevision,
         providerVerifiedAt: attemptedAt,
         providerVerificationExpiresAt: new Date(attemptedAt.getTime() + RETELL_AGENT_VERIFICATION_TTL_MS),
