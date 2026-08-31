@@ -1129,6 +1129,49 @@ export interface RetellAgentReadinessRequirements {
  * value we set. Keys present only on the provider's copy are defaults we did
  * not express an opinion about, so they are ignored.
  */
+/**
+ * "We asked for nothing" and "the provider has nothing" are the same state.
+ *
+ * Retell normalises empty collections away on write: we author
+ * `parameters: { type: 'object', properties: {}, required: [] }` for a tool
+ * that takes no arguments, and it stores `{ properties: {}, type: 'object' }`
+ * with `required` dropped entirely. A key we set to an empty list coming back
+ * absent is the provider agreeing with us, not drifting from us.
+ *
+ * Only vacuous values are forgiven. A non-empty list or object that the
+ * provider dropped is still drift, because there we asked for something and
+ * did not get it.
+ */
+function vacuousToolValue(value: unknown): boolean {
+  if (Array.isArray(value)) return value.length === 0;
+  const row = record(value);
+  return row !== null && Object.keys(row).length === 0;
+}
+
+/**
+ * Does the provider's value still say what we authored?
+ *
+ * Recursive, because the normalisation happens at any depth: the empty
+ * `required` Retell drops lives inside `parameters`, not at the top of the
+ * tool. Extra keys on the provider's side are its defaults and are ignored at
+ * every level, for the same reason they are ignored at the top.
+ */
+function toolValueMatches(authored: unknown, actual: unknown): boolean {
+  if (Array.isArray(authored)) {
+    return Array.isArray(actual)
+      && authored.length === actual.length
+      && authored.every((item, index) => toolValueMatches(item, actual[index]));
+  }
+  const authoredRow = record(authored);
+  if (authoredRow) {
+    const actualRow = record(actual);
+    if (!actualRow) return false;
+    return Object.entries(authoredRow).every(([key, value]) =>
+      (!(key in actualRow) && vacuousToolValue(value)) || toolValueMatches(value, actualRow[key]));
+  }
+  return fingerprintJson(authored) === fingerprintJson(actual);
+}
+
 export interface DeployedToolDifference {
   /** The tool the difference is on, or null when the SET of tools differs. */
   tool: string | null;
@@ -1154,7 +1197,8 @@ export function describeDeployedToolDrift(authored: unknown[], actual: unknown[]
     const actualTool = got.get(name);
     if (!actualTool) return { tool: name, key: '*missing*' };
     for (const [key, value] of Object.entries(authoredTool)) {
-      if (fingerprintJson(value) !== fingerprintJson(actualTool[key])) return { tool: name, key };
+      if (!(key in actualTool) && vacuousToolValue(value)) continue;
+      if (!toolValueMatches(value, actualTool[key])) return { tool: name, key };
     }
   }
   return null;
@@ -1177,7 +1221,8 @@ export function compareDeployedTools(authored: unknown[], actual: unknown[]): 'o
     const actualTool = got.get(name);
     if (!actualTool) return 'tools_drift';
     for (const [key, value] of Object.entries(authoredTool)) {
-      if (fingerprintJson(value) !== fingerprintJson(actualTool[key])) return 'tools_drift';
+      if (!(key in actualTool) && vacuousToolValue(value)) continue;
+      if (!toolValueMatches(value, actualTool[key])) return 'tools_drift';
     }
   }
   return 'ok';
