@@ -1156,6 +1156,35 @@ function vacuousToolValue(value: unknown): boolean {
  * tool. Extra keys on the provider's side are its defaults and are ignored at
  * every level, for the same reason they are ignored at the top.
  */
+/**
+ * The path to the first difference, or null when the provider's value still
+ * says what we authored. `firstToolDifference` and `toolValueMatches` share
+ * one traversal so a verdict and its explanation can never disagree.
+ */
+function firstToolDifference(authored: unknown, actual: unknown, path: string): string | null {
+  if (actual === undefined) return authored === undefined ? null : path;
+  if (Array.isArray(authored)) {
+    if (!Array.isArray(actual) || authored.length !== actual.length) return path;
+    for (const [index, item] of authored.entries()) {
+      const inner = firstToolDifference(item, actual[index], `${path}[${index}]`);
+      if (inner) return inner;
+    }
+    return null;
+  }
+  const authoredRow = record(authored);
+  if (authoredRow) {
+    const actualRow = record(actual);
+    if (!actualRow) return path;
+    for (const [key, value] of Object.entries(authoredRow)) {
+      if (!(key in actualRow) && vacuousToolValue(value)) continue;
+      const inner = firstToolDifference(value, actualRow[key], `${path}.${key}`);
+      if (inner) return inner;
+    }
+    return null;
+  }
+  return fingerprintJson(authored) === fingerprintJson(actual) ? null : path;
+}
+
 function toolValueMatches(authored: unknown, actual: unknown): boolean {
   // `fingerprintJson(undefined)` throws ERR_INVALID_ARG_TYPE: JSON.stringify
   // returns undefined for it and the hash refuses that. A key the provider
@@ -1204,7 +1233,10 @@ export function describeDeployedToolDrift(authored: unknown[], actual: unknown[]
     if (!actualTool) return { tool: name, key: '*missing*' };
     for (const [key, value] of Object.entries(authoredTool)) {
       if (!(key in actualTool) && vacuousToolValue(value)) continue;
-      if (!toolValueMatches(value, actualTool[key])) return { tool: name, key };
+      // The full path, not just the top-level key. `parameters` alone sent a
+      // reader hunting through a fourteen-property JSON Schema by hand.
+      const difference = firstToolDifference(value, actualTool[key], key);
+      if (difference) return { tool: name, key: difference };
     }
   }
   return null;
