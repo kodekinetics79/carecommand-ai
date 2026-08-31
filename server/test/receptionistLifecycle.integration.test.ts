@@ -9,8 +9,8 @@ import { signRetell } from './helpers/retellSignature';
 // creates a log, a later call_analyzed UPDATES the same log (duration, summary,
 // sentiment, recording), a BOOKED outcome files exactly one appointment request,
 // webhook redelivery is idempotent, an OPTED_OUT files one opt-out, an unknown
-// outcome degrades to IN_PROGRESS, and a webhook can only ever write into the
-// tenant that owns the clinic on the URL.
+// outcome is discarded without stopping the call from ending terminally, and a
+// webhook can only ever write into the tenant that owns the clinic on the URL.
 vi.mock('../workers/queues', () => ({
   redisConnection: {},
   autopilotQueue: { client: Promise.resolve(undefined), add: async () => undefined },
@@ -178,14 +178,20 @@ describe('receptionist inbound-call lifecycle (event webhook)', () => {
     expect(optOuts[0].channel).toBe('ALL');
   });
 
-  it('an unrecognized outcome degrades to IN_PROGRESS (never crashes)', async () => {
+  it('an unrecognized outcome is discarded but the call still ends terminally (never crashes)', async () => {
     const t = await makeTenant();
     const callId = `call-${randomUUID()}`;
     await registerCall(t, callId, '+15550001234');
     const res = await webhook(t.clinicId, { event: 'call_analyzed', call: { call_id: callId, from_number: '+15550001234', direction: 'inbound', call_analysis: { custom_analysis_data: { outcome: 'ORDER_PIZZA' } } } });
     expect(res.statusCode).toBe(200);
     const log = await db.receptionistCallLog.findFirst({ where: { tenantId: t.id, retellCallId: callId } });
-    expect(log?.outcome).toBe('IN_PROGRESS');
+    // The model's word is discarded, but the PROVIDER still says the call
+    // ended, so the row is terminal. It used to degrade to IN_PROGRESS with
+    // endedAt set — a contradiction that pinned outbound targets in CALLING
+    // forever. ESCALATED is the honest answer: the call happened and no
+    // trustworthy outcome came out of it, so a human should look at it.
+    expect(log?.outcome).toBe('ESCALATED');
+    expect(log?.endedAt).not.toBeNull();
   });
 
   it('stored call authority cannot be redirected by a clinicId selector', async () => {
