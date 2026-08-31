@@ -246,6 +246,12 @@ const baseEnvSchema = z.object({
   AUTHORIZED_TEST_PHONE_E164: z.string().optional(),
   LIVE_TEST_RECIPIENT_ALLOWLIST: z.string().default(''),
   LIVE_TEST_EXPIRES_AT: z.string().datetime({ offset: true }).optional(),
+  // A duration instead of an instant. A hand-pasted timestamp goes stale
+  // between being written and being deployed — and because the cap is 24
+  // hours, a slow rollout fails boot on a value that was correct when it was
+  // typed. Six consecutive production deploys died that way. Hours are
+  // computed against process start, so they cannot expire in transit.
+  LIVE_TEST_EXPIRES_IN_HOURS: z.coerce.number().int().min(1).max(24).optional(),
   LIVE_TEST_TIMEZONE: z.string().min(1).max(80).default('America/New_York'),
   LIVE_TEST_WINDOW_START: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).default('09:00'),
   LIVE_TEST_WINDOW_END: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).default('20:00'),
@@ -345,9 +351,11 @@ export const envSchema = baseEnvSchema.superRefine((cfg, ctx) => {
     if (!cfg.RETELL_FROM_NUMBER || !e164.test(cfg.RETELL_FROM_NUMBER.trim())) {
       ctx.addIssue({ code: 'custom', path: ['RETELL_FROM_NUMBER'], message: 'Live voice UAT requires a valid Retell outbound number in E.164 format.' });
     }
-    if (!cfg.LIVE_TEST_EXPIRES_AT) {
-      ctx.addIssue({ code: 'custom', path: ['LIVE_TEST_EXPIRES_AT'], message: 'Live voice UAT requires an explicit expiration timestamp.' });
-    } else {
+    if (!cfg.LIVE_TEST_EXPIRES_AT && !cfg.LIVE_TEST_EXPIRES_IN_HOURS) {
+      ctx.addIssue({ code: 'custom', path: ['LIVE_TEST_EXPIRES_AT'], message: 'Live voice UAT requires an expiry: set LIVE_TEST_EXPIRES_IN_HOURS (1-24), or an explicit LIVE_TEST_EXPIRES_AT timestamp.' });
+    } else if (cfg.LIVE_TEST_EXPIRES_IN_HOURS) {
+      // A duration is valid by construction; the instant is derived at boot.
+    } else if (cfg.LIVE_TEST_EXPIRES_AT) {
       const expiresAt = Date.parse(cfg.LIVE_TEST_EXPIRES_AT);
       const now = Date.now();
       if (!Number.isFinite(expiresAt) || expiresAt <= now || expiresAt - now > 24 * 60 * 60 * 1_000) {
