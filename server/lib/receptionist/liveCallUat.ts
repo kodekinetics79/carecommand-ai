@@ -93,9 +93,19 @@ export function maskProviderId(value: string | null | undefined): string | null 
   return `${value.slice(0, 4)}…${value.slice(-4)}`;
 }
 
+// Process start, so a duration-based authorisation expires a fixed number of
+// hours after this service booted rather than at an instant someone typed.
+const BOOTED_AT_MS = Date.now();
+
+/** The instant this authorisation lapses, from a duration if one is set. */
+export function liveCallUatExpiresAtMs(): number {
+  if (env.LIVE_TEST_EXPIRES_IN_HOURS) return BOOTED_AT_MS + env.LIVE_TEST_EXPIRES_IN_HOURS * 3_600_000;
+  return env.LIVE_TEST_EXPIRES_AT ? Date.parse(env.LIVE_TEST_EXPIRES_AT) : Number.NaN;
+}
+
 export function liveCallUatStatus(now = new Date(), tenantId?: string): LiveCallUatStatus {
   const destinations = allowedDestinations();
-  const expiresAtMs = env.LIVE_TEST_EXPIRES_AT ? Date.parse(env.LIVE_TEST_EXPIRES_AT) : Number.NaN;
+  const expiresAtMs = liveCallUatExpiresAtMs();
   const projectedMaximumCostUsd = Number((
     env.LIVE_TEST_MAX_CALLS
     * env.LIVE_TEST_MAX_CALL_MINUTES
@@ -118,7 +128,7 @@ export function liveCallUatStatus(now = new Date(), tenantId?: string): LiveCall
     active: env.LIVE_TEST_CALLS_AUTHORIZED && blockingReason === null,
     executionId: env.LIVE_TEST_EXECUTION_ID ?? null,
     allowedDestinationMasked: maskPhone(destinations[0]),
-    expiresAt: env.LIVE_TEST_EXPIRES_AT ?? null,
+    expiresAt: Number.isFinite(expiresAtMs) ? new Date(expiresAtMs).toISOString() : null,
     timezone: env.LIVE_TEST_TIMEZONE,
     windowStart: env.LIVE_TEST_WINDOW_START,
     windowEnd: env.LIVE_TEST_WINDOW_END,

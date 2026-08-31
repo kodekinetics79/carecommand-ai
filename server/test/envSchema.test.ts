@@ -385,6 +385,29 @@ describe('env schema — attended synthetic live voice UAT', () => {
     expect(envSchema.safeParse({ ...validLiveUat(), LIVE_TEST_MAX_PROVIDER_COST_USD: 1 }).success).toBe(false);
   });
 
+  it('accepts a duration instead of an instant, and lets it override a stale timestamp', () => {
+    // A hand-pasted timestamp goes stale between being written and being
+    // deployed, and the cap is 24 hours — six consecutive production deploys
+    // died on a value that was correct when it was typed. A duration is
+    // computed from process start and cannot expire in transit.
+    const withoutTimestamp = { ...validLiveUat(), LIVE_TEST_EXPIRES_AT: undefined };
+    expect(envSchema.safeParse({ ...withoutTimestamp, LIVE_TEST_EXPIRES_IN_HOURS: 20 }).success).toBe(true);
+
+    // The unblock that matters operationally: a duration makes an already-stale
+    // timestamp irrelevant, so recovery is adding ONE variable rather than
+    // correcting one under time pressure.
+    const stale = new Date(Date.now() + 40 * 60 * 60 * 1_000).toISOString();
+    expect(envSchema.safeParse({ ...validLiveUat(), LIVE_TEST_EXPIRES_AT: stale }).success).toBe(false);
+    expect(envSchema.safeParse({ ...validLiveUat(), LIVE_TEST_EXPIRES_AT: stale, LIVE_TEST_EXPIRES_IN_HOURS: 20 }).success).toBe(true);
+  });
+
+  it('still requires an expiry of some kind, and bounds the duration', () => {
+    const withoutTimestamp = { ...validLiveUat(), LIVE_TEST_EXPIRES_AT: undefined };
+    expect(envSchema.safeParse(withoutTimestamp).success).toBe(false);
+    expect(envSchema.safeParse({ ...withoutTimestamp, LIVE_TEST_EXPIRES_IN_HOURS: 0 }).success).toBe(false);
+    expect(envSchema.safeParse({ ...withoutTimestamp, LIVE_TEST_EXPIRES_IN_HOURS: 25 }).success).toBe(false);
+  });
+
   it('rejects live-test admission in pilot and enterprise deployment profiles', () => {
     expect(envSchema.safeParse({ ...validLiveUat(), DEPLOYMENT_PROFILE: 'pilot' }).success).toBe(false);
     expect(envSchema.safeParse({ ...validLiveUat(), DEPLOYMENT_PROFILE: 'enterprise' }).success).toBe(false);
