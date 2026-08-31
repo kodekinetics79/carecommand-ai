@@ -246,3 +246,48 @@ export async function enqueueEligibilityReconciliationTenantJob(tenantId: string
   const data = createTenantJobEnvelope({ queue: 'eligibility-reconciliation', operation: 'scan', tenantId, _otel: currentTraceCarrier() });
   await eligibilityReconciliationQueue.add('scan-tenant', data, { jobId: tenantJobId(data) });
 }
+
+// ---- Receptionist stranded-call reconciliation queue ----------------------
+// Closes call rows the provider is finished with. This queue exists because a
+// call the provider never starts sends no lifecycle webhook at all, so the row
+// is only ever closed by asking. Same fan-out shape as eligibility
+// reconciliation: a signed tick enqueues one signed per-tenant job.
+export const receptionistCallReconciliationQueue: Queue<ScheduledQueueData, void, string> = QUEUES_ENABLED
+  ? new Queue('receptionist-call-reconciliation', {
+      connection: redisConnection,
+      prefix: bullMqPrefix,
+      defaultJobOptions: { attempts: 3, backoff: { type: 'exponential', delay: 2000 }, removeOnComplete: 500, removeOnFail: 1000 },
+    })
+  : disabledQueue('receptionist-call-reconciliation');
+
+export async function registerReceptionistCallReconciliationSchedule() {
+  if (!env.RECEPTIONIST_CALL_RECONCILIATION_ENABLED) return;
+  await receptionistCallReconciliationQueue.upsertJobScheduler(
+    'receptionist-call-reconciliation-scan',
+    { every: env.RECEPTIONIST_CALL_RECONCILIATION_INTERVAL_SECONDS * 1000 },
+    { name: 'scan', data: {} },
+  );
+}
+
+export async function enqueueReceptionistCallReconciliationTenantJob(tenantId: string) {
+  const data = createTenantJobEnvelope({ queue: 'receptionist-call-reconciliation', operation: 'scan', tenantId, _otel: currentTraceCarrier() });
+  await receptionistCallReconciliationQueue.add('scan-tenant', data, { jobId: tenantJobId(data) });
+}
+
+// ---- The registry -----------------------------------------------------------
+// Every queue that lives under `bullMqPrefix`, in one place.
+//
+// This exists because the namespace-teardown test hand-listed the queues it
+// knew about, so adding a queue silently left that list stale: the new queue's
+// `:meta` key survived a cleanup that claimed to remove "every key in its own
+// namespace". A list that a new member must remember to join is not a list of
+// every member. Anything iterating all queues — teardown, depth sampling,
+// health — should derive from this rather than restate it.
+export const ALL_QUEUES = [
+  autopilotQueue,
+  complianceQueue,
+  campaignQueue,
+  monitoringQueue,
+  eligibilityReconciliationQueue,
+  receptionistCallReconciliationQueue,
+] as const;

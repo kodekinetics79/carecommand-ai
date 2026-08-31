@@ -109,6 +109,17 @@ const baseEnvSchema = z.object({
   ELIGIBILITY_RECONCILIATION_STALE_SECONDS: z.coerce.number().int().min(300).max(86400).default(300),
   ELIGIBILITY_RECONCILIATION_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(25),
   ELIGIBILITY_RECONCILIATION_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(10).default(2),
+  // ---- Stranded receptionist call reconciliation ------------------------
+  // A call the provider never starts sends no lifecycle webhook, so the only
+  // thing that closes its row is a poll. Disabling this reintroduces a
+  // monotonic leak of IN_PROGRESS rows against tenant concurrency, so it may
+  // only be off in local/demo development (enforced below).
+  RECEPTIONIST_CALL_RECONCILIATION_ENABLED: booleanString(true),
+  RECEPTIONIST_CALL_RECONCILIATION_INTERVAL_SECONDS: z.coerce.number().int().min(30).max(3600).default(120),
+  // One provider round trip per stranded row, so the batch is bounded well
+  // below anything that could stall a pass.
+  RECEPTIONIST_CALL_RECONCILIATION_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(25),
+  RECEPTIONIST_CALL_RECONCILIATION_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(10).default(2),
   // A lost HTTP response or browser restart must not invoke the payer again.
   // A new idempotency key with the same tenant-scoped request fingerprint
   // replays a recent completed result only within this bounded freshness window.
@@ -294,6 +305,9 @@ export const envSchema = baseEnvSchema.superRefine((cfg, ctx) => {
   }
   if ((cfg.NODE_ENV === 'production' || cfg.DEPLOYMENT_PROFILE !== 'demo') && !cfg.ELIGIBILITY_RECONCILIATION_ENABLED) {
     ctx.addIssue({ code: 'custom', path: ['ELIGIBILITY_RECONCILIATION_ENABLED'], message: 'Eligibility reconciliation scanning must remain enabled outside local/demo development.' });
+  }
+  if ((cfg.NODE_ENV === 'production' || cfg.DEPLOYMENT_PROFILE !== 'demo') && !cfg.RECEPTIONIST_CALL_RECONCILIATION_ENABLED) {
+    ctx.addIssue({ code: 'custom', path: ['RECEPTIONIST_CALL_RECONCILIATION_ENABLED'], message: 'Receptionist call reconciliation must remain enabled outside local/demo development: without it a call the provider never starts is never closed.' });
   }
   if (Boolean(cfg.ELIGIBILITY_HMAC_PREVIOUS_SECRET) !== Boolean(cfg.ELIGIBILITY_HMAC_PREVIOUS_KEY_VERSION)) {
     ctx.addIssue({ code: 'custom', path: ['ELIGIBILITY_HMAC_PREVIOUS_SECRET'], message: 'Previous eligibility HMAC secret and key version must be configured together.' });

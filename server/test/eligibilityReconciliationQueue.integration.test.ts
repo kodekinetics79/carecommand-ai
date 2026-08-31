@@ -7,13 +7,10 @@ import { fixtureDb } from './helpers/fixtureDb';
 import { requireQueueRedis } from './helpers/requireQueueRedis';
 import { createEligibilityReconciliationWorker } from '../workers/eligibilityReconciliation.worker';
 import {
-  autopilotQueue,
+  ALL_QUEUES,
   bullMqPrefix,
-  campaignQueue,
-  complianceQueue,
   eligibilityReconciliationQueue,
   enqueueEligibilityReconciliationTenantJob,
-  monitoringQueue,
   redisConnection,
   registerEligibilityReconciliationSchedule,
   type ScheduledQueueData,
@@ -53,12 +50,13 @@ async function cleanup() {
   await worker.close();
   await eligibilityReconciliationQueue.removeJobScheduler('eligibility-reconciliation-scan').catch(() => false);
   await Promise.allSettled([
-    autopilotQueue.obliterate({ force: true }), campaignQueue.obliterate({ force: true }),
-    complianceQueue.obliterate({ force: true }), monitoringQueue.obliterate({ force: true }),
-    eligibilityReconciliationQueue.obliterate({ force: true }),
+    // Derived from the registry, never restated: a hand-written list here went
+    // stale the moment a queue was added, and this test then asserted an empty
+    // namespace while the new queue's :meta key sat in it.
+    ...ALL_QUEUES.map(queue => queue.obliterate({ force: true })),
   ]);
   await Promise.allSettled([
-    autopilotQueue.close(), campaignQueue.close(), complianceQueue.close(), monitoringQueue.close(), eligibilityReconciliationQueue.close(),
+    ...ALL_QUEUES.map(queue => queue.close()),
   ]);
 }
 
@@ -108,5 +106,9 @@ describe('eligibility reconciliation queue lifecycle', () => {
     expect(await keys(`${bullMqPrefix}:*`)).toEqual([]);
     expect((await keys(`${sentinelPrefix}:*`)).length).toBeGreaterThan(0);
     expect((await sentinel.getJob('must-survive-other-cleanup'))?.data).toEqual({ retain: true });
-  });
+    // Teardown obliterates every queue in the namespace, so its cost grows with
+    // the registry — the default 5s stopped being enough at six queues. The
+    // assertions above are unchanged; only the time allowed for the cleanup
+    // they depend on is.
+  }, 30_000);
 });
