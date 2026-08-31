@@ -526,6 +526,7 @@ model Appointment {
   @@index([tenantId, branchId, startsAt])
   @@index([tenantId, patientId, startsAt])
   @@index([tenantId, status, startsAt])
+  @@index([tenantId, patientConfirmedAt, startsAt])
   @@index([tenantId, providerProfileId, startsAt])
 }
 
@@ -3237,6 +3238,7 @@ model ReceptionistCallTarget {
 
   @@unique([tenantId, campaignId, id])
   @@index([tenantId, campaignId, status])
+  @@index([tenantId, appointmentId])
   @@unique([tenantId, campaignId, phone])
 }
 
