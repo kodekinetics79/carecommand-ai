@@ -17,8 +17,15 @@
 -- Terminal rows never need it: they already stop counting by outcome.
 -- ===========================================================================
 
+-- The DEFAULT is the point. Requiring every insert path to remember an expiry
+-- is the same class of mistake as requiring every path to remember to close a
+-- row: it works until someone adds a path. The database supplies a safe bound
+-- and code may narrow it; a writer that forgets simply gets the safe one.
 ALTER TABLE "ReceptionistCallLog"
   ADD COLUMN IF NOT EXISTS "deadlineAt" timestamp(3) without time zone;
+
+ALTER TABLE "ReceptionistCallLog"
+  ALTER COLUMN "deadlineAt" SET DEFAULT (now() AT TIME ZONE 'utc') + interval '1 hour';
 
 -- Existing stranded rows: give them an expiry so the current leak drains
 -- rather than requiring a manual sweep. One hour past their start is well

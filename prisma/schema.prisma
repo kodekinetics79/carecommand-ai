@@ -2349,7 +2349,7 @@ model ReceptionistCallLog {
   // impossible to insert WITHOUT an expiry, so the leak cannot be
   // reintroduced by a new code path that forgets to set one, and capacity
   // recovers on its own even if the sweeper is not running.
-  deadlineAt                   DateTime?
+  deadlineAt                   DateTime?                            @default(dbgenerated("((now() AT TIME ZONE 'utc'::text) + '01:00:00'::interval)"))
   // Inbound patient-data tools bind the signed provider envelope to one exact,
   // currently verified clinic deployment before any tool is dispatched. These
   // fields are immutable call authority; null is retained for legacy and
