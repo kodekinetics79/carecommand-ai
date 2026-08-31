@@ -179,6 +179,7 @@ const INBOUND_DEPLOYMENT_BOUND_TOOLS = new Set([
   'list_upcoming_appointments',
   'prepare_appointment_change',
   'cancel_appointment',
+  'confirm_appointment',
   'reschedule_appointment',
   'book_appointment',
 ]);

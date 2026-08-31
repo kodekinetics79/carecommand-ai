@@ -480,6 +480,22 @@ model Appointment {
   noShowRisk                     Int                             @default(0)
   eligibilityStatus              String?
   eligibilityLastVerifiedAt      DateTime?
+  // Did the PATIENT say they are coming, and on what evidence.
+  //
+  // Deliberately NOT AppointmentStatus. `CONFIRMED` is the default the moment a
+  // row is created, so it already means "booked" — writing it again on a
+  // patient's "yes" would be a no-op and would erase the only distinction that
+  // matters to a reminder campaign: an appointment the clinic believes in
+  // versus one the patient has actually agreed to attend.
+  //
+  // Absence means "not confirmed", never "declined": a patient who declines
+  // cancels, which is a status change. Source and evidence travel with the
+  // timestamp so a confirmation can always be traced to the call that produced
+  // it, and the CHECK below refuses a confirmation that cannot say where it
+  // came from.
+  patientConfirmedAt             DateTime?
+  patientConfirmationSource      String?
+  patientConfirmedCallLogId      String?                         @db.Uuid
   notes                          String?
   deletedAt                      DateTime?
   createdAt                      DateTime                        @default(now())
@@ -501,6 +517,7 @@ model Appointment {
   appointmentRequests            AppointmentRequest[]             @relation("AppointmentRequestBookedAppointment")
   notificationEvents             NotificationEvent[]
   campaignAttributions           CampaignAttribution[]
+  receptionistCallTargets        ReceptionistCallTarget[]        @relation("ReceptionistCallTargetAppointment")
   // Append-only note history (C4). The scalar `notes` string stays for old readers.
   noteEntries                    AppointmentNote[]
 
@@ -509,6 +526,7 @@ model Appointment {
   @@index([tenantId, branchId, startsAt])
   @@index([tenantId, patientId, startsAt])
   @@index([tenantId, status, startsAt])
+  @@index([tenantId, patientConfirmedAt, startsAt])
   @@index([tenantId, providerProfileId, startsAt])
 }
 
@@ -3196,6 +3214,13 @@ model ReceptionistCallTarget {
   lastName      String?
   phone         String
   email         String?
+  // The appointment this target is being called ABOUT.
+  //
+  // Without it a reminder campaign can only read a script written once for
+  // everybody, which is what the pilot did: every patient heard the same
+  // clinician, day and time. Nullable because reactivation and recall targets
+  // are legitimately about no appointment at all.
+  appointmentId String?                      @db.Uuid
   status        CallTargetStatus             @default(PENDING)
   attempts      Int                          @default(0)
   lastCallLogId String?                      @db.Uuid
@@ -3206,12 +3231,14 @@ model ReceptionistCallTarget {
   campaign      ReceptionistOutboundCampaign @relation(fields: [tenantId, campaignId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallTarget_campaign_scope_fkey")
   patient       Patient?                     @relation(fields: [tenantId, patientId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallTarget_patient_scope_fkey")
   lead          Lead?                        @relation(fields: [tenantId, leadId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallTarget_lead_scope_fkey")
+  appointment   Appointment?                 @relation("ReceptionistCallTargetAppointment", fields: [tenantId, appointmentId], references: [tenantId, id], onDelete: Restrict, map: "ReceptionistCallTarget_appointment_scope_fkey")
   callLogs      ReceptionistCallLog[] @relation("ReceptionistCallLogTarget")
   lastCallLog   ReceptionistCallLog? @relation("ReceptionistCallTargetLastCall", fields: [tenantId, campaignId, lastCallLogId], references: [tenantId, outboundCampaignId, id], onDelete: Restrict, map: "ReceptionistCallTarget_last_call_ownership_fkey")
   providerIntents ReceptionistOutboundProviderIntent[]
 
   @@unique([tenantId, campaignId, id])
   @@index([tenantId, campaignId, status])
+  @@index([tenantId, appointmentId])
   @@unique([tenantId, campaignId, phone])
 }
 

@@ -787,6 +787,91 @@ export async function cancelAppointment(ctx: ToolContext, args: Record<string, u
   return { cancelled: true, appointment_id: appointmentId, needs_manual_refund: outcome.needsManualRefund, message: outcome.needsManualRefund ? 'The appointment is cancelled. A payment was previously collected, so staff must review any refund; I have not promised or issued one.' : 'Your appointment is cancelled.' };
 }
 
+/**
+ * Record that the PATIENT said they are attending.
+ *
+ * This is the other half of a reminder call, and until now it did not exist.
+ * The agent could ask "confirm or cancel"; cancel had `cancel_appointment` and
+ * a status to move to, while a "yes" had nowhere to go and survived only as a
+ * sentence in the post-call summary. A clinic ran the campaign and still could
+ * not answer which appointments were confirmed.
+ *
+ * WHY THERE IS NO prepare/confirm NONCE HERE
+ *
+ * `cancel_appointment` and `reschedule_appointment` take one because they
+ * DESTROY or MOVE a booking: getting those wrong loses the patient their slot.
+ * This writes an assertion alongside the appointment and changes no scheduling
+ * state at all. The worst a mistaken confirmation does is leave the clinic
+ * expecting someone — strictly less harm than the two-step flow prevents, and
+ * a two-step confirmation of a confirmation would be absurd to sit through on
+ * the phone. It is fully auditable and reversible: the timestamp carries its
+ * source and the call log that produced it.
+ *
+ * Idempotent by construction. `patientConfirmedAt: null` in the WHERE means the
+ * first write wins and a repeat is reported as a duplicate rather than
+ * overwriting the original evidence with a later time.
+ */
+export async function confirmAppointment(ctx: ToolContext, args: Record<string, unknown>) {
+  const patientId = await verifiedPatientForCall(ctx);
+  const appointmentId = str(args.appointment_id, 40);
+  if (!patientId || !appointmentId || !UUID_RE.test(appointmentId)) {
+    return { confirmed: false, needs_human: true, message: 'I cannot securely identify that appointment. I can connect you with the front desk.' };
+  }
+  const current = await db.appointment.findFirst({
+    where: { id: appointmentId, tenantId: ctx.tenantId, patientId, deletedAt: null },
+    select: { id: true, status: true, startsAt: true, patientConfirmedAt: true },
+  });
+  if (!current) return { confirmed: false, needs_human: true, message: 'I cannot securely identify that appointment. I can connect you with the front desk.' };
+  const pack = await callPack(ctx);
+  if (current.patientConfirmedAt) {
+    return { confirmed: true, duplicate: true, appointment_id: current.id, message: speak(pack, 'tool.confirm.already', {}, 'Thank you — that appointment is already confirmed.') };
+  }
+  // Confirming an appointment that has already begun asserts nothing about
+  // attendance; the clinic knows by then whether the patient arrived.
+  if (current.startsAt.getTime() <= Date.now()) {
+    return { confirmed: false, needs_human: true, message: speak(pack, 'tool.confirm.not_confirmable', {}, 'That appointment is not one I can confirm on this call. I can connect you with the front desk.') };
+  }
+  if (!VOICE_MUTABLE_STATUSES.includes(current.status as (typeof VOICE_MUTABLE_STATUSES)[number])) {
+    return { confirmed: false, needs_human: true, message: speak(pack, 'tool.confirm.locked', {}, 'That appointment can no longer be confirmed automatically. I can connect you with the front desk.') };
+  }
+  // Evidence: which of OUR call rows produced this. `ctx.callId` is the
+  // provider's id, so it has to be resolved to the local log.
+  const callLog = ctx.callId
+    ? await db.receptionistCallLog.findFirst({ where: { tenantId: ctx.tenantId, retellCallId: ctx.callId }, select: { id: true } })
+    : null;
+  const confirmedAt = new Date();
+  const written = await db.$transaction(async tx => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`receptionist-confirm:${ctx.tenantId}:${appointmentId}`})::bigint)`;
+    const changed = await tx.appointment.updateMany({
+      where: {
+        id: appointmentId, tenantId: ctx.tenantId, patientId, deletedAt: null,
+        patientConfirmedAt: null, status: { in: [...VOICE_MUTABLE_STATUSES] },
+      },
+      data: {
+        patientConfirmedAt: confirmedAt,
+        patientConfirmationSource: 'receptionist_call',
+        patientConfirmedCallLogId: callLog?.id ?? null,
+      },
+    });
+    if (changed.count !== 1) return false;
+    await tx.auditEvent.create({ data: {
+      tenantId: ctx.tenantId, actorUserId: null, action: 'receptionist.appointment.patientConfirmed',
+      resource: 'appointment', resourceId: appointmentId, userAgent: 'retell-webhook',
+      metadata: { via: 'verified_live_call', callLogId: callLog?.id ?? null, confirmedAt: confirmedAt.toISOString() },
+    } });
+    await tx.businessEvent.create({ data: {
+      tenantId: ctx.tenantId, eventType: 'appointment.patientConfirmed', entityType: 'appointment',
+      entityId: appointmentId, sourceModule: 'receptionist',
+      payload: { source: 'receptionist_call', callLogId: callLog?.id ?? null },
+    } });
+    return true;
+  });
+  if (!written) {
+    return { confirmed: false, needs_human: true, message: 'That appointment changed while we were speaking. I can connect you with the front desk.' };
+  }
+  return { confirmed: true, appointment_id: appointmentId, message: speak(pack, 'tool.confirm.recorded', {}, 'Thank you — I have recorded that you are attending.') };
+}
+
 /** Reschedule only the verified patient's own appointment into a canonical open slot. */
 export async function rescheduleAppointment(ctx: ToolContext, args: Record<string, unknown>) {
   const patientId = await verifiedPatientForCall(ctx);
@@ -1629,6 +1714,7 @@ export async function handleAgentTool(ctx: ToolContext, name: string, args: Reco
   if (name === 'list_upcoming_appointments') return listUpcomingAppointments(ctx);
   if (name === 'prepare_appointment_change') return prepareAppointmentChange(ctx, args);
   if (name === 'cancel_appointment') return cancelAppointment(ctx, args);
+  if (name === 'confirm_appointment') return confirmAppointment(ctx, args);
   if (name === 'reschedule_appointment') return rescheduleAppointment(ctx, args);
   if (name === 'record_do_not_call') return recordDoNotCall(ctx, args);
   if (name === 'check_availability') return checkAvailability(ctx, args);
