@@ -483,6 +483,16 @@ describe('Retell agent provider contract', () => {
     expect(compareDeployedTools(authored, providerStored)).toBe('ok');
   });
 
+  it('reports drift rather than throwing when the provider omits a top-level key', async () => {
+    // `fingerprintJson(undefined)` throws ERR_INVALID_ARG_TYPE, so a key the
+    // provider does not carry has to be answered before any hashing. This
+    // surfaced live as a 500 from verify-provider rather than a drift verdict.
+    const authored = [{ type: 'custom', name: 'take_message', url: 'https://api.example.test/fn', speak_during_execution: true }];
+    const providerStored = [{ type: 'custom', name: 'take_message', url: 'https://api.example.test/fn' }];
+    expect(() => compareDeployedTools(authored, providerStored)).not.toThrow();
+    expect(compareDeployedTools(authored, providerStored)).toBe('tools_drift');
+  });
+
   it('still calls a dropped NON-empty value drift', async () => {
     // The forgiveness is only for vacuous values. A required field we actually
     // asked for, gone from the provider's copy, is a real difference.

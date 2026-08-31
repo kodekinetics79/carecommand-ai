@@ -1157,6 +1157,12 @@ function vacuousToolValue(value: unknown): boolean {
  * every level, for the same reason they are ignored at the top.
  */
 function toolValueMatches(authored: unknown, actual: unknown): boolean {
+  // `fingerprintJson(undefined)` throws ERR_INVALID_ARG_TYPE: JSON.stringify
+  // returns undefined for it and the hash refuses that. A key the provider
+  // does not carry reaches here as undefined whenever the value we authored
+  // was NOT vacuous, so the absence has to be answered before any hashing.
+  // Absent and non-vacuous is simply a difference.
+  if (actual === undefined) return authored === undefined;
   if (Array.isArray(authored)) {
     return Array.isArray(actual)
       && authored.length === actual.length
