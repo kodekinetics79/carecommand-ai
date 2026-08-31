@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { PhoneOff, Activity, Loader2, AlertCircle, PhoneCall, PhoneOutgoing } from 'lucide-react';
 import { Field, TextInput } from '../../ui/Field';
-import { receptionistApi as api, OUTBOUND_RECONCILIATION_WARNING, launchControlsBlocked, mergeReconciliationRefresh, presentLaunchResult, clearTransportAmbiguityToken, readTransportAmbiguityToken, transportAmbiguityStorageKey, writeTransportAmbiguityToken, type CallLog, type VoiceLineStatus, type OutboundCampaign, type CallTarget, type OutboundReconciliationEvidence } from '../../../lib/receptionist';
+import { receptionistApi as api, OUTBOUND_RECONCILIATION_WARNING, launchControlsBlocked, mergeReconciliationRefresh, presentLaunchResult, clearTransportAmbiguityToken, readTransportAmbiguityToken, transportAmbiguityStorageKey, writeTransportAmbiguityToken, type CallLog, type OutboundCampaign, type CallTarget, type OutboundReconciliationEvidence } from '../../../lib/receptionist';
+import { normalizeVoiceLineStatus, type VoiceLineStatusLike } from '../../../lib/receptionistDeployment';
 import { describeFailure } from '../../../lib/resourceState';
 import { isBusy, useMutationState } from '../../../hooks/useMutationState';
 import { formatEnumLabel, maskedPhone, maskedProviderId, outcomeBadge } from '../helpers';
@@ -9,7 +10,7 @@ import { ConfirmedButton } from '../shared';
 import { MutationNotice } from '../MutationNotice';
 import { TargetList } from './TargetList';
 
-export function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { campaign: OutboundCampaign; status: VoiceLineStatus | null; outboundStopped: boolean; onChanged: () => void }) {
+export function CampaignDetail({ campaign, status, outboundStopped, onChanged }: { campaign: OutboundCampaign; status: VoiceLineStatusLike | null; outboundStopped: boolean; onChanged: () => void }) {
   const transportAmbiguityKey = transportAmbiguityStorageKey(campaign.id);
   const [targets, setTargets] = useState<CallTarget[]>([]);
   const [logs, setLogs] = useState<CallLog[]>([]);
@@ -151,7 +152,16 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
   }
 
   const transportAmbiguous = transportAmbiguityToken !== null;
-  const configured = status?.configured ?? false;
+  // Read through the normalizer, never off the raw body. The route answers with
+  // the NEW shape (providerConfigured / attendedUat) while this file was still
+  // reading the pre-migration one (configured / liveTest) — fields the server
+  // has not sent for some time. Both read as `undefined`, so the launch button
+  // was permanently disabled and the attended-UAT card never rendered, on a
+  // voice line the card directly above reported as ready. The normalizer
+  // already accepts either shape; VoiceLineStatusCard has used it all along.
+  const view = status ? normalizeVoiceLineStatus(status) : null;
+  const configured = view?.providerConfigured ?? false;
+  const uat = view?.attendedUat ?? null;
   const reconciliationBlocksLaunch = launchControlsBlocked({ transportAmbiguous, reconciliationVerified, reconciliations });
 
   async function approveAndRun() {
@@ -237,25 +247,25 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
         </div>
       </div>
 
-      {status?.liveTest?.enabled && (
-        <div className={`cc-card border-l-4 p-4 ${status.liveTest.active ? 'border-l-emerald-v' : 'border-l-amber-v'}`}>
+      {uat?.enabled && (
+        <div className={`cc-card border-l-4 p-4 ${uat.active ? 'border-l-emerald-v' : 'border-l-amber-v'}`}>
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <p className="text-sm font-bold text-t1">Attended synthetic live voice UAT</p>
               <p className="mt-1 text-xs text-t2">
-                Destination {status.liveTest.allowedDestinationMasked ?? 'not configured'} · {status.liveTest.callsRemaining} calls remaining · {status.liveTest.minutesRemaining} minutes remaining · one active call at a time.
+                Destination {uat.allowedDestinationMasked ?? 'not configured'} · {uat.callsRemaining} calls remaining · {uat.minutesRemaining} minutes remaining · one active call at a time.
               </p>
               <p className="mt-1 text-[11px] text-t3">
-                Window {status.liveTest.windowStart}–{status.liveTest.windowEnd} {status.liveTest.timezone}. Authorization expires {status.liveTest.expiresAt ? new Date(status.liveTest.expiresAt).toLocaleString() : 'not configured'}.
+                Window {uat.windowStart}–{uat.windowEnd} {uat.timezone}. Authorization expires {uat.expiresAt ? new Date(uat.expiresAt).toLocaleString() : 'not configured'}.
               </p>
-              {!status.liveTest.active && <p role="alert" className="mt-2 text-xs font-semibold text-amber-v">Blocked: {formatEnumLabel(status.liveTest.blockingReason ?? status.liveTest.admissionReason ?? 'live test not ready')}</p>}
+              {!uat.active && <p role="alert" className="mt-2 text-xs font-semibold text-amber-v">Blocked: {formatEnumLabel(uat.blockingReason ?? uat.admissionReason ?? 'live test not ready')}</p>}
             </div>
             <ConfirmedButton
               dialogTitle="Attach the environment-authorized synthetic recipient?"
               message="This creates or reuses a clearly synthetic lead and campaign target for the one masked destination authorized in the local process environment. It does not expose or accept a phone number from the browser."
               confirmLabel="Attach synthetic recipient"
               tone="amber"
-              disabled={!status.liveTest.active || attachingLiveTarget}
+              disabled={!uat.active || attachingLiveTarget}
               onConfirm={attachAuthorizedLiveTestTarget}
               className="rounded-lg border border-emerald-v/40 px-3 py-1.5 text-xs font-semibold text-emerald-v disabled:opacity-50"
             >
