@@ -455,6 +455,51 @@ button, a, [role="button"] {
 .hover\:bg-amber-v:hover { background: var(--amber); }
 .hover\:bg-red-v:hover   { background: var(--red); }
 
+
+/* ═══════════════════════════════════════════════════════
+   SEMANTIC COLOUR UTILITIES — the ones that were missing
+   ═══════════════════════════════════════════════════════
+   `border-red-v`, `bg-amber-v/5`, `text-red-v/90` and friends are NOT Tailwind
+   colours. They are hand-written classes in this file, so Tailwind cannot
+   compose an opacity modifier onto them and never emitted a rule for the
+   border variants at all.
+
+   The result, measured across src/: 22 class names used on real controls that
+   resolved to NO CSS. Every error card's red border, every warning card's
+   amber ground, and the coloured left-rules on the receptionist status cards
+   were simply absent — the semantic colour language of the app was missing
+   while the markup said it was there. This is the same defect already
+   documented above for `bg-indigo`, which once shipped invisible primary
+   buttons on 56 controls; it was fixed for backgrounds and left in place for
+   borders, rings and every alpha variant.
+
+   Generated from the tokens above, so a token change still flows through.
+   If you add a new variant in markup, add it here too — or use an arbitrary
+   value (`border-[var(--red)]`), which Tailwind CAN compose.
+   ═══════════════════════════════════════════════════════ */
+.bg-amber-v\/5 { background-color: rgba(217,119,6,0.05); }
+.bg-red-v\/5 { background-color: rgba(220,38,38,0.05); }
+.border-amber-v\/30 { border-color: rgba(217,119,6,0.30); }
+.border-amber-v\/40 { border-color: rgba(217,119,6,0.40); }
+.border-amber-v\/50 { border-color: rgba(217,119,6,0.50); }
+.border-emerald-v\/30 { border-color: rgba(5,150,105,0.30); }
+.border-emerald-v\/40 { border-color: rgba(5,150,105,0.40); }
+.border-indigo { border-color: var(--indigo); }
+.border-indigo\/40 { border-color: rgba(79,70,229,0.40); }
+.border-l-amber-v { border-left-color: var(--amber); }
+.border-l-emerald-v { border-left-color: var(--emerald); }
+.border-l-indigo { border-left-color: var(--indigo); }
+.border-l-red-v { border-left-color: var(--red); }
+.border-red-v\/30 { border-color: rgba(220,38,38,0.30); }
+.border-red-v\/40 { border-color: rgba(220,38,38,0.40); }
+.border-red-v\/50 { border-color: rgba(220,38,38,0.50); }
+.ring-indigo { --tw-ring-color: var(--indigo); }
+.text-amber-v\/70 { color: rgba(217,119,6,0.70); }
+.text-red-v\/70 { color: rgba(220,38,38,0.70); }
+.text-red-v\/80 { color: rgba(220,38,38,0.80); }
+.text-red-v\/90 { color: rgba(220,38,38,0.90); }
+.text-violet-v\/70 { color: rgba(124,58,237,0.70); }
+
 /* ═══════════════════════════════════════════════════════
    BORDER UTILITIES
    ═══════════════════════════════════════════════════════ */
