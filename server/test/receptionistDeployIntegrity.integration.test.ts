@@ -568,6 +568,46 @@ describe('A6 — two deploys of one agent do not both win', () => {
   });
 });
 
+describe('a version-tag edit does not throw away the version we published', () => {
+  it('keeps the deployment pin when only the tag changes', async () => {
+    // Observed in production. Editing ONLY `providerVersionTag` nulled
+    // `currentDeploymentId`, which is where the numeric version pin lives. An
+    // unpinned probe then asks Retell for `?version=<tag>` and gets 404 — Retell
+    // exposes no public tag-assignment write, so CareCommand can never create
+    // that tag. A healthy published v0 deployment went straight to `not_found`
+    // and could never verify again by any route.
+    //
+    // The agent-id case in A7 below is unaffected and still nulls the pointer:
+    // there the deployment really does describe a different provider agent.
+    useMockProvider();
+    try {
+      const t = await tenant();
+      const { agent, campaign } = await deployableCampaign(t);
+      expect((await deploy(t, campaign.id)).statusCode).toBe(200);
+
+      const deployed = await db.receptionistAgent.findUniqueOrThrow({ where: { id: agent.id } });
+      expect(deployed.currentDeploymentId).not.toBeNull();
+      const published = await db.receptionistAgentDeployment.findUniqueOrThrow({ where: { id: deployed.currentDeploymentId! } });
+      // Version 0 is the normal published version, so this also guards against
+      // anyone reintroducing a falsy-zero check on the pin.
+      expect(published.providerAgentVersion).toBe(0);
+
+      const retagged = await app.inject({
+        method: 'PATCH', url: `/v1/receptionist/agents/${agent.id}`, headers: auth(t),
+        payload: { providerVersionTag: 'carecommand' },
+      });
+      expect(retagged.statusCode).toBe(200);
+      // The pin survives — same deployment, same published version.
+      expect(retagged.json().currentDeploymentId).toBe(deployed.currentDeploymentId);
+      // Re-attestation is still forced, which is what a tag edit does warrant.
+      expect(retagged.json().providerStatus).toBe('UNVERIFIED');
+      expect(retagged.json().providerConfigRevision).toBeGreaterThan(deployed.providerConfigRevision);
+    } finally {
+      restoreProvider();
+    }
+  });
+});
+
 describe('A7 — ownership is about this provider agent, not about any row', () => {
   it('refuses the second deploy after the binding is relinked to a hand-built agent', async () => {
     useMockProvider();
