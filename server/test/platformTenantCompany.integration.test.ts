@@ -32,6 +32,8 @@ describe('platform tenant company record', () => {
   let app: FastifyInstance;
   let tenantId: string;
   let ownerEmail: string;
+  let frontDeskEmail: string;
+  let formerStaffEmail: string;
   const adminId = randomUUID();
   const supportId = randomUUID();
 
@@ -55,8 +57,10 @@ describe('platform tenant company record', () => {
     await db.branch.create({ data: { tenantId, name: 'Old Site', location: 'Leeds', timezone: 'Europe/London', active: false } });
     const hash = await generatePasswordHash('OwnerPass123!');
     await db.user.create({ data: { tenantId, branchId: branch.id, email: ownerEmail, displayName: 'Owner Person', role: 'OWNER', passwordHash: hash, active: true } });
-    await db.user.create({ data: { tenantId, branchId: branch.id, email: `fd-${tenantId.slice(0, 8)}@company.test`, displayName: 'Desk', role: 'FRONT_DESK', passwordHash: hash, active: true } });
-    await db.user.create({ data: { tenantId, branchId: branch.id, email: `old-${tenantId.slice(0, 8)}@company.test`, displayName: 'Former', role: 'FRONT_DESK', passwordHash: hash, active: false } });
+    frontDeskEmail = `fd-${tenantId.slice(0, 8)}@company.test`;
+    formerStaffEmail = `old-${tenantId.slice(0, 8)}@company.test`;
+    await db.user.create({ data: { tenantId, branchId: branch.id, email: frontDeskEmail, displayName: 'Desk', role: 'FRONT_DESK', passwordHash: hash, active: true } });
+    await db.user.create({ data: { tenantId, branchId: branch.id, email: formerStaffEmail, displayName: 'Former', role: 'FRONT_DESK', passwordHash: hash, active: false } });
   }, 60_000);
 
   afterAll(async () => {
@@ -89,8 +93,15 @@ describe('platform tenant company record', () => {
     expect(body.branches[0]).toMatchObject({ name: 'Main Site', location: 'London', active: true });
 
     // The boundary: no payload anywhere carries the non-owner staff identities.
+    //
+    // Assert the identities themselves, not fragments of them. `'fd-'` was a
+    // three-character substring that any random UUID can contain — a tenant id
+    // of `3310c351-208c-43fd-a8ae-…` carries `fd-` in `43fd-` — so this failed
+    // on roughly one CI run in sixty for a reason that had nothing to do with
+    // the boundary being tested.
     const serialised = JSON.stringify(body);
-    expect(serialised).not.toContain('fd-');
+    expect(serialised).not.toContain(frontDeskEmail);
+    expect(serialised).not.toContain(formerStaffEmail);
     expect(serialised).not.toContain('Former');
     expect(body).not.toHaveProperty('users');
   });
