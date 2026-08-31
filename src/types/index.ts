@@ -1,3 +1,5 @@
+import type { PatientConfirmation } from '../lib/patientConfirmation';
+
 export type BranchStatus = 'active' | 'inactive' | 'opening';
 export type AppointmentStatus = 'confirmed' | 'risky' | 'arrived' | 'no-show' | 'canceled' | 'completed' | 'waitlist';
 export type LifecycleStage = 'new' | 'active' | 'at-risk' | 'inactive' | 'lost' | 'retained';
@@ -78,11 +80,23 @@ export interface Appointment {
   service: string;
   date: string;
   time: string;
+  /**
+   * The CLINIC's booking state. `confirmed` is the state a new appointment is
+   * created in, so it never asserts that the patient agreed to attend — that
+   * is `patientConfirmation` below, and the two must not be read as one.
+   */
   status: AppointmentStatus;
   noShowRisk: number; // 0-100
   channel: Channel;
   value: number;
   notes?: string;
+  /**
+   * The PATIENT's own "yes", or null when they have not given one. Only ever
+   * set from a timestamp the server actually sent (see
+   * src/lib/patientConfirmation.ts); null means "not confirmed", never
+   * "declined".
+   */
+  patientConfirmation?: PatientConfirmation | null;
 }
 
 export interface Lead {

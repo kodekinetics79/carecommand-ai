@@ -1,6 +1,7 @@
 import type { Appointment, Campaign, Doctor, Integration, InventoryItem, LabOrder, Lead, Opportunity, Patient, RevenueData, RevenueLeak } from '../types';
 import { apiRequest } from './api';
 import { isRestrictedView, receptionistViewFromMetadata, type ReceptionistTaskInfo, type TaskOutcomeCode } from './frontDesk';
+import { readPatientConfirmation, type PatientConfirmationFields } from './patientConfirmation';
 
 /**
  * Reads a list endpoint, accepting both shapes the API uses: a bare array and
@@ -135,7 +136,7 @@ export interface ApiProviderProfile {
   _count?: { availability: number };
 }
 
-export interface ApiAppointment {
+export interface ApiAppointment extends PatientConfirmationFields {
   id: string;
   branchId: string;
   patientId: string;
@@ -143,6 +144,10 @@ export interface ApiAppointment {
   providerRef?: string | null;
   service: string;
   startsAt: string;
+  // The CLINIC's booking state. `CONFIRMED` is the default a row is created
+  // with, so it never means the patient agreed to attend — that is
+  // `patientConfirmedAt`, inherited from PatientConfirmationFields above and
+  // sent by GET /v1/appointments (list) and GET /v1/appointments/:id.
   status: 'CONFIRMED' | 'RISKY' | 'ARRIVED' | 'NO_SHOW' | 'CANCELED' | 'COMPLETED' | 'WAITLIST';
   channel: 'WHATSAPP' | 'SMS' | 'EMAIL' | 'PUSH' | 'CALL' | 'VIDEO';
   value: string;
@@ -442,6 +447,9 @@ export function mapAppointment(row: ApiAppointment): Appointment {
     channel: row.channel.toLowerCase() as Appointment['channel'],
     value: Number(row.value),
     notes: row.notes ?? undefined,
+    // Null unless the response itself carried a real timestamp. A patient
+    // confirmation is never inferred from `status`.
+    patientConfirmation: readPatientConfirmation(row),
   };
 }
 

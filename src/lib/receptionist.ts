@@ -338,6 +338,26 @@ export interface OutboundCampaign {
   _count?: { targets: number; callLogs: number };
 }
 
+/**
+ * How far a reminder campaign has actually got: how many of its targets are
+ * about an appointment, and how many of those appointments the PATIENT has
+ * since said they will attend.
+ *
+ * `patientConfirmed` counts every confirmation, however it arrived (a call, the
+ * front desk, the portal). `confirmedOnCampaignCall` is the subset this
+ * campaign's own calls produced — the narrower claim, kept separate so the
+ * panel never credits the campaign with a confirmation someone took at the desk.
+ */
+export interface OutboundConfirmationSummary {
+  campaignId: string;
+  /** Everyone on the list, appointment-linked or not. */
+  targets: number;
+  /** Targets that are about a live appointment — the only ones confirmable. */
+  targetsWithAppointment: number;
+  patientConfirmed: number;
+  confirmedOnCampaignCall: number;
+}
+
 export interface CallTarget {
   id: string;
   campaignId: string;
@@ -833,6 +853,11 @@ export const receptionistApi = {
   updateOutboundCampaign: (id: string, body: Partial<OutboundCampaignInput>) => apiRequest<OutboundCampaign>(`${base}/outbound-campaigns/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   approveOutboundCampaign: (id: string, status: 'SCHEDULED' | 'RUNNING') => apiRequest<OutboundCampaign>(`${base}/outbound-campaigns/${id}/approve`, { method: 'POST', body: JSON.stringify({ approvalConfirmed: true, status }) }),
   listTargets: (campaignId: string) => apiRequest<CallTarget[]>(`${base}/outbound-campaigns/${campaignId}/targets`),
+  // Counts only — see GET /outbound-campaigns/:id/confirmations. There is no
+  // client-side fallback and no default object: a failed read must render as a
+  // named failure, never as a campaign that produced nothing.
+  getOutboundConfirmations: (campaignId: string) =>
+    apiRequest<OutboundConfirmationSummary>(`${base}/outbound-campaigns/${campaignId}/confirmations`),
   listOutboundTargetCandidates: (campaignId: string, q = '') => apiRequest<OutboundTargetCandidate[]>(`${base}/outbound-target-candidates?campaignId=${encodeURIComponent(campaignId)}${q ? `&q=${encodeURIComponent(q)}` : ''}`),
   addTargets: (campaignId: string, targets: Array<Partial<CallTarget> & { patientId?: string; leadId?: string }>) =>
     apiRequest<{ added: number }>(`${base}/outbound-campaigns/${campaignId}/targets`, { method: 'POST', body: JSON.stringify({ targets }) }),
