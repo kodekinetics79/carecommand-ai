@@ -487,6 +487,56 @@ describe('a published engine is frozen, so the next deploy makes a new one', () 
   });
 });
 
+describe('the agent write never pins an engine version', () => {
+  it('omits response_engine.version so the provider aligns it with the agent version', async () => {
+    // Retell answers `400 Response engine version must match agent version`
+    // when `response_engine.version` is not the AGENT version being written.
+    // Pinning the engine's own version was correct only by coincidence — on a
+    // first deploy both are 0. Once a published agent at version 1 takes a
+    // freshly created engine at version 0 (exactly what the published-engine
+    // fix produces), every agent write failed. Confirmed against the live
+    // provider on 2026-08-30.
+    const agentId = providerId('agent_ver');
+    const llmId = providerId('llm_ver');
+    env.RETELL_API_KEY = 'real-provider-key';
+    env.RETELL_BASE_URL = 'https://api.retellai.com';
+    env.RETELL_FROM_NUMBER = '+15550100000';
+    const agentWrites: Array<Record<string, unknown>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL, init?: { body?: string }) => {
+      const value = String(url).replace('https://api.retellai.com', '');
+      if (value.startsWith('/create-retell-llm') || value.startsWith('/update-retell-llm/')) {
+        return new Response(JSON.stringify({ llm_id: llmId, version: 0 }), { status: 200 });
+      }
+      if (value.startsWith('/create-agent') || value.startsWith('/update-agent/')) {
+        agentWrites.push(JSON.parse(init?.body ?? '{}') as Record<string, unknown>);
+        return new Response(JSON.stringify({ agent_id: agentId, version: 1 }), { status: 200 });
+      }
+      if (value.startsWith('/publish-agent-version/')) return new Response(JSON.stringify({}), { status: 200 });
+      if (value.startsWith('/update-phone-number/')) {
+        const number = decodeURIComponent(value.split('phone-number/')[1] ?? '');
+        return new Response(JSON.stringify({ phone_number: number, inbound_agents: [{ agent_id: agentId, agent_version: 1 }] }), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    }));
+    try {
+      const t = await tenant();
+      const { campaign } = await deployableCampaign(t);
+      expect((await deploy(t, campaign.id)).statusCode).toBe(200);
+
+      expect(agentWrites.length).toBeGreaterThan(0);
+      for (const body of agentWrites) {
+        const engine = body.response_engine as Record<string, unknown>;
+        expect(engine.llm_id).toBe(llmId);
+        expect(engine.type).toBe('retell-llm');
+        // The engine we just wrote, with the version left to the provider.
+        expect(engine).not.toHaveProperty('version');
+      }
+    } finally {
+      restoreProvider();
+    }
+  });
+});
+
 describe('A6 — two deploys of one agent do not both win', () => {
   it('serialises concurrent deploys and refuses to adopt the loser', async () => {
     useMockProvider();
