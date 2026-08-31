@@ -463,6 +463,60 @@ export function checkFor(readiness: ReadinessResponse | null, key: ReadinessKey)
   return readiness?.checks.find(row => row.key === key) ?? null;
 }
 
+/**
+ * Which Studio tab a remediation link points at, if any.
+ *
+ * The server already answers "where do I fix this" — every failing readiness
+ * row carries a `fixHref` naming a tab. Nothing read that except the link
+ * itself, so the tab strip stayed silent about where the work was and the
+ * operator had to open all eight to find out.
+ */
+export function studioTabFromFixHref(fixHref: string | null | undefined): StudioTab | null {
+  if (!fixHref) return null;
+  // Relative hrefs are the norm here; the base is only to satisfy the parser.
+  try {
+    return resolveStudioTab(new URL(fixHref, 'https://studio.invalid').searchParams.get('tab'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * How many unresolved items each Studio tab is responsible for.
+ *
+ * `pending` counts alongside `fail`: a check the server has not been able to
+ * evaluate is not a check that passed, and telling an operator a step is done
+ * when we do not know is the failure mode this whole module keeps hitting.
+ * `warn` does NOT count — it is advisory, and marking a tab as needing
+ * attention for something that does not block go-live trains people to ignore
+ * the marks.
+ */
+export function studioTabAttention(
+  readiness: ReadinessResponse | null,
+  prerequisites: readonly { fixHref: string | null }[] = [],
+): Partial<Record<StudioTab, number>> {
+  const counts: Partial<Record<StudioTab, number>> = {};
+  const add = (fixHref: string | null | undefined) => {
+    const tab = studioTabFromFixHref(fixHref);
+    if (!tab) return;
+    counts[tab] = (counts[tab] ?? 0) + 1;
+  };
+  for (const check of readiness?.checks ?? []) {
+    if (check.status === 'fail' || check.status === 'pending') add(check.fixHref);
+  }
+  for (const prerequisite of prerequisites) add(prerequisite.fixHref);
+  return counts;
+}
+
+/** Readiness as a fraction, for a progress indicator. Null when nothing is known yet. */
+export function studioReadyFraction(readiness: ReadinessResponse | null): { passed: number; total: number } | null {
+  if (!readiness || readiness.checks.length === 0) return null;
+  return {
+    passed: readiness.checks.filter(check => check.status === 'pass').length,
+    total: readiness.checks.length,
+  };
+}
+
 export function failingChecks(readiness: ReadinessResponse): ReadinessCheck[] {
   return readiness.checks.filter(check => check.status === 'fail' || check.status === 'pending');
 }

@@ -39,8 +39,16 @@ describe('live AI receptionist UAT production contract', () => {
     expect(outboundSource).toContain('liveCallUatDestination(request.auth.tenantId)');
     expect(liveUatSource).toContain('live_test_tenant_not_authorized');
     expect(outboundSource).toContain('acknowledgeAuthorizedSyntheticRecipient');
-    expect(studioSource).toContain('Attach authorized synthetic recipient');
-    expect(studioSource).toContain('the browser cannot supply or change the number');
+    // These two pin a PROPERTY, not a phrasing: the Studio must offer an
+    // explicit control for the server-authorized recipient, and must tell the
+    // operator that the destination cannot be supplied or altered from the
+    // browser. The wording may be improved — it was, because
+    // "Attach authorized synthetic recipient" and "the browser cannot supply or
+    // change the number" are our vocabulary, not a clinic's — but the claim
+    // must survive the rewrite. If you change this copy, change it here too,
+    // and only if the new sentence still makes the same promise.
+    expect(studioSource).toContain('Add the approved test number');
+    expect(studioSource).toContain('can never be typed in here or changed from this screen');
     expect(apiSource).toContain('attachLiveTestTarget');
     expect(apiSource).not.toContain('attachLiveTestTarget: (campaignId: string, body: { phone:');
   });
@@ -65,7 +73,7 @@ describe('live AI receptionist UAT production contract', () => {
     expect(packageSource).toContain('test:e2e:live-voice');
     expect(liveE2eSource).toContain("testInfo.project.name !== 'desktop-installed-chrome'");
     expect(liveE2eSource).toContain('LIVE_TEST_MAX_CALLS=1');
-    expect(liveE2eSource).toContain('Attach authorized synthetic recipient');
+    expect(liveE2eSource).toContain('Add the approved test number');
     expect(liveE2eSource).toContain('Refresh provider status');
     expect(liveE2eSource).toContain('AUTHORIZED_TEST_PHONE_E164');
   });

@@ -235,10 +235,37 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
                 >Approve and start</ConfirmedButton>}
           </div>
         </div>
+        {/*
+          What a clinic needs to read here is what this campaign does and
+          whether it may run. The policy version, legal basis, approver id and
+          evidence fingerprint used to sit on this line too — including a raw
+          user UUID — which is our vocabulary, not theirs, and pushed the one
+          actionable fact ("not approved yet") to the end of a wall of text.
+          They are kept, in full, one disclosure away: compliance needs them and
+          nobody reads them daily.
+        */}
         <p className="text-[11px] text-t3">
-          Policy {campaign.policyVersion ?? 'not configured'} · purpose {campaign.purpose ? formatEnumLabel(campaign.purpose) : 'not set'} · legal basis {campaign.legalBasis ? formatEnumLabel(campaign.legalBasis) : 'not set'} · {campaign.authorityApprovedAt ? `approved ${new Date(campaign.authorityApprovedAt).toLocaleString()} by ${campaign.authorityApprovedById ?? 'unknown'}` : 'not approved'}
-          {campaign.authorityFingerprint ? ` · evidence ${campaign.authorityFingerprint.slice(0, 12)}…` : ''}
+          {campaign.purpose ? formatEnumLabel(campaign.purpose) : 'Purpose not set'}
+          {campaign.authorityApprovedAt
+            ? ` · approved ${new Date(campaign.authorityApprovedAt).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}`
+            : ' · not approved yet'}
         </p>
+        <details className="group">
+          <summary className="cursor-pointer list-none text-[11px] font-semibold text-t3 hover:text-t2 marker:content-none">
+            <span className="group-open:hidden">Show compliance record</span>
+            <span className="hidden group-open:inline">Hide compliance record</span>
+          </summary>
+          <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 rounded-lg bg-[var(--s2)] p-3 text-[11px] text-t2">
+            <dt className="text-t3">Policy version</dt>
+            <dd>{campaign.policyVersion ?? 'not configured'}</dd>
+            <dt className="text-t3">Legal basis</dt>
+            <dd>{campaign.legalBasis ? formatEnumLabel(campaign.legalBasis) : 'not set'}</dd>
+            <dt className="text-t3">Approved</dt>
+            <dd>{campaign.authorityApprovedAt ? new Date(campaign.authorityApprovedAt).toLocaleString() : 'not approved'}</dd>
+            {campaign.authorityApprovedById && (<><dt className="text-t3">Approved by</dt><dd className="font-mono break-all">{campaign.authorityApprovedById}</dd></>)}
+            {campaign.authorityFingerprint && (<><dt className="text-t3">Evidence</dt><dd className="font-mono break-all">{campaign.authorityFingerprint}</dd></>)}
+          </dl>
+        </details>
         <MutationNotice state={campaignAction.state} />
         <p className="text-xs text-t3 whitespace-pre-wrap">{campaign.script}</p>
         <div className="flex flex-wrap gap-1.5">
@@ -251,7 +278,10 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
         <div className={`cc-card border-l-4 p-4 ${uat.active ? 'border-l-emerald-v' : 'border-l-amber-v'}`}>
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <p className="text-sm font-bold text-t1">Attended synthetic live voice UAT</p>
+              {/* "Attended synthetic live voice UAT" is what we call this to
+                  each other. To the clinic it is: we will ring one number you
+                  approved, a few times, while somebody is listening. */}
+              <p className="text-sm font-bold text-t1">Test calling — one approved number</p>
               <p className="mt-1 text-xs text-t2">
                 Destination {uat.allowedDestinationMasked ?? 'not configured'} · {uat.callsRemaining} calls remaining · {uat.minutesRemaining} minutes remaining · one active call at a time.
               </p>
@@ -269,7 +299,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
               onConfirm={attachAuthorizedLiveTestTarget}
               className="rounded-lg border border-emerald-v/40 px-3 py-1.5 text-xs font-semibold text-emerald-v disabled:opacity-50"
             >
-              {attachingLiveTarget ? 'Attaching…' : 'Attach authorized synthetic recipient'}
+              {attachingLiveTarget ? 'Adding…' : 'Add the approved test number'}
             </ConfirmedButton>
           </div>
         </div>
@@ -285,7 +315,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
         )}
         {!configured && (
           <div className="flex items-center gap-2 rounded-lg border border-amber-v/40 bg-amber-v/5 px-3 py-2 text-xs text-amber-v">
-            <AlertCircle className="w-4 h-4" /> The voice line isn’t connected — launching returns a setup-required notice instead of placing a call.
+            <AlertCircle className="w-4 h-4" /> The phone line isn’t set up yet, so nothing will be dialled. Finish setup on the Go live tab.
           </div>
         )}
         {status?.adhocTestCallsAllowed ? (
@@ -304,7 +334,7 @@ export function CampaignDetail({ campaign, status, outboundStopped, onChanged }:
               {launching ? <Loader2 className="w-4 h-4 animate-spin" /> : <PhoneOutgoing className="w-4 h-4" />} Place test call
             </ConfirmedButton>
           </div>
-        ) : <p className="text-xs text-t3">Calls must use an authorized patient or lead target below. During live UAT, attach the environment-authorized synthetic recipient and launch it from the target row; the browser cannot supply or change the number.</p>}
+        ) : <p className="text-xs text-t3">Calls go to the people in your target list below — pick one and use its Call button. A phone number can never be typed in here or changed from this screen; it always comes from the saved patient or lead record.</p>}
         {launchMsg && (
           <p role={launchMsg.kind === 'err' ? 'alert' : 'status'} aria-live={launchMsg.kind === 'err' ? 'assertive' : 'polite'} className={`text-xs ${launchMsg.kind === 'ok' ? 'text-emerald-v' : launchMsg.kind === 'warn' ? 'text-amber-v' : 'text-red-v'}`}>{launchMsg.text}</p>
         )}
