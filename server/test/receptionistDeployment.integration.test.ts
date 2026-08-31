@@ -441,15 +441,28 @@ describe('deploying a campaign to Retell', () => {
       expect(calls[3]!.url).toContain(encodeURIComponent(clinic.phone));
       expect(calls[3]!.url).not.toContain(encodeURIComponent('+15550100000'));
 
-      // The agent carries the webhook and pins the LLM version we just wrote;
-      // without that pin the published agent runs the PREVIOUS engine version
-      // and our own verification would read it as prompt drift.
+      // The agent carries the webhook and names the engine we just wrote, and
+      // deliberately does NOT pin a version on it.
+      //
+      // This used to assert `version: 0`, to stop the published agent running
+      // the PREVIOUS engine version. The provider does not work that way:
+      // `response_engine.version` must equal the AGENT version being written,
+      // and it answers `400 Response engine version must match agent version`
+      // otherwise. Sending the engine's own version was right only while both
+      // happened to be 0 — on a first deploy — and broke every deploy after,
+      // because a published agent at version 1 taking a newly created engine at
+      // version 0 is a mismatch.
+      //
+      // Verified against the live provider: writing the agent with `{ llm_id }`
+      // alone binds engine version to the agent version being created, so the
+      // published agent runs the engine we just wrote. That is the outcome the
+      // old pin was reaching for, and omitting is how you actually get it.
       const agentBody = calls[1]!.body;
       expect(agentBody.webhook_url).toBe(`${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`);
       expect(agentBody.webhook_events).toEqual(['call_started', 'call_ended', 'call_analyzed']);
       expect(agentBody.data_storage_setting).toBe('basic_attributes_only');
       expect(agentBody.opt_in_signed_url).toBe(true);
-      expect(agentBody.response_engine).toEqual({ type: 'retell-llm', llm_id: newLlmId, version: 0 });
+      expect(agentBody.response_engine).toEqual({ type: 'retell-llm', llm_id: newLlmId });
 
       // Publishing pins an exact numeric version, and the phone number's
       // INBOUND agent is bound to it — otherwise publishing changes nothing
