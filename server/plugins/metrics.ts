@@ -10,7 +10,7 @@ import {
   sampleQueueDepths,
 } from '../lib/metrics';
 import { refreshDependencyGauges } from '../modules/health/checks';
-import { autopilotQueue, campaignQueue, complianceQueue } from '../workers/queues';
+import { ALL_QUEUES } from '../workers/queues';
 
 // Per-request start time, kept off the public request type.
 const START = Symbol('metricsStart');
@@ -69,7 +69,12 @@ export const metricsPlugin = fp(async app => {
     // backlog and Postgres/Redis health even if the worker is down and no
     // external monitor is polling /health/ready. Cheap; failure-tolerant.
     await Promise.all([
-      sampleQueueDepths([autopilotQueue, campaignQueue, complianceQueue]),
+      // Derived from the registry, never restated. This list used to name
+      // three queues by hand and had silently gone stale: monitoring-safety,
+      // eligibility-reconciliation and receptionist-call-reconciliation could
+      // back up to any depth and `/metrics` reported nothing, so the
+      // QueueBacklogGrowing alert could not fire for them at all.
+      sampleQueueDepths([...ALL_QUEUES]),
       refreshDependencyGauges(),
     ]);
 

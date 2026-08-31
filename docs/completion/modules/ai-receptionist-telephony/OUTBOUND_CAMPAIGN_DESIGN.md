@@ -18,6 +18,37 @@ Audience: the engineering team who will build this. Every claim about current be
 > Everything below from **Phase 1** onward — the dialler, per-patient appointment context, confirm/cancel
 > write-back — remains unbuilt. Read the phases as written; read the Phase 0 sections as history.
 
+> **Status, 2026-08-31 (second update).** §6.1 and a first slice of §6.2 are **built**.
+>
+> * **§6.1, the extraction, is done and is the load-bearing part.** The launch path moved out of the
+>   route to `server/lib/receptionist/outboundLaunch.ts` as a near-verbatim move with two mechanical
+>   seams (`LaunchActor` for `request.auth.*`, `answer(n, x)` for `reply.code(n).send(x)`). The 79
+>   existing outbound tests pass unmodified. `server/modules/receptionist/outbound.ts` fell from 3,004
+>   lines to ~1,000 and the `/call` handler is now a 20-line adapter.
+> * **The dialler is one queue, not three.** `receptionist-outbound-dial` fans a signed tick out to one
+>   signed per-tenant pacing job (`server/lib/receptionist/outboundDialer.ts`), which selects PENDING
+>   targets and calls `launchOutboundCall` per target. There is no `dial-task` queue and no
+>   `ReceptionistCampaignRun`: without the run noun there is nothing to pace *per run*, and the target
+>   claim inside the launch path is already atomic, so a separate claiming step in the pacer would have
+>   fought it (`PENDING` is the only claimable status). §6.3's `SKIP LOCKED` claim belongs with the run
+>   model, not before it.
+> * **Pacing lives on the campaign**, as `dialerEnabled` / `dialerMaxConcurrentCalls` /
+>   `dialerCallsPerMinute` / `dialerRetryGapMinutes` (migration
+>   `20260831210000_receptionist_outbound_dialler`). `dialerEnabled` defaults false so this migration
+>   did not turn every RUNNING campaign into an autodialler.
+> * **A6-F07 is fixed.** The shared-suppression branch now writes the `OPTED_OUT` call log and
+>   terminalises the target in the same place the DNC branch does. Left as it was, every pass would have
+>   re-offered the same suppressed patient forever.
+> * **§6.9(b) is done**: enabling `dialerEnabled` is refused `409 { status: 'setup_required', reason:
+>   'dispatcher_not_running' }` when `QUEUES_ENABLED` or `RECEPTIONIST_OUTBOUND_DIAL_ENABLED` is off.
+>   §6.9(a), standing the worker up on the production stack, is still a deployment decision and is NOT
+>   done.
+> * **Still unbuilt**: `ReceptionistCampaignRun` and calling windows (§3.2, §6.4's `windowStart/End`),
+>   the disposition-aware retry table (§6.5 — only a flat minimum gap and `maxRetryAttempts` exist),
+>   spend caps (§6.7), kill-switch queue draining (§6.8.1 — the pass re-reads the switch before every
+>   target instead, so a stop takes effect on the next dial rather than by removing queued jobs), and
+>   all of §7 onward.
+
 **Product statement.** The patient never dials the clinic. The clinic dials the patient, states *their*
 appointment — provider, date, time — and takes a confirm or a cancel. Reminders and confirmations first;
 recall and reactivation later on the same machinery.

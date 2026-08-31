@@ -3185,6 +3185,27 @@ model ReceptionistOutboundCampaign {
   quietHoursStart         String?
   quietHoursEnd           String?
   maxRetryAttempts        Int                      @default(1)
+  // ---- Dialler pacing: the only two knobs a clinic actually has ------------
+  //
+  // "How many at once" and "how fast". Everything else about an outbound call
+  // is a safety fence and belongs to the platform, not to a clinic form.
+  //
+  // `dialerEnabled` defaults FALSE deliberately. A campaign that is RUNNING
+  // today means "a person may click Call on these targets". It must not start
+  // meaning "the machine will phone all of them" because a migration ran.
+  // Automatic dialling is a second, explicit decision.
+  //
+  // These are PACING, not safety. The per-tenant concurrency ceiling
+  // (MAX_TENANT_ACTIVE_CALLS) and the voice-minute budget still apply inside
+  // the launch path and are the numbers that actually protect anyone;
+  // `dialerMaxConcurrentCalls` can only ever be tighter than they are.
+  dialerEnabled            Boolean                 @default(false)
+  dialerMaxConcurrentCalls Int                     @default(1)
+  dialerCallsPerMinute     Int                     @default(1)
+  // Never phone the same patient twice inside this window. Two calls in an
+  // hour is how a clinic's number gets labelled spam, and a dialler is the
+  // only thing fast enough to do it by accident.
+  dialerRetryGapMinutes    Int                     @default(60)
   status                  OutboundCampaignStatus   @default(DRAFT)
   createdAt               DateTime                 @default(now())
   updatedAt               DateTime                 @updatedAt

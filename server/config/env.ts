@@ -120,6 +120,29 @@ const baseEnvSchema = z.object({
   // below anything that could stall a pass.
   RECEPTIONIST_CALL_RECONCILIATION_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(25),
   RECEPTIONIST_CALL_RECONCILIATION_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(10).default(2),
+  // ---- Outbound dialler -------------------------------------------------
+  // The loop that works through a campaign's PENDING targets without anyone
+  // clicking Call. It defaults OFF, unlike the reconcilers above, because the
+  // failure modes are opposite: a reconciler that does not run leaves rows
+  // stranded, while a dialler that runs when nobody expected it phones real
+  // patients. Enabling it is a deliberate act on a deploy that has an
+  // always-on worker; the per-campaign `dialerEnabled` flag is the second,
+  // tenant-level switch and both must be on.
+  //
+  // Never `z.coerce.boolean()` here: it turns the string "false" into `true`,
+  // so a deployment that explicitly disabled dialling would dial.
+  RECEPTIONIST_OUTBOUND_DIAL_ENABLED: booleanString(false),
+  // How often the pacer looks at each tenant. The per-tick budget derives from
+  // this and the campaign's calls-per-minute, so the two stay consistent when
+  // an operator changes either.
+  RECEPTIONIST_OUTBOUND_DIAL_INTERVAL_SECONDS: z.coerce.number().int().min(15).max(3600).default(60),
+  // Real dial concurrency: this many `dial-target` jobs run at once in a
+  // worker process. It is a floor on latency, never a ceiling on safety — the
+  // per-tenant concurrency fence lives in the launch path.
+  RECEPTIONIST_OUTBOUND_DIAL_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(20).default(4),
+  // Upper bound on targets one pacer pass may enqueue for one campaign, so a
+  // misconfigured calls-per-minute cannot flood the queue in a single tick.
+  RECEPTIONIST_OUTBOUND_DIAL_MAX_PER_PASS: z.coerce.number().int().min(1).max(200).default(25),
   // A lost HTTP response or browser restart must not invoke the payer again.
   // A new idempotency key with the same tenant-scoped request fingerprint
   // replays a recent completed result only within this bounded freshness window.

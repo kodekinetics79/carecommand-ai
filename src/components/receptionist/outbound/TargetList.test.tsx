@@ -25,7 +25,8 @@ function campaign(overrides: Partial<OutboundCampaign> = {}): OutboundCampaign {
     purpose: null, legalBasis: null, policyVersion: null, authorityApprovedAt: null, authorityApprovedById: null, authorityFingerprint: null,
     requiredFields: ['firstName', 'lastName', 'phone'], customQuestions: null, consentText: null, humanHandoffInstruction: null,
     bookingMode: 'APPOINTMENT_REQUEST_ONLY', defaultBranchId: null, defaultService: null, quietHoursStart: null, quietHoursEnd: null,
-    maxRetryAttempts: 1, status: 'DRAFT', createdAt: '2026-08-29T00:00:00.000Z', updatedAt: '2026-08-29T00:00:00.000Z',
+    maxRetryAttempts: 1, dialerEnabled: false, dialerMaxConcurrentCalls: 1, dialerCallsPerMinute: 1, dialerRetryGapMinutes: 60,
+    status: 'DRAFT', createdAt: '2026-08-29T00:00:00.000Z', updatedAt: '2026-08-29T00:00:00.000Z',
     ...overrides,
   };
 }

@@ -722,20 +722,31 @@ export async function launchOutboundCall(input: LaunchOutboundCallInput): Promis
 
     const dialIdentity = target ?? body;
 
-    if (await isSuppressed(tenantId, {
+    // ---- Compliance gate: NEVER dial a suppressed person or number --------
+    // Two sources, one consequence. Shared suppression is the cross-module
+    // answer (consent revoked, patient-level preference, legacy consent);
+    // `ReceptionistOptOut` is the voice-channel do-not-call list (ALL/VOICE
+    // both suppress). Outbound targets are queued without a filter, so
+    // suppression MUST be enforced here, at the dial, against state that may
+    // have changed since the target was queued a moment or a week ago.
+    //
+    // WHY THEY SHARE ONE BRANCH. Shared suppression used to return `skipped`
+    // WITHOUT writing a call log or moving the target, so the target stayed
+    // PENDING. With a person clicking Call that is merely untidy — they see
+    // the skip and stop. With a dialler it is an infinite loop: every pass
+    // re-selects the same suppressed patient, refuses it, and writes another
+    // audit row, forever. Suppression is terminal for this target either way,
+    // so it is recorded the same way either way; only the audit metadata
+    // distinguishes which list said no.
+    const sharedSuppression = await isSuppressed(tenantId, {
       patientId: target?.patientId ?? null,
       leadId: target?.leadId ?? null,
       destination: canonicalDialDestination,
-    }, 'voice')) {
-      await launchAudit({ action: 'receptionist.call.suppressed', resource: target ? 'receptionistCallTarget' : 'receptionistOutboundCampaign', resourceId: target?.id ?? campaign.id, metadata: { campaignId: campaign.id, reason: 'shared_suppression_gate' } });
-      return answer(200, { status: 'skipped', reason: 'opted_out' });
-    }
-
-    // ---- Compliance gate: NEVER dial an opted-out number ------------------
-    // Consult ReceptionistOptOut (voice channel; ALL/VOICE suppress it), tenant-
-    // scoped. This closes gap (c): outbound targets are queued without a filter,
-    // so suppression MUST be enforced here at the dial. Record + skip, no dial.
-    if (await isDestinationOptedOut(tenantId, canonicalDialDestination, 'voice')) {
+    }, 'voice');
+    const destinationOptedOut = sharedSuppression
+      ? false
+      : await isDestinationOptedOut(tenantId, canonicalDialDestination, 'voice');
+    if (sharedSuppression || destinationOptedOut) {
       const callLog = await db.receptionistCallLog.create({
         data: {
           tenantId: tenantId, clinicId: campaign.clinicId, outboundCampaignId: campaign.id, targetId: body.targetId,
@@ -744,7 +755,16 @@ export async function launchOutboundCall(input: LaunchOutboundCallInput): Promis
         },
       });
       if (body.targetId) await db.receptionistCallTarget.updateMany({ where: { id: body.targetId, tenantId: tenantId }, data: { status: 'OPTED_OUT', lastOutcome: 'OPTED_OUT', lastCallLogId: callLog.id } });
-      await launchAudit({ action: 'receptionist.call.suppressed', resource: 'receptionistCallLog', resourceId: callLog.id, metadata: { campaignId: campaign.id, reason: 'opted_out' } });
+      await launchAudit({
+        action: 'receptionist.call.suppressed',
+        resource: 'receptionistCallLog',
+        resourceId: callLog.id,
+        metadata: {
+          campaignId: campaign.id,
+          targetId: body.targetId ?? null,
+          reason: sharedSuppression ? 'shared_suppression_gate' : 'opted_out',
+        },
+      });
       return answer(200, { status: 'skipped', reason: 'opted_out', callLogId: callLog.id });
     }
 

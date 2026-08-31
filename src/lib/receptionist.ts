@@ -331,6 +331,12 @@ export interface OutboundCampaign {
   quietHoursStart: string | null;
   quietHoursEnd: string | null;
   maxRetryAttempts: number;
+  // Dialler pacing. Off by default: a RUNNING campaign means staff may call
+  // these people, not that the machine will phone all of them.
+  dialerEnabled: boolean;
+  dialerMaxConcurrentCalls: number;
+  dialerCallsPerMinute: number;
+  dialerRetryGapMinutes: number;
   status: OutboundCampaignStatus;
   createdAt: string;
   updatedAt: string;
@@ -710,6 +716,10 @@ export interface OutboundCampaignInput {
   quietHoursStart?: string | null;
   quietHoursEnd?: string | null;
   maxRetryAttempts?: number;
+  dialerEnabled?: boolean;
+  dialerMaxConcurrentCalls?: number;
+  dialerCallsPerMinute?: number;
+  dialerRetryGapMinutes?: number;
   status?: OutboundCampaignStatus;
 }
 

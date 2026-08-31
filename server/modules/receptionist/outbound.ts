@@ -2,6 +2,7 @@ import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { db } from '../../lib/db';
 import { audit } from '../../lib/audit';
+import { env } from '../../config/env';
 import { getPhoneCall, stopPhoneCall } from '../../lib/retell';
 import { isValidE164, toE164 } from '../../lib/campaigns';
 import { requireRoles } from '../../plugins/roles';
@@ -40,7 +41,6 @@ import {
   DEFAULT_VOICE_MINUTES_LIMIT, isTargetDialable, targetStatusAfterOutcome,
 } from '../../lib/receptionist/outboundPolicy';
 export { DEFAULT_VOICE_MINUTES_LIMIT, isTargetDialable, targetStatusAfterOutcome };
-
 
 // ---------------------------------------------------------------------------
 // The launch path and everything it shares with the rest of this module now
@@ -83,7 +83,6 @@ function requestLaunchActor(request: FastifyRequest): LaunchActor {
 function requestAuditContext(request: FastifyRequest): { tenantId: string; actor: LaunchActor } {
   return { tenantId: request.auth.tenantId, actor: requestLaunchActor(request) };
 }
-
 
 // Registered INSIDE receptionistRoutes, so it inherits the ai_receptionist
 // feature gate and the authenticated scope.
@@ -357,11 +356,24 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     quietHoursStart: optionalQuietHour,
     quietHoursEnd: optionalQuietHour,
     maxRetryAttempts: maxRetryAttemptsInput,
+    // Dialler pacing. Deliberately NOT part of the authority fingerprint and
+    // NOT in `authorityChanged` below: how fast a clinic works through a list
+    // is an operational dial, not a change to what the agent is authorized to
+    // say, so it can be turned while the campaign is RUNNING without voiding
+    // the approval. Bounds mirror the database CHECK.
+    dialerEnabled: z.boolean(),
+    dialerMaxConcurrentCalls: z.number().int().min(1).max(50),
+    dialerCallsPerMinute: z.number().int().min(1).max(60),
+    dialerRetryGapMinutes: z.number().int().min(0).max(1440),
   });
   const campaignCreate = campaignBase.extend({
     requiredFields: z.array(z.enum(REQUIRED_FIELD_KEYS)).default(REQUIRED_FIELDS_DEFAULT),
     bookingMode: bookingModeEnum.default('APPOINTMENT_REQUEST_ONLY'),
     maxRetryAttempts: maxRetryAttemptsInput.default(1),
+    dialerEnabled: z.boolean().default(false),
+    dialerMaxConcurrentCalls: z.number().int().min(1).max(50).default(1),
+    dialerCallsPerMinute: z.number().int().min(1).max(60).default(1),
+    dialerRetryGapMinutes: z.number().int().min(0).max(1440).default(60),
   });
   const campaignUpdate = campaignBase.omit({ clinicId: true }).partial().extend({
     status: z.enum(['DRAFT', 'SCHEDULED', 'RUNNING', 'PAUSED', 'COMPLETED', 'FAILED']).optional(),
@@ -383,8 +395,20 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     return row;
   });
 
+  // A dialler shipped onto a deployment with no worker would accept the
+  // operator's "dial these automatically" and then silently never dial. That
+  // is a worse failure than an error, because it looks like success: the
+  // campaign is RUNNING, the targets are PENDING, and nothing happens all
+  // week. So switching the dialler ON is refused, loudly, wherever nothing
+  // could consume the queue — `QUEUES_ENABLED=false` (the shipped serverless
+  // config) or the dialler flag off.
+  const dispatcherCanDial = () => env.QUEUES_ENABLED && env.RECEPTIONIST_OUTBOUND_DIAL_ENABLED;
+
   app.post('/outbound-campaigns', { preHandler: writeRoles }, async (request, reply) => {
     const input = campaignCreate.parse(request.body);
+    if (input.dialerEnabled && !dispatcherCanDial()) {
+      return reply.code(409).send({ status: 'setup_required', reason: 'dispatcher_not_running' });
+    }
     try {
       const row = await runWithTenantContext(request.auth.tenantId, async tx => {
         await lockOutboundConfiguration(tx, request.auth.tenantId);
@@ -417,9 +441,12 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     }
   });
 
-  app.patch('/outbound-campaigns/:id', { preHandler: writeRoles }, async request => {
+  app.patch('/outbound-campaigns/:id', { preHandler: writeRoles }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
     const input = campaignUpdate.parse(request.body);
+    if (input.dialerEnabled === true && !dispatcherCanDial()) {
+      return reply.code(409).send({ status: 'setup_required', reason: 'dispatcher_not_running' });
+    }
     try {
       return await runWithTenantContext(request.auth.tenantId, async tx => {
         await lockOutboundConfiguration(tx, request.auth.tenantId);
@@ -961,7 +988,6 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     if (result.notFound) throw app.httpErrors.notFound(result.notFound);
     return reply.code(result.code).send(result.body);
   });
-
 
   // Provider lifecycle polling fallback for attended UAT when a public signed
   // webhook is not available. This endpoint never returns transcripts,

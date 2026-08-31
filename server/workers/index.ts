@@ -12,17 +12,13 @@ import { sampleQueueDepths } from '../lib/metrics';
 import { startWorkerMetricsServer } from './metricsServer';
 import { captureException } from '../lib/observability';
 import {
-  autopilotQueue,
-  campaignQueue,
-  complianceQueue,
-  monitoringQueue,
-  eligibilityReconciliationQueue,
-  receptionistCallReconciliationQueue,
+  ALL_QUEUES,
   registerCampaignSchedules,
   registerComplianceSchedules,
   registerMonitoringSchedules,
   registerEligibilityReconciliationSchedule,
   registerReceptionistCallReconciliationSchedule,
+  registerReceptionistOutboundDialSchedule,
 } from './queues';
 import { createAutopilotWorker } from './autopilot.worker';
 import { createCampaignWorker } from './campaign.worker';
@@ -30,6 +26,7 @@ import { createComplianceWorker } from './compliance.worker';
 import { createMonitoringWorker } from './monitoring.worker';
 import { createEligibilityReconciliationWorker } from './eligibilityReconciliation.worker';
 import { createReceptionistCallReconciliationWorker } from './receptionistCallReconciliation.worker';
+import { createReceptionistOutboundDialWorker } from './receptionistOutboundDial.worker';
 import { reconcileStrandedAutopilotDispatches } from './autopilotRecovery';
 
 // ===========================================================================
@@ -60,7 +57,7 @@ export async function startWorkers(): Promise<WorkerRuntime> {
   // DB role can bypass RLS, and non-production can opt in via the env flag.
   await assertRlsRuntimeRole();
 
-  const workers = [createAutopilotWorker(), createComplianceWorker(), createCampaignWorker(), createMonitoringWorker(), createEligibilityReconciliationWorker(), createReceptionistCallReconciliationWorker()];
+  const workers = [createAutopilotWorker(), createComplianceWorker(), createCampaignWorker(), createMonitoringWorker(), createEligibilityReconciliationWorker(), createReceptionistCallReconciliationWorker(), createReceptionistOutboundDialWorker()];
 
   // Idempotent on every boot — upsertJobScheduler dedupes by scheduler id, so
   // restarts never create duplicate schedules.
@@ -69,6 +66,10 @@ export async function startWorkers(): Promise<WorkerRuntime> {
   await registerMonitoringSchedules();
   await registerEligibilityReconciliationSchedule();
   await registerReceptionistCallReconciliationSchedule();
+  // No-op unless RECEPTIONIST_OUTBOUND_DIAL_ENABLED is on. The consumer above
+  // is always created so a job enqueued by hand is still drained rather than
+  // sitting in Redis looking like a stuck queue.
+  await registerReceptionistOutboundDialSchedule();
 
   const AUTOPILOT_RECOVERY_INTERVAL_MS = 60_000;
   let activeAutopilotRecoveryPass: Promise<void> | null = null;
@@ -97,7 +98,10 @@ export async function startWorkers(): Promise<WorkerRuntime> {
   // Publish queue backlog to the metrics registry so alerts can fire on a
   // growing/stuck queue. The worker is the source of truth for depth; sampling
   // every 15s is negligible Redis load.
-  const queues = [autopilotQueue, campaignQueue, complianceQueue, monitoringQueue, eligibilityReconciliationQueue, receptionistCallReconciliationQueue];
+  // Derived from the registry, never restated: a hand-listed array here goes
+  // stale the moment a queue is added, and a queue nothing samples is a queue
+  // no backlog alert can fire for.
+  const queues = [...ALL_QUEUES];
   await sampleQueueDepths(queues);
   const depthTimer = setInterval(() => { void sampleQueueDepths(queues); }, 15_000);
   depthTimer.unref?.();
@@ -110,7 +114,7 @@ export async function startWorkers(): Promise<WorkerRuntime> {
     clearInterval(depthTimer);
     clearInterval(autopilotRecoveryTimer);
     await Promise.allSettled(workers.map(worker => worker.close()));
-    await Promise.allSettled([autopilotQueue.close(), complianceQueue.close(), campaignQueue.close(), monitoringQueue.close(), eligibilityReconciliationQueue.close(), receptionistCallReconciliationQueue.close()]);
+    await Promise.allSettled(ALL_QUEUES.map(queue => queue.close()));
     if (metricsServer) await new Promise(resolve => metricsServer.close(() => resolve(null)));
     await db.$disconnect();
     // Last, so spans emitted while draining still flush to the exporter.
@@ -126,7 +130,7 @@ const isDirectRun = process.argv[1] ? import.meta.url === `file://${process.argv
 if (isDirectRun) {
   startWorkers()
     .then(({ workers, shutdown }) => {
-      console.info(`[workers] runtime started — draining ${workers.length} queues (autopilot, compliance, campaign, monitoring-safety, eligibility-reconciliation, receptionist-call-reconciliation)`);
+      console.info(`[workers] runtime started — draining ${workers.length} queues (${ALL_QUEUES.map(queue => queue.name).join(', ')})`);
       let closing = false;
       const onSignal = async (signal: string) => {
         if (closing) return;

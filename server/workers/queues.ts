@@ -274,6 +274,41 @@ export async function enqueueReceptionistCallReconciliationTenantJob(tenantId: s
   await receptionistCallReconciliationQueue.add('scan-tenant', data, { jobId: tenantJobId(data) });
 }
 
+// ---- Receptionist outbound dialler queue ---------------------------------
+// Works through a RUNNING campaign's PENDING targets so a clinic does not have
+// to click Call once per patient. Same fan-out shape as the reconcilers above:
+// a signed tick enqueues one signed per-tenant job, and the per-tenant job is
+// the pacer.
+//
+// It is OFF by default, unlike the reconcilers. Their failure mode is a row
+// left stranded; this one's is a phone ringing in somebody's house. Enabling
+// it needs the env flag AND the per-campaign `dialerEnabled` switch.
+export const receptionistOutboundDialQueue: Queue<ScheduledQueueData, void, string> = QUEUES_ENABLED
+  ? new Queue('receptionist-outbound-dial', {
+      connection: redisConnection,
+      prefix: bullMqPrefix,
+      // Two attempts, not three. A retried pass re-reads live state and cannot
+      // double-dial (the target claim inside the launch path is atomic), but a
+      // long retry ladder on a queue that places phone calls buys nothing: the
+      // next scheduled tick is along in a minute anyway.
+      defaultJobOptions: { attempts: 2, backoff: { type: 'exponential', delay: 5000 }, removeOnComplete: 500, removeOnFail: 1000 },
+    })
+  : disabledQueue('receptionist-outbound-dial');
+
+export async function registerReceptionistOutboundDialSchedule() {
+  if (!env.RECEPTIONIST_OUTBOUND_DIAL_ENABLED) return;
+  await receptionistOutboundDialQueue.upsertJobScheduler(
+    'receptionist-outbound-dial-scan',
+    { every: env.RECEPTIONIST_OUTBOUND_DIAL_INTERVAL_SECONDS * 1000 },
+    { name: 'scan', data: {} },
+  );
+}
+
+export async function enqueueReceptionistOutboundDialTenantJob(tenantId: string) {
+  const data = createTenantJobEnvelope({ queue: 'receptionist-outbound-dial', operation: 'dial', tenantId, _otel: currentTraceCarrier() });
+  await receptionistOutboundDialQueue.add('dial-tenant', data, { jobId: tenantJobId(data) });
+}
+
 // ---- The registry -----------------------------------------------------------
 // Every queue that lives under `bullMqPrefix`, in one place.
 //
@@ -290,4 +325,5 @@ export const ALL_QUEUES = [
   monitoringQueue,
   eligibilityReconciliationQueue,
   receptionistCallReconciliationQueue,
+  receptionistOutboundDialQueue,
 ] as const;

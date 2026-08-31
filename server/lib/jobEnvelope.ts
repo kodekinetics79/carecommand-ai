@@ -9,7 +9,7 @@ export const JOB_ENVELOPE_MAX_AGE_MS = 15 * 60_000;
 
 const envelopeSchema = z.object({
   v: z.literal(VERSION),
-  queue: z.enum(['campaign-scheduler', 'compliance-maintenance', 'monitoring-safety', 'eligibility-reconciliation', 'receptionist-call-reconciliation']),
+  queue: z.enum(['campaign-scheduler', 'compliance-maintenance', 'monitoring-safety', 'eligibility-reconciliation', 'receptionist-call-reconciliation', 'receptionist-outbound-dial']),
   operation: z.string().min(1).max(80),
   tenantId: z.string().uuid(),
   issuedAt: z.number().int().nonnegative(),
