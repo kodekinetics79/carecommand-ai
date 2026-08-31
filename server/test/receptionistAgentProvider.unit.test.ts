@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { env } from '../config/env';
-import { compareDeployedTools, evaluateRetellAgentReadiness, hashPrompt, probeRetellAgent } from '../lib/retell';
+import { compareDeployedTools, describeDeployedToolDrift, evaluateRetellAgentReadiness, hashPrompt, probeRetellAgent } from '../lib/retell';
 import { bookAppointmentToolFingerprint, compileIntakeContract } from '../modules/receptionist/intakeContract';
 import { buildRetellConfig, type PromptConfig } from '../modules/receptionist/promptService';
 import { promptFixture } from './fixtures/receptionistPromptConfigs';
@@ -491,6 +491,22 @@ describe('Retell agent provider contract', () => {
     const providerStored = [{ type: 'custom', name: 'take_message', url: 'https://api.example.test/fn' }];
     expect(() => compareDeployedTools(authored, providerStored)).not.toThrow();
     expect(compareDeployedTools(authored, providerStored)).toBe('tools_drift');
+  });
+
+  it('names the full path to the difference, not just the top-level key', async () => {
+    // `parameters` alone meant hunting through a fourteen-property JSON Schema
+    // by hand to find one changed value. The path ends that.
+    const authored = [{
+      type: 'custom', name: 'book_appointment',
+      parameters: { type: 'object', properties: { first_name: { type: 'string', maxLength: 80 } } },
+    }];
+    const providerStored = [{
+      type: 'custom', name: 'book_appointment',
+      parameters: { type: 'object', properties: { first_name: { type: 'string', maxLength: 120 } } },
+    }];
+    expect(describeDeployedToolDrift(authored, providerStored)).toEqual({
+      tool: 'book_appointment', key: 'parameters.properties.first_name.maxLength',
+    });
   });
 
   it('still calls a dropped NON-empty value drift', async () => {
