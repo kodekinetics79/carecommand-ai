@@ -211,9 +211,9 @@ describe('deploying a campaign to Retell', () => {
       // re-derivation of it, so this is the published payload under test.
       const row = await db.receptionistAgentDeployment.findFirstOrThrow({ where: { campaignId: campaign.id } });
       const tools = row.toolsJson as Array<Record<string, unknown>>;
-      expect(tools).toHaveLength(14);
+      expect(tools).toHaveLength(15);
       for (const tool of tools) expect(RETELL_GENERAL_TOOL_TYPES).toContain(tool.type);
-      expect(tools.filter(tool => tool.type === 'custom')).toHaveLength(13);
+      expect(tools.filter(tool => tool.type === 'custom')).toHaveLength(14);
       expect(tools.filter(tool => tool.type === 'transfer_call').map(tool => tool.name)).toEqual(['transfer_to_staff']);
       expect(tools.some(tool => tool.type === 'function')).toBe(false);
 

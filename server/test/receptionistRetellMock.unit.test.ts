@@ -199,10 +199,13 @@ describe('the mock provider validates the agent payload', () => {
 
 describe('the tools we actually ship', () => {
   it('declares every live tool with a type Retell allows', () => {
-    // 13 webhook-backed custom tools plus Retell's provider-native transfer.
+    // 14 webhook-backed custom tools plus Retell's provider-native transfer.
     // The thirteenth is `report_comprehension_failure`: the agent must tell the
     // server it did not understand a turn, because the server owns the ceiling.
-    expect(config.tools).toHaveLength(14);
+    // The fourteenth is `confirm_appointment`: a reminder call has to be able to
+    // record a "yes". Cancelling had a tool and a status to move to; confirming
+    // had neither, so the answer survived only inside a call summary.
+    expect(config.tools).toHaveLength(15);
     const byType = config.tools.reduce<Record<string, string[]>>((acc, tool) => {
       const type = String(tool.type);
       (acc[type] ??= []).push(String(tool.name));
@@ -210,7 +213,7 @@ describe('the tools we actually ship', () => {
     }, {});
     expect(Object.keys(byType).sort()).toEqual(['custom', 'transfer_call']);
     expect(byType.transfer_call).toEqual(['transfer_to_staff']);
-    expect(byType.custom).toHaveLength(13);
+    expect(byType.custom).toHaveLength(14);
     expect(byType.custom).toContain('book_appointment');
     expect(byType.custom).toContain('check_availability');
     expect(byType.custom).toContain('report_comprehension_failure');

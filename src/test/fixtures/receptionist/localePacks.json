@@ -54,7 +54,11 @@
           "emergency.callback.line": "I have alerted the practice, and someone will ring you straight back on this number. Please don't wait for that call if you need help now.",
           "comprehension.retry": "I'm sorry, that's my fault — I didn't catch that. Could you tell me again?",
           "comprehension.bail_out.transfer": "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I'm putting you through to a person at the practice now. Please stay on the line.",
-          "comprehension.bail_out.callback": "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've asked someone at the practice to ring you straight back on this number, and I've written down that we spoke."
+          "comprehension.bail_out.callback": "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've asked someone at the practice to ring you straight back on this number, and I've written down that we spoke.",
+          "tool.confirm.recorded": "Thank you — I have recorded that you are attending.",
+          "tool.confirm.already": "Thank you — that appointment is already confirmed.",
+          "tool.confirm.not_confirmable": "That appointment is not one I can confirm on this call. I can connect you with the front desk.",
+          "tool.confirm.locked": "That appointment can no longer be confirmed automatically. I can connect you with the front desk."
         }
       },
       "evidenceHash": "ce30e8be04af5d9273c10270af44ab4f0470f6a326fab3de601f66b1455b5045",
@@ -122,7 +126,11 @@
           "emergency.callback.line": "I have alerted the practice, and someone will ring you straight back on this number. Please don't wait for that call if you need help now.",
           "comprehension.retry": "I'm sorry, that's my fault — I didn't catch that. Could you tell me again?",
           "comprehension.bail_out.transfer": "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I'm putting you through to a person at the practice now. Please stay on the line.",
-          "comprehension.bail_out.callback": "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've asked someone at the practice to ring you straight back on this number, and I've written down that we spoke."
+          "comprehension.bail_out.callback": "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've asked someone at the practice to ring you straight back on this number, and I've written down that we spoke.",
+          "tool.confirm.recorded": "Thank you — I have recorded that you are attending.",
+          "tool.confirm.already": "Thank you — that appointment is already confirmed.",
+          "tool.confirm.not_confirmable": "That appointment is not one I can confirm on this call. I can connect you with the front desk.",
+          "tool.confirm.locked": "That appointment can no longer be confirmed automatically. I can connect you with the front desk."
         }
       },
       "evidenceHash": "7b585a11d5603acc4faa5220d201ebb6fcf41231b0773ef97f3b1abbfa13305b",
@@ -177,7 +185,11 @@
           "tool.booking.already": "You're already booked for {{booking}}.{{confirmation}}",
           "tool.booking.confirmation_accepted": "I've sent your confirmation; I can't confirm it has arrived yet.",
           "tool.message.recorded": "Thank you. That's written down for the front desk with your number. Someone will pick it up and get back to you; I can't promise exactly when.",
-          "tool.message.appended": "Thank you. I've added that to the same note for the front desk. Someone will pick it up and get back to you; I can't promise exactly when."
+          "tool.message.appended": "Thank you. I've added that to the same note for the front desk. Someone will pick it up and get back to you; I can't promise exactly when.",
+          "tool.confirm.recorded": "Thank you — I have recorded that you are attending.",
+          "tool.confirm.already": "Thank you — that appointment is already confirmed.",
+          "tool.confirm.not_confirmable": "That appointment is not one I can confirm on this call. I can connect you with the front desk.",
+          "tool.confirm.locked": "That appointment can no longer be confirmed automatically. I can connect you with the front desk."
         }
       },
       "evidenceHash": "96593e692983930812319ce82ddd8aaca9f667057d78b592741329ac00e83240"
@@ -224,7 +236,11 @@
           "tool.booking.already": "You're already booked for {{booking}}.{{confirmation}}",
           "tool.booking.confirmation_accepted": "I've sent your confirmation; I can't confirm it has arrived yet.",
           "tool.message.recorded": "Thank you. That's written down for reception with your number. Someone will pick it up and get back to you; I can't promise exactly when.",
-          "tool.message.appended": "Thank you. I've added that to the same note for reception. Someone will pick it up and get back to you; I can't promise exactly when."
+          "tool.message.appended": "Thank you. I've added that to the same note for reception. Someone will pick it up and get back to you; I can't promise exactly when.",
+          "tool.confirm.recorded": "Thank you — I have recorded that you are attending.",
+          "tool.confirm.already": "Thank you — that appointment is already confirmed.",
+          "tool.confirm.not_confirmable": "That appointment is not one I can confirm on this call. I can connect you with the front desk.",
+          "tool.confirm.locked": "That appointment can no longer be confirmed automatically. I can connect you with the front desk."
         }
       },
       "evidenceHash": "ce30e8be04af5d9273c10270af44ab4f0470f6a326fab3de601f66b1455b5045"

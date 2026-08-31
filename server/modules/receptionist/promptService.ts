@@ -551,6 +551,7 @@ Say: "${notInterestedLine}" Then end politely.
 - Do not collect detailed medical history unless an intake field above explicitly requires it.
 - Never collect Social Security numbers, payment card, or financial details.
 - Before any patient-specific action involving an existing record, call verify_patient_identity using the date of birth stated by the caller. Never treat a name, caller assertion, or model-generated flag as verification. If verification fails, locks, or the caller is a proxy, guardian, or minor, use request_human_handoff; do not reveal whether a patient record exists.
+- If the caller says they will attend an existing appointment, call confirm_appointment with that appointment_id. It records the confirmation and changes nothing else; it needs no confirmation token. Say the appointment is confirmed only if the tool says so.
 - For an existing appointment, verify identity first, then call list_upcoming_appointments. Use only the appointment_id returned by that tool. Call prepare_appointment_change with the exact action and requested time; read its confirmation question exactly. Only after the caller explicitly says yes, call cancel_appointment or reschedule_appointment with confirmed=true and the returned confirmation_token. Never invent or reuse a token. Never claim a cancellation or reschedule succeeded unless the mutation tool returns success; if it reports needs_human, create a handoff.
 - Immediately after the opening turn, wait. Call record_recording_preference only with the caller's explicit answer and before collecting information, then follow the Consent section above. A refusal or a withdrawal means: record it with that tool first, do not use a tool that reads or writes a patient record until consent is granted, and keep helping with everything else. Refusing to be recorded is a right the caller is exercising; it is never a reason to end the call or to send them away.
 - If the person mentions a possible emergency at ANY point, interrupt what you are saying and immediately say: "${emergencyInstruction}" This rule overrides finishing the disclosure or waiting for consent. Never delay the emergency instruction to ask questions or use another tool. Only after you have said it, call report_emergency, then say its message exactly as returned and DO WHAT ITS next_action FIELD SAYS, on this call, while the caller is still on the line: if it says transfer_now, call transfer_to_staff immediately; if it says offer_callback, say so and stay with them. The emergency is not handled by a task appearing on a screen — nobody may be looking at that screen — so it is handled by you getting a person onto this call or a callback promised on it. Never tell the caller to wait for staff to notice something. A clinically urgent but non-life-threatening request is NOT an emergency: handle it under "Urgent but not life-threatening" above.
@@ -771,6 +772,21 @@ export function buildRetellConfig(config: PromptConfig, options: { webhookBaseUr
           confirmed: { type: 'boolean', description: 'True only after the caller explicitly says yes to the server-rendered confirmation.' },
         },
         required: ['appointment_id', 'confirmation_token', 'confirmed'],
+      },
+    },
+    {
+      type: 'custom',
+      name: 'confirm_appointment',
+      description: "Record that the caller confirmed they will attend an existing appointment. Use only when the caller clearly says they are coming. Never use it to cancel, move, or create anything. Report the tool result exactly; if it reports needs_human, do not claim the appointment is confirmed.",
+      url: fnUrl,
+      speak_during_execution: true,
+      speak_after_execution: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          appointment_id: { type: 'string', description: 'Exact appointment_id returned by list_upcoming_appointments, or the one supplied for this reminder call.' },
+        },
+        required: ['appointment_id'],
       },
     },
     {

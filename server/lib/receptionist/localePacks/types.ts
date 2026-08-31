@@ -134,6 +134,10 @@ export const LOCALE_PACK_MESSAGE_KEYS = {
   'tool.booking.confirmed': { vars: ['first_name', 'booking', 'confirmation'], describe: 'book_appointment succeeded; {{booking}} is the spoken appointment.' },
   'tool.booking.already': { vars: ['booking', 'confirmation'], describe: 'book_appointment replayed against an existing booking.' },
   'tool.booking.confirmation_accepted': { vars: [], describe: 'Appended to a booking confirmation only when the messaging provider accepted the send.' },
+  'tool.confirm.recorded': { vars: [], describe: 'confirm_appointment recorded that the patient said they are attending. States what was written down, never that anything was changed.' },
+  'tool.confirm.already': { vars: [], describe: 'confirm_appointment replayed against an appointment already confirmed. Thanks the caller without implying a second confirmation was recorded.' },
+  'tool.confirm.not_confirmable': { vars: [], describe: 'confirm_appointment refused because the appointment has already started. Offers a human rather than explaining the rule.' },
+  'tool.confirm.locked': { vars: [], describe: 'confirm_appointment refused because the appointment is cancelled, completed or otherwise no longer confirmable by voice. Offers a human.' },
   'tool.message.recorded': { vars: [], describe: 'take_message recorded a new callback request.' },
   'tool.message.appended': { vars: [], describe: 'take_message appended to the callback request already open for this call.' },
 
