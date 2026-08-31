@@ -737,7 +737,11 @@ describe('AI receptionist trusted configuration', () => {
     const t = await tenant();
     const clinicId = (await createClinic(t, { name: 'Pinned clinic' })).json().id as string;
     const verifiedShape = {
-      tenantId: t.id, clinicId, providerAgentId: 'agent_pinned', providerVersionTag: 'carecommand',
+      // Unique per run: `ReceptionistAgent_active_provider_deployment_unique`
+      // is on ("providerAgentId","providerVersion") GLOBALLY, not per tenant,
+      // so a hardcoded id passes once and collides on every rerun against the
+      // shared dev database.
+      tenantId: t.id, clinicId, providerAgentId: `agent_pinned_${randomUUID().replaceAll('-', '')}`, providerVersionTag: 'carecommand',
       providerVersion: 0, providerStatus: 'VERIFIED' as const, providerPublished: true,
       providerWebhookUrl: `${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`,
       providerWebhookEvents: ['call_started', 'call_ended', 'call_analyzed'],
@@ -759,7 +763,7 @@ describe('AI receptionist trusted configuration', () => {
     // Hand-linked and routed BY tag: the tag must genuinely be assigned, so a
     // half-attested row is still refused by the database.
     await expect(db.receptionistAgent.create({
-      data: { ...verifiedShape, name: 'BYO agent', providerAgentId: 'agent_byo', providerAssignedTags: [], providerVersionPinned: false },
+      data: { ...verifiedShape, name: 'BYO agent', providerAgentId: `agent_byo_${randomUUID().replaceAll('-', '')}`, providerAssignedTags: [], providerVersionPinned: false },
     })).rejects.toThrow();
   });
 
