@@ -466,6 +466,37 @@ describe('Retell agent provider contract', () => {
     expect(compareDeployedTools(authored, providerStored)).toBe('ok');
   });
 
+  it('accepts the provider dropping an empty collection we authored', async () => {
+    // Retell normalises empties away on write. `record_do_not_call` takes no
+    // arguments, so we author `required: []` and it stores the parameters
+    // object with `required` absent. Confirmed against the live provider on
+    // 2026-08-31 — this exact tool and this exact key was the whole of a
+    // `tools_drift` that blocked every deployment from verifying.
+    const authored = [{
+      type: 'custom', name: 'record_do_not_call', url: 'https://api.example.test/fn',
+      parameters: { type: 'object', properties: {}, required: [] },
+    }];
+    const providerStored = [{
+      type: 'custom', name: 'record_do_not_call', url: 'https://api.example.test/fn',
+      parameters: { type: 'object', properties: {} },
+    }];
+    expect(compareDeployedTools(authored, providerStored)).toBe('ok');
+  });
+
+  it('still calls a dropped NON-empty value drift', async () => {
+    // The forgiveness is only for vacuous values. A required field we actually
+    // asked for, gone from the provider's copy, is a real difference.
+    const authored = [{
+      type: 'custom', name: 'book_appointment', url: 'https://api.example.test/fn',
+      parameters: { type: 'object', properties: {}, required: ['first_name'] },
+    }];
+    const providerStored = [{
+      type: 'custom', name: 'book_appointment', url: 'https://api.example.test/fn',
+      parameters: { type: 'object', properties: {} },
+    }];
+    expect(compareDeployedTools(authored, providerStored)).toBe('tools_drift');
+  });
+
   it('still catches a tool we authored being changed, added or removed', async () => {
     const authored = [bookingTool(), { type: 'custom', name: 'take_message', url: 'https://api.example.test/fn' }];
     // A value we DID author, changed by someone in the provider console.
