@@ -431,6 +431,78 @@ describe('A5 — a failed deploy does not leak the engine it created', () => {
       restoreProvider();
     }
   });
+
+  it('reuses a failed replacement engine without patching the previously published agent', async () => {
+    const firstAgentId = providerId('agent_recovery_old');
+    const replacementAgentId = providerId('agent_recovery_new');
+    const firstLlmId = providerId('llm_recovery_old');
+    const replacementLlmId = providerId('llm_recovery_new');
+    env.RETELL_API_KEY = 'real-provider-key';
+    env.RETELL_BASE_URL = 'https://api.retellai.com';
+    env.RETELL_FROM_NUMBER = '+15550100000';
+    let createdEngines = 0;
+    let failReplacementAgent = true;
+    let currentAgentId = firstAgentId;
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string | URL) => {
+      const value = String(url).replace('https://api.retellai.com', '');
+      calls.push(value);
+      if (value.startsWith('/create-retell-llm')) {
+        createdEngines += 1;
+        return new Response(JSON.stringify({
+          llm_id: createdEngines === 1 ? firstLlmId : replacementLlmId,
+          version: 0,
+        }), { status: 200 });
+      }
+      if (value.startsWith(`/update-retell-llm/${replacementLlmId}`)) {
+        return new Response(JSON.stringify({ llm_id: replacementLlmId, version: 0 }), { status: 200 });
+      }
+      if (value.startsWith('/create-agent')) {
+        if (createdEngines === 2 && failReplacementAgent) {
+          failReplacementAgent = false;
+          return new Response(JSON.stringify({ message: 'replacement agent rejected' }), { status: 400 });
+        }
+        currentAgentId = createdEngines === 1 ? firstAgentId : replacementAgentId;
+        return new Response(JSON.stringify({ agent_id: currentAgentId, version: 0 }), { status: 200 });
+      }
+      if (value.startsWith('/update-agent/')) {
+        return new Response(JSON.stringify({ message: 'published agent cannot accept replacement engine' }), { status: 400 });
+      }
+      if (value.startsWith('/publish-agent/')) return new Response(JSON.stringify({}), { status: 200 });
+      if (value.startsWith('/get-agent/')) {
+        return new Response(JSON.stringify({ agent_id: currentAgentId, version: 0, is_published: true }), { status: 200 });
+      }
+      if (value.startsWith('/update-phone-number/')) {
+        const number = decodeURIComponent(value.split('phone-number/')[1] ?? '');
+        return new Response(JSON.stringify({ phone_number: number, inbound_agents: [{ agent_id: currentAgentId, agent_version: 0 }] }), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    }));
+    try {
+      const t = await tenant();
+      const { campaign } = await deployableCampaign(t);
+
+      expect((await deploy(t, campaign.id)).statusCode).toBe(200);
+      const failedReplacement = await deploy(t, campaign.id);
+      expect(failedReplacement.statusCode).not.toBe(200);
+      expect(failedReplacement.json().code).toBe('provider_invalid_request');
+
+      calls.length = 0;
+      expect((await deploy(t, campaign.id)).statusCode).toBe(200);
+      expect(calls.some(call => call.startsWith(`/update-retell-llm/${replacementLlmId}`))).toBe(true);
+      expect(calls.some(call => call.startsWith('/create-agent'))).toBe(true);
+      expect(calls.some(call => call.startsWith('/update-agent/'))).toBe(false);
+
+      const recovered = await db.receptionistAgentDeployment.findFirstOrThrow({
+        where: { campaignId: campaign.id }, orderBy: { startedAt: 'desc' },
+      });
+      expect(recovered.status).toBe('PUBLISHED');
+      expect(recovered.providerLlmId).toBe(replacementLlmId);
+      expect(recovered.providerAgentId).toBe(replacementAgentId);
+    } finally {
+      restoreProvider();
+    }
+  });
 });
 
 describe('a published engine is frozen, so the next deploy makes a new one', () => {

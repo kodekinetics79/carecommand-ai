@@ -287,6 +287,25 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
     if (agent.providerAgentId && !owned) {
       return { kind: 'error' as const, code: 'engine_not_owned' as ReceptionistDeployFailureCode, message: `This campaign points at a ${VOICE.configuration} CareCommand did not create. Clear it before publishing, so publishing does not overwrite a configuration it does not own.` };
     }
+    // Publication freezes every existing VERSION of this agent. A later
+    // failed deployment can leave a newer, still-editable response engine in
+    // our ledger while the agent row continues to point at the older published
+    // agent. In that recovery state `priorLlmPublished` is false, but PATCHing
+    // the adopted agent is still wrong: Retell rejects the old agent/new engine
+    // pairing. Remember publication independently from whichever engine row is
+    // newest so the retry creates the replacement agent it originally meant to
+    // create.
+    const publishedProviderAgent = agent.providerAgentId
+      ? await tx.receptionistAgentDeployment.findFirst({
+        where: {
+          tenantId: input.tenantId,
+          agentId: agent.id,
+          providerAgentId: agent.providerAgentId,
+          publishedAt: { not: null },
+        },
+        select: { id: true },
+      })
+      : null;
 
     // A4 — a redeploy flips the agent to UNVERIFIED, and the runtime gate then
     // drops every caller to the five safe tools until verification lands. That
@@ -400,6 +419,7 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
       agentName: agent.name,
       providerConfigRevision: agent.providerConfigRevision,
       providerAgentId: agent.providerAgentId,
+      providerAgentPublished: publishedProviderAgent !== null,
       priorLlmId: priorEngine?.providerLlmId ?? null,
       priorLlmVersion: priorEngine?.providerLlmVersion ?? 0,
       // Retell answers `400 Cannot update published LLM`. Publishing a
@@ -524,7 +544,7 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
   // and bind that new pair. Editable engine drafts continue updating the
   // existing editable agent draft.
   const replacingPublishedEngine = Boolean(claim.priorLlmPublished);
-  const providerAgent = claim.providerAgentId && !replacingPublishedEngine
+  const providerAgent = claim.providerAgentId && !replacingPublishedEngine && !claim.providerAgentPublished
     ? await updateRetellAgent(claim.providerAgentId, agentSpec, claim.priorAgentVersion)
     : await createRetellAgent(agentSpec);
   if (!providerAgent.ok) {
