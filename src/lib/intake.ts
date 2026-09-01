@@ -22,6 +22,10 @@ export interface IntakePacket {
   created?: boolean;
   publicToken?: string | null;
   publicUrl?: string | null;
+  /** Permissioned staff context. Never present on the public token contract. */
+  subject: { kind: 'patient' | 'lead' | 'unknown'; name: string | null };
+  clinic: { id: string; name: string; timezone: string } | null;
+  visit: { service: string | null; startsAt: string | null } | null;
 }
 
 export interface IntakePacketDetail extends IntakePacket {
