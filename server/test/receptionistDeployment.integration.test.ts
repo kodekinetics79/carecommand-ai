@@ -448,25 +448,15 @@ describe('deploying a campaign to Retell', () => {
       // The agent carries the webhook and names the engine we just wrote, and
       // deliberately does NOT pin a version on it.
       //
-      // This used to assert `version: 0`, to stop the published agent running
-      // the PREVIOUS engine version. The provider does not work that way:
-      // `response_engine.version` must equal the AGENT version being written,
-      // and it answers `400 Response engine version must match agent version`
-      // otherwise. Sending the engine's own version was right only while both
-      // happened to be 0 — on a first deploy — and broke every deploy after,
-      // because a published agent at version 1 taking a newly created engine at
-      // version 0 is a mismatch.
-      //
-      // Verified against the live provider: writing the agent with `{ llm_id }`
-      // alone binds engine version to the agent version being created, so the
-      // published agent runs the engine we just wrote. That is the outcome the
-      // old pin was reaching for, and omitting is how you actually get it.
+      // The provider contract requires the response-engine version. The deploy
+      // planner pairs this new V0 engine with a new V0 agent, so the versions
+      // are explicit and aligned instead of attaching V0 to a V1+ draft.
       const agentBody = calls[1]!.body;
       expect(agentBody.webhook_url).toBe(`${env.PUBLIC_API_URL.replace(/\/$/, '')}/v1/receptionist/webhooks/retell`);
       expect(agentBody.webhook_events).toEqual(['call_started', 'call_ended', 'call_analyzed']);
       expect(agentBody.data_storage_setting).toBe('basic_attributes_only');
       expect(agentBody.opt_in_signed_url).toBe(true);
-      expect(agentBody.response_engine).toEqual({ type: 'retell-llm', llm_id: newLlmId });
+      expect(agentBody.response_engine).toEqual({ type: 'retell-llm', llm_id: newLlmId, version: 0 });
 
       // Publishing goes to `/publish-agent`, not `/publish-agent-version`.
       //

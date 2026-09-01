@@ -225,7 +225,7 @@ export function retellAgentRequestIssues(body: unknown): string[] {
       issues.push(`response_engine/type must be equal to one of the allowed values: ${[...RETELL_RESPONSE_ENGINE_TYPES].join(', ')}`);
     }
     if (engine.type === 'retell-llm' && !isNonEmptyString(engine.llm_id)) issues.push('response_engine/llm_id must be a non-empty string');
-    if (engine.version !== undefined && (!Number.isSafeInteger(engine.version) || Number(engine.version) < 0)) {
+    if (!Number.isSafeInteger(engine.version) || Number(engine.version) < 0) {
       issues.push('response_engine/version must be a non-negative integer');
     }
   }

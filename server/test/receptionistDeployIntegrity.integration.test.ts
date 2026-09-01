@@ -490,6 +490,8 @@ describe('a published engine is frozen, so the next deploy makes a new one', () 
       expect((await deploy(t, campaign.id)).statusCode).toBe(200);
       expect(calls.some(call => call.startsWith('/update-retell-llm/'))).toBe(false);
       expect(calls.some(call => call.startsWith('/create-retell-llm'))).toBe(true);
+      expect(calls.some(call => call.startsWith('/create-agent'))).toBe(true);
+      expect(calls.some(call => call.startsWith('/update-agent/'))).toBe(false);
       expect(createdEngines).toBe(2);
     } finally {
       restoreProvider();
@@ -497,15 +499,8 @@ describe('a published engine is frozen, so the next deploy makes a new one', () 
   });
 });
 
-describe('the agent write never pins an engine version', () => {
-  it('omits response_engine.version so the provider aligns it with the agent version', async () => {
-    // Retell answers `400 Response engine version must match agent version`
-    // when `response_engine.version` is not the AGENT version being written.
-    // Pinning the engine's own version was correct only by coincidence — on a
-    // first deploy both are 0. Once a published agent at version 1 takes a
-    // freshly created engine at version 0 (exactly what the published-engine
-    // fix produces), every agent write failed. Confirmed against the live
-    // provider on 2026-08-30.
+describe('the agent write pins the accepted engine version', () => {
+  it('includes response_engine.version and pairs a replacement V0 engine with a replacement V0 agent', async () => {
     const agentId = providerId('agent_ver');
     const llmId = providerId('llm_ver');
     env.RETELL_API_KEY = 'real-provider-key';
@@ -519,17 +514,17 @@ describe('the agent write never pins an engine version', () => {
       }
       if (value.startsWith('/create-agent') || value.startsWith('/update-agent/')) {
         agentWrites.push(JSON.parse(init?.body ?? '{}') as Record<string, unknown>);
-        return new Response(JSON.stringify({ agent_id: agentId, version: 1 }), { status: 200 });
+        return new Response(JSON.stringify({ agent_id: agentId, version: 0 }), { status: 200 });
       }
       if (value.startsWith('/publish-agent/')) return new Response(JSON.stringify({}), { status: 200 });
       // Publishing now CONFIRMS the version with the provider instead of
       // trusting the number it was handed, so the read-back has to answer.
       if (value.startsWith('/get-agent/')) {
-        return new Response(JSON.stringify({ agent_id: agentId, version: 1, is_published: true }), { status: 200 });
+        return new Response(JSON.stringify({ agent_id: agentId, version: 0, is_published: true }), { status: 200 });
       }
       if (value.startsWith('/update-phone-number/')) {
         const number = decodeURIComponent(value.split('phone-number/')[1] ?? '');
-        return new Response(JSON.stringify({ phone_number: number, inbound_agents: [{ agent_id: agentId, agent_version: 1 }] }), { status: 200 });
+        return new Response(JSON.stringify({ phone_number: number, inbound_agents: [{ agent_id: agentId, agent_version: 0 }] }), { status: 200 });
       }
       return new Response('{}', { status: 200 });
     }));
@@ -543,8 +538,7 @@ describe('the agent write never pins an engine version', () => {
         const engine = body.response_engine as Record<string, unknown>;
         expect(engine.llm_id).toBe(llmId);
         expect(engine.type).toBe('retell-llm');
-        // The engine we just wrote, with the version left to the provider.
-        expect(engine).not.toHaveProperty('version');
+        expect(engine.version).toBe(0);
       }
     } finally {
       restoreProvider();
@@ -703,11 +697,12 @@ describe('the second deploy of a line that is already live', () => {
       });
       expect(republished.id).not.toBe(first.id);
       expect(republished.status).toBe('PUBLISHED');
-      // Same agent, next version — and a NEW response engine, because
-      // publishing froze the previous one. Updating it would have been refused
-      // by the simulation exactly as the live account refuses it.
-      expect(republished.providerAgentId).toBe(first.providerAgentId);
-      expect(republished.providerAgentVersion).toBe(1);
+      // A replacement V0 agent is paired with the NEW V0 response engine.
+      // Retell requires those versions to match and published versions are
+      // immutable, so attaching the replacement engine to the old agent's V1
+      // draft is not a valid provider operation.
+      expect(republished.providerAgentId).not.toBe(first.providerAgentId);
+      expect(republished.providerAgentVersion).toBe(0);
       expect(republished.providerLlmId).not.toBe(first.providerLlmId);
       // A second deploy is a real change, not a re-publish of the same words.
       expect(republished.promptHash).not.toBe(first.promptHash);
@@ -727,12 +722,12 @@ describe('the second deploy of a line that is already live', () => {
       // The line answers with the version we just published, read back rather
       // than asserted.
       expect(attested.numberBindingVerifiedAt).not.toBeNull();
-      expect(attested.numberBindingAgentVersion).toBe(1);
+      expect(attested.numberBindingAgentVersion).toBe(0);
 
       const row = await db.receptionistAgent.findUniqueOrThrow({ where: { id: agent.id } });
       expect(row.currentDeploymentId).toBe(republished.id);
       expect(row.providerStatus).toBe('VERIFIED');
-      expect(row.providerVersion).toBe(1);
+      expect(row.providerVersion).toBe(0);
       // A deployment CareCommand made is routed by number, so the row is a
       // pinned attestation; the CHECK constraint accepts it without a tag.
       expect(row.providerVersionPinned).toBe(true);

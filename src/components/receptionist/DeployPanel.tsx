@@ -182,6 +182,9 @@ export function DeployPanel({ campaignId, config, campaignStatus = null, onDeplo
   const deployment = diff?.deployment ?? null;
   const busy = isBusy(deployState.state) || deploying;
   const canDeploy = !busy && cooldownSeconds === 0 && view !== 'no-agent' && Boolean(status);
+  const verificationExpired = status?.verification.status === 'VERIFIED'
+    && status.verification.expiresInMs !== null
+    && status.verification.expiresInMs <= 0;
 
   const statusFailed = statusResource.state.status === 'error';
   const diffFailed = diffResource.state.status === 'error';
@@ -322,7 +325,7 @@ export function DeployPanel({ campaignId, config, campaignStatus = null, onDeplo
             {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> : <Rocket className="h-4 w-4" aria-hidden="true" />}
             {view === 'deployed-stale' ? 'Publish changes' : view === 'deploy-failed' || view === 'drift-blocked' ? (cooldownSeconds > 0 ? `Retry in ${cooldownSeconds}s` : 'Retry') : view === 'deployed-current' ? VOICE.publishAgain : VOICE.publish}
           </button>
-          {(view === 'verification-failed' || (deployment && deployment.status === 'PUBLISHED')) && agentId && (
+          {(view === 'verification-failed' || (deployment && deployment.status === 'PUBLISHED') || verificationExpired) && agentId && (
             <button type="button" disabled={busy} onClick={verifyAgain} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-3 py-2 text-xs font-semibold text-t1 disabled:opacity-40">
               <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" /> {VOICE.runCheck}
             </button>

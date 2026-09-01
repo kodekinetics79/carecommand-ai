@@ -1415,23 +1415,11 @@ export function llmRequestBody(spec: RetellLlmSpec) {
 function agentRequestBody(spec: RetellAgentSpec) {
   return {
     agent_name: spec.agentName,
-    // No `version` here, deliberately. Retell's rule is that
-    // `response_engine.version` must equal the AGENT version being written, not
-    // the engine's own version — it answers
-    // `400 Response engine version must match agent version` otherwise.
-    //
-    // We used to pin `spec.llmVersion`, which was only ever correct by
-    // coincidence: on the first deploy both the new agent and the new engine
-    // are version 0. The moment they diverge — a published agent at version 1
-    // taking a freshly created engine at version 0, which is exactly what the
-    // published-engine fix produces — every agent update failed. Omitting the
-    // field lets Retell bind the engine we just wrote to the agent version it
-    // is creating, which is the alignment we actually want.
-    //
-    // The deployment is still pinned by number where it counts: the phone
-    // number binds one exact published AGENT version, and verification records
-    // whatever engine version the provider reports back.
-    response_engine: { type: 'retell-llm', llm_id: spec.llmId },
+    // Retell's current agent contract requires the response-engine version.
+    // The deploy planner guarantees that a replacement engine is paired with
+    // a replacement V0 agent, while an editable agent draft is paired with the
+    // matching engine draft. Omitting this value now produces a provider 400.
+    response_engine: { type: 'retell-llm', llm_id: spec.llmId, version: spec.llmVersion },
     voice_id: spec.voiceId,
     language: spec.language,
     webhook_url: spec.webhookUrl,

@@ -20,6 +20,7 @@ import { TransferReadinessBadge } from './TransferReadinessBadge';
 interface ClinicDraft {
   name: string;
   phone: string;
+  inboundNumber: string | null;
   logoUrl: string | null;
   website: string | null;
   addressLine: string | null;
@@ -34,7 +35,7 @@ interface ClinicDraft {
 }
 
 const DRAFT_KEYS: Array<keyof ClinicDraft> = [
-  'name', 'phone', 'logoUrl', 'website', 'addressLine', 'country', 'timezone', 'defaultLanguage',
+  'name', 'phone', 'inboundNumber', 'logoUrl', 'website', 'addressLine', 'country', 'timezone', 'defaultLanguage',
   'complianceDisclosure', 'humanFallbackNumber', 'doNotContactPolicy', 'workingHours', 'active',
 ];
 
@@ -47,6 +48,7 @@ function toDraft(clinic: ClinicRow): ClinicDraft {
   return {
     name: clinic.name,
     phone: clinic.phone,
+    inboundNumber: blank(clinic.inboundNumber),
     logoUrl: blank(clinic.logoUrl),
     website: blank(clinic.website),
     addressLine: blank(clinic.addressLine),
@@ -114,7 +116,7 @@ export function ClinicPanel({ clinic, onChanged }: { clinic: ClinicRow; onChange
   const changes = changedKeys(stored, draft, DRAFT_KEYS.filter(key => key !== 'workingHours'));
   const dirty = Object.keys(changes).length > 0 || hoursDirty;
   const set = <K extends keyof ClinicDraft>(key: K, value: ClinicDraft[K]) => setDraft(prev => ({ ...prev, [key]: value }));
-  const setText = (key: 'logoUrl' | 'website' | 'addressLine' | 'complianceDisclosure' | 'humanFallbackNumber' | 'doNotContactPolicy', value: string) => set(key, blank(value));
+  const setText = (key: 'inboundNumber' | 'logoUrl' | 'website' | 'addressLine' | 'complianceDisclosure' | 'humanFallbackNumber' | 'doNotContactPolicy', value: string) => set(key, blank(value));
 
   const serverFieldErrors = saveState.state.status === 'error' ? saveState.state.fieldErrors : {};
   const fieldError = (key: string): string | null => localErrors[key] ?? serverFieldErrors[key]?.[0] ?? null;
@@ -186,6 +188,9 @@ export function ClinicPanel({ clinic, onChanged }: { clinic: ClinicRow; onChange
           <Field label="Clinic name" required><TextInput value={draft.name} onChange={e => set('name', e.target.value)} /></Field>
           <Field label="Phone number" required hint={fieldError('phone') ?? undefined}>
             <TextInput value={draft.phone} aria-invalid={Boolean(fieldError('phone'))} onChange={e => set('phone', e.target.value)} />
+          </Field>
+          <Field label="AI voice line" hint={fieldError('inboundNumber') ?? 'The dedicated number patients dial to reach this receptionist. Leave blank until a line is assigned.'}>
+            <TextInput value={draft.inboundNumber ?? ''} placeholder="+12125550100" aria-invalid={Boolean(fieldError('inboundNumber'))} onChange={e => setText('inboundNumber', e.target.value)} />
           </Field>
           <Field label="Website" hint={fieldError('website') ?? undefined}>
             <TextInput value={draft.website ?? ''} placeholder="https://" aria-invalid={Boolean(fieldError('website'))} onChange={e => setText('website', e.target.value)} />

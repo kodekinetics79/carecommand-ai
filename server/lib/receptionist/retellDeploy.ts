@@ -517,7 +517,14 @@ export async function deployCampaignToRetell(input: DeployInput): Promise<Deploy
     webhookUrl: expectedRetellAgentWebhookUrl(),
     postCallAnalysisData: claim.plan.config.callOutcomeFields,
   };
-  const providerAgent = claim.providerAgentId
+  // Published response engines are immutable. Their replacement starts at V0,
+  // so it cannot be attached to an existing agent whose next draft is V1+:
+  // Retell requires response_engine.version to match the agent version. Pair a
+  // replacement V0 engine with a replacement V0 agent, then atomically adopt
+  // and bind that new pair. Editable engine drafts continue updating the
+  // existing editable agent draft.
+  const replacingPublishedEngine = Boolean(claim.priorLlmPublished);
+  const providerAgent = claim.providerAgentId && !replacingPublishedEngine
     ? await updateRetellAgent(claim.providerAgentId, agentSpec, claim.priorAgentVersion)
     : await createRetellAgent(agentSpec);
   if (!providerAgent.ok) {
