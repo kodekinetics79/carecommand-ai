@@ -1,7 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Save, Megaphone, Loader2 } from 'lucide-react';
 import { Field, TextInput, TextArea, Select } from '../../ui/Field';
-import { receptionistApi as api, OUTBOUND_REQUIRED_FIELDS, validateOutboundQuietHours, type Campaign, type OutboundRequiredField, type OutboundBookingMode, type OutboundCampaignInput, type Location } from '../../../lib/receptionist';
+import { receptionistApi as api, OUTBOUND_REQUIRED_FIELDS, validateOutboundQuietHours, type Agent, type Campaign, type OutboundRequiredField, type OutboundBookingMode, type OutboundCampaignInput, type Location } from '../../../lib/receptionist';
 import { isBusy, useMutationState } from '../../../hooks/useMutationState';
 import { MutationNotice } from '../MutationNotice';
 import { EMPTY_CAMPAIGN, toOutboundCampaignPayload } from './campaignPayload';
@@ -26,12 +26,30 @@ function RequiredFieldPicker({ value, onChange }: { value: OutboundRequiredField
   );
 }
 
-function CampaignFormFields({ form, set, bookingAuthorities, locations }: { form: OutboundCampaignInput; set: (patch: Partial<OutboundCampaignInput>) => void; bookingAuthorities: Campaign[]; locations: Location[] }) {
+function CampaignFormFields({ form, set, bookingAuthorities, locations, agents, effectiveAgentId }: { form: OutboundCampaignInput; set: (patch: Partial<OutboundCampaignInput>) => void; bookingAuthorities: Campaign[]; locations: Location[]; agents: Agent[]; effectiveAgentId: string | null }) {
   return (
     <>
       <Field label="Campaign name" required>
         <TextInput value={form.name} onChange={e => set({ name: e.target.value })} placeholder="June reactivation outreach" />
       </Field>
+      {form.bookingMode !== 'DIRECT_BOOKING_IF_SLOT_AVAILABLE' && (
+        <Field
+          label="Which receptionist places these calls?"
+          required
+          hint={agents.length === 0
+            ? 'No published receptionist on this clinic yet. Publish one on the Go live tab first — a campaign cannot be approved without it.'
+            : 'The published receptionist whose voice and prompt this campaign uses.'}
+        >
+          <Select
+            aria-label="Receptionist placing these calls"
+            value={effectiveAgentId ?? ''}
+            onChange={e => set({ agentId: e.target.value || null })}
+          >
+            <option value="">{agents.length === 0 ? 'No published receptionist available' : 'Select a receptionist'}</option>
+            {agents.map(agent => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
+          </Select>
+        </Field>
+      )}
       <Field label="Call script" required hint="What the agent should say. Keep it scheduling-focused — the AI must not give medical advice.">
         <TextArea rows={4} disabled={form.bookingMode === 'DIRECT_BOOKING_IF_SLOT_AVAILABLE'} value={form.script} onChange={e => set({ script: e.target.value })} placeholder="Hi, this is {{agent_name}} calling from {{clinic_name}}..." />
       </Field>
@@ -115,6 +133,32 @@ function CampaignFormFields({ form, set, bookingAuthorities, locations }: { form
 
 export function CampaignBuilder({ clinicId, bookingAuthorities, locations, timezone, onSaved, onCancel }: { clinicId: string; bookingAuthorities: Campaign[]; locations: Location[]; timezone: string; onSaved: (id: string) => void; onCancel: () => void }) {
   const [form, setForm] = useState<OutboundCampaignInput>({ ...EMPTY_CAMPAIGN, clinicId });
+  // The voice agent that will place these calls.
+  //
+  // This form never collected one, so every campaign it created was born with
+  // agentId null — and `approveOutboundAuthority` refuses that with
+  // `agent_unlinked`. A campaign could be created, could not be approved, and
+  // could not be edited afterwards, so the only way out was a database write.
+  // Three clinics' worth of that was a demo lost.
+  //
+  // Direct booking is exempt: there the agent is inherited from the attested
+  // booking authority below, and choosing one here would let the two disagree.
+  const [agents, setAgents] = useState<Agent[] | null>(null);
+  useEffect(() => {
+    let active = true;
+    void api.listAgents(clinicId)
+      .then(rows => { if (active) setAgents(rows); })
+      .catch(() => { if (active) setAgents([]); });
+    return () => { active = false; };
+  }, [clinicId]);
+
+  const usableAgents = (agents ?? []).filter(agent => agent.active && agent.providerAgentId);
+  // One agent is the overwhelmingly common case, so it is chosen rather than
+  // asked about — a required question with exactly one possible answer is not a
+  // choice, it is a step to forget. DERIVED, not written into form state: a
+  // default that lives in state has to be kept in sync with the list it came
+  // from, and this one is simply recomputed.
+  const effectiveAgentId = form.agentId ?? (usableAgents.length === 1 ? usableAgents[0].id : null);
   const saveState = useMutationState();
   const saving = isBusy(saveState.state);
   const [err, setErr] = useState<string | null>(null);
@@ -123,15 +167,24 @@ export function CampaignBuilder({ clinicId, bookingAuthorities, locations, timez
   async function save() {
     const quietHoursError = validateOutboundQuietHours(form.quietHoursStart, form.quietHoursEnd, timezone);
     if (quietHoursError) { setErr(quietHoursError); return; }
+    // Saving a campaign that can never be approved is worse than refusing it:
+    // there is no edit form, so an unlinked campaign is unusable forever and
+    // the only remedy is a database write. Say so here instead.
+    if (form.bookingMode !== 'DIRECT_BOOKING_IF_SLOT_AVAILABLE' && !effectiveAgentId) {
+      setErr(usableAgents.length === 0
+        ? 'This clinic has no published receptionist yet, so a campaign cannot be approved. Publish one on the Go live tab first.'
+        : 'Choose which receptionist places these calls.');
+      return;
+    }
     setErr(null);
-    const row = await saveState.run(() => api.createOutboundCampaign(toOutboundCampaignPayload(form, clinicId)));
+    const row = await saveState.run(() => api.createOutboundCampaign(toOutboundCampaignPayload({ ...form, agentId: effectiveAgentId }, clinicId)));
     if (row) onSaved(row.id);
   }
 
   return (
     <div className="cc-card p-5 space-y-4">
       <h3 className="text-sm font-bold text-t1 flex items-center gap-2"><Megaphone className="w-4 h-4 text-indigo" /> New outbound campaign</h3>
-      <CampaignFormFields form={form} set={set} bookingAuthorities={bookingAuthorities} locations={locations} />
+      <CampaignFormFields form={form} set={set} bookingAuthorities={bookingAuthorities} locations={locations} agents={usableAgents} effectiveAgentId={effectiveAgentId} />
       <p className="text-[11px] text-t3">Quiet hours are enforced in clinic timezone {timezone}. Overnight windows such as 21:00–08:00 are supported.</p>
       {err && <p role="alert" className="text-xs text-red-v">{err}</p>}
       <MutationNotice state={saveState.state} showSaved={false} />
