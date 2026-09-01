@@ -42,7 +42,8 @@
     "test:e2e:chrome": "E2E_USE_INSTALLED_CHROME=true E2E_HEADLESS=false npm run test:e2e",
     "check": "npm run db:validate && npm run api:typecheck && npm run lint && npm run build",
     "preview": "vite preview",
-    "test:e2e:live-voice": "RUN_LIVE_VOICE_UAT=true E2E_USE_INSTALLED_CHROME=true E2E_HEADLESS=false npm run test:e2e -- --project=desktop-installed-chrome tests/e2e/receptionist-live-uat.spec.ts"
+    "test:e2e:live-voice": "RUN_LIVE_VOICE_UAT=true E2E_USE_INSTALLED_CHROME=true E2E_HEADLESS=false npm run test:e2e -- --project=desktop-installed-chrome tests/e2e/receptionist-live-uat.spec.ts",
+    "test:e2e:appointment-confirmation-live": "RUN_APPOINTMENT_CONFIRMATION_LIVE_UAT=true E2E_USE_INSTALLED_CHROME=true E2E_HEADLESS=false npm run test:e2e -- --project=desktop-installed-chrome tests/e2e/receptionist-appointment-confirmation-live-uat.spec.ts"
   },
   "dependencies": {
     "@fastify/cors": "^11.3.0",
