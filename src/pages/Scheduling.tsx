@@ -284,6 +284,17 @@ export default function Scheduling() {
     setSlotsError(null);
   }
 
+  function openBooking() {
+    // The schedule date is already the front desk's working context. Requiring
+    // a second native date-picker interaction before the first slot request is
+    // needless friction, and the initial booking state used to contain an empty
+    // date even though emptyBooking explicitly expects a clinic-local day.
+    // Always start a new booking on the date currently selected on the board;
+    // changing provider/service below still clears only the chosen slot.
+    setBooking(current => ({ ...current, date: activeDate, slotStart: '', slotEnd: '' }));
+    setShowBooking(true);
+  }
+
   async function bookAppointment() {
     const patient = patientRecords.find(p => p.id === booking.patientId);
     if (!patient || !patient.branchId || !booking.service.trim() || !booking.providerId || !booking.slotStart) {
@@ -435,7 +446,7 @@ export default function Scheduling() {
         badgeColor={loadError ? 'red' : source === 'live' ? 'emerald' : 'blue'}
         actions={
           <div className="flex gap-2">
-            <button type="button" onClick={() => setShowBooking(true)} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
+            <button type="button" onClick={openBooking} className="inline-flex items-center gap-2 rounded-xl bg-[var(--indigo)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 transition">
               <CalendarDays className="w-4 h-4" /> Book appointment
             </button>
           </div>
