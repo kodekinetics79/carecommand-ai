@@ -70,6 +70,7 @@ export function blockerLabel(blocker: string): string {
 export interface ClinicCreateInput {
   name: string;
   phone: string;
+  inboundNumber?: string | null;
   country: string;
   timezone: string;
   defaultLanguage: string;

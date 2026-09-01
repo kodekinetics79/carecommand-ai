@@ -75,6 +75,7 @@ export interface Clinic {
   name: string;
   logoUrl: string | null;
   phone: string;
+  inboundNumber?: string | null;
   website: string | null;
   addressLine: string | null;
   timezone: string;

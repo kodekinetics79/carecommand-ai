@@ -143,6 +143,18 @@ describe('DeployPanel', () => {
     expect(screen.getByRole('button', { name: /Publish to the line again/ })).toBeEnabled();
   });
 
+  it('offers a direct line-check recovery action when verification has expired', async () => {
+    respond = routes({
+      status: () => Promise.resolve(status({
+        verification: { status: 'VERIFIED', expiresAt: '2026-08-31T17:00:00.000Z', expiresInMs: -1, autoRenew: { enabled: true, lastSystemAttemptAt: null } },
+        blockers: [{ code: 'agent_verification_stale', severity: 'blocking', title: 'The last line check has expired', action: 'Run the line check again.', fixHref: '/receptionist-studio?tab=deploy', scope: 'agent' }],
+      })),
+    });
+    renderPanel();
+
+    expect(await screen.findByRole('button', { name: /Run the line check/ })).toBeEnabled();
+  });
+
   it('shows changed-setting chips and a Deploy changes button when the draft moved on', async () => {
     // No `toolsDiff` — the route does not send one. Rendering the stale state
     // used to throw here and take the whole tab down with it.

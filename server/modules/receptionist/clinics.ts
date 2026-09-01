@@ -63,6 +63,7 @@ export const clinicRoutes: FastifyPluginAsync = async app => {
   const clinicCreate = z.object({
     name: promptText(160).pipe(z.string().min(2)),
     phone: e164Phone,
+    inboundNumber: optionalE164Phone,
     country: iso2Country.refine(isSupportedCountry, 'Country is not supported yet'),
     timezone: timezoneInput,
     defaultLanguage: languageTag.refine(isSupportedAgentLanguage, 'Language is not supported by the voice provider').optional(),
@@ -176,7 +177,7 @@ export const clinicRoutes: FastifyPluginAsync = async app => {
   app.patch('/clinics/:id', { preHandler: writeRoles }, async (request, reply) => {
     const { id } = idParam.parse(request.params);
     const { expectedUpdatedAt, ...input } = clinicUpdate.parse(request.body);
-    const changed = { hours: false, timezone: false, phone: false };
+    const changed = { hours: false, timezone: false, phone: false, inboundNumber: false };
     try {
       const updated = await runWithTenantContext(request.auth.tenantId, async tx => {
         await lockReceptionistConfiguration(tx, request.auth.tenantId);
@@ -190,6 +191,7 @@ export const clinicRoutes: FastifyPluginAsync = async app => {
         changed.hours = input.workingHours !== undefined;
         changed.timezone = input.timezone !== undefined && input.timezone !== existing.timezone;
         changed.phone = input.phone !== undefined && input.phone !== existing.phone;
+        changed.inboundNumber = input.inboundNumber !== undefined && input.inboundNumber !== existing.inboundNumber;
         const merged = { ...existing, ...input };
         if (!merged.active) {
           const [activeCampaigns, runningOutbound, activeCalls] = await Promise.all([
@@ -229,6 +231,7 @@ export const clinicRoutes: FastifyPluginAsync = async app => {
       if (changed.hours) await recordWorkflowEvent(request.auth.tenantId, { eventType: 'receptionist.clinic.hours_changed', entityType: 'receptionistClinic', entityId: id, sourceModule: 'receptionist', payload: { clinicId: id } });
       if (changed.timezone) await recordWorkflowEvent(request.auth.tenantId, { eventType: 'receptionist.clinic.timezone_changed', entityType: 'receptionistClinic', entityId: id, sourceModule: 'receptionist', payload: { clinicId: id, timezone: updated.timezone } });
       if (changed.phone) await recordWorkflowEvent(request.auth.tenantId, { eventType: 'receptionist.clinic.phone_changed', entityType: 'receptionistClinic', entityId: id, sourceModule: 'receptionist', payload: { clinicId: id } });
+      if (changed.inboundNumber) await recordWorkflowEvent(request.auth.tenantId, { eventType: 'receptionist.clinic.inbound_number_changed', entityType: 'receptionistClinic', entityId: id, sourceModule: 'receptionist', payload: { clinicId: id } });
       return { ...updated, readiness: await clinicReadiness(request.auth.tenantId, updated) };
     } catch (error) {
       if (error instanceof StaleRevisionError) {

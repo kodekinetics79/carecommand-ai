@@ -15,6 +15,7 @@ export type WorkflowEventType =
   // AI receptionist clinic configuration and after-hours facts (C2).
   | 'receptionist.call.after_hours'
   | 'receptionist.clinic.hours_changed' | 'receptionist.clinic.timezone_changed' | 'receptionist.clinic.phone_changed'
+  | 'receptionist.clinic.inbound_number_changed'
   | 'receptionist.knowledge.approved' | 'receptionist.locale_pack.approved'
   // An ACTIVE campaign that no longer passes its own activation gate (B8).
   | 'receptionist.campaign.readiness_regressed'
