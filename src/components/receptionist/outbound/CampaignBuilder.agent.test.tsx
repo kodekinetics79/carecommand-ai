@@ -23,7 +23,7 @@ import { CampaignBuilder } from './CampaignBuilder';
  */
 const AGENT = {
   id: 'agent-1', clinicId: 'clinic-1', name: 'Ava', voice: 'v', tone: 't', language: 'en-US',
-  persona: null, greetingOverride: null, active: true, providerAgentId: 'retell-abc', providerVersionTag: 'carecommand', providerVersion: 3,
+  persona: null, greetingOverride: null, active: true, providerAgentId: 'provider-agent-abc', providerVersionTag: 'carecommand', providerVersion: 3,
 };
 
 function renderBuilder() {
