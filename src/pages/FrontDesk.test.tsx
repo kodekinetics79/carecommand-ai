@@ -224,6 +224,16 @@ describe('FrontDesk lanes', () => {
 
 /** E13 — one number per fact, and a truncated lane that admits it. */
 describe('FrontDesk counts', () => {
+  it('counts the same inbound population that the unreviewed lane loads', async () => {
+    happyPath();
+    const summaryRequest = vi.fn((path: string) => { void path; return CALL_SUMMARY; });
+    route('GET', /^\/v1\/receptionist\/call-logs\/summary/, summaryRequest);
+    renderPage();
+
+    await waitFor(() => expect(summaryRequest).toHaveBeenCalled());
+    expect(summaryRequest.mock.calls[0]?.[0]).toContain('direction=inbound');
+  });
+
   it('takes every tile from a server count, not from the length of a truncated page', async () => {
     happyPath();
     // 9 emergencies exist; the lane page carries 2 rows. The tile must read 9.

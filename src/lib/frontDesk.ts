@@ -466,7 +466,7 @@ export const frontDeskApi = {
       reviewStatus: query.reviewStatus, handoff: query.handoff, consent: query.consent, from: query.from, to: query.to,
       cursor: query.cursor, limit: query.limit,
     })}`)),
-  callLogSummary: (query: { clinicId?: string; from?: string; to?: string } = {}) =>
+  callLogSummary: (query: Pick<CallLogQuery, 'clinicId' | 'direction' | 'from' | 'to'> = {}) =>
     apiRequest<CallLogSummary>(`${receptionistBase}/call-logs/summary${qs(query)}`),
   getCallLog: (id: string) => apiRequest<CallLogDetail>(`${receptionistBase}/call-logs/${id}`),
 

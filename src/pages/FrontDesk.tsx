@@ -237,7 +237,11 @@ export default function FrontDesk() {
 
   const fetchCallSummary = useCallback(async (forClinic: string) => {
     try {
-      return { data: await frontDeskApi.callLogSummary({ clinicId: forClinic || undefined }), state: 'ready' as const, failure: null };
+      // This count labels the inbound-only unreviewed lane below, so its server
+      // denominator must carry the same direction filter. Without it the tile
+      // counted every unreviewed outbound campaign call too, then told staff
+      // those extra rows were mysteriously "not loadable from this lane".
+      return { data: await frontDeskApi.callLogSummary({ clinicId: forClinic || undefined, direction: 'inbound' }), state: 'ready' as const, failure: null };
     } catch (error) {
       return { data: null, state: 'error' as const, failure: describeFailure(error) };
     }
