@@ -1320,8 +1320,22 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
               scenario: body.scenario,
             }),
             evidenceReference,
-            captureMethod: 'STAFF_ATTESTED_SYNTHETIC_UAT',
-            source: 'CARECOMMAND_LIVE_UAT',
+            // These two are constrained by the DATABASE, as a pair:
+            // ReceptionistVoiceConsentEvent_capture_method_check allows only
+            // verbal_recorded | written | portal | staff_attestation |
+            // import_verified, and _method_source_check demands the matching
+            // source. 'STAFF_ATTESTED_SYNTHETIC_UAT' / 'CARECOMMAND_LIVE_UAT'
+            // were never legal values, so attaching the authorized live-test
+            // recipient failed with 23514 every single time this path ran.
+            //
+            // A staff member authorising a synthetic UAT recipient IS a staff
+            // attestation, which is what the allowed pair means; the fact that
+            // it is a UAT record is carried by `jurisdiction` and
+            // `evidenceReference` below, not by inventing an enum value the
+            // schema does not accept. `actorUserId` is required for this
+            // capture method and is already set.
+            captureMethod: 'staff_attestation',
+            source: 'staff_attested',
             actorUserId: request.auth.userId,
             jurisdiction: 'SYNTHETIC_UAT',
           } });
