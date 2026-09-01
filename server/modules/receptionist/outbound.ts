@@ -1523,7 +1523,7 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     const campaign = await db.receptionistOutboundCampaign.findFirst({
       where: { id, tenantId: request.auth.tenantId },
       include: {
-        clinic: { select: { id: true, name: true, complianceDisclosure: true, timezone: true, country: true, defaultLanguage: true } },
+        clinic: { select: { id: true, name: true, complianceDisclosure: true, timezone: true, country: true, defaultLanguage: true, humanFallbackNumber: true } },
         agent: true,
         receptionistCampaign: { select: { id: true, offerScript: true, appointmentType: true } },
       },
@@ -1583,6 +1583,25 @@ export const outboundRoutes: FastifyPluginAsync = async app => {
     if (!isValidE164(canonicalDialDestination)) {
       await audit(request, { action: 'receptionist.call.blocked', resource: 'receptionistOutboundCampaign', resourceId: campaign.id, metadata: { reason: 'invalid_e164_destination' } });
       return reply.code(400).send({ status: 'blocked', reason: 'invalid_e164_destination' });
+    }
+    // A transfer tool is fixed on the published agent, so an outbound call to
+    // the clinic's own human fallback could transfer straight back to the
+    // person already on the line and be misreported as a completed handoff.
+    // Refuse the dial before reserving an attempt or crossing the provider
+    // boundary. The operator must use a distinct staffed fallback number.
+    const humanFallbackDestination = toE164(campaign.clinic.humanFallbackNumber ?? '');
+    if (humanFallbackDestination && humanFallbackDestination === canonicalDialDestination) {
+      await audit(request, {
+        action: 'receptionist.call.blocked',
+        resource: target ? 'receptionistCallTarget' : 'receptionistOutboundCampaign',
+        resourceId: target?.id ?? campaign.id,
+        metadata: {
+          campaignId: campaign.id,
+          reason: 'destination_matches_human_fallback',
+          destinationMasked: maskPhone(canonicalDialDestination),
+        },
+      });
+      return reply.code(409).send({ status: 'blocked', reason: 'destination_matches_human_fallback' });
     }
     const liveAuthorization = env.LIVE_TEST_CALLS_AUTHORIZED
       ? authorizeLiveCallDestination(canonicalDialDestination, new Date(), request.auth.tenantId)

@@ -481,7 +481,7 @@ export interface ConfirmationDelivery {
 
 export type LaunchBlockReason =
   | 'campaign_not_running' | 'outbound_authority_unapproved' | 'outbound_stopped'
-  | 'invalid_e164_destination' | 'adhoc_call_not_authorized'
+  | 'invalid_e164_destination' | 'destination_matches_human_fallback' | 'adhoc_call_not_authorized'
   | 'target_identity_unbound' | 'target_identity_mismatch' | 'target_not_dialable'
   | 'positive_voice_consent_missing' | 'concurrency_limit_reached' | 'voice_minutes_limit_reached'
   | 'target_identity_changed' | 'shared_suppression_gate' | 'campaign_authority_changed'
@@ -534,7 +534,7 @@ const LAUNCH_RESULT_STATUSES = new Set([
 ]);
 const LAUNCH_BLOCK_REASONS = new Set<LaunchBlockReason>([
   'campaign_not_running', 'outbound_authority_unapproved', 'outbound_stopped',
-  'invalid_e164_destination', 'adhoc_call_not_authorized', 'target_identity_unbound',
+  'invalid_e164_destination', 'destination_matches_human_fallback', 'adhoc_call_not_authorized', 'target_identity_unbound',
   'target_identity_mismatch', 'target_not_dialable', 'positive_voice_consent_missing',
   'concurrency_limit_reached', 'voice_minutes_limit_reached', 'target_identity_changed',
   'shared_suppression_gate', 'campaign_authority_invalid', 'agent_unlinked',
