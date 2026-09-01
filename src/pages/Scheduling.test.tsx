@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -10,6 +10,7 @@ vi.mock('../lib/api', async () => {
 });
 
 import { GROWTH_POLICY_PATH } from '../lib/growthPolicy';
+import { todayInZone } from '../lib/clinicTime';
 import Scheduling from './Scheduling';
 
 /**
@@ -61,6 +62,7 @@ beforeEach(() => {
 
 function respondWith(options: {
   appointments?: unknown[];
+  branches?: unknown[];
   policy?: () => Promise<unknown>;
 }) {
   respond = (path: string) => {
@@ -70,7 +72,7 @@ function respondWith(options: {
     if (path.startsWith('/v1/appointments')) return Promise.resolve(options.appointments ?? []);
     if (path.startsWith('/v1/providers/overview')) return Promise.resolve([]);
     if (path.startsWith('/v1/patients')) return Promise.resolve([]);
-    if (path.startsWith('/v1/branches')) return Promise.resolve([]);
+    if (path.startsWith('/v1/branches')) return Promise.resolve(options.branches ?? []);
     if (path.startsWith('/v1/revenue-protection/appointment-queue')) return Promise.resolve({ appointments: [] });
     if (path === GROWTH_POLICY_PATH) return options.policy ? options.policy() : Promise.resolve(growthPolicy());
     return Promise.reject(new Error(`Unexpected request in test: ${path}`));
@@ -80,6 +82,19 @@ function respondWith(options: {
 function renderPage() {
   return render(<MemoryRouter><Scheduling /></MemoryRouter>);
 }
+
+describe('Scheduling — a new booking inherits the selected clinic date', () => {
+  it('opens on the board date instead of an empty native date input', async () => {
+    respondWith({
+      branches: [{ id: 'branch-1', name: 'Downtown', timezone: 'UTC' }],
+    });
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Book appointment' }));
+
+    expect(screen.getByLabelText('Date')).toHaveValue(todayInZone('UTC'));
+  });
+});
 
 describe('Scheduling — the risk flag is the configured rule, not a literal', () => {
   it('flags at the default inclusive bound (>= 50): 55 and exactly 50 flagged, 49 not', async () => {
