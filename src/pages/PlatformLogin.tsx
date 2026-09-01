@@ -18,10 +18,27 @@ export default function PlatformLogin() {
     setBusy(true); setError(null);
     try {
       if (mfaToken) {
-        const r = await platformAdmin.mfaVerify(code, mfaToken);
-        setPlatformToken(r.token);
-        navigate('/platform');
-        return;
+        try {
+          const r = await platformAdmin.mfaVerify(code, mfaToken);
+          setPlatformToken(r.token);
+          navigate('/platform');
+          return;
+        } catch (verifyError) {
+          // The verification token lives ten minutes. This screen reused the
+          // same one on every attempt, so once it lapsed no code could ever
+          // work: the operator retyped fresh codes against a dead token and got
+          // "session expired" forever, with nothing sending them back. Only a
+          // genuinely rejected CODE keeps them here.
+          const code = (verifyError as { code?: string }).code;
+          if (code !== 'invalid_code') {
+            setMfaToken(null);
+            setMfaEnrollment(null);
+            setPassword('');
+            setError('Your verification window expired. Enter your password again to get a new code prompt.');
+            return;
+          }
+          throw verifyError;
+        }
       }
       const r = await platformAdmin.login(email, password);
       if (r.mfaSetupRequired && r.mfaToken) {

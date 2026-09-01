@@ -20,6 +20,9 @@ async function pf<T>(path: string, init?: RequestInit & { auth?: boolean }): Pro
   });
   if (res.status === 401) {
     const refused = await res.json().catch(() => null) as { message?: string; error?: string } | null;
+    // Carry the server's error CODE, not just its prose, so a caller can tell a
+    // rejected code from an expired verification window and act differently.
+    const carry = (message: string) => Object.assign(new Error(message), { status: 401, code: refused?.error });
     // A 401 on a call made WITH the stored session token means that session is
     // gone: drop it and say so. A 401 from sign-in or two-factor verification
     // means the CREDENTIAL was refused, and calling that "session expired" sends
@@ -29,7 +32,7 @@ async function pf<T>(path: string, init?: RequestInit & { auth?: boolean }): Pro
     // the body away and substitute one message for all of them.
     const usedStoredSession = init?.auth !== false && Boolean(token);
     if (usedStoredSession) setPlatformToken(null);
-    throw new Error(refused?.message ?? (usedStoredSession
+    throw carry(refused?.message ?? (usedStoredSession
       ? 'Platform session expired. Please sign in again.'
       : 'That request was refused. Check the details and try again.'));
   }
