@@ -104,6 +104,11 @@ describe('authenticated intake authorization and branch boundaries', () => {
     const providerRead = await app.inject({ method: 'GET', url: '/v1/intake/packets', headers: headers(t, t.users.providerA) });
     expect(providerRead.statusCode).toBe(200);
     expect(providerRead.json().map((row: { intakePacketId: string }) => row.intakePacketId)).toEqual([packetA.id]);
+    expect(providerRead.json()[0]).toMatchObject({
+      subject: { kind: 'patient', name: 'Alex A' },
+      clinic: { id: t.branchA.id, name: 'Branch A', timezone: 'UTC' },
+      visit: { service: 'Visit A', startsAt: t.appointmentA.startsAt.toISOString() },
+    });
     expect(await db.auditEvent.findFirst({ where: { tenantId: t.id, actorUserId: t.users.providerA.id, action: 'intake.packets.read' } })).not.toBeNull();
 
     const providerWrite = await app.inject({ method: 'POST', url: '/v1/intake/packets', headers: headers(t, t.users.providerA), payload: { patientId: t.patientA.id, issueToken: false } });
