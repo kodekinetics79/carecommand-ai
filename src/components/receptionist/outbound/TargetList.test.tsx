@@ -31,15 +31,16 @@ function campaign(overrides: Partial<OutboundCampaign> = {}): OutboundCampaign {
 }
 
 const CANDIDATES_PATH = '/v1/receptionist/outbound-target-candidates?campaignId=ob-1';
-let respond: (path: string) => Promise<unknown>;
+const TARGETS_PATH = '/v1/receptionist/outbound-campaigns/ob-1/targets';
+let respond: (path: string, init?: RequestInit) => Promise<unknown>;
 
 beforeEach(() => {
   apiRequestMock.mockReset();
-  apiRequestMock.mockImplementation((path: string) => respond(path));
+  apiRequestMock.mockImplementation((path: string, init?: RequestInit) => respond(path, init));
 });
 
-function renderList(onConfigure?: () => void) {
-  return render(<TargetList campaign={campaign()} targets={[]} onAdded={() => {}} onCall={() => {}} canCall={false} onConfigure={onConfigure} />);
+function renderList(onConfigure?: () => void, overrides: Partial<OutboundCampaign> = {}) {
+  return render(<TargetList campaign={campaign(overrides)} targets={[]} onAdded={() => {}} onCall={() => {}} canCall={false} onConfigure={onConfigure} />);
 }
 
 describe('TargetList — candidate states are not interchangeable', () => {
@@ -90,5 +91,78 @@ describe('TargetList — candidate states are not interchangeable', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.queryByText(POLICY_MISSING_GUIDANCE)).not.toBeInTheDocument();
     expect(screen.getByRole('combobox', { name: 'Authorized outbound target' })).toBeEnabled();
+  });
+});
+
+describe('TargetList — appointment reminders are about one real appointment', () => {
+  it('auto-selects the only upcoming appointment and sends its id with the patient target', async () => {
+    let posted: unknown = null;
+    respond = async (path, init) => {
+      if (path === CANDIDATES_PATH) {
+        return [{
+          type: 'patient',
+          id: 'patient-1',
+          name: 'Jordan Test',
+          phone: '+15714305555',
+          voiceAuthorizationReady: true,
+          voiceAuthorizationReason: 'treatment_operations',
+          appointments: [{
+            appointmentId: 'appointment-1',
+            startsAt: '2026-09-02T14:00:00.000Z',
+            timezone: 'America/New_York',
+            service: 'Follow-up visit',
+            clinician: 'Dr. Maya Chen',
+            location: 'Main Clinic',
+          }],
+        }];
+      }
+      if (path === TARGETS_PATH && init?.method === 'POST') {
+        posted = JSON.parse(String(init.body));
+        return { added: 1 };
+      }
+      throw new Error(`Unexpected request in test: ${path}`);
+    };
+
+    renderList(undefined, {
+      purpose: 'APPOINTMENT_REMINDER',
+      legalBasis: 'TREATMENT_OPERATIONS',
+      policyVersion: 'appointment-reminder-v1',
+    });
+
+    const patient = await screen.findByRole('combobox', { name: 'Authorized outbound target' });
+    fireEvent.change(patient, { target: { value: 'patient:patient-1' } });
+
+    const appointment = screen.getByRole('combobox', { name: 'Appointment to confirm' }) as HTMLSelectElement;
+    await waitFor(() => expect(appointment.value).toBe('appointment-1'));
+    expect(screen.getByText(/choose the patient and the exact upcoming visit/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }));
+    await waitFor(() => expect(posted).toEqual({
+      targets: [{ patientId: 'patient-1', appointmentId: 'appointment-1' }],
+    }));
+  });
+
+  it('does not offer leads or patients with no upcoming appointment as reminder targets', async () => {
+    respond = path => path === CANDIDATES_PATH ? Promise.resolve([
+      {
+        type: 'lead', id: 'lead-1', name: 'Lead Person', phone: '+15714305556',
+        voiceAuthorizationReady: true, voiceAuthorizationReason: 'compatible_immutable_consent', appointments: [],
+      },
+      {
+        type: 'patient', id: 'patient-2', name: 'No Appointment Patient', phone: '+15714305557',
+        voiceAuthorizationReady: true, voiceAuthorizationReason: 'treatment_operations', appointments: [],
+      },
+    ]) : Promise.reject(new Error(`Unexpected request in test: ${path}`));
+
+    renderList(undefined, {
+      purpose: 'APPOINTMENT_REMINDER',
+      legalBasis: 'TREATMENT_OPERATIONS',
+      policyVersion: 'appointment-reminder-v1',
+    });
+
+    expect(await screen.findByText('No authorized patient with an upcoming appointment yet')).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /Lead Person/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /No Appointment Patient/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Add' })).toBeDisabled();
   });
 });
