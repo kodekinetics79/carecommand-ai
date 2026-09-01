@@ -1568,6 +1568,34 @@ describe('AI receptionist DNC evidence and provider-boundary linearization', () 
 });
 
 describe('AI receptionist outbound authority and target integrity', () => {
+  it('blocks a destination that equals the clinic human fallback before provider submission', async () => {
+    const tenant = await makeTenant();
+    const campaignId = await createCampaign(tenant, { status: 'RUNNING' });
+    const target = await addPatientTarget(tenant, campaignId, 798);
+    await db.receptionistClinic.update({
+      where: { id: tenant.clinicId },
+      data: { humanFallbackNumber: target.phone },
+    });
+    const providerFetch = vi.fn<typeof fetch>();
+    vi.stubGlobal('fetch', providerFetch);
+
+    const blocked = await app.inject({
+      method: 'POST',
+      url: `/v1/receptionist/outbound-campaigns/${campaignId}/call`,
+      headers: auth(tenant),
+      payload: { targetId: target.id, phone: target.phone },
+    });
+
+    expect(blocked.statusCode).toBe(409);
+    expect(blocked.json()).toMatchObject({ status: 'blocked', reason: 'destination_matches_human_fallback' });
+    expect(providerFetch).not.toHaveBeenCalled();
+    expect(await db.receptionistCallLog.count({ where: { tenantId: tenant.id, outboundCampaignId: campaignId } })).toBe(0);
+    expect(await db.receptionistCallTarget.findUniqueOrThrow({ where: { id: target.id } })).toMatchObject({ status: 'PENDING', attempts: 0 });
+    expect(await db.auditEvent.count({
+      where: { tenantId: tenant.id, action: 'receptionist.call.blocked', resourceId: target.id },
+    })).toBe(1);
+  });
+
   it('requires strict deployable quiet hours and fails closed on invalid clinic timezone at dispatch', async () => {
     const tenant = await makeTenant();
     const basePayload = {
