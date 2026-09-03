@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Plus, Phone, PhoneOutgoing, Settings2 } from 'lucide-react';
 import { Field, Select } from '../../ui/Field';
-import { receptionistApi as api, type OutboundCampaign, type CallTarget, type OutboundTargetCandidate } from '../../../lib/receptionist';
+import { receptionistApi as api, type OutboundCampaign, type CallTarget, type OutboundTargetCandidate, type OutboundTargetCandidateAppointment } from '../../../lib/receptionist';
 import { ApiError } from '../../../lib/api';
 import { describeFailure, type ResourceFailure } from '../../../lib/resourceState';
 import { isBusy, useMutationState } from '../../../hooks/useMutationState';
@@ -28,6 +28,26 @@ function candidateFailureState(error: unknown): CandidateState {
   return { status: 'error', failure: describeFailure(error) };
 }
 
+function appointmentOptionLabel(appointment: OutboundTargetCandidateAppointment): string {
+  let when = appointment.startsAt;
+  try {
+    when = new Intl.DateTimeFormat(undefined, {
+      timeZone: appointment.timezone,
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    }).format(new Date(appointment.startsAt));
+  } catch {
+    // The server is authoritative for timezone validity. If a malformed value
+    // still reaches the browser, show the ISO instant instead of hiding the row.
+  }
+  return [
+    when,
+    appointment.service,
+    appointment.clinician ? `with ${appointment.clinician}` : null,
+    appointment.location,
+  ].filter(Boolean).join(' · ');
+}
+
 export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConfigure }: {
   campaign: OutboundCampaign;
   targets: CallTarget[];
@@ -44,6 +64,7 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
     .sort()
     .join(',');
   const [selectedCandidate, setSelectedCandidate] = useState('');
+  const [selectedAppointment, setSelectedAppointment] = useState('');
   const addState = useMutationState();
   const removeState = useMutationState();
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -72,16 +93,38 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
     return () => { active = false; };
   }, [campaign.id, targetIdentityKey]);
 
+  const reminderCampaign = campaign.purpose === 'APPOINTMENT_REMINDER';
+  const selectedCandidateRow = candidates.find(item => `${item.type}:${item.id}` === selectedCandidate) ?? null;
+
+  function chooseCandidate(value: string) {
+    setSelectedCandidate(value);
+    const candidate = candidates.find(item => `${item.type}:${item.id}` === value);
+    if (reminderCampaign && candidate?.type === 'patient' && candidate.appointments.length === 1) {
+      setSelectedAppointment(candidate.appointments[0].appointmentId);
+    } else {
+      setSelectedAppointment('');
+    }
+  }
+
   async function add() {
     const candidate = candidates.find(item => `${item.type}:${item.id}` === selectedCandidate);
     if (!candidate) return;
+    const appointment = reminderCampaign
+      ? candidate.appointments.find(item => item.appointmentId === selectedAppointment)
+      : null;
+    // A reminder without an appointment binding is a call that can say nothing
+    // truthful about the visit. Refuse it in the UI as well as at the backend.
+    if (reminderCampaign && (!appointment || candidate.type !== 'patient')) return;
+
     await addState.run(async () => {
       await api.addTargets(campaign.id, [{
         ...(candidate.type === 'patient' ? { patientId: candidate.id } : { leadId: candidate.id }),
+        ...(appointment ? { appointmentId: appointment.appointmentId } : {}),
       }]);
       setSelectedCandidate('');
+      setSelectedAppointment('');
       onAdded();
-    }, { successMessage: `${candidate.name} added to the target list` });
+    }, { successMessage: reminderCampaign ? `${candidate.name} added for appointment confirmation` : `${candidate.name} added to the target list` });
   }
 
   async function remove(target: CallTarget) {
@@ -98,6 +141,15 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
 
   const policyMissing = candidateState.status === 'policy_missing';
   const readyCandidates = candidates.filter(candidate => candidate.voiceAuthorizationReady);
+  // An appointment-reminder campaign is not a generic calling list. Only a
+  // patient with an upcoming, still-attendable appointment can be selected.
+  const eligibleCandidates = reminderCampaign
+    ? readyCandidates.filter(candidate => candidate.type === 'patient' && candidate.appointments.length > 0)
+    : readyCandidates;
+  const appointmentChoices = reminderCampaign && selectedCandidateRow?.type === 'patient'
+    ? selectedCandidateRow.appointments
+    : [];
+  const addDisabled = busy || !selectedCandidate || (reminderCampaign && !selectedAppointment);
 
   return (
     <div className="cc-card p-5 space-y-3">
@@ -121,21 +173,39 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
           </div>
         </div>
       )}
+      {reminderCampaign && !policyMissing && candidateState.status !== 'error' && (
+        <div className="rounded-lg border border-[var(--b1)] bg-[var(--s2)] px-3 py-2 text-xs text-t2">
+          <span className="font-semibold text-t1">Appointment confirmation:</span> choose the patient and the exact upcoming visit this call is about. CareCommand reads the appointment again when the call is placed, so the receptionist does not rely on static campaign text.
+        </div>
+      )}
       <div className="grid grid-cols-[1fr_auto] gap-2 items-end">
-        <Field label="Authorized patient or lead">
-          <Select aria-label="Authorized outbound target" value={selectedCandidate} disabled={policyMissing || candidateState.status === 'loading'} onChange={e => setSelectedCandidate(e.target.value)}>
+        <Field label={reminderCampaign ? 'Patient to call' : 'Authorized patient or lead'}>
+          <Select aria-label="Authorized outbound target" value={selectedCandidate} disabled={policyMissing || candidateState.status === 'loading'} onChange={e => chooseCandidate(e.target.value)}>
             <option value="">
               {policyMissing ? 'Configure the campaign policy first'
                 : candidateState.status === 'loading' ? 'Loading authorized identities…'
-                  : candidateState.status === 'ready' && readyCandidates.length === 0 ? 'No authorized identity with a canonical phone yet'
-                    : 'Select an identity with a canonical phone'}
+                  : candidateState.status === 'ready' && eligibleCandidates.length === 0
+                    ? reminderCampaign ? 'No authorized patient with an upcoming appointment yet' : 'No authorized identity with a canonical phone yet'
+                    : reminderCampaign ? 'Select a patient with an upcoming appointment' : 'Select an identity with a canonical phone'}
             </option>
-            {readyCandidates.map(candidate => <option key={`${candidate.type}:${candidate.id}`} value={`${candidate.type}:${candidate.id}`}>{candidate.name} · {maskedPhone(candidate.phone)} · {candidate.voiceAuthorizationReason === 'compatible_immutable_consent' ? 'compatible consent evidence' : 'treatment/operations authority'}</option>)}
+            {eligibleCandidates.map(candidate => <option key={`${candidate.type}:${candidate.id}`} value={`${candidate.type}:${candidate.id}`}>
+              {candidate.name} · {maskedPhone(candidate.phone)}{reminderCampaign ? ` · ${candidate.appointments.length} upcoming appointment${candidate.appointments.length === 1 ? '' : 's'}` : ` · ${candidate.voiceAuthorizationReason === 'compatible_immutable_consent' ? 'compatible consent evidence' : 'treatment/operations authority'}`}
+            </option>)}
           </Select>
         </Field>
-        <button type="button" disabled={busy || !selectedCandidate} onClick={add} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50 h-[38px]"><Plus className="w-4 h-4" /> Add</button>
+        <button type="button" disabled={addDisabled} onClick={add} className="inline-flex items-center gap-2 rounded-xl border border-[var(--b1)] px-4 py-2 text-sm font-semibold text-t2 hover:bg-[var(--s2)] disabled:opacity-50 h-[38px]"><Plus className="w-4 h-4" /> Add</button>
       </div>
-      <MutationNotice state={addState.state} onRetry={selectedCandidate ? add : undefined} />
+      {reminderCampaign && selectedCandidateRow?.type === 'patient' && (
+        <Field label="Appointment to confirm" required>
+          <Select aria-label="Appointment to confirm" value={selectedAppointment} onChange={e => setSelectedAppointment(e.target.value)}>
+            <option value="">Select the exact appointment this call is about</option>
+            {appointmentChoices.map(appointment => (
+              <option key={appointment.appointmentId} value={appointment.appointmentId}>{appointmentOptionLabel(appointment)}</option>
+            ))}
+          </Select>
+        </Field>
+      )}
+      <MutationNotice state={addState.state} onRetry={selectedCandidate && (!reminderCampaign || selectedAppointment) ? add : undefined} />
       <MutationNotice state={removeState.state} showSaved={false} />
       {targets.length > 0 && (
         <div className="space-y-1.5">
@@ -149,6 +219,7 @@ export function TargetList({ campaign, targets, onAdded, onCall, canCall, onConf
                     <span className="badge badge-blue">{formatEnumLabel(t.status)}</span>
                     <span className="text-t2">{[t.firstName, t.lastName].filter(Boolean).join(' ') || maskedPhone(t.phone)}</span>
                     <span className="text-t3">{maskedPhone(t.phone)}</span>
+                    {t.appointmentId && <span className="text-t3">· appointment linked</span>}
                   </div>
                   <div className="flex items-center gap-2">
                     <button type="button" disabled={!canCall || t.status !== 'PENDING' || !consentReady} title={!consentReady ? `Target is not authorized for this exact campaign (${candidate?.voiceAuthorizationReason ?? 'authorization evidence unavailable'})` : !canCall ? 'Campaign must be running, provider-ready, and not emergency-stopped' : t.status !== 'PENDING' ? `Target is ${t.status}` : 'Call target'} onClick={() => onCall(t)} className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--b1)] px-2.5 py-1 font-semibold text-indigo hover:bg-[var(--s2)] disabled:opacity-50">
