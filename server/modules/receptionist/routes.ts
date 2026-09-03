@@ -12,6 +12,7 @@ import { knowledgeRoutes } from './knowledge';
 import { localePackRoutes } from './localePacks';
 import { catalogRoutes } from './catalog';
 import { hoursStatusRoutes } from './hoursStatus';
+import { workforceRoutes } from './workforce';
 
 export { receptionistWebhookRoutes, verifyRetellSignature } from './webhooks';
 
@@ -56,6 +57,11 @@ export const receptionistRoutes: FastifyPluginAsync = async app => {
 
   // ===== Appointment requests, reconciliations, call logs, opt-outs, overview
   await app.register(activityRoutes);
+
+  // ===== AI front-office workforce orchestration ===========================
+  // Identifies real work and prepares governed workflows over the same
+  // scheduler/campaign/task models; it never bypasses outbound launch gates.
+  await app.register(workforceRoutes);
 
   // ===== Outbound calling (campaigns, targets, launch, booking queue) =====
   // Registered here so it inherits the ai_receptionist feature gate above.
