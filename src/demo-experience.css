@@ -1,0 +1,588 @@
+/*
+ * CareCommand AI — Demo Experience 4.0
+ * -----------------------------------
+ * Presentation-layer hardening for the client pilot. This file deliberately
+ * loads after index.css so it can modernize the shared shell without changing
+ * clinical, authorization, tenancy, audit, or API behavior.
+ */
+
+:root {
+  --bg: #eef3f9;
+  --s0: #ffffff;
+  --s1: rgba(255, 255, 255, 0.92);
+  --s2: #f7f9fc;
+  --s3: #eef2f7;
+  --s4: #e2e8f0;
+  --b0: rgba(15, 23, 42, 0.035);
+  --b1: rgba(148, 163, 184, 0.26);
+  --b2: rgba(100, 116, 139, 0.34);
+  --t1: #101828;
+  --t2: #475467;
+  --t3: #667085;
+  --indigo: #5756d9;
+  --indigo-soft: rgba(87, 86, 217, 0.10);
+  --indigo-mid: rgba(87, 86, 217, 0.18);
+  --indigo-glow: rgba(87, 86, 217, 0.28);
+  --sidebar-w: 276px;
+  --topbar-h: 64px;
+  --cc-radius-sm: 12px;
+  --cc-radius-md: 16px;
+  --cc-radius-lg: 22px;
+  --cc-shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.04), 0 5px 14px rgba(16, 24, 40, 0.035);
+  --cc-shadow-md: 0 16px 42px -24px rgba(16, 24, 40, 0.34), 0 4px 14px rgba(16, 24, 40, 0.055);
+  --cc-shadow-lg: 0 28px 70px -34px rgba(16, 24, 40, 0.42), 0 8px 22px rgba(16, 24, 40, 0.06);
+}
+
+html {
+  background: #eef3f9;
+}
+
+body {
+  background:
+    radial-gradient(900px 600px at 78% -12%, rgba(99, 102, 241, 0.12), transparent 62%),
+    radial-gradient(700px 520px at 18% 104%, rgba(14, 165, 233, 0.08), transparent 60%),
+    #eef3f9;
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(71, 84, 103, 0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(71, 84, 103, 0.025) 1px, transparent 1px);
+  background-size: 28px 28px;
+  -webkit-mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.36), transparent 72%);
+  mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.36), transparent 72%);
+}
+
+/* ─────────────────────────────────────────────────────
+   Floating application shell
+   ───────────────────────────────────────────────────── */
+.app-shell {
+  background: transparent;
+}
+
+.app-main {
+  margin-left: var(--sidebar-w);
+}
+
+.app-scroll {
+  padding-top: 84px;
+}
+
+.app-inner {
+  width: 100%;
+  max-width: 1760px;
+  padding: 26px 30px 48px;
+}
+
+.app-inner > div {
+  animation: ccRouteIn 360ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes ccRouteIn {
+  from { opacity: 0; transform: translateY(8px) scale(0.997); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* ─────────────────────────────────────────────────────
+   Midnight command rail
+   ───────────────────────────────────────────────────── */
+.sidebar {
+  --t1: #f8fafc;
+  --t2: #d0d5dd;
+  --t3: #98a2b3;
+  --b1: rgba(255, 255, 255, 0.10);
+  --b2: rgba(255, 255, 255, 0.16);
+  --s2: rgba(255, 255, 255, 0.055);
+  --s3: rgba(255, 255, 255, 0.085);
+  --indigo: #a5b4fc;
+  --indigo-soft: rgba(129, 140, 248, 0.14);
+
+  top: 12px;
+  bottom: 12px;
+  left: 12px;
+  width: calc(var(--sidebar-w) - 18px);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 24px;
+  background:
+    radial-gradient(460px 300px at 12% -4%, rgba(99, 102, 241, 0.26), transparent 65%),
+    radial-gradient(380px 300px at 110% 76%, rgba(14, 165, 233, 0.11), transparent 62%),
+    linear-gradient(165deg, #11172b 0%, #0b1020 52%, #080c18 100%);
+  box-shadow:
+    0 30px 60px -30px rgba(2, 6, 23, 0.74),
+    inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  isolation: isolate;
+}
+
+.sidebar::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(115deg, rgba(255,255,255,0.045), transparent 28%, transparent 72%, rgba(129,140,248,0.035));
+}
+
+.sidebar > div:first-child {
+  padding-top: 20px !important;
+  padding-bottom: 16px !important;
+  border-bottom-color: rgba(255,255,255,0.09) !important;
+}
+
+.sidebar > div:first-child .workspace-btn {
+  background: rgba(255,255,255,0.055);
+  border-color: rgba(255,255,255,0.08);
+  color: #cbd5e1;
+}
+
+.sidebar nav {
+  padding-inline: 10px !important;
+  scrollbar-gutter: stable;
+}
+
+.sidebar input[type='text'] {
+  height: 38px;
+  border-radius: 12px !important;
+  border-color: rgba(255,255,255,0.10) !important;
+  background: rgba(255,255,255,0.055) !important;
+  color: #f8fafc !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+}
+
+.sidebar input[type='text']::placeholder {
+  color: #98a2b3 !important;
+}
+
+.sidebar input[type='text']:focus {
+  border-color: rgba(165, 180, 252, 0.72) !important;
+  box-shadow: 0 0 0 3px rgba(129,140,248,0.13);
+}
+
+.sidebar-section-label {
+  margin-top: 15px;
+  margin-bottom: 5px;
+  padding-inline: 10px;
+  color: #7f8aa3;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+}
+
+.nav-item {
+  min-height: 38px;
+  margin: 2px 0;
+  padding: 8px 10px;
+  border-radius: 11px;
+  gap: 10px;
+  color: #c5ccda;
+  font-size: 12.5px;
+  font-weight: 520;
+}
+
+.nav-item:hover {
+  background: rgba(255,255,255,0.075);
+  color: #ffffff;
+  transform: translateX(2px);
+}
+
+.nav-item.active {
+  color: #ffffff;
+  background:
+    linear-gradient(100deg, rgba(99,102,241,0.30), rgba(99,102,241,0.15) 62%, rgba(56,189,248,0.10));
+  border: 1px solid rgba(165,180,252,0.20);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.08), 0 8px 20px -15px rgba(99,102,241,0.85);
+}
+
+.nav-item.active::before {
+  left: -1px;
+  top: 9px;
+  bottom: 9px;
+  width: 3px;
+  border-radius: 0 999px 999px 0;
+  background: linear-gradient(#c7d2fe, #818cf8);
+  box-shadow: 0 0 12px rgba(129,140,248,0.65);
+}
+
+.nav-item.active svg,
+.sidebar .text-indigo {
+  color: #c7d2fe !important;
+  filter: drop-shadow(0 0 7px rgba(129,140,248,0.25));
+}
+
+.sidebar .logo-user {
+  background: linear-gradient(145deg, #6366f1, #8b5cf6) !important;
+  box-shadow: 0 4px 14px rgba(99,102,241,0.32);
+}
+
+.sidebar > div:last-child button {
+  border: 1px solid transparent;
+}
+
+.sidebar > div:last-child button:hover {
+  background: rgba(255,255,255,0.07) !important;
+  border-color: rgba(255,255,255,0.08);
+}
+
+/* ─────────────────────────────────────────────────────
+   Floating glass command bar
+   ───────────────────────────────────────────────────── */
+.topbar {
+  top: 12px;
+  left: var(--sidebar-w);
+  right: 16px;
+  height: var(--topbar-h);
+  padding: 0 16px;
+  gap: 12px;
+  border: 1px solid rgba(255,255,255,0.82);
+  border-radius: 19px;
+  background: rgba(255,255,255,0.76);
+  -webkit-backdrop-filter: blur(22px) saturate(165%);
+  backdrop-filter: blur(22px) saturate(165%);
+  box-shadow:
+    0 18px 42px -27px rgba(16,24,40,0.42),
+    0 3px 12px rgba(16,24,40,0.045),
+    inset 0 1px 0 rgba(255,255,255,0.82);
+}
+
+.topbar::before {
+  content: '';
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: -1px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(99,102,241,0.22), transparent);
+  pointer-events: none;
+}
+
+.topbar-search {
+  min-height: 38px;
+  border-radius: 12px !important;
+  border-color: rgba(148,163,184,0.24) !important;
+  background: rgba(248,250,252,0.82) !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.8);
+}
+
+.topbar-search:hover {
+  border-color: rgba(99,102,241,0.30) !important;
+  background: #ffffff !important;
+  box-shadow: 0 8px 22px -16px rgba(79,70,229,0.42);
+}
+
+.topbar-kbd {
+  border-radius: 7px !important;
+  background: #ffffff !important;
+  border: 1px solid rgba(148,163,184,0.22) !important;
+  box-shadow: 0 1px 2px rgba(16,24,40,0.05);
+}
+
+.topbar label,
+.topbar > div.relative > button {
+  min-height: 38px;
+  border-radius: 12px !important;
+  border-color: rgba(148,163,184,0.24) !important;
+  background: rgba(255,255,255,0.74) !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.85);
+}
+
+.topbar > div.relative > button:hover,
+.topbar label:hover {
+  background: #ffffff !important;
+  border-color: rgba(99,102,241,0.24) !important;
+}
+
+.topbar-icon-btn,
+.workspace-btn {
+  border-radius: 11px !important;
+}
+
+/* ─────────────────────────────────────────────────────
+   Page hierarchy
+   ───────────────────────────────────────────────────── */
+.page-header {
+  position: relative;
+  align-items: center !important;
+  margin-bottom: 24px !important;
+  padding: 4px 2px 2px;
+}
+
+.page-header::before {
+  content: '';
+  position: absolute;
+  left: -10px;
+  top: 7px;
+  bottom: 7px;
+  width: 3px;
+  border-radius: 999px;
+  background: linear-gradient(180deg, #6366f1, #38bdf8);
+  box-shadow: 0 0 15px rgba(99,102,241,0.22);
+}
+
+.page-title {
+  font-size: clamp(23px, 2vw, 30px) !important;
+  line-height: 1.12 !important;
+  letter-spacing: -0.035em !important;
+  font-weight: 720 !important;
+}
+
+.page-subtitle {
+  margin-top: 5px;
+  font-size: 12.5px !important;
+  color: var(--t3) !important;
+  max-width: 760px !important;
+}
+
+.page-actions {
+  gap: 8px !important;
+  padding: 5px;
+  border-radius: 14px;
+}
+
+/* ─────────────────────────────────────────────────────
+   Premium operational surfaces
+   ───────────────────────────────────────────────────── */
+.cc-card,
+.metric-card,
+.cockpit-card,
+.glass-card,
+.ai-briefing {
+  border-radius: var(--cc-radius-md) !important;
+  border-color: rgba(148,163,184,0.20) !important;
+  background: rgba(255,255,255,0.84) !important;
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  backdrop-filter: blur(14px) saturate(140%);
+  box-shadow: var(--cc-shadow-sm) !important;
+}
+
+.cc-card:hover,
+.metric-card:hover,
+.cockpit-card:hover {
+  border-color: rgba(99,102,241,0.22) !important;
+  box-shadow: var(--cc-shadow-md) !important;
+  transform: translateY(-1px);
+}
+
+.command-deck {
+  border-radius: 24px !important;
+  border: 1px solid rgba(99,102,241,0.18) !important;
+  background:
+    radial-gradient(720px 340px at 90% -15%, rgba(129,140,248,0.20), transparent 62%),
+    radial-gradient(560px 300px at -6% 112%, rgba(14,165,233,0.12), transparent 58%),
+    linear-gradient(135deg, rgba(245,247,255,0.98) 0%, rgba(255,255,255,0.94) 52%, rgba(246,250,255,0.96) 100%) !important;
+  box-shadow:
+    0 26px 64px -38px rgba(79,70,229,0.42),
+    0 8px 24px rgba(16,24,40,0.055) !important;
+}
+
+.command-deck-grid {
+  opacity: 0.62;
+  background-size: 26px 26px !important;
+}
+
+.deck-chip {
+  border-radius: 13px !important;
+  border-color: rgba(148,163,184,0.18) !important;
+  background: rgba(255,255,255,0.68) !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.8);
+}
+
+.hero-figure {
+  letter-spacing: -0.045em !important;
+  text-shadow: 0 8px 26px rgba(79,70,229,0.08);
+}
+
+/* Stat icon depth without visual noise. */
+.stat-icon {
+  width: 2.15rem !important;
+  height: 2.15rem !important;
+  border-radius: 11px !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.8), 0 6px 16px -12px currentColor;
+}
+
+/* ─────────────────────────────────────────────────────
+   Controls: compact, tactile, enterprise-clean
+   ───────────────────────────────────────────────────── */
+.app-shell input:not([type='checkbox']):not([type='radio']):not([type='range']),
+.app-shell select,
+.app-shell textarea {
+  border-radius: 11px;
+  border-color: rgba(148,163,184,0.30);
+  background-color: rgba(255,255,255,0.88);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.82), 0 1px 2px rgba(16,24,40,0.025);
+}
+
+.app-shell input:not([type='checkbox']):not([type='radio']):not([type='range']):focus,
+.app-shell select:focus,
+.app-shell textarea:focus {
+  border-color: rgba(87,86,217,0.62);
+  box-shadow: 0 0 0 3px rgba(87,86,217,0.10), 0 4px 12px rgba(16,24,40,0.04);
+}
+
+.app-shell button[class*='bg-indigo'],
+.app-shell a[class*='bg-indigo'] {
+  border-radius: 11px !important;
+  background: linear-gradient(135deg, #635bdf, #4f46c7) !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.18), 0 8px 18px -11px rgba(79,70,229,0.72);
+}
+
+.app-shell button[class*='bg-indigo']:hover,
+.app-shell a[class*='bg-indigo']:hover {
+  filter: brightness(1.055);
+  transform: translateY(-1px);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.20), 0 12px 24px -13px rgba(79,70,229,0.82);
+}
+
+.app-shell button[class*='border-[var(--b1)]'],
+.app-shell a[class*='border-[var(--b1)]'] {
+  border-radius: 11px !important;
+}
+
+.badge {
+  min-height: 20px;
+  border-radius: 999px;
+  padding-inline: 8px;
+  font-weight: 650;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.55);
+}
+
+/* ─────────────────────────────────────────────────────
+   Tables and data-dense workflows
+   ───────────────────────────────────────────────────── */
+.app-shell table {
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+.app-shell thead th {
+  background: rgba(248,250,252,0.76);
+  color: #667085;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-weight: 700;
+}
+
+.app-shell tbody tr {
+  transition: background-color 130ms ease, box-shadow 130ms ease;
+}
+
+.app-shell tbody tr:hover {
+  background: rgba(99,102,241,0.035);
+}
+
+/* ─────────────────────────────────────────────────────
+   Dashboard spacing: composed, not cramped
+   ───────────────────────────────────────────────────── */
+.dash-cockpit {
+  gap: 14px !important;
+}
+
+.dash-bar {
+  padding-inline: 2px;
+}
+
+.dash-kpis {
+  gap: 12px !important;
+}
+
+.skeleton,
+.skeleton-line {
+  border-radius: 12px !important;
+  background: linear-gradient(90deg, #edf1f6 25%, #f8fafc 50%, #edf1f6 75%) !important;
+  background-size: 420px 100% !important;
+}
+
+/* ─────────────────────────────────────────────────────
+   Drawers, modals, command palette
+   ───────────────────────────────────────────────────── */
+.glass-surface,
+.glass-strong,
+.cmd-backdrop > div {
+  border-radius: 22px !important;
+}
+
+.glass-surface,
+.glass-strong {
+  background: rgba(255,255,255,0.88) !important;
+  -webkit-backdrop-filter: blur(24px) saturate(160%);
+  backdrop-filter: blur(24px) saturate(160%);
+  border-color: rgba(255,255,255,0.74) !important;
+  box-shadow: var(--cc-shadow-lg) !important;
+}
+
+.cmd-backdrop {
+  background: rgba(9,14,30,0.48) !important;
+  -webkit-backdrop-filter: blur(8px) saturate(120%);
+  backdrop-filter: blur(8px) saturate(120%);
+}
+
+/* ─────────────────────────────────────────────────────
+   Motion discipline
+   ───────────────────────────────────────────────────── */
+.nav-item,
+.cc-card,
+.metric-card,
+.cockpit-card,
+.deck-chip,
+.topbar-search {
+  transition:
+    transform 180ms cubic-bezier(0.16, 1, 0.3, 1),
+    background-color 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease,
+    box-shadow 180ms ease !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-inner > div { animation: none !important; }
+  .nav-item:hover,
+  .cc-card:hover,
+  .metric-card:hover,
+  .cockpit-card:hover,
+  .app-shell button[class*='bg-indigo']:hover,
+  .app-shell a[class*='bg-indigo']:hover { transform: none !important; }
+}
+
+/* ─────────────────────────────────────────────────────
+   Responsive shell
+   ───────────────────────────────────────────────────── */
+@media (max-width: 1023px) {
+  :root { --sidebar-w: 250px; }
+  .app-inner { padding-inline: 20px; }
+  .topbar { right: 12px; }
+}
+
+@media (max-width: 767px) {
+  :root { --topbar-h: 60px; }
+  .sidebar {
+    top: 8px;
+    bottom: 8px;
+    left: 8px;
+    width: min(86vw, 330px);
+    border-radius: 20px;
+  }
+  .app-main { margin-left: 0; }
+  .topbar {
+    left: 8px;
+    right: 8px;
+    top: 8px;
+    height: var(--topbar-h);
+    border-radius: 16px;
+    padding-inline: 10px;
+  }
+  .app-scroll { padding-top: 76px; }
+  .app-inner { padding: 18px 14px 36px; }
+  .page-header {
+    align-items: flex-start !important;
+    flex-direction: column;
+    gap: 12px !important;
+    padding-left: 10px;
+  }
+  .page-header::before { left: 0; }
+  .page-title { font-size: 23px !important; }
+  .page-actions { width: 100%; overflow-x: auto; justify-content: flex-start; }
+}
