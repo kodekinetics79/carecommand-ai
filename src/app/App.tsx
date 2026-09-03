@@ -19,6 +19,7 @@ const ClinicRadar = lazy(() => import('../pages/ClinicRadar'));
 const Autopilot = lazy(() => import('../pages/Autopilot'));
 const CRM = lazy(() => import('../pages/CRM'));
 const AIReceptionist = lazy(() => import('../pages/AIReceptionist'));
+const AIWorkforce = lazy(() => import('../pages/AIWorkforce'));
 const FrontDesk = lazy(() => import('../pages/FrontDesk'));
 const ReceptionistStudio = lazy(() => import('../pages/ReceptionistStudio'));
 const Scheduling = lazy(() => import('../pages/Scheduling'));
@@ -174,6 +175,11 @@ export default function App() {
           <Route path="/front-desk" element={<FrontDesk />} />
           <Route path="/ai-receptionist" element={<AIReceptionist />} />
           <Route path="/receptionist-studio" element={<ReceptionistStudio />} />
+          {/* Workforce inherits the Studio's receptionist:manage access declaration
+              through the segment-aware route registry. It orchestrates the same
+              scheduler, intake, task and outbound records rather than creating a
+              second AI-specific data plane. */}
+          <Route path="/receptionist-studio/workforce" element={<AIWorkforce />} />
           <Route path="/scheduling" element={<Scheduling />} />
           <Route path="/patients" element={<Patients />} />
           <Route path="/patients/:id" element={<PatientProfile />} />
