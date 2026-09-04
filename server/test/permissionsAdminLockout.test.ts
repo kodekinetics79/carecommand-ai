@@ -1,5 +1,18 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { FastifyRequest } from 'fastify';
+
+// These are authority-unit tests, not database-integration tests. Keep the
+// permissions module from booting a real Prisma client when this file runs in
+// the unit-test phase (the full CI suite separately proves RoleDefinition + RLS
+// behaviour against PostgreSQL).
+vi.mock('../lib/db', () => ({
+  db: {
+    roleDefinition: {
+      findFirst: vi.fn(async () => null),
+    },
+  },
+}));
+
 import {
   assertRoleEditWithinAuthority,
   type Permission,
@@ -7,6 +20,10 @@ import {
 
 function requestWithPermissions(permissions: Permission[]): FastifyRequest {
   return {
+    auth: {
+      tenantId: '00000000-0000-4000-8000-000000000001',
+      role: 'OWNER',
+    },
     _permissionCache: new Set(permissions),
   } as unknown as FastifyRequest;
 }
