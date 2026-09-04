@@ -57,6 +57,7 @@ const PilotStatusShare = lazy(() => import('../pages/PilotStatusShare'));
 const ClientLogin = lazy(() => import('../pages/client/ClientLogin'));
 const ClientLayout = lazy(() => import('../pages/client/ClientLayout'));
 const Settings = lazy(() => import('../pages/Settings'));
+const RoleAccess = lazy(() => import('../pages/RoleAccess'));
 const ControlPlane = lazy(() => import('../pages/ControlPlane'));
 
 function ProtectedLayout() {
@@ -216,6 +217,7 @@ export default function App() {
           {/* Operator-only console — gated by a platform token, not a tenant role; not in the sidebar. */}
           <Route path="/platform-legacy" element={<Platform />} />
           <Route path="/settings" element={<Settings />} />
+          <Route path="/settings/roles-access" element={<RoleAccess />} />
           {/* Owner/admin console. ProtectedLayout's access gate holds the role
               requirement, mirroring requireRoles('OWNER','ADMIN') on
               /v1/control-plane; the API stays the enforcement point. */}
