@@ -67,7 +67,7 @@ function WorkCard({
       </div>
       {onOpen && (
         <span className="mt-auto pt-1 inline-flex items-center gap-1 text-[11px] font-semibold text-indigo">
-          Open workflow <ArrowRight className="w-3 h-3" />
+          View details <ArrowRight className="w-3 h-3" />
         </span>
       )}
     </div>
@@ -78,8 +78,8 @@ function WorkCard({
 
 function reasonText(reason?: string) {
   if (!reason) return null;
-  if (reason === 'unattended_dispatcher_not_yet_on_current_main') return 'The safe unattended dispatcher is being rebuilt on the current production baseline.';
-  if (reason === 'generic_survey_and_custom_form_runtime_is_next_increment') return 'Reusable survey and custom-form execution is the next workforce increment.';
+  if (reason === 'unattended_dispatcher_not_yet_on_current_main') return 'Automatic outbound calling is being completed and certified.';
+  if (reason === 'generic_survey_and_custom_form_runtime_is_next_increment') return 'Reusable surveys and custom forms are being completed and certified.';
   return reason.replace(/_/g, ' ');
 }
 
@@ -115,36 +115,39 @@ export default function AIWorkforce() {
     }
   }, []);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => { void load(); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [load]);
 
   const capabilityRows = useMemo(() => overview ? [
     {
-      label: 'Inbound AI receptionist',
+      label: 'Answer patient calls',
       description: `${overview.capabilities.inboundAiReceptionist.readyAgents} ready voice configuration${overview.capabilities.inboundAiReceptionist.readyAgents === 1 ? '' : 's'}`,
       state: overview.capabilities.inboundAiReceptionist.state,
     },
     {
-      label: 'Live appointment booking',
-      description: `${overview.capabilities.liveAppointmentBooking.voiceBookableServices} voice-bookable service${overview.capabilities.liveAppointmentBooking.voiceBookableServices === 1 ? '' : 's'} · ${overview.capabilities.liveAppointmentBooking.activeProviders} active provider${overview.capabilities.liveAppointmentBooking.activeProviders === 1 ? '' : 's'}`,
+      label: 'Book appointments during calls',
+      description: `${overview.capabilities.liveAppointmentBooking.voiceBookableServices} bookable service${overview.capabilities.liveAppointmentBooking.voiceBookableServices === 1 ? '' : 's'} · ${overview.capabilities.liveAppointmentBooking.activeProviders} active provider${overview.capabilities.liveAppointmentBooking.activeProviders === 1 ? '' : 's'}`,
       state: overview.capabilities.liveAppointmentBooking.state,
     },
     {
-      label: 'Governed outbound calling',
-      description: `${overview.capabilities.governedOutboundCalling.pendingTargets} target${overview.capabilities.governedOutboundCalling.pendingTargets === 1 ? '' : 's'} waiting across outbound campaigns`,
+      label: 'Make approved outbound calls',
+      description: `${overview.capabilities.governedOutboundCalling.pendingTargets} patient${overview.capabilities.governedOutboundCalling.pendingTargets === 1 ? '' : 's'} waiting across outbound work`,
       state: overview.capabilities.governedOutboundCalling.state,
     },
     {
-      label: 'Autonomous outbound dialer',
-      description: reasonText(overview.capabilities.autonomousOutboundDialer.reason) ?? 'Unattended voice operations',
+      label: 'Run outbound calling automatically',
+      description: reasonText(overview.capabilities.autonomousOutboundDialer.reason) ?? 'Automatic voice operations',
       state: overview.capabilities.autonomousOutboundDialer.state,
     },
     {
-      label: 'Conversational intake',
+      label: 'Complete patient intake',
       description: `${overview.capabilities.conversationalIntake.incompletePackets} incomplete intake packet${overview.capabilities.conversationalIntake.incompletePackets === 1 ? '' : 's'} currently visible`,
       state: overview.capabilities.conversationalIntake.state,
     },
     {
-      label: 'Universal conversational forms',
+      label: 'Complete surveys and clinic forms',
       description: reasonText(overview.capabilities.universalConversationalForms.reason) ?? 'Reusable forms and surveys',
       state: overview.capabilities.universalConversationalForms.state,
     },
@@ -166,7 +169,7 @@ export default function AIWorkforce() {
     } catch (cause) {
       const message = cause instanceof ApiError && cause.status === 409
         ? cause.message.replace(/_/g, ' ')
-        : cause instanceof Error ? cause.message : 'The confirmation campaign could not be prepared.';
+        : cause instanceof Error ? cause.message : 'The confirmation work could not be prepared.';
       setPrepareError(message);
     } finally {
       setPreparing(false);
@@ -177,7 +180,7 @@ export default function AIWorkforce() {
     <div className="animate-fade-up space-y-5">
       <PageHeader
         title="AI Workforce"
-        subtitle="CareCommand identifies front-office work, prepares governed automation, completes structured actions through the existing clinic systems, and leaves exceptions for staff."
+        subtitle="See what needs attention, let AI handle routine front-desk work, and review only the exceptions."
         badge="Front Office"
         badgeColor="violet"
         actions={(
@@ -199,13 +202,13 @@ export default function AIWorkforce() {
         <div className="relative z-[1] grid gap-5 lg:grid-cols-[1.25fr_0.75fr] lg:items-center">
           <div>
             <div className="inline-flex items-center gap-2 rounded-full border border-indigo/40 bg-white/70 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.12em] text-indigo">
-              <Sparkles className="w-3.5 h-3.5" /> Conversation → workflow → outcome
+              <Sparkles className="w-3.5 h-3.5" /> Conversation → action → outcome
             </div>
             <h2 className="mt-4 max-w-3xl text-[24px] md:text-[30px] font-bold tracking-[-0.035em] text-t1 leading-[1.08]">
-              One operating layer for the work your front desk repeats all day.
+              AI handles routine front-office work. Your team handles exceptions.
             </h2>
             <p className="mt-3 max-w-2xl text-[13px] leading-relaxed text-t2">
-              The workforce uses the real scheduler, patient records, intake packets, staff queue and AI call evidence. It does not create a parallel demo system.
+              Calls, scheduling, patient intake and follow-up use the same live clinic records your staff already works with.
             </p>
           </div>
           <div className="grid grid-cols-2 gap-2.5">
@@ -215,11 +218,11 @@ export default function AIWorkforce() {
             </div>
             <div className="deck-chip">
               <div className="deck-dot bg-indigo" />
-              <div><p className="text-[10px] text-t3">Calls live now</p><p className="text-lg font-bold text-t1">{overview?.workload.callsCurrentlyInProgress ?? '—'}</p></div>
+              <div><p className="text-[10px] text-t3">Calls happening now</p><p className="text-lg font-bold text-t1">{overview?.workload.callsCurrentlyInProgress ?? '—'}</p></div>
             </div>
             <div className="deck-chip col-span-2">
               <ShieldCheck className="w-4 h-4 text-emerald-v" />
-              <p className="text-[11px] leading-relaxed text-t2">Outbound work still crosses approval, consent/DNC, quiet-hours, identity, concurrency and provider-evidence gates before any phone rings.</p>
+              <p className="text-[11px] leading-relaxed text-t2">CareCommand checks patient contact rules, clinic calling hours and safety limits automatically before any outbound call.</p>
             </div>
           </div>
         </div>
@@ -228,35 +231,35 @@ export default function AIWorkforce() {
       <section>
         <div className="flex items-end justify-between gap-3 mb-3">
           <div>
-            <h2 className="text-[15px] font-bold text-t1">Work waiting for the AI front office</h2>
-            <p className="mt-0.5 text-[11px] text-t3">Live counts from the same operational records staff use.</p>
+            <h2 className="text-[15px] font-bold text-t1">Work waiting for AI</h2>
+            <p className="mt-0.5 text-[11px] text-t3">Live counts from your clinic operations.</p>
           </div>
           {overview?.generatedAt && <span className="text-[10px] text-t3">Updated {new Date(overview.generatedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</span>}
         </div>
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
           <WorkCard icon={<CalendarCheck2 className="w-4 h-4" />} label="Appointments to confirm"
             value={overview?.workload.appointmentsNeedingConfirmationNext24h ?? 0}
-            detail="Upcoming appointments in the next 24 hours without patient confirmation evidence."
+            detail="Upcoming appointments without patient confirmation."
             onOpen={() => navigate('/scheduling')} />
-          <WorkCard icon={<PhoneCall className="w-4 h-4" />} label="Missed or escalated calls"
+          <WorkCard icon={<PhoneCall className="w-4 h-4" />} label="Calls needing follow-up"
             value={overview?.workload.missedOrEscalatedInboundCallsLast24h ?? 0}
-            detail="Inbound calls from the last 24 hours that ended without a normal completed outcome."
+            detail="Recent calls that need another attempt or staff attention."
             onOpen={() => navigate('/front-desk')} />
-          <WorkCard icon={<ClipboardList className="w-4 h-4" />} label="Intake packets incomplete"
+          <WorkCard icon={<ClipboardList className="w-4 h-4" />} label="Intake forms incomplete"
             value={overview?.workload.incompleteIntakePackets ?? 0}
-            detail="Patient intake work that is still draft, in progress, or waiting for review."
+            detail="Patient intake work still waiting for information or review."
             onOpen={() => navigate('/patient-intake')} />
           <WorkCard icon={<Clock3 className="w-4 h-4" />} label="Appointment requests"
             value={overview?.workload.appointmentRequestsNeedingReview ?? 0}
-            detail="AI-created appointment requests that still need information or front-desk review."
+            detail="Appointment requests that still need information or staff review."
             onOpen={() => navigate('/front-desk')} />
-          <WorkCard icon={<UserRoundCheck className="w-4 h-4" />} label="Staff exceptions"
+          <WorkCard icon={<UserRoundCheck className="w-4 h-4" />} label="Needs staff attention"
             value={overview?.workload.receptionistTasksNeedingStaff ?? 0}
-            detail="Open receptionist tasks where a human still owns the next action."
+            detail="Exceptions where a team member still owns the next step."
             onOpen={() => navigate('/front-desk')} />
-          <WorkCard icon={<Megaphone className="w-4 h-4" />} label="Outbound targets waiting"
+          <WorkCard icon={<Megaphone className="w-4 h-4" />} label="Patients waiting for an outbound call"
             value={overview?.workload.outboundTargetsWaiting ?? 0}
-            detail="Governed call targets waiting across currently prepared outbound campaigns."
+            detail="Patients already prepared for approved outbound work."
             onOpen={() => navigate('/receptionist-studio')} />
         </div>
       </section>
@@ -266,11 +269,11 @@ export default function AIWorkforce() {
           <div className="flex items-start justify-between gap-4">
             <div>
               <div className="inline-flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.1em] text-indigo">
-                <Bot className="w-3.5 h-3.5" /> Workforce action
+                <Bot className="w-3.5 h-3.5" /> AI action
               </div>
-              <h2 className="mt-2 text-[17px] font-bold text-t1">Prepare appointment confirmations</h2>
+              <h2 className="mt-2 text-[17px] font-bold text-t1">Confirm upcoming appointments</h2>
               <p className="mt-1 text-[12px] leading-relaxed text-t3 max-w-xl">
-                CareCommand finds the clinic's upcoming unconfirmed appointments, binds each patient to their exact appointment, and builds a draft AI calling campaign. Nothing is approved or dialled by this action.
+                CareCommand finds upcoming unconfirmed appointments and prepares the exact patients and appointment details for AI follow-up. Nothing is called until the existing approval and safety checks are complete.
               </p>
             </div>
           </div>
@@ -287,7 +290,7 @@ export default function AIWorkforce() {
             <button type="button" onClick={() => void prepareConfirmations()} disabled={!selectedClinicId || preparing}
               className="inline-flex min-h-10 items-center justify-center gap-2 rounded-xl bg-indigo px-4 py-2.5 text-[12px] font-semibold text-white shadow-sm disabled:opacity-50 disabled:cursor-not-allowed">
               {preparing ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
-              {preparing ? 'Preparing…' : 'Prepare 48-hour campaign'}
+              {preparing ? 'Preparing…' : 'Prepare confirmations'}
             </button>
           </div>
 
@@ -298,14 +301,14 @@ export default function AIWorkforce() {
               <div className="flex items-start gap-3">
                 <CheckCircle2 className="w-5 h-5 text-emerald-v shrink-0 mt-0.5" />
                 <div className="min-w-0 flex-1">
-                  <p className="text-[13px] font-bold text-t1">{prepared.targetsPrepared} exact appointment target{prepared.targetsPrepared === 1 ? '' : 's'} prepared</p>
-                  <p className="mt-1 text-[11px] leading-relaxed text-t2">{prepared.campaignName} · {prepared.clinicName}. Calls placed: {prepared.callsPlaced}. Approval is still required.</p>
+                  <p className="text-[13px] font-bold text-t1">{prepared.targetsPrepared} appointment{prepared.targetsPrepared === 1 ? '' : 's'} ready for AI confirmation</p>
+                  <p className="mt-1 text-[11px] leading-relaxed text-t2">{prepared.clinicName}. Calls placed: {prepared.callsPlaced}. Review and approval are still required before calling begins.</p>
                   {(prepared.invalidPhoneSkipped > 0 || prepared.duplicateDestinationSkipped > 0) && (
-                    <p className="mt-1 text-[10px] text-t3">Skipped: {prepared.invalidPhoneSkipped} invalid phone · {prepared.duplicateDestinationSkipped} duplicate destination.</p>
+                    <p className="mt-1 text-[10px] text-t3">Needs cleanup: {prepared.invalidPhoneSkipped} invalid phone · {prepared.duplicateDestinationSkipped} duplicate destination.</p>
                   )}
                   <button type="button" onClick={() => navigate('/receptionist-studio')}
                     className="mt-3 inline-flex items-center gap-1.5 text-[11px] font-bold text-indigo">
-                    Review in Receptionist Studio <ArrowRight className="w-3 h-3" />
+                    Review calling work <ArrowRight className="w-3 h-3" />
                   </button>
                 </div>
               </div>
@@ -316,8 +319,8 @@ export default function AIWorkforce() {
         <div className="cc-card p-5">
           <div className="flex items-center justify-between gap-3">
             <div>
-              <h2 className="text-[15px] font-bold text-t1">Workforce capability gate</h2>
-              <p className="mt-0.5 text-[11px] text-t3">Only evidence-backed states are shown as ready.</p>
+              <h2 className="text-[15px] font-bold text-t1">AI Workforce readiness</h2>
+              <p className="mt-0.5 text-[11px] text-t3">Only capabilities that have passed their readiness checks are marked ready.</p>
             </div>
             <ShieldCheck className="w-5 h-5 text-indigo" />
           </div>
