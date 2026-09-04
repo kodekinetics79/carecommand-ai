@@ -14,10 +14,13 @@ import { canOpenPath, type RoutePath } from '../../lib/access';
 import { useUiPrefs } from '../../lib/uiPrefs';
 import Logo from '../ui/Logo';
 
+type WorkforcePath = '/receptionist-studio/workforce';
+
 // Nav paths gated by a subscription feature. Locked items show a lock and route
 // to /subscription (backend still enforces access regardless of the UI).
 const NAV_FEATURE: Record<string, string> = {
   '/receptionist-studio': 'ai_receptionist',
+  '/receptionist-studio/workforce': 'ai_receptionist',
   '/front-desk': 'ai_receptionist',
   '/ai-receptionist': 'ai_receptionist',
   '/campaigns': 'campaign_automation',
@@ -40,10 +43,10 @@ const NAV_FEATURE: Record<string, string> = {
 
 interface NavItem {
   label: string;
-  // Only declared destinations are navigable: every path here must exist in the
-  // route access registry (src/lib/access.ts), so an entry can never ship
-  // without stating what its destination requires.
-  path: RoutePath;
+  // AI Workforce deliberately lives beneath Receptionist Studio so the shared
+  // access registry gives it the same receptionist:manage boundary without a
+  // second permission definition drifting away from the APIs it orchestrates.
+  path: RoutePath | WorkforcePath;
   icon: React.ElementType;
   badge?: string | number;
   badgeColor?: 'red' | 'amber' | 'indigo';
@@ -73,6 +76,7 @@ const nav: NavSection[] = [
       { label: 'Scheduling', path: '/scheduling', icon: CalendarDays },
       { label: 'Patient Intake', path: '/patient-intake', icon: ClipboardList },
       { label: 'Front Desk', path: '/front-desk', icon: PhoneCall },
+      { label: 'AI Workforce', path: '/receptionist-studio/workforce', icon: Sparkles },
       { label: 'AI Receptionist', path: '/ai-receptionist', icon: Bot },
       { label: 'Receptionist Studio', path: '/receptionist-studio', icon: Bot },
       { label: 'Staff Tasks', path: '/staff', icon: ClipboardList },
@@ -126,6 +130,7 @@ const nav: NavSection[] = [
     items: [
       { label: 'Compliance Readiness', path: '/compliance', icon: FileText },
       { label: 'Control Plane', path: '/control-plane', icon: ShieldCheck },
+      { label: 'Roles & Access', path: '/settings/roles-access', icon: Users2 },
       { label: 'Subscription', path: '/subscription', icon: CreditCard },
       { label: 'Settings', path: '/settings', icon: Settings },
     ],
@@ -147,6 +152,12 @@ function initials(name?: string): string {
 // child (/patients/:id) but NOT a sibling prefix (/revenue vs /revenue-protection).
 function isPathActive(pathname: string, path: string): boolean {
   if (path === '/') return pathname === '/';
+  // AI Workforce is a first-class child destination. Keep the parent Studio
+  // from also lighting up when the workforce command center is open.
+  if (path === '/receptionist-studio') return pathname === path;
+  // Roles & Access is a first-class child destination. Keep Settings from also
+  // lighting up when the access editor is open.
+  if (path === '/settings') return pathname === path;
   return pathname === path || pathname.startsWith(path + '/');
 }
 

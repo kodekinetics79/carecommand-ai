@@ -1,0 +1,13 @@
+/*
+ * Semantic alpha utilities that are used by the role-access surface.
+ *
+ * These names look like Tailwind opacity modifiers, but `indigo` is a
+ * CareCommand hand-written semantic token rather than a Tailwind palette key.
+ * Without explicit rules the classes ship in markup and render no colour.
+ * Keep these definitions token-aware so the active theme can change --indigo
+ * without leaving the role-access state styling on an old hard-coded palette.
+ */
+.bg-indigo\/5 { background-color: color-mix(in srgb, var(--indigo) 5%, transparent); }
+.border-indigo\/20 { border-color: color-mix(in srgb, var(--indigo) 20%, transparent); }
+.border-indigo\/30 { border-color: color-mix(in srgb, var(--indigo) 30%, transparent); }
+.border-indigo\/35 { border-color: color-mix(in srgb, var(--indigo) 35%, transparent); }

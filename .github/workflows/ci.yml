@@ -111,7 +111,18 @@ jobs:
         run: npm run verify:db-lifecycle
       - run: npm run api:typecheck
       - run: npm run lint
-      - run: npm test
+      - name: Run unit and component tests
+        shell: bash
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee unit-test.log
+      - name: Upload unit-test failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-evidence
+          path: unit-test.log
+          if-no-files-found: error
       - name: Run disposable-only receptionist integrity suites
         env:
           NODE_ENV: test

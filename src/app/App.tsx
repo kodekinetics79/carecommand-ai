@@ -19,6 +19,7 @@ const ClinicRadar = lazy(() => import('../pages/ClinicRadar'));
 const Autopilot = lazy(() => import('../pages/Autopilot'));
 const CRM = lazy(() => import('../pages/CRM'));
 const AIReceptionist = lazy(() => import('../pages/AIReceptionist'));
+const AIWorkforce = lazy(() => import('../pages/AIWorkforce'));
 const FrontDesk = lazy(() => import('../pages/FrontDesk'));
 const ReceptionistStudio = lazy(() => import('../pages/ReceptionistStudio'));
 const Scheduling = lazy(() => import('../pages/Scheduling'));
@@ -56,6 +57,7 @@ const PilotStatusShare = lazy(() => import('../pages/PilotStatusShare'));
 const ClientLogin = lazy(() => import('../pages/client/ClientLogin'));
 const ClientLayout = lazy(() => import('../pages/client/ClientLayout'));
 const Settings = lazy(() => import('../pages/Settings'));
+const RoleAccess = lazy(() => import('../pages/RoleAccess'));
 const ControlPlane = lazy(() => import('../pages/ControlPlane'));
 
 function ProtectedLayout() {
@@ -174,6 +176,11 @@ export default function App() {
           <Route path="/front-desk" element={<FrontDesk />} />
           <Route path="/ai-receptionist" element={<AIReceptionist />} />
           <Route path="/receptionist-studio" element={<ReceptionistStudio />} />
+          {/* Workforce inherits the Studio's receptionist:manage access declaration
+              through the segment-aware route registry. It orchestrates the same
+              scheduler, intake, task and outbound records rather than creating a
+              second AI-specific data plane. */}
+          <Route path="/receptionist-studio/workforce" element={<AIWorkforce />} />
           <Route path="/scheduling" element={<Scheduling />} />
           <Route path="/patients" element={<Patients />} />
           <Route path="/patients/:id" element={<PatientProfile />} />
@@ -210,6 +217,7 @@ export default function App() {
           {/* Operator-only console — gated by a platform token, not a tenant role; not in the sidebar. */}
           <Route path="/platform-legacy" element={<Platform />} />
           <Route path="/settings" element={<Settings />} />
+          <Route path="/settings/roles-access" element={<RoleAccess />} />
           {/* Owner/admin console. ProtectedLayout's access gate holds the role
               requirement, mirroring requireRoles('OWNER','ADMIN') on
               /v1/control-plane; the API stays the enforcement point. */}
