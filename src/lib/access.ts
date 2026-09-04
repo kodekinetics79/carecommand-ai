@@ -187,6 +187,10 @@ export const ROUTES = {
   // GET /v1/settings/roles, /notification-templates — authenticated only. Also
   // the account page every user reaches from their own avatar.
   '/settings': { label: 'Settings' },
+  // Owner/Admin-only fine-grained permission editor. Its API catalogue is
+  // guarded by requirePermission('admin:manage'), and role writes run through
+  // the same authority/escalation fence before persistence.
+  '/settings/roles-access': { label: 'Roles & Access', permission: 'admin:manage' },
 
   // Routed but not in the sidebar; still deep-linkable.
   // GET /v1/inventory — requirePermission('inventory:read')
