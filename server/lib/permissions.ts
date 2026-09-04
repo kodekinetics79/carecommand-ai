@@ -207,6 +207,19 @@ export const ROLE_ENUM_TO_NAME: Record<UserRole, string> = {
 };
 
 const PERMISSION_SET = new Set<string>(PERMISSIONS);
+const ROLE_NAME_TO_ENUM = new Map<string, UserRole>(
+  Object.entries(ROLE_ENUM_TO_NAME).map(([role, name]) => [name.toLowerCase(), role as UserRole]),
+);
+
+/**
+ * Minimum recovery authority built into OWNER/ADMIN.
+ *
+ * These two roles are the tenant's governance escape hatch. Allowing a custom
+ * override to remove either grant can make role administration unrecoverable
+ * from inside the tenant even though the role label still says Owner/Admin.
+ * Other permissions remain customisable; these two are structurally required.
+ */
+export const PROTECTED_ADMIN_PERMISSIONS: readonly Permission[] = ['admin:manage', 'settings:write'];
 
 /** Validate + dedupe a caller-supplied permission list against the vocabulary. */
 export function sanitizePermissions(input: unknown): Permission[] {
@@ -252,11 +265,6 @@ export async function hasPermission(request: FastifyRequest, permission: Permiss
 }
 
 /**
- * The single 403 shape for a permission refusal. `permission` names the grant
- * the caller would need; when several grants are accepted it names the broad
- * one, because that is the grant an administrator would actually assign.
- */
-/**
  * Guard for editing a tenant's RoleDefinition rows.
  *
  * A RoleDefinition whose `name` matches a built-in role REPLACES that role's
@@ -264,26 +272,34 @@ export async function hasPermission(request: FastifyRequest, permission: Permiss
  * gated on `settings:write`, which MANAGER holds - so without this guard a
  * Branch Manager could write a definition named "Branch Manager" granting
  * `admin:manage`, `patient:export` and `audit:read`, and hold them on the next
- * request. Two rules close it:
+ * request.
  *
+ * Rules:
  *   1. You may not grant a permission you do not already hold.
  *   2. You may not define or edit a built-in role's grants without `admin:manage`.
- *
- * OWNER and ADMIN hold every permission, so neither rule constrains them.
+ *   3. OWNER/ADMIN overrides may never remove the governance recovery grants
+ *      (`admin:manage` and `settings:write`). This prevents a tenant from
+ *      locking its own role editor while the account still appears to be an
+ *      administrative account.
  */
 export async function assertRoleEditWithinAuthority(
   request: FastifyRequest,
   input: { names: Array<string | null | undefined>; permissions?: Permission[] },
-): Promise<{ ok: true } | { ok: false; status: 403; error: string; message: string }> {
+): Promise<{ ok: true } | { ok: false; status: 403 | 409; error: string; message: string }> {
   const granted = await getRequestPermissions(request);
+  const normalizedNames = input.names
+    .filter((name): name is string => typeof name === 'string')
+    .map(name => name.trim().toLowerCase());
   const reserved = new Set(Object.values(ROLE_ENUM_TO_NAME).map(name => name.toLowerCase()));
-  const touchesBuiltIn = input.names.some(name => typeof name === 'string' && reserved.has(name.trim().toLowerCase()));
+  const touchesBuiltIn = normalizedNames.some(name => reserved.has(name));
+
   if (touchesBuiltIn && !granted.has('admin:manage')) {
     return {
       ok: false, status: 403, error: 'reserved_role_name',
       message: 'That name belongs to a built-in role. Redefining a built-in role requires the admin:manage permission.',
     };
   }
+
   const escalation = (input.permissions ?? []).find(permission => !granted.has(permission));
   if (escalation) {
     return {
@@ -291,6 +307,25 @@ export async function assertRoleEditWithinAuthority(
       message: `You cannot grant a permission you do not hold yourself (${escalation}).`,
     };
   }
+
+  if (input.permissions !== undefined) {
+    const touchedEnums = normalizedNames
+      .map(name => ROLE_NAME_TO_ENUM.get(name))
+      .filter((role): role is UserRole => role !== undefined);
+    const touchesAdministrativeRole = touchedEnums.some(role => role === 'OWNER' || role === 'ADMIN');
+    if (touchesAdministrativeRole) {
+      const missingRecoveryGrant = PROTECTED_ADMIN_PERMISSIONS.find(permission => !input.permissions?.includes(permission));
+      if (missingRecoveryGrant) {
+        return {
+          ok: false,
+          status: 409,
+          error: 'protected_admin_permission',
+          message: `Owner and Admin must retain ${missingRecoveryGrant} so the tenant cannot lock itself out of access administration.`,
+        };
+      }
+    }
+  }
+
   return { ok: true };
 }
 
