@@ -48,6 +48,19 @@ describe('campaign workspace access', () => {
   });
 });
 
+describe('roles and access administration', () => {
+  it('requires the same admin:manage grant as the permission catalogue API', () => {
+    expect(matchRoute('/settings/roles-access').path).toBe('/settings/roles-access');
+    expect(canOpenPath(userWith([]), '/settings/roles-access')).toBe(false);
+    expect(canOpenPath(userWith(['admin:manage']), '/settings/roles-access')).toBe(true);
+  });
+
+  it('does not let the parent settings route make the child editor public', () => {
+    expect(canOpenPath(userWith([]), '/settings')).toBe(true);
+    expect(canOpenPath(userWith([]), '/settings/roles-access')).toBe(false);
+  });
+});
+
 describe('single-permission destinations are unaffected', () => {
   it('accepts a lone string permission exactly as before', () => {
     expect(hasRouteAccess(userWith(['crm:read']), ROUTES['/crm'])).toBe(true);
