@@ -131,12 +131,14 @@ describe('security mutation audit atomicity', () => {
     expect((await db.user.findUniqueOrThrow({ where: { id: owner.id } })).mfaEnabled).toBe(true);
     await removeFault();
 
-    // Tenant RBAC definitions and session revocation are equally evidence-bound.
+    // RoleDefinition now only overrides the nine assignable built-in roles.
+    // Use the supported Analyst override here so this test still reaches the
+    // transaction/audit boundary instead of being rejected at name validation.
     removeFault = await installAuditFault(tenantId, 'role.created');
-    expect((await app.inject({ method: 'POST', url: '/v1/settings/roles', headers: { authorization }, payload: { name: 'Atomic Role', description: 'Must roll back', permissions: [] } })).statusCode).toBe(500);
-    expect(await db.roleDefinition.count({ where: { tenantId, name: 'Atomic Role' } })).toBe(0);
+    expect((await app.inject({ method: 'POST', url: '/v1/settings/roles', headers: { authorization }, payload: { name: 'Analyst', description: 'Must roll back', permissions: [] } })).statusCode).toBe(500);
+    expect(await db.roleDefinition.count({ where: { tenantId, name: 'Analyst' } })).toBe(0);
     await removeFault();
-    const roleCreated = await app.inject({ method: 'POST', url: '/v1/settings/roles', headers: { authorization }, payload: { name: 'Atomic Role', description: 'Original description', permissions: [] } });
+    const roleCreated = await app.inject({ method: 'POST', url: '/v1/settings/roles', headers: { authorization }, payload: { name: 'Analyst', description: 'Original description', permissions: [] } });
     expect(roleCreated.statusCode).toBe(201);
     const roleId = roleCreated.json().id as string;
 
