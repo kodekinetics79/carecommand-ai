@@ -167,7 +167,7 @@ describe('AI front-office workforce', () => {
     expect(targets.some(target => target.patientId === earliest.patient.id && target.appointmentId === earliest.appointment.id)).toBe(true);
 
     expect(await db.receptionistCallLog.count({ where: { tenantId: tenant.id, outboundCampaignId: body.campaignId } })).toBe(0);
-    expect(await db.receptionistOutboundProviderIntent.count({ where: { tenantId: tenant.id, campaignId: body.campaignId } })).toBe(0);
+    expect(await db.receptionistOutboundProviderIntent.count({ where: { tenantId: tenant.id, outboundCampaignId: body.campaignId } })).toBe(0);
     expect(await db.auditEvent.count({ where: { tenantId: tenant.id, resource: 'receptionistOutboundCampaign', resourceId: body.campaignId, action: 'receptionist.workforce.appointmentConfirmationsPrepared' } })).toBe(1);
   });
 
