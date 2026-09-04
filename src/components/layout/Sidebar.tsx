@@ -130,6 +130,7 @@ const nav: NavSection[] = [
     items: [
       { label: 'Compliance Readiness', path: '/compliance', icon: FileText },
       { label: 'Control Plane', path: '/control-plane', icon: ShieldCheck },
+      { label: 'Roles & Access', path: '/settings/roles-access', icon: Users2 },
       { label: 'Subscription', path: '/subscription', icon: CreditCard },
       { label: 'Settings', path: '/settings', icon: Settings },
     ],
@@ -154,6 +155,9 @@ function isPathActive(pathname: string, path: string): boolean {
   // AI Workforce is a first-class child destination. Keep the parent Studio
   // from also lighting up when the workforce command center is open.
   if (path === '/receptionist-studio') return pathname === path;
+  // Roles & Access is a first-class child destination. Keep Settings from also
+  // lighting up when the access editor is open.
+  if (path === '/settings') return pathname === path;
   return pathname === path || pathname.startsWith(path + '/');
 }
 
