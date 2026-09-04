@@ -102,7 +102,7 @@ async function patientWithAppointment(
     tenantId: tenant.id, branchId: tenant.branchId, patientId: patient.id,
     service: 'Synthetic consultation', startsAt, endsAt: new Date(startsAt.getTime() + 30 * 60 * 1000),
     status: options.status ?? 'CONFIRMED', channel: 'CALL', patientConfirmedAt: options.patientConfirmedAt ?? null,
-    patientConfirmationSource: options.patientConfirmedAt ? 'STAFF' : null,
+    patientConfirmationSource: options.patientConfirmedAt ? 'staff' : null,
   } });
   return { patient, appointment };
 }
