@@ -267,20 +267,17 @@ export async function hasPermission(request: FastifyRequest, permission: Permiss
 /**
  * Guard for editing a tenant's RoleDefinition rows.
  *
- * A RoleDefinition whose `name` matches a built-in role REPLACES that role's
- * default grants for everyone holding it (see resolvePermissions). Role CRUD is
- * gated on `settings:write`, which MANAGER holds - so without this guard a
- * Branch Manager could write a definition named "Branch Manager" granting
- * `admin:manage`, `patient:export` and `audit:read`, and hold them on the next
- * request.
+ * RoleDefinition is a per-tenant override for the nine actual UserRole enum
+ * values. It is not a second role system. A row with an arbitrary name cannot
+ * be assigned to a User, so accepting one creates a misleading admin object
+ * that never becomes effective access policy.
  *
  * Rules:
- *   1. You may not grant a permission you do not already hold.
- *   2. You may not define or edit a built-in role's grants without `admin:manage`.
- *   3. OWNER/ADMIN overrides may never remove the governance recovery grants
- *      (`admin:manage` and `settings:write`). This prevents a tenant from
- *      locking its own role editor while the account still appears to be an
- *      administrative account.
+ *   1. Only the nine assignable built-in role names may be defined/overridden.
+ *   2. You may not grant a permission you do not already hold.
+ *   3. Editing a built-in role requires `admin:manage`.
+ *   4. OWNER/ADMIN overrides may never remove the governance recovery grants
+ *      (`admin:manage` and `settings:write`).
  */
 export async function assertRoleEditWithinAuthority(
   request: FastifyRequest,
@@ -291,12 +288,20 @@ export async function assertRoleEditWithinAuthority(
     .filter((name): name is string => typeof name === 'string')
     .map(name => name.trim().toLowerCase());
   const reserved = new Set(Object.values(ROLE_ENUM_TO_NAME).map(name => name.toLowerCase()));
-  const touchesBuiltIn = normalizedNames.some(name => reserved.has(name));
+  const unsupportedName = normalizedNames.find(name => !reserved.has(name));
+  if (unsupportedName) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'unsupported_role_name',
+      message: 'CareCommand role definitions can only override the nine assignable user roles. Choose a built-in role instead of creating a role name that users cannot be assigned.',
+    };
+  }
 
-  if (touchesBuiltIn && !granted.has('admin:manage')) {
+  if (normalizedNames.length > 0 && !granted.has('admin:manage')) {
     return {
       ok: false, status: 403, error: 'reserved_role_name',
-      message: 'That name belongs to a built-in role. Redefining a built-in role requires the admin:manage permission.',
+      message: 'Changing a built-in role requires the admin:manage permission.',
     };
   }
 
