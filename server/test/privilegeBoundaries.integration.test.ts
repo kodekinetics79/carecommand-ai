@@ -17,15 +17,14 @@ const { buildApp } = await import('../app');
 const { fixtureDb: db } = await import('./helpers/fixtureDb');
 
 /**
- * Two privilege boundaries that were open.
+ * Privilege-boundary contracts.
  *
- * 1. The advisory brief returns named patients with churn risk, lifetime value
- *    and outstanding balance. It had no permission check at all - every
- *    authenticated role could read it - and recorded no audit event.
- * 2. A RoleDefinition named after a built-in role REPLACES that role's default
- *    grants. Role CRUD is gated on `settings:write`, which MANAGER holds, so a
- *    Branch Manager could write a "Branch Manager" definition granting itself
- *    admin:manage and hold it on the next request.
+ * 1. The advisory brief is a PHI-bearing commercial surface and therefore
+ *    requires an explicit permission plus audit evidence.
+ * 2. RoleDefinition is only a per-tenant override for the nine assignable
+ *    UserRole values. It is not a second custom-role system: arbitrary labels
+ *    are rejected, built-in edits require admin:manage, and even an admin may
+ *    not grant platform-only authority it does not hold.
  */
 describe('privilege boundaries', () => {
   let app: FastifyInstance;
@@ -80,12 +79,11 @@ describe('privilege boundaries', () => {
       expect(res.statusCode).toBe(200);
       const events = await db.auditEvent.findMany({ where: { tenantId, action: 'advisory.brief.read' } });
       expect(events.length).toBeGreaterThan(0);
-      // The record must never become a second copy of the PHI it describes.
       expect(JSON.stringify(events[0].metadata ?? {})).not.toMatch(/firstName|lastName|dateOfBirth/i);
     }, 30_000);
   });
 
-  describe('a role edit cannot exceed the editor', () => {
+  describe('role overrides cannot exceed the nine-role authority model', () => {
     it('refuses a manager redefining a built-in role', async () => {
       const res = await app.inject({
         method: 'POST', url: '/v1/settings/roles', headers: auth('MANAGER'),
@@ -96,58 +94,44 @@ describe('privilege boundaries', () => {
       expect(await db.roleDefinition.count({ where: { tenantId, name: 'Branch Manager' } })).toBe(0);
     });
 
-    it('refuses a manager granting a permission it does not hold', async () => {
+    it('rejects arbitrary custom role labels instead of creating fake access policy', async () => {
       const res = await app.inject({
-        method: 'POST', url: '/v1/settings/roles', headers: auth('MANAGER'),
-        payload: { name: 'Custom Ops', description: 'escalation attempt', permissions: ['admin:manage'] },
+        method: 'POST', url: '/v1/settings/roles', headers: auth('ADMIN'),
+        payload: { name: 'Custom Ops', description: 'not assignable', permissions: ['patient:read'] },
+      });
+      expect(res.statusCode).toBe(409);
+      expect(res.json().error).toBe('unsupported_role_name');
+      expect(await db.roleDefinition.count({ where: { tenantId, name: 'Custom Ops' } })).toBe(0);
+    });
+
+    it('refuses an admin granting platform-only authority the admin does not hold', async () => {
+      const res = await app.inject({
+        method: 'POST', url: '/v1/settings/roles', headers: auth('ADMIN'),
+        payload: { name: 'Auditor', description: 'escalation attempt', permissions: ['platform:voice-line-mechanics:read'] },
       });
       expect(res.statusCode).toBe(403);
       expect(res.json().error).toBe('permission_escalation');
+      expect(await db.roleDefinition.count({ where: { tenantId, name: 'Auditor' } })).toBe(0);
     });
 
-    it('still lets a manager create a role within its own authority', async () => {
+    it('lets an admin define a supported built-in role override within its own authority', async () => {
       const res = await app.inject({
-        method: 'POST', url: '/v1/settings/roles', headers: auth('MANAGER'),
-        payload: { name: 'Front Desk Lead', description: 'legitimate', permissions: ['patient:read', 'appointment:read'] },
+        method: 'POST', url: '/v1/settings/roles', headers: auth('ADMIN'),
+        payload: { name: 'Analyst', description: 'tenant override', permissions: ['patient:read', 'appointment:read'] },
       });
       expect(res.statusCode).toBe(201);
+      expect(res.json()).toEqual(expect.objectContaining({ name: 'Analyst' }));
     });
 
-    it('refuses a manager escalating an existing role by patch', async () => {
-      const created = await app.inject({
-        method: 'POST', url: '/v1/settings/roles', headers: auth('ADMIN'),
-        payload: { name: 'Patchable', description: 'seed', permissions: ['patient:read'] },
-      });
-      expect(created.statusCode).toBe(201);
-      const id = created.json().id as string;
+    it('refuses a manager patching an existing built-in override', async () => {
+      const existing = await db.roleDefinition.findFirstOrThrow({ where: { tenantId, name: 'Analyst' } });
       const res = await app.inject({
-        method: 'PATCH', url: `/v1/settings/roles/${id}`, headers: auth('MANAGER'),
-        payload: { permissions: ['admin:manage'] },
-      });
-      expect(res.statusCode).toBe(403);
-      expect(res.json().error).toBe('permission_escalation');
-    });
-
-    it('refuses a manager renaming a role onto a built-in name', async () => {
-      const created = await app.inject({
-        method: 'POST', url: '/v1/settings/roles', headers: auth('MANAGER'),
-        payload: { name: 'Renamable', description: 'seed', permissions: ['patient:read'] },
-      });
-      expect(created.statusCode).toBe(201);
-      const res = await app.inject({
-        method: 'PATCH', url: `/v1/settings/roles/${created.json().id}`, headers: auth('MANAGER'),
-        payload: { name: 'Admin' },
+        method: 'PATCH', url: `/v1/settings/roles/${existing.id}`, headers: auth('MANAGER'),
+        payload: { permissions: ['patient:read'] },
       });
       expect(res.statusCode).toBe(403);
       expect(res.json().error).toBe('reserved_role_name');
-    });
-
-    it('leaves an admin able to define a built-in role, which is the point of overrides', async () => {
-      const res = await app.inject({
-        method: 'POST', url: '/v1/settings/roles', headers: auth('ADMIN'),
-        payload: { name: 'Branch Manager', description: 'tenant override', permissions: ['patient:read', 'appointment:read'] },
-      });
-      expect(res.statusCode).toBe(201);
+      expect((await db.roleDefinition.findUniqueOrThrow({ where: { id: existing.id } })).permissions).toEqual(['patient:read', 'appointment:read']);
     });
   });
 });
