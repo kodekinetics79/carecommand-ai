@@ -81,10 +81,24 @@ describe('role permission edit authority', () => {
     });
   });
 
-  it('does not let an editor grant a permission they do not hold', async () => {
-    const request = requestWithPermissions(['settings:write']);
+  it('rejects role names that the UserRole model cannot assign', async () => {
+    const request = requestWithPermissions(['admin:manage', 'settings:write']);
     const result = await assertRoleEditWithinAuthority(request, {
       names: ['Custom reporting role'],
+      permissions: ['settings:write'],
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      status: 409,
+      error: 'unsupported_role_name',
+    });
+  });
+
+  it('does not let an admin grant a permission they do not hold', async () => {
+    const request = requestWithPermissions(['admin:manage', 'settings:write']);
+    const result = await assertRoleEditWithinAuthority(request, {
+      names: ['Front Desk'],
       permissions: ['settings:write', 'patient:export'],
     });
 
