@@ -3,6 +3,7 @@ import type { db as DbClient } from '../../db';
 import { platformLocalePack, platformLocalePackForCountry, platformLocalePackHash } from './defaults';
 import { isLocalePackStrings, localeFormatOf } from './render';
 import type { LocaleFormat, LocalePackStrings } from './types';
+import { hasUnconfirmedOutcomeClaims } from '../outcomeTruth';
 
 type Client = typeof DbClient | Prisma.TransactionClient;
 
@@ -53,7 +54,7 @@ export async function resolveApprovedLocalePack(
     where: { tenantId: input.tenantId, language: input.language, country: input.country, status: 'APPROVED' },
     select: { id: true, language: true, country: true, version: true, strings: true, evidenceHash: true },
   });
-  if (!row || !isLocalePackStrings(row.strings)) return null;
+  if (!row || !isLocalePackStrings(row.strings) || hasUnconfirmedOutcomeClaims(row.strings.messages)) return null;
   const filled = withPlatformDefaults(row.strings, row.language, row.country);
   return {
     id: row.id, language: row.language, country: row.country, version: row.version,
@@ -102,7 +103,7 @@ export async function resolveCallLocalePack(
   });
   if (!call?.clinic) return null;
   const stamped = call.localePack;
-  if (stamped?.status === 'APPROVED' && isLocalePackStrings(stamped.strings)) {
+  if (stamped?.status === 'APPROVED' && isLocalePackStrings(stamped.strings) && !hasUnconfirmedOutcomeClaims(stamped.strings.messages)) {
     const filled = withPlatformDefaults(stamped.strings, stamped.language, stamped.country);
     return {
       id: stamped.id, language: stamped.language, country: stamped.country, version: stamped.version,

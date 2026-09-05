@@ -39,8 +39,10 @@ import {
   COMPREHENSION_BAILOUT_STAFF_NOTE,
   HUMAN_ONLY_REASON,
   HUMAN_ONLY_STAFF_NOTE,
+  RECEPTIONIST_TASK_WORKFLOW,
   createSafetyTask,
   possibleDuplicatePatientNote,
+  type SafetyTaskResult,
 } from './frontDeskTask';
 import { HUMAN_ONLY_PERMITTED_TOOLS, callIsHumanOnly } from './humanOnly';
 import { MAX_UNPARSEABLE_TURNS, comprehensionDecision } from './comprehension';
@@ -410,7 +412,7 @@ export async function requestHumanHandoff(ctx: ToolContext, args: Record<string,
     task_id: task.taskId,
     message: transfer.ready
       ? speak(pack, 'handoff.spoken', {}, "Of course. I've passed this to the front desk with your number, so it won't be lost. Let me see if someone is free to pick up now.")
-      : speak(pack, 'handoff.no_transfer', {}, "Of course. I've passed this to the front desk with your number, so it won't be lost, and someone will get back to you. Is there anything you'd like me to add for them?"),
+      : speak(pack, 'handoff.no_transfer', {}, "I've recorded your request for the front desk. I cannot confirm a callback or response time. Is there anything you'd like me to add for them?"),
   };
 }
 
@@ -443,30 +445,18 @@ export async function takeMessage(ctx: ToolContext, args: Record<string, unknown
     appended: task.appended,
     task_id: task.taskId,
     message: task.appended
-      ? speak(pack, 'tool.message.appended', {}, "Thank you. I've added that to the same note for the front desk. Someone will pick it up and get back to you; I can't promise exactly when.")
-      : speak(pack, 'tool.message.recorded', {}, "Thank you. That's written down for the front desk with your number. Someone will pick it up and get back to you; I can't promise exactly when."),
+      ? speak(pack, 'tool.message.appended', {}, "Thank you. I've added that to the same note for the front desk. I cannot confirm a callback or response time.")
+      : speak(pack, 'tool.message.recorded', {}, "Thank you. I've recorded your message for the front desk. I cannot confirm a callback or response time."),
   };
 }
 
-/**
- * Emergency handling that does not depend on anyone looking at a screen.
- *
- * This used to create a StaffTask and a critical signal and stop there. The
- * Front Desk board was the only thing that surfaced either: in-app only, a
- * twenty-second poll, and nobody alerted at all if no tab is open. An emergency
- * could therefore sit overnight behind a masked number — which is the single
- * most serious gap in the whole product, and it is not one a colour, a lane or
- * a badge can close.
- *
- * So the mechanism moves onto the call. The receptionist gives the emergency
- * instruction, and then, in the same turn, either places the transfer to the
- * clinic's human fallback or promises an immediate callback. `next_action` is
- * what the agent must do next, and the prompt is written to obey it. The board
- * card is still created — it is now the durable RECORD of what happened, not
- * the mechanism that makes it happen.
- */
+/** Record staff follow-up without delaying the caller's emergency instruction. */
 export async function reportEmergency(ctx: ToolContext, args: Record<string, unknown>) {
   const task = await createSafetyTask(ctx, 'emergency', args);
+  return emergencyResult(ctx, task);
+}
+
+async function emergencyResult(ctx: ToolContext, task: SafetyTaskResult) {
   // The emergency number is jurisdictional: it comes from the call's approved
   // locale pack. With no pack (and no country to fall back on) the agent says
   // the number-free sentence rather than naming the wrong country's number.
@@ -474,30 +464,24 @@ export async function reportEmergency(ctx: ToolContext, args: Record<string, unk
   const instruction = pack
     ? renderPackMessage(pack.strings, 'tool.emergency.message', { emergency_number: pack.strings.emergencyNumber })
     : EMERGENCY_FALLBACK_NUMBER_FREE;
-  // The clinic-side half of the same turn. It is appended to the instruction
-  // rather than replacing it: calling the emergency services always comes
-  // first, and reaching the practice never displaces it.
-  const escalation = transfer.ready
-    ? speak(pack, 'emergency.transfer.line', {}, "I'm also connecting you to someone at the practice right now. Please stay on the line.")
-    : speak(pack, 'emergency.callback.line', {}, 'I have alerted the practice, and someone will call you straight back on this number. Please don’t wait for that call if you need help now.');
-  // Two pack renders joined, never a sentence written here: the emergency
-  // instruction the caller must hear first, then what we are doing about it.
-  const spoken = `${instruction} ${escalation}`;
   return {
     emergency_recorded: true,
-    protocol_status: 'pending_provider_evidence',
+    protocol_status: 'staff_review_pending',
     acknowledgment_pending: true,
-    // What the agent must DO next, on this call, while the caller is still on
-    // the line. Not advice; the prompt treats it as an instruction.
-    next_action: transfer.ready ? 'transfer_now' : 'offer_callback',
+    // A configured clinic transfer is not an emergency-service connection.
+    // The caller must not be held on the AI line waiting for either it or a
+    // callback that this operation has not scheduled or delivered.
+    next_action: 'end_emergency_flow',
     transfer_available: transfer.ready,
-    // The board card is evidence, not the alerting channel. Said plainly here
-    // so no future reader mistakes the task id for "somebody has been told".
-    alerting_channel: transfer.ready ? 'live_transfer' : 'immediate_callback',
+    transfer_attempted: false,
+    transfer_completed: false,
+    callback_scheduled: false,
+    staff_acknowledged: false,
+    alerting_channel: 'staff_work_queue',
     duplicate: task.duplicate,
     appended: task.appended,
     task_id: task.taskId,
-    message: spoken,
+    message: instruction,
   };
 }
 
@@ -572,13 +556,13 @@ export async function reportComprehensionFailure(ctx: ToolContext, args: Record<
     // Zero, permanently. There is no third attempt.
     attempts_remaining: 0,
     bail_out: true,
-    next_action: transfer.ready ? 'transfer_now' : 'offer_callback',
+    next_action: transfer.ready ? 'transfer_now' : 'staff_review_pending',
     transfer_available: transfer.ready,
     task_id: task.taskId,
     duplicate: task.duplicate,
     message: transfer.ready
-      ? speak(pack, 'comprehension.bail_out.transfer', {}, "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I'm putting you through to a person at the practice now. Please stay on the line.")
-      : speak(pack, 'comprehension.bail_out.callback', {}, "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've asked someone at the practice to call you straight back on this number, and I've written down that we spoke."),
+      ? speak(pack, 'comprehension.bail_out.transfer', {}, "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've recorded a request for staff and will try the transfer now.")
+      : speak(pack, 'comprehension.bail_out.callback', {}, "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've recorded a request for the front desk. I cannot confirm a callback or response time."),
   };
 }
 
@@ -1580,6 +1564,27 @@ export async function bookAppointment(ctx: ToolContext, args: Record<string, unk
 }
 
 export async function handleAgentTool(ctx: ToolContext, name: string, args: Record<string, unknown>) {
+  // Emergency escalation is terminal for ordinary work on this exact call,
+  // even if a model invokes another tool or staff already closed the task.
+  // Privacy withdrawal and do-not-contact remain available.
+  if (ctx.callId && !['record_recording_preference', 'record_do_not_call'].includes(name)) {
+    const emergency = await db.staffTask.findFirst({
+      where: {
+        tenantId: ctx.tenantId,
+        callLog: { tenantId: ctx.tenantId, retellCallId: ctx.callId },
+        AND: [
+          { metadata: { path: ['workflow'], equals: RECEPTIONIST_TASK_WORKFLOW } },
+          { metadata: { path: ['kind'], equals: 'emergency' } },
+        ],
+      },
+      select: { id: true },
+    });
+    if (emergency) return {
+      ...await emergencyResult(ctx, { taskId: emergency.id, duplicate: true, appended: false }),
+      allowed: false,
+      tool_refused: name,
+    };
+  }
   // "Human only", enforced where it cannot be talked out of.
   //
   // `call_inbound` already routed this caller to a person and the prompt is

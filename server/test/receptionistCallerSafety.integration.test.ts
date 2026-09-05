@@ -14,8 +14,8 @@ import { signRetell } from './helpers/retellSignature';
 //
 //   · the AI disclosure is spoken at the END of a call as well as the start,
 //     because California AB 3030 requires it and our packs had no closing key;
-//   · an emergency is handled ON the call — a transfer or an immediate callback
-//     — instead of appearing on a board nobody may be watching;
+//   · an emergency ends ordinary intake immediately, without claiming an
+//     unconfirmed transfer or callback from a staff-queue record;
 //   · the receptionist stops after two turns it cannot parse, because a stroke
 //     survivor tried five times and gave up;
 //   · a caller marked Human only never meets the AI line at all;
@@ -267,7 +267,7 @@ describe('AB 3030 — a pack that never says goodbye as an AI cannot go live', (
 // 2. The emergency path must not be a screen.
 // ===========================================================================
 
-describe('an emergency reaches a person during the call, not a board', () => {
+describe('emergency instructions do not delay the caller for unconfirmed staff follow-up', () => {
   it('refuses activation when there is nowhere to put an emergency caller through to', async () => {
     const t = await tenant();
     const { campaign } = await scenario(t, { humanFallbackNumber: null });
@@ -287,20 +287,18 @@ describe('an emergency reaches a person during the call, not a board', () => {
     expect(activation.statusCode).toBe(409);
   });
 
-  it('places the transfer on the call, and files the board card as the record of it', async () => {
+  it('records a critical task without claiming a configured transfer was attempted', async () => {
     const t = await tenant();
     const { clinic } = await scenario(t);
     const { ctx, callLogId } = await liveCall(t, clinic.id, '+12125550143');
 
     const result = await tool(ctx, 'report_emergency', { reason_category: 'possible_emergency', message: 'Chest pain' });
 
-    // The caller hears the emergency instruction FIRST, then what we are doing.
     expect(String(result.message)).toMatch(/call 911 now/i);
-    expect(String(result.message)).toMatch(/connecting you to someone at the practice/i);
-    // And the agent is told to do it, on this call, rather than to stop here.
-    expect(result.next_action).toBe('transfer_now');
+    expect(String(result.message)).not.toMatch(/stay on the line|connecting you|call you straight back/i);
+    expect(result.next_action).toBe('end_emergency_flow');
     expect(result.transfer_available).toBe(true);
-    expect(result.alerting_channel).toBe('live_transfer');
+    expect(result).toMatchObject({ transfer_attempted: false, transfer_completed: false, callback_scheduled: false, staff_acknowledged: false, alerting_channel: 'staff_work_queue' });
 
     // The task still exists — as evidence of what happened, not as the alert.
     const task = await db.staffTask.findFirstOrThrow({ where: { tenantId: t.id, callLogId } });
@@ -308,19 +306,52 @@ describe('an emergency reaches a person during the call, not a board', () => {
     expect(result.task_id).toBe(task.id);
   });
 
-  it('offers an immediate callback when no transfer target exists, and says so', async () => {
+  it('does not invent an immediate callback when no transfer target exists', async () => {
     const t = await tenant();
     const { clinic } = await scenario(t, { humanFallbackNumber: null });
     const { ctx } = await liveCall(t, clinic.id, '+12125550144');
 
     const result = await tool(ctx, 'report_emergency', { reason_category: 'possible_emergency' });
-    expect(result.next_action).toBe('offer_callback');
+    expect(result.next_action).toBe('end_emergency_flow');
     expect(result.transfer_available).toBe(false);
-    expect(result.alerting_channel).toBe('immediate_callback');
+    expect(result.alerting_channel).toBe('staff_work_queue');
+    expect(result.callback_scheduled).toBe(false);
     expect(String(result.message)).toMatch(/call 911 now/i);
-    expect(String(result.message)).toMatch(/call you straight back/i);
+    expect(String(result.message)).not.toMatch(/call you straight back|stay on the line/i);
     // It never tells an emergency caller to wait for staff to notice something.
     expect(String(result.message)).not.toMatch(/wait for (the )?(staff|team)/i);
+  });
+
+  it('keeps emergency exit terminal after task completion and deduplicates retries', async () => {
+    const t = await tenant();
+    const { clinic } = await scenario(t);
+    const { ctx, callLogId } = await liveCall(t, clinic.id, '+12125550145');
+    const first = await tool(ctx, 'report_emergency', { reason_category: 'possible_emergency' });
+    await db.staffTask.update({ where: { id: String(first.task_id) }, data: { status: 'COMPLETED' } });
+    for (const name of ['report_emergency', 'book_appointment', 'check_availability', 'request_human_handoff', 'take_message']) {
+      const result = await tool(ctx, name);
+      expect(result).toMatchObject({ allowed: false, tool_refused: name, task_id: first.task_id, next_action: 'end_emergency_flow', duplicate: true });
+      expect(String(result.message)).toMatch(/call 911 now/i);
+    }
+    expect(await db.staffTask.count({ where: { tenantId: t.id, callLogId } })).toBe(1);
+  });
+
+  it('rejects unsafe legacy approvals without modifying their evidence and uses safe call wording', async () => {
+    const t = await tenant();
+    const { clinic, campaign } = await scenario(t);
+    const pack = await db.receptionistLocalePack.findFirstOrThrow({ where: { tenantId: t.id, status: 'APPROVED' } });
+    const strings = structuredClone(PLATFORM_LOCALE_PACKS.find(p => p.country === 'US')!.strings);
+    strings.messages['emergency.callback.line'] = 'Someone will call you straight back.';
+    const evidenceHash = localePackEvidenceHash(strings);
+    await db.receptionistLocalePack.update({ where: { id: pack.id }, data: { strings: strings as never, evidenceHash } });
+    expect(row(await checks(t, campaign.id), 'locale_pack_approved').status).toBe('fail');
+    const { ctx } = await liveCall(t, clinic.id, '+12125550146');
+    const result = await tool(ctx, 'report_emergency', { reason_category: 'possible_emergency' });
+    expect(String(result.message)).toMatch(/call 911 now/i);
+    expect(String(result.message)).not.toMatch(/straight back|stay on the line/i);
+    const retained = await db.receptionistLocalePack.findUniqueOrThrow({ where: { id: pack.id } });
+    expect(retained.evidenceHash).toBe(evidenceHash);
+    expect(retained.strings).toEqual(strings);
   });
 });
 

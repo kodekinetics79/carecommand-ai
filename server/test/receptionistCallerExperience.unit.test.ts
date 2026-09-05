@@ -171,7 +171,8 @@ describe('the handoff says nothing about our queue', () => {
   it('says out loud that the tool result is not for the caller', () => {
     const prompt = generateSystemPrompt(promptFixture('us-full'));
     expect(prompt).toMatch(/Never read our internal state to a caller/i);
-    expect(prompt).toMatch(/give the staff member one short sentence of context/i);
+    expect(prompt).toMatch(/This configuration uses a cold transfer/i);
+    expect(prompt).toMatch(/do not claim that you can speak to the staff member before leaving the call/i);
   });
 });
 

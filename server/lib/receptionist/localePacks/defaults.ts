@@ -23,7 +23,7 @@ export interface PlatformLocalePack {
 const EN_US_V1: PlatformLocalePack = {
   language: 'en-US',
   country: 'US',
-  version: 2,
+  version: 3,
   strings: {
     emergencyNumber: '911',
     timeStyle: '12h',
@@ -54,7 +54,7 @@ const EN_US_V1: PlatformLocalePack = {
       // the service; only an objection to the AI itself routes away.
       'consent.granted.ack': 'Thank you. So, how can I help you today?',
       'consent.refused.continue': "That's absolutely fine. This call won't be recorded, and we can carry straight on. How can I help you today?",
-      'consent.declined.route': "Of course, you should speak to a person. Let me pass you to the team now, and if no one is free I'll take your details so they can call you straight back.",
+      'consent.declined.route': "Of course. I'll check the approved staff option. If a transfer is unavailable, I can record a request for the front desk, but I cannot confirm a callback or response time.",
       'consent.refused.recorded': "That's recorded. This call won't be recorded or transcribed, and I can still help you here.",
 
       // C6 — a lapsed or drifted deployment. The caller keeps a way through.
@@ -73,19 +73,19 @@ const EN_US_V1: PlatformLocalePack = {
 
       // Caller safety — the emergency path happens on the call, not on a board
       // somebody may not be watching.
-      'emergency.transfer.line': "I'm also connecting you to someone at the practice right now. Please stay on the line.",
-      'emergency.callback.line': "I have alerted the practice, and someone will call you straight back on this number. Please don't wait for that call if you need help now.",
+      'emergency.transfer.line': 'The staff review request is recorded. Do not delay seeking emergency help.',
+      'emergency.callback.line': 'The staff review request is recorded. A callback is not confirmed. Do not delay seeking emergency help.',
 
       // Caller safety — comprehension. One retry, then a person. Nothing here
       // asks the caller to change how they speak or what they are calling from.
       'comprehension.retry': "I'm sorry, that's my fault — I didn't catch that. Could you tell me again?",
-      'comprehension.bail_out.transfer': "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I'm putting you through to a person at the practice now. Please stay on the line.",
-      'comprehension.bail_out.callback': "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've asked someone at the practice to call you straight back on this number, and I've written down that we spoke.",
+      'comprehension.bail_out.transfer': "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've recorded a request for staff and will try the transfer now.",
+      'comprehension.bail_out.callback': "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've recorded a request for the front desk. I cannot confirm a callback or response time.",
 
       // C12 — what the caller hears when they ask for a human. The task id and
       // the acknowledgment state stay in the structured result, not here.
       'handoff.spoken': "Of course. I've passed this to the front desk with your number, so it won't be lost. Let me see if someone is free to pick up now.",
-      'handoff.no_transfer': "Of course. I've passed this to the front desk with your number, so it won't be lost, and someone will get back to you. Is there anything you'd like me to add for them?",
+      'handoff.no_transfer': "I've recorded your request for the front desk. I cannot confirm a callback or response time. Is there anything you'd like me to add for them?",
 
       // C10 — booking and availability results, previously hardcoded en-US.
       'tool.availability.none': "I don't have any openings on {{date}}. Would a different day work?",
@@ -98,8 +98,8 @@ const EN_US_V1: PlatformLocalePack = {
       'tool.confirm.already': 'Thank you — that appointment is already confirmed.',
       'tool.confirm.not_confirmable': "That appointment is not one I can confirm on this call. I can connect you with the front desk.",
       'tool.confirm.locked': "That appointment can no longer be confirmed automatically. I can connect you with the front desk.",
-      'tool.message.recorded': "Thank you. That's written down for the front desk with your number. Someone will pick it up and get back to you; I can't promise exactly when.",
-      'tool.message.appended': "Thank you. I've added that to the same note for the front desk. Someone will pick it up and get back to you; I can't promise exactly when.",
+      'tool.message.recorded': "Thank you. I've recorded your message for the front desk. I cannot confirm a callback or response time.",
+      'tool.message.appended': "Thank you. I've added that to the same note for the front desk. I cannot confirm a callback or response time.",
       // The reminder, in this patient's own details. The holes are runtime
       // variables resolved at dial time from the appointment the call target is
       // bound to; the campaign script no longer gets to state them.
@@ -112,7 +112,7 @@ const EN_US_V1: PlatformLocalePack = {
 const EN_GB_V1: PlatformLocalePack = {
   language: 'en-GB',
   country: 'GB',
-  version: 2,
+  version: 3,
   strings: {
     emergencyNumber: '999',
     timeStyle: '24h',
@@ -140,7 +140,7 @@ const EN_GB_V1: PlatformLocalePack = {
       // the service; only an objection to the AI itself routes away.
       'consent.granted.ack': 'Thank you. So, how can I help you today?',
       'consent.refused.continue': "That's absolutely fine. This call won't be recorded, and we can carry straight on. How can I help you today?",
-      'consent.declined.route': "Of course, you should speak to a person. Let me pass you to the team now, and if no one is free I'll take your details so they can ring you straight back.",
+      'consent.declined.route': "Of course. I'll check the approved staff option. If a transfer is unavailable, I can record a request for reception, but I cannot confirm a callback or response time.",
       'consent.refused.recorded': "That's recorded. This call won't be recorded or transcribed, and I can still help you here.",
 
       // C6 — a lapsed or drifted deployment. The caller keeps a way through.
@@ -159,19 +159,19 @@ const EN_GB_V1: PlatformLocalePack = {
 
       // Caller safety — the emergency path happens on the call, not on a board
       // somebody may not be watching.
-      'emergency.transfer.line': "I'm also connecting you to someone at the practice right now. Please stay on the line.",
-      'emergency.callback.line': "I have alerted the practice, and someone will ring you straight back on this number. Please don't wait for that call if you need help now.",
+      'emergency.transfer.line': 'The staff review request is recorded. Do not delay seeking emergency help.',
+      'emergency.callback.line': 'The staff review request is recorded. A callback is not confirmed. Do not delay seeking emergency help.',
 
       // Caller safety — comprehension. One retry, then a person. Nothing here
       // asks the caller to change how they speak or what they are calling from.
       'comprehension.retry': "I'm sorry, that's my fault — I didn't catch that. Could you tell me again?",
-      'comprehension.bail_out.transfer': "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I'm putting you through to a person at the practice now. Please stay on the line.",
-      'comprehension.bail_out.callback': "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've asked someone at the practice to ring you straight back on this number, and I've written down that we spoke.",
+      'comprehension.bail_out.transfer': "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've recorded a request for staff and will try the transfer now.",
+      'comprehension.bail_out.callback': "I'm sorry — this is me, not you, and I don't want to keep you repeating yourself. I've recorded a request for reception. I cannot confirm a callback or response time.",
 
       // C12 — what the caller hears when they ask for a human. The task id and
       // the acknowledgment state stay in the structured result, not here.
       'handoff.spoken': "Of course. I've passed this to reception with your number, so it won't be lost. Let me see if someone is free to pick up now.",
-      'handoff.no_transfer': "Of course. I've passed this to reception with your number, so it won't be lost, and someone will get back to you. Is there anything you'd like me to add for them?",
+      'handoff.no_transfer': "I've recorded your request for reception. I cannot confirm a callback or response time. Is there anything you'd like me to add for them?",
 
       // C10 — booking and availability results, previously hardcoded en-US.
       'tool.availability.none': "I don't have any openings on {{date}}. Would a different day work?",
@@ -184,8 +184,8 @@ const EN_GB_V1: PlatformLocalePack = {
       'tool.confirm.already': 'Thank you — that appointment is already confirmed.',
       'tool.confirm.not_confirmable': "That appointment is not one I can confirm on this call. I can put you through to reception.",
       'tool.confirm.locked': "That appointment can no longer be confirmed automatically. I can put you through to reception.",
-      'tool.message.recorded': "Thank you. That's written down for reception with your number. Someone will pick it up and get back to you; I can't promise exactly when.",
-      'tool.message.appended': "Thank you. I've added that to the same note for reception. Someone will pick it up and get back to you; I can't promise exactly when.",
+      'tool.message.recorded': "Thank you. I've recorded your message for reception. I cannot confirm a callback or response time.",
+      'tool.message.appended': "Thank you. I've added that to the same note for reception. I cannot confirm a callback or response time.",
       'reminder.appointment.line': "I'm ringing about your {{appointment_service}} appointment on {{appointment_date}} at {{appointment_time}}, at {{appointment_location}}.",
       'reminder.appointment.clinician': "You're booked in with {{appointment_clinician}}.",
     },

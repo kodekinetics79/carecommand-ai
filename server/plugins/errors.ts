@@ -72,7 +72,7 @@ export const errorPlugin = fp(async app => {
     }
 
     return reply.code(statusCode).send({
-      error: handledError.code ?? 'INTERNAL_SERVER_ERROR',
+      error: handledError.code ?? (statusCode < 500 ? `HTTP_${statusCode}` : 'INTERNAL_SERVER_ERROR'),
       message: statusCode < 500 ? handledError.message : 'An unexpected error occurred',
       requestId: request.id,
     });

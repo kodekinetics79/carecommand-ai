@@ -145,12 +145,13 @@ describe('the comprehension ceiling', () => {
 });
 
 describe('the emergency path and pre-answer routing appear in the prompt', () => {
-  it('tells the agent to act on the emergency result during the call, not to file a task and stop', () => {
+  it('lets the caller seek emergency help without a clinic hold or closing script', () => {
     for (const name of FIXTURES) {
       const prompt = generateSystemPrompt(promptFixture(name));
-      expect(prompt, name).toMatch(/DO WHAT ITS next_action FIELD SAYS, on this call, while the caller is still on the line/);
-      // The reason, stated where somebody editing this will read it.
-      expect(prompt, name).toMatch(/not handled by a task appearing on a screen/i);
+      expect(prompt, name).toContain('Its next_action is end_emergency_flow');
+      expect(prompt, name).toContain('Do not ask them to stay on the line, transfer them to the clinic, promise a callback');
+      expect(prompt, name).toContain('If recording the alert fails, the same emergency instruction and immediate exit still apply');
+      expect(prompt, name).toContain('or during an emergency: never delay');
     }
   });
 

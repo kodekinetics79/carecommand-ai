@@ -163,16 +163,10 @@ export const LOCALE_PACK_MESSAGE_KEYS = {
     describe: 'Outbound reminder: who the patient is booked in with. Spoken as its own sentence and ONLY when a clinician is recorded, never as an empty hole inside the appointment line.',
   },
 
-  // --- Caller safety: the emergency path happens ON THE CALL ---------------
-  // An emergency used to produce a StaffTask and a critical signal, and the
-  // Front Desk board was the only thing that surfaced it: in-app only, a 20
-  // second poll, nobody alerted if no tab is open. An emergency could sit
-  // overnight behind a masked number. These two lines are what the receptionist
-  // says while it actually places the transfer or takes the callback, in the
-  // same turn as the emergency instruction. The board card becomes the record
-  // of what happened, not the mechanism that makes it happen.
-  'emergency.transfer.line': { vars: [], describe: 'Spoken immediately after the emergency instruction when the receptionist is placing the transfer to a person during the call.' },
-  'emergency.callback.line': { vars: [], describe: 'Spoken immediately after the emergency instruction when no transfer target exists and an immediate callback is being arranged instead.' },
+  // Retained for stored-pack compatibility; report_emergency speaks only the
+  // emergency instruction and never holds a caller for clinic follow-up.
+  'emergency.transfer.line': { vars: [], describe: 'Legacy follow-up wording. Must not ask an emergency caller to stay on the line or imply a transfer happened.' },
+  'emergency.callback.line': { vars: [], describe: 'Legacy follow-up wording. A recorded staff request must not promise a callback.' },
 
   // --- Caller safety: comprehension ----------------------------------------
   // A stroke survivor tried five times to book an appointment and could not get
