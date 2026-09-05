@@ -19,6 +19,7 @@ import {
   BadgeCheck,
 } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
+import ClinicCreateForm from '../components/ClinicCreateForm';
 import BentoCard from '../components/ui/BentoCard';
 import StatCard from '../components/ui/StatCard';
 import ResourceSection, { ResourceErrorNotice, ResourceSkeleton } from '../components/ui/ResourceSection';
@@ -957,6 +958,7 @@ export default function ControlPlane() {
           </BentoCard>
 
           <BentoCard title="Clinics" subtitle="Activate / deactivate clinics and view operational load">
+            <ClinicCreateForm canCreate={canManage} onCreated={() => { clinics.reload(); overview.reload(); users.reload(); }} />
             <ResourceSection
               label="Clinics"
               state={clinics.state}

@@ -89,7 +89,14 @@ regressions are not live voice, EHR, load, or multi-role acceptance evidence.
 - Root-cause hypothesis: backend branch creation is not wired into tenant setup UI.
 - Remediation: narrow owner/admin branch creation form using existing scoped API,
   validation, audit, and duplicate-submit protection; no backend seed workaround.
-- Retest: OPEN, implementation next.
+- Remediation implemented: owner/admin Add clinic form in Administration and
+  Control Plane; existing scoped branch endpoint now serializes duplicate names
+  per tenant and writes branch plus audit atomically. Form blocks in-flight
+  duplicates, retains failed input, and makes timezone explicit.
+- Retest: 13 tests PASS across branch API, new form, existing Settings journey.
+  Includes concurrent duplicate requests (201/409, one row/audit), identical names
+  in different tenants, rejected foreign tenant input, front-desk 403, invalid
+  timezone 400, form success/failure and disabled duplicate submit. Browser retest pending.
 
 ## Verification performed
 
@@ -106,9 +113,35 @@ regressions are not live voice, EHR, load, or multi-role acceptance evidence.
 - Remediation: preserve explicit domain codes; use HTTP_<status> for expected 4xx.
 - Evidence/retest: `httpErrorClassification.unit.test.ts`, four tests PASS;
   production retest pending. Server typecheck and lint rerun PASS after this fix.
-- Number assignment remains EXTERNAL_BLOCKED until existing holder is identified
-  through authorized administration and reassignment is explicitly decided, or a
-  separate provider number is supplied. Never silently steal another tenant's line.
+- User clarified the number model: +15717391177 is outbound-only and customer
+  numbers are inbound. Do not reassign this outbound number to Bright Health's
+  inbound configuration. User created the receptionist clinic using the authorized
+  number ending 5555 as its public phone; dedicated AI voice line remains blank.
+  Actual customer-number routing/import/forwarding still needs provider verification.
+
+## Release and setup update
+
+- Safety release `6b73aedf30a4e595bd03e1da48842c50a1d5351b` pushed to main and live
+  on Render (`dep-dae0gkc9v7es73ao9m1g`, auto-deploy, 1m11s).
+- `/health` confirmed that SHA at 2026-09-05T12:20:03Z; `/health/ready` reports
+  database, Redis, and ingressProxy OK. This is service health, not live-call proof.
+- Bright Health receptionist profile exists, public phone ending 5555; synthetic
+  Arlington address, US/en-US, America/New_York, weekday 09:00–17:00, weekends closed.
+  Fallback is authorized test destination ending 6009. No calls initiated.
+- Architecture check: `RETELL_FROM_NUMBER` is separate from clinic inbound binding
+  in `retellDeploy.ts`. Preserve this distinction. A shared outbound number's return
+  calls cannot automatically identify a tenant; never guess using caller identity.
+- Confirmed number roadmap: +15717391177 is a shared outbound-only caller ID for
+  now. Each customer uses its own verified inbound number. Later, each customer
+  also receives a separately configured, provider-verified outbound caller ID.
+  This future per-tenant outbound selection is a requirement, not a completed
+  capability: the current `createPhoneCall` payload uses the process-wide default.
+  Acceptance for that change must prove server-side tenant ownership, the correct
+  caller ID and agent on calls and retries, tenant-scoped logs, and rejection of
+  unverified or cross-tenant numbers. A failed dedicated-number configuration must
+  not silently substitute another customer's number. Shared fallback, if retained
+  during migration, must be explicit and auditable. Do not bind the shared outbound
+  number as any customer's inbound receptionist line.
 
 - `npm run check`: PASS (schema validation, server typecheck, lint, production build).
 - Final focused suite: 10 files / 122 tests PASS, 16.44 s; disposable local Postgres

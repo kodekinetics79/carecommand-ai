@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { db } from '../../lib/db';
-import { audit } from '../../lib/audit';
+import { runWithTenantContext } from '../../lib/tenantContext';
 import { cursorPage, paginationSchema } from '../../lib/pagination';
 import { requireRoles } from '../../plugins/roles';
 import { branchScope } from '../../lib/scope';
@@ -43,10 +43,20 @@ export const branchRoutes: FastifyPluginAsync = async app => {
 
   app.post('/', { preHandler: requireRoles('OWNER', 'ADMIN') }, async (request, reply) => {
     const input = branchInput.parse(request.body);
-    const branch = await db.branch.create({
-      data: { tenantId: request.auth.tenantId, ...input },
+    const branch = await runWithTenantContext(request.auth.tenantId, async tx => {
+      // Serialize tenant provisioning so stale tabs/retries cannot create the
+      // same named location twice. Keep the row and audit in one transaction.
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`branch.create:${request.auth.tenantId}`}::text, 0))::text AS locked`;
+      const existing = await tx.branch.findFirst({ where: { tenantId: request.auth.tenantId, name: { equals: input.name, mode: 'insensitive' } }, select: { id: true } });
+      if (existing) throw app.httpErrors.conflict('A clinic with this name already exists. Refresh the clinic list before trying again.');
+      const created = await tx.branch.create({ data: { tenantId: request.auth.tenantId, ...input } });
+      await tx.auditEvent.create({ data: {
+        tenantId: request.auth.tenantId, actorUserId: request.auth.userId,
+        action: 'branch.created', resource: 'branch', resourceId: created.id,
+        requestId: request.id, ipAddress: request.ip, userAgent: request.headers['user-agent'],
+      } });
+      return created;
     });
-    await audit(request, { action: 'branch.created', resource: 'branch', resourceId: branch.id });
     return reply.code(201).send(branch);
   });
 };

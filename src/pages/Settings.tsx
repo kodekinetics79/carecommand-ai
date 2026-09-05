@@ -1,5 +1,6 @@
 import { useState, type ReactNode, useEffect, useRef, type FormEvent } from 'react';
 import { useNavigate } from 'react-router';
+import ClinicCreateForm from '../components/ClinicCreateForm';
 import { useSession } from '../hooks/useSession';
 import {
   Building2, Users, Lock, Bell, ShieldCheck, CheckCircle2, Circle,
@@ -145,7 +146,7 @@ export default function Settings() {
         {/* Section content */}
         <div className="min-w-0 space-y-4">
           {loading && <ResourceSkeleton label="administration access" lines={4} rowClassName="h-16 rounded-xl" />}
-          {!loading && activeSection === 'overview' && <OverviewSection overview={overview} />}
+          {!loading && activeSection === 'overview' && <OverviewSection overview={overview} canCreate={!!user && ['OWNER', 'ADMIN'].includes(user.role)} />}
           {!loading && activeSection === 'preferences' && <PreferencesSection />}
           {!loading && activeSection === 'team' && <TeamSection />}
           {!loading && activeSection === 'roles' && <RolesSection />}
@@ -264,7 +265,7 @@ function PreferencesSection() {
 }
 
 /* ------------------------------------------------------------------ Overview */
-function OverviewSection({ overview }: { overview: UseResourceResult<AdminOverview> }) {
+function OverviewSection({ overview, canCreate }: { overview: UseResourceResult<AdminOverview>; canCreate: boolean }) {
   return (
     <ResourceSection
       label="Workspace overview"
@@ -291,6 +292,7 @@ function OverviewSection({ overview }: { overview: UseResourceResult<AdminOvervi
           </BentoCard>
 
           <BentoCard title="Practice Locations" subtitle="Branch configuration" headerRight={<MapPin className="w-4 h-4 text-t3" />}>
+            <ClinicCreateForm canCreate={canCreate} onCreated={overview.reload} />
             {data.branches.length === 0 ? (
               <EmptyStatePremium
                 icon={<MapPin className="w-5 h-5" />}
